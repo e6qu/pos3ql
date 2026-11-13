@@ -5,6 +5,10 @@
 //! Source SHA-256: 318da07345255e429024fdfd72c7db27cc525cc95fda241f6c1fb010422dd58f
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"\xe0\xae\x93";
@@ -50,287 +54,1332 @@ const S_39: &[u8] = b"\xe0\xaf\x8d";
 const S_40: &[u8] = b"\xe0\xaf\x8d";
 
 const A_0: &[Among] = &[
-    Among { s: b"\xe0\xae\xb5\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xaf\x82", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xaf\x8a", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xaf\x8b", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xaf\x82",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xaf\x8a",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xaf\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x99", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9e", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa8", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xae", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaf", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb5", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x99",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9e",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xe0\xaf\x8d", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x8d",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"\xe0\xae\xa9\xe0\xaf\x81", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x95\xe0\xaf\x8d", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x95\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xe0\xae\x99\xe0\xaf\x8d", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x8d", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xe0\xae\xa4\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x8d", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xa8\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\xaa\xe0\xaf\x8d", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaf\xe0\xaf\x8d", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xaf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xe0\xae\xa9\xe0\xaf\x81",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x95\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x95\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\x95\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x99\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\xaa\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaf\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"\xe0\xae\x9e", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa3", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa8", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa9", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xae", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaf", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb0", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb2", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb3", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb5", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x9e",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa3",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb0",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb2",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb3",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_9: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x8d", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x8d",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_10: &[Among] = &[
-    Among { s: b"\xe0\xae\x85", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x89", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x85",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x89",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_11: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x99", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9e", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa8", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xae", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaf", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb5", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x99",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9e",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa8",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_12: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_13: &[Among] = &[
-    Among { s: b"\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x99\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x99\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\x95\xe0\xae\xb3\xe0\xaf\x8d",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_14: &[Among] = &[
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x8b", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x8b",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_15: &[Among] = &[
-    Among { s: b"\xe0\xae\xaa\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_16: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_17: &[Among] = &[
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xae\xa4\xe0\xaf\x81", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xaf\x86\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2\xe0\xaf\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xae\xa9\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xaf\x86\xe0\xae\xa9\xe0\xaf\x81\xe0\xae\xae\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\x9f\xe0\xae\xae\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xaf\x86\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2\xe0\xae\xbe\xe0\xae\xae\xe0\xaf\x8d", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xae\xa3", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xaf\x86\xe0\xae\xa9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xa4\xe0\xae\xbe\xe0\xae\xa9", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xae\xbf\xe0\xae\xa4\xe0\xae\xbe\xe0\xae\xa9", substring_i: 15, result: 3, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88\xe0\xae\xaf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xaf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xaf\x81\xe0\xae\xb0\xe0\xae\xbf\xe0\xae\xaf", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\xb3\xe0\xaf\x8d\xe0\xae\xb3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\x95\xe0\xae\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xae\xbf", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xae\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xaa\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\xb1\xe0\xae\xbf", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xae\xa4\xe0\xaf\x81",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2\xe0\xaf\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xae\xa9\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86\xe0\xae\xa9\xe0\xaf\x81\xe0\xae\xae\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\x9f\xe0\xae\xae\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2\xe0\xae\xbe\xe0\xae\xae\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xaf\x8d\xe0\xae\x9f\xe0\xae\xa3",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86\xe0\xae\xa9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4\xe0\xae\xbe\xe0\xae\xa9",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xae\xbf\xe0\xae\xa4\xe0\xae\xbe\xe0\xae\xa9",
+        substring_i: 15,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88\xe0\xae\xaf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xaf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xaf\x81\xe0\xae\xb0\xe0\xae\xbf\xe0\xae\xaf",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb2\xe0\xaf\x8d\xe0\xae\xb2",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\xb3\xe0\xaf\x8d\xe0\xae\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\x95\xe0\xae\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\x9f\xe0\xae\xbf",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xae\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa\xe0\xae\xb1\xe0\xaf\x8d\xe0\xae\xb1\xe0\xae\xbf",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_18: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_19: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_20: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xe0\xaf\x8a\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xaf\x8b\xe0\xae\x9f\xe0\xaf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\xa4\xe0\xaf\x81", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xb0\xe0\xaf\x81\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x81", substring_i: 3, result: 2, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\xa9\xe0\xaf\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xae\xa3\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xae\xe0\xaf\x81\xe0\xae\xa9\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\x9f\xe0\xae\xae\xe0\xaf\x8d", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xe0\xae\xae\xe0\xaf\x87\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\xb2\xe0\xaf\x8d", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xe0\xae\xae\xe0\xaf\x87\xe0\xae\xb2\xe0\xaf\x8d", substring_i: 14, result: 1, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\xae\xe0\xae\xb2\xe0\xaf\x8d", substring_i: 14, result: 2, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\xb2\xe0\xaf\x8d", substring_i: 14, result: 2, function: None },
-    Among { s: b"\xe0\xae\xbf\xe0\xae\xb2\xe0\xaf\x8d", substring_i: 14, result: 2, function: None },
-    Among { s: b"\xe0\xaf\x81\xe0\xae\xb3\xe0\xaf\x8d", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xaf\x80\xe0\xae\xb4\xe0\xaf\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x8a\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x8b\xe0\xae\x9f\xe0\xaf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4\xe0\xaf\x81",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xb0\xe0\xaf\x81\xe0\xae\xa8\xe0\xaf\x8d\xe0\xae\xa4\xe0\xaf\x81",
+        substring_i: 3,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\x9f\xe0\xaf\x88",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa9\xe0\xaf\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xa3\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae\xe0\xaf\x81\xe0\xae\xa9\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\x9f\xe0\xae\xae\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae\xe0\xaf\x87\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb2\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xae\xe0\xaf\x87\xe0\xae\xb2\xe0\xaf\x8d",
+        substring_i: 14,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\xae\xe0\xae\xb2\xe0\xaf\x8d",
+        substring_i: 14,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\xb2\xe0\xaf\x8d",
+        substring_i: 14,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf\xe0\xae\xb2\xe0\xaf\x8d",
+        substring_i: 14,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81\xe0\xae\xb3\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xaf\x80\xe0\xae\xb4\xe0\xaf\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb5\xe0\xae\xbf\xe0\xae\x9f",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_21: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_22: &[Among] = &[
-    Among { s: b"\xe0\xae\x95", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x9f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xa4", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xaa", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x9f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xa4",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xaa",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_23: &[Among] = &[
-    Among { s: b"\xe0\xae\x85", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x89", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x8a", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x8e", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x8f", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x90", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x92", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x93", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x94", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x85",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x89",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x8a",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x8e",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x8f",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x90",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x92",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x93",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x94",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_24: &[Among] = &[
-    Among { s: b"\xe0\xaf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x86", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x87", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xaf\x88", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbf", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xaf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x86",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x87",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xaf\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbf",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_25: &[Among] = &[
@@ -383,12 +1432,42 @@ const A_25: &[Among] = &[
 ];
 
 const A_26: &[Among] = &[
-    Among { s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\xa8\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xb1\xe0\xaf\x8d", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\xbe\xe0\xae\xa8\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xb1", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\xa8\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xb1\xe0\xaf\x8d",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\xbe\xe0\xae\xa8\xe0\xae\xbf\xe0\xae\xa9\xe0\xaf\x8d\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xae\x95\xe0\xae\xbf\xe0\xae\xb1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 fn r_has_min_length(z: &mut Env) -> i32 {
@@ -408,35 +1487,27 @@ fn r_fix_va_start(z: &mut Env) -> i32 {
     z.ket = z.c;
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_0);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_0);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_1);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_1);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_2);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_2);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_from(S_3);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_3);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -519,11 +1590,9 @@ fn r_fix_ending(z: &mut Env) -> i32 {
                 z.bra = z.c;
                 match among_var {
                     1 => {
-                        {
-                            let ret = z.slice_del();
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_del();
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     2 => {
@@ -542,27 +1611,21 @@ fn r_fix_ending(z: &mut Env) -> i32 {
                         }
                     }
                     3 => {
-                        {
-                            let ret = z.slice_from(S_6);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_6);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     4 => {
-                        {
-                            let ret = z.slice_from(S_7);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_7);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     5 => {
-                        {
-                            let ret = z.slice_from(S_8);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_8);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     6 => {
@@ -587,11 +1650,9 @@ fn r_fix_ending(z: &mut Env) -> i32 {
                         }
                     }
                     7 => {
-                        {
-                            let ret = z.slice_from(S_11);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_11);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     8 => {
@@ -620,19 +1681,15 @@ fn r_fix_ending(z: &mut Env) -> i32 {
                         }
                         match among_var {
                             1 => {
-                                {
-                                    let ret = z.slice_del();
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_del();
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             2 => {
-                                {
-                                    let ret = z.slice_from(S_12);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_12);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             _ => {}
@@ -764,54 +1821,46 @@ fn r_remove_plural_suffix(z: &mut Env) -> i32 {
     }
     z.bra = z.c;
     match among_var {
-        1 => {
-            'lab0: {
-                {
-                    let m1 = z.l - z.c;
-                    'lab1: {
-                        if find_among_b(z, A_12) == 0 {
-                            break 'lab1;
-                        }
-                        {
-                            let ret = z.slice_from(S_17);
-                            if ret < 0 {
-                                return ret;
-                            }
-                        }
-                        break 'lab0;
+        1 => 'lab0: {
+            {
+                let m1 = z.l - z.c;
+                'lab1: {
+                    if find_among_b(z, A_12) == 0 {
+                        break 'lab1;
                     }
-                    z.c = z.l - m1;
                     {
-                        let ret = z.slice_from(S_18);
+                        let ret = z.slice_from(S_17);
                         if ret < 0 {
                             return ret;
                         }
+                    }
+                    break 'lab0;
+                }
+                z.c = z.l - m1;
+                {
+                    let ret = z.slice_from(S_18);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_19);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_19);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_20);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_20);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -935,11 +1984,9 @@ fn r_remove_common_word_endings(z: &mut Env) -> i32 {
     z.bra = z.c;
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_24);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_24);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
@@ -961,11 +2008,9 @@ fn r_remove_common_word_endings(z: &mut Env) -> i32 {
             }
         }
         3 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -998,7 +2043,10 @@ fn r_remove_vetrumai_urupukal(z: &mut Env) -> i32 {
                 {
                     let m_test2 = z.l - z.c;
                     z.ket = z.c;
-                    if z.c - 2 <= z.lb || z.byte(z.c - 1) >> 5 != 4 || (-2147475197 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 2 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 4
+                        || (-2147475197 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         break 'lab1;
                     }
                     among_var = find_among_b(z, A_20);
@@ -1008,19 +2056,15 @@ fn r_remove_vetrumai_urupukal(z: &mut Env) -> i32 {
                     z.bra = z.c;
                     match among_var {
                         1 => {
-                            {
-                                let ret = z.slice_del();
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_del();
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         2 => {
-                            {
-                                let ret = z.slice_from(S_26);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_26);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         3 => {
@@ -1089,11 +2133,9 @@ fn r_remove_vetrumai_urupukal(z: &mut Env) -> i32 {
                             }
                         }
                         7 => {
-                            {
-                                let ret = z.slice_from(S_31);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_31);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         _ => {}
@@ -1227,18 +2269,19 @@ fn r_remove_tense_suffix(z: &mut Env) -> i32 {
                 z.bra = z.c;
                 match among_var {
                     1 => {
-                        {
-                            let ret = z.slice_del();
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_del();
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     2 => {
                         {
                             let m3 = z.l - z.c;
                             'lab1: {
-                                if z.c - 2 <= z.lb || z.byte(z.c - 1) >> 5 != 4 || (1951712 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                                if z.c - 2 <= z.lb
+                                    || z.byte(z.c - 1) >> 5 != 4
+                                    || (1951712 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                                {
                                     break 'lab1;
                                 }
                                 if find_among_b(z, A_23) == 0 {
@@ -1292,11 +2335,9 @@ fn r_remove_tense_suffix(z: &mut Env) -> i32 {
                         }
                     }
                     5 => {
-                        {
-                            let ret = z.slice_from(S_39);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_39);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     6 => {

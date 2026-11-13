@@ -5,6 +5,10 @@
 //! Source SHA-256: 64b154959895056b17cd9a66306578539dc8598e8ad51e5c6f5aeccee817dd60
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"\xd6\xbc";
@@ -100,196 +104,1056 @@ const G_VOWEL: &[u8] = &[33, 2, 4, 0, 6];
 const G_CONSONANT: &[u8] = &[239, 254, 253, 131];
 
 const A_0: &[Among] = &[
-    Among { s: b"\xd7\x95\xd7\x95", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x95\xd7\x99", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd7\x99\xd7\x99", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd7\x9a", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xd7\x9d", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xd7\x9f", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xd7\xa3", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xd7\xa5", substring_i: -1, result: 8, function: None },
+    Among {
+        s: b"\xd7\x95\xd7\x95",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x95\xd7\x99",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\x99",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9a",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9d",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9f",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa3",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa5",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xd7\x90\xd7\x93\xd7\x95\xd7\xa8\xd7\x9b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x94\xd7\x99\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x94\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x94\xd7\xb2\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x95\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x95\xd7\xa0\xd7\x98\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\x99\xd7\x91\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa0\xd7\x98", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa0\xd7\x98\xd7\xa7\xd7\xa2\xd7\x92\xd7\xa0", substring_i: 8, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa0\xd7\x99\xd7\x93\xd7\xa2\xd7\xa8", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa4\xd7\x99\xd7\xa8", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa7\xd7\xa2\xd7\x92\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\x90\xd7\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\x95\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\x95\xd7\xa0\xd7\x98\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\x99\xd7\x91\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xa8\xd7\xb2\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xb0\xd7\xa2\xd7\xa7", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xb1\xd7\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xb1\xd7\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x90\xd7\xb2\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x91\xd7\x90", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x91\xd7\xb2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x93\xd7\x95\xd7\xa8\xd7\x9b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x93\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x9e\xd7\x99\xd7\x98", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa0\xd7\x90\xd7\x9b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa4\xd7\x90\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x91\xd7\xb2", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa1", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xd7\xa4\xd7\x95\xd7\xa0\xd7\x90\xd7\xa0\xd7\x93\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa6\xd7\x95", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa6\xd7\x95\xd7\x96\xd7\x90\xd7\x9e\xd7\xa2\xd7\xa0", substring_i: 35, result: 1, function: None },
-    Among { s: b"\xd7\xa6\xd7\x95\xd7\xa0\xd7\xb1\xd7\xa4", substring_i: 35, result: 1, function: None },
-    Among { s: b"\xd7\xa6\xd7\x95\xd7\xa8\xd7\x99\xd7\xa7", substring_i: 35, result: 1, function: None },
-    Among { s: b"\xd7\xa6\xd7\xa2", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd7\x90\xd7\x93\xd7\x95\xd7\xa8\xd7\x9b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x94\xd7\x99\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x94\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x94\xd7\xb2\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x95\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x95\xd7\xa0\xd7\x98\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\x99\xd7\x91\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa0\xd7\x98",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa0\xd7\x98\xd7\xa7\xd7\xa2\xd7\x92\xd7\xa0",
+        substring_i: 8,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa0\xd7\x99\xd7\x93\xd7\xa2\xd7\xa8",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa4\xd7\x99\xd7\xa8",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa7\xd7\xa2\xd7\x92\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\x90\xd7\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\x95\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\x95\xd7\xa0\xd7\x98\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\x99\xd7\x91\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xa8\xd7\xb2\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xb0\xd7\xa2\xd7\xa7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xb1\xd7\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xb1\xd7\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x90\xd7\xb2\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x90",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x93\xd7\x95\xd7\xa8\xd7\x9b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x93\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9e\xd7\x99\xd7\x98",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\x90\xd7\x9b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x90\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x91\xd7\xb2",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\xb1\xd7\xa1",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x95\xd7\xa0\xd7\x90\xd7\xa0\xd7\x93\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\x95",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\x95\xd7\x96\xd7\x90\xd7\x9e\xd7\xa2\xd7\xa0",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\x95\xd7\xa0\xd7\xb1\xd7\xa4",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\x95\xd7\xa8\xd7\x99\xd7\xa7",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\xa2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xd7\x93\xd7\x96\xd7\xa9", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xd7\xa9\xd7\x98\xd7\xa8", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xd7\xa9\xd7\x98\xd7\xa9", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xd7\xa9\xd7\xa4\xd7\xa8", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xd7\x93\xd7\x96\xd7\xa9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x98\xd7\xa8",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x98\xd7\xa9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xa4\xd7\xa8",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"\xd7\xa7\xd7\x9c\xd7\x99\xd7\x91", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xd7\xa8\xd7\x99\xd7\x91", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xd7\x98\xd7\xa8\xd7\x99\xd7\x91", substring_i: 1, result: 7, function: None },
-    Among { s: b"\xd7\xa9\xd7\xa8\xd7\x99\xd7\x91", substring_i: 1, result: 15, function: None },
-    Among { s: b"\xd7\x94\xd7\xb1\xd7\x91", substring_i: -1, result: 23, function: None },
-    Among { s: b"\xd7\xa9\xd7\xb0\xd7\x99\xd7\x92", substring_i: -1, result: 12, function: None },
-    Among { s: b"\xd7\x92\xd7\x90\xd7\xa0\xd7\x92", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x96\xd7\x95\xd7\xa0\xd7\x92", substring_i: -1, result: 18, function: None },
-    Among { s: b"\xd7\xa9\xd7\x9c\xd7\x95\xd7\xa0\xd7\x92", substring_i: -1, result: 21, function: None },
-    Among { s: b"\xd7\xa6\xd7\xb0\xd7\x95\xd7\xa0\xd7\x92", substring_i: -1, result: 20, function: None },
-    Among { s: b"\xd7\x91\xd7\xb1\xd7\x92", substring_i: -1, result: 22, function: None },
-    Among { s: b"\xd7\x91\xd7\x95\xd7\xa0\xd7\x93", substring_i: -1, result: 16, function: None },
-    Among { s: b"\xd7\xb0\xd7\x99\xd7\x96", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xd7\x91\xd7\x99\xd7\x98", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xd7\x9c\xd7\x99\xd7\x98", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xd7\x9e\xd7\x99\xd7\x98", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd7\xa9\xd7\xa0\xd7\x99\xd7\x98", substring_i: -1, result: 14, function: None },
-    Among { s: b"\xd7\xa0\xd7\x95\xd7\x9e", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd7\xa9\xd7\x98\xd7\x90\xd7\xa0", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xd7\x91\xd7\x99\xd7\xa1", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xd7\xa9\xd7\x9e\xd7\x99\xd7\xa1", substring_i: -1, result: 13, function: None },
-    Among { s: b"\xd7\xa8\xd7\x99\xd7\xa1", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xd7\x98\xd7\xa8\xd7\x95\xd7\xa0\xd7\xa7", substring_i: -1, result: 19, function: None },
-    Among { s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x9c\xd7\xb1\xd7\xa8", substring_i: -1, result: 24, function: None },
-    Among { s: b"\xd7\xa9\xd7\xb0\xd7\xb1\xd7\xa8", substring_i: -1, result: 26, function: None },
-    Among { s: b"\xd7\xb0\xd7\x95\xd7\x98\xd7\xa9", substring_i: -1, result: 17, function: None },
+    Among {
+        s: b"\xd7\xa7\xd7\x9c\xd7\x99\xd7\x91",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa8\xd7\x99\xd7\x91",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa8\xd7\x99\xd7\x91",
+        substring_i: 1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xa8\xd7\x99\xd7\x91",
+        substring_i: 1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x94\xd7\xb1\xd7\x91",
+        substring_i: -1,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xb0\xd7\x99\xd7\x92",
+        substring_i: -1,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x92\xd7\x90\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x96\xd7\x95\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x9c\xd7\x95\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\xb0\xd7\x95\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\xb1\xd7\x92",
+        substring_i: -1,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x95\xd7\xa0\xd7\x93",
+        substring_i: -1,
+        result: 16,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xb0\xd7\x99\xd7\x96",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x99\xd7\x98",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9c\xd7\x99\xd7\x98",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9e\xd7\x99\xd7\x98",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xa0\xd7\x99\xd7\x98",
+        substring_i: -1,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\x95\xd7\x9e",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x98\xd7\x90\xd7\xa0",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x99\xd7\xa1",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x9e\xd7\x99\xd7\xa1",
+        substring_i: -1,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa8\xd7\x99\xd7\xa1",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa8\xd7\x95\xd7\xa0\xd7\xa7",
+        substring_i: -1,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x9c\xd7\xb1\xd7\xa8",
+        substring_i: -1,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xb0\xd7\xb1\xd7\xa8",
+        substring_i: -1,
+        result: 26,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xb0\xd7\x95\xd7\x98\xd7\xa9",
+        substring_i: -1,
+        result: 17,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"\xd7\x95\xd7\xa0\xd7\x92", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa1\xd7\x98\xd7\x95", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x98", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x91\xd7\xa8\xd7\x90\xd7\x9b\xd7\x98", substring_i: 2, result: 31, function: None },
-    Among { s: b"\xd7\xa1\xd7\x98", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa1\xd7\x98", substring_i: 4, result: 33, function: None },
-    Among { s: b"\xd7\xa2\xd7\x98", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\xa9\xd7\x90\xd7\xa4\xd7\x98", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\x94\xd7\xb2\xd7\x98", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\xa7\xd7\xb2\xd7\x98", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa7\xd7\xb2\xd7\x98", substring_i: 9, result: 1, function: None },
-    Among { s: b"\xd7\x9c\xd7\xa2\xd7\x9b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\x9b", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\x96\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x9e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\x9e", substring_i: 15, result: 3, function: None },
-    Among { s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2\xd7\x9e", substring_i: 16, result: 4, function: None },
-    Among { s: b"\xd7\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa7\xd7\x9c\xd7\x99\xd7\x91\xd7\xa0", substring_i: 18, result: 14, function: None },
-    Among { s: b"\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0", substring_i: 18, result: 15, function: None },
-    Among { s: b"\xd7\x98\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0", substring_i: 20, result: 12, function: None },
-    Among { s: b"\xd7\xa9\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0", substring_i: 20, result: 7, function: None },
-    Among { s: b"\xd7\x94\xd7\xb1\xd7\x91\xd7\xa0", substring_i: 18, result: 27, function: None },
-    Among { s: b"\xd7\xa9\xd7\xb0\xd7\x99\xd7\x92\xd7\xa0", substring_i: 18, result: 17, function: None },
-    Among { s: b"\xd7\x96\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0", substring_i: 18, result: 22, function: None },
-    Among { s: b"\xd7\xa9\xd7\x9c\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0", substring_i: 18, result: 25, function: None },
-    Among { s: b"\xd7\xa6\xd7\xb0\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0", substring_i: 18, result: 24, function: None },
-    Among { s: b"\xd7\x91\xd7\xb1\xd7\x92\xd7\xa0", substring_i: 18, result: 26, function: None },
-    Among { s: b"\xd7\x91\xd7\x95\xd7\xa0\xd7\x93\xd7\xa0", substring_i: 18, result: 20, function: None },
-    Among { s: b"\xd7\xb0\xd7\x99\xd7\x96\xd7\xa0", substring_i: 18, result: 11, function: None },
-    Among { s: b"\xd7\x98\xd7\xa0", substring_i: 18, result: 4, function: None },
-    Among { s: b"GE\xd7\x91\xd7\x99\xd7\x98\xd7\xa0", substring_i: 31, result: 9, function: None },
-    Among { s: b"GE\xd7\x9c\xd7\x99\xd7\x98\xd7\xa0", substring_i: 31, result: 13, function: None },
-    Among { s: b"GE\xd7\x9e\xd7\x99\xd7\x98\xd7\xa0", substring_i: 31, result: 8, function: None },
-    Among { s: b"\xd7\xa9\xd7\xa0\xd7\x99\xd7\x98\xd7\xa0", substring_i: 31, result: 19, function: None },
-    Among { s: b"\xd7\xa1\xd7\x98\xd7\xa0", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa1\xd7\x98\xd7\xa0", substring_i: 36, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x98\xd7\xa0", substring_i: 31, result: 1, function: None },
-    Among { s: b"GE\xd7\x91\xd7\x99\xd7\xa1\xd7\xa0", substring_i: 18, result: 10, function: None },
-    Among { s: b"\xd7\xa9\xd7\x9e\xd7\x99\xd7\xa1\xd7\xa0", substring_i: 18, result: 18, function: None },
-    Among { s: b"GE\xd7\xa8\xd7\x99\xd7\xa1\xd7\xa0", substring_i: 18, result: 16, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0", substring_i: 18, result: 1, function: None },
-    Among { s: b"\xd7\x92\xd7\x90\xd7\xa0\xd7\x92\xd7\xa2\xd7\xa0", substring_i: 42, result: 5, function: None },
-    Among { s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\xa0", substring_i: 42, result: 1, function: None },
-    Among { s: b"\xd7\xa0\xd7\x95\xd7\x9e\xd7\xa2\xd7\xa0", substring_i: 42, result: 6, function: None },
-    Among { s: b"\xd7\x99\xd7\x96\xd7\x9e\xd7\xa2\xd7\xa0", substring_i: 42, result: 1, function: None },
-    Among { s: b"\xd7\xa9\xd7\x98\xd7\x90\xd7\xa0\xd7\xa2\xd7\xa0", substring_i: 42, result: 29, function: None },
-    Among { s: b"\xd7\x98\xd7\xa8\xd7\x95\xd7\xa0\xd7\xa7\xd7\xa0", substring_i: 18, result: 23, function: None },
-    Among { s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x9c\xd7\xb1\xd7\xa8\xd7\xa0", substring_i: 18, result: 28, function: None },
-    Among { s: b"\xd7\xa9\xd7\xb0\xd7\xb1\xd7\xa8\xd7\xa0", substring_i: 18, result: 30, function: None },
-    Among { s: b"\xd7\xb0\xd7\x95\xd7\x98\xd7\xa9\xd7\xa0", substring_i: 18, result: 21, function: None },
-    Among { s: b"\xd7\x92\xd7\xb2\xd7\xa0", substring_i: 18, result: 5, function: None },
-    Among { s: b"\xd7\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x98\xd7\xa1", substring_i: 53, result: 4, function: None },
-    Among { s: b"\xd7\xa2\xd7\x98\xd7\xa1", substring_i: 54, result: 1, function: None },
-    Among { s: b"\xd7\xa0\xd7\xa1", substring_i: 53, result: 1, function: None },
-    Among { s: b"\xd7\x98\xd7\xa0\xd7\xa1", substring_i: 56, result: 4, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\xa1", substring_i: 56, result: 3, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa1", substring_i: 53, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa2\xd7\xa1", substring_i: 59, result: 2, function: None },
-    Among { s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\xa1", substring_i: 59, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa8\xd7\xa1", substring_i: 53, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8\xd7\xa1", substring_i: 62, result: 1, function: None },
-    Among { s: b"\xd7\xa2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x98\xd7\xa2", substring_i: 64, result: 4, function: None },
-    Among { s: b"\xd7\xa1\xd7\x98\xd7\xa2", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x98\xd7\xa2", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa2", substring_i: 64, result: -1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x9c\xd7\xa2", substring_i: 64, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\xa2", substring_i: 64, result: 3, function: None },
-    Among { s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2", substring_i: 70, result: 4, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x98\xd7\xa2\xd7\xa8", substring_i: 72, result: 4, function: None },
-    Among { s: b"\xd7\xa1\xd7\x98\xd7\xa2\xd7\xa8", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\x98\xd7\xa2\xd7\xa8", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8", substring_i: 72, result: 3, function: None },
-    Among { s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8", substring_i: 76, result: 4, function: None },
-    Among { s: b"\xd7\x95\xd7\xaa", substring_i: -1, result: 32, function: None },
+    Among {
+        s: b"\xd7\x95\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1\xd7\x98\xd7\x95",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\xa8\xd7\x90\xd7\x9b\xd7\x98",
+        substring_i: 2,
+        result: 31,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1\xd7\x98",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa1\xd7\x98",
+        substring_i: 4,
+        result: 33,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x98",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x90\xd7\xa4\xd7\x98",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x94\xd7\xb2\xd7\x98",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa7\xd7\xb2\xd7\x98",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa7\xd7\xb2\xd7\x98",
+        substring_i: 9,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9c\xd7\xa2\xd7\x9b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\x9b",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\x96\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x9e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\x9e",
+        substring_i: 15,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2\xd7\x9e",
+        substring_i: 16,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa7\xd7\x9c\xd7\x99\xd7\x91\xd7\xa0",
+        substring_i: 18,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0",
+        substring_i: 18,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0",
+        substring_i: 20,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xa8\xd7\x99\xd7\x91\xd7\xa0",
+        substring_i: 20,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x94\xd7\xb1\xd7\x91\xd7\xa0",
+        substring_i: 18,
+        result: 27,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xb0\xd7\x99\xd7\x92\xd7\xa0",
+        substring_i: 18,
+        result: 17,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x96\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0",
+        substring_i: 18,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x9c\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0",
+        substring_i: 18,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa6\xd7\xb0\xd7\x95\xd7\xa0\xd7\x92\xd7\xa0",
+        substring_i: 18,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\xb1\xd7\x92\xd7\xa0",
+        substring_i: 18,
+        result: 26,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x95\xd7\xa0\xd7\x93\xd7\xa0",
+        substring_i: 18,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xb0\xd7\x99\xd7\x96\xd7\xa0",
+        substring_i: 18,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa0",
+        substring_i: 18,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"GE\xd7\x91\xd7\x99\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"GE\xd7\x9c\xd7\x99\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"GE\xd7\x9e\xd7\x99\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xa0\xd7\x99\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa1\xd7\x98\xd7\xa0",
+        substring_i: 36,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x98\xd7\xa0",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"GE\xd7\x91\xd7\x99\xd7\xa1\xd7\xa0",
+        substring_i: 18,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x9e\xd7\x99\xd7\xa1\xd7\xa0",
+        substring_i: 18,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"GE\xd7\xa8\xd7\x99\xd7\xa1\xd7\xa0",
+        substring_i: 18,
+        result: 16,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x92\xd7\x90\xd7\xa0\xd7\x92\xd7\xa2\xd7\xa0",
+        substring_i: 42,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\xa0",
+        substring_i: 42,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\x95\xd7\x9e\xd7\xa2\xd7\xa0",
+        substring_i: 42,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\x96\xd7\x9e\xd7\xa2\xd7\xa0",
+        substring_i: 42,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x98\xd7\x90\xd7\xa0\xd7\xa2\xd7\xa0",
+        substring_i: 42,
+        result: 29,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa8\xd7\x95\xd7\xa0\xd7\xa7\xd7\xa0",
+        substring_i: 18,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa4\xd7\x90\xd7\xa8\xd7\x9c\xd7\xb1\xd7\xa8\xd7\xa0",
+        substring_i: 18,
+        result: 28,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\xb0\xd7\xb1\xd7\xa8\xd7\xa0",
+        substring_i: 18,
+        result: 30,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xb0\xd7\x95\xd7\x98\xd7\xa9\xd7\xa0",
+        substring_i: 18,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x92\xd7\xb2\xd7\xa0",
+        substring_i: 18,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa1",
+        substring_i: 53,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x98\xd7\xa1",
+        substring_i: 54,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\xa1",
+        substring_i: 53,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa0\xd7\xa1",
+        substring_i: 56,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\xa1",
+        substring_i: 56,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa1",
+        substring_i: 53,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa2\xd7\xa1",
+        substring_i: 59,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x9c\xd7\xa2\xd7\xa1",
+        substring_i: 59,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa8\xd7\xa1",
+        substring_i: 53,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8\xd7\xa1",
+        substring_i: 62,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa2",
+        substring_i: 64,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1\xd7\x98\xd7\xa2",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x98\xd7\xa2",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa2",
+        substring_i: 64,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x9c\xd7\xa2",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\xa2",
+        substring_i: 64,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2",
+        substring_i: 70,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa2\xd7\xa8",
+        substring_i: 72,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa1\xd7\x98\xd7\xa2\xd7\xa8",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\x98\xd7\xa2\xd7\xa8",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8",
+        substring_i: 72,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x98\xd7\xa2\xd7\xa0\xd7\xa2\xd7\xa8",
+        substring_i: 76,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x95\xd7\xaa",
+        substring_i: -1,
+        result: 32,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"\xd7\x95\xd7\xa0\xd7\x92", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa9\xd7\x90\xd7\xa4\xd7\x98", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x94\xd7\xb2\xd7\x98", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\xa7\xd7\xb2\xd7\x98", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa7\xd7\xb2\xd7\x98", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xd7\x9c", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xd7\x95\xd7\xa0\xd7\x92",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa9\xd7\x90\xd7\xa4\xd7\x98",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x94\xd7\xb2\xd7\x98",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa7\xd7\xb2\xd7\x98",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa7\xd7\xb2\xd7\x98",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x9c",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"\xd7\x99\xd7\x92", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa7", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd7\x93\xd7\x99\xd7\xa7", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xd7\xa0\xd7\x93\xd7\x99\xd7\xa7", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xd7\xa2\xd7\xa0\xd7\x93\xd7\x99\xd7\xa7", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xd7\x91\xd7\x9c\xd7\x99\xd7\xa7", substring_i: 1, result: -1, function: None },
-    Among { s: b"\xd7\x92\xd7\x9c\xd7\x99\xd7\xa7", substring_i: 1, result: -1, function: None },
-    Among { s: b"\xd7\xa0\xd7\x99\xd7\xa7", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xd7\x99\xd7\xa9", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd7\x99\xd7\x92",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x93\xd7\x99\xd7\xa7",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\x93\xd7\x99\xd7\xa7",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa2\xd7\xa0\xd7\x93\xd7\x99\xd7\xa7",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x91\xd7\x9c\xd7\x99\xd7\xa7",
+        substring_i: 1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x92\xd7\x9c\xd7\x99\xd7\xa7",
+        substring_i: 1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\xa0\xd7\x99\xd7\xa7",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd7\x99\xd7\xa9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_prelude(z: &mut Env) -> i32 {
@@ -364,43 +1228,33 @@ fn r_prelude(z: &mut Env) -> i32 {
                                 }
                             }
                             4 => {
-                                {
-                                    let ret = z.slice_from(S_6);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_6);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             5 => {
-                                {
-                                    let ret = z.slice_from(S_7);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_7);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             6 => {
-                                {
-                                    let ret = z.slice_from(S_8);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_8);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             7 => {
-                                {
-                                    let ret = z.slice_from(S_9);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_9);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             8 => {
-                                {
-                                    let ret = z.slice_from(S_10);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_10);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             _ => {}
@@ -743,211 +1597,159 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                     z.bra = z.c;
                     match among_var {
                         1 => {
-                            {
-                                let ret = z.slice_from(S_24);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_24);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         2 => {
-                            {
-                                let ret = z.slice_from(S_25);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_25);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         3 => {
-                            {
-                                let ret = z.slice_from(S_26);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_26);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         4 => {
-                            {
-                                let ret = z.slice_from(S_27);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_27);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         5 => {
-                            {
-                                let ret = z.slice_from(S_28);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_28);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         6 => {
-                            {
-                                let ret = z.slice_from(S_29);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_29);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         7 => {
-                            {
-                                let ret = z.slice_from(S_30);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_30);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         8 => {
-                            {
-                                let ret = z.slice_from(S_31);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_31);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         9 => {
-                            {
-                                let ret = z.slice_from(S_32);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_32);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         10 => {
-                            {
-                                let ret = z.slice_from(S_33);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_33);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         11 => {
-                            {
-                                let ret = z.slice_from(S_34);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_34);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         12 => {
-                            {
-                                let ret = z.slice_from(S_35);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_35);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         13 => {
-                            {
-                                let ret = z.slice_from(S_36);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_36);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         14 => {
-                            {
-                                let ret = z.slice_from(S_37);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_37);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         15 => {
-                            {
-                                let ret = z.slice_from(S_38);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_38);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         16 => {
-                            {
-                                let ret = z.slice_from(S_39);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_39);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         17 => {
-                            {
-                                let ret = z.slice_from(S_40);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_40);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         18 => {
-                            {
-                                let ret = z.slice_from(S_41);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_41);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         19 => {
-                            {
-                                let ret = z.slice_from(S_42);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_42);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         20 => {
-                            {
-                                let ret = z.slice_from(S_43);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_43);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         21 => {
-                            {
-                                let ret = z.slice_from(S_44);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_44);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         22 => {
-                            {
-                                let ret = z.slice_from(S_45);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_45);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         23 => {
-                            {
-                                let ret = z.slice_from(S_46);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_46);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         24 => {
-                            {
-                                let ret = z.slice_from(S_47);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_47);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         25 => {
-                            {
-                                let ret = z.slice_from(S_48);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_48);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         26 => {
-                            {
-                                let ret = z.slice_from(S_49);
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            let ret = z.slice_from(S_49);
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                         _ => {}
@@ -1006,219 +1808,165 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.slice_from(S_54);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_54);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 6 => {
-                    {
-                        let ret = z.slice_from(S_55);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_55);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 7 => {
-                    {
-                        let ret = z.slice_from(S_56);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_56);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 8 => {
-                    {
-                        let ret = z.slice_from(S_57);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_57);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 9 => {
-                    {
-                        let ret = z.slice_from(S_58);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_58);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 10 => {
-                    {
-                        let ret = z.slice_from(S_59);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_59);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 11 => {
-                    {
-                        let ret = z.slice_from(S_60);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_60);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 12 => {
-                    {
-                        let ret = z.slice_from(S_61);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_61);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 13 => {
-                    {
-                        let ret = z.slice_from(S_62);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_62);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 14 => {
-                    {
-                        let ret = z.slice_from(S_63);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_63);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 15 => {
-                    {
-                        let ret = z.slice_from(S_64);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_64);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 16 => {
-                    {
-                        let ret = z.slice_from(S_65);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_65);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 17 => {
-                    {
-                        let ret = z.slice_from(S_66);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_66);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 18 => {
-                    {
-                        let ret = z.slice_from(S_67);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_67);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 19 => {
-                    {
-                        let ret = z.slice_from(S_68);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_68);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 20 => {
-                    {
-                        let ret = z.slice_from(S_69);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_69);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 21 => {
-                    {
-                        let ret = z.slice_from(S_70);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_70);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 22 => {
-                    {
-                        let ret = z.slice_from(S_71);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_71);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 23 => {
-                    {
-                        let ret = z.slice_from(S_72);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_72);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 24 => {
-                    {
-                        let ret = z.slice_from(S_73);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_73);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 25 => {
-                    {
-                        let ret = z.slice_from(S_74);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_74);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 26 => {
-                    {
-                        let ret = z.slice_from(S_75);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_75);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 27 => {
-                    {
-                        let ret = z.slice_from(S_76);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_76);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 28 => {
-                    {
-                        let ret = z.slice_from(S_77);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_77);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 29 => {
-                    {
-                        let ret = z.slice_from(S_78);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_78);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 30 => {
-                    {
-                        let ret = z.slice_from(S_79);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_79);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 31 => {
-                    {
-                        let ret = z.slice_from(S_80);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_80);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 32 => {
@@ -1238,64 +1986,62 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                         }
                     }
                 }
-                33 => {
-                    'lab4: {
-                        {
-                            let m4 = z.l - z.c;
-                            'lab5: {
-                                'lab6: {
-                                    {
-                                        let m5 = z.l - z.c;
-                                        'lab7: {
-                                            if z.eq_s_b(S_82) == 0 {
-                                                break 'lab7;
-                                            }
-                                            break 'lab6;
-                                        }
-                                        z.c = z.l - m5;
-                                        if z.eq_s_b(S_83) == 0 {
-                                            break 'lab5;
-                                        }
-                                    }
-                                }
+                33 => 'lab4: {
+                    {
+                        let m4 = z.l - z.c;
+                        'lab5: {
+                            'lab6: {
                                 {
-                                    let m6 = z.l - z.c;
-                                    'lab8: {
-                                        {
-                                            let ret = r_r1plus3(z);
-                                            if ret == 0 {
-                                                z.c = z.l - m6;
-                                                break 'lab8;
-                                            }
-                                            if ret < 0 {
-                                                return ret;
-                                            }
+                                    let m5 = z.l - z.c;
+                                    'lab7: {
+                                        if z.eq_s_b(S_82) == 0 {
+                                            break 'lab7;
                                         }
-                                        {
-                                            let ret = z.slice_from(S_84);
-                                            if ret < 0 {
-                                                return ret;
-                                            }
+                                        break 'lab6;
+                                    }
+                                    z.c = z.l - m5;
+                                    if z.eq_s_b(S_83) == 0 {
+                                        break 'lab5;
+                                    }
+                                }
+                            }
+                            {
+                                let m6 = z.l - z.c;
+                                'lab8: {
+                                    {
+                                        let ret = r_r1plus3(z);
+                                        if ret == 0 {
+                                            z.c = z.l - m6;
+                                            break 'lab8;
+                                        }
+                                        if ret < 0 {
+                                            return ret;
+                                        }
+                                    }
+                                    {
+                                        let ret = z.slice_from(S_84);
+                                        if ret < 0 {
+                                            return ret;
                                         }
                                     }
                                 }
-                                break 'lab4;
                             }
-                            z.c = z.l - m4;
-                            {
-                                let ret = r_r1(z);
-                                if ret == 0 {
-                                    break 'lab0;
-                                }
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            break 'lab4;
+                        }
+                        z.c = z.l - m4;
+                        {
+                            let ret = r_r1(z);
+                            if ret == 0 {
+                                break 'lab0;
                             }
-                            {
-                                let ret = z.slice_del();
-                                if ret < 0 {
-                                    return ret;
-                                }
+                            if ret < 0 {
+                                return ret;
+                            }
+                        }
+                        {
+                            let ret = z.slice_del();
+                            if ret < 0 {
+                                return ret;
                             }
                         }
                     }
@@ -1309,7 +2055,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
         let m7 = z.l - z.c;
         z.ket = z.c;
         'lab9: {
-            if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 4 || (285474816 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+            if z.c - 1 <= z.lb
+                || z.byte(z.c - 1) >> 5 != 4
+                || (285474816 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+            {
                 break 'lab9;
             }
             among_var = find_among_b(z, A_5);

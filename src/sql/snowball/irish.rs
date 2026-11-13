@@ -5,6 +5,10 @@
 //! Source SHA-256: 526a7ea122d81d25b23a9556903931d3c0c43889398ef7d3f9c7914f0d0618bf
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"f";
@@ -22,95 +26,482 @@ const S_11: &[u8] = b"graf";
 const S_12: &[u8] = b"paite";
 const S_13: &[u8] = b"\xc3\xb3id";
 
-const G_V: &[u8] = &[17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 17, 4, 2];
+const G_V: &[u8] = &[
+    17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 17, 4, 2,
+];
 
 const A_0: &[Among] = &[
-    Among { s: b"b'", substring_i: -1, result: 1, function: None },
-    Among { s: b"bh", substring_i: -1, result: 4, function: None },
-    Among { s: b"bhf", substring_i: 1, result: 2, function: None },
-    Among { s: b"bp", substring_i: -1, result: 8, function: None },
-    Among { s: b"ch", substring_i: -1, result: 5, function: None },
-    Among { s: b"d'", substring_i: -1, result: 1, function: None },
-    Among { s: b"d'fh", substring_i: 5, result: 2, function: None },
-    Among { s: b"dh", substring_i: -1, result: 6, function: None },
-    Among { s: b"dt", substring_i: -1, result: 9, function: None },
-    Among { s: b"fh", substring_i: -1, result: 2, function: None },
-    Among { s: b"gc", substring_i: -1, result: 5, function: None },
-    Among { s: b"gh", substring_i: -1, result: 7, function: None },
-    Among { s: b"h-", substring_i: -1, result: 1, function: None },
-    Among { s: b"m'", substring_i: -1, result: 1, function: None },
-    Among { s: b"mb", substring_i: -1, result: 4, function: None },
-    Among { s: b"mh", substring_i: -1, result: 10, function: None },
-    Among { s: b"n-", substring_i: -1, result: 1, function: None },
-    Among { s: b"nd", substring_i: -1, result: 6, function: None },
-    Among { s: b"ng", substring_i: -1, result: 7, function: None },
-    Among { s: b"ph", substring_i: -1, result: 8, function: None },
-    Among { s: b"sh", substring_i: -1, result: 3, function: None },
-    Among { s: b"t-", substring_i: -1, result: 1, function: None },
-    Among { s: b"th", substring_i: -1, result: 9, function: None },
-    Among { s: b"ts", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"b'",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"bh",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"bhf",
+        substring_i: 1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"bp",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"ch",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"d'",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"d'fh",
+        substring_i: 5,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"dh",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"dt",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"fh",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"gc",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"gh",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"h-",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"m'",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"mb",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"mh",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"n-",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"nd",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"ng",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"ph",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"sh",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"t-",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"th",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"ts",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xc3\xadochta", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc3\xadochta", substring_i: 0, result: 1, function: None },
-    Among { s: b"ire", substring_i: -1, result: 2, function: None },
-    Among { s: b"aire", substring_i: 2, result: 2, function: None },
-    Among { s: b"abh", substring_i: -1, result: 1, function: None },
-    Among { s: b"eabh", substring_i: 4, result: 1, function: None },
-    Among { s: b"ibh", substring_i: -1, result: 1, function: None },
-    Among { s: b"aibh", substring_i: 6, result: 1, function: None },
-    Among { s: b"amh", substring_i: -1, result: 1, function: None },
-    Among { s: b"eamh", substring_i: 8, result: 1, function: None },
-    Among { s: b"imh", substring_i: -1, result: 1, function: None },
-    Among { s: b"aimh", substring_i: 10, result: 1, function: None },
-    Among { s: b"\xc3\xadocht", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc3\xadocht", substring_i: 12, result: 1, function: None },
-    Among { s: b"ir\xc3\xad", substring_i: -1, result: 2, function: None },
-    Among { s: b"air\xc3\xad", substring_i: 14, result: 2, function: None },
+    Among {
+        s: b"\xc3\xadochta",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc3\xadochta",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ire",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"aire",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"abh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eabh",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aibh",
+        substring_i: 6,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eamh",
+        substring_i: 8,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"imh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aimh",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadocht",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc3\xadocht",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xad",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"air\xc3\xad",
+        substring_i: 14,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xc3\xb3ideacha", substring_i: -1, result: 6, function: None },
-    Among { s: b"patacha", substring_i: -1, result: 5, function: None },
-    Among { s: b"achta", substring_i: -1, result: 1, function: None },
-    Among { s: b"arcachta", substring_i: 2, result: 2, function: None },
-    Among { s: b"eachta", substring_i: 2, result: 1, function: None },
-    Among { s: b"grafa\xc3\xadochta", substring_i: -1, result: 4, function: None },
-    Among { s: b"paite", substring_i: -1, result: 5, function: None },
-    Among { s: b"ach", substring_i: -1, result: 1, function: None },
-    Among { s: b"each", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xc3\xb3ideach", substring_i: 8, result: 6, function: None },
-    Among { s: b"gineach", substring_i: 8, result: 3, function: None },
-    Among { s: b"patach", substring_i: 7, result: 5, function: None },
-    Among { s: b"grafa\xc3\xadoch", substring_i: -1, result: 4, function: None },
-    Among { s: b"pataigh", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xc3\xb3idigh", substring_i: -1, result: 6, function: None },
-    Among { s: b"acht\xc3\xbail", substring_i: -1, result: 1, function: None },
-    Among { s: b"eacht\xc3\xbail", substring_i: 15, result: 1, function: None },
-    Among { s: b"gineas", substring_i: -1, result: 3, function: None },
-    Among { s: b"ginis", substring_i: -1, result: 3, function: None },
-    Among { s: b"acht", substring_i: -1, result: 1, function: None },
-    Among { s: b"arcacht", substring_i: 19, result: 2, function: None },
-    Among { s: b"eacht", substring_i: 19, result: 1, function: None },
-    Among { s: b"grafa\xc3\xadocht", substring_i: -1, result: 4, function: None },
-    Among { s: b"arcachta\xc3\xad", substring_i: -1, result: 2, function: None },
-    Among { s: b"grafa\xc3\xadochta\xc3\xad", substring_i: -1, result: 4, function: None },
+    Among {
+        s: b"\xc3\xb3ideacha",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"patacha",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"achta",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arcachta",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"eachta",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"grafa\xc3\xadochta",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"paite",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"ach",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"each",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb3ideach",
+        substring_i: 8,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"gineach",
+        substring_i: 8,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"patach",
+        substring_i: 7,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"grafa\xc3\xadoch",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"pataigh",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb3idigh",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"acht\xc3\xbail",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eacht\xc3\xbail",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"gineas",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ginis",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"acht",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arcacht",
+        substring_i: 19,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"eacht",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"grafa\xc3\xadocht",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"arcachta\xc3\xad",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"grafa\xc3\xadochta\xc3\xad",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"imid", substring_i: -1, result: 1, function: None },
-    Among { s: b"aimid", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xadmid", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc3\xadmid", substring_i: 2, result: 1, function: None },
-    Among { s: b"adh", substring_i: -1, result: 2, function: None },
-    Among { s: b"eadh", substring_i: 4, result: 2, function: None },
-    Among { s: b"faidh", substring_i: -1, result: 1, function: None },
-    Among { s: b"fidh", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1il", substring_i: -1, result: 2, function: None },
-    Among { s: b"ain", substring_i: -1, result: 2, function: None },
-    Among { s: b"tear", substring_i: -1, result: 2, function: None },
-    Among { s: b"tar", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"imid",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aimid",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadmid",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc3\xadmid",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"adh",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"eadh",
+        substring_i: 4,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"faidh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"fidh",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1il",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ain",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"tear",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"tar",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 fn r_mark_regions(z: &mut Env) -> i32 {
@@ -167,83 +558,63 @@ fn r_initial_morph(z: &mut Env) -> i32 {
     z.ket = z.c;
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_0);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_0);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_1);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_1);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_from(S_2);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_2);
+            if ret < 0 {
+                return ret;
             }
         }
         5 => {
-            {
-                let ret = z.slice_from(S_3);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_3);
+            if ret < 0 {
+                return ret;
             }
         }
         6 => {
-            {
-                let ret = z.slice_from(S_4);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_4);
+            if ret < 0 {
+                return ret;
             }
         }
         7 => {
-            {
-                let ret = z.slice_from(S_5);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_5);
+            if ret < 0 {
+                return ret;
             }
         }
         8 => {
-            {
-                let ret = z.slice_from(S_6);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_6);
+            if ret < 0 {
+                return ret;
             }
         }
         9 => {
-            {
-                let ret = z.slice_from(S_7);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_7);
+            if ret < 0 {
+                return ret;
             }
         }
         10 => {
-            {
-                let ret = z.slice_from(S_8);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_8);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -329,43 +700,33 @@ fn r_deriv(z: &mut Env) -> i32 {
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_9);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_9);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_10);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_10);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_from(S_11);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_11);
+            if ret < 0 {
+                return ret;
             }
         }
         5 => {
-            {
-                let ret = z.slice_from(S_12);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_12);
+            if ret < 0 {
+                return ret;
             }
         }
         6 => {
-            {
-                let ret = z.slice_from(S_13);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_13);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}

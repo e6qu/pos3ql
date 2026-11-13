@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import pathlib
 import re
+import subprocess
 import sys
 
 PG_TAG = "REL_18_6"
@@ -369,6 +370,9 @@ class Function:
                 return (f"{self.paren(text, precedence, 4)} == 0", "bool", 3)
             text = self.int(node[2])
             return (op.replace("~", "!") + self.paren(text, self.expr(node[2])[2], 10), "int", 10)
+        if kind == "binary" and node[1] in ("+", "-") and node[3] == ("num", 0):
+            # Snowball writes `z->c + 0` for the first byte of a test.
+            return self.expr(node[2])
         if kind == "binary":
             op, left, right = node[1], node[2], node[3]
             precedence = RUST_PRECEDENCE[op]
@@ -945,6 +949,10 @@ def module_header(language, source_name, digest):
         f"//! Source SHA-256: {digest}",
         "//! License: Snowball BSD 3-clause, reproduced in `mod.rs`.",
         "",
+        "// Declarations stay where Snowball's C declares them, so the control flow",
+        "// reads statement for statement against the source.",
+        "#![allow(clippy::needless_late_init)]",
+        "",
     ]
 
 
@@ -1010,6 +1018,9 @@ def main():
         (args.output / f"{language}.rs").write_text(text)
     lines, _ = stopword_module(args.source)
     (args.output / "stopwords.rs").write_text("\n".join(lines).rstrip() + "\n")
+    outputs = [args.output / f"{language}.rs" for language in LANGUAGES]
+    outputs.append(args.output / "stopwords.rs")
+    subprocess.run(["rustfmt", "--edition", "2024", *map(str, outputs)], check=True)
 
 
 if __name__ == "__main__":

@@ -25042,8 +25042,8 @@ fn text_search_regproc<'a>(oid: i32, arena: &'a Arena) -> Result<Datum<'a>, SqlE
         3732 => "dispell_lexize",
         3740 => "thesaurus_init",
         3741 => "thesaurus_lexize",
-        13_232 => "dsnowball_init",
-        13_233 => "dsnowball_lexize",
+        13_638 => "dsnowball_init",
+        13_639 => "dsnowball_lexize",
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

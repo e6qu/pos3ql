@@ -75,6 +75,7 @@ pub mod ryu;
 pub mod sequence;
 pub mod sha512;
 pub mod snapshot;
+pub(crate) mod snowball;
 mod spgist_catalog;
 pub(crate) mod statistics;
 pub mod timezone;
@@ -88,7 +89,6 @@ pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
 pub mod types;
 pub mod tzif;
-pub(crate) mod snowball;
 pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
@@ -32350,7 +32350,10 @@ fn canonical_text_search_config(
     };
     let identifier = |part: &str| -> Option<crate::util::StackStr<64>> {
         let mut out = crate::util::StackStr::<64>::new();
-        if let Some(quoted) = part.strip_prefix('"').and_then(|part| part.strip_suffix('"')) {
+        if let Some(quoted) = part
+            .strip_prefix('"')
+            .and_then(|part| part.strip_suffix('"'))
+        {
             let mut previous_quote = false;
             for character in quoted.chars() {
                 if character == '"' && previous_quote {
@@ -32368,7 +32371,10 @@ fn canonical_text_search_config(
         (!out.is_empty() && !out.is_truncated()).then_some(out)
     };
     let (schema, name) = catalog::split_qualified_name(value).ok_or_else(invalid)?;
-    let schema = schema.map(identifier).map(|part| part.ok_or_else(invalid)).transpose()?;
+    let schema = schema
+        .map(identifier)
+        .map(|part| part.ok_or_else(invalid))
+        .transpose()?;
     let name = identifier(name).ok_or_else(invalid)?;
     let slot = storage
         .text_search_slot_on_path(

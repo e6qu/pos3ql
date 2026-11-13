@@ -1578,8 +1578,14 @@ pub fn matches(vector_text: &str, query_text: &str, arena: &Arena) -> Result<boo
     }
 }
 
+/// PostgreSQL's parser under the C ctype treats every non-ASCII character as
+/// a letter (`p_iswhat` in `wparser_def.c`).
+fn parser_alpha(character: char) -> bool {
+    character.is_ascii_alphabetic() || !character.is_ascii()
+}
+
 fn token_char(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+    parser_alpha(character) || character.is_ascii_digit() || character == '_'
 }
 
 /// `str_tolower` under the default collation: pos3ql databases use the C
@@ -1708,22 +1714,25 @@ pub(crate) fn normalize_builtin<'a>(
     token: &str,
     arena: &'a Arena,
 ) -> Result<TextSearchLexeme<'a>, SqlError> {
-    let Some(crate::storage::TextSearchDefinition::Configuration { mappings, .. }) =
-        builtin_object(crate::sql::ast::TextSearchObjectKind::Configuration, config.oid())
-    else {
+    let Some(crate::storage::TextSearchDefinition::Configuration { mappings, .. }) = builtin_object(
+        crate::sql::ast::TextSearchObjectKind::Configuration,
+        config.oid(),
+    ) else {
         unreachable!("every built-in configuration has a catalog definition");
     };
-    lexize_mapped(&mappings, token_type, token, arena, |oid| {
-        match builtin_object(crate::sql::ast::TextSearchObjectKind::Dictionary, oid) {
-            Some(crate::storage::TextSearchDefinition::Dictionary { behavior, .. }) => {
-                Ok(behavior)
-            }
+    lexize_mapped(
+        &mappings,
+        token_type,
+        token,
+        arena,
+        |oid| match builtin_object(crate::sql::ast::TextSearchObjectKind::Dictionary, oid) {
+            Some(crate::storage::TextSearchDefinition::Dictionary { behavior, .. }) => Ok(behavior),
             _ => Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "text-search configuration references a missing dictionary"
             )),
-        }
-    })
+        },
+    )
 }
 
 fn token_type(token: &str) -> u8 {
@@ -1745,11 +1754,11 @@ fn token_type(token: &str) -> u8 {
         } else {
             22 // uint
         }
-    } else if token.contains('.') && token.chars().any(char::is_alphabetic) {
+    } else if token.contains('.') && token.chars().any(parser_alpha) {
         6 // host
     } else if token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
         1 // asciiword
-    } else if token.chars().all(char::is_alphabetic) {
+    } else if token.chars().all(parser_alpha) {
         2 // word
     } else if token.bytes().all(|byte| byte.is_ascii_digit()) {
         22 // uint
@@ -1867,9 +1876,33 @@ fn document_tokens_with<'a>(
             continue;
         }
         let begin = at;
+        // Quotes, brackets and most punctuation separate words; a colon does
+        // too unless it opens a URL (`http://`).
         while at < bytes.len()
             && !bytes[at].is_ascii_whitespace()
-            && !matches!(bytes[at], b'<' | b'>' | b'&')
+            && !matches!(
+                bytes[at],
+                b'<' | b'>'
+                    | b'&'
+                    | b'\''
+                    | b'"'
+                    | b'`'
+                    | b','
+                    | b';'
+                    | b'!'
+                    | b'*'
+                    | b'^'
+                    | b'$'
+                    | b'|'
+                    | b'\\'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+            )
+            && !(bytes[at] == b':' && !bytes[at + 1..].starts_with(b"//"))
         {
             at += 1;
         }
@@ -1877,7 +1910,7 @@ fn document_tokens_with<'a>(
         while end > begin
             && matches!(
                 bytes[end - 1],
-                b',' | b';' | b'!' | b'?' | b')' | b']' | b'}'
+                b',' | b';' | b'!' | b'?' | b')' | b']' | b'}' | b'.'
             )
         {
             end -= 1;
@@ -1913,7 +1946,7 @@ fn document_tokens_with<'a>(
         } else if source.contains('-')
             && source
                 .split('-')
-                .all(|part| !part.is_empty() && part.chars().all(char::is_alphabetic))
+                .all(|part| !part.is_empty() && part.chars().all(parser_alpha))
         {
             let unicode = source.bytes().any(|byte| !byte.is_ascii());
             emit(if unicode { 17 } else { 16 }, source)?;
@@ -1921,7 +1954,7 @@ fn document_tokens_with<'a>(
                 emit(if unicode { 10 } else { 11 }, part)?;
             }
         } else if source.split_once('-').is_some_and(|(left, right)| {
-            left.chars().all(char::is_alphabetic) && right.bytes().all(|byte| byte.is_ascii_digit())
+            left.chars().all(parser_alpha) && right.bytes().all(|byte| byte.is_ascii_digit())
         }) {
             let (left, _) = source.split_once('-').expect("checked hyphen");
             emit(token_type(left), left)?;

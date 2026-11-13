@@ -5,6 +5,10 @@
 //! Source SHA-256: 34ca232ef1c41adfadb6227226b2713c780ec0b1bfa87051275e8603addc70a0
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"\xc8\x99";
@@ -30,255 +34,1397 @@ const S_19: &[u8] = b"\xc8\x9b";
 const S_20: &[u8] = b"t";
 const S_21: &[u8] = b"ist";
 
-const G_V: &[u8] = &[17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 32, 0, 0, 4];
+const G_V: &[u8] = &[
+    17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 32, 0, 0, 4,
+];
 
 const A_0: &[Among] = &[
-    Among { s: b"\xc5\x9f", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc5\xa3", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xc5\x9f",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc5\xa3",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 3, function: None },
-    Among { s: b"I", substring_i: 0, result: 1, function: None },
-    Among { s: b"U", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"I",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"U",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"ea", substring_i: -1, result: 3, function: None },
-    Among { s: b"a\xc8\x9bia", substring_i: -1, result: 7, function: None },
-    Among { s: b"aua", substring_i: -1, result: 2, function: None },
-    Among { s: b"iua", substring_i: -1, result: 4, function: None },
-    Among { s: b"a\xc8\x9bie", substring_i: -1, result: 7, function: None },
-    Among { s: b"ele", substring_i: -1, result: 3, function: None },
-    Among { s: b"ile", substring_i: -1, result: 5, function: None },
-    Among { s: b"iile", substring_i: 6, result: 4, function: None },
-    Among { s: b"iei", substring_i: -1, result: 4, function: None },
-    Among { s: b"atei", substring_i: -1, result: 6, function: None },
-    Among { s: b"ii", substring_i: -1, result: 4, function: None },
-    Among { s: b"ului", substring_i: -1, result: 1, function: None },
-    Among { s: b"ul", substring_i: -1, result: 1, function: None },
-    Among { s: b"elor", substring_i: -1, result: 3, function: None },
-    Among { s: b"ilor", substring_i: -1, result: 4, function: None },
-    Among { s: b"iilor", substring_i: 14, result: 4, function: None },
+    Among {
+        s: b"ea",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"a\xc8\x9bia",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"aua",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iua",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"a\xc8\x9bie",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"ele",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ile",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"iile",
+        substring_i: 6,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"iei",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"atei",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"ii",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ului",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ul",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"elor",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ilor",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"iilor",
+        substring_i: 14,
+        result: 4,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"icala", substring_i: -1, result: 4, function: None },
-    Among { s: b"iciva", substring_i: -1, result: 4, function: None },
-    Among { s: b"ativa", substring_i: -1, result: 5, function: None },
-    Among { s: b"itiva", substring_i: -1, result: 6, function: None },
-    Among { s: b"icale", substring_i: -1, result: 4, function: None },
-    Among { s: b"a\xc8\x9biune", substring_i: -1, result: 5, function: None },
-    Among { s: b"i\xc8\x9biune", substring_i: -1, result: 6, function: None },
-    Among { s: b"atoare", substring_i: -1, result: 5, function: None },
-    Among { s: b"itoare", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xc4\x83toare", substring_i: -1, result: 5, function: None },
-    Among { s: b"icitate", substring_i: -1, result: 4, function: None },
-    Among { s: b"abilitate", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibilitate", substring_i: -1, result: 2, function: None },
-    Among { s: b"ivitate", substring_i: -1, result: 3, function: None },
-    Among { s: b"icive", substring_i: -1, result: 4, function: None },
-    Among { s: b"ative", substring_i: -1, result: 5, function: None },
-    Among { s: b"itive", substring_i: -1, result: 6, function: None },
-    Among { s: b"icali", substring_i: -1, result: 4, function: None },
-    Among { s: b"atori", substring_i: -1, result: 5, function: None },
-    Among { s: b"icatori", substring_i: 18, result: 4, function: None },
-    Among { s: b"itori", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xc4\x83tori", substring_i: -1, result: 5, function: None },
-    Among { s: b"icitati", substring_i: -1, result: 4, function: None },
-    Among { s: b"abilitati", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivitati", substring_i: -1, result: 3, function: None },
-    Among { s: b"icivi", substring_i: -1, result: 4, function: None },
-    Among { s: b"ativi", substring_i: -1, result: 5, function: None },
-    Among { s: b"itivi", substring_i: -1, result: 6, function: None },
-    Among { s: b"icit\xc4\x83i", substring_i: -1, result: 4, function: None },
-    Among { s: b"abilit\xc4\x83i", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivit\xc4\x83i", substring_i: -1, result: 3, function: None },
-    Among { s: b"icit\xc4\x83\xc8\x9bi", substring_i: -1, result: 4, function: None },
-    Among { s: b"abilit\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivit\xc4\x83\xc8\x9bi", substring_i: -1, result: 3, function: None },
-    Among { s: b"ical", substring_i: -1, result: 4, function: None },
-    Among { s: b"ator", substring_i: -1, result: 5, function: None },
-    Among { s: b"icator", substring_i: 35, result: 4, function: None },
-    Among { s: b"itor", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xc4\x83tor", substring_i: -1, result: 5, function: None },
-    Among { s: b"iciv", substring_i: -1, result: 4, function: None },
-    Among { s: b"ativ", substring_i: -1, result: 5, function: None },
-    Among { s: b"itiv", substring_i: -1, result: 6, function: None },
-    Among { s: b"ical\xc4\x83", substring_i: -1, result: 4, function: None },
-    Among { s: b"iciv\xc4\x83", substring_i: -1, result: 4, function: None },
-    Among { s: b"ativ\xc4\x83", substring_i: -1, result: 5, function: None },
-    Among { s: b"itiv\xc4\x83", substring_i: -1, result: 6, function: None },
+    Among {
+        s: b"icala",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"iciva",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ativa",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itiva",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"icale",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"a\xc8\x9biune",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"i\xc8\x9biune",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"atoare",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itoare",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83toare",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"icitate",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"abilitate",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibilitate",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ivitate",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"icive",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ative",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itive",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"icali",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"atori",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"icatori",
+        substring_i: 18,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"itori",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83tori",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"icitati",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"abilitati",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivitati",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"icivi",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ativi",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itivi",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"icit\xc4\x83i",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"abilit\xc4\x83i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivit\xc4\x83i",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"icit\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"abilit\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivit\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ical",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ator",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"icator",
+        substring_i: 35,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"itor",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83tor",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"iciv",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ativ",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itiv",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"ical\xc4\x83",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"iciv\xc4\x83",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ativ\xc4\x83",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"itiv\xc4\x83",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"ica", substring_i: -1, result: 1, function: None },
-    Among { s: b"abila", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibila", substring_i: -1, result: 1, function: None },
-    Among { s: b"oasa", substring_i: -1, result: 1, function: None },
-    Among { s: b"ata", substring_i: -1, result: 1, function: None },
-    Among { s: b"ita", substring_i: -1, result: 1, function: None },
-    Among { s: b"anta", substring_i: -1, result: 1, function: None },
-    Among { s: b"ista", substring_i: -1, result: 3, function: None },
-    Among { s: b"uta", substring_i: -1, result: 1, function: None },
-    Among { s: b"iva", substring_i: -1, result: 1, function: None },
-    Among { s: b"ic", substring_i: -1, result: 1, function: None },
-    Among { s: b"ice", substring_i: -1, result: 1, function: None },
-    Among { s: b"abile", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibile", substring_i: -1, result: 1, function: None },
-    Among { s: b"isme", substring_i: -1, result: 3, function: None },
-    Among { s: b"iune", substring_i: -1, result: 2, function: None },
-    Among { s: b"oase", substring_i: -1, result: 1, function: None },
-    Among { s: b"ate", substring_i: -1, result: 1, function: None },
-    Among { s: b"itate", substring_i: 17, result: 1, function: None },
-    Among { s: b"ite", substring_i: -1, result: 1, function: None },
-    Among { s: b"ante", substring_i: -1, result: 1, function: None },
-    Among { s: b"iste", substring_i: -1, result: 3, function: None },
-    Among { s: b"ute", substring_i: -1, result: 1, function: None },
-    Among { s: b"ive", substring_i: -1, result: 1, function: None },
-    Among { s: b"ici", substring_i: -1, result: 1, function: None },
-    Among { s: b"abili", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibili", substring_i: -1, result: 1, function: None },
-    Among { s: b"iuni", substring_i: -1, result: 2, function: None },
-    Among { s: b"atori", substring_i: -1, result: 1, function: None },
-    Among { s: b"osi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ati", substring_i: -1, result: 1, function: None },
-    Among { s: b"itati", substring_i: 30, result: 1, function: None },
-    Among { s: b"iti", substring_i: -1, result: 1, function: None },
-    Among { s: b"anti", substring_i: -1, result: 1, function: None },
-    Among { s: b"isti", substring_i: -1, result: 3, function: None },
-    Among { s: b"uti", substring_i: -1, result: 1, function: None },
-    Among { s: b"i\xc8\x99ti", substring_i: -1, result: 3, function: None },
-    Among { s: b"ivi", substring_i: -1, result: 1, function: None },
-    Among { s: b"it\xc4\x83i", substring_i: -1, result: 1, function: None },
-    Among { s: b"o\xc8\x99i", substring_i: -1, result: 1, function: None },
-    Among { s: b"it\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"abil", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibil", substring_i: -1, result: 1, function: None },
-    Among { s: b"ism", substring_i: -1, result: 3, function: None },
-    Among { s: b"ator", substring_i: -1, result: 1, function: None },
-    Among { s: b"os", substring_i: -1, result: 1, function: None },
-    Among { s: b"at", substring_i: -1, result: 1, function: None },
-    Among { s: b"it", substring_i: -1, result: 1, function: None },
-    Among { s: b"ant", substring_i: -1, result: 1, function: None },
-    Among { s: b"ist", substring_i: -1, result: 3, function: None },
-    Among { s: b"ut", substring_i: -1, result: 1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
-    Among { s: b"ic\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"abil\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibil\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"oas\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"at\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"it\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ant\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ist\xc4\x83", substring_i: -1, result: 3, function: None },
-    Among { s: b"ut\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"iv\xc4\x83", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ica",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abila",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibila",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"oasa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ata",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ita",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"anta",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ista",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"uta",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iva",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ice",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abile",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibile",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isme",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"iune",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"oase",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ate",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"itate",
+        substring_i: 17,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ite",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ante",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iste",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ute",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ive",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ici",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abili",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibili",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iuni",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"atori",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"osi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ati",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"itati",
+        substring_i: 30,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"anti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isti",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"uti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"i\xc8\x99ti",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ivi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it\xc4\x83i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"o\xc8\x99i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abil",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibil",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ism",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ator",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"os",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"at",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ant",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ist",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ut",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ic\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abil\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibil\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"oas\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"at\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ant\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ist\xc4\x83",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ut\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iv\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"ea", substring_i: -1, result: 1, function: None },
-    Among { s: b"ia", substring_i: -1, result: 1, function: None },
-    Among { s: b"esc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc4\x83sc", substring_i: -1, result: 1, function: None },
-    Among { s: b"ind", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2nd", substring_i: -1, result: 1, function: None },
-    Among { s: b"are", substring_i: -1, result: 1, function: None },
-    Among { s: b"ere", substring_i: -1, result: 1, function: None },
-    Among { s: b"ire", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2re", substring_i: -1, result: 1, function: None },
-    Among { s: b"se", substring_i: -1, result: 2, function: None },
-    Among { s: b"ase", substring_i: 10, result: 1, function: None },
-    Among { s: b"sese", substring_i: 10, result: 2, function: None },
-    Among { s: b"ise", substring_i: 10, result: 1, function: None },
-    Among { s: b"use", substring_i: 10, result: 1, function: None },
-    Among { s: b"\xc3\xa2se", substring_i: 10, result: 1, function: None },
-    Among { s: b"e\xc8\x99te", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc4\x83\xc8\x99te", substring_i: -1, result: 1, function: None },
-    Among { s: b"eze", substring_i: -1, result: 1, function: None },
-    Among { s: b"ai", substring_i: -1, result: 1, function: None },
-    Among { s: b"eai", substring_i: 19, result: 1, function: None },
-    Among { s: b"iai", substring_i: 19, result: 1, function: None },
-    Among { s: b"sei", substring_i: -1, result: 2, function: None },
-    Among { s: b"e\xc8\x99ti", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc4\x83\xc8\x99ti", substring_i: -1, result: 1, function: None },
-    Among { s: b"ui", substring_i: -1, result: 1, function: None },
-    Among { s: b"ezi", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc8\x99i", substring_i: -1, result: 1, function: None },
-    Among { s: b"se\xc8\x99i", substring_i: -1, result: 2, function: None },
-    Among { s: b"ase\xc8\x99i", substring_i: 28, result: 1, function: None },
-    Among { s: b"sese\xc8\x99i", substring_i: 28, result: 2, function: None },
-    Among { s: b"ise\xc8\x99i", substring_i: 28, result: 1, function: None },
-    Among { s: b"use\xc8\x99i", substring_i: 28, result: 1, function: None },
-    Among { s: b"\xc3\xa2se\xc8\x99i", substring_i: 28, result: 1, function: None },
-    Among { s: b"i\xc8\x99i", substring_i: -1, result: 1, function: None },
-    Among { s: b"u\xc8\x99i", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2\xc8\x99i", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc8\x9bi", substring_i: -1, result: 2, function: None },
-    Among { s: b"ea\xc8\x9bi", substring_i: 37, result: 1, function: None },
-    Among { s: b"ia\xc8\x9bi", substring_i: 37, result: 1, function: None },
-    Among { s: b"e\xc8\x9bi", substring_i: -1, result: 2, function: None },
-    Among { s: b"i\xc8\x9bi", substring_i: -1, result: 2, function: None },
-    Among { s: b"ar\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ser\xc4\x83\xc8\x9bi", substring_i: -1, result: 2, function: None },
-    Among { s: b"aser\xc4\x83\xc8\x9bi", substring_i: 43, result: 1, function: None },
-    Among { s: b"seser\xc4\x83\xc8\x9bi", substring_i: 43, result: 2, function: None },
-    Among { s: b"iser\xc4\x83\xc8\x9bi", substring_i: 43, result: 1, function: None },
-    Among { s: b"user\xc4\x83\xc8\x9bi", substring_i: 43, result: 1, function: None },
-    Among { s: b"\xc3\xa2ser\xc4\x83\xc8\x9bi", substring_i: 43, result: 1, function: None },
-    Among { s: b"ir\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ur\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2r\xc4\x83\xc8\x9bi", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2\xc8\x9bi", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc3\xa2i", substring_i: -1, result: 1, function: None },
-    Among { s: b"am", substring_i: -1, result: 1, function: None },
-    Among { s: b"eam", substring_i: 54, result: 1, function: None },
-    Among { s: b"iam", substring_i: 54, result: 1, function: None },
-    Among { s: b"em", substring_i: -1, result: 2, function: None },
-    Among { s: b"asem", substring_i: 57, result: 1, function: None },
-    Among { s: b"sesem", substring_i: 57, result: 2, function: None },
-    Among { s: b"isem", substring_i: 57, result: 1, function: None },
-    Among { s: b"usem", substring_i: 57, result: 1, function: None },
-    Among { s: b"\xc3\xa2sem", substring_i: 57, result: 1, function: None },
-    Among { s: b"im", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc4\x83m", substring_i: -1, result: 2, function: None },
-    Among { s: b"ar\xc4\x83m", substring_i: 64, result: 1, function: None },
-    Among { s: b"ser\xc4\x83m", substring_i: 64, result: 2, function: None },
-    Among { s: b"aser\xc4\x83m", substring_i: 66, result: 1, function: None },
-    Among { s: b"seser\xc4\x83m", substring_i: 66, result: 2, function: None },
-    Among { s: b"iser\xc4\x83m", substring_i: 66, result: 1, function: None },
-    Among { s: b"user\xc4\x83m", substring_i: 66, result: 1, function: None },
-    Among { s: b"\xc3\xa2ser\xc4\x83m", substring_i: 66, result: 1, function: None },
-    Among { s: b"ir\xc4\x83m", substring_i: 64, result: 1, function: None },
-    Among { s: b"ur\xc4\x83m", substring_i: 64, result: 1, function: None },
-    Among { s: b"\xc3\xa2r\xc4\x83m", substring_i: 64, result: 1, function: None },
-    Among { s: b"\xc3\xa2m", substring_i: -1, result: 2, function: None },
-    Among { s: b"au", substring_i: -1, result: 1, function: None },
-    Among { s: b"eau", substring_i: 76, result: 1, function: None },
-    Among { s: b"iau", substring_i: 76, result: 1, function: None },
-    Among { s: b"indu", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2ndu", substring_i: -1, result: 1, function: None },
-    Among { s: b"ez", substring_i: -1, result: 1, function: None },
-    Among { s: b"easc\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ser\xc4\x83", substring_i: -1, result: 2, function: None },
-    Among { s: b"aser\xc4\x83", substring_i: 84, result: 1, function: None },
-    Among { s: b"seser\xc4\x83", substring_i: 84, result: 2, function: None },
-    Among { s: b"iser\xc4\x83", substring_i: 84, result: 1, function: None },
-    Among { s: b"user\xc4\x83", substring_i: 84, result: 1, function: None },
-    Among { s: b"\xc3\xa2ser\xc4\x83", substring_i: 84, result: 1, function: None },
-    Among { s: b"ir\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"ur\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2r\xc4\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"eaz\xc4\x83", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ea",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ia",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"esc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83sc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ind",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2nd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"are",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ere",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ire",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2re",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"se",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ase",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"sese",
+        substring_i: 10,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ise",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"use",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2se",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"e\xc8\x99te",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83\xc8\x99te",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eze",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ai",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eai",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iai",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"sei",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"e\xc8\x99ti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83\xc8\x99ti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ui",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ezi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc8\x99i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"se\xc8\x99i",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ase\xc8\x99i",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"sese\xc8\x99i",
+        substring_i: 28,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ise\xc8\x99i",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"use\xc8\x99i",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2se\xc8\x99i",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"i\xc8\x99i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"u\xc8\x99i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2\xc8\x99i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc8\x9bi",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ea\xc8\x9bi",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ia\xc8\x9bi",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"e\xc8\x9bi",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"i\xc8\x9bi",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ser\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"aser\xc4\x83\xc8\x9bi",
+        substring_i: 43,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"seser\xc4\x83\xc8\x9bi",
+        substring_i: 43,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iser\xc4\x83\xc8\x9bi",
+        substring_i: 43,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"user\xc4\x83\xc8\x9bi",
+        substring_i: 43,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2ser\xc4\x83\xc8\x9bi",
+        substring_i: 43,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ur\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2r\xc4\x83\xc8\x9bi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2\xc8\x9bi",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"am",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eam",
+        substring_i: 54,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iam",
+        substring_i: 54,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"em",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"asem",
+        substring_i: 57,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"sesem",
+        substring_i: 57,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"isem",
+        substring_i: 57,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"usem",
+        substring_i: 57,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2sem",
+        substring_i: 57,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"im",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83m",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc4\x83m",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ser\xc4\x83m",
+        substring_i: 64,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"aser\xc4\x83m",
+        substring_i: 66,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"seser\xc4\x83m",
+        substring_i: 66,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iser\xc4\x83m",
+        substring_i: 66,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"user\xc4\x83m",
+        substring_i: 66,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2ser\xc4\x83m",
+        substring_i: 66,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc4\x83m",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ur\xc4\x83m",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2r\xc4\x83m",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2m",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"au",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eau",
+        substring_i: 76,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iau",
+        substring_i: 76,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"indu",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2ndu",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ez",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"easc\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ser\xc4\x83",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"aser\xc4\x83",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"seser\xc4\x83",
+        substring_i: 84,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iser\xc4\x83",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"user\xc4\x83",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2ser\xc4\x83",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ur\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2r\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eaz\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"a", substring_i: -1, result: 1, function: None },
-    Among { s: b"e", substring_i: -1, result: 1, function: None },
-    Among { s: b"ie", substring_i: 1, result: 1, function: None },
-    Among { s: b"i", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc4\x83", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ie",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc4\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_norm(z: &mut Env) -> i32 {
@@ -302,19 +1448,15 @@ fn r_norm(z: &mut Env) -> i32 {
                         z.ket = z.c;
                         match among_var {
                             1 => {
-                                {
-                                    let ret = z.slice_from(S_0);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_0);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             2 => {
-                                {
-                                    let ret = z.slice_from(S_1);
-                                    if ret < 0 {
-                                        return ret;
-                                    }
+                                let ret = z.slice_from(S_1);
+                                if ret < 0 {
+                                    return ret;
                                 }
                             }
                             _ => {}
@@ -537,7 +1679,7 @@ fn r_postlude(z: &mut Env) -> i32 {
     'loop1: loop {
         let c1 = z.c;
         z.bra = z.c;
-        if z.c >= z.l || z.byte(z.c + 0) != 73 && z.byte(z.c + 0) != 85 {
+        if z.c >= z.l || z.byte(z.c) != 73 && z.byte(z.c) != 85 {
             among_var = 3;
         } else {
             among_var = find_among(z, A_1);
@@ -546,29 +1688,23 @@ fn r_postlude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_4);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_4);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_5);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_5);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -611,35 +1747,27 @@ fn r_step_0(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_6);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_6);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_7);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_7);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_from(S_8);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_8);
+            if ret < 0 {
+                return ret;
             }
         }
         5 => {
@@ -661,19 +1789,15 @@ fn r_step_0(z: &mut Env) -> i32 {
             }
         }
         6 => {
-            {
-                let ret = z.slice_from(S_11);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_11);
+            if ret < 0 {
+                return ret;
             }
         }
         7 => {
-            {
-                let ret = z.slice_from(S_12);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_12);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -699,51 +1823,39 @@ fn r_combo_suffix(z: &mut Env) -> i32 {
         }
         match among_var {
             1 => {
-                {
-                    let ret = z.slice_from(S_13);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_13);
+                if ret < 0 {
+                    return ret;
                 }
             }
             2 => {
-                {
-                    let ret = z.slice_from(S_14);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_14);
+                if ret < 0 {
+                    return ret;
                 }
             }
             3 => {
-                {
-                    let ret = z.slice_from(S_15);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_15);
+                if ret < 0 {
+                    return ret;
                 }
             }
             4 => {
-                {
-                    let ret = z.slice_from(S_16);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_16);
+                if ret < 0 {
+                    return ret;
                 }
             }
             5 => {
-                {
-                    let ret = z.slice_from(S_17);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_17);
+                if ret < 0 {
+                    return ret;
                 }
             }
             6 => {
-                {
-                    let ret = z.slice_from(S_18);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_18);
+                if ret < 0 {
+                    return ret;
                 }
             }
             _ => {}
@@ -788,11 +1900,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
@@ -808,11 +1918,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_21);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_21);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -864,11 +1972,9 @@ fn r_verb_suffix(z: &mut Env) -> i32 {
                 }
             }
             2 => {
-                {
-                    let ret = z.slice_del();
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_del();
+                if ret < 0 {
+                    return ret;
                 }
             }
             _ => {}

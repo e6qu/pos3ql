@@ -5,6 +5,10 @@
 //! Source SHA-256: 8f04c73729e7433326057ca417e034d5fcc536b055afc44de371512cbda43db6
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"\xc3\xa0";
@@ -28,229 +32,1218 @@ const S_17: &[u8] = b"ic";
 const S_18: &[u8] = b"divano";
 const S_19: &[u8] = b"divan";
 
-const G_V: &[u8] = &[17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 8, 2, 1];
-const G_AEIO: &[u8] = &[17, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 8, 2];
+const G_V: &[u8] = &[
+    17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 8, 2, 1,
+];
+const G_AEIO: &[u8] = &[
+    17, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 8, 2,
+];
 const G_CG: &[u8] = &[17];
 
 const A_0: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 7, function: None },
-    Among { s: b"qu", substring_i: 0, result: 6, function: None },
-    Among { s: b"\xc3\xa1", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xa9", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xc3\xad", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xc3\xb3", substring_i: 0, result: 4, function: None },
-    Among { s: b"\xc3\xba", substring_i: 0, result: 5, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"qu",
+        substring_i: 0,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xad",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb3",
+        substring_i: 0,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xba",
+        substring_i: 0,
+        result: 5,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 3, function: None },
-    Among { s: b"I", substring_i: 0, result: 1, function: None },
-    Among { s: b"U", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"I",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"U",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"la", substring_i: -1, result: -1, function: None },
-    Among { s: b"cela", substring_i: 0, result: -1, function: None },
-    Among { s: b"gliela", substring_i: 0, result: -1, function: None },
-    Among { s: b"mela", substring_i: 0, result: -1, function: None },
-    Among { s: b"tela", substring_i: 0, result: -1, function: None },
-    Among { s: b"vela", substring_i: 0, result: -1, function: None },
-    Among { s: b"le", substring_i: -1, result: -1, function: None },
-    Among { s: b"cele", substring_i: 6, result: -1, function: None },
-    Among { s: b"gliele", substring_i: 6, result: -1, function: None },
-    Among { s: b"mele", substring_i: 6, result: -1, function: None },
-    Among { s: b"tele", substring_i: 6, result: -1, function: None },
-    Among { s: b"vele", substring_i: 6, result: -1, function: None },
-    Among { s: b"ne", substring_i: -1, result: -1, function: None },
-    Among { s: b"cene", substring_i: 12, result: -1, function: None },
-    Among { s: b"gliene", substring_i: 12, result: -1, function: None },
-    Among { s: b"mene", substring_i: 12, result: -1, function: None },
-    Among { s: b"sene", substring_i: 12, result: -1, function: None },
-    Among { s: b"tene", substring_i: 12, result: -1, function: None },
-    Among { s: b"vene", substring_i: 12, result: -1, function: None },
-    Among { s: b"ci", substring_i: -1, result: -1, function: None },
-    Among { s: b"li", substring_i: -1, result: -1, function: None },
-    Among { s: b"celi", substring_i: 20, result: -1, function: None },
-    Among { s: b"glieli", substring_i: 20, result: -1, function: None },
-    Among { s: b"meli", substring_i: 20, result: -1, function: None },
-    Among { s: b"teli", substring_i: 20, result: -1, function: None },
-    Among { s: b"veli", substring_i: 20, result: -1, function: None },
-    Among { s: b"gli", substring_i: 20, result: -1, function: None },
-    Among { s: b"mi", substring_i: -1, result: -1, function: None },
-    Among { s: b"si", substring_i: -1, result: -1, function: None },
-    Among { s: b"ti", substring_i: -1, result: -1, function: None },
-    Among { s: b"vi", substring_i: -1, result: -1, function: None },
-    Among { s: b"lo", substring_i: -1, result: -1, function: None },
-    Among { s: b"celo", substring_i: 31, result: -1, function: None },
-    Among { s: b"glielo", substring_i: 31, result: -1, function: None },
-    Among { s: b"melo", substring_i: 31, result: -1, function: None },
-    Among { s: b"telo", substring_i: 31, result: -1, function: None },
-    Among { s: b"velo", substring_i: 31, result: -1, function: None },
+    Among {
+        s: b"la",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"cela",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gliela",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"mela",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tela",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vela",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"le",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"cele",
+        substring_i: 6,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gliele",
+        substring_i: 6,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"mele",
+        substring_i: 6,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tele",
+        substring_i: 6,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vele",
+        substring_i: 6,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ne",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"cene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gliene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"mene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"sene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vene",
+        substring_i: 12,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ci",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"li",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"celi",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"glieli",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"meli",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"teli",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"veli",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gli",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"mi",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"si",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ti",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vi",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"lo",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"celo",
+        substring_i: 31,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"glielo",
+        substring_i: 31,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"melo",
+        substring_i: 31,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"telo",
+        substring_i: 31,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"velo",
+        substring_i: 31,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"ando", substring_i: -1, result: 1, function: None },
-    Among { s: b"endo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar", substring_i: -1, result: 2, function: None },
-    Among { s: b"er", substring_i: -1, result: 2, function: None },
-    Among { s: b"ir", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"ando",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"endo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"er",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ir",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"ic", substring_i: -1, result: -1, function: None },
-    Among { s: b"abil", substring_i: -1, result: -1, function: None },
-    Among { s: b"os", substring_i: -1, result: -1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"abil",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"os",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"ic", substring_i: -1, result: 1, function: None },
-    Among { s: b"abil", substring_i: -1, result: 1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abil",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"ica", substring_i: -1, result: 1, function: None },
-    Among { s: b"logia", substring_i: -1, result: 3, function: None },
-    Among { s: b"osa", substring_i: -1, result: 1, function: None },
-    Among { s: b"ista", substring_i: -1, result: 1, function: None },
-    Among { s: b"iva", substring_i: -1, result: 9, function: None },
-    Among { s: b"anza", substring_i: -1, result: 1, function: None },
-    Among { s: b"enza", substring_i: -1, result: 5, function: None },
-    Among { s: b"ice", substring_i: -1, result: 1, function: None },
-    Among { s: b"atrice", substring_i: 7, result: 1, function: None },
-    Among { s: b"iche", substring_i: -1, result: 1, function: None },
-    Among { s: b"logie", substring_i: -1, result: 3, function: None },
-    Among { s: b"abile", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibile", substring_i: -1, result: 1, function: None },
-    Among { s: b"usione", substring_i: -1, result: 4, function: None },
-    Among { s: b"azione", substring_i: -1, result: 2, function: None },
-    Among { s: b"uzione", substring_i: -1, result: 4, function: None },
-    Among { s: b"atore", substring_i: -1, result: 2, function: None },
-    Among { s: b"ose", substring_i: -1, result: 1, function: None },
-    Among { s: b"ante", substring_i: -1, result: 1, function: None },
-    Among { s: b"mente", substring_i: -1, result: 1, function: None },
-    Among { s: b"amente", substring_i: 19, result: 7, function: None },
-    Among { s: b"iste", substring_i: -1, result: 1, function: None },
-    Among { s: b"ive", substring_i: -1, result: 9, function: None },
-    Among { s: b"anze", substring_i: -1, result: 1, function: None },
-    Among { s: b"enze", substring_i: -1, result: 5, function: None },
-    Among { s: b"ici", substring_i: -1, result: 1, function: None },
-    Among { s: b"atrici", substring_i: 25, result: 1, function: None },
-    Among { s: b"ichi", substring_i: -1, result: 1, function: None },
-    Among { s: b"abili", substring_i: -1, result: 1, function: None },
-    Among { s: b"ibili", substring_i: -1, result: 1, function: None },
-    Among { s: b"ismi", substring_i: -1, result: 1, function: None },
-    Among { s: b"usioni", substring_i: -1, result: 4, function: None },
-    Among { s: b"azioni", substring_i: -1, result: 2, function: None },
-    Among { s: b"uzioni", substring_i: -1, result: 4, function: None },
-    Among { s: b"atori", substring_i: -1, result: 2, function: None },
-    Among { s: b"osi", substring_i: -1, result: 1, function: None },
-    Among { s: b"anti", substring_i: -1, result: 1, function: None },
-    Among { s: b"amenti", substring_i: -1, result: 6, function: None },
-    Among { s: b"imenti", substring_i: -1, result: 6, function: None },
-    Among { s: b"isti", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivi", substring_i: -1, result: 9, function: None },
-    Among { s: b"ico", substring_i: -1, result: 1, function: None },
-    Among { s: b"ismo", substring_i: -1, result: 1, function: None },
-    Among { s: b"oso", substring_i: -1, result: 1, function: None },
-    Among { s: b"amento", substring_i: -1, result: 6, function: None },
-    Among { s: b"imento", substring_i: -1, result: 6, function: None },
-    Among { s: b"ivo", substring_i: -1, result: 9, function: None },
-    Among { s: b"it\xc3\xa0", substring_i: -1, result: 8, function: None },
-    Among { s: b"ist\xc3\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"ist\xc3\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"ist\xc3\xac", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ica",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"logia",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"osa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ista",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iva",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"anza",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"enza",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"ice",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"atrice",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iche",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"logie",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"abile",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibile",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"usione",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"azione",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"uzione",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"atore",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ose",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ante",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"mente",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amente",
+        substring_i: 19,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"iste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ive",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"anze",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"enze",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"ici",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"atrici",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ichi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abili",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ibili",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ismi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"usioni",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"azioni",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"uzioni",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"atori",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"osi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"anti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amenti",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"imenti",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"isti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivi",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"ico",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ismo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"oso",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amento",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"imento",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"ivo",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"it\xc3\xa0",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"ist\xc3\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ist\xc3\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ist\xc3\xac",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"isca", substring_i: -1, result: 1, function: None },
-    Among { s: b"enda", substring_i: -1, result: 1, function: None },
-    Among { s: b"ata", substring_i: -1, result: 1, function: None },
-    Among { s: b"ita", substring_i: -1, result: 1, function: None },
-    Among { s: b"uta", substring_i: -1, result: 1, function: None },
-    Among { s: b"ava", substring_i: -1, result: 1, function: None },
-    Among { s: b"eva", substring_i: -1, result: 1, function: None },
-    Among { s: b"iva", substring_i: -1, result: 1, function: None },
-    Among { s: b"erebbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"irebbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"isce", substring_i: -1, result: 1, function: None },
-    Among { s: b"ende", substring_i: -1, result: 1, function: None },
-    Among { s: b"are", substring_i: -1, result: 1, function: None },
-    Among { s: b"ere", substring_i: -1, result: 1, function: None },
-    Among { s: b"ire", substring_i: -1, result: 1, function: None },
-    Among { s: b"asse", substring_i: -1, result: 1, function: None },
-    Among { s: b"ate", substring_i: -1, result: 1, function: None },
-    Among { s: b"avate", substring_i: 16, result: 1, function: None },
-    Among { s: b"evate", substring_i: 16, result: 1, function: None },
-    Among { s: b"ivate", substring_i: 16, result: 1, function: None },
-    Among { s: b"ete", substring_i: -1, result: 1, function: None },
-    Among { s: b"erete", substring_i: 20, result: 1, function: None },
-    Among { s: b"irete", substring_i: 20, result: 1, function: None },
-    Among { s: b"ite", substring_i: -1, result: 1, function: None },
-    Among { s: b"ereste", substring_i: -1, result: 1, function: None },
-    Among { s: b"ireste", substring_i: -1, result: 1, function: None },
-    Among { s: b"ute", substring_i: -1, result: 1, function: None },
-    Among { s: b"erai", substring_i: -1, result: 1, function: None },
-    Among { s: b"irai", substring_i: -1, result: 1, function: None },
-    Among { s: b"isci", substring_i: -1, result: 1, function: None },
-    Among { s: b"endi", substring_i: -1, result: 1, function: None },
-    Among { s: b"erei", substring_i: -1, result: 1, function: None },
-    Among { s: b"irei", substring_i: -1, result: 1, function: None },
-    Among { s: b"assi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ati", substring_i: -1, result: 1, function: None },
-    Among { s: b"iti", substring_i: -1, result: 1, function: None },
-    Among { s: b"eresti", substring_i: -1, result: 1, function: None },
-    Among { s: b"iresti", substring_i: -1, result: 1, function: None },
-    Among { s: b"uti", substring_i: -1, result: 1, function: None },
-    Among { s: b"avi", substring_i: -1, result: 1, function: None },
-    Among { s: b"evi", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivi", substring_i: -1, result: 1, function: None },
-    Among { s: b"isco", substring_i: -1, result: 1, function: None },
-    Among { s: b"ando", substring_i: -1, result: 1, function: None },
-    Among { s: b"endo", substring_i: -1, result: 1, function: None },
-    Among { s: b"Yamo", substring_i: -1, result: 1, function: None },
-    Among { s: b"iamo", substring_i: -1, result: 1, function: None },
-    Among { s: b"avamo", substring_i: -1, result: 1, function: None },
-    Among { s: b"evamo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivamo", substring_i: -1, result: 1, function: None },
-    Among { s: b"eremo", substring_i: -1, result: 1, function: None },
-    Among { s: b"iremo", substring_i: -1, result: 1, function: None },
-    Among { s: b"assimo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ammo", substring_i: -1, result: 1, function: None },
-    Among { s: b"emmo", substring_i: -1, result: 1, function: None },
-    Among { s: b"eremmo", substring_i: 54, result: 1, function: None },
-    Among { s: b"iremmo", substring_i: 54, result: 1, function: None },
-    Among { s: b"immo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ano", substring_i: -1, result: 1, function: None },
-    Among { s: b"iscano", substring_i: 58, result: 1, function: None },
-    Among { s: b"avano", substring_i: 58, result: 1, function: None },
-    Among { s: b"evano", substring_i: 58, result: 1, function: None },
-    Among { s: b"ivano", substring_i: 58, result: 1, function: None },
-    Among { s: b"eranno", substring_i: -1, result: 1, function: None },
-    Among { s: b"iranno", substring_i: -1, result: 1, function: None },
-    Among { s: b"ono", substring_i: -1, result: 1, function: None },
-    Among { s: b"iscono", substring_i: 65, result: 1, function: None },
-    Among { s: b"arono", substring_i: 65, result: 1, function: None },
-    Among { s: b"erono", substring_i: 65, result: 1, function: None },
-    Among { s: b"irono", substring_i: 65, result: 1, function: None },
-    Among { s: b"erebbero", substring_i: -1, result: 1, function: None },
-    Among { s: b"irebbero", substring_i: -1, result: 1, function: None },
-    Among { s: b"assero", substring_i: -1, result: 1, function: None },
-    Among { s: b"essero", substring_i: -1, result: 1, function: None },
-    Among { s: b"issero", substring_i: -1, result: 1, function: None },
-    Among { s: b"ato", substring_i: -1, result: 1, function: None },
-    Among { s: b"ito", substring_i: -1, result: 1, function: None },
-    Among { s: b"uto", substring_i: -1, result: 1, function: None },
-    Among { s: b"avo", substring_i: -1, result: 1, function: None },
-    Among { s: b"evo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir", substring_i: -1, result: 1, function: None },
-    Among { s: b"er\xc3\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir\xc3\xa0", substring_i: -1, result: 1, function: None },
-    Among { s: b"er\xc3\xb2", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir\xc3\xb2", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"isca",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"enda",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ata",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ita",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"uta",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ava",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eva",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iva",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erebbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irebbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isce",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ende",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"are",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ere",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ire",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"asse",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ate",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avate",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"evate",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivate",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ete",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erete",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irete",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ite",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ereste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ireste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ute",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erai",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irai",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isci",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"endi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erei",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irei",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"assi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ati",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eresti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iresti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"uti",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"evi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivi",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isco",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ando",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"endo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"Yamo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iamo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avamo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"evamo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivamo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eremo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iremo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"assimo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ammo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"emmo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eremmo",
+        substring_i: 54,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iremmo",
+        substring_i: 54,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"immo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ano",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iscano",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avano",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"evano",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivano",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eranno",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iranno",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ono",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iscono",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arono",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erono",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irono",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erebbero",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irebbero",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"assero",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"essero",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issero",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ato",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ito",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"uto",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"evo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xa0",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_prelude(z: &mut Env) -> i32 {
@@ -265,61 +1258,47 @@ fn r_prelude(z: &mut Env) -> i32 {
             'lab0: {
                 match among_var {
                     1 => {
-                        {
-                            let ret = z.slice_from(S_0);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_0);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     2 => {
-                        {
-                            let ret = z.slice_from(S_1);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_1);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     3 => {
-                        {
-                            let ret = z.slice_from(S_2);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_2);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     4 => {
-                        {
-                            let ret = z.slice_from(S_3);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_3);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     5 => {
-                        {
-                            let ret = z.slice_from(S_4);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_4);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     6 => {
-                        {
-                            let ret = z.slice_from(S_5);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_5);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     7 => {
-                        {
-                            let ret = z.skip_utf8(z.c, z.l, 1);
-                            if ret < 0 {
-                                break 'lab0;
-                            }
-                            z.c = ret;
+                        let ret = z.skip_utf8(z.c, z.l, 1);
+                        if ret < 0 {
+                            break 'lab0;
                         }
+                        z.c = ret;
                     }
                     _ => {}
                 }
@@ -525,7 +1504,7 @@ fn r_postlude(z: &mut Env) -> i32 {
     'loop1: loop {
         let c1 = z.c;
         z.bra = z.c;
-        if z.c >= z.l || z.byte(z.c + 0) != 73 && z.byte(z.c + 0) != 85 {
+        if z.c >= z.l || z.byte(z.c) != 73 && z.byte(z.c) != 85 {
             among_var = 3;
         } else {
             among_var = find_among(z, A_1);
@@ -534,29 +1513,23 @@ fn r_postlude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_8);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_8);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_9);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_9);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -605,19 +1578,15 @@ fn r_attached_pronoun(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_10);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_10);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -762,7 +1731,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 let m2 = z.l - z.c;
                 z.ket = z.c;
                 'lab1: {
-                    if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (4722696 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 1 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 3
+                        || (4722696 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         z.c = z.l - m2;
                         break 'lab1;
                     }
@@ -832,7 +1804,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 let m3 = z.l - z.c;
                 z.ket = z.c;
                 'lab2: {
-                    if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 1 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 3
+                        || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         z.c = z.l - m3;
                         break 'lab2;
                     }

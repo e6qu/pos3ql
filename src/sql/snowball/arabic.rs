@@ -5,6 +5,10 @@
 //! Source SHA-256: b3bedcab5d869d539e13b2e038ef80c3222ad2d9736a68cc8ac5bc0ce9d6d811
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"0";
@@ -76,296 +80,1414 @@ const S_65: &[u8] = b"\xd8\xa7\xd8\xb3\xd8\xaa";
 const S_66: &[u8] = b"\xd9\x8a";
 
 const A_0: &[Among] = &[
-    Among { s: b"\xd9\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8c", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8f", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x90", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x91", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x92", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\xa0", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\xa1", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\xa2", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xd9\xa3", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xd9\xa4", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xd9\xa5", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xd9\xa6", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xd9\xa7", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xd9\xa8", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xd9\xa9", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xef\xba\x80", substring_i: -1, result: 12, function: None },
-    Among { s: b"\xef\xba\x81", substring_i: -1, result: 16, function: None },
-    Among { s: b"\xef\xba\x82", substring_i: -1, result: 16, function: None },
-    Among { s: b"\xef\xba\x83", substring_i: -1, result: 13, function: None },
-    Among { s: b"\xef\xba\x84", substring_i: -1, result: 13, function: None },
-    Among { s: b"\xef\xba\x85", substring_i: -1, result: 17, function: None },
-    Among { s: b"\xef\xba\x86", substring_i: -1, result: 17, function: None },
-    Among { s: b"\xef\xba\x87", substring_i: -1, result: 14, function: None },
-    Among { s: b"\xef\xba\x88", substring_i: -1, result: 14, function: None },
-    Among { s: b"\xef\xba\x89", substring_i: -1, result: 15, function: None },
-    Among { s: b"\xef\xba\x8a", substring_i: -1, result: 15, function: None },
-    Among { s: b"\xef\xba\x8b", substring_i: -1, result: 15, function: None },
-    Among { s: b"\xef\xba\x8c", substring_i: -1, result: 15, function: None },
-    Among { s: b"\xef\xba\x8d", substring_i: -1, result: 18, function: None },
-    Among { s: b"\xef\xba\x8e", substring_i: -1, result: 18, function: None },
-    Among { s: b"\xef\xba\x8f", substring_i: -1, result: 19, function: None },
-    Among { s: b"\xef\xba\x90", substring_i: -1, result: 19, function: None },
-    Among { s: b"\xef\xba\x91", substring_i: -1, result: 19, function: None },
-    Among { s: b"\xef\xba\x92", substring_i: -1, result: 19, function: None },
-    Among { s: b"\xef\xba\x93", substring_i: -1, result: 20, function: None },
-    Among { s: b"\xef\xba\x94", substring_i: -1, result: 20, function: None },
-    Among { s: b"\xef\xba\x95", substring_i: -1, result: 21, function: None },
-    Among { s: b"\xef\xba\x96", substring_i: -1, result: 21, function: None },
-    Among { s: b"\xef\xba\x97", substring_i: -1, result: 21, function: None },
-    Among { s: b"\xef\xba\x98", substring_i: -1, result: 21, function: None },
-    Among { s: b"\xef\xba\x99", substring_i: -1, result: 22, function: None },
-    Among { s: b"\xef\xba\x9a", substring_i: -1, result: 22, function: None },
-    Among { s: b"\xef\xba\x9b", substring_i: -1, result: 22, function: None },
-    Among { s: b"\xef\xba\x9c", substring_i: -1, result: 22, function: None },
-    Among { s: b"\xef\xba\x9d", substring_i: -1, result: 23, function: None },
-    Among { s: b"\xef\xba\x9e", substring_i: -1, result: 23, function: None },
-    Among { s: b"\xef\xba\x9f", substring_i: -1, result: 23, function: None },
-    Among { s: b"\xef\xba\xa0", substring_i: -1, result: 23, function: None },
-    Among { s: b"\xef\xba\xa1", substring_i: -1, result: 24, function: None },
-    Among { s: b"\xef\xba\xa2", substring_i: -1, result: 24, function: None },
-    Among { s: b"\xef\xba\xa3", substring_i: -1, result: 24, function: None },
-    Among { s: b"\xef\xba\xa4", substring_i: -1, result: 24, function: None },
-    Among { s: b"\xef\xba\xa5", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xef\xba\xa6", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xef\xba\xa7", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xef\xba\xa8", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xef\xba\xa9", substring_i: -1, result: 26, function: None },
-    Among { s: b"\xef\xba\xaa", substring_i: -1, result: 26, function: None },
-    Among { s: b"\xef\xba\xab", substring_i: -1, result: 27, function: None },
-    Among { s: b"\xef\xba\xac", substring_i: -1, result: 27, function: None },
-    Among { s: b"\xef\xba\xad", substring_i: -1, result: 28, function: None },
-    Among { s: b"\xef\xba\xae", substring_i: -1, result: 28, function: None },
-    Among { s: b"\xef\xba\xaf", substring_i: -1, result: 29, function: None },
-    Among { s: b"\xef\xba\xb0", substring_i: -1, result: 29, function: None },
-    Among { s: b"\xef\xba\xb1", substring_i: -1, result: 30, function: None },
-    Among { s: b"\xef\xba\xb2", substring_i: -1, result: 30, function: None },
-    Among { s: b"\xef\xba\xb3", substring_i: -1, result: 30, function: None },
-    Among { s: b"\xef\xba\xb4", substring_i: -1, result: 30, function: None },
-    Among { s: b"\xef\xba\xb5", substring_i: -1, result: 31, function: None },
-    Among { s: b"\xef\xba\xb6", substring_i: -1, result: 31, function: None },
-    Among { s: b"\xef\xba\xb7", substring_i: -1, result: 31, function: None },
-    Among { s: b"\xef\xba\xb8", substring_i: -1, result: 31, function: None },
-    Among { s: b"\xef\xba\xb9", substring_i: -1, result: 32, function: None },
-    Among { s: b"\xef\xba\xba", substring_i: -1, result: 32, function: None },
-    Among { s: b"\xef\xba\xbb", substring_i: -1, result: 32, function: None },
-    Among { s: b"\xef\xba\xbc", substring_i: -1, result: 32, function: None },
-    Among { s: b"\xef\xba\xbd", substring_i: -1, result: 33, function: None },
-    Among { s: b"\xef\xba\xbe", substring_i: -1, result: 33, function: None },
-    Among { s: b"\xef\xba\xbf", substring_i: -1, result: 33, function: None },
-    Among { s: b"\xef\xbb\x80", substring_i: -1, result: 33, function: None },
-    Among { s: b"\xef\xbb\x81", substring_i: -1, result: 34, function: None },
-    Among { s: b"\xef\xbb\x82", substring_i: -1, result: 34, function: None },
-    Among { s: b"\xef\xbb\x83", substring_i: -1, result: 34, function: None },
-    Among { s: b"\xef\xbb\x84", substring_i: -1, result: 34, function: None },
-    Among { s: b"\xef\xbb\x85", substring_i: -1, result: 35, function: None },
-    Among { s: b"\xef\xbb\x86", substring_i: -1, result: 35, function: None },
-    Among { s: b"\xef\xbb\x87", substring_i: -1, result: 35, function: None },
-    Among { s: b"\xef\xbb\x88", substring_i: -1, result: 35, function: None },
-    Among { s: b"\xef\xbb\x89", substring_i: -1, result: 36, function: None },
-    Among { s: b"\xef\xbb\x8a", substring_i: -1, result: 36, function: None },
-    Among { s: b"\xef\xbb\x8b", substring_i: -1, result: 36, function: None },
-    Among { s: b"\xef\xbb\x8c", substring_i: -1, result: 36, function: None },
-    Among { s: b"\xef\xbb\x8d", substring_i: -1, result: 37, function: None },
-    Among { s: b"\xef\xbb\x8e", substring_i: -1, result: 37, function: None },
-    Among { s: b"\xef\xbb\x8f", substring_i: -1, result: 37, function: None },
-    Among { s: b"\xef\xbb\x90", substring_i: -1, result: 37, function: None },
-    Among { s: b"\xef\xbb\x91", substring_i: -1, result: 38, function: None },
-    Among { s: b"\xef\xbb\x92", substring_i: -1, result: 38, function: None },
-    Among { s: b"\xef\xbb\x93", substring_i: -1, result: 38, function: None },
-    Among { s: b"\xef\xbb\x94", substring_i: -1, result: 38, function: None },
-    Among { s: b"\xef\xbb\x95", substring_i: -1, result: 39, function: None },
-    Among { s: b"\xef\xbb\x96", substring_i: -1, result: 39, function: None },
-    Among { s: b"\xef\xbb\x97", substring_i: -1, result: 39, function: None },
-    Among { s: b"\xef\xbb\x98", substring_i: -1, result: 39, function: None },
-    Among { s: b"\xef\xbb\x99", substring_i: -1, result: 40, function: None },
-    Among { s: b"\xef\xbb\x9a", substring_i: -1, result: 40, function: None },
-    Among { s: b"\xef\xbb\x9b", substring_i: -1, result: 40, function: None },
-    Among { s: b"\xef\xbb\x9c", substring_i: -1, result: 40, function: None },
-    Among { s: b"\xef\xbb\x9d", substring_i: -1, result: 41, function: None },
-    Among { s: b"\xef\xbb\x9e", substring_i: -1, result: 41, function: None },
-    Among { s: b"\xef\xbb\x9f", substring_i: -1, result: 41, function: None },
-    Among { s: b"\xef\xbb\xa0", substring_i: -1, result: 41, function: None },
-    Among { s: b"\xef\xbb\xa1", substring_i: -1, result: 42, function: None },
-    Among { s: b"\xef\xbb\xa2", substring_i: -1, result: 42, function: None },
-    Among { s: b"\xef\xbb\xa3", substring_i: -1, result: 42, function: None },
-    Among { s: b"\xef\xbb\xa4", substring_i: -1, result: 42, function: None },
-    Among { s: b"\xef\xbb\xa5", substring_i: -1, result: 43, function: None },
-    Among { s: b"\xef\xbb\xa6", substring_i: -1, result: 43, function: None },
-    Among { s: b"\xef\xbb\xa7", substring_i: -1, result: 43, function: None },
-    Among { s: b"\xef\xbb\xa8", substring_i: -1, result: 43, function: None },
-    Among { s: b"\xef\xbb\xa9", substring_i: -1, result: 44, function: None },
-    Among { s: b"\xef\xbb\xaa", substring_i: -1, result: 44, function: None },
-    Among { s: b"\xef\xbb\xab", substring_i: -1, result: 44, function: None },
-    Among { s: b"\xef\xbb\xac", substring_i: -1, result: 44, function: None },
-    Among { s: b"\xef\xbb\xad", substring_i: -1, result: 45, function: None },
-    Among { s: b"\xef\xbb\xae", substring_i: -1, result: 45, function: None },
-    Among { s: b"\xef\xbb\xaf", substring_i: -1, result: 46, function: None },
-    Among { s: b"\xef\xbb\xb0", substring_i: -1, result: 46, function: None },
-    Among { s: b"\xef\xbb\xb1", substring_i: -1, result: 47, function: None },
-    Among { s: b"\xef\xbb\xb2", substring_i: -1, result: 47, function: None },
-    Among { s: b"\xef\xbb\xb3", substring_i: -1, result: 47, function: None },
-    Among { s: b"\xef\xbb\xb4", substring_i: -1, result: 47, function: None },
-    Among { s: b"\xef\xbb\xb5", substring_i: -1, result: 51, function: None },
-    Among { s: b"\xef\xbb\xb6", substring_i: -1, result: 51, function: None },
-    Among { s: b"\xef\xbb\xb7", substring_i: -1, result: 49, function: None },
-    Among { s: b"\xef\xbb\xb8", substring_i: -1, result: 49, function: None },
-    Among { s: b"\xef\xbb\xb9", substring_i: -1, result: 50, function: None },
-    Among { s: b"\xef\xbb\xba", substring_i: -1, result: 50, function: None },
-    Among { s: b"\xef\xbb\xbb", substring_i: -1, result: 48, function: None },
-    Among { s: b"\xef\xbb\xbc", substring_i: -1, result: 48, function: None },
+    Among {
+        s: b"\xd9\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8c",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8f",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x90",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x91",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x92",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa0",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa1",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa2",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa3",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa4",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa5",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa6",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa7",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa8",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\xa9",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x80",
+        substring_i: -1,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x81",
+        substring_i: -1,
+        result: 16,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x82",
+        substring_i: -1,
+        result: 16,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x83",
+        substring_i: -1,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x84",
+        substring_i: -1,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x85",
+        substring_i: -1,
+        result: 17,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x86",
+        substring_i: -1,
+        result: 17,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x87",
+        substring_i: -1,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x88",
+        substring_i: -1,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x89",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8a",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8b",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8c",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8d",
+        substring_i: -1,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8e",
+        substring_i: -1,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x8f",
+        substring_i: -1,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x90",
+        substring_i: -1,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x91",
+        substring_i: -1,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x92",
+        substring_i: -1,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x93",
+        substring_i: -1,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x94",
+        substring_i: -1,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x95",
+        substring_i: -1,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x96",
+        substring_i: -1,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x97",
+        substring_i: -1,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x98",
+        substring_i: -1,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x99",
+        substring_i: -1,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9a",
+        substring_i: -1,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9b",
+        substring_i: -1,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9c",
+        substring_i: -1,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9d",
+        substring_i: -1,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9e",
+        substring_i: -1,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\x9f",
+        substring_i: -1,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa0",
+        substring_i: -1,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa1",
+        substring_i: -1,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa2",
+        substring_i: -1,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa3",
+        substring_i: -1,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa4",
+        substring_i: -1,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa5",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa6",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa7",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa8",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xa9",
+        substring_i: -1,
+        result: 26,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xaa",
+        substring_i: -1,
+        result: 26,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xab",
+        substring_i: -1,
+        result: 27,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xac",
+        substring_i: -1,
+        result: 27,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xad",
+        substring_i: -1,
+        result: 28,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xae",
+        substring_i: -1,
+        result: 28,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xaf",
+        substring_i: -1,
+        result: 29,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb0",
+        substring_i: -1,
+        result: 29,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb1",
+        substring_i: -1,
+        result: 30,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb2",
+        substring_i: -1,
+        result: 30,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb3",
+        substring_i: -1,
+        result: 30,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb4",
+        substring_i: -1,
+        result: 30,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb5",
+        substring_i: -1,
+        result: 31,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb6",
+        substring_i: -1,
+        result: 31,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb7",
+        substring_i: -1,
+        result: 31,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb8",
+        substring_i: -1,
+        result: 31,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xb9",
+        substring_i: -1,
+        result: 32,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xba",
+        substring_i: -1,
+        result: 32,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xbb",
+        substring_i: -1,
+        result: 32,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xbc",
+        substring_i: -1,
+        result: 32,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xbd",
+        substring_i: -1,
+        result: 33,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xbe",
+        substring_i: -1,
+        result: 33,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xba\xbf",
+        substring_i: -1,
+        result: 33,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x80",
+        substring_i: -1,
+        result: 33,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x81",
+        substring_i: -1,
+        result: 34,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x82",
+        substring_i: -1,
+        result: 34,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x83",
+        substring_i: -1,
+        result: 34,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x84",
+        substring_i: -1,
+        result: 34,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x85",
+        substring_i: -1,
+        result: 35,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x86",
+        substring_i: -1,
+        result: 35,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x87",
+        substring_i: -1,
+        result: 35,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x88",
+        substring_i: -1,
+        result: 35,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x89",
+        substring_i: -1,
+        result: 36,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8a",
+        substring_i: -1,
+        result: 36,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8b",
+        substring_i: -1,
+        result: 36,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8c",
+        substring_i: -1,
+        result: 36,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8d",
+        substring_i: -1,
+        result: 37,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8e",
+        substring_i: -1,
+        result: 37,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x8f",
+        substring_i: -1,
+        result: 37,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x90",
+        substring_i: -1,
+        result: 37,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x91",
+        substring_i: -1,
+        result: 38,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x92",
+        substring_i: -1,
+        result: 38,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x93",
+        substring_i: -1,
+        result: 38,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x94",
+        substring_i: -1,
+        result: 38,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x95",
+        substring_i: -1,
+        result: 39,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x96",
+        substring_i: -1,
+        result: 39,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x97",
+        substring_i: -1,
+        result: 39,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x98",
+        substring_i: -1,
+        result: 39,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x99",
+        substring_i: -1,
+        result: 40,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9a",
+        substring_i: -1,
+        result: 40,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9b",
+        substring_i: -1,
+        result: 40,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9c",
+        substring_i: -1,
+        result: 40,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9d",
+        substring_i: -1,
+        result: 41,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9e",
+        substring_i: -1,
+        result: 41,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\x9f",
+        substring_i: -1,
+        result: 41,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa0",
+        substring_i: -1,
+        result: 41,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa1",
+        substring_i: -1,
+        result: 42,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa2",
+        substring_i: -1,
+        result: 42,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa3",
+        substring_i: -1,
+        result: 42,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa4",
+        substring_i: -1,
+        result: 42,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa5",
+        substring_i: -1,
+        result: 43,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa6",
+        substring_i: -1,
+        result: 43,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa7",
+        substring_i: -1,
+        result: 43,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa8",
+        substring_i: -1,
+        result: 43,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xa9",
+        substring_i: -1,
+        result: 44,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xaa",
+        substring_i: -1,
+        result: 44,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xab",
+        substring_i: -1,
+        result: 44,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xac",
+        substring_i: -1,
+        result: 44,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xad",
+        substring_i: -1,
+        result: 45,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xae",
+        substring_i: -1,
+        result: 45,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xaf",
+        substring_i: -1,
+        result: 46,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb0",
+        substring_i: -1,
+        result: 46,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb1",
+        substring_i: -1,
+        result: 47,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb2",
+        substring_i: -1,
+        result: 47,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb3",
+        substring_i: -1,
+        result: 47,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb4",
+        substring_i: -1,
+        result: 47,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb5",
+        substring_i: -1,
+        result: 51,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb6",
+        substring_i: -1,
+        result: 51,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb7",
+        substring_i: -1,
+        result: 49,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb8",
+        substring_i: -1,
+        result: 49,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xb9",
+        substring_i: -1,
+        result: 50,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xba",
+        substring_i: -1,
+        result: 50,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xbb",
+        substring_i: -1,
+        result: 48,
+        function: None,
+    },
+    Among {
+        s: b"\xef\xbb\xbc",
+        substring_i: -1,
+        result: 48,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xd8\xa2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa6", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd8\xa2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa6",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xd8\xa2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa4", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd8\xa5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa6", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"\xd8\xa2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa4",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa6",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"\xd8\xa7\xd9\x84", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd8\xa8\xd8\xa7\xd9\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd8\xa7\xd9\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x84\xd9\x84", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa8\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x84\xd9\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"\xd8\xa3\xd8\xa2", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd8\xa3\xd8\xa3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa3\xd8\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa3\xd8\xa5", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xd8\xa3\xd8\xa7", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"\xd8\xa3\xd8\xa2",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3\xd8\xa3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3\xd8\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3\xd8\xa5",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa3\xd8\xa7",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"\xd9\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x88", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd9\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"\xd8\xa7\xd9\x84", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd8\xa8\xd8\xa7\xd9\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd8\xa7\xd9\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x84\xd9\x84", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa8\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd8\xa7\xd9\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x84\xd9\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"\xd8\xa8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa8\xd8\xa7", substring_i: 0, result: -1, function: None },
-    Among { s: b"\xd8\xa8\xd8\xa8", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xd9\x83\xd9\x83", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"\xd8\xa8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa8\xd8\xa7",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa8\xd8\xa8",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x83",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"\xd8\xb3\xd8\xa3", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xd8\xb3\xd8\xaa", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd8\xb3\xd9\x86", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd8\xb3\xd9\x8a", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd8\xb3\xd8\xa3",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xb3\xd8\xaa",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xb3\xd9\x86",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xb3\xd9\x8a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_9: &[Among] = &[
-    Among { s: b"\xd8\xaa\xd8\xb3\xd8\xaa", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x86\xd8\xb3\xd8\xaa", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8a\xd8\xb3\xd8\xaa", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd8\xaa\xd8\xb3\xd8\xaa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x86\xd8\xb3\xd8\xaa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8a\xd8\xb3\xd8\xaa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_10: &[Among] = &[
-    Among { s: b"\xd9\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd9\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd9\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd9\x86", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8a", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd9\x85\xd8\xa7", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\x87\xd9\x85\xd8\xa7", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\x86\xd8\xa7", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd8\xa7", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xd9\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x86",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x85\xd8\xa7",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x85\xd8\xa7",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x86\xd8\xa7",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd8\xa7",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
-const A_11: &[Among] = &[
-    Among { s: b"\xd9\x86", substring_i: -1, result: 1, function: None },
-];
+const A_11: &[Among] = &[Among {
+    s: b"\xd9\x86",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
 const A_12: &[Among] = &[
-    Among { s: b"\xd9\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x8a", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa7", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd9\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
-const A_13: &[Among] = &[
-    Among { s: b"\xd8\xa7\xd8\xaa", substring_i: -1, result: 1, function: None },
-];
+const A_13: &[Among] = &[Among {
+    s: b"\xd8\xa7\xd8\xaa",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
-const A_14: &[Among] = &[
-    Among { s: b"\xd8\xaa", substring_i: -1, result: 1, function: None },
-];
+const A_14: &[Among] = &[Among {
+    s: b"\xd8\xaa",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
-const A_15: &[Among] = &[
-    Among { s: b"\xd8\xa9", substring_i: -1, result: 1, function: None },
-];
+const A_15: &[Among] = &[Among {
+    s: b"\xd8\xa9",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
-const A_16: &[Among] = &[
-    Among { s: b"\xd9\x8a", substring_i: -1, result: 1, function: None },
-];
+const A_16: &[Among] = &[Among {
+    s: b"\xd9\x8a",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
 const A_17: &[Among] = &[
-    Among { s: b"\xd9\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd9\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd9\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x83\xd9\x86", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd9\x86", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x83\xd9\x85\xd9\x88", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\x86\xd9\x8a", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x83\xd9\x85\xd8\xa7", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\x87\xd9\x85\xd8\xa7", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xd9\x86\xd8\xa7", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xd9\x87\xd8\xa7", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xd9\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x86",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x86",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x85\xd9\x88",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x86\xd9\x8a",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x83\xd9\x85\xd8\xa7",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd9\x85\xd8\xa7",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x86\xd8\xa7",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x87\xd8\xa7",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_18: &[Among] = &[
-    Among { s: b"\xd9\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x88\xd9\x86", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xd9\x8a\xd9\x86", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xd8\xa7\xd9\x86", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xd8\xaa\xd9\x86", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xd9\x8a", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xa7", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xaa\xd9\x85\xd8\xa7", substring_i: 6, result: 4, function: None },
-    Among { s: b"\xd9\x86\xd8\xa7", substring_i: 6, result: 2, function: None },
-    Among { s: b"\xd8\xaa\xd8\xa7", substring_i: 6, result: 2, function: None },
-    Among { s: b"\xd8\xaa", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd9\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x88\xd9\x86",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8a\xd9\x86",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa7\xd9\x86",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xaa\xd9\x86",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x8a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xa7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xaa\xd9\x85\xd8\xa7",
+        substring_i: 6,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x86\xd8\xa7",
+        substring_i: 6,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xaa\xd8\xa7",
+        substring_i: 6,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xaa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_19: &[Among] = &[
-    Among { s: b"\xd8\xaa\xd9\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd9\x88\xd8\xa7", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xd8\xaa\xd9\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd9\x88\xd8\xa7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_20: &[Among] = &[
-    Among { s: b"\xd9\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xd8\xaa\xd9\x85\xd9\x88", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"\xd9\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xd8\xaa\xd9\x85\xd9\x88",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
-const A_21: &[Among] = &[
-    Among { s: b"\xd9\x89", substring_i: -1, result: 1, function: None },
-];
+const A_21: &[Among] = &[Among {
+    s: b"\xd9\x89",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
 fn r_normalize_pre(z: &mut Env) -> i32 {
     let mut among_var: i32;
@@ -386,411 +1508,309 @@ fn r_normalize_pre(z: &mut Env) -> i32 {
                             z.ket = z.c;
                             match among_var {
                                 1 => {
-                                    {
-                                        let ret = z.slice_del();
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_del();
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 2 => {
-                                    {
-                                        let ret = z.slice_from(S_0);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_0);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 3 => {
-                                    {
-                                        let ret = z.slice_from(S_1);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_1);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 4 => {
-                                    {
-                                        let ret = z.slice_from(S_2);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_2);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 5 => {
-                                    {
-                                        let ret = z.slice_from(S_3);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_3);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 6 => {
-                                    {
-                                        let ret = z.slice_from(S_4);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_4);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 7 => {
-                                    {
-                                        let ret = z.slice_from(S_5);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_5);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 8 => {
-                                    {
-                                        let ret = z.slice_from(S_6);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_6);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 9 => {
-                                    {
-                                        let ret = z.slice_from(S_7);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_7);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 10 => {
-                                    {
-                                        let ret = z.slice_from(S_8);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_8);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 11 => {
-                                    {
-                                        let ret = z.slice_from(S_9);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_9);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 12 => {
-                                    {
-                                        let ret = z.slice_from(S_10);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_10);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 13 => {
-                                    {
-                                        let ret = z.slice_from(S_11);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_11);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 14 => {
-                                    {
-                                        let ret = z.slice_from(S_12);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_12);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 15 => {
-                                    {
-                                        let ret = z.slice_from(S_13);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_13);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 16 => {
-                                    {
-                                        let ret = z.slice_from(S_14);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_14);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 17 => {
-                                    {
-                                        let ret = z.slice_from(S_15);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_15);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 18 => {
-                                    {
-                                        let ret = z.slice_from(S_16);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_16);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 19 => {
-                                    {
-                                        let ret = z.slice_from(S_17);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_17);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 20 => {
-                                    {
-                                        let ret = z.slice_from(S_18);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_18);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 21 => {
-                                    {
-                                        let ret = z.slice_from(S_19);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_19);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 22 => {
-                                    {
-                                        let ret = z.slice_from(S_20);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_20);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 23 => {
-                                    {
-                                        let ret = z.slice_from(S_21);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_21);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 24 => {
-                                    {
-                                        let ret = z.slice_from(S_22);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_22);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 25 => {
-                                    {
-                                        let ret = z.slice_from(S_23);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_23);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 26 => {
-                                    {
-                                        let ret = z.slice_from(S_24);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_24);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 27 => {
-                                    {
-                                        let ret = z.slice_from(S_25);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_25);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 28 => {
-                                    {
-                                        let ret = z.slice_from(S_26);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_26);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 29 => {
-                                    {
-                                        let ret = z.slice_from(S_27);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_27);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 30 => {
-                                    {
-                                        let ret = z.slice_from(S_28);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_28);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 31 => {
-                                    {
-                                        let ret = z.slice_from(S_29);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_29);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 32 => {
-                                    {
-                                        let ret = z.slice_from(S_30);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_30);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 33 => {
-                                    {
-                                        let ret = z.slice_from(S_31);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_31);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 34 => {
-                                    {
-                                        let ret = z.slice_from(S_32);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_32);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 35 => {
-                                    {
-                                        let ret = z.slice_from(S_33);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_33);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 36 => {
-                                    {
-                                        let ret = z.slice_from(S_34);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_34);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 37 => {
-                                    {
-                                        let ret = z.slice_from(S_35);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_35);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 38 => {
-                                    {
-                                        let ret = z.slice_from(S_36);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_36);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 39 => {
-                                    {
-                                        let ret = z.slice_from(S_37);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_37);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 40 => {
-                                    {
-                                        let ret = z.slice_from(S_38);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_38);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 41 => {
-                                    {
-                                        let ret = z.slice_from(S_39);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_39);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 42 => {
-                                    {
-                                        let ret = z.slice_from(S_40);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_40);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 43 => {
-                                    {
-                                        let ret = z.slice_from(S_41);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_41);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 44 => {
-                                    {
-                                        let ret = z.slice_from(S_42);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_42);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 45 => {
-                                    {
-                                        let ret = z.slice_from(S_43);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_43);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 46 => {
-                                    {
-                                        let ret = z.slice_from(S_44);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_44);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 47 => {
-                                    {
-                                        let ret = z.slice_from(S_45);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_45);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 48 => {
-                                    {
-                                        let ret = z.slice_from(S_46);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_46);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 49 => {
-                                    {
-                                        let ret = z.slice_from(S_47);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_47);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 50 => {
-                                    {
-                                        let ret = z.slice_from(S_48);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_48);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 51 => {
-                                    {
-                                        let ret = z.slice_from(S_49);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_49);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 _ => {}
@@ -825,7 +1845,10 @@ fn r_normalize_post(z: &mut Env) -> i32 {
         z.c = z.l;
         z.ket = z.c;
         'lab0: {
-            if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 5 || (124 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+            if z.c - 1 <= z.lb
+                || z.byte(z.c - 1) >> 5 != 5
+                || (124 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+            {
                 break 'lab0;
             }
             if find_among_b(z, A_1) == 0 {
@@ -852,7 +1875,10 @@ fn r_normalize_post(z: &mut Env) -> i32 {
                         let c4 = z.c;
                         z.bra = z.c;
                         'lab4: {
-                            if z.c + 1 >= z.l || z.byte(z.c + 1) >> 5 != 5 || (124 >> (z.byte(z.c + 1) & 31)) & 1 == 0 {
+                            if z.c + 1 >= z.l
+                                || z.byte(z.c + 1) >> 5 != 5
+                                || (124 >> (z.byte(z.c + 1) & 31)) & 1 == 0
+                            {
                                 break 'lab4;
                             }
                             among_var = find_among(z, A_2);
@@ -862,27 +1888,21 @@ fn r_normalize_post(z: &mut Env) -> i32 {
                             z.ket = z.c;
                             match among_var {
                                 1 => {
-                                    {
-                                        let ret = z.slice_from(S_51);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_51);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 2 => {
-                                    {
-                                        let ret = z.slice_from(S_52);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_52);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 3 => {
-                                    {
-                                        let ret = z.slice_from(S_53);
-                                        if ret < 0 {
-                                            return ret;
-                                        }
+                                    let ret = z.slice_from(S_53);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                                 _ => {}

@@ -5,6 +5,10 @@
 //! Source SHA-256: 01ebf7a323094f0d3bbb97fade0e312d84f8c16dffedb04bbcdd0902254b31a7
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among_b};
 
 const S_0: &[u8] = b"\xe0\xa4\x8f";
@@ -16,129 +20,699 @@ const S_5: &[u8] = b"\xe0\xa4\xa5\xe0\xa5\x87";
 const S_6: &[u8] = b"\xe0\xa4\xa4\xe0\xa5\x8d\xe0\xa4\xb0";
 
 const A_0: &[Among] = &[
-    Among { s: b"\xe0\xa4\x95\xe0\xa5\x80", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb2\xe0\xa5\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x95\xe0\xa5\x88", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xa4\xb8\xe0\xa4\x81\xe0\xa4\x97\xe0\xa5\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xae\xe0\xa5\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x95\xe0\xa5\x8b", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xa4\xb8\xe0\xa4\x81\xe0\xa4\x97", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb8\xe0\xa4\x82\xe0\xa4\x97", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xae\xe0\xa4\xbe\xe0\xa4\xb0\xe0\xa5\x8d\xe0\xa4\xab\xe0\xa4\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb0\xe0\xa4\xa4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x95\xe0\xa4\xbe", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xa4\xae\xe0\xa4\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x8d\xe0\xa4\xb5\xe0\xa4\xbe\xe0\xa4\xb0\xe0\xa4\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x95\xe0\xa4\xbf", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xe0\xa4\xaa\xe0\xa4\x9b\xe0\xa4\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xe0\xa4\x95\xe0\xa5\x80",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb2\xe0\xa5\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x95\xe0\xa5\x88",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb8\xe0\xa4\x81\xe0\xa4\x97\xe0\xa5\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xae\xe0\xa5\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb8\xe0\xa4\x81\xe0\xa4\x97",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb8\xe0\xa4\x82\xe0\xa4\x97",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xae\xe0\xa4\xbe\xe0\xa4\xb0\xe0\xa5\x8d\xe0\xa4\xab\xe0\xa4\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb0\xe0\xa4\xa4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xae\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x8d\xe0\xa4\xb5\xe0\xa4\xbe\xe0\xa4\xb0\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x95\xe0\xa4\xbf",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xaa\xe0\xa4\x9b\xe0\xa4\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xe0\xa4\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xa4\x82", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xe0\xa5\x88", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xe0\xa4\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x82",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x88",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xe0\xa4\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x82", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x88", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xe0\xa4\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x82",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x88",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x87\xe0\xa4\x96\xe0\xa5\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa5\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa5\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x81", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x81", substring_i: 8, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa5\x81", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb9\xe0\xa4\xb0\xe0\xa5\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb9\xe0\xa4\xb0\xe0\xa5\x82", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa5\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa5\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x88", substring_i: 17, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa5\x88", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa5\x88", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x8b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x8b", substring_i: 23, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b", substring_i: 25, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b", substring_i: 25, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x8b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa5\x8b", substring_i: 28, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa5\x8b", substring_i: 28, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xad\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 31, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 35, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b", substring_i: 35, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: 40, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa5\x8c", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xaf\xe0\xa5\x8c", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8c", substring_i: 44, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8c", substring_i: 44, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8c", substring_i: 44, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: 48, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: 48, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: 50, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: 48, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: 48, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xaa\xe0\xa4\xb0\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\x87\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 58, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa5\x87\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb9\xe0\xa5\x8b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 62, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 62, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 64, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 62, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 62, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xb8\xe0\xa5\x8d", substring_i: 68, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\x8f", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x9b", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb9\xe0\xa5\x81\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b", substring_i: 74, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xb9\xe0\xa5\x81\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x9b", substring_i: 71, result: 1, function: None },
-    Among { s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa4\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa4\xbe", substring_i: 81, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe", substring_i: 83, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe", substring_i: 83, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa4\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa4\xbe", substring_i: 86, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa4\xbe", substring_i: 86, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xa6\xe0\xa5\x87\xe0\xa4\x96\xe0\xa4\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xe0\xa4\xae\xe0\xa4\xbe\xe0\xa4\xa5\xe0\xa4\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x80",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x87\xe0\xa4\x96\xe0\xa5\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa5\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa5\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x81",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x81",
+        substring_i: 8,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa5\x81",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb9\xe0\xa4\xb0\xe0\xa5\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb9\xe0\xa4\xb0\xe0\xa5\x82",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa5\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa5\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x88",
+        substring_i: 17,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa5\x88",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa5\x88",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: 23,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa5\x8b",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa5\x8b",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa5\x8b",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xad\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 31,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8b",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: 40,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa5\x8c",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xaf\xe0\xa5\x8c",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8c",
+        substring_i: 44,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa5\x8d\xe0\xa4\xaf\xe0\xa5\x8c",
+        substring_i: 44,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xaf\xe0\xa5\x8c",
+        substring_i: 44,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: 48,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: 48,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: 50,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: 48,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: 48,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb2\xe0\xa4\xbe\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xaa\xe0\xa4\xb0\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\x87\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa5\x87\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb9\xe0\xa5\x8b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 62,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 62,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 64,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 62,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x9b\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 62,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\xb8\xe0\xa5\x8d",
+        substring_i: 68,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa5\xe0\xa4\xbf\xe0\xa4\x8f",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x9b",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb9\xe0\xa5\x81\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x9b",
+        substring_i: 74,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xb9\xe0\xa5\x81\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xa8\xe0\xa5\x8d\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x9b",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa5\x87\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa8\xe0\xa5\x87\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: 81,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: 83,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\x8f\xe0\xa4\x95\xe0\xa4\xbe",
+        substring_i: 83,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa4\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\x87\xe0\xa4\xa6\xe0\xa4\xbe",
+        substring_i: 86,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xbf\xe0\xa4\xa6\xe0\xa4\xbe",
+        substring_i: 86,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xa6\xe0\xa5\x87\xe0\xa4\x96\xe0\xa4\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xe0\xa4\xae\xe0\xa4\xbe\xe0\xa4\xa5\xe0\xa4\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_remove_category_1(z: &mut Env) -> i32 {
@@ -151,41 +725,37 @@ fn r_remove_category_1(z: &mut Env) -> i32 {
     z.bra = z.c;
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
-        2 => {
-            'lab0: {
-                {
-                    let m1 = z.l - z.c;
-                    'lab1: {
-                        'lab2: {
-                            {
-                                let m2 = z.l - z.c;
-                                'lab3: {
-                                    if z.eq_s_b(S_0) == 0 {
-                                        break 'lab3;
-                                    }
-                                    break 'lab2;
+        2 => 'lab0: {
+            {
+                let m1 = z.l - z.c;
+                'lab1: {
+                    'lab2: {
+                        {
+                            let m2 = z.l - z.c;
+                            'lab3: {
+                                if z.eq_s_b(S_0) == 0 {
+                                    break 'lab3;
                                 }
-                                z.c = z.l - m2;
-                                if z.eq_s_b(S_1) == 0 {
-                                    break 'lab1;
-                                }
+                                break 'lab2;
+                            }
+                            z.c = z.l - m2;
+                            if z.eq_s_b(S_1) == 0 {
+                                break 'lab1;
                             }
                         }
-                        break 'lab0;
                     }
-                    z.c = z.l - m1;
-                    {
-                        let ret = z.slice_del();
-                        if ret < 0 {
-                            return ret;
-                        }
+                    break 'lab0;
+                }
+                z.c = z.l - m1;
+                {
+                    let ret = z.slice_del();
+                    if ret < 0 {
+                        return ret;
                     }
                 }
             }

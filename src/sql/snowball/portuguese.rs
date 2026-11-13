@@ -5,6 +5,10 @@
 //! Source SHA-256: 81a48722d51bf64c418ffcf235ff6ebb6d89cab36dba681c8213063cb82e44cc
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"a~";
@@ -19,225 +23,1187 @@ const S_8: &[u8] = b"at";
 const S_9: &[u8] = b"ir";
 const S_10: &[u8] = b"c";
 
-const G_V: &[u8] = &[17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 19, 12, 2];
+const G_V: &[u8] = &[
+    17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 19, 12, 2,
+];
 
 const A_0: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xc3\xa3", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xb5", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa3",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb5",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 3, function: None },
-    Among { s: b"a~", substring_i: 0, result: 1, function: None },
-    Among { s: b"o~", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"a~",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"o~",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"ic", substring_i: -1, result: -1, function: None },
-    Among { s: b"ad", substring_i: -1, result: -1, function: None },
-    Among { s: b"os", substring_i: -1, result: -1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ad",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"os",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"ante", substring_i: -1, result: 1, function: None },
-    Among { s: b"avel", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xadvel", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ante",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avel",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadvel",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"ic", substring_i: -1, result: 1, function: None },
-    Among { s: b"abil", substring_i: -1, result: 1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"abil",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"ica", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa2ncia", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaancia", substring_i: -1, result: 4, function: None },
-    Among { s: b"logia", substring_i: -1, result: 2, function: None },
-    Among { s: b"ira", substring_i: -1, result: 9, function: None },
-    Among { s: b"adora", substring_i: -1, result: 1, function: None },
-    Among { s: b"osa", substring_i: -1, result: 1, function: None },
-    Among { s: b"ista", substring_i: -1, result: 1, function: None },
-    Among { s: b"iva", substring_i: -1, result: 8, function: None },
-    Among { s: b"eza", substring_i: -1, result: 1, function: None },
-    Among { s: b"idade", substring_i: -1, result: 7, function: None },
-    Among { s: b"ante", substring_i: -1, result: 1, function: None },
-    Among { s: b"mente", substring_i: -1, result: 6, function: None },
-    Among { s: b"amente", substring_i: 12, result: 5, function: None },
-    Among { s: b"\xc3\xa1vel", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xadvel", substring_i: -1, result: 1, function: None },
-    Among { s: b"ico", substring_i: -1, result: 1, function: None },
-    Among { s: b"ismo", substring_i: -1, result: 1, function: None },
-    Among { s: b"oso", substring_i: -1, result: 1, function: None },
-    Among { s: b"amento", substring_i: -1, result: 1, function: None },
-    Among { s: b"imento", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivo", substring_i: -1, result: 8, function: None },
-    Among { s: b"a\xc3\xa7a~o", substring_i: -1, result: 1, function: None },
-    Among { s: b"u\xc3\xa7a~o", substring_i: -1, result: 3, function: None },
-    Among { s: b"ador", substring_i: -1, result: 1, function: None },
-    Among { s: b"icas", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaancias", substring_i: -1, result: 4, function: None },
-    Among { s: b"logias", substring_i: -1, result: 2, function: None },
-    Among { s: b"iras", substring_i: -1, result: 9, function: None },
-    Among { s: b"adoras", substring_i: -1, result: 1, function: None },
-    Among { s: b"osas", substring_i: -1, result: 1, function: None },
-    Among { s: b"istas", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivas", substring_i: -1, result: 8, function: None },
-    Among { s: b"ezas", substring_i: -1, result: 1, function: None },
-    Among { s: b"idades", substring_i: -1, result: 7, function: None },
-    Among { s: b"adores", substring_i: -1, result: 1, function: None },
-    Among { s: b"antes", substring_i: -1, result: 1, function: None },
-    Among { s: b"a\xc3\xa7o~es", substring_i: -1, result: 1, function: None },
-    Among { s: b"u\xc3\xa7o~es", substring_i: -1, result: 3, function: None },
-    Among { s: b"icos", substring_i: -1, result: 1, function: None },
-    Among { s: b"ismos", substring_i: -1, result: 1, function: None },
-    Among { s: b"osos", substring_i: -1, result: 1, function: None },
-    Among { s: b"amentos", substring_i: -1, result: 1, function: None },
-    Among { s: b"imentos", substring_i: -1, result: 1, function: None },
-    Among { s: b"ivos", substring_i: -1, result: 8, function: None },
+    Among {
+        s: b"ica",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2ncia",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaancia",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"logia",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ira",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"adora",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"osa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ista",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iva",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"eza",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"idade",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"ante",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"mente",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"amente",
+        substring_i: 12,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1vel",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadvel",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ico",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ismo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"oso",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amento",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"imento",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivo",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"a\xc3\xa7a~o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"u\xc3\xa7a~o",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ador",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"icas",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaancias",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"logias",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iras",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"adoras",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"osas",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"istas",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivas",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"ezas",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"idades",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"adores",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"antes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"a\xc3\xa7o~es",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"u\xc3\xa7o~es",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"icos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ismos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"osos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amentos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"imentos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ivos",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"ada", substring_i: -1, result: 1, function: None },
-    Among { s: b"ida", substring_i: -1, result: 1, function: None },
-    Among { s: b"ia", substring_i: -1, result: 1, function: None },
-    Among { s: b"aria", substring_i: 2, result: 1, function: None },
-    Among { s: b"eria", substring_i: 2, result: 1, function: None },
-    Among { s: b"iria", substring_i: 2, result: 1, function: None },
-    Among { s: b"ara", substring_i: -1, result: 1, function: None },
-    Among { s: b"era", substring_i: -1, result: 1, function: None },
-    Among { s: b"ira", substring_i: -1, result: 1, function: None },
-    Among { s: b"ava", substring_i: -1, result: 1, function: None },
-    Among { s: b"asse", substring_i: -1, result: 1, function: None },
-    Among { s: b"esse", substring_i: -1, result: 1, function: None },
-    Among { s: b"isse", substring_i: -1, result: 1, function: None },
-    Among { s: b"aste", substring_i: -1, result: 1, function: None },
-    Among { s: b"este", substring_i: -1, result: 1, function: None },
-    Among { s: b"iste", substring_i: -1, result: 1, function: None },
-    Among { s: b"ei", substring_i: -1, result: 1, function: None },
-    Among { s: b"arei", substring_i: 16, result: 1, function: None },
-    Among { s: b"erei", substring_i: 16, result: 1, function: None },
-    Among { s: b"irei", substring_i: 16, result: 1, function: None },
-    Among { s: b"am", substring_i: -1, result: 1, function: None },
-    Among { s: b"iam", substring_i: 20, result: 1, function: None },
-    Among { s: b"ariam", substring_i: 21, result: 1, function: None },
-    Among { s: b"eriam", substring_i: 21, result: 1, function: None },
-    Among { s: b"iriam", substring_i: 21, result: 1, function: None },
-    Among { s: b"aram", substring_i: 20, result: 1, function: None },
-    Among { s: b"eram", substring_i: 20, result: 1, function: None },
-    Among { s: b"iram", substring_i: 20, result: 1, function: None },
-    Among { s: b"avam", substring_i: 20, result: 1, function: None },
-    Among { s: b"em", substring_i: -1, result: 1, function: None },
-    Among { s: b"arem", substring_i: 29, result: 1, function: None },
-    Among { s: b"erem", substring_i: 29, result: 1, function: None },
-    Among { s: b"irem", substring_i: 29, result: 1, function: None },
-    Among { s: b"assem", substring_i: 29, result: 1, function: None },
-    Among { s: b"essem", substring_i: 29, result: 1, function: None },
-    Among { s: b"issem", substring_i: 29, result: 1, function: None },
-    Among { s: b"ado", substring_i: -1, result: 1, function: None },
-    Among { s: b"ido", substring_i: -1, result: 1, function: None },
-    Among { s: b"ando", substring_i: -1, result: 1, function: None },
-    Among { s: b"endo", substring_i: -1, result: 1, function: None },
-    Among { s: b"indo", substring_i: -1, result: 1, function: None },
-    Among { s: b"ara~o", substring_i: -1, result: 1, function: None },
-    Among { s: b"era~o", substring_i: -1, result: 1, function: None },
-    Among { s: b"ira~o", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar", substring_i: -1, result: 1, function: None },
-    Among { s: b"er", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir", substring_i: -1, result: 1, function: None },
-    Among { s: b"as", substring_i: -1, result: 1, function: None },
-    Among { s: b"adas", substring_i: 47, result: 1, function: None },
-    Among { s: b"idas", substring_i: 47, result: 1, function: None },
-    Among { s: b"ias", substring_i: 47, result: 1, function: None },
-    Among { s: b"arias", substring_i: 50, result: 1, function: None },
-    Among { s: b"erias", substring_i: 50, result: 1, function: None },
-    Among { s: b"irias", substring_i: 50, result: 1, function: None },
-    Among { s: b"aras", substring_i: 47, result: 1, function: None },
-    Among { s: b"eras", substring_i: 47, result: 1, function: None },
-    Among { s: b"iras", substring_i: 47, result: 1, function: None },
-    Among { s: b"avas", substring_i: 47, result: 1, function: None },
-    Among { s: b"es", substring_i: -1, result: 1, function: None },
-    Among { s: b"ardes", substring_i: 58, result: 1, function: None },
-    Among { s: b"erdes", substring_i: 58, result: 1, function: None },
-    Among { s: b"irdes", substring_i: 58, result: 1, function: None },
-    Among { s: b"ares", substring_i: 58, result: 1, function: None },
-    Among { s: b"eres", substring_i: 58, result: 1, function: None },
-    Among { s: b"ires", substring_i: 58, result: 1, function: None },
-    Among { s: b"asses", substring_i: 58, result: 1, function: None },
-    Among { s: b"esses", substring_i: 58, result: 1, function: None },
-    Among { s: b"isses", substring_i: 58, result: 1, function: None },
-    Among { s: b"astes", substring_i: 58, result: 1, function: None },
-    Among { s: b"estes", substring_i: 58, result: 1, function: None },
-    Among { s: b"istes", substring_i: 58, result: 1, function: None },
-    Among { s: b"is", substring_i: -1, result: 1, function: None },
-    Among { s: b"ais", substring_i: 71, result: 1, function: None },
-    Among { s: b"eis", substring_i: 71, result: 1, function: None },
-    Among { s: b"areis", substring_i: 73, result: 1, function: None },
-    Among { s: b"ereis", substring_i: 73, result: 1, function: None },
-    Among { s: b"ireis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xa1reis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xa9reis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xadreis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xa1sseis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xa9sseis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xadsseis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xa1veis", substring_i: 73, result: 1, function: None },
-    Among { s: b"\xc3\xadeis", substring_i: 73, result: 1, function: None },
-    Among { s: b"ar\xc3\xadeis", substring_i: 84, result: 1, function: None },
-    Among { s: b"er\xc3\xadeis", substring_i: 84, result: 1, function: None },
-    Among { s: b"ir\xc3\xadeis", substring_i: 84, result: 1, function: None },
-    Among { s: b"ados", substring_i: -1, result: 1, function: None },
-    Among { s: b"idos", substring_i: -1, result: 1, function: None },
-    Among { s: b"amos", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1ramos", substring_i: 90, result: 1, function: None },
-    Among { s: b"\xc3\xa9ramos", substring_i: 90, result: 1, function: None },
-    Among { s: b"\xc3\xadramos", substring_i: 90, result: 1, function: None },
-    Among { s: b"\xc3\xa1vamos", substring_i: 90, result: 1, function: None },
-    Among { s: b"\xc3\xadamos", substring_i: 90, result: 1, function: None },
-    Among { s: b"ar\xc3\xadamos", substring_i: 95, result: 1, function: None },
-    Among { s: b"er\xc3\xadamos", substring_i: 95, result: 1, function: None },
-    Among { s: b"ir\xc3\xadamos", substring_i: 95, result: 1, function: None },
-    Among { s: b"emos", substring_i: -1, result: 1, function: None },
-    Among { s: b"aremos", substring_i: 99, result: 1, function: None },
-    Among { s: b"eremos", substring_i: 99, result: 1, function: None },
-    Among { s: b"iremos", substring_i: 99, result: 1, function: None },
-    Among { s: b"\xc3\xa1ssemos", substring_i: 99, result: 1, function: None },
-    Among { s: b"\xc3\xaassemos", substring_i: 99, result: 1, function: None },
-    Among { s: b"\xc3\xadssemos", substring_i: 99, result: 1, function: None },
-    Among { s: b"imos", substring_i: -1, result: 1, function: None },
-    Among { s: b"armos", substring_i: -1, result: 1, function: None },
-    Among { s: b"ermos", substring_i: -1, result: 1, function: None },
-    Among { s: b"irmos", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1mos", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar\xc3\xa1s", substring_i: -1, result: 1, function: None },
-    Among { s: b"er\xc3\xa1s", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir\xc3\xa1s", substring_i: -1, result: 1, function: None },
-    Among { s: b"eu", substring_i: -1, result: 1, function: None },
-    Among { s: b"iu", substring_i: -1, result: 1, function: None },
-    Among { s: b"ou", substring_i: -1, result: 1, function: None },
-    Among { s: b"ar\xc3\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"er\xc3\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"ir\xc3\xa1", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ada",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ida",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ia",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aria",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eria",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iria",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ara",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"era",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ira",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ava",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"asse",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"esse",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isse",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"este",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ei",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arei",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erei",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irei",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"am",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iam",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ariam",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eriam",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iriam",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aram",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eram",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iram",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avam",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"em",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"assem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"essem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issem",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ado",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ido",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ando",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"endo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"indo",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ara~o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"era~o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ira~o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"as",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"adas",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"idas",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ias",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"arias",
+        substring_i: 50,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erias",
+        substring_i: 50,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irias",
+        substring_i: 50,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aras",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eras",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iras",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"avas",
+        substring_i: 47,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"es",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ardes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erdes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irdes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ares",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eres",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ires",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"asses",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"esses",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isses",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"astes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"estes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"istes",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"is",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ais",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eis",
+        substring_i: 71,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"areis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ereis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ireis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1reis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9reis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadreis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1sseis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9sseis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadsseis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1veis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadeis",
+        substring_i: 73,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc3\xadeis",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xadeis",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xadeis",
+        substring_i: 84,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ados",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"idos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"amos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1ramos",
+        substring_i: 90,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9ramos",
+        substring_i: 90,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadramos",
+        substring_i: 90,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1vamos",
+        substring_i: 90,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadamos",
+        substring_i: 90,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc3\xadamos",
+        substring_i: 95,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xadamos",
+        substring_i: 95,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xadamos",
+        substring_i: 95,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"emos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aremos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eremos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iremos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1ssemos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaassemos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xadssemos",
+        substring_i: 99,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"imos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"armos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ermos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irmos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1mos",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc3\xa1s",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xa1s",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xa1s",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eu",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iu",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ou",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ar\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"a", substring_i: -1, result: 1, function: None },
-    Among { s: b"i", substring_i: -1, result: 1, function: None },
-    Among { s: b"o", substring_i: -1, result: 1, function: None },
-    Among { s: b"os", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xad", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xb3", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"os",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xad",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"e", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa7", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaa", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa7",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaa",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_prelude(z: &mut Env) -> i32 {
@@ -254,29 +1220,23 @@ fn r_prelude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_0);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_0);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_1);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_1);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -425,29 +1385,23 @@ fn r_postlude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_2);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_2);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_3);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_3);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -556,7 +1510,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 let m1 = z.l - z.c;
                 z.ket = z.c;
                 'lab0: {
-                    if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (4718616 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 1 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 3
+                        || (4718616 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         z.c = z.l - m1;
                         break 'lab0;
                     }
@@ -671,7 +1628,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 let m3 = z.l - z.c;
                 z.ket = z.c;
                 'lab2: {
-                    if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 1 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 3
+                        || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         z.c = z.l - m3;
                         break 'lab2;
                     }
@@ -881,11 +1841,9 @@ fn r_residual_form(z: &mut Env) -> i32 {
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_10);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_10);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}

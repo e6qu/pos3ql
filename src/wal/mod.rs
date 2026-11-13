@@ -11561,9 +11561,8 @@ fn decode_op_inner<'a>(
                     init: read_i32(&mut at)?,
                     lexize: read_i32(&mut at)?,
                     kind: {
-                        let kind = crate::storage::TextSearchTemplateKind::from_code(
-                            *payload.get(at)?,
-                        )?;
+                        let kind =
+                            crate::storage::TextSearchTemplateKind::from_code(*payload.get(at)?)?;
                         at += 1;
                         kind
                     },

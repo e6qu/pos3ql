@@ -5,6 +5,10 @@
 //! Source SHA-256: 3f41ff503facb851e08eddb3f20ec7733fc15b3494d3ff3313212f070e852058
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"U";
@@ -24,63 +28,250 @@ const S_13: &[u8] = b"ig";
 const S_14: &[u8] = b"er";
 const S_15: &[u8] = b"en";
 
-const G_V: &[u8] = &[17, 65, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 32, 8];
+const G_V: &[u8] = &[
+    17, 65, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 32, 8,
+];
 const G_S_ENDING: &[u8] = &[117, 30, 5];
 const G_ST_ENDING: &[u8] = &[117, 30, 4];
 
 const A_0: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 5, function: None },
-    Among { s: b"ae", substring_i: 0, result: 2, function: None },
-    Among { s: b"oe", substring_i: 0, result: 3, function: None },
-    Among { s: b"qu", substring_i: 0, result: -1, function: None },
-    Among { s: b"ue", substring_i: 0, result: 4, function: None },
-    Among { s: b"\xc3\x9f", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"ae",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"oe",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"qu",
+        substring_i: 0,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ue",
+        substring_i: 0,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\x9f",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 5, function: None },
-    Among { s: b"U", substring_i: 0, result: 2, function: None },
-    Among { s: b"Y", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xa4", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xc3\xb6", substring_i: 0, result: 4, function: None },
-    Among { s: b"\xc3\xbc", substring_i: 0, result: 2, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"U",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"Y",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa4",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6",
+        substring_i: 0,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xbc",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"e", substring_i: -1, result: 3, function: None },
-    Among { s: b"em", substring_i: -1, result: 1, function: None },
-    Among { s: b"en", substring_i: -1, result: 3, function: None },
-    Among { s: b"erinnen", substring_i: 2, result: 2, function: None },
-    Among { s: b"erin", substring_i: -1, result: 2, function: None },
-    Among { s: b"ln", substring_i: -1, result: 5, function: None },
-    Among { s: b"ern", substring_i: -1, result: 2, function: None },
-    Among { s: b"er", substring_i: -1, result: 2, function: None },
-    Among { s: b"s", substring_i: -1, result: 4, function: None },
-    Among { s: b"es", substring_i: 8, result: 3, function: None },
-    Among { s: b"lns", substring_i: 8, result: 5, function: None },
+    Among {
+        s: b"e",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"em",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"en",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erinnen",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"erin",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ln",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"ern",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"er",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"s",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"es",
+        substring_i: 8,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"lns",
+        substring_i: 8,
+        result: 5,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"en", substring_i: -1, result: 1, function: None },
-    Among { s: b"er", substring_i: -1, result: 1, function: None },
-    Among { s: b"st", substring_i: -1, result: 2, function: None },
-    Among { s: b"est", substring_i: 2, result: 1, function: None },
+    Among {
+        s: b"en",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"er",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"st",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"est",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"ig", substring_i: -1, result: 1, function: None },
-    Among { s: b"lich", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ig",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"lich",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"end", substring_i: -1, result: 1, function: None },
-    Among { s: b"ig", substring_i: -1, result: 2, function: None },
-    Among { s: b"ung", substring_i: -1, result: 1, function: None },
-    Among { s: b"lich", substring_i: -1, result: 3, function: None },
-    Among { s: b"isch", substring_i: -1, result: 2, function: None },
-    Among { s: b"ik", substring_i: -1, result: 2, function: None },
-    Among { s: b"heit", substring_i: -1, result: 3, function: None },
-    Among { s: b"keit", substring_i: -1, result: 4, function: None },
+    Among {
+        s: b"end",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ig",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ung",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"lich",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"isch",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ik",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"heit",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"keit",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
 ];
 
 fn r_prelude(z: &mut Env) -> i32 {
@@ -161,45 +352,35 @@ fn r_prelude(z: &mut Env) -> i32 {
         'lab4: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_2);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_2);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_3);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_3);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.slice_from(S_4);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_4);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 4 => {
-                    {
-                        let ret = z.slice_from(S_5);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_5);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab4;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab4;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -275,45 +456,35 @@ fn r_postlude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_6);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_6);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_7);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_7);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.slice_from(S_8);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_8);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 4 => {
-                    {
-                        let ret = z.slice_from(S_9);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_9);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -339,7 +510,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
         let m1 = z.l - z.c;
         z.ket = z.c;
         'lab0: {
-            if z.c <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (811040 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+            if z.c <= z.lb
+                || z.byte(z.c - 1) >> 5 != 3
+                || (811040 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+            {
                 break 'lab0;
             }
             among_var = find_among_b(z, A_2);
@@ -376,11 +550,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_del();
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_del();
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
@@ -425,11 +597,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.slice_from(S_12);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_12);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 _ => {}
@@ -441,7 +611,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
         let m4 = z.l - z.c;
         z.ket = z.c;
         'lab3: {
-            if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (1327104 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+            if z.c - 1 <= z.lb
+                || z.byte(z.c - 1) >> 5 != 3
+                || (1327104 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+            {
                 break 'lab3;
             }
             among_var = find_among_b(z, A_3);
@@ -460,11 +633,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
             }
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_del();
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_del();
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
@@ -494,7 +665,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
         let m5 = z.l - z.c;
         z.ket = z.c;
         'lab4: {
-            if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (1051024 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+            if z.c - 1 <= z.lb
+                || z.byte(z.c - 1) >> 5 != 3
+                || (1051024 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+            {
                 break 'lab4;
             }
             among_var = find_among_b(z, A_5);

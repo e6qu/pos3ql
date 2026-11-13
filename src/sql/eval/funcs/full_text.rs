@@ -914,9 +914,7 @@ pub(crate) fn dispatch<'a>(
                         crate::sql::ast::TextSearchObjectKind::Configuration,
                         oid,
                     )
-                    .map(|definition| {
-                        crate::util::StackStr::from_str(definition.name().as_str())
-                    })
+                    .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
                 }
                 .ok_or_else(|| {
                     sql_err!(

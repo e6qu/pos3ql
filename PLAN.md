@@ -594,6 +594,14 @@ A user table's `tableoid` system column fails with `0A000`
 expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
+A `COPY FROM` row error carries no `CONTEXT` line (PostgreSQL adds
+`COPY t, line 3: "..."` or `COPY t, line 3, column c: "..."`), and
+`DROP TEXT SEARCH ... a, b` with several names fails with `42601` where
+PostgreSQL drops them together. The text search parser tokenizes common
+words, numbers, hosts, URLs, e-mail addresses, files and hyphenated words as
+PostgreSQL's `default` parser does, but is a reimplementation rather than a
+port of its state machine (`wparser_def.c`), so rarer token shapes can split
+differently.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)

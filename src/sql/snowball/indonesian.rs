@@ -5,6 +5,10 @@
 //! Source SHA-256: 940f4bfd30e36fd286afefd0ca8efd5554b0c25919da2b9fe6b74dae892da4a4
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"er";
@@ -18,45 +22,180 @@ const S_6: &[u8] = b"ajar";
 const G_VOWEL: &[u8] = &[17, 65, 16];
 
 const A_0: &[Among] = &[
-    Among { s: b"kah", substring_i: -1, result: 1, function: None },
-    Among { s: b"lah", substring_i: -1, result: 1, function: None },
-    Among { s: b"pun", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"kah",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"lah",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"pun",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"nya", substring_i: -1, result: 1, function: None },
-    Among { s: b"ku", substring_i: -1, result: 1, function: None },
-    Among { s: b"mu", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"nya",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ku",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"mu",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"i", substring_i: -1, result: 1, function: Some(r_suffix_i_ok) },
-    Among { s: b"an", substring_i: -1, result: 1, function: Some(r_suffix_an_ok) },
-    Among { s: b"kan", substring_i: 1, result: 1, function: Some(r_suffix_kan_ok) },
+    Among {
+        s: b"i",
+        substring_i: -1,
+        result: 1,
+        function: Some(r_suffix_i_ok),
+    },
+    Among {
+        s: b"an",
+        substring_i: -1,
+        result: 1,
+        function: Some(r_suffix_an_ok),
+    },
+    Among {
+        s: b"kan",
+        substring_i: 1,
+        result: 1,
+        function: Some(r_suffix_kan_ok),
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"di", substring_i: -1, result: 1, function: None },
-    Among { s: b"ke", substring_i: -1, result: 2, function: None },
-    Among { s: b"me", substring_i: -1, result: 1, function: None },
-    Among { s: b"mem", substring_i: 2, result: 5, function: None },
-    Among { s: b"men", substring_i: 2, result: 1, function: None },
-    Among { s: b"meng", substring_i: 4, result: 1, function: None },
-    Among { s: b"meny", substring_i: 4, result: 3, function: Some(r_vowel) },
-    Among { s: b"pem", substring_i: -1, result: 6, function: None },
-    Among { s: b"pen", substring_i: -1, result: 2, function: None },
-    Among { s: b"peng", substring_i: 8, result: 2, function: None },
-    Among { s: b"peny", substring_i: 8, result: 4, function: Some(r_vowel) },
-    Among { s: b"ter", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"di",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ke",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"me",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"mem",
+        substring_i: 2,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"men",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"meng",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"meny",
+        substring_i: 4,
+        result: 3,
+        function: Some(r_vowel),
+    },
+    Among {
+        s: b"pem",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"pen",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"peng",
+        substring_i: 8,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"peny",
+        substring_i: 8,
+        result: 4,
+        function: Some(r_vowel),
+    },
+    Among {
+        s: b"ter",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"be", substring_i: -1, result: 3, function: Some(r_ker) },
-    Among { s: b"belajar", substring_i: 0, result: 4, function: None },
-    Among { s: b"ber", substring_i: 0, result: 3, function: None },
-    Among { s: b"pe", substring_i: -1, result: 1, function: None },
-    Among { s: b"pelajar", substring_i: 3, result: 2, function: None },
-    Among { s: b"per", substring_i: 3, result: 1, function: None },
+    Among {
+        s: b"be",
+        substring_i: -1,
+        result: 3,
+        function: Some(r_ker),
+    },
+    Among {
+        s: b"belajar",
+        substring_i: 0,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ber",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"pe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"pelajar",
+        substring_i: 3,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"per",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_remove_particle(z: &mut Env) -> i32 {

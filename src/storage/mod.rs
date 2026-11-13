@@ -3904,7 +3904,9 @@ pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearc
         }
     };
     let mut simple_mappings = TextSearchMappings::EMPTY;
-    for token in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22] {
+    for token in [
+        1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
+    ] {
         simple_mappings.dictionaries[token - 1][0] = 3765;
         simple_mappings.counts[token - 1] = 1;
     }
@@ -3951,7 +3953,7 @@ pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearc
                 FIRST_SNOWBALL_DICTIONARY_OID + 2 * index as i32
             };
             let mut text = StackStr::<64>::new();
-            if (ordinal - 8) % 2 == 0 {
+            if (ordinal - 8).is_multiple_of(2) {
                 let stopwords = StopwordList::parse(language.name());
                 let mut options = StackStr::<512>::new();
                 let _ = write!(options, "language = '{}'", language.name());
@@ -4075,7 +4077,9 @@ impl TextSearchTemplateKind {
         (Self::Synonym, 3728, 3729),
         (Self::Ispell, 3731, 3732),
         (Self::Thesaurus, 3740, 3741),
-        (Self::Snowball, 13_232, 13_233),
+        // `snowball_create.sql` defines these after initdb imports collations;
+        // they are the OIDs `pg_proc` lists (catalog_callable_signatures.rs).
+        (Self::Snowball, 13_638, 13_639),
     ];
 
     /// The kind whose `init` and `lexize` routines these are; `init` is
@@ -4132,8 +4136,14 @@ impl TextSearchDictionaryBehavior {
             })
         };
         match self {
-            Self::Simple { accept, stopwords: list } => [0, u8::from(accept), stopwords(list)],
-            Self::Snowball { language, stopwords: list } => [
+            Self::Simple {
+                accept,
+                stopwords: list,
+            } => [0, u8::from(accept), stopwords(list)],
+            Self::Snowball {
+                language,
+                stopwords: list,
+            } => [
                 1,
                 crate::sql::snowball::SnowballLanguage::ALL
                     .iter()
@@ -4147,9 +4157,7 @@ impl TextSearchDictionaryBehavior {
     pub(crate) fn from_code(code: [u8; 3]) -> Option<Self> {
         let stopwords = match code[2] {
             0 => None,
-            list => Some(
-                *crate::sql::snowball::StopwordList::ALL.get(usize::from(list) - 1)?,
-            ),
+            list => Some(*crate::sql::snowball::StopwordList::ALL.get(usize::from(list) - 1)?),
         };
         match code[0] {
             0 if code[1] <= 1 => Some(Self::Simple {
@@ -22768,14 +22776,15 @@ impl Storage {
         .enumerate()
         {
             for ordinal in 0..BUILTIN_TEXT_SEARCH_OBJECTS {
-                text_search_objects[offset * BUILTIN_TEXT_SEARCH_OBJECTS + ordinal] = TextSearchDef {
-                    database,
-                    created_at: 0,
-                    definition: builtin_text_search_definition(ordinal)
-                        .expect("ordinal below the builtin count"),
-                    pending: None,
-                    ddl_state: CatalogDdlState::Present,
-                };
+                text_search_objects[offset * BUILTIN_TEXT_SEARCH_OBJECTS + ordinal] =
+                    TextSearchDef {
+                        database,
+                        created_at: 0,
+                        definition: builtin_text_search_definition(ordinal)
+                            .expect("ordinal below the builtin count"),
+                        pending: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
             }
         }
         let mut event_triggers =

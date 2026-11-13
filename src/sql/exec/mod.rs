@@ -43362,8 +43362,8 @@ fn text_search_support_routine(name: QualName<'_>) -> Result<i32, SqlError> {
         "dispell_lexize" => Ok(3732),
         "thesaurus_init" => Ok(3740),
         "thesaurus_lexize" => Ok(3741),
-        "dsnowball_init" => Ok(13_232),
-        "dsnowball_lexize" => Ok(13_233),
+        "dsnowball_init" => Ok(13_638),
+        "dsnowball_lexize" => Ok(13_639),
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "text search support routine {} is not executable",
@@ -43597,13 +43597,14 @@ pub fn create_text_search_template(
             .transpose()?
             .unwrap_or(0);
         let lexize = text_search_support_routine(command.lexize)?;
-        let kind = crate::storage::TextSearchTemplateKind::from_routines(init, lexize)
-            .ok_or_else(|| {
+        let kind = crate::storage::TextSearchTemplateKind::from_routines(init, lexize).ok_or_else(
+            || {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "text search template support routine combination is not executable"
                 )
-            })?;
+            },
+        )?;
         Ok(crate::storage::TextSearchDefinition::Template {
             schema,
             name,
@@ -43646,7 +43647,10 @@ impl DictionaryOptions {
     }
 
     fn push(&mut self, name: &str, value: &str) -> Result<(), SqlError> {
-        let slot = self.entries.get_mut(self.count).ok_or_else(Self::too_long)?;
+        let slot = self
+            .entries
+            .get_mut(self.count)
+            .ok_or_else(Self::too_long)?;
         *slot = (StackStr::from_str(name), StackStr::from_str(value));
         if slot.0.is_truncated() || slot.1.is_truncated() {
             return Err(Self::too_long());
@@ -43801,7 +43805,9 @@ fn dictionary_behavior(
     template: crate::storage::TextSearchDefinition,
     options: &DictionaryOptions,
 ) -> Result<crate::storage::TextSearchDictionaryBehavior, SqlError> {
-    use crate::storage::{TextSearchDictionaryBehavior as Behavior, TextSearchTemplateKind as Kind};
+    use crate::storage::{
+        TextSearchDictionaryBehavior as Behavior, TextSearchTemplateKind as Kind,
+    };
     let crate::storage::TextSearchDefinition::Template { kind, name, .. } = template else {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -43828,15 +43834,17 @@ fn dictionary_behavior(
                     }
                     "accept" if accept_loaded => return Err(multiple("Accept")),
                     "accept" => {
-                        accept = match value.to_ascii_lowercase().as_str() {
-                            "true" | "on" | "1" => true,
-                            "false" | "off" | "0" => false,
-                            _ => {
-                                return Err(sql_err!(
-                                    sqlstate::SYNTAX_ERROR,
-                                    "accept requires a Boolean value"
-                                ));
-                            }
+                        // `defGetBoolean`.
+                        let is = |word: &str| value.eq_ignore_ascii_case(word);
+                        accept = if is("true") || is("on") || value == "1" {
+                            true
+                        } else if is("false") || is("off") || value == "0" {
+                            false
+                        } else {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "accept requires a Boolean value"
+                            ));
                         };
                         accept_loaded = true;
                     }

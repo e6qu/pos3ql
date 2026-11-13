@@ -5,6 +5,10 @@
 //! Source SHA-256: ffce652bc929b093966913e88b907fb6dbaa39b2c2c853499dc2cf701a4fc5d5
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"a";
@@ -22,224 +26,1137 @@ const S_11: &[u8] = b"e";
 const S_12: &[u8] = b"a";
 const S_13: &[u8] = b"e";
 
-const G_V: &[u8] = &[17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 17, 36, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1];
+const G_V: &[u8] = &[
+    17, 65, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 17, 36, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0, 1,
+];
 
 const A_0: &[Among] = &[
-    Among { s: b"cs", substring_i: -1, result: -1, function: None },
-    Among { s: b"dzs", substring_i: -1, result: -1, function: None },
-    Among { s: b"gy", substring_i: -1, result: -1, function: None },
-    Among { s: b"ly", substring_i: -1, result: -1, function: None },
-    Among { s: b"ny", substring_i: -1, result: -1, function: None },
-    Among { s: b"sz", substring_i: -1, result: -1, function: None },
-    Among { s: b"ty", substring_i: -1, result: -1, function: None },
-    Among { s: b"zs", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"cs",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"dzs",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gy",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ly",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ny",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"sz",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ty",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"zs",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xc3\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"bb", substring_i: -1, result: -1, function: None },
-    Among { s: b"cc", substring_i: -1, result: -1, function: None },
-    Among { s: b"dd", substring_i: -1, result: -1, function: None },
-    Among { s: b"ff", substring_i: -1, result: -1, function: None },
-    Among { s: b"gg", substring_i: -1, result: -1, function: None },
-    Among { s: b"jj", substring_i: -1, result: -1, function: None },
-    Among { s: b"kk", substring_i: -1, result: -1, function: None },
-    Among { s: b"ll", substring_i: -1, result: -1, function: None },
-    Among { s: b"mm", substring_i: -1, result: -1, function: None },
-    Among { s: b"nn", substring_i: -1, result: -1, function: None },
-    Among { s: b"pp", substring_i: -1, result: -1, function: None },
-    Among { s: b"rr", substring_i: -1, result: -1, function: None },
-    Among { s: b"ccs", substring_i: -1, result: -1, function: None },
-    Among { s: b"ss", substring_i: -1, result: -1, function: None },
-    Among { s: b"zzs", substring_i: -1, result: -1, function: None },
-    Among { s: b"tt", substring_i: -1, result: -1, function: None },
-    Among { s: b"vv", substring_i: -1, result: -1, function: None },
-    Among { s: b"ggy", substring_i: -1, result: -1, function: None },
-    Among { s: b"lly", substring_i: -1, result: -1, function: None },
-    Among { s: b"nny", substring_i: -1, result: -1, function: None },
-    Among { s: b"tty", substring_i: -1, result: -1, function: None },
-    Among { s: b"ssz", substring_i: -1, result: -1, function: None },
-    Among { s: b"zz", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"bb",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"cc",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"dd",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ff",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"gg",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"jj",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"kk",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ll",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"mm",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"nn",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"pp",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"rr",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ccs",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ss",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"zzs",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tt",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vv",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ggy",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"lly",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"nny",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tty",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ssz",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"zz",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"al", substring_i: -1, result: 1, function: None },
-    Among { s: b"el", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"al",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"el",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"ba", substring_i: -1, result: -1, function: None },
-    Among { s: b"ra", substring_i: -1, result: -1, function: None },
-    Among { s: b"be", substring_i: -1, result: -1, function: None },
-    Among { s: b"re", substring_i: -1, result: -1, function: None },
-    Among { s: b"ig", substring_i: -1, result: -1, function: None },
-    Among { s: b"nak", substring_i: -1, result: -1, function: None },
-    Among { s: b"nek", substring_i: -1, result: -1, function: None },
-    Among { s: b"val", substring_i: -1, result: -1, function: None },
-    Among { s: b"vel", substring_i: -1, result: -1, function: None },
-    Among { s: b"ul", substring_i: -1, result: -1, function: None },
-    Among { s: b"b\xc5\x91l", substring_i: -1, result: -1, function: None },
-    Among { s: b"r\xc5\x91l", substring_i: -1, result: -1, function: None },
-    Among { s: b"t\xc5\x91l", substring_i: -1, result: -1, function: None },
-    Among { s: b"n\xc3\xa1l", substring_i: -1, result: -1, function: None },
-    Among { s: b"n\xc3\xa9l", substring_i: -1, result: -1, function: None },
-    Among { s: b"b\xc3\xb3l", substring_i: -1, result: -1, function: None },
-    Among { s: b"r\xc3\xb3l", substring_i: -1, result: -1, function: None },
-    Among { s: b"t\xc3\xb3l", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xc3\xbcl", substring_i: -1, result: -1, function: None },
-    Among { s: b"n", substring_i: -1, result: -1, function: None },
-    Among { s: b"an", substring_i: 19, result: -1, function: None },
-    Among { s: b"ban", substring_i: 20, result: -1, function: None },
-    Among { s: b"en", substring_i: 19, result: -1, function: None },
-    Among { s: b"ben", substring_i: 22, result: -1, function: None },
-    Among { s: b"k\xc3\xa9ppen", substring_i: 22, result: -1, function: None },
-    Among { s: b"on", substring_i: 19, result: -1, function: None },
-    Among { s: b"\xc3\xb6n", substring_i: 19, result: -1, function: None },
-    Among { s: b"k\xc3\xa9pp", substring_i: -1, result: -1, function: None },
-    Among { s: b"kor", substring_i: -1, result: -1, function: None },
-    Among { s: b"t", substring_i: -1, result: -1, function: None },
-    Among { s: b"at", substring_i: 29, result: -1, function: None },
-    Among { s: b"et", substring_i: 29, result: -1, function: None },
-    Among { s: b"k\xc3\xa9nt", substring_i: 29, result: -1, function: None },
-    Among { s: b"ank\xc3\xa9nt", substring_i: 32, result: -1, function: None },
-    Among { s: b"enk\xc3\xa9nt", substring_i: 32, result: -1, function: None },
-    Among { s: b"onk\xc3\xa9nt", substring_i: 32, result: -1, function: None },
-    Among { s: b"ot", substring_i: 29, result: -1, function: None },
-    Among { s: b"\xc3\xa9rt", substring_i: 29, result: -1, function: None },
-    Among { s: b"\xc3\xb6t", substring_i: 29, result: -1, function: None },
-    Among { s: b"hez", substring_i: -1, result: -1, function: None },
-    Among { s: b"hoz", substring_i: -1, result: -1, function: None },
-    Among { s: b"h\xc3\xb6z", substring_i: -1, result: -1, function: None },
-    Among { s: b"v\xc3\xa1", substring_i: -1, result: -1, function: None },
-    Among { s: b"v\xc3\xa9", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"ba",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ra",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"be",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"re",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ig",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"nak",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"nek",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"val",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"vel",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ul",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"b\xc5\x91l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"r\xc5\x91l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"t\xc5\x91l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"n\xc3\xa1l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"n\xc3\xa9l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"b\xc3\xb3l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"r\xc3\xb3l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"t\xc3\xb3l",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xbcl",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"n",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"an",
+        substring_i: 19,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ban",
+        substring_i: 20,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"en",
+        substring_i: 19,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ben",
+        substring_i: 22,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"k\xc3\xa9ppen",
+        substring_i: 22,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"on",
+        substring_i: 19,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6n",
+        substring_i: 19,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"k\xc3\xa9pp",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"kor",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"t",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"at",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"et",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"k\xc3\xa9nt",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ank\xc3\xa9nt",
+        substring_i: 32,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"enk\xc3\xa9nt",
+        substring_i: 32,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"onk\xc3\xa9nt",
+        substring_i: 32,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ot",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9rt",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6t",
+        substring_i: 29,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"hez",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"hoz",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"h\xc3\xb6z",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"v\xc3\xa1",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"v\xc3\xa9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"\xc3\xa1n", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc3\xa9n", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1nk\xc3\xa9nt", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xc3\xa1n",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9n",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1nk\xc3\xa9nt",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"stul", substring_i: -1, result: 1, function: None },
-    Among { s: b"astul", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xa1stul", substring_i: 0, result: 2, function: None },
-    Among { s: b"st\xc3\xbcl", substring_i: -1, result: 1, function: None },
-    Among { s: b"est\xc3\xbcl", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xc3\xa9st\xc3\xbcl", substring_i: 3, result: 3, function: None },
+    Among {
+        s: b"stul",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"astul",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1stul",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"st\xc3\xbcl",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"est\xc3\xbcl",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9st\xc3\xbcl",
+        substring_i: 3,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"\xc3\xa1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xc3\xa1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"k", substring_i: -1, result: 3, function: None },
-    Among { s: b"ak", substring_i: 0, result: 3, function: None },
-    Among { s: b"ek", substring_i: 0, result: 3, function: None },
-    Among { s: b"ok", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xc3\xa1k", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xc3\xa9k", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xc3\xb6k", substring_i: 0, result: 3, function: None },
+    Among {
+        s: b"k",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ak",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ek",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ok",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1k",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9k",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6k",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_9: &[Among] = &[
-    Among { s: b"\xc3\xa9i", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1\xc3\xa9i", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xc3\xa9\xc3\xa9i", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 1, function: None },
-    Among { s: b"k\xc3\xa9", substring_i: 3, result: 1, function: None },
-    Among { s: b"ak\xc3\xa9", substring_i: 4, result: 1, function: None },
-    Among { s: b"ek\xc3\xa9", substring_i: 4, result: 1, function: None },
-    Among { s: b"ok\xc3\xa9", substring_i: 4, result: 1, function: None },
-    Among { s: b"\xc3\xa1k\xc3\xa9", substring_i: 4, result: 3, function: None },
-    Among { s: b"\xc3\xa9k\xc3\xa9", substring_i: 4, result: 2, function: None },
-    Among { s: b"\xc3\xb6k\xc3\xa9", substring_i: 4, result: 1, function: None },
-    Among { s: b"\xc3\xa9\xc3\xa9", substring_i: 3, result: 2, function: None },
+    Among {
+        s: b"\xc3\xa9i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1\xc3\xa9i",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9\xc3\xa9i",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"k\xc3\xa9",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ak\xc3\xa9",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ek\xc3\xa9",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ok\xc3\xa9",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1k\xc3\xa9",
+        substring_i: 4,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9k\xc3\xa9",
+        substring_i: 4,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6k\xc3\xa9",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9\xc3\xa9",
+        substring_i: 3,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_10: &[Among] = &[
-    Among { s: b"a", substring_i: -1, result: 1, function: None },
-    Among { s: b"ja", substring_i: 0, result: 1, function: None },
-    Among { s: b"d", substring_i: -1, result: 1, function: None },
-    Among { s: b"ad", substring_i: 2, result: 1, function: None },
-    Among { s: b"ed", substring_i: 2, result: 1, function: None },
-    Among { s: b"od", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xc3\xa1d", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xc3\xa9d", substring_i: 2, result: 3, function: None },
-    Among { s: b"\xc3\xb6d", substring_i: 2, result: 1, function: None },
-    Among { s: b"e", substring_i: -1, result: 1, function: None },
-    Among { s: b"je", substring_i: 9, result: 1, function: None },
-    Among { s: b"nk", substring_i: -1, result: 1, function: None },
-    Among { s: b"unk", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xc3\xa1nk", substring_i: 11, result: 2, function: None },
-    Among { s: b"\xc3\xa9nk", substring_i: 11, result: 3, function: None },
-    Among { s: b"\xc3\xbcnk", substring_i: 11, result: 1, function: None },
-    Among { s: b"uk", substring_i: -1, result: 1, function: None },
-    Among { s: b"juk", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xc3\xa1juk", substring_i: 17, result: 2, function: None },
-    Among { s: b"\xc3\xbck", substring_i: -1, result: 1, function: None },
-    Among { s: b"j\xc3\xbck", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xc3\xa9j\xc3\xbck", substring_i: 20, result: 3, function: None },
-    Among { s: b"m", substring_i: -1, result: 1, function: None },
-    Among { s: b"am", substring_i: 22, result: 1, function: None },
-    Among { s: b"em", substring_i: 22, result: 1, function: None },
-    Among { s: b"om", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xc3\xa1m", substring_i: 22, result: 2, function: None },
-    Among { s: b"\xc3\xa9m", substring_i: 22, result: 3, function: None },
-    Among { s: b"o", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xa1", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"a",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ja",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"d",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ad",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ed",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"od",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1d",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9d",
+        substring_i: 2,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xb6d",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"e",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"je",
+        substring_i: 9,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"nk",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"unk",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1nk",
+        substring_i: 11,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9nk",
+        substring_i: 11,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xbcnk",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"uk",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"juk",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1juk",
+        substring_i: 17,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xbck",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"j\xc3\xbck",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9j\xc3\xbck",
+        substring_i: 20,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"m",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"am",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"em",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"om",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1m",
+        substring_i: 22,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9m",
+        substring_i: 22,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"o",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_11: &[Among] = &[
-    Among { s: b"id", substring_i: -1, result: 1, function: None },
-    Among { s: b"aid", substring_i: 0, result: 1, function: None },
-    Among { s: b"jaid", substring_i: 1, result: 1, function: None },
-    Among { s: b"eid", substring_i: 0, result: 1, function: None },
-    Among { s: b"jeid", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xc3\xa1id", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xc3\xa9id", substring_i: 0, result: 3, function: None },
-    Among { s: b"i", substring_i: -1, result: 1, function: None },
-    Among { s: b"ai", substring_i: 7, result: 1, function: None },
-    Among { s: b"jai", substring_i: 8, result: 1, function: None },
-    Among { s: b"ei", substring_i: 7, result: 1, function: None },
-    Among { s: b"jei", substring_i: 10, result: 1, function: None },
-    Among { s: b"\xc3\xa1i", substring_i: 7, result: 2, function: None },
-    Among { s: b"\xc3\xa9i", substring_i: 7, result: 3, function: None },
-    Among { s: b"itek", substring_i: -1, result: 1, function: None },
-    Among { s: b"eitek", substring_i: 14, result: 1, function: None },
-    Among { s: b"jeitek", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xc3\xa9itek", substring_i: 14, result: 3, function: None },
-    Among { s: b"ik", substring_i: -1, result: 1, function: None },
-    Among { s: b"aik", substring_i: 18, result: 1, function: None },
-    Among { s: b"jaik", substring_i: 19, result: 1, function: None },
-    Among { s: b"eik", substring_i: 18, result: 1, function: None },
-    Among { s: b"jeik", substring_i: 21, result: 1, function: None },
-    Among { s: b"\xc3\xa1ik", substring_i: 18, result: 2, function: None },
-    Among { s: b"\xc3\xa9ik", substring_i: 18, result: 3, function: None },
-    Among { s: b"ink", substring_i: -1, result: 1, function: None },
-    Among { s: b"aink", substring_i: 25, result: 1, function: None },
-    Among { s: b"jaink", substring_i: 26, result: 1, function: None },
-    Among { s: b"eink", substring_i: 25, result: 1, function: None },
-    Among { s: b"jeink", substring_i: 28, result: 1, function: None },
-    Among { s: b"\xc3\xa1ink", substring_i: 25, result: 2, function: None },
-    Among { s: b"\xc3\xa9ink", substring_i: 25, result: 3, function: None },
-    Among { s: b"aitok", substring_i: -1, result: 1, function: None },
-    Among { s: b"jaitok", substring_i: 32, result: 1, function: None },
-    Among { s: b"\xc3\xa1itok", substring_i: -1, result: 2, function: None },
-    Among { s: b"im", substring_i: -1, result: 1, function: None },
-    Among { s: b"aim", substring_i: 35, result: 1, function: None },
-    Among { s: b"jaim", substring_i: 36, result: 1, function: None },
-    Among { s: b"eim", substring_i: 35, result: 1, function: None },
-    Among { s: b"jeim", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xc3\xa1im", substring_i: 35, result: 2, function: None },
-    Among { s: b"\xc3\xa9im", substring_i: 35, result: 3, function: None },
+    Among {
+        s: b"id",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aid",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jaid",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eid",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jeid",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1id",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9id",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ai",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jai",
+        substring_i: 8,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ei",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jei",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1i",
+        substring_i: 7,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9i",
+        substring_i: 7,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"itek",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eitek",
+        substring_i: 14,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jeitek",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9itek",
+        substring_i: 14,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ik",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aik",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jaik",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eik",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jeik",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1ik",
+        substring_i: 18,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9ik",
+        substring_i: 18,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ink",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aink",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jaink",
+        substring_i: 26,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eink",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jeink",
+        substring_i: 28,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1ink",
+        substring_i: 25,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9ink",
+        substring_i: 25,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"aitok",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jaitok",
+        substring_i: 32,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1itok",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"im",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"aim",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jaim",
+        substring_i: 36,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"eim",
+        substring_i: 35,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"jeim",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa1im",
+        substring_i: 35,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9im",
+        substring_i: 35,
+        result: 3,
+        function: None,
+    },
 ];
 
 fn r_mark_regions(z: &mut Env) -> i32 {
@@ -258,7 +1175,10 @@ fn r_mark_regions(z: &mut Env) -> i32 {
                     {
                         let c2 = z.c;
                         'lab3: {
-                            if z.c + 1 >= z.l || z.byte(z.c + 1) >> 5 != 3 || (101187584 >> (z.byte(z.c + 1) & 31)) & 1 == 0 {
+                            if z.c + 1 >= z.l
+                                || z.byte(z.c + 1) >> 5 != 3
+                                || (101187584 >> (z.byte(z.c + 1) & 31)) & 1 == 0
+                            {
                                 break 'lab3;
                             }
                             if find_among(z, A_0) == 0 {
@@ -319,19 +1239,15 @@ fn r_v_ending(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_0);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_0);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_1);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_1);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -342,7 +1258,10 @@ fn r_v_ending(z: &mut Env) -> i32 {
 fn r_double(z: &mut Env) -> i32 {
     {
         let m_test1 = z.l - z.c;
-        if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (106790108 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+        if z.c - 1 <= z.lb
+            || z.byte(z.c - 1) >> 5 != 3
+            || (106790108 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+        {
             return 0;
         }
         if find_among_b(z, A_2) == 0 {
@@ -461,19 +1380,15 @@ fn r_case_special(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_2);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_2);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_3);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_3);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -500,27 +1415,21 @@ fn r_case_other(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_4);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_4);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_5);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_5);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -583,27 +1492,21 @@ fn r_plural(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_6);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_6);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_7);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_7);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -630,27 +1533,21 @@ fn r_owned(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_8);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_8);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_9);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_9);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -674,27 +1571,21 @@ fn r_sing_owner(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_10);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_10);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_11);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_11);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -721,27 +1612,21 @@ fn r_plur_owner(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_del();
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_del();
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_12);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_12);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_13);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_13);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}

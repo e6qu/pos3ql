@@ -5,6 +5,10 @@
 //! Source SHA-256: baead1d30454b902da94e1521e79695cba6bbdc736465f895c3c12f16f22c173
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among_b};
 
 const S_0: &[u8] = b"\xce\xb1";
@@ -119,607 +123,3042 @@ const G_V: &[u8] = &[81, 65, 16, 1];
 const G_V2: &[u8] = &[81, 65, 0, 1];
 
 const A_0: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 25, function: None },
-    Among { s: b"\xcf\x82", substring_i: 0, result: 18, function: None },
-    Among { s: b"\xce\x86", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\x88", substring_i: 0, result: 5, function: None },
-    Among { s: b"\xce\x89", substring_i: 0, result: 7, function: None },
-    Among { s: b"\xce\x8a", substring_i: 0, result: 9, function: None },
-    Among { s: b"\xcf\x8a", substring_i: 0, result: 7, function: None },
-    Among { s: b"\xcf\x8b", substring_i: 0, result: 20, function: None },
-    Among { s: b"\xce\x8c", substring_i: 0, result: 15, function: None },
-    Among { s: b"\xcf\x8c", substring_i: 0, result: 15, function: None },
-    Among { s: b"\xcf\x8d", substring_i: 0, result: 20, function: None },
-    Among { s: b"\xce\x8e", substring_i: 0, result: 20, function: None },
-    Among { s: b"\xcf\x8e", substring_i: 0, result: 24, function: None },
-    Among { s: b"\xce\x8f", substring_i: 0, result: 24, function: None },
-    Among { s: b"\xce\x90", substring_i: 0, result: 7, function: None },
-    Among { s: b"\xce\x91", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\x92", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xce\x93", substring_i: 0, result: 3, function: None },
-    Among { s: b"\xce\x94", substring_i: 0, result: 4, function: None },
-    Among { s: b"\xce\x95", substring_i: 0, result: 5, function: None },
-    Among { s: b"\xce\x96", substring_i: 0, result: 6, function: None },
-    Among { s: b"\xce\x97", substring_i: 0, result: 7, function: None },
-    Among { s: b"\xce\x98", substring_i: 0, result: 8, function: None },
-    Among { s: b"\xce\x99", substring_i: 0, result: 9, function: None },
-    Among { s: b"\xce\x9a", substring_i: 0, result: 10, function: None },
-    Among { s: b"\xce\x9b", substring_i: 0, result: 11, function: None },
-    Among { s: b"\xce\x9c", substring_i: 0, result: 12, function: None },
-    Among { s: b"\xce\x9d", substring_i: 0, result: 13, function: None },
-    Among { s: b"\xce\x9e", substring_i: 0, result: 14, function: None },
-    Among { s: b"\xce\x9f", substring_i: 0, result: 15, function: None },
-    Among { s: b"\xce\xa0", substring_i: 0, result: 16, function: None },
-    Among { s: b"\xce\xa1", substring_i: 0, result: 17, function: None },
-    Among { s: b"\xce\xa3", substring_i: 0, result: 18, function: None },
-    Among { s: b"\xce\xa4", substring_i: 0, result: 19, function: None },
-    Among { s: b"\xce\xa5", substring_i: 0, result: 20, function: None },
-    Among { s: b"\xce\xa6", substring_i: 0, result: 21, function: None },
-    Among { s: b"\xce\xa7", substring_i: 0, result: 22, function: None },
-    Among { s: b"\xce\xa8", substring_i: 0, result: 23, function: None },
-    Among { s: b"\xce\xa9", substring_i: 0, result: 24, function: None },
-    Among { s: b"\xce\xaa", substring_i: 0, result: 9, function: None },
-    Among { s: b"\xce\xab", substring_i: 0, result: 20, function: None },
-    Among { s: b"\xce\xac", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xad", substring_i: 0, result: 5, function: None },
-    Among { s: b"\xce\xae", substring_i: 0, result: 7, function: None },
-    Among { s: b"\xce\xaf", substring_i: 0, result: 9, function: None },
-    Among { s: b"\xce\xb0", substring_i: 0, result: 20, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 25,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x82",
+        substring_i: 0,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x86",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x88",
+        substring_i: 0,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x89",
+        substring_i: 0,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x8a",
+        substring_i: 0,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x8a",
+        substring_i: 0,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x8b",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x8c",
+        substring_i: 0,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x8c",
+        substring_i: 0,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x8d",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x8e",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x8e",
+        substring_i: 0,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x8f",
+        substring_i: 0,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x90",
+        substring_i: 0,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x91",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x92",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x93",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x94",
+        substring_i: 0,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x95",
+        substring_i: 0,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x96",
+        substring_i: 0,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x97",
+        substring_i: 0,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x98",
+        substring_i: 0,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x99",
+        substring_i: 0,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9a",
+        substring_i: 0,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9b",
+        substring_i: 0,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9c",
+        substring_i: 0,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9d",
+        substring_i: 0,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9e",
+        substring_i: 0,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"\xce\x9f",
+        substring_i: 0,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa0",
+        substring_i: 0,
+        result: 16,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa1",
+        substring_i: 0,
+        result: 17,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa3",
+        substring_i: 0,
+        result: 18,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa4",
+        substring_i: 0,
+        result: 19,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa5",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa6",
+        substring_i: 0,
+        result: 21,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa7",
+        substring_i: 0,
+        result: 22,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa8",
+        substring_i: 0,
+        result: 23,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xa9",
+        substring_i: 0,
+        result: 24,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xaa",
+        substring_i: 0,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xab",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xac",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xad",
+        substring_i: 0,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xae",
+        substring_i: 0,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xaf",
+        substring_i: 0,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb0",
+        substring_i: 0,
+        result: 20,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x83", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xcf\x86\xcf\x89\xcf\x83", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x83", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x83", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x83", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xcf\x86\xcf\x89\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x83", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xce\xb1", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xcf\x86\xcf\x89\xcf\x84\xce\xb1", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb1", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb1", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xce\xb1", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xce\xb1", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xce\xb1", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xce\xb1", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xce\xb1", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xce\xb1", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb7", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xcf\x86\xcf\x89\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 9, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 11, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x83",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x89\xcf\x83",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x89\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x89\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xce\xb7",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb5\xcf\x83\xcf\x84\xcf\x89\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x89\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb5\xcf\x81\xce\xb1\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xb5\xce\xb1\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xce\xb3\xce\xbf\xce\xbd\xce\xbf\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xce\xb3\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xb1\xce\xb3\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb1\xcf\x84\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf\xce\xb3\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb9\xce\xbc\xcf\x80", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x80\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xcf\x81", substring_i: 3, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xbb\xcf\x85\xce\xba\xcf\x85\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xce\xbb\xcf\x85\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xcf\x80\xce\xb1\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xba\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xcf\x80\xce\xb9\xcf\x80\xce\xb5\xcf\x81\xce\xbf\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xb2\xce\xbf\xce\xbb\xce\xb2\xce\xbf\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xbb\xcf\x85\xce\xba\xce\xbf\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xbb\xce\xbf\xcf\x85", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb1", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xce\xb2", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xce\xb8\xcf\x85\xcf\x81\xce\xb9", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xcf\x81\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xcf\x81\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xcf\x81\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: 29, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbc\xcf\x80",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xcf\x81",
+        substring_i: 3,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xbb\xcf\x85\xce\xba\xcf\x85\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xce\xbb\xcf\x85\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xcf\x80\xce\xb1\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xba\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb9\xcf\x80\xce\xb5\xcf\x81\xce\xbf\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xbf\xce\xbb\xce\xb2\xce\xbf\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xbb\xcf\x85\xce\xba\xce\xbf\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb1",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xce\xb8\xcf\x85\xcf\x81\xce\xb9",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xcf\x81\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xcf\x81\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xcf\x81\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb5\xce\xb9\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xcf\x89", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb1\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb5\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb5\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb5\xce\xb9\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xcf\x89",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb5\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb5\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb6\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb6\xcf\x89", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb6\xcf\x89",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbb\xce\xb1\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb4\xce\xb7\xce\xbc\xce\xbf\xce\xba\xcf\x81\xce\xb1\xcf\x84", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x86", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xb9\xce\xb3\xce\xb1\xce\xbd\xcf\x84\xce\xbf\xce\xb1\xcf\x86", substring_i: 3, result: 2, function: None },
-    Among { s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb1\xcf\x81\xcf\x84\xce\xbf\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbe\xce\xb1\xcf\x81\xcf\x87\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb5", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb5\xcf\x80\xce\xb5", substring_i: 13, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xb5", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xba\xce\xb5", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5", substring_i: 18, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5", substring_i: 18, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xb5\xce\xba\xce\xbb\xce\xb5", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5", substring_i: 18, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xcf\x85\xce\xba\xce\xb1\xce\xbc", substring_i: 25, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xce\xbc", substring_i: 25, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: 29, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb7\xce\xbc\xce\xbf\xce\xba\xcf\x81\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x86",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb9\xce\xb3\xce\xb1\xce\xbd\xcf\x84\xce\xbf\xce\xb1\xcf\x86",
+        substring_i: 3,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb1\xcf\x81\xcf\x84\xce\xbf\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbe\xce\xb1\xcf\x81\xcf\x87\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb5",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb5\xcf\x80\xce\xb5",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xba\xce\xb5",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xb5\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xcf\x85\xce\xba\xce\xb1\xce\xbc",
+        substring_i: 25,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xce\xbc",
+        substring_i: 25,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb1\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb1\xcf\x81\xcf\x84\xce\xbf\xcf\x80\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbe\xce\xb1\xcf\x81\xcf\x87\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb5", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb5\xcf\x80\xce\xb5", substring_i: 8, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xb5\xce\xba\xce\xbb\xce\xb5", substring_i: 13, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5", substring_i: 11, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: 17, result: 1, function: None },
+    Among {
+        s: b"\xce\xbe\xce\xb1\xce\xbd\xce\xb1\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x81\xce\xb9\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb1\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb1\xcf\x81\xcf\x84\xce\xbf\xcf\x80\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbe\xce\xb1\xcf\x81\xcf\x87\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb5",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb5\xcf\x80\xce\xb5",
+        substring_i: 8,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xb5\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 11,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: 17,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_9: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb5\xce\xb9\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x89", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb5\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xb5\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb5\xce\xb9\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x89",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb5\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xb5\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_10: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb5\xcf\x85\xcf\x80", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x80", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xce\xb5\xce\xbc\xcf\x80", substring_i: 0, result: 2, function: None },
-    Among { s: b"\xce\xb3\xcf\x85\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x87\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x87\xcf\x89\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xbf\xcf\x81", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x87\xcf\x84", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x87\xcf\x84", substring_i: 9, result: 2, function: None },
-    Among { s: b"\xce\xba\xcf\x84", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xba\xcf\x84", substring_i: 11, result: 2, function: None },
-    Among { s: b"\xcf\x83\xcf\x87", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xcf\x87", substring_i: 13, result: 2, function: None },
-    Among { s: b"\xcf\x84\xce\xb1\xcf\x87", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x85\xcf\x88", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x84\xce\xb1", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x86\xce\xb1", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb7\xcf\x86\xce\xb1", substring_i: 18, result: 2, function: None },
-    Among { s: b"\xce\xbb\xcf\x85\xce\xb3", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xce\xb3", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb7\xce\xb4", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xce\xb5", substring_i: 23, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5", substring_i: 26, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x87\xce\xb8", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xcf\x85\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x86\xce\xb9\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xce\xbc", substring_i: 36, result: 2, function: None },
-    Among { s: b"\xce\xb1\xcf\x87\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x85\xcf\x80",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc\xcf\x80",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xcf\x85\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xcf\x89\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbf\xcf\x81",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xcf\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x87\xcf\x84",
+        substring_i: 9,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x84",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xba\xcf\x84",
+        substring_i: 11,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x87",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xcf\x87",
+        substring_i: 13,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb1\xcf\x87",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x88",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x86\xce\xb1",
+        substring_i: 18,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xcf\x85\xce\xb3",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xce\xb3",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb4",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xce\xb5",
+        substring_i: 23,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xcf\x89\xce\xba\xce\xbb\xce\xb5",
+        substring_i: 26,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x87\xce\xb8",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb9\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xce\xbc",
+        substring_i: 36,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x87\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb8\xcf\x81\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_11: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb7\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb7", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb7\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xb7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xcf\x84\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_12: &[Among] = &[
-    Among { s: b"\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb1\xcf\x83\xce\xb5", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb9\xce\xba\xcf\x81\xce\xbf\xcf\x83\xce\xb5", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xb3\xce\xba\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xb4\xce\xb1\xce\xbd\xce\xb5", substring_i: 5, result: 2, function: None },
+    Among {
+        s: b"\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xcf\x84\xce\xb1\xcf\x83\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb9\xce\xba\xcf\x81\xce\xbf\xcf\x83\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb3\xce\xba\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xb4\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: 5,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_13: &[Among] = &[
-    Among { s: b"\xcf\x84\xce\xbf\xcf\x80\xce\xb9\xce\xba", substring_i: -1, result: 7, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xb5\xcf\x80\xcf\x84\xce\xb9\xce\xba", substring_i: -1, result: 6, function: None },
-    Among { s: b"\xce\xb3\xce\xbd\xcf\x89\xcf\x83\xcf\x84\xce\xb9\xce\xba", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xbd\xcf\x89\xcf\x83\xcf\x84\xce\xb9\xce\xba", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5\xce\xba\xcf\x84\xce\xb9\xce\xba", substring_i: -1, result: 5, function: None },
-    Among { s: b"\xce\xb1\xcf\x84\xce\xbf\xce\xbc\xce\xb9\xce\xba", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb5\xce\xb8\xce\xbd\xce\xb9\xce\xba", substring_i: -1, result: 4, function: None },
-    Among { s: b"\xce\xb8\xce\xb5\xce\xb1\xcf\x84\xcf\x81\xce\xb9\xce\xbd", substring_i: -1, result: 10, function: None },
-    Among { s: b"\xce\xb1\xce\xbb\xce\xb5\xce\xbe\xce\xb1\xce\xbd\xce\xb4\xcf\x81\xce\xb9\xce\xbd", substring_i: -1, result: 8, function: None },
-    Among { s: b"\xce\xb2\xcf\x85\xce\xb6\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xbd", substring_i: -1, result: 9, function: None },
+    Among {
+        s: b"\xcf\x84\xce\xbf\xcf\x80\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xb5\xcf\x80\xcf\x84\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xbd\xcf\x89\xcf\x83\xcf\x84\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xbd\xcf\x89\xcf\x83\xcf\x84\xce\xb9\xce\xba",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb5\xce\xba\xcf\x84\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x84\xce\xbf\xce\xbc\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb8\xce\xbd\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb8\xce\xb5\xce\xb1\xcf\x84\xcf\x81\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb\xce\xb5\xce\xbe\xce\xb1\xce\xbd\xce\xb4\xcf\x81\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xcf\x85\xce\xb6\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 9,
+        function: None,
+    },
 ];
 
 const A_14: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xbc\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_15: &[Among] = &[
-    Among { s: b"\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_16: &[Among] = &[
-    Among { s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb1\xce\xba\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb1\xce\xba\xce\xb9", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb1\xce\xba\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb1\xce\xba\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_17: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xcf\x84\xcf\x81\xce\xb1\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xcf\x81", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb1\xce\xb2\xcf\x81", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb2\xcf\x81", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x84\xce\xb5\xcf\x81", substring_i: 2, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xcf\x81", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb8\xcf\x81", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xcf\x81", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb1\xce\xb3\xce\xba\xce\xb1\xcf\x83", substring_i: 10, result: 1, function: None },
-    Among { s: b"\xcf\x84\xce\xbf\xcf\x83", substring_i: 10, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xbf\xcf\x85\xcf\x83\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x81\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x86", substring_i: 15, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbb\xce\xb9\xcf\x83\xcf\x86", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xce\xbd\xcf\x85\xcf\x86", substring_i: 15, result: 2, function: None },
-    Among { s: b"\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xce\xbc\xce\xb2", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xbb\xce\xbf\xce\xb2", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x83\xce\xb5\xcf\x87\xce\xbf\xcf\x83\xce\xbb\xce\xbf\xce\xb2", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xcf\x81\xce\xb4", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb6", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x84\xce\xb6", substring_i: 25, result: 1, function: None },
-    Among { s: b"\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba", substring_i: 27, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xcf\x80\xce\xb1\xce\xba", substring_i: 27, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xbf\xce\xba", substring_i: 27, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xbf\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x84\xcf\x81\xce\xb9\xcf\x80\xce\xbf\xce\xbb", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xcf\x81\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb9\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbb\xce\xb9\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xba\xcf\x81\xcf\x85\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xcf\x83\xcf\x80\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xb9\xce\xb1\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xb7\xce\xb3\xce\xbf\xcf\x85\xce\xbc\xce\xb5\xce\xbd", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xcf\x84\xcf\x81\xce\xb1\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xcf\x81",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb1\xce\xb2\xcf\x81",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb2\xcf\x81",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: 2,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xcf\x81",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb8\xcf\x81",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xcf\x81",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb1\xce\xb3\xce\xba\xce\xb1\xcf\x83",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: 10,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xbf\xcf\x85\xcf\x83\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x86",
+        substring_i: 15,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb\xce\xb9\xcf\x83\xcf\x86",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xcf\x85\xcf\x86",
+        substring_i: 15,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xce\xbc\xce\xb2",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbb\xce\xbf\xce\xb2",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x83\xce\xb5\xcf\x87\xce\xbf\xcf\x83\xce\xbb\xce\xbf\xce\xb2",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xcf\x81\xce\xb4",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb6",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb6",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba",
+        substring_i: 27,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xcf\x80\xce\xb1\xce\xba",
+        substring_i: 27,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbf\xce\xba",
+        substring_i: 27,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xbf\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x81\xce\xb9\xcf\x80\xce\xbf\xce\xbb",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xcf\x81\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb9\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbb\xce\xb9\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xba\xcf\x81\xcf\x85\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x80\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb9\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb3\xce\xbf\xcf\x85\xce\xbc\xce\xb5\xce\xbd",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_18: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb1\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xba\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9\xce\xb1", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xba\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9", substring_i: 5, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x84\xcf\x83\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x84\xcf\x83\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xba\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9\xce\xb1",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xba\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb9",
+        substring_i: 5,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x84\xcf\x83\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_19: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x88\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb9\xcf\x86\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x88\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb9\xcf\x86\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_20: &[Among] = &[
-    Among { s: b"\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xce\xb9\xcf\x87\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xce\xb9\xcf\x87\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_21: &[Among] = &[
-    Among { s: b"\xce\xb9\xce\xb4\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb4\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb4\xce\xb9\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xce\xb4\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb4\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb4\xce\xb9\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_22: &[Among] = &[
-    Among { s: b"\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xcf\x85\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x81\xce\xb1\xce\xb3\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xb2\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb7\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xcf\x85\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x81\xce\xb1\xce\xb3\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xb2\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb7\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_23: &[Among] = &[
-    Among { s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xba\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xba\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x83\xce\xba\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_24: &[Among] = &[
-    Among { s: b"\xce\xb1\xce\xb4\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb4\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xce\xb4\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb4\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_25: &[Among] = &[
-    Among { s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xbc\xcf\x80", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xba\xcf\x85\xcf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x84\xce\xb5\xcf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xce\xb8\xce\xb5\xcf\x81", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xcf\x84", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xb3\xce\xb9\xce\xb1\xce\xb3\xce\xb9", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xb8\xce\xb5\xce\xb9", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xbf\xce\xba", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xbc", substring_i: -1, result: -1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xbd", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xbc\xcf\x80",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x85\xcf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xce\xb8\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xcf\x84",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb9\xce\xb1\xce\xb3\xce\xb9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb8\xce\xb5\xce\xb9",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xba",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xbc",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_26: &[Among] = &[
-    Among { s: b"\xce\xb5\xce\xb4\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xb4\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb5\xce\xb4\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb4\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_27: &[Among] = &[
-    Among { s: b"\xce\xba\xcf\x81\xce\xb1\xcf\x83\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb1\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xb7\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbc\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb9\xce\xbb", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xb1\xcf\x83\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb1\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb7\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb9\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_28: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xb4\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xb4\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xb4\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_29: &[Among] = &[
-    Among { s: b"\xcf\x83\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb9\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x81\xce\xb1\xce\xb3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xbb\xce\xb9\xce\xb1\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xbf\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x84\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbb\xce\xb5\xce\xbe", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x83\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb9\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x81\xce\xb1\xce\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xbb\xce\xb9\xce\xb1\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xbf\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x84\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbb\xce\xb5\xce\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_30: &[Among] = &[
-    Among { s: b"\xce\xb5\xcf\x89\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb5\xcf\x89\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_31: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb4", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb4",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_32: &[Among] = &[
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_33: &[Among] = &[
-    Among { s: b"\xce\xb9\xce\xba\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xba\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xba\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xba\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb9\xce\xba\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xba\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xba\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xba\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_34: &[Among] = &[
-    Among { s: b"\xce\xba\xce\xb1\xce\xbb\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb3\xce\xb5\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbb\xce\xb9\xce\xb1\xcf\x84\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xcf\x84\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb9\xcf\x84\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb1\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xb5\xcf\x81\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xb3\xce\xb9\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb9\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb9\xce\xba\xce\xb1\xce\xbd\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbe\xcf\x89\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xcf\x84\xce\xb1\xce\xb4", substring_i: 13, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb4", substring_i: 13, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x80\xce\xbf\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xcf\x89\xcf\x84\xce\xbf\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x85\xce\xbb\xce\xbf\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb7\xce\xb8", substring_i: 21, result: 1, function: None },
-    Among { s: b"\xce\xbe\xce\xb9\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xbf\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xbc\xce\xbf\xcf\x87\xce\xb1\xce\xbb", substring_i: 25, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xbf\xce\xbc\xce\xb7\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xce\xbf\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xcf\x81\xcf\x89\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x83\xce\xb1\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xbb\xce\xbb\xce\xb9\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xcf\x83\xcf\x84\xce\xb5\xce\xbb\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xb9\xce\xbb\xce\xbf\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xbb\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb3\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbb\xce\xb9\xce\xb1\xcf\x84\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xcf\x84\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb9\xcf\x84\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb5\xcf\x81\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xb3\xce\xb9\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb9\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb9\xce\xba\xce\xb1\xce\xbd\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbe\xcf\x89\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xcf\x84\xce\xb1\xce\xb4",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb1\xce\xb4",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x80\xce\xbf\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xcf\x89\xcf\x84\xce\xbf\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x85\xce\xbb\xce\xbf\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb7\xce\xb8",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe\xce\xb9\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xbf\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xbc\xce\xbf\xcf\x87\xce\xb1\xce\xbb",
+        substring_i: 25,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xbf\xce\xbc\xce\xb7\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xbf\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xcf\x81\xcf\x89\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x83\xce\xb1\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xbb\xce\xbb\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xcf\x83\xcf\x84\xce\xb5\xce\xbb\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb9\xce\xbb\xce\xbf\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_35: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5", substring_i: 3, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbc\xce\xb5",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_36: &[Among] = &[
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb1\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb9\xce\xba\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xcf\x83\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xb9\xcf\x87", substring_i: 4, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xbf\xcf\x85\xce\xb2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbe\xce\xb5\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb1\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb9\xce\xba\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xcf\x83\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb9\xcf\x87",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xbf\xcf\x85\xce\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe\xce\xb5\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_37: &[Among] = &[
-    Among { s: b"\xcf\x84\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x83", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x84\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_38: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: 2, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: 4, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x84\xce\xb1\xce\xbd\xce\xb5", substring_i: 6, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5", substring_i: 9, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: 2,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x84\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: 6,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd\xce\xb5",
+        substring_i: 9,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_39: &[Among] = &[
@@ -820,285 +3259,1356 @@ const A_39: &[Among] = &[
     Among { s: b"\xce\xb1\xce\xbc\xce\xb5\xcf\x81\xce\xb9\xce\xba\xce\xb1\xce\xbd", substring_i: 93, result: 1, function: None },
 ];
 
-const A_40: &[Among] = &[
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb5\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-];
+const A_40: &[Among] = &[Among {
+    s: b"\xce\xb7\xcf\x83\xce\xb5\xcf\x84\xce\xb5",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
 const A_41: &[Among] = &[
-    Among { s: b"\xcf\x80\xcf\x85\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x85\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xcf\x89\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb9\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xbf\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb5\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x80\xce\xb5\xcf\x81\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x85\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x81\xce\xb1\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xce\xb1\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb9\xce\xb1\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xce\xb9\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xba\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x81\xce\xbf\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xcf\x86\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xbf\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb9\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x81\xce\xbf\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80\xcf\x85\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x85\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xcf\x89\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb9\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xbf\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb5\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x80\xce\xb5\xcf\x81\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x85\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81\xce\xb1\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb1\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb9\xce\xb1\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xb9\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xba\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81\xce\xbf\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xcf\x86\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xbf\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81\xce\xbf\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_42: &[Among] = &[
-    Among { s: b"\xcf\x83\xce\xb5\xcf\x81\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb8\xce\xb1\xcf\x81\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xcf\x84\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb2\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb2\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xcf\x80\xce\xbf\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xcf\x81\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb9\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xce\xb3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb4", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb8", substring_i: 14, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xce\xbf\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb5\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb2\xce\xb1\xcf\x81\xce\xbf\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x83\xce\xb5\xcf\x81\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb8\xce\xb1\xcf\x81\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xcf\x84\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb2\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb2\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xcf\x80\xce\xbf\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xcf\x81\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb9\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xce\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb4",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb8",
+        substring_i: 14,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xce\xbf\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb5\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xce\xb1\xcf\x81\xce\xbf\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_43: &[Among] = &[
-    Among { s: b"\xcf\x89\xce\xbd\xcf\x84\xce\xb1\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xcf\x83", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x89\xce\xbd\xcf\x84\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_44: &[Among] = &[
-    Among { s: b"\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_45: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xba\xce\xb1\xcf\x84\xce\xb1\xcf\x80", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbc\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xcf\x85\xce\xbc\xcf\x80", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb5\xcf\x84\xce\xb1\xce\xbc\xcf\x86", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xba\xce\xb1\xcf\x84\xce\xb1\xcf\x80",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbc\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xcf\x85\xce\xbc\xcf\x80",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb5\xcf\x84\xce\xb1\xce\xbc\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_46: &[Among] = &[
-    Among { s: b"\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb9\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb6", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xce\xbb", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xba\xcf\x84\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbe", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb9\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb6",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xce\xbb",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xba\xcf\x84\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_47: &[Among] = &[
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_48: &[Among] = &[
-    Among { s: b"\xcf\x83\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb1\xcf\x81\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb9\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xce\xbf\xcf\x85\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xba\xcf\x89\xce\xbb", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x83\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb1\xcf\x81\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb9\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xce\xbf\xcf\x85\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xba\xcf\x89\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_49: &[Among] = &[
-    Among { s: b"\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xce\xb8", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xcf\x84\xce\xb1\xce\xb8", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb9\xce\xb1\xce\xb8", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb8", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xce\xb8",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xce\xba\xce\xb1\xcf\x84\xce\xb1\xce\xb8",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb9\xce\xb1\xce\xb8",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xce\xb8",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_50: &[Among] = &[
-    Among { s: b"\xce\xb7\xce\xba\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_51: &[Among] = &[
-    Among { s: b"\xce\xb2\xce\xbb\xce\xb5\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xce\xb4\xce\xb1\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xcf\x89\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xcf\x85\xce\xbc\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xce\xbd\xcf\x84\xce\xb1\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb1\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xce\xb3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb7\xce\xb3", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x81\xcf\x85\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xce\xbb\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb2\xce\xbb\xce\xb5\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xce\xb4\xce\xb1\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xcf\x89\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x85\xce\xbc\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xce\xbd\xcf\x84\xce\xb1\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb1\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xce\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb7\xce\xb3",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x81\xcf\x85\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xbd\xcf\x84\xce\xb9\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xce\xbb\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_52: &[Among] = &[
-    Among { s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb9\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb1\xcf\x81\xcf\x81", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd\xce\xb4\xce\xb9\xce\xb1\xcf\x86\xce\xb5\xcf\x81", substring_i: 1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb1\xcf\x81\xce\xb5\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb5\xcf\x85\xcf\x84\xce\xb5\xcf\x81\xce\xb5\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb5\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x83\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb1\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xb1\xce\xbc\xcf\x80\xce\xb9\xce\xb4", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbb\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xcf\x83\xce\xb1\xce\xb6", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb5\xcf\x83\xcf\x80\xce\xbf\xce\xb6", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb9\xce\xb8", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xce\xb1\xcf\x81\xce\xbc\xce\xb1\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xce\xb7\xce\xba", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc", substring_i: 21, result: 1, function: None },
-    Among { s: b"\xce\xb2\xcf\x81\xce\xbf\xce\xbc", substring_i: 21, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x80\xce\xbf\xcf\x84\xce\xb5\xce\xb9\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb5\xce\xba\xce\xbb\xce\xb9\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb1\xcf\x81\xcf\x81",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd\xce\xb4\xce\xb9\xce\xb1\xcf\x86\xce\xb5\xcf\x81",
+        substring_i: 1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xb1\xce\xb8\xce\xb1\xcf\x81\xce\xb5\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb5\xcf\x85\xcf\x84\xce\xb5\xcf\x81\xce\xb5\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb5\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x83\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb1\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xb1\xce\xbc\xcf\x80\xce\xb9\xce\xb4",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbb\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xcf\x83\xce\xb1\xce\xb6",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb5\xcf\x83\xcf\x80\xce\xbf\xce\xb6",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb9\xce\xb8",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xce\xb1\xcf\x81\xce\xbc\xce\xb1\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xce\xb7\xce\xba",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb2\xcf\x81\xce\xbf\xce\xbc",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x80\xce\xbf\xcf\x84\xce\xb5\xce\xb9\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_53: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_54: &[Among] = &[
-    Among { s: b"\xcf\x81\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xbf\xcf\x81\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x88\xce\xbf\xcf\x86", substring_i: 5, result: -1, function: None },
-    Among { s: b"\xce\xbb\xce\xbf\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb1\xcf\x85\xce\xbb\xce\xbf\xcf\x87", substring_i: 7, result: -1, function: None },
-    Among { s: b"\xcf\x80\xce\xb5\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xbc\xce\xb7\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x81\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xbf\xcf\x81\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x88\xce\xbf\xcf\x86",
+        substring_i: 5,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xbf\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb1\xcf\x85\xce\xbb\xce\xbf\xcf\x87",
+        substring_i: 7,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb5\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xbc\xce\xb7\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_55: &[Among] = &[
-    Among { s: b"\xcf\x80", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xcf\x85\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x81\xcf\x84\xce\xb9\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb5\xce\xb9\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbc\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xcf\x89\xcf\x80\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xb9\xce\xb4\xce\xb7\xcf\x81\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb4\xcf\x81\xce\xbf\xcf\x83\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb5\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xba\xcf\x81\xce\xbf\xce\xba\xce\xb1\xce\xbb\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbb\xce\xbf\xcf\x80", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x84\xcf\x81", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x81", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xcf\x80\xce\xb1\xcf\x81", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb1\xcf\x81", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x87\xce\xb1\xcf\x81", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xb5\xcf\x81", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd\xcf\x85\xcf\x83\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb2\xce\xb1\xcf\x83\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb9\xce\xbc\xce\xbf\xcf\x83\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb9\xce\xb1\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xce\xb9\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xcf\x83\xcf\x85\xce\xbd\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x80\xce\xbf\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbf\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x84", substring_i: 19, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xbf\xce\xbc\xce\xbf\xcf\x84", substring_i: 29, result: 1, function: None },
-    Among { s: b"\xce\xbd\xce\xb1\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xbf\xce\xbb\xcf\x85\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbe\xce\xb5\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb4\xce\xb7\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xce\xbc\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbb\xce\xbb\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbb", substring_i: 38, result: 1, function: None },
-    Among { s: b"\xce\xbc", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbb\xce\xb1\xce\xbc", substring_i: 40, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xce\xb5\xcf\x81\xce\xb2\xce\xb5\xce\xbd", substring_i: 42, result: 1, function: None },
+    Among {
+        s: b"\xcf\x80",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xcf\x85\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x81\xcf\x84\xce\xb9\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb5\xce\xb9\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbc\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xcf\x89\xcf\x80\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb9\xce\xb4\xce\xb7\xcf\x81\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xcf\x81\xce\xbf\xcf\x83\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb5\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xcf\x81\xce\xbf\xce\xba\xce\xb1\xce\xbb\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbb\xce\xbf\xcf\x80",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84\xcf\x81",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x81",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xcf\x80\xce\xb1\xcf\x81",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb1\xcf\x81",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x87\xce\xb1\xcf\x81",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xb5\xcf\x81",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd\xcf\x85\xcf\x83\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb2\xce\xb1\xcf\x83\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xcf\x81\xce\xbf\xcf\x83\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb9\xce\xbc\xce\xbf\xcf\x83\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb9\xce\xb1\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xce\xb9\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xcf\x85\xce\xbd\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x80\xce\xbf\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbf\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x84",
+        substring_i: 19,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xbf\xce\xbc\xce\xbf\xcf\x84",
+        substring_i: 29,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbd\xce\xb1\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xbf\xce\xbb\xcf\x85\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbe\xce\xb5\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb4\xce\xb7\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xce\xbc\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbb\xce\xbb\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xbb",
+        substring_i: 38,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbb\xce\xb1\xce\xbc",
+        substring_i: 40,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xce\xb5\xcf\x81\xce\xb2\xce\xb5\xce\xbd",
+        substring_i: 42,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_56: &[Among] = &[
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_57: &[Among] = &[
-    Among { s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb5", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_58: &[Among] = &[
-    Among { s: b"\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x80\xcf\x84\xce\xb1\xce\xbd", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb4\xcf\x89\xce\xb4\xce\xb5\xce\xba\xce\xb1\xce\xbd", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x87\xce\xb5\xcf\x81\xcf\x83\xce\xbf\xce\xbd", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb5\xce\xb3\xce\xb1\xce\xbb\xce\xbf\xce\xbd", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x81\xce\xb7\xce\xbc\xce\xbf\xce\xbd", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x80\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xcf\x89\xce\xb4\xce\xb5\xce\xba\xce\xb1\xce\xbd",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87\xce\xb5\xcf\x81\xcf\x83\xce\xbf\xce\xbd",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb5\xce\xb3\xce\xb1\xce\xbb\xce\xbf\xce\xbd",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x81\xce\xb7\xce\xbc\xce\xbf\xce\xbd",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
-const A_59: &[Among] = &[
-    Among { s: b"\xce\xb7\xcf\x83\xcf\x84\xce\xb5", substring_i: -1, result: 1, function: None },
-];
+const A_59: &[Among] = &[Among {
+    s: b"\xce\xb7\xcf\x83\xcf\x84\xce\xb5",
+    substring_i: -1,
+    result: 1,
+    function: None,
+}];
 
 const A_60: &[Among] = &[
-    Among { s: b"\xcf\x87\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb4\xcf\x85\xcf\x83\xcf\x87\xcf\x81", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x85\xcf\x87\xcf\x81", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x87\xcf\x81", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xba\xce\xbf\xce\xb9\xce\xbd\xce\xbf\xcf\x87\xcf\x81", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xce\xbb\xce\xb9\xce\xbc\xcf\x88", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x83\xce\xb2", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xce\xb2", substring_i: 6, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x80\xce\xbb", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb5\xce\xb9\xce\xbc\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x87\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb4\xcf\x85\xcf\x83\xcf\x87\xcf\x81",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x85\xcf\x87\xcf\x81",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x87\xcf\x81",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xba\xce\xbf\xce\xb9\xce\xbd\xce\xbf\xcf\x87\xcf\x81",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xce\xbb\xce\xb9\xce\xbc\xcf\x88",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x83\xce\xb2",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xce\xb2",
+        substring_i: 6,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x80\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb5\xce\xb9\xce\xbc\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_61: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbd\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb5", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbd\xce\xb5", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbd\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbd\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_62: &[Among] = &[
@@ -1111,123 +4621,648 @@ const A_62: &[Among] = &[
 ];
 
 const A_63: &[Among] = &[
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbc\xce\xb5", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbc\xce\xb5", substring_i: 0, result: 1, function: None },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbc\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbc\xce\xb5",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_64: &[Among] = &[
-    Among { s: b"\xce\xb1\xcf\x83\xce\xbf\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xcf\x83\xce\xbf\xcf\x85\xcf\x83", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbb\xce\xbb\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x86", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x87", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb6", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xcf\x81\xce\xb9\xce\xbf\xcf\x80\xce\xbb", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x80\xce\xb1\xcf\x81\xce\xb1\xcf\x83\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbb\xce\xbb\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x86",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x87",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb6",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xcf\x81\xce\xb9\xce\xbf\xcf\x80\xce\xbb",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_65: &[Among] = &[
-    Among { s: b"\xce\xbc\xce\xb1\xcf\x84\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xcf\x84\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbc\xce\xb1\xcf\x84\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xcf\x84\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xcf\x84\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbc\xce\xb1\xcf\x84\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_66: &[Among] = &[
-    Among { s: b"\xcf\x85\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83", substring_i: 0, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb5\xcf\x83", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb4\xce\xb5\xcf\x83", substring_i: 3, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xb9\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9\xcf\x83", substring_i: 7, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x83", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85", substring_i: 10, result: 1, function: None },
-    Among { s: b"\xcf\x89", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xcf\x89", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x89", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xcf\x89", substring_i: 12, result: 1, function: None },
-    Among { s: b"\xce\xb1", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbc\xce\xb1", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb1", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb1", substring_i: 18, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd\xce\xb1", substring_i: 16, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd\xce\xb1", substring_i: 20, result: 1, function: None },
-    Among { s: b"\xce\xb5", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb5\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 24, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 26, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb5\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb1\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb1\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5", substring_i: 32, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xb9\xcf\x84\xce\xb5", substring_i: 22, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9\xcf\x84\xce\xb5", substring_i: 34, result: 1, function: None },
-    Among { s: b"\xce\xb7", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb9", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x83\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb5\xcf\x83\xce\xb1\xce\xb9", substring_i: 39, result: 1, function: None },
-    Among { s: b"\xce\xb1\xcf\x84\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x84\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb5\xcf\x84\xce\xb1\xce\xb9", substring_i: 42, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xb9", substring_i: 44, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xb5\xce\xbc\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc\xce\xb1\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb5\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb5\xce\xb9", substring_i: 51, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb5\xce\xb9", substring_i: 51, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9", substring_i: 51, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xb9", substring_i: 37, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbd", substring_i: 56, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd", substring_i: 56, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd", substring_i: 58, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbd", substring_i: 56, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd", substring_i: 56, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd", substring_i: 61, result: 1, function: None },
-    Among { s: b"\xcf\x89\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb4\xcf\x89\xce\xbd", substring_i: 63, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xbd", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd", substring_i: 66, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd", substring_i: 67, result: 1, function: None },
-    Among { s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd", substring_i: 70, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd", substring_i: 72, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd", substring_i: 74, result: 1, function: None },
-    Among { s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd", substring_i: 76, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x84\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb9\xce\xbf\xcf\x84\xce\xb1\xce\xbd", substring_i: 78, result: 1, function: None },
-    Among { s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbd", substring_i: 65, result: 1, function: None },
-    Among { s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd", substring_i: 81, result: 1, function: None },
-    Among { s: b"\xce\xbf", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xcf\x85\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb5\xcf\x83",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb4\xce\xb5\xcf\x83",
+        substring_i: 3,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb9\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9\xcf\x83",
+        substring_i: 7,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x83",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85",
+        substring_i: 10,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xcf\x89",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x89",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xcf\x89",
+        substring_i: 12,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbc\xce\xb1",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb1",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd\xce\xb1",
+        substring_i: 18,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd\xce\xb1",
+        substring_i: 16,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd\xce\xb1",
+        substring_i: 20,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb5\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 24,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 26,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb5\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xcf\x84\xce\xb5",
+        substring_i: 32,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb9\xcf\x84\xce\xb5",
+        substring_i: 22,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9\xcf\x84\xce\xb5",
+        substring_i: 34,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x83\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb5\xcf\x83\xce\xb1\xce\xb9",
+        substring_i: 39,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb5\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 42,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 44,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbc\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbc\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xb5\xce\xbc\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xb1\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb5\xce\xb9",
+        substring_i: 51,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb5\xce\xb9",
+        substring_i: 51,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb5\xce\xb9",
+        substring_i: 51,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xb9",
+        substring_i: 37,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 56,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 56,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 58,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 56,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 56,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xbf\xcf\x85\xce\xbd",
+        substring_i: 61,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb4\xcf\x89\xce\xbd",
+        substring_i: 63,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xbd",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd",
+        substring_i: 66,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xbf\xcf\x85\xcf\x83\xce\xb1\xce\xbd",
+        substring_i: 67,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xcf\x83\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x83\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 70,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbc\xce\xb1\xcf\x83\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 72,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x85\xce\xbd\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 74,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xce\xbd\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 76,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb9\xce\xbf\xcf\x84\xce\xb1\xce\xbd",
+        substring_i: 78,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb1\xce\xb3\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xba\xce\xb1\xce\xbd",
+        substring_i: 65,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb7\xce\xb8\xce\xb7\xce\xba\xce\xb1\xce\xbd",
+        substring_i: 81,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_67: &[Among] = &[
-    Among { s: b"\xce\xb5\xcf\x83\xcf\x84\xce\xb5\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x84\xce\xb5\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xcf\x84\xce\xb5\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x84\xce\xb5\xcf\x81", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xb5\xcf\x83\xcf\x84\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x85\xcf\x84\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xcf\x89\xcf\x84\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xce\xbf\xcf\x84\xce\xb1\xcf\x84", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x84\xce\xb5\xcf\x81",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xb5\xcf\x83\xcf\x84\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x85\xcf\x84\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xcf\x89\xcf\x84\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xce\xbf\xcf\x84\xce\xb1\xcf\x84",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 fn r_has_min_length(z: &mut Env) -> i32 {
@@ -1244,205 +5279,155 @@ fn r_tolower(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_0);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_0);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_1);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_1);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.slice_from(S_2);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_2);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 4 => {
-                    {
-                        let ret = z.slice_from(S_3);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_3);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.slice_from(S_4);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_4);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 6 => {
-                    {
-                        let ret = z.slice_from(S_5);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_5);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 7 => {
-                    {
-                        let ret = z.slice_from(S_6);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_6);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 8 => {
-                    {
-                        let ret = z.slice_from(S_7);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_7);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 9 => {
-                    {
-                        let ret = z.slice_from(S_8);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_8);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 10 => {
-                    {
-                        let ret = z.slice_from(S_9);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_9);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 11 => {
-                    {
-                        let ret = z.slice_from(S_10);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_10);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 12 => {
-                    {
-                        let ret = z.slice_from(S_11);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_11);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 13 => {
-                    {
-                        let ret = z.slice_from(S_12);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_12);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 14 => {
-                    {
-                        let ret = z.slice_from(S_13);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_13);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 15 => {
-                    {
-                        let ret = z.slice_from(S_14);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_14);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 16 => {
-                    {
-                        let ret = z.slice_from(S_15);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_15);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 17 => {
-                    {
-                        let ret = z.slice_from(S_16);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_16);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 18 => {
-                    {
-                        let ret = z.slice_from(S_17);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_17);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 19 => {
-                    {
-                        let ret = z.slice_from(S_18);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_18);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 20 => {
-                    {
-                        let ret = z.slice_from(S_19);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_19);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 21 => {
-                    {
-                        let ret = z.slice_from(S_20);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_20);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 22 => {
-                    {
-                        let ret = z.slice_from(S_21);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_21);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 23 => {
-                    {
-                        let ret = z.slice_from(S_22);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_22);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 24 => {
-                    {
-                        let ret = z.slice_from(S_23);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_23);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 25 => {
-                    {
-                        let ret = z.skip_b_utf8(z.c, z.lb, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_b_utf8(z.c, z.lb, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -1464,91 +5449,69 @@ fn r_step_1(z: &mut Env) -> i32 {
     z.bra = z.c;
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_24);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_24);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_25);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_25);
+            if ret < 0 {
+                return ret;
             }
         }
         3 => {
-            {
-                let ret = z.slice_from(S_26);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_26);
+            if ret < 0 {
+                return ret;
             }
         }
         4 => {
-            {
-                let ret = z.slice_from(S_27);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_27);
+            if ret < 0 {
+                return ret;
             }
         }
         5 => {
-            {
-                let ret = z.slice_from(S_28);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_28);
+            if ret < 0 {
+                return ret;
             }
         }
         6 => {
-            {
-                let ret = z.slice_from(S_29);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_29);
+            if ret < 0 {
+                return ret;
             }
         }
         7 => {
-            {
-                let ret = z.slice_from(S_30);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_30);
+            if ret < 0 {
+                return ret;
             }
         }
         8 => {
-            {
-                let ret = z.slice_from(S_31);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_31);
+            if ret < 0 {
+                return ret;
             }
         }
         9 => {
-            {
-                let ret = z.slice_from(S_32);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_32);
+            if ret < 0 {
+                return ret;
             }
         }
         10 => {
-            {
-                let ret = z.slice_from(S_33);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_33);
+            if ret < 0 {
+                return ret;
             }
         }
         11 => {
-            {
-                let ret = z.slice_from(S_34);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_34);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -1582,19 +5545,15 @@ fn r_step_s1(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_35);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_35);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_36);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_36);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -1680,19 +5639,15 @@ fn r_step_s3(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_40);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_40);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_41);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_41);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -1715,7 +5670,10 @@ fn r_step_s4(z: &mut Env) -> i32 {
     z.i[0] = 0;
     z.ket = z.c;
     z.bra = z.c;
-    if z.c - 3 <= z.lb || z.byte(z.c - 1) >> 5 != 5 || (-2145255424 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+    if z.c - 3 <= z.lb
+        || z.byte(z.c - 1) >> 5 != 5
+        || (-2145255424 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+    {
         return 0;
     }
     if find_among_b(z, A_8) == 0 {
@@ -1758,19 +5716,15 @@ fn r_step_s5(z: &mut Env) -> i32 {
     }
     match among_var {
         1 => {
-            {
-                let ret = z.slice_from(S_43);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_43);
+            if ret < 0 {
+                return ret;
             }
         }
         2 => {
-            {
-                let ret = z.slice_from(S_44);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_44);
+            if ret < 0 {
+                return ret;
             }
         }
         _ => {}
@@ -1810,19 +5764,15 @@ fn r_step_s6(z: &mut Env) -> i32 {
                 }
                 match among_var {
                     1 => {
-                        {
-                            let ret = z.slice_from(S_45);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_45);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     2 => {
-                        {
-                            let ret = z.slice_from(S_46);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_46);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     _ => {}
@@ -1841,83 +5791,63 @@ fn r_step_s6(z: &mut Env) -> i32 {
             z.bra = z.c;
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_47);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_47);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_48);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_48);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.slice_from(S_49);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_49);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 4 => {
-                    {
-                        let ret = z.slice_from(S_50);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_50);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.slice_from(S_51);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_51);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 6 => {
-                    {
-                        let ret = z.slice_from(S_52);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_52);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 7 => {
-                    {
-                        let ret = z.slice_from(S_53);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_53);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 8 => {
-                    {
-                        let ret = z.slice_from(S_54);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_54);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 9 => {
-                    {
-                        let ret = z.slice_from(S_55);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_55);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 10 => {
-                    {
-                        let ret = z.slice_from(S_56);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_56);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 _ => {}
@@ -1992,19 +5922,15 @@ fn r_step_s8(z: &mut Env) -> i32 {
                 }
                 match among_var {
                     1 => {
-                        {
-                            let ret = z.slice_from(S_58);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_58);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     2 => {
-                        {
-                            let ret = z.slice_from(S_59);
-                            if ret < 0 {
-                                return ret;
-                            }
+                        let ret = z.slice_from(S_59);
+                        if ret < 0 {
+                            return ret;
                         }
                     }
                     _ => {}
@@ -2030,7 +5956,10 @@ fn r_step_s8(z: &mut Env) -> i32 {
 
 fn r_step_s9(z: &mut Env) -> i32 {
     z.ket = z.c;
-    if z.c - 7 <= z.lb || z.byte(z.c - 1) >> 5 != 5 || (-1610481664 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+    if z.c - 7 <= z.lb
+        || z.byte(z.c - 1) >> 5 != 5
+        || (-1610481664 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+    {
         return 0;
     }
     if find_among_b(z, A_21) == 0 {

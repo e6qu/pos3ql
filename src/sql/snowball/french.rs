@@ -5,6 +5,10 @@
 //! Source SHA-256: 4a49722177841bc7fb55ab87c2e9aa16c39dd9845f0545c1470202d3829f8d82
 //! License: Snowball BSD 3-clause, reproduced in `mod.rs`.
 
+// Declarations stay where Snowball's C declares them, so the control flow
+// reads statement for statement against the source.
+#![allow(clippy::needless_late_init)]
+
 use super::{Among, Env, find_among, find_among_b};
 
 const S_0: &[u8] = b"qu";
@@ -49,181 +53,913 @@ const S_38: &[u8] = b"i";
 const S_39: &[u8] = b"\xc3\xa7";
 const S_40: &[u8] = b"c";
 
-const G_V: &[u8] = &[17, 65, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 130, 103, 8, 5];
+const G_V: &[u8] = &[
+    17, 65, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 130, 103, 8, 5,
+];
 const G_ELISION_CHAR: &[u8] = &[131, 14, 3];
 const G_KEEP_WITH_S: &[u8] = &[1, 65, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128];
 
 const A_0: &[Among] = &[
-    Among { s: b"col", substring_i: -1, result: -1, function: None },
-    Among { s: b"par", substring_i: -1, result: -1, function: None },
-    Among { s: b"tap", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"col",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"par",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"tap",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 const A_1: &[Among] = &[
-    Among { s: b"", substring_i: -1, result: 7, function: None },
-    Among { s: b"H", substring_i: 0, result: 6, function: None },
-    Among { s: b"He", substring_i: 1, result: 4, function: None },
-    Among { s: b"Hi", substring_i: 1, result: 5, function: None },
-    Among { s: b"I", substring_i: 0, result: 1, function: None },
-    Among { s: b"U", substring_i: 0, result: 2, function: None },
-    Among { s: b"Y", substring_i: 0, result: 3, function: None },
+    Among {
+        s: b"",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"H",
+        substring_i: 0,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"He",
+        substring_i: 1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"Hi",
+        substring_i: 1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"I",
+        substring_i: 0,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"U",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"Y",
+        substring_i: 0,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_2: &[Among] = &[
-    Among { s: b"iqU", substring_i: -1, result: 3, function: None },
-    Among { s: b"abl", substring_i: -1, result: 3, function: None },
-    Among { s: b"I\xc3\xa8r", substring_i: -1, result: 4, function: None },
-    Among { s: b"i\xc3\xa8r", substring_i: -1, result: 4, function: None },
-    Among { s: b"eus", substring_i: -1, result: 2, function: None },
-    Among { s: b"iv", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"iqU",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"abl",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"I\xc3\xa8r",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"i\xc3\xa8r",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"eus",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_3: &[Among] = &[
-    Among { s: b"ic", substring_i: -1, result: 2, function: None },
-    Among { s: b"abil", substring_i: -1, result: 1, function: None },
-    Among { s: b"iv", substring_i: -1, result: 3, function: None },
+    Among {
+        s: b"ic",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"abil",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iv",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
 ];
 
 const A_4: &[Among] = &[
-    Among { s: b"iqUe", substring_i: -1, result: 1, function: None },
-    Among { s: b"atrice", substring_i: -1, result: 2, function: None },
-    Among { s: b"ance", substring_i: -1, result: 1, function: None },
-    Among { s: b"ence", substring_i: -1, result: 5, function: None },
-    Among { s: b"logie", substring_i: -1, result: 3, function: None },
-    Among { s: b"able", substring_i: -1, result: 1, function: None },
-    Among { s: b"isme", substring_i: -1, result: 1, function: None },
-    Among { s: b"euse", substring_i: -1, result: 11, function: None },
-    Among { s: b"iste", substring_i: -1, result: 1, function: None },
-    Among { s: b"ive", substring_i: -1, result: 8, function: None },
-    Among { s: b"if", substring_i: -1, result: 8, function: None },
-    Among { s: b"usion", substring_i: -1, result: 4, function: None },
-    Among { s: b"ation", substring_i: -1, result: 2, function: None },
-    Among { s: b"ution", substring_i: -1, result: 4, function: None },
-    Among { s: b"ateur", substring_i: -1, result: 2, function: None },
-    Among { s: b"iqUes", substring_i: -1, result: 1, function: None },
-    Among { s: b"atrices", substring_i: -1, result: 2, function: None },
-    Among { s: b"ances", substring_i: -1, result: 1, function: None },
-    Among { s: b"ences", substring_i: -1, result: 5, function: None },
-    Among { s: b"logies", substring_i: -1, result: 3, function: None },
-    Among { s: b"ables", substring_i: -1, result: 1, function: None },
-    Among { s: b"ismes", substring_i: -1, result: 1, function: None },
-    Among { s: b"euses", substring_i: -1, result: 11, function: None },
-    Among { s: b"istes", substring_i: -1, result: 1, function: None },
-    Among { s: b"ives", substring_i: -1, result: 8, function: None },
-    Among { s: b"ifs", substring_i: -1, result: 8, function: None },
-    Among { s: b"usions", substring_i: -1, result: 4, function: None },
-    Among { s: b"ations", substring_i: -1, result: 2, function: None },
-    Among { s: b"utions", substring_i: -1, result: 4, function: None },
-    Among { s: b"ateurs", substring_i: -1, result: 2, function: None },
-    Among { s: b"ments", substring_i: -1, result: 15, function: None },
-    Among { s: b"ements", substring_i: 30, result: 6, function: None },
-    Among { s: b"issements", substring_i: 31, result: 12, function: None },
-    Among { s: b"it\xc3\xa9s", substring_i: -1, result: 7, function: None },
-    Among { s: b"ment", substring_i: -1, result: 15, function: None },
-    Among { s: b"ement", substring_i: 34, result: 6, function: None },
-    Among { s: b"issement", substring_i: 35, result: 12, function: None },
-    Among { s: b"amment", substring_i: 34, result: 13, function: None },
-    Among { s: b"emment", substring_i: 34, result: 14, function: None },
-    Among { s: b"aux", substring_i: -1, result: 10, function: None },
-    Among { s: b"eaux", substring_i: 39, result: 9, function: None },
-    Among { s: b"eux", substring_i: -1, result: 1, function: None },
-    Among { s: b"it\xc3\xa9", substring_i: -1, result: 7, function: None },
+    Among {
+        s: b"iqUe",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"atrice",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ance",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ence",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"logie",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"able",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isme",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"euse",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"iste",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ive",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"if",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"usion",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ation",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ution",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ateur",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iqUes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"atrices",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ances",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ences",
+        substring_i: -1,
+        result: 5,
+        function: None,
+    },
+    Among {
+        s: b"logies",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ables",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ismes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"euses",
+        substring_i: -1,
+        result: 11,
+        function: None,
+    },
+    Among {
+        s: b"istes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ives",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"ifs",
+        substring_i: -1,
+        result: 8,
+        function: None,
+    },
+    Among {
+        s: b"usions",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ations",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"utions",
+        substring_i: -1,
+        result: 4,
+        function: None,
+    },
+    Among {
+        s: b"ateurs",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ments",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"ements",
+        substring_i: 30,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"issements",
+        substring_i: 31,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"it\xc3\xa9s",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
+    Among {
+        s: b"ment",
+        substring_i: -1,
+        result: 15,
+        function: None,
+    },
+    Among {
+        s: b"ement",
+        substring_i: 34,
+        result: 6,
+        function: None,
+    },
+    Among {
+        s: b"issement",
+        substring_i: 35,
+        result: 12,
+        function: None,
+    },
+    Among {
+        s: b"amment",
+        substring_i: 34,
+        result: 13,
+        function: None,
+    },
+    Among {
+        s: b"emment",
+        substring_i: 34,
+        result: 14,
+        function: None,
+    },
+    Among {
+        s: b"aux",
+        substring_i: -1,
+        result: 10,
+        function: None,
+    },
+    Among {
+        s: b"eaux",
+        substring_i: 39,
+        result: 9,
+        function: None,
+    },
+    Among {
+        s: b"eux",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it\xc3\xa9",
+        substring_i: -1,
+        result: 7,
+        function: None,
+    },
 ];
 
 const A_5: &[Among] = &[
-    Among { s: b"ira", substring_i: -1, result: 1, function: None },
-    Among { s: b"ie", substring_i: -1, result: 1, function: None },
-    Among { s: b"isse", substring_i: -1, result: 1, function: None },
-    Among { s: b"issante", substring_i: -1, result: 1, function: None },
-    Among { s: b"i", substring_i: -1, result: 1, function: None },
-    Among { s: b"irai", substring_i: 4, result: 1, function: None },
-    Among { s: b"ir", substring_i: -1, result: 1, function: None },
-    Among { s: b"iras", substring_i: -1, result: 1, function: None },
-    Among { s: b"ies", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaemes", substring_i: -1, result: 1, function: None },
-    Among { s: b"isses", substring_i: -1, result: 1, function: None },
-    Among { s: b"issantes", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaetes", substring_i: -1, result: 1, function: None },
-    Among { s: b"is", substring_i: -1, result: 1, function: None },
-    Among { s: b"irais", substring_i: 13, result: 1, function: None },
-    Among { s: b"issais", substring_i: 13, result: 1, function: None },
-    Among { s: b"irions", substring_i: -1, result: 1, function: None },
-    Among { s: b"issions", substring_i: -1, result: 1, function: None },
-    Among { s: b"irons", substring_i: -1, result: 1, function: None },
-    Among { s: b"issons", substring_i: -1, result: 1, function: None },
-    Among { s: b"issants", substring_i: -1, result: 1, function: None },
-    Among { s: b"it", substring_i: -1, result: 1, function: None },
-    Among { s: b"irait", substring_i: 21, result: 1, function: None },
-    Among { s: b"issait", substring_i: 21, result: 1, function: None },
-    Among { s: b"issant", substring_i: -1, result: 1, function: None },
-    Among { s: b"iraIent", substring_i: -1, result: 1, function: None },
-    Among { s: b"issaIent", substring_i: -1, result: 1, function: None },
-    Among { s: b"irent", substring_i: -1, result: 1, function: None },
-    Among { s: b"issent", substring_i: -1, result: 1, function: None },
-    Among { s: b"iront", substring_i: -1, result: 1, function: None },
-    Among { s: b"\xc3\xaet", substring_i: -1, result: 1, function: None },
-    Among { s: b"iriez", substring_i: -1, result: 1, function: None },
-    Among { s: b"issiez", substring_i: -1, result: 1, function: None },
-    Among { s: b"irez", substring_i: -1, result: 1, function: None },
-    Among { s: b"issez", substring_i: -1, result: 1, function: None },
+    Among {
+        s: b"ira",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ie",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isse",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issante",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"i",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irai",
+        substring_i: 4,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ir",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iras",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"ies",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaemes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"isses",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issantes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaetes",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"is",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irais",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issais",
+        substring_i: 13,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irions",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issions",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irons",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issons",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issants",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"it",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irait",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issait",
+        substring_i: 21,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issant",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iraIent",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issaIent",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irent",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issent",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iront",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xaet",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"iriez",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issiez",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"irez",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"issez",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
 ];
 
 const A_6: &[Among] = &[
-    Among { s: b"a", substring_i: -1, result: 3, function: None },
-    Among { s: b"era", substring_i: 0, result: 2, function: None },
-    Among { s: b"asse", substring_i: -1, result: 3, function: None },
-    Among { s: b"ante", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xc3\xa9e", substring_i: -1, result: 2, function: None },
-    Among { s: b"ai", substring_i: -1, result: 3, function: None },
-    Among { s: b"erai", substring_i: 5, result: 2, function: None },
-    Among { s: b"er", substring_i: -1, result: 2, function: None },
-    Among { s: b"as", substring_i: -1, result: 3, function: None },
-    Among { s: b"eras", substring_i: 8, result: 2, function: None },
-    Among { s: b"\xc3\xa2mes", substring_i: -1, result: 3, function: None },
-    Among { s: b"asses", substring_i: -1, result: 3, function: None },
-    Among { s: b"antes", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xc3\xa2tes", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xc3\xa9es", substring_i: -1, result: 2, function: None },
-    Among { s: b"ais", substring_i: -1, result: 3, function: None },
-    Among { s: b"erais", substring_i: 15, result: 2, function: None },
-    Among { s: b"ions", substring_i: -1, result: 1, function: None },
-    Among { s: b"erions", substring_i: 17, result: 2, function: None },
-    Among { s: b"assions", substring_i: 17, result: 3, function: None },
-    Among { s: b"erons", substring_i: -1, result: 2, function: None },
-    Among { s: b"ants", substring_i: -1, result: 3, function: None },
-    Among { s: b"\xc3\xa9s", substring_i: -1, result: 2, function: None },
-    Among { s: b"ait", substring_i: -1, result: 3, function: None },
-    Among { s: b"erait", substring_i: 23, result: 2, function: None },
-    Among { s: b"ant", substring_i: -1, result: 3, function: None },
-    Among { s: b"aIent", substring_i: -1, result: 3, function: None },
-    Among { s: b"eraIent", substring_i: 26, result: 2, function: None },
-    Among { s: b"\xc3\xa8rent", substring_i: -1, result: 2, function: None },
-    Among { s: b"assent", substring_i: -1, result: 3, function: None },
-    Among { s: b"eront", substring_i: -1, result: 2, function: None },
-    Among { s: b"\xc3\xa2t", substring_i: -1, result: 3, function: None },
-    Among { s: b"ez", substring_i: -1, result: 2, function: None },
-    Among { s: b"iez", substring_i: 32, result: 2, function: None },
-    Among { s: b"eriez", substring_i: 33, result: 2, function: None },
-    Among { s: b"assiez", substring_i: 33, result: 3, function: None },
-    Among { s: b"erez", substring_i: 32, result: 2, function: None },
-    Among { s: b"\xc3\xa9", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"a",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"era",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"asse",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ante",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9e",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ai",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erai",
+        substring_i: 5,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"er",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"as",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"eras",
+        substring_i: 8,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2mes",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"asses",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"antes",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2tes",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9es",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ais",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erais",
+        substring_i: 15,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ions",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"erions",
+        substring_i: 17,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"assions",
+        substring_i: 17,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erons",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ants",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9s",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ait",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erait",
+        substring_i: 23,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ant",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"aIent",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"eraIent",
+        substring_i: 26,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa8rent",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"assent",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"eront",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa2t",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"ez",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"iez",
+        substring_i: 32,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"eriez",
+        substring_i: 33,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"assiez",
+        substring_i: 33,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"erez",
+        substring_i: 32,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"\xc3\xa9",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_7: &[Among] = &[
-    Among { s: b"e", substring_i: -1, result: 3, function: None },
-    Among { s: b"I\xc3\xa8re", substring_i: 0, result: 2, function: None },
-    Among { s: b"i\xc3\xa8re", substring_i: 0, result: 2, function: None },
-    Among { s: b"ion", substring_i: -1, result: 1, function: None },
-    Among { s: b"Ier", substring_i: -1, result: 2, function: None },
-    Among { s: b"ier", substring_i: -1, result: 2, function: None },
+    Among {
+        s: b"e",
+        substring_i: -1,
+        result: 3,
+        function: None,
+    },
+    Among {
+        s: b"I\xc3\xa8re",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"i\xc3\xa8re",
+        substring_i: 0,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ion",
+        substring_i: -1,
+        result: 1,
+        function: None,
+    },
+    Among {
+        s: b"Ier",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
+    Among {
+        s: b"ier",
+        substring_i: -1,
+        result: 2,
+        function: None,
+    },
 ];
 
 const A_8: &[Among] = &[
-    Among { s: b"ell", substring_i: -1, result: -1, function: None },
-    Among { s: b"eill", substring_i: -1, result: -1, function: None },
-    Among { s: b"enn", substring_i: -1, result: -1, function: None },
-    Among { s: b"onn", substring_i: -1, result: -1, function: None },
-    Among { s: b"ett", substring_i: -1, result: -1, function: None },
+    Among {
+        s: b"ell",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"eill",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"enn",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"onn",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
+    Among {
+        s: b"ett",
+        substring_i: -1,
+        result: -1,
+        function: None,
+    },
 ];
 
 fn r_elisions(z: &mut Env) -> i32 {
@@ -448,7 +1184,10 @@ fn r_mark_regions(z: &mut Env) -> i32 {
                     }
                     z.c = c2;
                     'lab3: {
-                        if z.c + 2 >= z.l || z.byte(z.c + 2) >> 5 != 3 || (331776 >> (z.byte(z.c + 2) & 31)) & 1 == 0 {
+                        if z.c + 2 >= z.l
+                            || z.byte(z.c + 2) >> 5 != 3
+                            || (331776 >> (z.byte(z.c + 2) & 31)) & 1 == 0
+                        {
                             break 'lab3;
                         }
                         if find_among(z, A_0) == 0 {
@@ -521,7 +1260,7 @@ fn r_postlude(z: &mut Env) -> i32 {
     'loop1: loop {
         let c1 = z.c;
         z.bra = z.c;
-        if z.c >= z.l || z.byte(z.c + 0) >> 5 != 2 || (35652352 >> (z.byte(z.c + 0) & 31)) & 1 == 0 {
+        if z.c >= z.l || z.byte(z.c) >> 5 != 2 || (35652352 >> (z.byte(z.c) & 31)) & 1 == 0 {
             among_var = 7;
         } else {
             among_var = find_among(z, A_1);
@@ -530,61 +1269,47 @@ fn r_postlude(z: &mut Env) -> i32 {
         'lab0: {
             match among_var {
                 1 => {
-                    {
-                        let ret = z.slice_from(S_10);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_10);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 2 => {
-                    {
-                        let ret = z.slice_from(S_11);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_11);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 3 => {
-                    {
-                        let ret = z.slice_from(S_12);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_12);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 4 => {
-                    {
-                        let ret = z.slice_from(S_13);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_13);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 5 => {
-                    {
-                        let ret = z.slice_from(S_14);
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_from(S_14);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 6 => {
-                    {
-                        let ret = z.slice_del();
-                        if ret < 0 {
-                            return ret;
-                        }
+                    let ret = z.slice_del();
+                    if ret < 0 {
+                        return ret;
                     }
                 }
                 7 => {
-                    {
-                        let ret = z.skip_utf8(z.c, z.l, 1);
-                        if ret < 0 {
-                            break 'lab0;
-                        }
-                        z.c = ret;
+                    let ret = z.skip_utf8(z.c, z.l, 1);
+                    if ret < 0 {
+                        break 'lab0;
                     }
+                    z.c = ret;
                 }
                 _ => {}
             }
@@ -792,44 +1517,42 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                                 }
                             }
                         }
-                        2 => {
-                            'lab4: {
-                                {
-                                    let m4 = z.l - z.c;
-                                    'lab5: {
-                                        {
-                                            let ret = r_r2(z);
-                                            if ret == 0 {
-                                                break 'lab5;
-                                            }
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        {
-                                            let ret = z.slice_del();
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        break 'lab4;
-                                    }
-                                    z.c = z.l - m4;
+                        2 => 'lab4: {
+                            {
+                                let m4 = z.l - z.c;
+                                'lab5: {
                                     {
-                                        let ret = r_r1(z);
+                                        let ret = r_r2(z);
                                         if ret == 0 {
-                                            z.c = z.l - m3;
-                                            break 'lab3;
+                                            break 'lab5;
                                         }
                                         if ret < 0 {
                                             return ret;
                                         }
                                     }
                                     {
-                                        let ret = z.slice_from(S_21);
+                                        let ret = z.slice_del();
                                         if ret < 0 {
                                             return ret;
                                         }
+                                    }
+                                    break 'lab4;
+                                }
+                                z.c = z.l - m4;
+                                {
+                                    let ret = r_r1(z);
+                                    if ret == 0 {
+                                        z.c = z.l - m3;
+                                        break 'lab3;
+                                    }
+                                    if ret < 0 {
+                                        return ret;
+                                    }
+                                }
+                                {
+                                    let ret = z.slice_from(S_21);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                             }
@@ -892,7 +1615,10 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 let m5 = z.l - z.c;
                 z.ket = z.c;
                 'lab6: {
-                    if z.c - 1 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+                    if z.c - 1 <= z.lb
+                        || z.byte(z.c - 1) >> 5 != 3
+                        || (4198408 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+                    {
                         z.c = z.l - m5;
                         break 'lab6;
                     }
@@ -903,66 +1629,62 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                     }
                     z.bra = z.c;
                     match among_var {
-                        1 => {
-                            'lab7: {
-                                {
-                                    let m6 = z.l - z.c;
-                                    'lab8: {
-                                        {
-                                            let ret = r_r2(z);
-                                            if ret == 0 {
-                                                break 'lab8;
-                                            }
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        {
-                                            let ret = z.slice_del();
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        break 'lab7;
-                                    }
-                                    z.c = z.l - m6;
+                        1 => 'lab7: {
+                            {
+                                let m6 = z.l - z.c;
+                                'lab8: {
                                     {
-                                        let ret = z.slice_from(S_23);
+                                        let ret = r_r2(z);
+                                        if ret == 0 {
+                                            break 'lab8;
+                                        }
                                         if ret < 0 {
                                             return ret;
                                         }
+                                    }
+                                    {
+                                        let ret = z.slice_del();
+                                        if ret < 0 {
+                                            return ret;
+                                        }
+                                    }
+                                    break 'lab7;
+                                }
+                                z.c = z.l - m6;
+                                {
+                                    let ret = z.slice_from(S_23);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                             }
                         }
-                        2 => {
-                            'lab9: {
-                                {
-                                    let m7 = z.l - z.c;
-                                    'lab10: {
-                                        {
-                                            let ret = r_r2(z);
-                                            if ret == 0 {
-                                                break 'lab10;
-                                            }
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        {
-                                            let ret = z.slice_del();
-                                            if ret < 0 {
-                                                return ret;
-                                            }
-                                        }
-                                        break 'lab9;
-                                    }
-                                    z.c = z.l - m7;
+                        2 => 'lab9: {
+                            {
+                                let m7 = z.l - z.c;
+                                'lab10: {
                                     {
-                                        let ret = z.slice_from(S_24);
+                                        let ret = r_r2(z);
+                                        if ret == 0 {
+                                            break 'lab10;
+                                        }
                                         if ret < 0 {
                                             return ret;
                                         }
+                                    }
+                                    {
+                                        let ret = z.slice_del();
+                                        if ret < 0 {
+                                            return ret;
+                                        }
+                                    }
+                                    break 'lab9;
+                                }
+                                z.c = z.l - m7;
+                                {
+                                    let ret = z.slice_from(S_24);
+                                    if ret < 0 {
+                                        return ret;
                                     }
                                 }
                             }
@@ -1068,11 +1790,9 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
             }
         }
         9 => {
-            {
-                let ret = z.slice_from(S_28);
-                if ret < 0 {
-                    return ret;
-                }
+            let ret = z.slice_from(S_28);
+            if ret < 0 {
+                return ret;
             }
         }
         10 => {
@@ -1089,40 +1809,38 @@ fn r_standard_suffix(z: &mut Env) -> i32 {
                 }
             }
         }
-        11 => {
-            'lab14: {
-                {
-                    let m10 = z.l - z.c;
-                    'lab15: {
-                        {
-                            let ret = r_r2(z);
-                            if ret == 0 {
-                                break 'lab15;
-                            }
-                            if ret < 0 {
-                                return ret;
-                            }
-                        }
-                        {
-                            let ret = z.slice_del();
-                            if ret < 0 {
-                                return ret;
-                            }
-                        }
-                        break 'lab14;
-                    }
-                    z.c = z.l - m10;
+        11 => 'lab14: {
+            {
+                let m10 = z.l - z.c;
+                'lab15: {
                     {
-                        let ret = r_r1(z);
-                        if ret <= 0 {
-                            return ret;
+                        let ret = r_r2(z);
+                        if ret == 0 {
+                            break 'lab15;
                         }
-                    }
-                    {
-                        let ret = z.slice_from(S_30);
                         if ret < 0 {
                             return ret;
                         }
+                    }
+                    {
+                        let ret = z.slice_del();
+                        if ret < 0 {
+                            return ret;
+                        }
+                    }
+                    break 'lab14;
+                }
+                z.c = z.l - m10;
+                {
+                    let ret = r_r1(z);
+                    if ret <= 0 {
+                        return ret;
+                    }
+                }
+                {
+                    let ret = z.slice_from(S_30);
+                    if ret < 0 {
+                        return ret;
                     }
                 }
             }
@@ -1210,7 +1928,8 @@ fn r_i_verb_suffix(z: &mut Env) -> i32 {
         mlimit1 = z.lb;
         z.lb = z.i[2];
         z.ket = z.c;
-        if z.c <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (68944418 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+        if z.c <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (68944418 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+        {
             z.lb = mlimit1;
             return 0;
         }
@@ -1284,11 +2003,9 @@ fn r_verb_suffix(z: &mut Env) -> i32 {
                 }
             }
             2 => {
-                {
-                    let ret = z.slice_del();
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_del();
+                if ret < 0 {
+                    return ret;
                 }
             }
             3 => {
@@ -1420,19 +2137,15 @@ fn r_residual_suffix(z: &mut Env) -> i32 {
                 }
             }
             2 => {
-                {
-                    let ret = z.slice_from(S_34);
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_from(S_34);
+                if ret < 0 {
+                    return ret;
                 }
             }
             3 => {
-                {
-                    let ret = z.slice_del();
-                    if ret < 0 {
-                        return ret;
-                    }
+                let ret = z.slice_del();
+                if ret < 0 {
+                    return ret;
                 }
             }
             _ => {}
@@ -1445,7 +2158,10 @@ fn r_residual_suffix(z: &mut Env) -> i32 {
 fn r_un_double(z: &mut Env) -> i32 {
     {
         let m_test1 = z.l - z.c;
-        if z.c - 2 <= z.lb || z.byte(z.c - 1) >> 5 != 3 || (1069056 >> (z.byte(z.c - 1) & 31)) & 1 == 0 {
+        if z.c - 2 <= z.lb
+            || z.byte(z.c - 1) >> 5 != 3
+            || (1069056 >> (z.byte(z.c - 1) & 31)) & 1 == 0
+        {
             return 0;
         }
         if find_among_b(z, A_8) == 0 {

@@ -149,7 +149,7 @@ impl Env {
             if b >= 0xC0 {
                 while c < limit {
                     let b = self.byte(c);
-                    if b >= 0xC0 || b < 0x80 {
+                    if !(0x80..0xC0).contains(&b) {
                         break;
                     }
                     c += 1;
@@ -201,7 +201,10 @@ impl Env {
         if b0 < 0xF0 || c == l {
             return (3, (b0 & 0xF) << 12 | b1 << 6 | b2);
         }
-        (4, (b0 & 0x7) << 18 | b1 << 12 | b2 << 6 | (self.byte(c) & 0x3F))
+        (
+            4,
+            (b0 & 0x7) << 18 | b1 << 12 | b2 << 6 | (self.byte(c) & 0x3F),
+        )
     }
 
     /// Decodes the character before `c`, returning its width and value.
@@ -420,7 +423,8 @@ pub(super) fn find_among(z: &mut Env, v: &[Among]) -> i32 {
         let mut diff = 0;
         let mut common = common_i.min(common_j);
         let w = &v[k as usize];
-        for i2 in common..w.s.len() as i32 {
+        let mut i2 = common;
+        while i2 < w.s.len() as i32 {
             if c + common == l {
                 diff = -1;
                 break;
@@ -430,6 +434,7 @@ pub(super) fn find_among(z: &mut Env, v: &[Among]) -> i32 {
                 break;
             }
             common += 1;
+            i2 += 1;
         }
         if diff < 0 {
             j = k;

@@ -702,10 +702,15 @@ its events already follow the main statement's.
   log, so a restart replays neither another producer's calls nor its rows;
   the consumer's progress records which producer row it last consumed.
   Producers count against `write_step_levels`, and exhaustion stays the named
-  `54000`.
+  `54000`. The invocation log replays calls by position, so a source read
+  again after a restart replays its own log: sharing the write's log would
+  shift every later call once skipped rows stop evaluating theirs.
 - **Rule steps.** A rule action's AFTER work runs from the same completion
   cursor as a top-level write's, so it yields instead of reading
-  synchronously. (Foreign-table writes already keep their selected remote
+  synchronously. The suspended completion returns to the statement's
+  attempt loop, which records the step finished with its outputs (the step
+  progress a routine call already keeps) and starts another attempt; that
+  attempt skips the finished steps and runs the next one. (Foreign-table writes already keep their selected remote
   rows across routine calls; see [execution model](#execution-model).)
 
 ### How saved state is owned

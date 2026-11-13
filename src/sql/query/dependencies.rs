@@ -47,12 +47,16 @@ trait EnclosingColumns {
 /// A query level around a subquery. A level without a schema (one reading a
 /// derived table, function or view) records its own references by relation,
 /// so a reference that resolves nowhere may belong to it.
-struct EnclosingLevel<'s, 'd> {
+struct EnclosingLevel<'s, 'd, 'a> {
     scope: Option<&'s super::QueryScope<'d>>,
     parent: Option<&'s dyn EnclosingColumns>,
+    /// Columns its subqueries read before the level's own relations are
+    /// recorded, which the level marks once they are.
+    deferred:
+        core::cell::RefCell<crate::mem::arena::ArenaList<'a, (DependencyClass, usize, usize)>>,
 }
 
-impl EnclosingColumns for EnclosingLevel<'_, '_> {
+impl EnclosingColumns for EnclosingLevel<'_, '_, '_> {
     fn mark(
         &self,
         qualifier: Option<&str>,
@@ -65,7 +69,16 @@ impl EnclosingColumns for EnclosingLevel<'_, '_> {
         if let Ok(resolved) =
             crate::sql::error_position::preserving_pending(|| scope.find_column(qualifier, name))
         {
-            mark_resolved_column(scope, resolved, dependencies)?;
+            visit_resolved_column(scope, resolved, &mut |class, slot, column| {
+                if dependencies.depends_on(class, slot) {
+                    dependencies.mark_referenced_column(class, slot, column)
+                } else {
+                    self.deferred
+                        .borrow_mut()
+                        .push((class, slot, column))
+                        .map_err(|_| arena_full())
+                }
+            })?;
             return Ok(true);
         }
         match self.parent {
@@ -2961,46 +2974,12 @@ fn collect_select<'a>(
         let level = EnclosingLevel {
             scope: level_scope.as_ref(),
             parent: context.enclosing,
+            deferred: core::cell::RefCell::new(crate::mem::arena::ArenaList::new(arena)),
         };
         let nested = CollectionContext {
             enclosing: Some(&level),
             ..context
         };
-        // Relations come first: a subquery's outer references mark columns of
-        // the relations this level reads.
-        if let Some(from) = select.from {
-            collect_table_ref(
-                &from.base,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                context,
-            )?;
-            for join in from.joins {
-                collect_table_ref(
-                    &join.table,
-                    storage,
-                    txid,
-                    visible_ctes,
-                    dependencies,
-                    arena,
-                    context,
-                )?;
-                if let Some(on) = join.on {
-                    collect_expression(
-                        on,
-                        storage,
-                        txid,
-                        visible_ctes,
-                        dependencies,
-                        arena,
-                        nested,
-                    )?;
-                }
-            }
-        }
 
         for item in select.items {
             match item {
@@ -3060,6 +3039,40 @@ fn collect_select<'a>(
             )?;
         }
         if let Some(from) = select.from {
+            collect_table_ref(
+                &from.base,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
+            )?;
+            for join in from.joins {
+                collect_table_ref(
+                    &join.table,
+                    storage,
+                    txid,
+                    visible_ctes,
+                    dependencies,
+                    arena,
+                    context,
+                )?;
+                if let Some(on) = join.on {
+                    collect_expression(
+                        on,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        nested,
+                    )?;
+                }
+            }
+            for &(class, slot, column) in level.deferred.borrow().as_slice() {
+                dependencies.mark_referenced_column(class, slot, column)?;
+            }
             if let Some(scope) = level_scope.as_ref() {
                 for item in select.items {
                     match item {
@@ -5044,6 +5057,17 @@ fn mark_resolved_column(
     resolved: super::ResolvedColumn,
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
+    visit_resolved_column(scope, resolved, &mut |class, slot, column| {
+        dependencies.mark_referenced_column(class, slot, column)
+    })
+}
+
+/// Each catalog relation column `resolved` reads.
+fn visit_resolved_column(
+    scope: &super::QueryScope<'_>,
+    resolved: super::ResolvedColumn,
+    visit: &mut dyn FnMut(DependencyClass, usize, usize) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     let mut mark = |table: usize, column| {
         let (class, slot) = match scope.view_accesses[table] {
             Some(view) => (DependencyClass::View, usize::from(view)),
@@ -5051,7 +5075,7 @@ fn mark_resolved_column(
             None if scope.slots[table] == usize::MAX => return Ok(()),
             None => (DependencyClass::Table, scope.slots[table]),
         };
-        dependencies.mark_referenced_column(class, slot, column)
+        visit(class, slot, column)
     };
     match resolved {
         super::ResolvedColumn::Table(table, column) => mark(table, column),

@@ -436,10 +436,7 @@ PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
 `text` where PostgreSQL reports `42804`. 
-An aggregate of an `UPDATE` or `DELETE`
-target in a subquery of its `WHERE` (`UPDATE t SET v = 2 WHERE (SELECT
-max(t.v) FROM u) > 0`) is not rejected with PostgreSQL's `aggregate functions
-are not allowed in WHERE`. A SQL function whose earlier
+A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

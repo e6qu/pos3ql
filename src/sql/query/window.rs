@@ -793,9 +793,19 @@ fn compute_window<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     // Outer references, such as PL/pgSQL variables, read the caller's row.
-    let argument_columns =
-        super::aggregate_argument_columns(Some(scope), outer, storage, txid, arena);
-    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = &argument_columns;
+    // Aggregate arguments type their subqueries through the catalog.
+    let scope_columns = super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
+    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
+        Some(columns) => columns,
+        None => &scope_columns,
+    };
     let Expr::Call {
         name,
         args,

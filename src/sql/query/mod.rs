@@ -15173,19 +15173,16 @@ fn describe_scope_record_star<'q>(
 /// Aggregate argument types inside a query that has outer references, such
 /// as PL/pgSQL variables: the query's own columns first, then the outer ones.
 /// Without outer references the query's columns alone resolve them.
-/// The columns an aggregate's arguments resolve against: the query's own,
-/// then the enclosing rows (PL/pgSQL variables, an outer query), with the
-/// catalog describing subqueries among the arguments.
-fn aggregate_argument_columns<'s, 'd, 'o, 'r, 'c>(
+fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
     scope: Option<&'s QueryScope<'d>>,
     outer: Option<&'o dyn ColumnLookup<'r>>,
     storage: &'c Storage,
     txid: u32,
     arena: &'c Arena,
-) -> subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c> {
-    subquery::SubqueryColumns {
+) -> Option<subquery::SubqueryColumns<'s, 'd, 'o, 'r, 'c>> {
+    outer.map(|outer| subquery::SubqueryColumns {
         scope,
-        outer,
+        outer: Some(outer),
         catalog: super::exec::CatalogCols {
             definition: None,
             alias: None,
@@ -15194,7 +15191,7 @@ fn aggregate_argument_columns<'s, 'd, 'o, 'r, 'c>(
             txid,
             arena,
         },
-    }
+    })
 }
 
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);

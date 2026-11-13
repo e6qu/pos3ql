@@ -4899,6 +4899,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             lists: &[],
             deferred: slots,
             statement: slots,
+            bindings: &[],
         };
         let correlated = super::ProceduralSubqueries { storage, txid };
         let hooks = EvalHooks {

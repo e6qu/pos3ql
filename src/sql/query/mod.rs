@@ -853,8 +853,11 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
+#[cfg(test)]
+pub(crate) use subquery::subquery_analyses;
 pub(crate) use subquery::{
-    DmlSubqueries, ProceduralSubqueries, check_sublink_columns, subquery_expression_type,
+    DmlSubqueries, ProceduralSubqueries, SubqueryBinding, check_sublink_columns,
+    subquery_expression_type,
 };
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
@@ -11427,6 +11430,7 @@ pub(crate) fn select_query_resumable<'a>(
     // and re-evaluated per outer row during the scan.
     // A join condition's correlated subquery runs for each pair of rows.
     let join_subqueries = ProceduralSubqueries { storage, txid };
+    let row_types = ScopeSchema(&scope);
     let outer_subs = match prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
@@ -11435,6 +11439,7 @@ pub(crate) fn select_query_resumable<'a>(
         arena,
         params,
         None,
+        &row_types,
         seq,
     ) {
         Ok(s) => s,
@@ -13056,6 +13061,11 @@ fn select_into_rows_mode<'a>(
         }
         collect_table_sample_expressions(from, &mut sub_exprs[2 + n_items + n_group..]);
         let join_subqueries = ProceduralSubqueries { storage, txid };
+        let row_schema = ScopeSchema(&scope);
+        let row_types = Chained {
+            inner: &row_schema,
+            outer,
+        };
         let outer_subs = prepare_outer_subqueries(
             sub_exprs,
             statement.from.as_ref(),
@@ -13064,6 +13074,7 @@ fn select_into_rows_mode<'a>(
             arena,
             params,
             outer,
+            &row_types,
             seq,
         )?;
         let hooks = EvalHooks {
@@ -13271,6 +13282,11 @@ fn select_into_rows_mode<'a>(
         },
     };
     let join_subqueries = ProceduralSubqueries { storage, txid };
+    let row_schema = ScopeSchema(&scope);
+    let row_types = Chained {
+        inner: &row_schema,
+        outer,
+    };
     let outer_subs = prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
@@ -13279,6 +13295,7 @@ fn select_into_rows_mode<'a>(
         arena,
         params,
         outer,
+        &row_types,
         seq,
     )?;
     let correlated = outer_subs.correlated;

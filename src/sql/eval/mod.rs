@@ -3529,6 +3529,9 @@ pub struct SubqueryValues<'h, 'a> {
     /// queries it runs for each row; see
     /// [`ColumnLookup::statement_subqueries`].
     pub statement: &'a [DeferredSubquery<'a>],
+    /// The correlated scalar and `ARRAY` subqueries analysed once for the
+    /// statement, before any outer row.
+    pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
 }
 
 /// A subquery run when evaluation first reaches it. An uncorrelated one runs
@@ -6741,6 +6744,7 @@ fn eval_full_inner<'a>(
                     lists: &[],
                     deferred: &[],
                     statement: &[],
+                    bindings: &[],
                 }
             }
             // The operand reads the query's other subqueries, so it is
@@ -6817,6 +6821,7 @@ fn eval_full_inner<'a>(
                     lists: &[],
                     deferred: &[],
                     statement: &[],
+                    bindings: &[],
                 }
             }
             SubqueryResult::List(list) => {
@@ -6829,6 +6834,7 @@ fn eval_full_inner<'a>(
                     lists: &lists,
                     deferred: &[],
                     statement: &[],
+                    bindings: &[],
                 }
             }
         };

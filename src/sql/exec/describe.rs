@@ -1664,7 +1664,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Case {
             origin:
                 crate::sql::ast::CaseOrigin::BooleanTest { .. }
-                | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+                | crate::sql::ast::CaseOrigin::DistinctFrom { .. }
+                | crate::sql::ast::CaseOrigin::UnknownTest { .. },
             ..
         } => None,
         Expr::Case {
@@ -5932,7 +5933,22 @@ fn infer_type_unpositioned(
                     }
                 }
             }
-            if operand.is_none() {
+            if let Some((tested, test)) = expression.boolean_test_argument() {
+                let tested_oid = infer_type_res(tested, columns)?.0;
+                if !matches!(tested_oid, oid::BOOL | oid::UNKNOWN) {
+                    let type_name =
+                        ColType::from_oid(tested_oid).map_or("unknown", |ctype| ctype.name());
+                    return Err(crate::sql::error_position::at_expression(
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "argument of {} must be type boolean, not type {}",
+                            test,
+                            type_name
+                        ),
+                        tested,
+                    ));
+                }
+            } else if operand.is_none() {
                 for (condition, _) in *whens {
                     let condition_oid = infer_type_res(condition, columns)?.0;
                     if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {

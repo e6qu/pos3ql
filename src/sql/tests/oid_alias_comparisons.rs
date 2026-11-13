@@ -68,3 +68,32 @@ fn catalog_oid_aliases_compare_unsigned_values_across_declared_types() {
         }
     }
 }
+
+/// A string cast to a catalog reference type is converted once, as
+/// PostgreSQL's parser converts it, not once per row a filter reads.
+#[test]
+fn catalog_reference_literals_in_filters_are_converted_once() {
+    let config = test_config("catalog-reference-literal-filters");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION literal_target() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        true,
+    );
+    let before = crate::sql::catalog::ROUTINE_NAME_LOOKUPS.with(core::cell::Cell::get);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_proc WHERE oid = 'literal_target()'::regprocedure",
+            true,
+        )),
+        ["1"]
+    );
+    let lookups = crate::sql::catalog::ROUTINE_NAME_LOOKUPS.with(core::cell::Cell::get) - before;
+    assert!(
+        lookups <= 2,
+        "{lookups} routine name lookups for one literal"
+    );
+}

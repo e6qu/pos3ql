@@ -1414,7 +1414,7 @@ pub(crate) use describe::{
     builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
     function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
-    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    static_meta_for_column, visit_catalog_composite_fields, visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -17007,6 +17007,11 @@ pub(crate) fn drop_schema(
                         arena,
                         responder,
                     ) {
+                        return sql_fail(error);
+                    }
+                    // The view's triggers are journaled as dropped before
+                    // the view, so recovery can still resolve their target.
+                    if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, *v) {
                         return sql_fail(error);
                     }
                     if !temporary {
@@ -53638,6 +53643,21 @@ fn stored_rule_definition<'a>(
                 ),
                 reference,
             ));
+        }
+        // `transformRuleStmt`: a WITH query cannot read the rule's rows.
+        let ctes = match action.statement {
+            crate::sql::ast::Stmt::Select(select) => select.with,
+            crate::sql::ast::Stmt::With { ctes, .. } => ctes,
+            _ => &[],
+        };
+        for (row, spelling) in [("old", "OLD"), ("new", "NEW")] {
+            if ctes.iter().any(|cte| rule_rows::cte_reads(cte, row)) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot refer to {} within WITH query",
+                    spelling
+                ));
+            }
         }
         condition_columns.used_old.set(false);
         condition_columns.used_new.set(false);
@@ -98158,4 +98178,139 @@ fn virtual_generated_alteration(
             column, relation
         ),
     )
+}
+
+/// Whether a rule action's `WITH` query names the rule's `OLD` or `NEW`
+/// row, which PostgreSQL rejects when the rule is created.
+mod rule_rows {
+    use crate::sql::ast::{Cte, Expr, FromClause, Select, SelectItem, SetTree, Stmt, TableRef};
+
+    pub(super) fn cte_reads(cte: &Cte<'_>, row: &str) -> bool {
+        match cte.dml {
+            Some(statement) => statement_reads(statement, row),
+            None => select_reads(cte.query, row),
+        }
+    }
+
+    fn statement_reads(statement: &Stmt<'_>, row: &str) -> bool {
+        match statement {
+            Stmt::Select(select) => select_reads(select, row),
+            Stmt::With { ctes, statement } => {
+                ctes.iter().any(|cte| cte_reads(cte, row)) || statement_reads(statement, row)
+            }
+            Stmt::Insert(insert) => {
+                insert
+                    .rows
+                    .iter()
+                    .any(|values| values.iter().any(|value| expression_reads(value, row)))
+                    || insert
+                        .select
+                        .is_some_and(|select| select_reads(select, row))
+                    || items_read(insert.returning.items, row)
+            }
+            Stmt::Update(update) => {
+                update
+                    .assignments
+                    .iter()
+                    .any(|(_, value)| expression_reads(value, row))
+                    || update.from.is_some_and(|from| from_reads(from, row))
+                    || update
+                        .where_clause
+                        .is_some_and(|condition| expression_reads(condition, row))
+                    || items_read(update.returning.items, row)
+            }
+            Stmt::Delete(delete) => {
+                delete.using.is_some_and(|from| from_reads(from, row))
+                    || delete
+                        .where_clause
+                        .is_some_and(|condition| expression_reads(condition, row))
+                    || items_read(delete.returning.items, row)
+            }
+            _ => false,
+        }
+    }
+
+    fn items_read(items: &[SelectItem<'_>], row: &str) -> bool {
+        items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } => expression_reads(expression, row),
+            SelectItem::TableWildcard(name) => name.eq_ignore_ascii_case(row),
+            _ => false,
+        })
+    }
+
+    fn select_reads(select: &Select<'_>, row: &str) -> bool {
+        select.with.iter().any(|cte| cte_reads(cte, row))
+            || items_read(select.items, row)
+            || select
+                .from
+                .as_ref()
+                .is_some_and(|from| from_reads(from, row))
+            || select
+                .where_clause
+                .is_some_and(|condition| expression_reads(condition, row))
+            || select
+                .having
+                .is_some_and(|condition| expression_reads(condition, row))
+            || select.group_by.iter().any(|key| expression_reads(key, row))
+            || select
+                .distinct_on
+                .iter()
+                .any(|key| expression_reads(key, row))
+            || select
+                .order_by
+                .iter()
+                .any(|order| expression_reads(order.expression, row))
+            || select.set_body.is_some_and(|tree| tree_reads(tree, row))
+    }
+
+    fn tree_reads(tree: &SetTree<'_>, row: &str) -> bool {
+        match tree {
+            SetTree::Select(select) => select_reads(select, row),
+            SetTree::Op { left, right, .. } => tree_reads(left, row) || tree_reads(right, row),
+        }
+    }
+
+    fn from_reads(from: &FromClause<'_>, row: &str) -> bool {
+        item_reads(&from.base, row)
+            || from.joins.iter().any(|join| {
+                item_reads(&join.table, row)
+                    || join
+                        .on
+                        .is_some_and(|condition| expression_reads(condition, row))
+            })
+    }
+
+    fn item_reads(item: &TableRef<'_>, row: &str) -> bool {
+        item.subquery
+            .is_some_and(|select| select_reads(select, row))
+            || item
+                .func_args
+                .is_some_and(|args| args.iter().any(|argument| expression_reads(argument, row)))
+    }
+
+    fn expression_reads(expression: &Expr<'_>, row: &str) -> bool {
+        let found = match expression {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                ..
+            } => qualifier.eq_ignore_ascii_case(row),
+            Expr::WholeRow(name) => name.eq_ignore_ascii_case(row),
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+                select_reads(select, row)
+            }
+            Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
+                select_reads(select, row)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+        let mut child_reads = false;
+        let _ = crate::sql::query::walk_children(expression, &mut |child| {
+            child_reads |= expression_reads(child, row);
+            Ok(())
+        });
+        child_reads
+    }
 }

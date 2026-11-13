@@ -3156,6 +3156,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {
@@ -3498,6 +3507,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {

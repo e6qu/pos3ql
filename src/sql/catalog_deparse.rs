@@ -17,8 +17,12 @@ use crate::sql::types::{ColType, oid};
 use crate::storage::TableDef;
 use core::fmt::Write;
 
+#[path = "catalog_deparse_operators.rs"]
+mod operators;
 #[path = "catalog_query_deparse.rs"]
 mod query;
+#[path = "catalog_deparse_types.rs"]
+mod types;
 
 /// Where an expression's value is delivered.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +39,11 @@ pub(crate) enum Destination {
 pub(crate) struct Context<'s> {
     pub storage: &'s Storage,
     pub txid: u32,
+    /// Scratch space for typing expressions the deparser does not model.
+    pub arena: &'s Arena,
+    /// The catalog identities a stored query captured at CREATE, which its
+    /// nested queries' names are bound to.
+    pub dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     pub table: Option<&'s TableDef>,
     /// Named parameters of the routine whose body or default is printed.
     pub parameters: &'s [crate::storage::RoutineParameterDef],
@@ -148,6 +157,21 @@ impl<'s> Joined<'s> {
         }
     }
 
+    /// A rule's `OLD` or `NEW` row of a relation with these columns.
+    pub(crate) fn rule_columns(name: &'s str, columns: Columns<'s>) -> Self {
+        Self {
+            name,
+            printed: name,
+            columns,
+            unqualified: false,
+            addressable: true,
+            level: 0,
+            row_type: None,
+            hides: 0,
+            cte: false,
+        }
+    }
+
     /// The table definition of a physical item.
     pub(crate) fn table(&self) -> Option<&'s TableDef> {
         match self.columns {
@@ -174,6 +198,12 @@ enum Parent {
     Cast,
     NullTest,
     ArrayComparison,
+    /// The operand of a prefix operator.
+    Prefix,
+    /// An argument `get_func_sql_syntax` prints in SQL syntax.
+    SqlSyntax,
+    /// The operand of `COLLATE`.
+    Collate,
 }
 
 /// Deparses `source`, or returns `None` when its shape is outside this
@@ -259,6 +289,25 @@ fn numeric_rank(type_oid: i32) -> Option<u8> {
         oid::FLOAT4 | oid::FLOAT8 => 3,
         _ => return None,
     })
+}
+
+/// `select_common_type` of two typed inputs: the numeric category's
+/// preferred direction, and `text` over the other string types.
+fn common_type(current: i32, next: i32) -> i32 {
+    let rank = |type_oid: i32| match type_oid {
+        oid::INT2 => Some(1),
+        oid::INT4 => Some(2),
+        oid::INT8 => Some(3),
+        oid::NUMERIC => Some(4),
+        oid::FLOAT4 => Some(5),
+        oid::FLOAT8 => Some(6),
+        _ => None,
+    };
+    match (rank(current), rank(next)) {
+        (Some(have), Some(found)) if found > have => next,
+        _ if next == oid::TEXT && matches!(current, oid::VARCHAR | oid::BPCHAR) => next,
+        _ => current,
+    }
 }
 
 /// The array type whose elements have `element`'s type.
@@ -519,6 +568,17 @@ impl Context<'_> {
     /// The type an expression has before its consumer coerces it, or `None`
     /// for an unknown-typed literal.
     fn type_of(&self, expression: &Expr<'_>) -> Result<Option<i32>, SqlError> {
+        if matches!(expression, Expr::Str(_) | Expr::Null) {
+            return Ok(None);
+        }
+        Ok(match self.modeled_type(expression)? {
+            Some(found) => Some(found),
+            None => self.inferred_type(expression),
+        })
+    }
+
+    /// The types this module derives itself, as PostgreSQL's parser does.
+    fn modeled_type(&self, expression: &Expr<'_>) -> Result<Option<i32>, SqlError> {
         Ok(match expression {
             Expr::Int(value) => Some(if i32::try_from(*value).is_ok() {
                 oid::INT4
@@ -584,11 +644,13 @@ impl Context<'_> {
             } => match sql_value_function(name) {
                 Some((_, result)) => Some(result),
                 None if is_conditional(name) => {
-                    let mut found = None;
+                    let mut found: Option<i32> = None;
                     for argument in *args {
                         if let Some(argument) = self.type_of(argument)? {
-                            found = Some(argument);
-                            break;
+                            found = Some(match found {
+                                None => argument,
+                                Some(current) => common_type(current, argument),
+                            });
                         }
                     }
                     found
@@ -701,16 +763,14 @@ impl Context<'_> {
             name,
             args,
             argument_names,
-            variadic: false,
+            variadic,
             star: false,
             ..
         } = expression
         else {
             return Ok(None);
         };
-        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS
-            || argument_names.iter().any(Option::is_some)
-        {
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
             return Ok(None);
         }
         let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -720,9 +780,9 @@ impl Context<'_> {
         Ok(
             match self.storage.select_routine_call(
                 name,
-                &[],
+                argument_names,
                 &argument_oids[..args.len()],
-                false,
+                *variadic,
                 self.txid,
                 crate::storage::RoutineCallKind::Function,
             ) {
@@ -735,10 +795,29 @@ impl Context<'_> {
     }
 
     fn type_name(&self, type_oid: i32, output: &mut Output<'_>) -> Result<(), SqlError> {
-        // `format_type_with_typemod(type, -1)`: an unconstrained character
-        // type is spelled `bpchar`.
-        if type_oid == oid::BPCHAR {
-            return output.push("bpchar");
+        self.type_name_mod(type_oid, -1, output)
+    }
+
+    /// `format_type_with_typemod`: a modifier PostgreSQL's grammar would
+    /// otherwise supply (`bit`, `bpchar`) is spelled as the quoted name.
+    fn type_name_mod(
+        &self,
+        type_oid: i32,
+        type_mod: i32,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        if type_mod < 0 {
+            match type_oid {
+                oid::BPCHAR => return output.push("bpchar"),
+                oid::BIT => return output.push("\"bit\""),
+                _ => {}
+            }
+        }
+        if crate::storage::NamedTypeKind::from_oid(type_oid).is_none()
+            && let Some(name) =
+                crate::sql::eval::funcs::system::format_builtin_type(type_oid, type_mod, true)
+        {
+            return output.push(name.as_str());
         }
         if let Some(ctype) = ColType::from_oid(type_oid)
             && crate::storage::NamedTypeKind::from_oid(type_oid).is_none()
@@ -778,13 +857,14 @@ impl Context<'_> {
         if matches!(expression, Expr::Str(_) | Expr::Null) {
             return self.literal(expression, expected.unwrap_or(oid::TEXT), output);
         }
+        // `ARRAY[...]` coerces its items, not the array.
+        if let (Expr::Array(items), Some(member)) = (expression, expected.and_then(element_of)) {
+            return self.array(items, Some(member), output);
+        }
         let natural = self.type_of(expression)?;
         match (natural, expected) {
-            (Some(natural), Some(expected))
-                if natural != expected
-                    && !(numeric_rank(natural) == Some(1) && numeric_rank(expected) == Some(1))
-                    && !(numeric_rank(natural) == Some(3) && numeric_rank(expected) == Some(3)) =>
-            {
+            // A row is a `record` without a coercion.
+            (Some(natural), Some(expected)) if natural != expected && expected != oid::RECORD => {
                 self.wrapped(expression, None, Parent::Cast, true, output)?;
                 output.push("::")?;
                 self.type_name(expected, output)
@@ -938,8 +1018,25 @@ impl Context<'_> {
                 )
             }
             Expr::Float(_) => output.unsupported(),
-            Expr::NumericLit(text) => self.constant(text, oid::NUMERIC, output),
+            Expr::NumericLit(text) => {
+                let canonical = self.numeric_text(text, false, output)?;
+                self.constant(canonical, oid::NUMERIC, output)
+            }
             Expr::Bool(value) => output.push(if *value { "true" } else { "false" }),
+            Expr::BitLit(written) => {
+                let bits = crate::sql::eval::parse_bits_text(written, output.arena)?;
+                self.constant(bits, oid::BIT, output)
+            }
+            Expr::SchemaColumn { table, name, .. } => self.bare(
+                &Expr::Column {
+                    qualifier: Some(table),
+                    name,
+                },
+                output,
+            ),
+            Expr::BoundLiteral { source, .. } => self.bare(source, output),
+            Expr::BoundDefault { expression, .. } => self.bare(expression, output),
+            Expr::OuterAggregate { call, .. } => self.bare(call, output),
             // `get_variable` prints a whole-row variable as `t.*`.
             _ if self.whole_row(expression).is_some() => {
                 let exposed = self.whole_row(expression).map_or("", |row| row.printed);
@@ -958,6 +1055,12 @@ impl Context<'_> {
                     output,
                 )
             }
+            Expr::Field { base, field } if *field != "*" => self.field(base, field, output),
+            Expr::Subscript { base, index } => self.subscript(base, Some(index), None, output),
+            Expr::Slice { base, lower, upper } => {
+                self.subscript(base, *lower, Some(*upper), output)
+            }
+            Expr::Collate { operand, collation } => self.collate(operand, collation, output),
             Expr::Call {
                 kind: CallKind::SqlSyntax,
                 name,
@@ -1042,16 +1145,37 @@ impl Context<'_> {
                     )
                 }
                 Expr::NumericLit(text) => {
-                    let negated = crate::stack_format!(160, "-{}", text);
-                    self.constant(negated.as_str(), oid::NUMERIC, output)
+                    let canonical = self.numeric_text(text, true, output)?;
+                    self.constant(canonical, oid::NUMERIC, output)
                 }
-                _ if self.pretty => output.unsupported(),
-                _ => {
-                    output.push("(- ")?;
-                    self.write(operand, None, output)?;
-                    output.push(")")
-                }
+                _ => self.prefix(UnaryOp::Neg, operand, output),
             },
+            // `NOT SIMILAR TO` and a row `IS DISTINCT FROM` are one construct.
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand:
+                    Expr::Call {
+                        kind: CallKind::SqlSyntax,
+                        name,
+                        args,
+                        ..
+                    },
+                source_position,
+            } if source_position.is_expanded()
+                && matches!(
+                    *name,
+                    crate::sql::parser::SIMILAR_TO | crate::sql::parser::ROWS_NOT_DISTINCT
+                ) =>
+            {
+                if *name == crate::sql::parser::SIMILAR_TO {
+                    self.similar(args, true, output)
+                } else {
+                    match (row_items(args[0]), row_items(args[1])) {
+                        (Some(left), Some(right)) => self.rows_distinct(left, right, false, output),
+                        _ => output.unsupported(),
+                    }
+                }
+            }
             Expr::Unary {
                 operator: UnaryOp::Not,
                 operand,
@@ -1067,38 +1191,21 @@ impl Context<'_> {
                 ..
             } => {
                 self.open(output)?;
-                self.connective(expression, *operator, true, output)?;
+                self.connective(expression, *operator, true, true, output)?;
                 self.close(output)
             }
+            Expr::Unary {
+                operator, operand, ..
+            } => self.prefix(*operator, operand, output),
             Expr::Binary {
                 operator,
                 left,
                 right,
                 ..
-            } => {
-                let Some(symbol) = operator_symbol(*operator) else {
-                    return output.unsupported();
-                };
-                let (left_type, right_type) = if *operator == BinaryOp::Concat {
-                    let text = |expression: &Expr<'_>| -> Result<Option<i32>, SqlError> {
-                        Ok(match self.type_of(expression)? {
-                            None => Some(oid::TEXT),
-                            Some(found) => Some(operator_type(found)),
-                        })
-                    };
-                    (text(left)?, text(right)?)
-                } else {
-                    self.operand_types(left, right)?
-                };
-                self.open(output)?;
-                let parent = Parent::Operator(symbol);
-                self.wrapped(left, Some(left_type), parent, true, output)?;
-                output.push(" ")?;
-                output.push(symbol)?;
-                output.push(" ")?;
-                self.wrapped(right, Some(right_type), parent, false, output)?;
-                self.close(output)
-            }
+            } => match (row_items(left), row_items(right)) {
+                (Some(left), Some(right)) => self.row_comparison(*operator, left, right, output),
+                _ => self.binary(*operator, left, right, output),
+            },
             Expr::IsNull { operand, negated } => {
                 self.open(output)?;
                 self.wrapped(operand, Some(None), Parent::NullTest, true, output)?;
@@ -1109,51 +1216,48 @@ impl Context<'_> {
                 operand,
                 list,
                 negated,
-            } => {
-                let element = match self.type_of(operand)? {
-                    Some(found) => Some(operator_type(found)),
-                    None => Some(oid::TEXT),
-                };
-                self.open(output)?;
-                self.wrapped(
-                    operand,
-                    Some(element),
-                    Parent::ArrayComparison,
-                    true,
-                    output,
-                )?;
-                output.push(if *negated {
-                    " <> ALL (ARRAY["
-                } else {
-                    " = ANY (ARRAY["
-                })?;
-                for (index, item) in list.iter().enumerate() {
-                    if index != 0 {
-                        output.push(", ")?;
+            } => match row_items(operand) {
+                // A row's `IN` list is the rows' comparisons, joined by `OR`
+                // (`AND` for `NOT IN`).
+                Some(fields) => {
+                    if list.len() > 1 {
+                        self.open(output)?;
                     }
-                    self.write(item, element, output)?;
-                }
-                output.push("])")?;
-                self.close(output)
-            }
-            Expr::Array(items) => {
-                let mut element = None;
-                for item in *items {
-                    if let Some(found) = self.type_of(item)? {
-                        element = Some(found);
-                        break;
+                    for (index, item) in list.iter().enumerate() {
+                        if index != 0 {
+                            output.push(if *negated { " AND " } else { " OR " })?;
+                        }
+                        let Some(items) = row_items(item) else {
+                            return output.unsupported();
+                        };
+                        let operator = if *negated {
+                            BinaryOp::NotEq
+                        } else {
+                            BinaryOp::Eq
+                        };
+                        let pretty_paren = self.pretty && list.len() > 1 && fields.len() > 1;
+                        if pretty_paren
+                            && (*negated || operator == BinaryOp::NotEq)
+                                == (operator == BinaryOp::Eq)
+                        {
+                            output.push("(")?;
+                        }
+                        self.row_comparison(operator, fields, items, output)?;
+                        if pretty_paren
+                            && (*negated || operator == BinaryOp::NotEq)
+                                == (operator == BinaryOp::Eq)
+                        {
+                            output.push(")")?;
+                        }
                     }
-                }
-                let element = element.unwrap_or(oid::TEXT);
-                output.push("ARRAY[")?;
-                for (index, item) in items.iter().enumerate() {
-                    if index != 0 {
-                        output.push(", ")?;
+                    if list.len() > 1 {
+                        self.close(output)?;
                     }
-                    self.write(item, Some(element), output)?;
+                    Ok(())
                 }
-                output.push("]")
-            }
+                None => self.in_list(operand, list, *negated, output),
+            },
+            Expr::Array(items) => self.array(items, None, output),
             Expr::AnyAll {
                 operand,
                 operator,
@@ -1167,11 +1271,25 @@ impl Context<'_> {
                     Some(found) => Some(operator_type(found)),
                     None => Some(oid::TEXT),
                 };
-                // An untyped array literal takes the operand's array type,
-                // which this deparser has no spelling for.
-                if matches!(array, Expr::Str(_)) {
-                    return output.unsupported();
-                }
+                let array_type = match (array, self.type_of(array)?) {
+                    // A constructor's items take the comparison's common type.
+                    (Expr::Array(_), found) => {
+                        let member = found.and_then(element_of);
+                        let common = match (element, member) {
+                            (Some(element), Some(member))
+                                if numeric_rank(member) > numeric_rank(element) =>
+                            {
+                                Some(member)
+                            }
+                            (Some(element), _) => Some(element),
+                            (None, member) => member,
+                        };
+                        common.and_then(array_of)
+                    }
+                    (_, Some(found)) => Some(found),
+                    // An untyped array literal takes the operand's array type.
+                    (_, None) => element.and_then(array_of),
+                };
                 self.open(output)?;
                 self.wrapped(
                     operand,
@@ -1183,7 +1301,7 @@ impl Context<'_> {
                 output.push(" ")?;
                 output.push(symbol)?;
                 output.push(if *all { " ALL (" } else { " ANY (" })?;
-                self.write(array, None, output)?;
+                self.write(array, array_type, output)?;
                 output.push(")")?;
                 self.close(output)
             }
@@ -1192,7 +1310,7 @@ impl Context<'_> {
                 pattern,
                 negated,
                 case_insensitive,
-                escape: None,
+                escape,
             } => {
                 let symbol = match (*negated, *case_insensitive) {
                     (false, false) => "~~",
@@ -1200,7 +1318,10 @@ impl Context<'_> {
                     (true, false) => "!~~",
                     (true, true) => "!~~*",
                 };
-                self.operator_pair(operand, pattern, symbol, output)
+                match escape {
+                    Some(escape) => self.like_escape(operand, pattern, escape, symbol, output),
+                    None => self.operator_pair(operand, pattern, symbol, output),
+                }
             }
             Expr::Match {
                 operand,
@@ -1226,8 +1347,10 @@ impl Context<'_> {
                     return output.unsupported();
                 };
                 // `transformArrayExpr`: a cast of an ARRAY constructor
-                // coerces each element to the element type instead.
+                // coerces each element to the element type instead; an empty
+                // one keeps the cast as its type.
                 if let Expr::Array(items) = operand
+                    && !items.is_empty()
                     && *type_mod < 0
                     && let Some(element) = crate::sql::assignment_path::element_type_oid(target)
                     && !items.iter().any(|item| matches!(item, Expr::Array(_)))
@@ -1250,14 +1373,104 @@ impl Context<'_> {
                 }
                 match operand {
                     // A cast literal is converted while parsing.
-                    Expr::Str(_) | Expr::Null => self.literal(operand, target, output),
+                    Expr::Str(_) | Expr::Null => {
+                        self.literal_mod(operand, target, *type_mod, output)
+                    }
+                    // `ARRAY[]` takes the cast's type as its own.
+                    Expr::Array([]) => {
+                        output.push("ARRAY[]::")?;
+                        self.type_name_mod(target, *type_mod, output)
+                    }
+                    // A constant of the target type is the constant itself.
+                    Expr::Int(_)
+                        if target == oid::INT4 && self.type_of(operand)? == Some(target) =>
+                    {
+                        self.bare(operand, output)
+                    }
                     _ => {
                         self.wrapped(operand, Some(None), Parent::Cast, true, output)?;
                         output.push("::")?;
-                        self.type_name(target, output)
+                        self.type_name_mod(target, *type_mod, output)
                     }
                 }
             }
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name: crate::sql::parser::SIMILAR_TO,
+                args,
+                ..
+            } => self.similar(args, false, output),
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name: crate::sql::parser::ROWS_NOT_DISTINCT,
+                args: [left, right],
+                ..
+            } => match (row_items(left), row_items(right)) {
+                (Some(left), Some(right)) => self.rows_distinct(left, right, true, output),
+                _ => output.unsupported(),
+            },
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                args: [argument],
+                ..
+            } if name.eq_ignore_ascii_case("grouping") => {
+                output.push("GROUPING(")?;
+                self.write(argument, None, output)?;
+                output.push(")")
+            }
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("grouping") => {
+                output.push("GROUPING(")?;
+                for (index, argument) in args.iter().enumerate() {
+                    if index != 0 {
+                        output.push(", ")?;
+                    }
+                    self.write(argument, None, output)?;
+                }
+                output.push(")")
+            }
+            // An operator the grammar could not map to a node of its own.
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if crate::sql::ast::catalog_operator_call(name).is_some() => {
+                let (schema, symbol) =
+                    crate::sql::ast::catalog_operator_call(name).expect("checked operator");
+                if schema.is_some_and(|schema| schema != "pg_catalog") {
+                    return output.unsupported();
+                }
+                match (args, BinaryOp::from_operator_name(symbol)) {
+                    ([left, right], Some(operator)) => self.binary(operator, left, right, output),
+                    ([operand], _) => {
+                        self.open(output)?;
+                        output.push(symbol)?;
+                        output.push(" ")?;
+                        self.wrapped(operand, None, Parent::Prefix, false, output)?;
+                        self.close(output)
+                    }
+                    ([left, right], None) => {
+                        self.open(output)?;
+                        let parent = Parent::Operator("operator");
+                        self.wrapped(left, None, parent, true, output)?;
+                        output.push(" ")?;
+                        output.push(symbol)?;
+                        output.push(" ")?;
+                        self.wrapped(right, None, parent, false, output)?;
+                        self.close(output)
+                    }
+                    _ => output.unsupported(),
+                }
+            }
+            // Both write nothing unless the call is theirs.
+            Expr::Call { .. } if self.sql_syntax_call(expression, output)? => Ok(()),
+            Expr::Call { .. } if self.ordered_set_aggregate(expression, output)? => Ok(()),
             Expr::Call {
                 kind: CallKind::SqlSyntax,
                 name,
@@ -1347,29 +1560,64 @@ impl Context<'_> {
                 }
                 self.call_close(expression, output)
             }
-            Expr::Call { name, args, .. } => {
+            Expr::Call {
+                name,
+                args,
+                argument_names,
+                variadic,
+                ..
+            } => {
                 let Some(routine) = self.selected_builtin(expression)? else {
                     return output.unsupported();
                 };
-                if routine.arguments.len() != args.len() || !routine.schema.eq("pg_catalog") {
+                if !routine.schema.eq("pg_catalog") {
                     return output.unsupported();
                 }
                 let mut identifier = crate::util::StackStr::<130>::new();
-                write_identifier(&mut identifier, name);
+                write_identifier(&mut identifier, unqualified(name));
                 output.push(identifier.as_str())?;
                 output.push("(")?;
                 self.call_prefix(expression, output)?;
-                for (index, (argument, parameter)) in args.iter().zip(routine.arguments).enumerate()
-                {
+                let last = routine.arguments.len().saturating_sub(1);
+                for (index, argument) in args.iter().enumerate() {
                     if index != 0 {
                         output.push(", ")?;
                     }
-                    // Polymorphic and `"any"` parameters take the argument
-                    // as it is.
-                    let expected = (crate::storage::PolymorphicType::from_oid(*parameter)
-                        .is_none()
-                        && *parameter != oid::ANY)
-                        .then_some(*parameter);
+                    let named = argument_names.get(index).copied().flatten();
+                    let parameter = match named {
+                        Some(named) => routine
+                            .argument_names
+                            .iter()
+                            .position(|candidate| *candidate == named)
+                            .and_then(|position| routine.arguments.get(position).copied()),
+                        // Arguments past the variadic parameter fill its
+                        // element type, unless the call passes the array.
+                        None if index >= last && !*variadic => routine
+                            .variadic_element
+                            .or_else(|| routine.arguments.get(index).copied()),
+                        None => routine.arguments.get(index).copied(),
+                    };
+                    let Some(parameter) = parameter else {
+                        return output.unsupported();
+                    };
+                    if let Some(named) = named {
+                        push_identifier(output, named)?;
+                        output.push(" => ")?;
+                    }
+                    if *variadic && index + 1 == args.len() {
+                        output.push("VARIADIC ")?;
+                    }
+                    // An `"any"` parameter keeps an untyped literal unknown;
+                    // polymorphic parameters take the argument as it is.
+                    if parameter == oid::ANY
+                        && let Expr::Str(text) = argument
+                    {
+                        quote_literal(output, text)?;
+                        continue;
+                    }
+                    let expected = (crate::storage::PolymorphicType::from_oid(parameter).is_none()
+                        && parameter != oid::ANY)
+                        .then_some(parameter);
                     self.write(argument, expected, output)?;
                 }
                 self.call_close(expression, output)
@@ -1423,25 +1671,70 @@ impl Context<'_> {
                 self.close(output)
             }
             Expr::Case {
-                operand: None,
+                origin: crate::sql::ast::CaseOrigin::UnknownTest { .. },
+                ..
+            } => {
+                let Some((operand, negated)) = expression.unknown_test_operand() else {
+                    return output.unsupported();
+                };
+                self.open(output)?;
+                self.wrapped(
+                    operand,
+                    Some(Some(oid::BOOL)),
+                    Parent::NullTest,
+                    true,
+                    output,
+                )?;
+                output.push(if negated {
+                    " IS NOT UNKNOWN"
+                } else {
+                    " IS UNKNOWN"
+                })?;
+                self.close(output)
+            }
+            Expr::Case {
+                operand,
                 whens,
                 otherwise,
                 origin: crate::sql::ast::CaseOrigin::Written,
             } => {
-                let Some((_, first)) = whens.first() else {
+                if whens.is_empty() {
                     return output.unsupported();
+                }
+                let mut result = self.type_of(expression)?;
+                if result.is_none() {
+                    for (_, value) in *whens {
+                        if let Some(found) = self.type_of(value)? {
+                            result = Some(found);
+                            break;
+                        }
+                    }
+                }
+                let result = result.or(Some(oid::TEXT));
+                // A simple `CASE` compares each `WHEN` value to its operand.
+                let when = |output: &mut Output<'_>, condition: &Expr<'_>| match operand {
+                    Some(operand) => {
+                        let (_, expected) =
+                            self.binary_operands(BinaryOp::Eq, operand, condition)?;
+                        self.write(condition, expected, output)
+                    }
+                    None => self.write(condition, Some(oid::BOOL), output),
                 };
-                let result = match self.type_of(first)? {
-                    Some(found) => Some(found),
-                    None => Some(oid::TEXT),
+                let head = |output: &mut Output<'_>| -> Result<(), SqlError> {
+                    if let Some(operand) = operand {
+                        output.push(" ")?;
+                        self.write(operand, None, output)?;
+                    }
+                    Ok(())
                 };
                 if output.layout {
                     // The indented layout starts each arm on its own line
                     // and always prints the `ELSE` the parser supplies.
                     output.keyword("CASE", 0, 4, 0)?;
+                    head(output)?;
                     for (condition, value) in *whens {
                         output.keyword("WHEN ", 0, 0, 0)?;
-                        self.write(condition, Some(oid::BOOL), output)?;
+                        when(output, condition)?;
                         output.push(" THEN ")?;
                         self.write(value, result, output)?;
                     }
@@ -1453,9 +1746,10 @@ impl Context<'_> {
                     return output.keyword("END", -4, 0, 0);
                 }
                 output.push("CASE")?;
+                head(output)?;
                 for (condition, value) in *whens {
                     output.push(" WHEN ")?;
-                    self.write(condition, Some(oid::BOOL), output)?;
+                    when(output, condition)?;
                     output.push(" THEN ")?;
                     self.write(value, result, output)?;
                 }
@@ -1520,6 +1814,143 @@ impl Context<'_> {
             }
             _ => output.unsupported(),
         }
+    }
+
+    /// `ARRAY[...]`: its items coerced to the element type, `member` when
+    /// the consumer gives one, else the items' common type.
+    fn array(
+        &self,
+        items: &[&Expr<'_>],
+        member: Option<i32>,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        let element = match member {
+            Some(member) => Some(member),
+            None => {
+                let mut common: Option<i32> = None;
+                for item in items {
+                    let found = match item {
+                        Expr::Array(_) => self.type_of(item)?.and_then(element_of),
+                        _ => self.type_of(item)?,
+                    };
+                    let Some(found) = found else {
+                        continue;
+                    };
+                    common = Some(match common {
+                        Some(current) if numeric_rank(found) <= numeric_rank(current) => current,
+                        _ => found,
+                    });
+                }
+                Some(common.unwrap_or(oid::TEXT))
+            }
+        };
+        output.push("ARRAY[")?;
+        for (index, item) in items.iter().enumerate() {
+            if index != 0 {
+                output.push(", ")?;
+            }
+            match item {
+                Expr::Array(nested) => self.array(nested, element, output)?,
+                _ => self.write(item, element, output)?,
+            }
+        }
+        output.push("]")
+    }
+
+    /// A numeric literal's canonical text (`numeric_out`), negated when the
+    /// parser folded a minus sign into it.
+    fn numeric_text<'o>(
+        &self,
+        text: &str,
+        negate: bool,
+        output: &Output<'o>,
+    ) -> Result<&'o str, SqlError> {
+        let written = if negate {
+            output
+                .arena
+                .alloc_str_display(format_args!("-{text}"))
+                .map_err(|_| arena_full())?
+        } else {
+            output.arena.alloc_str(text).map_err(|_| arena_full())?
+        };
+        match crate::sql::eval::cast_to(
+            crate::sql::types::Datum::Text(written),
+            ColType::Numeric,
+            output.arena,
+        ) {
+            Ok(value) => output
+                .arena
+                .alloc_str_display(value)
+                .map_err(|_| arena_full()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A literal converted to `target` under a type modifier.
+    fn literal_mod(
+        &self,
+        expression: &Expr<'_>,
+        target: i32,
+        type_mod: i32,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        if type_mod < 0 {
+            return self.literal(expression, target, output);
+        }
+        let mut piece = output.piece();
+        self.literal(expression, target, &mut piece)?;
+        // The literal ends with its unmodified type name; respell it.
+        let text = piece.text.as_str();
+        let mut plain = Output::new(output.arena);
+        self.type_name(target, &mut plain)?;
+        let Some(value) = text.strip_suffix(plain.text.as_str()) else {
+            return output.unsupported();
+        };
+        if !value.ends_with("::") {
+            output.push(text)?;
+            return output.unsupported();
+        }
+        output.push(value)?;
+        self.type_name_mod(target, type_mod, output)
+    }
+
+    /// Whether `expression` is a constant the parser folds (`Const`).
+    fn is_constant(&self, expression: &Expr<'_>) -> bool {
+        match expression {
+            Expr::Int(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::BitLit(_) => true,
+            Expr::Unary {
+                operator: UnaryOp::Neg,
+                operand: Expr::Int(_) | Expr::NumericLit(_),
+                ..
+            } => true,
+            Expr::Cast { operand, .. } => matches!(operand, Expr::Str(_) | Expr::Null),
+            _ => false,
+        }
+    }
+
+    /// `get_const_expr` with `showtype` 1: a constant with its type always
+    /// shown.
+    fn labeled_constant(
+        &self,
+        expression: &Expr<'_>,
+        expected: Option<i32>,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        let start = output.text.as_str().len();
+        self.write(expression, expected, output)?;
+        let text = &output.text.as_str()[start..];
+        let labeled = text.starts_with('\'') || text.starts_with("NULL::");
+        if !labeled {
+            let type_oid = expected.or(self.type_of(expression)?).unwrap_or(oid::TEXT);
+            output.push("::")?;
+            self.type_name(type_oid, output)?;
+        }
+        Ok(())
     }
 
     /// An aggregate's `DISTINCT`, after its opening parenthesis.
@@ -1592,6 +2023,7 @@ impl Context<'_> {
         expression: &Expr<'_>,
         operator: BinaryOp,
         first: bool,
+        descend: bool,
         output: &mut Output<'_>,
     ) -> Result<bool, SqlError> {
         if let Expr::Binary {
@@ -1601,8 +2033,11 @@ impl Context<'_> {
             ..
         } = expression
             && *found == operator
+            && descend
         {
-            let first = self.connective(left, operator, first, output)?;
+            // A `BETWEEN`'s connective is its own list.
+            let nested = !left.source_position().is_expanded();
+            let first = self.connective(left, operator, first, nested, output)?;
             output.push(if operator == BinaryOp::And {
                 " AND "
             } else {
@@ -1642,13 +2077,14 @@ impl Context<'_> {
         symbol: &'static str,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
+        let (left_type, right_type) = self.binary_operands(BinaryOp::Like, left, right)?;
         self.open(output)?;
         let parent = Parent::Operator(symbol);
-        self.wrapped(left, Some(Some(oid::TEXT)), parent, true, output)?;
+        self.wrapped(left, Some(left_type), parent, true, output)?;
         output.push(" ")?;
         output.push(symbol)?;
         output.push(" ")?;
-        self.wrapped(right, Some(Some(oid::TEXT)), parent, false, output)?;
+        self.wrapped(right, Some(right_type), parent, false, output)?;
         self.close(output)
     }
 }
@@ -1661,7 +2097,7 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
             None | Some(BinaryOp::And) => matches!(outer, BinaryOp::And | BinaryOp::Or),
             Some(_) => outer == BinaryOp::Or,
         },
-        Parent::Not => matches!(kind, None | Some(BinaryOp::And)),
+        Parent::Not => false,
         _ => false,
     };
     let operator = |symbol: &str| match parent {
@@ -1691,22 +2127,100 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
         | Expr::Bool(_)
         | Expr::Str(_)
         | Expr::Null
-        | Expr::Call { .. }
+        | Expr::BitLit(_)
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::Array(_)
+        | Expr::SchemaColumn { .. }
+        | Expr::Case {
+            origin: crate::sql::ast::CaseOrigin::Written,
+            ..
+        }
         | Expr::Cast { .. } => true,
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name: crate::sql::parser::SIMILAR_TO,
+            ..
+        } => operator("~"),
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name: crate::sql::parser::ROWS_NOT_DISTINCT,
+            ..
+        } => connective(None),
+        Expr::Call { .. } => true,
         Expr::Unary {
             operator: UnaryOp::Neg,
-            operand,
+            operand: Expr::Int(_) | Expr::NumericLit(_),
             ..
-        } => matches!(operand, Expr::Int(_) | Expr::NumericLit(_)),
+        } => true,
+        Expr::Unary {
+            operator: UnaryOp::Not,
+            operand,
+            source_position,
+        } if source_position.is_expanded() => match operand {
+            Expr::Call {
+                args: [left, _], ..
+            } if row_items(left).is_some_and(|items| items.len() > 1) => {
+                connective(Some(BinaryOp::Or))
+            }
+            Expr::Call {
+                name: crate::sql::parser::SIMILAR_TO,
+                ..
+            } => operator("!~"),
+            _ => matches!(parent, Parent::Connective(_) | Parent::Not),
+        },
         Expr::Unary {
             operator: UnaryOp::Not,
             ..
         } => connective(None),
+        Expr::Unary { .. } => operator("prefix"),
         Expr::Binary {
             operator: kind @ (BinaryOp::And | BinaryOp::Or),
             ..
         } => connective(Some(*kind)),
-        Expr::Binary { operator: kind, .. } => operator_symbol(*kind).is_some_and(operator),
+        Expr::Binary {
+            operator: kind,
+            left,
+            ..
+        } if row_items(left).is_some() => match kind {
+            BinaryOp::Eq if row_items(left).is_some_and(|items| items.len() > 1) => {
+                connective(Some(BinaryOp::And))
+            }
+            BinaryOp::NotEq if row_items(left).is_some_and(|items| items.len() > 1) => {
+                connective(Some(BinaryOp::Or))
+            }
+            BinaryOp::Eq | BinaryOp::NotEq => operator("="),
+            _ => false,
+        },
+        Expr::Binary { operator: kind, .. } => kind.operator_name().is_some_and(operator),
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => {
+            let (array, count) = operators::in_list_shape(list);
+            if row_items(operand).is_some() {
+                if list.len() > 1 {
+                    connective(Some(if *negated {
+                        BinaryOp::And
+                    } else {
+                        BinaryOp::Or
+                    }))
+                } else {
+                    false
+                }
+            } else if count > 1 {
+                connective(Some(if *negated {
+                    BinaryOp::And
+                } else {
+                    BinaryOp::Or
+                }))
+            } else if array {
+                false
+            } else {
+                operator("=")
+            }
+        }
         Expr::Like { .. } | Expr::Match { .. } => operator("~~"),
         Expr::IsNull { .. }
         | Expr::Exists(_)
@@ -1717,6 +2231,7 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
         | Expr::Case {
             origin:
                 crate::sql::ast::CaseOrigin::BooleanTest { .. }
+                | crate::sql::ast::CaseOrigin::UnknownTest { .. }
                 | crate::sql::ast::CaseOrigin::DistinctFrom { negated: false },
             ..
         } => matches!(parent, Parent::Connective(_) | Parent::Not),
@@ -1725,6 +2240,19 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
             ..
         } => connective(None),
         _ => false,
+    }
+}
+
+/// The fields of a row constructor, `ROW(...)` or `(a, b)`.
+fn row_items<'e>(expression: &'e Expr<'e>) -> Option<&'e [&'e Expr<'e>]> {
+    match expression {
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => Some(args),
+        _ => None,
     }
 }
 
@@ -1864,7 +2392,7 @@ pub(crate) fn view_definition<'a>(
 pub(crate) fn rule_action_definition<'a>(
     storage: &Storage,
     txid: u32,
-    rule_table: &TableDef,
+    rule_table: Columns<'_>,
     action: &'a str,
     pretty: bool,
     arena: &'a Arena,
@@ -1924,8 +2452,8 @@ pub(crate) fn rule_action_definition<'a>(
     };
     let target_table = read.as_deref();
     // OLD and NEW, then the target and, for ON CONFLICT DO UPDATE, EXCLUDED.
-    let mut rows = [Joined::rule_row("old", rule_table); 4];
-    rows[1] = Joined::rule_row("new", rule_table);
+    let mut rows = [Joined::rule_columns("old", rule_table); 4];
+    rows[1] = Joined::rule_columns("new", rule_table);
     let mut count = 2;
     if let (Some(table), Some((_, _, alias))) = (target_table, target) {
         rows[2] = Joined::new(alias.unwrap_or(table.name.as_str()), table);
@@ -1954,6 +2482,8 @@ pub(crate) fn rule_action_definition<'a>(
     let context = Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: target_table,
         parameters: &[],
         joined,
@@ -2192,6 +2722,23 @@ pub(crate) fn rule_action_definition<'a>(
         }
     }
     Ok(output.supported.then(|| output.text.as_str()))
+}
+
+/// A string constant of type `unknown`: quoted, without a type label.
+fn quote_literal(output: &mut Output<'_>, text: &str) -> Result<(), SqlError> {
+    output.push("'")?;
+    for (index, part) in text.split('\'').enumerate() {
+        if index != 0 {
+            output.push("''")?;
+        }
+        output.push(part)?;
+    }
+    output.push("'")
+}
+
+/// A function name without the `pg_catalog.` the parser may attach.
+fn unqualified(name: &str) -> &str {
+    name.strip_prefix("pg_catalog.").unwrap_or(name)
 }
 
 fn push_identifier(output: &mut Output<'_>, name: &str) -> Result<(), SqlError> {

@@ -25,8 +25,8 @@ mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
-    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
-    validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
+    cast_to_text, parse_bits_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid,
+    parse_uuid, validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
     validate_geometry_type_cast,
 };
 
@@ -707,6 +707,22 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
 
 impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'b>, SqlError> {
+        self.0.lookup_unsuggested(qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
         self.0.lookup(qualifier, name)
     }
@@ -877,6 +893,27 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// [`Self::lookup`] for a caller that may still find the column in an
+    /// enclosing scope: a missing column's spelling suggestion is left to the
+    /// caller that reports the error.
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.lookup(qualifier, name)
+    }
+
+    /// [`Self::resolve_column_type`] without the spelling suggestion, as
+    /// [`Self::lookup_unsuggested`].
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.resolve_column_type(qualifier, name)
+    }
 
     /// Offers this scope's FROM items, then the enclosing queries' ones, to
     /// a missing column's spelling suggestion.
@@ -1807,6 +1844,22 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         name: &str,
     ) -> Result<ColType, SqlError> {
         (**self).resolve_column_type(qualifier, name)
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        (**self).resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        (**self).lookup_unsuggested(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -3698,6 +3751,22 @@ impl<'a> StatementSubqueryScope<'_, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup_unsuggested(qualifier, name)
+    }
+
     fn statement_subqueries(&self) -> StatementScope<'a> {
         self.scope
     }
@@ -5645,20 +5714,11 @@ fn eval_binary_values<'a>(
         row,
         hooks,
     )?;
-    // A number or boolean is never an enum's value, so neither operand's
-    // declared type can be an enum or a domain over one.
-    let not_enum = |value: &Datum<'_>| {
-        matches!(
-            value,
-            Datum::Bool(_)
-                | Datum::Int2(_)
-                | Datum::Int4(_)
-                | Datum::Int8(_)
-                | Datum::Float4(_)
-                | Datum::Float8(_)
-        )
-    };
-    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
+    // Only an enum member (or a NULL, of any type) can have an enum or a
+    // domain over one as its declared type, so other values skip the
+    // per-row type lookup.
+    let may_be_enum = |value: &Datum<'_>| matches!(value, Datum::Enum { .. } | Datum::Null);
+    if comparison_collation.is_some() && (may_be_enum(&l) || may_be_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {

@@ -3681,15 +3681,34 @@ pub struct TableSample<'a> {
 /// Source provenance does not participate in SQL expression equality. Runtime
 /// plan keys must extract the actual offset, never compare this annotation.
 #[derive(Debug, Clone, Copy)]
-pub struct SourcePosition(Option<usize>);
+pub struct SourcePosition {
+    offset: Option<usize>,
+    /// The node is one part of a single grammar construct the parser
+    /// expanded (`BETWEEN`'s connective), which PostgreSQL's grammar does not
+    /// merge into a surrounding `AND`/`OR` list.
+    expanded: bool,
+}
 
 impl SourcePosition {
-    pub const UNKNOWN: Self = Self(None);
+    pub const UNKNOWN: Self = Self::new(None);
     pub const fn new(offset: Option<usize>) -> Self {
-        Self(offset)
+        Self {
+            offset,
+            expanded: false,
+        }
     }
     pub const fn get(self) -> Option<usize> {
-        self.0
+        self.offset
+    }
+    /// This position, marking its node as an expanded grammar construct.
+    pub const fn expanded(self) -> Self {
+        Self {
+            expanded: true,
+            ..self
+        }
+    }
+    pub const fn is_expanded(self) -> bool {
+        self.expanded
     }
 }
 
@@ -6031,8 +6050,8 @@ pub enum Expr<'a> {
     /// time. PostgreSQL types these as numeric, not float8.
     NumericLit(&'a str),
     Str(&'a str),
-    /// Bit-string literal (`B'1010'` / `X'1F'`): the canonical `'0'`/`'1'`
-    /// characters, typed `bit(len)`.
+    /// Bit-string literal (`B'1010'` / `X'1F'`): `B` or `X`, then the written
+    /// digits, typed `bit(len)`.
     BitLit(&'a str),
     Column {
         /// Optional table/alias qualifier.
@@ -6262,6 +6281,9 @@ pub enum CaseOrigin {
     /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
     /// the equality operator's function.
     DistinctFrom { negated: bool },
+    /// `x IS [NOT] UNKNOWN`: one `WHEN` whose condition is `x IS [NOT] NULL`,
+    /// for a boolean `x`.
+    UnknownTest { negated: bool },
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
@@ -6444,6 +6466,45 @@ impl<'a> Expr<'a> {
             }
         };
         Some((operand, *value, *negated))
+    }
+
+    /// The operand of `x IS [NOT] UNKNOWN` and whether the test is negated.
+    pub(crate) fn unknown_test_operand(&self) -> Option<(&'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::UnknownTest { negated },
+            whens: [(Expr::IsNull { operand, .. }, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((operand, *negated))
+    }
+
+    /// The boolean operand of a desugared `IS [NOT] TRUE/FALSE/UNKNOWN` and
+    /// the test's spelling, for its type check.
+    pub(crate) fn boolean_test_argument(&self) -> Option<(&'a Expr<'a>, &'static str)> {
+        if let Some((operand, value, negated)) = self.boolean_test_operand() {
+            return Some((
+                operand,
+                match (value, negated) {
+                    (true, false) => "IS TRUE",
+                    (true, true) => "IS NOT TRUE",
+                    (false, false) => "IS FALSE",
+                    (false, true) => "IS NOT FALSE",
+                },
+            ));
+        }
+        self.unknown_test_operand().map(|(operand, negated)| {
+            (
+                operand,
+                if negated {
+                    "IS NOT UNKNOWN"
+                } else {
+                    "IS UNKNOWN"
+                },
+            )
+        })
     }
 
     pub(crate) const fn source_position(&self) -> SourcePosition {

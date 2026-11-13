@@ -36,6 +36,7 @@ mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod hash_outer_joins;
 mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
@@ -67830,7 +67831,12 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
              ORDER BY location <-> circle '<(0,0),1>' LIMIT 2",
     ));
     assert_eq!(
-        fallback.iter().filter(|row| row.contains("Sort")).count(),
+        fallback
+            .iter()
+            .filter(|row| row
+                .trim_start_matches([' ', '-', '>'])
+                .starts_with("Sort  "))
+            .count(),
         2,
         "unsupported ordering directions and right types retain the exact Sort path: {fallback:?}"
     );
@@ -101578,4 +101584,39 @@ fn spilled_grouping_keys_read_enclosing_aggregates() {
             ["2"]
         );
     }
+}
+
+/// `DROP SCHEMA ... CASCADE` journals a view's triggers as dropped before the
+/// view itself, so recovery can still resolve each trigger's target.
+#[test]
+fn schema_drop_journals_view_triggers_before_their_view() {
+    let config = test_config("schema-drop-view-triggers");
+    {
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SCHEMA s; CREATE TABLE s.t (a int); \
+             CREATE VIEW s.v AS SELECT * FROM s.t; \
+             CREATE FUNCTION s.tf() RETURNS trigger LANGUAGE plpgsql \
+               AS $$BEGIN RETURN NEW; END$$; \
+             CREATE TRIGGER g INSTEAD OF INSERT ON s.v FOR EACH ROW EXECUTE FUNCTION s.tf(); \
+             DROP SCHEMA s CASCADE",
+            false,
+        );
+        drop(session);
+        drop(engine);
+    }
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 's'",
+            false
+        )),
+        ["0"]
+    );
 }

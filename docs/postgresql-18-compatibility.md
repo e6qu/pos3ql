@@ -434,8 +434,9 @@ Functions and expressions:
   (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
   'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
-  parentheses as PostgreSQL does. Expressions outside the deparser's typed
-  coverage and other views keep their stored spelling
+  parentheses as PostgreSQL does. A view or rule is always printed from its
+  analyzed query, never from its stored text; a query shape the deparser does
+  not cover fails with `0A000` instead
   (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
 
 - Named arguments and omitted defaults run in declared input order and share

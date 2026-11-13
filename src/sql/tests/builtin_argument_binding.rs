@@ -68,17 +68,15 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
             "ALTER SEQUENCE rule_argument_effects RESTART WITH 1",
             true,
         );
-        let unsupported = session.execute(
+        // The pretty flag's argument runs once, and the action deparses in
+        // either form.
+        let pretty_action = data_rows(&session.success(
             &mut engine,
             "SELECT pg_get_ruledef(oid,nextval('rule_argument_effects')=1) \
                FROM pg_rewrite WHERE rulename='diag_action'",
             true,
-        );
-        assert_eq!(error_sqlstates(&unsupported), ["0A000"]);
-        assert!(
-            String::from_utf8_lossy(&unsupported)
-                .contains("pretty formatting of rewrite rule actions is not supported")
-        );
+        ));
+        assert!(pretty_action[0].contains("like_escape('a'::text, '#'::text)"));
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT nextval('rule_argument_effects'); \
              SELECT pg_get_ruledef(oid,false) LIKE '%rule_format_sink%' FROM pg_rewrite WHERE rulename='diag_action'", true)),

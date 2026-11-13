@@ -467,7 +467,8 @@ option, scrolling follows PostgreSQL's plan for the query, as
 [described above](#cursors-that-read-as-you-fetch).
 
 A cursor over a join of tables, `VALUES` lists and retained set-returning
-functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
+functions (inner, cross or `LEFT`, or a `RIGHT` or `FULL` join of two
+items, with a non-volatile condition) also reads
 as it fetches, as a nested loop or, for a two-table equality join, a hash
 join whose build table is read into `plan_build_bytes` at `DECLARE` (a table
 that does not fit makes the cursor save its rows at `DECLARE` instead):

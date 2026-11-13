@@ -467,9 +467,7 @@ call fails with `22P02`. An index key whose value is a whole row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`: evaluation yields an anonymous
 record, and only named composite types have a stored value form (a table's
 row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
-`NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
-`pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
-names from the stored query text. A
+`NEW.` or `OLD.` fails the rename with `0A000`. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
@@ -484,18 +482,24 @@ PostgreSQL's statement snapshot does; a volatile routine's queries see the
 change. A STABLE or IMMUTABLE SQL function's catalog query still reads the
 catalog as it is when it runs, where PostgreSQL reads it under the calling
 statement's snapshot. `pg_get_viewdef`, `pg_views`,
-`pg_get_ruledef` and `pg_rules` print a view's or rule action's query as
-PostgreSQL deparses it, in its indented layout and wrap column, including
-subqueries, functions, explicit, `USING` and `NATURAL` joins, set operations,
-`DISTINCT ON`, windows, grouping sets, `WITH` queries, `LATERAL` items,
-`VALUES` lists, `TABLESAMPLE` and sublinks. A query that reads a function
-returning a record or composite type, a catalog relation, a `WITH` query with
-`SEARCH` or `CYCLE` or one that modifies data, or that groups or orders by a
-constant, or an expression outside the typed expression coverage, still prints
-its stored text, and a rule action's pretty form then fails with `0A000`. The
-routines and types a view's subqueries name are printed as the subquery names
-them, so after such a routine or type is renamed the view prints its stored
-text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
+`pg_get_ruledef` and `pg_rules` print every view's and rule's query as
+PostgreSQL deparses it, in its indented layout and wrap column, from the
+stored query, never its stored text: subqueries, functions (including ones
+returning composite rows, `OUT` parameters or a `json_to_record` column
+definition list), catalog and `information_schema` relations, joins, set
+operations, windows, grouping sets, `WITH` queries with `SEARCH` and `CYCLE`,
+constant and repeated sort keys, and the analyzed form of each expression
+(operator coercions, SQL-syntax functions, `IN` lists, row comparisons,
+`BETWEEN`, `LIKE ... ESCAPE`, `SIMILAR TO`, subscripts, `COLLATE`, typmod
+casts, variadic and named arguments). Routines, types and relations are
+printed under their current names at every query level. A rule on a view
+prints like one on a table. A query shape the deparser does not cover fails
+with `0A000` (`deparsing the query of view "v" is not supported`): a rule
+action with a data-modifying `WITH` query is one. A `FROM` function returning
+`record` with a column definition list is accepted only for the
+`json[b]_to_record[set]` family; for other functions the list is a syntax
+error, and `SYSTEM_USER` and system columns such as `xmin` are rejected.
+In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
@@ -516,9 +520,13 @@ conditions reading it, as PostgreSQL does. Outer joins of stored tables in
 FROM order place an `ON` condition reading only the nullable side below the
 join, keep the rest as the join's hash condition or join filter, and filter
 the join's output (`Filter`) by a `WHERE` condition reading a nulled
-relation. A right or full join runs, and prints, as a `Nested Loop Right
-Join` or `Nested Loop Full Join`, where PostgreSQL swaps a right join's
-inputs or hashes and merges. The join order
+relation. An outer hash join hashes its
+nullable side (a `RIGHT JOIN` shows as `Hash Left Join` probing its right
+item, as PostgreSQL plans tables of similar size), or its preserved side
+(`Hash Right Join`) when only that side fits the build; a `FULL JOIN` shows
+as `Hash Full Join`; `enable_hashjoin = off` runs each as a nested loop. Other
+right or full joins run, and print, as a `Nested Loop Right Join` or
+`Nested Loop Full Join`, where PostgreSQL may also merge. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
 can differ from PostgreSQL's cost-based order. The executor has no merge
 join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs

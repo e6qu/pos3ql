@@ -28065,7 +28065,7 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
             AccessClass::Index => self.index(slot).visible_to(txid),
-            AccessClass::Routine => self.routine(slot).visible_to(txid),
+            AccessClass::Routine => self.routine_visible_to(slot, txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespace(slot).visible_to(txid),
             AccessClass::Statistics => self.extended_statistics(slot).visible_to(txid),
@@ -28115,7 +28115,7 @@ impl Storage {
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
             AccessClass::Index => Some(self.index(slot).database),
-            AccessClass::Routine => Some(self.routine(slot).database),
+            AccessClass::Routine => Some(self.routine_database(slot)),
             AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics(slot).database),
             AccessClass::Extension => Some(self.extension(slot).database),
@@ -47654,6 +47654,28 @@ impl Storage {
         self.routine_at(slot).expect("routine slot is in range")
     }
 
+    /// Whether a routine slot is visible, read without copying its whole
+    /// definition, as catalog snapshots ask for every routine.
+    fn routine_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .visible_to(txid)
+    }
+
+    /// A routine's database, read without copying its whole definition, as
+    /// catalog snapshots ask for every routine's.
+    fn routine_database(&self, slot: usize) -> DatabaseOid {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .database
+    }
+
     fn routine_at(&self, slot: usize) -> Option<RoutineDef> {
         self.routines
             .lock()
@@ -50302,12 +50324,21 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, ExtendedStatisticsDef)> + '_ {
-        ExtendedStatisticsIter {
-            catalog: &self.extended_statistics_catalog,
-            next_slot: 0,
-        }
-        .filter(move |(_, statistics)| {
-            statistics.database == current_database() && statistics.visible_to(txid)
+        // Only the visible definitions are copied out of the catalog.
+        let mut next_slot = 0;
+        core::iter::from_fn(move || {
+            let catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            loop {
+                let slot = next_slot;
+                let definition = catalog.definitions.get(slot)?;
+                next_slot += 1;
+                if definition.database == current_database() && definition.visible_to(txid) {
+                    return Some((slot, *definition));
+                }
+            }
         })
     }
 
@@ -58289,12 +58320,22 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, OperatorFamilyDefinition)> + '_ {
-        OperatorFamilyIter {
-            catalog: &self.operator_catalog,
-            next_slot: 0,
-        }
-        .filter(move |(_, family)| family.database == current_database() && family.visible_to(txid))
-        .map(move |(slot, family)| (slot, family.definition_for(txid)))
+        // Only the visible families are copied out of the catalog.
+        let mut next_slot = 0;
+        core::iter::from_fn(move || {
+            let catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            loop {
+                let slot = next_slot;
+                let family = catalog.families.get(slot)?;
+                next_slot += 1;
+                if family.database == current_database() && family.visible_to(txid) {
+                    return Some((slot, family.definition_for(txid)));
+                }
+            }
+        })
     }
 
     pub(crate) fn operator_family(&self, slot: usize) -> OperatorFamilyDef {

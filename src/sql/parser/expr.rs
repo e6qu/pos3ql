@@ -63,7 +63,7 @@ impl<'a> Parser<'a> {
             right: high,
         })?;
         self.arena_expr(Expr::Binary {
-            source_position,
+            source_position: source_position.expanded(),
             operator: if negated { BinaryOp::Or } else { BinaryOp::And },
             left: lower,
             right: upper,
@@ -198,7 +198,23 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                if self.eat_ident("null")? || self.eat_ident("unknown")? {
+                if self.eat_ident("unknown")? {
+                    // `x IS [NOT] UNKNOWN` -> CASE WHEN x IS [NOT] NULL THEN
+                    // true ELSE false, which keeps PostgreSQL's boolean test.
+                    let tested = self.arena_expr(Expr::IsNull {
+                        operand: left,
+                        negated,
+                    })?;
+                    let whens = self.arena_slice(&[(tested, &Expr::Bool(true))])?;
+                    left = self.arena_expr(Expr::Case {
+                        operand: None,
+                        whens,
+                        otherwise: Some(&Expr::Bool(false)),
+                        origin: crate::sql::ast::CaseOrigin::UnknownTest { negated },
+                    })?;
+                    continue;
+                }
+                if self.eat_ident("null")? {
                     left = self.arena_expr(Expr::IsNull {
                         operand: left,
                         negated,
@@ -492,7 +508,7 @@ impl<'a> Parser<'a> {
                             negated,
                         )?;
                         left = self.arena_expr(Expr::Binary {
-                            source_position,
+                            source_position: source_position.expanded(),
                             operator: if negated { BinaryOp::And } else { BinaryOp::Or },
                             left,
                             right: swapped,
@@ -563,9 +579,11 @@ impl<'a> Parser<'a> {
                         over: None,
                         filter: None,
                     })?;
+                    // `NOT SIMILAR TO` is one operator (`!~`), unlike a
+                    // written `NOT (x SIMILAR TO p)`.
                     left = if negated {
                         self.arena_expr(Expr::Unary {
-                            source_position,
+                            source_position: source_position.expanded(),
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: call,
                         })?
@@ -2494,15 +2512,19 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
                 return self.plain_call("pg_catalog.substring", &[target, one, len]);
             }
-            // Comma form `substring(str, start[, len])`.
+            // Comma form `substring(str, start[, len])`: an ordinary call,
+            // which PostgreSQL prints as one.
             let mut cargs = [target, target, target];
             let mut cn = 1;
             while self.eat_op(",")? {
+                if cn == cargs.len() {
+                    return Err(self.syntax_error_here());
+                }
                 cargs[cn] = self.expression(0)?;
                 cn += 1;
             }
             self.expect_op(")")?;
-            return self.plain_call("pg_catalog.substring", &cargs[..cn]);
+            return self.plain_call(name, &cargs[..cn]);
         }
         if syntax && name.eq_ignore_ascii_case("trim") {
             let dir = if self.eat_ident("both")? {
@@ -2514,6 +2536,12 @@ impl<'a> Parser<'a> {
             } else {
                 "pg_catalog.btrim"
             };
+            // `trim(both from str)`: no characters expression.
+            if self.eat_ident("from")? {
+                let target = self.expression(0)?;
+                self.expect_op(")")?;
+                return self.plain_call(dir, &[target]);
+            }
             // Optional characters expression, then `FROM str` — or just `str`.
             let first = self.expression(0)?;
             if self.eat_ident("from")? {
@@ -3696,8 +3724,9 @@ impl<'a> Parser<'a> {
             return if negated {
                 Ok(same)
             } else {
+                // One construct: PostgreSQL's pairwise `IS DISTINCT FROM`s.
                 self.arena_expr(Expr::Unary {
-                    source_position,
+                    source_position: source_position.expanded(),
                     operator: UnaryOp::Not,
                     operand: same,
                 })

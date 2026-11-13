@@ -57,15 +57,43 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        ColumnLookup::<'a>::resolve_column_type_unsuggested(
+            &ScopeSchema(self.scope),
+            qualifier,
+            name,
+        )
+    }
+
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.scope.suggest_columns(suggestion);
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.n == 0
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.lookup_unsuggested(qualifier, name)
+            .map_err(|error| self.scope.suggested(error, qualifier, name))
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
             (0..t).map(|i| self.scope.stored_width(i)).sum::<usize>() + c
         };
-        match self.scope.find_column(qualifier, name)? {
+        match self.scope.find_column_unsuggested(qualifier, name)? {
             ResolvedColumn::Table(t, c) => crate::sql::exec::decode_projected_col_record(
                 self.bytes,
                 self.raw_at + flat_of(t, c),
@@ -90,7 +118,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.scope.find_column(qualifier, name) {
+        match self.scope.find_column_unsuggested(qualifier, name) {
             Ok(entry) => Some(self.scope.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -106,7 +134,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
         self.scope
-            .find_column(qualifier, name)
+            .find_column_unsuggested(qualifier, name)
             .ok()
             .map(|entry| self.scope.output_collation(entry))
             .unwrap_or(Collation::None)
@@ -122,7 +150,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self.scope.find_column_unsuggested(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => {
                 self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
@@ -131,7 +159,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self.scope.find_column_unsuggested(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => Some((table as u32, column as u32)),
             ResolvedColumn::Merged(merged) => Some((u32::MAX, merged as u32)),
         }
@@ -1164,7 +1192,16 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        match self.0.find_column(qualifier, name) {
+        ColumnLookup::<'a>::resolve_column_type_unsuggested(self, qualifier, name)
+            .map_err(|error| self.0.suggested(error, qualifier, name))
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        match self.0.find_column_unsuggested(qualifier, name) {
             Ok(column) => Ok(self.0.output_type(column)),
             Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
                 self.whole_row_type(name).ok_or(error)
@@ -1185,7 +1222,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.0.find_column(qualifier, name) {
+        match self.0.find_column_unsuggested(qualifier, name) {
             Ok(entry) => Some(self.0.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -1199,7 +1236,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
         self.0
-            .find_column(qualifier, name)
+            .find_column_unsuggested(qualifier, name)
             .ok()
             .map(|entry| self.0.output_collation(entry))
             .unwrap_or(Collation::None)
@@ -1213,7 +1250,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.0.find_column(qualifier, name).ok()? {
+        match self.0.find_column_unsuggested(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.user_type
             }
@@ -1221,7 +1258,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         }
     }
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self.0.find_column(qualifier, name).ok()? {
+        match self.0.find_column_unsuggested(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
         }
@@ -1254,7 +1291,8 @@ impl ScopePrefix<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::scope::ResolvedColumn, SqlError> {
-        self.scope.find_column_among(self.visible, qualifier, name)
+        self.scope
+            .find_column_among_unsuggested(self.visible, qualifier, name)
     }
 
     fn names_visible_item(&self, table: &str) -> bool {
@@ -1316,9 +1354,11 @@ impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
                     && error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && self.names_visible_item(name) =>
             {
-                self.scope.whole_row_type(name).ok_or(error)
+                self.scope
+                    .whole_row_type(name)
+                    .ok_or_else(|| self.scope.suggested(error, qualifier, name))
             }
-            Err(error) => Err(error),
+            Err(error) => Err(self.scope.suggested(error, qualifier, name)),
         }
     }
 

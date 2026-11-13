@@ -172,12 +172,12 @@ fn drain_after(
 ) -> Vec<u8> {
     // A stall, not total duration, fails the drain: a long result on a busy
     // host keeps delivering bytes and must not trip a wall-clock budget.
-    let mut deadline = Instant::now() + Duration::from_secs(20);
+    let mut deadline = crate::test_wait::deadline();
     loop {
         let before = received.len();
         read_available(client, &mut received);
         if received.len() > before {
-            deadline = Instant::now() + Duration::from_secs(20);
+            deadline = crate::test_wait::deadline();
         }
         if messages(&received).iter().filter(|m| m.0 == b'Z').count() >= ready_count {
             return received;
@@ -565,7 +565,7 @@ fn tls_backpressure_keeps_ciphertext_queued_instead_of_closing() {
     }
     assert!(conn.wants_write());
     let mut plaintext = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = crate::test_wait::deadline();
     while plaintext.len() < rows * 43 {
         assert!(Instant::now() < deadline, "TLS output did not drain");
         assert_eq!(conn.on_writable(), After::Continue);
@@ -1586,7 +1586,7 @@ fn stream_rows_wait_for_locks_without_repeating_delivered_rows_or_effects() {
     assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
     assert!(conn.result_streams.is_active());
     // Read until the stream waits for the lock with rows already delivered.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = crate::test_wait::deadline();
     let mut received = Vec::new();
     while conn.parked_wait() != Some(crate::sql::StatementWait::Lock) {
         assert!(Instant::now() < deadline, "stream did not reach the lock");
@@ -1928,7 +1928,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
     assert!(messages(&response).iter().all(|message| message.0 != b'E'));
     assert!(conn.result_streams.is_active());
     let mut plaintext = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = crate::test_wait::deadline();
     while messages(&plaintext)
         .iter()
         .filter(|message| message.0 == b'Z')
@@ -2077,7 +2077,7 @@ fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
         client.write_all(&input).unwrap();
         assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
         let mut received = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = crate::test_wait::deadline();
         while messages(&received)
             .iter()
             .filter(|message| message.0 == b'C')

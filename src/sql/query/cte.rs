@@ -1052,6 +1052,7 @@ pub(crate) fn rule_select<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     }
 }
 
@@ -3875,6 +3876,7 @@ fn wrap_set_tree_with<'a>(
         with,
         set_body: Some(tree),
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -5491,6 +5493,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         with: &[],
         set_body: Some(tree),
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -6371,6 +6374,7 @@ fn subst_select_body<'a>(
         with: &[],
         set_body,
         locking: s.locking,
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
 }
@@ -7837,6 +7841,7 @@ fn subst_expr<'a>(
                         partition_by: subst_expr_slice(w.partition_by, context, arena)?,
                         order_by: ob2.as_slice(),
                         frame,
+                        ..**w
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }

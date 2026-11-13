@@ -10957,13 +10957,19 @@ fn rewrite_grouped_expr<'a>(
                             };
                             Some(WindowFrame {
                                 units: f.units,
+                                between: f.between,
                                 start: bound(&f.start)?,
                                 end: bound(&f.end)?,
                                 exclusion: f.exclusion,
                             })
                         }
                     };
-                    let spec = super::ast::WindowSpec { partition_by, order_by, frame };
+                    let spec = super::ast::WindowSpec {
+                        partition_by,
+                        order_by,
+                        frame,
+                        ..**spec
+                    };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }
             };

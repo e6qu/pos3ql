@@ -76488,6 +76488,7 @@ pub(crate) fn merge<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     // Keep temporary source descriptions by value. Retaining full copies here
     // would consume the fixed statement arena before selecting source rows.

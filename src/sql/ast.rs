@@ -3213,6 +3213,38 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+    /// How the query was written where execution no longer needs it.
+    pub written: WrittenQuery<'a>,
+}
+
+/// The written form of a query level that its executable fields expand,
+/// kept so that `pg_get_viewdef` and `pg_get_ruledef` print it as written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WrittenQuery<'a> {
+    /// The level is one row of a `VALUES` list.
+    pub values: bool,
+    /// The `GROUP BY` elements, by position in `group_by`, when the clause
+    /// holds grouping sets.
+    pub grouping: &'a [GroupingElement<'a>],
+}
+
+impl WrittenQuery<'_> {
+    pub const PLAIN: Self = Self {
+        values: false,
+        grouping: &[],
+    };
+}
+
+/// One written `GROUP BY` element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GroupingElement<'a> {
+    /// One expression, by its position in `group_by`.
+    Expression(u16),
+    /// A parenthesized list, `(a, b)` or `()`.
+    List(&'a [u16]),
+    Rollup(&'a [GroupingElement<'a>]),
+    Cube(&'a [GroupingElement<'a>]),
+    Sets(&'a [GroupingElement<'a>]),
 }
 
 impl Select<'_> {
@@ -3235,6 +3267,7 @@ impl Select<'_> {
         with: &[],
         set_body: None,
         locking: &[],
+        written: WrittenQuery::PLAIN,
     };
 }
 
@@ -3772,8 +3805,15 @@ pub enum SelectItem<'a> {
 }
 
 /// A window function's resolved `OVER` clause.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct WindowSpec<'a> {
+    /// The `WINDOW` clause name this specification was defined under, which
+    /// `OVER name` keeps for deparsing.
+    pub name: Option<&'a str>,
+    /// The window an `OVER (base ...)` or `AS (base ...)` copy extends.
+    pub base: Option<&'a str>,
+    /// A copy took its `ORDER BY` from `base`.
+    pub copied_order: bool,
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [OrderBy<'a>],
     /// Explicit `ROWS`/`RANGE`/`GROUPS` frame; None = the default frame
@@ -3781,10 +3821,23 @@ pub struct WindowSpec<'a> {
     pub frame: Option<WindowFrame<'a>>,
 }
 
+/// Names only record how the specification was written; two specifications
+/// that partition, order and frame rows alike evaluate alike.
+impl PartialEq for WindowSpec<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.partition_by == other.partition_by
+            && self.order_by == other.order_by
+            && self.frame == other.frame
+    }
+}
+
 /// An explicit window frame clause.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowFrame<'a> {
     pub units: FrameUnits,
+    /// Written as `BETWEEN start AND end`; otherwise `end` is the implied
+    /// `CURRENT ROW`.
+    pub between: bool,
     pub start: FrameBound<'a>,
     pub end: FrameBound<'a>,
     pub exclusion: FrameExclusion,

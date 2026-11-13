@@ -3737,9 +3737,18 @@ impl<'a> Parser<'a> {
                 );
             }
         }
+        // The condition stays a slice of the statement, so its analysis
+        // errors carry their position.
         let when = self
             .eat_ident("when")?
-            .then(|| self.check_text())
+            .then(|| {
+                self.expect_op("(")?;
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                let text = self.text[start..self.peek_at].trim_end();
+                self.expect_op(")")?;
+                Ok(text)
+            })
             .transpose()?;
         if when.is_some() && matches!(timing, TriggerTiming::InsteadOf) {
             return Err(self.err_here("INSTEAD OF triggers cannot have WHEN conditions"));

@@ -21094,10 +21094,22 @@ fn validate_trigger_when(
             ));
         } else if let Some(definition) = definition {
             if name != "old" && name != "new" && definition.column_index(name).is_none() {
-                reference_error = Some(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
+                let error = match qualifier {
+                    Some(qualifier) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    ),
+                    None => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ),
+                };
+                reference_error = Some(crate::sql::error_position::at_reference(
+                    error,
+                    qualifier.unwrap_or(name),
                 ));
             } else if is_new
                 && matches!(timing, TriggerTiming::Before)
@@ -21114,7 +21126,7 @@ fn validate_trigger_when(
                     error
                 } else {
                     crate::sql::error_position::with_detail(
-                        crate::sql::error_position::at_subject(error, qualifier.unwrap_or(name)),
+                        crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
                         format_args!("Column \"{}\" is a generated column.", name),
                     )
                 });
@@ -21148,6 +21160,30 @@ fn validate_trigger_when(
             sqlstate::DATATYPE_MISMATCH,
             "trigger WHEN condition must be type boolean"
         ));
+    }
+    // Unknown literals convert to their operands' types as PostgreSQL's
+    // analysis converts them.
+    if let Some(definition) = definition {
+        let transition = TriggerTransition {
+            definition,
+            old: TriggerRecordValue::Empty,
+            new: TriggerRecordValue::Empty,
+        };
+        let columns = super::eval::RuntimeColumnTypes {
+            row: &transition,
+            catalog: Some(&catalog),
+        };
+        super::query::check_literal_operands_typed(
+            expression,
+            &|other| {
+                super::exec::infer_type_res(other, &columns)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid))
+            },
+            storage,
+            txid,
+            arena,
+        )?;
     }
     Ok(())
 }
@@ -40984,18 +41020,21 @@ pub fn create_trigger(
     }
     let when = match trigger.when {
         Some(source) => {
-            if let Err(error) = validate_trigger_when(
-                storage,
-                txn.txid,
-                arena,
-                Some(crate::storage::RelationDefinition::from_definition(
-                    &target_definition,
-                )),
-                timing,
-                level,
-                events,
-                source,
-            ) {
+            // The condition is analysed in the statement's text.
+            if let Err(error) = crate::sql::error_position::with_analysis_in(source, || {
+                validate_trigger_when(
+                    storage,
+                    txn.txid,
+                    arena,
+                    Some(crate::storage::RelationDefinition::from_definition(
+                        &target_definition,
+                    )),
+                    timing,
+                    level,
+                    events,
+                    source,
+                )
+            }) {
                 return sql_fail(error);
             }
             match crate::storage::trigger_when_stackstr(source) {

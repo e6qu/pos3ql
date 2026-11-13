@@ -15,6 +15,7 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
+use crate::sql::query::instrument::{BlockId, NodeCounters, NodeKey, Role, Segment, Slot};
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
@@ -63,6 +64,9 @@ struct PlanNode {
     /// entries are labelled `QualLabel::None`.
     quals: [(QualLabel, StackStr<512>); 3],
     keys: PlanKeys,
+    /// The node's identity in execution, for the nodes whose work
+    /// `EXPLAIN ANALYZE` measures.
+    key: Option<NodeKey>,
 }
 
 /// A node's `Sort Key` or `Group Key` items, separated by
@@ -189,7 +193,48 @@ impl PlanNode {
         constant_false: false,
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
+        key: None,
     };
+}
+
+/// What `EXPLAIN ANALYZE` reports for one node.
+#[derive(Clone, Copy)]
+enum NodeActual {
+    /// Not analyzed, or a node whose work the executor does not count.
+    Unmeasured,
+    NeverExecuted,
+    Ran(NodeCounters),
+}
+
+impl NodeActual {
+    /// The rows removed by `label`'s qualification, per loop as PostgreSQL
+    /// prints them, unless the node was not measured.
+    fn removed(self, label: QualLabel) -> Option<f64> {
+        let counters = match self {
+            Self::Unmeasured => return None,
+            Self::NeverExecuted => return Some(0.0),
+            Self::Ran(counters) => counters,
+        };
+        let removed = match label {
+            QualLabel::Filter => counters.filtered,
+            QualLabel::JoinFilter => counters.join_filtered,
+            QualLabel::IndexCond | QualLabel::RecheckCond => 0,
+            QualLabel::HashCond | QualLabel::None => return None,
+        };
+        Some(removed as f64 / counters.loops as f64)
+    }
+}
+
+impl QualLabel {
+    /// The label of the count of rows this qualification removed.
+    const fn removed_label(self) -> Option<&'static str> {
+        match self {
+            Self::Filter => Some("Rows Removed by Filter"),
+            Self::JoinFilter => Some("Rows Removed by Join Filter"),
+            Self::IndexCond | Self::RecheckCond => Some("Rows Removed by Index Recheck"),
+            Self::HashCond | Self::None => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +251,8 @@ pub(super) struct ExplainActual {
 pub(super) struct Plan<'a> {
     nodes: &'a mut [PlanNode],
     count: usize,
+    /// Per node, what it did while `EXPLAIN ANALYZE` ran the statement.
+    measured: Option<&'a [NodeCounters]>,
     planning_micros: u64,
     /// The plan methods enabled while planning, which mark nodes that had
     /// to use a disabled one.
@@ -220,6 +267,7 @@ impl<'a> Plan<'a> {
         Ok(Self {
             nodes,
             count: 0,
+            measured: None,
             planning_micros: 0,
             methods: crate::sql::guc::planner_methods(),
         })
@@ -262,6 +310,68 @@ impl<'a> Plan<'a> {
         self.nodes[self.count] = node;
         self.count += 1;
         Ok(())
+    }
+
+    /// Runs `execute`, the statement this plan explains, counting the work
+    /// of each node that has a key; `timing` also measures its time.
+    pub(super) fn analyze<R>(
+        &mut self,
+        arena: &'a Arena,
+        timing: bool,
+        execute: impl FnOnce() -> R,
+    ) -> Result<R, SqlError> {
+        let nodes = &self.nodes[..self.count];
+        let slots = arena
+            .alloc_slice_with(self.count, |index| Slot::new(nodes[index].key))
+            .map_err(|_| query::arena_full_pub())?;
+        let result = query::instrument::analyze(slots, timing, execute);
+        let counters = arena
+            .alloc_slice_with(self.count, |index| slots[index].counters())
+            .map_err(|_| query::arena_full_pub())?;
+        self.measured = Some(counters);
+        Ok(result)
+    }
+
+    /// What the node at `index` did under `EXPLAIN ANALYZE`, as PostgreSQL
+    /// reports it.
+    fn actual(&self, index: usize, actual: Option<ExplainActual>) -> NodeActual {
+        let Some(actual) = actual else {
+            return NodeActual::Unmeasured;
+        };
+        let node = &self.nodes[index];
+        let counters = self
+            .measured
+            .filter(|_| node.key.is_some())
+            .map(|measured| measured[index]);
+        if let Some(counters) = counters.filter(|counters| counters.loops != 0) {
+            return NodeActual::Ran(counters);
+        }
+        // The root always runs once. When the path execution took does not
+        // count it, its rows are the statement's.
+        if index == 0 {
+            return NodeActual::Ran(NodeCounters {
+                loops: 1,
+                rows: actual.rows,
+                startup_nanos: 0,
+                total_nanos: actual.elapsed_micros.saturating_mul(1_000),
+                ..NodeCounters::default()
+            });
+        }
+        let (Some(measured), Some(_)) = (self.measured, counters) else {
+            return NodeActual::Unmeasured;
+        };
+        // A node whose own subtree ran did run: its operator is not one the
+        // executor counts on the path it took.
+        let subtree_ran = self.nodes[index + 1..self.count]
+            .iter()
+            .zip(&measured[index + 1..])
+            .take_while(|(child, _)| child.depth > node.depth)
+            .any(|(child, counters)| child.key.is_some() && counters.loops != 0);
+        if subtree_ran {
+            NodeActual::Unmeasured
+        } else {
+            NodeActual::NeverExecuted
+        }
     }
 
     fn memory_kib(&self) -> (usize, usize) {
@@ -1975,6 +2085,7 @@ fn scan_node<'a>(
         constant_false: false,
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
+        key: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -1986,8 +2097,10 @@ pub(super) fn plan_select<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Select<'_>,
+    block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    let key = |role| Some(NodeKey::new(block, role));
     let started = std::time::Instant::now();
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
@@ -2206,6 +2319,10 @@ pub(super) fn plan_select<'a>(
                         .map(|join| join.kind),
                     hash_join,
                 )),
+                key: key(Role::Join(
+                    u16::try_from(scope.as_ref().map_or(1, |scope| scope.n) - 1)
+                        .map_err(|_| arena_full())?,
+                )),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2232,6 +2349,7 @@ pub(super) fn plan_select<'a>(
                 } else {
                     "HashAggregate"
                 }),
+                key: key(Role::Aggregate),
                 keys: match group_keys(statement, arena)?.filter(|_| !statement.group_by.is_empty())
                 {
                     Some(keys) => plan_keys(
@@ -2261,6 +2379,7 @@ pub(super) fn plan_select<'a>(
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str("WindowAgg"),
+                key: key(Role::Window),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2277,6 +2396,7 @@ pub(super) fn plan_select<'a>(
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str("Sort"),
+                key: key(Role::Sort),
                 keys: plan_keys(
                     storage,
                     txid,
@@ -2310,6 +2430,7 @@ pub(super) fn plan_select<'a>(
                         "Unique"
                     },
                 ),
+                key: key(Role::Unique),
                 keys: match group_keys(statement, arena)?.filter(|_| {
                     statement.order_by.is_empty()
                         && statement.distinct_on.is_empty()
@@ -2335,13 +2456,15 @@ pub(super) fn plan_select<'a>(
             },
         )?;
     }
-    if statement.limit.is_some() {
+    // PostgreSQL's Limit node also applies an OFFSET alone.
+    if statement.limit.is_some() || statement.offset.is_some() {
         estimated_rows = estimated_rows.min(100);
         add_stage(
             &mut stages,
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str("Limit"),
+                key: key(Role::Limit),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2358,6 +2481,7 @@ pub(super) fn plan_select<'a>(
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str("Result"),
+                key: key(Role::Result),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2510,6 +2634,9 @@ pub(super) fn plan_select<'a>(
             plan.push(
                 PlanNode {
                     name: StackStr::from_str(join),
+                    key: key(Role::Join(
+                        u16::try_from(position).map_err(|_| arena_full())?,
+                    )),
                     depth: (top + n - 1 - position) as u8,
                     output,
                     ..PlanNode::EMPTY
@@ -2537,6 +2664,8 @@ pub(super) fn plan_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
+            let position_role = u16::try_from(table).map_err(|_| arena_full())?;
+            scan.key = key(Role::Scan(position_role));
             let sequential =
                 scan.name.as_str() == "Seq Scan" && crate::sql::guc::planner_methods().material;
             scan = scan
@@ -2553,6 +2682,11 @@ pub(super) fn plan_select<'a>(
                 if let Some(wrapper) = wrapper {
                     plan.push(PlanNode {
                         name: StackStr::from_str(wrapper),
+                        key: key(if hash_join {
+                            Role::Hash(position_role)
+                        } else {
+                            Role::Materialize(position_role)
+                        }),
                         depth: scan.depth,
                         total_cost: scan.total_cost,
                         rows: scan.rows,
@@ -2602,11 +2736,14 @@ pub(super) fn plan_select<'a>(
                     .items
                     .iter()
                     .all(|item| matches!(item, SelectItem::Wildcard(_)));
+            let derived_block = block.child(Segment::Derived(
+                u16::try_from(table).map_err(|_| arena_full())?,
+            ));
             plan = with_derived_plan(
                 plan,
                 scope.names[table],
                 passes_through,
-                plan_derived(storage, txid, body, arena)?,
+                plan_derived(storage, txid, body, derived_block, arena)?,
                 arena,
             )?;
         }
@@ -2622,6 +2759,7 @@ fn plan_derived<'a>(
     storage: &Storage,
     txid: u32,
     body: &Select<'_>,
+    block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     match body.set_body {
@@ -2637,13 +2775,15 @@ fn plan_derived<'a>(
                 with_ties: body.with_ties,
                 locking: body.locking,
             },
+            block,
             arena,
         ),
-        None if body.with.is_empty() => plan_select(storage, txid, body, arena),
+        None if body.with.is_empty() => plan_select(storage, txid, body, block, arena),
         None => plan_select(
             storage,
             txid,
             query::expand_ctes(body, storage, txid, arena)?,
+            block,
             arena,
         ),
     }
@@ -2979,9 +3119,13 @@ fn physical_scan_node(
         constant_false: false,
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
+        key: None,
     }
 }
 
+/// Pushes the plan of `tree` at `depth`. Its set operations are numbered in
+/// pre-order from `numbers.0` and its leaves left to right from `numbers.1`,
+/// as execution numbers them.
 fn push_set_tree(
     plan: &mut Plan<'_>,
     storage: &Storage,
@@ -2989,6 +3133,8 @@ fn push_set_tree(
     tree: &SetTree<'_>,
     arena: &Arena,
     depth: u8,
+    block: BlockId,
+    numbers: &mut (u16, u16),
 ) -> Result<PlanNode, SqlError> {
     match tree {
         SetTree::Op {
@@ -3000,7 +3146,9 @@ fn push_set_tree(
             Ok(node)
         }
         SetTree::Select(select) => {
-            let leaf = plan_select(storage, txid, select, arena)?;
+            let branch = block.child(Segment::Branch(numbers.1));
+            numbers.1 = numbers.1.saturating_add(1);
+            let leaf = plan_select(storage, txid, select, branch, arena)?;
             let root = leaf.nodes[0];
             for node in &leaf.nodes[..leaf.count] {
                 let mut node = *node;
@@ -3018,8 +3166,28 @@ fn push_set_tree(
         } => {
             let at = plan.count;
             plan.push(PlanNode::EMPTY)?;
-            let left = push_set_tree(plan, storage, txid, left, arena, depth.saturating_add(1))?;
-            let right = push_set_tree(plan, storage, txid, right, arena, depth.saturating_add(1))?;
+            let role = Role::SetOperation(numbers.0);
+            numbers.0 = numbers.0.saturating_add(1);
+            let left = push_set_tree(
+                plan,
+                storage,
+                txid,
+                left,
+                arena,
+                depth.saturating_add(1),
+                block,
+                numbers,
+            )?;
+            let right = push_set_tree(
+                plan,
+                storage,
+                txid,
+                right,
+                arena,
+                depth.saturating_add(1),
+                block,
+                numbers,
+            )?;
             let rows = match (operator, all) {
                 (SetOp::Union, true) => left.rows.saturating_add(right.rows),
                 (SetOp::Union, false) => left.rows.saturating_add(right.rows).div_ceil(2),
@@ -3050,6 +3218,7 @@ fn push_set_tree(
                 constant_false: false,
                 quals: NO_QUALS,
                 keys: PlanKeys::NONE,
+                key: Some(NodeKey::new(block, role)),
             };
             plan.nodes[at] = node;
             Ok(node)
@@ -3177,22 +3346,31 @@ pub(super) fn plan_set_query<'a>(
     storage: &Storage,
     txid: u32,
     query: &SetQuery<'_>,
+    block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
-    let wrapper_count =
-        usize::from(!query.order_by.is_empty()) + usize::from(query.limit.is_some());
+    let limited = query.limit.is_some() || query.offset.is_some();
+    let wrapper_count = usize::from(!query.order_by.is_empty()) + usize::from(limited);
     let mut plan = Plan::new(
         arena,
         wrapper_count.saturating_add(set_tree_plan_capacity(query.body)),
     )?;
     for depth in 0..wrapper_count {
         plan.push(PlanNode {
-            name: StackStr::from_str(if query.limit.is_some() && depth == 0 {
+            name: StackStr::from_str(if limited && depth == 0 {
                 "Limit"
             } else {
                 "Sort"
             }),
+            key: Some(NodeKey::new(
+                block,
+                if limited && depth == 0 {
+                    Role::Limit
+                } else {
+                    Role::Sort
+                },
+            )),
             depth: depth as u8,
             ..PlanNode::EMPTY
         })?;
@@ -3204,6 +3382,8 @@ pub(super) fn plan_set_query<'a>(
         query.body,
         arena,
         wrapper_count as u8,
+        block,
+        &mut (0, 0),
     )?;
     let mut child = root;
     for at in (0..wrapper_count).rev() {
@@ -3325,6 +3505,7 @@ pub(super) fn plan_modification<'a>(
         constant_false: false,
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
+        key: Some(NodeKey::new(BlockId::ROOT, Role::Modify)),
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -3570,7 +3751,13 @@ pub(super) fn plan_modification<'a>(
         return Ok(plan);
     }
     let child = if let Some(select) = source {
-        let source_plan = plan_select(storage, txid, select, arena)?;
+        let source_plan = plan_select(
+            storage,
+            txid,
+            select,
+            BlockId::ROOT.child(Segment::Source),
+            arena,
+        )?;
         let root = source_plan.nodes[0];
         for source_node in &source_plan.nodes[..source_plan.count] {
             let mut source_node = *source_node;
@@ -3635,6 +3822,7 @@ pub(super) fn plan_modification<'a>(
             let mut scan =
                 physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name);
             scan.alias = target_node.alias;
+            scan.key = Some(NodeKey::new(BlockId::ROOT, Role::Scan(0)));
             let definition = storage.table_def(slot, txid);
             let (index_cond, filter) = single_relation_quals(
                 storage,
@@ -3680,12 +3868,7 @@ fn property_indent(depth: u8) -> usize {
     }
 }
 
-fn text_line(
-    node: &PlanNode,
-    options: ExplainOptions,
-    actual: Option<ExplainActual>,
-    root: bool,
-) -> StackStr<2048> {
+fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> StackStr<2048> {
     let mut line = StackStr::new();
     // PostgreSQL indents each child's `->  ` arrow six columns past its
     // parent's, starting two columns in.
@@ -3713,19 +3896,47 @@ fn text_line(
             node.startup_cost, node.total_cost, node.rows, node.width
         );
     }
-    if let Some(actual) = actual.filter(|_| root) {
-        if options.timing {
-            let elapsed_ms = actual.elapsed_micros as f64 / 1_000.0;
+    match actual {
+        NodeActual::Unmeasured => {}
+        NodeActual::NeverExecuted => {
+            let _ = write!(line, " (never executed)");
+        }
+        NodeActual::Ran(counters) => {
+            let loops = counters.loops as f64;
+            let _ = write!(line, " (actual ");
+            if options.timing {
+                let _ = write!(
+                    line,
+                    "time={:.3}..{:.3} ",
+                    counters.startup_nanos as f64 / 1e6 / loops,
+                    counters.total_nanos as f64 / 1e6 / loops
+                );
+            }
             let _ = write!(
                 line,
-                " (actual time=0.000..{elapsed_ms:.3} rows={:.2} loops=1)",
-                actual.rows as f64
+                "rows={:.2} loops={})",
+                counters.rows as f64 / loops,
+                counters.loops
             );
-        } else {
-            let _ = write!(line, " (actual rows={:.2} loops=1)", actual.rows as f64);
         }
     }
     line
+}
+
+/// The count of rows `label`'s qualification of `node` removed, when
+/// PostgreSQL shows one.
+fn removed_count(
+    node: &PlanNode,
+    actual: NodeActual,
+    label: QualLabel,
+) -> Option<(&'static str, f64)> {
+    let name = node.name.as_str();
+    // A bitmap index scan's condition only marks the candidate rows; its
+    // heap scan rechecks them.
+    if label == QualLabel::IndexCond && !name.starts_with("Index") {
+        return None;
+    }
+    Some((label.removed_label()?, actual.removed(label)?))
 }
 
 fn emit_text(
@@ -3750,7 +3961,8 @@ pub(super) fn visit_text_rows<E>(
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
-        let line = text_line(node, options, actual, index == 0);
+        let node_actual = plan.actual(index, actual);
+        let line = text_line(node, options, node_actual);
         emit(line.as_str())?;
         if plan.disabled(node) {
             let mut disabled = StackStr::<512>::new();
@@ -3786,6 +3998,17 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(qual, "{}: {}", label.text(), text);
             emit(qual.as_str())?;
+            // In text PostgreSQL leaves out a count of no rows.
+            if let Some((removed_label, removed)) = removed_count(node, node_actual, label)
+                && removed > 0.0
+            {
+                let mut line = StackStr::<128>::new();
+                for _ in 0..property_indent(node.depth) {
+                    let _ = write!(line, " ");
+                }
+                let _ = write!(line, "{removed_label}: {removed:.0}");
+                emit(line.as_str())?;
+            }
         }
         if node.constant_false {
             let mut filter = StackStr::<64>::new();
@@ -3907,7 +4130,7 @@ pub(super) fn plan_statement<'a>(
             } else {
                 query::expand_ctes(select, storage, txid, arena)?
             };
-            plan_select(storage, txid, select, arena)
+            plan_select(storage, txid, select, BlockId::ROOT, arena)
         }
         Stmt::SetQuery(set_query) => {
             let body = query::expand_set_tree(
@@ -3924,7 +4147,7 @@ pub(super) fn plan_statement<'a>(
                 body,
                 ..*set_query
             };
-            plan_set_query(storage, txid, &planned, arena)
+            plan_set_query(storage, txid, &planned, BlockId::ROOT, arena)
         }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
             plan_modification(storage, txid, statement, arena)
@@ -4435,21 +4658,37 @@ fn structured_node(
         document.number("Plan Rows", node.rows);
         document.number("Plan Width", node.width);
     }
-    let actual = actual.filter(|_| at == 0);
-    if let Some(actual) = actual {
-        if options.timing {
-            document.number("Actual Startup Time", "0.000");
-            document.number(
-                "Actual Total Time",
-                stack_format!(32, "{:.3}", actual.elapsed_micros as f64 / 1_000.0),
-            );
+    let node_actual = plan.actual(at, actual);
+    match node_actual {
+        NodeActual::Unmeasured => {}
+        NodeActual::NeverExecuted => {
+            if options.timing {
+                document.number("Actual Startup Time", "0.000");
+                document.number("Actual Total Time", "0.000");
+            }
+            document.number("Actual Rows", 0);
+            document.number("Actual Loops", 0);
         }
-        document.number(
-            "Actual Rows",
-            stack_format!(32, "{:.2}", actual.rows as f64),
-        );
-        document.number("Actual Loops", 1);
+        NodeActual::Ran(counters) => {
+            let loops = counters.loops as f64;
+            if options.timing {
+                document.number(
+                    "Actual Startup Time",
+                    stack_format!(32, "{:.3}", counters.startup_nanos as f64 / 1e6 / loops),
+                );
+                document.number(
+                    "Actual Total Time",
+                    stack_format!(32, "{:.3}", counters.total_nanos as f64 / 1e6 / loops),
+                );
+            }
+            document.number(
+                "Actual Rows",
+                stack_format!(32, "{:.2}", counters.rows as f64 / loops),
+            );
+            document.number("Actual Loops", counters.loops);
+        }
     }
+    let actual = actual.filter(|_| at == 0);
     document.boolean("Disabled", plan.disabled(node));
     if options.verbose && !node.output.as_str().is_empty() {
         document.list("Output", node.output.as_str().split(", "));
@@ -4465,6 +4704,9 @@ fn structured_node(
     }
     for (label, text) in node.qualifications() {
         document.text(label.text(), text);
+        if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
+            document.number(removed_label, stack_format!(32, "{removed:.0}"));
+        }
     }
     if let Some(actual) = actual {
         if options.buffers {

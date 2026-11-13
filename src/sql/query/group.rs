@@ -19,9 +19,9 @@ use crate::sql::exec::MAX_PROJ;
 use super::aggregate::AggState;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
-    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
-    sql_fail, sql_ok,
+    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, instrument,
+    pax_column_demand, resolve_order_target, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -193,6 +193,7 @@ pub(super) fn groups_for_mask<'a>(
     pax_demand: super::PaxReadDemand,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
+    let aggregate = instrument::node(instrument::Role::Aggregate);
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -722,7 +723,10 @@ pub(super) fn groups_for_mask<'a>(
             };
             match eval_full(h, arena, params, &schema, &having_hooks)? {
                 Datum::Bool(true) => {}
-                Datum::Bool(false) | Datum::Null => continue,
+                Datum::Bool(false) | Datum::Null => {
+                    aggregate.filtered();
+                    continue;
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
@@ -731,6 +735,7 @@ pub(super) fn groups_for_mask<'a>(
                 }
             }
         }
+        aggregate.row();
         let _merged_subs_binding = super::subquery::bind_correlated_row(
             hooks.subs.expect("outer subqueries prepared"),
             &group_row,
@@ -818,6 +823,7 @@ pub(super) fn grouped_rows<'a>(
     hooks: &EvalHooks<'_, 'a>,
     correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
+    stages: &instrument::Stages,
 ) -> Result<(&'a [&'a [u8]], usize), SqlError> {
     // A star in a grouped select stands for its columns: expand it so each
     // expanded column is validated (and projected) like a written one —
@@ -890,6 +896,8 @@ pub(super) fn grouped_rows<'a>(
     // A global aggregate has one group even for an empty source. It needs no
     // per-row group assignments and must not execute its source just to size them.
     if !statement.group_by.is_empty() {
+        // Sizing the groups is not one of the plan's scans.
+        let _sizing = instrument::suspend();
         scan_source_recycling_with_pax_columns(
             storage,
             scope,
@@ -1057,6 +1065,10 @@ pub(super) fn grouped_rows<'a>(
         }
         live = crate::sql::exec::sort_dedup_projected(storage, txid, out_rows, width)?;
     }
+    // A sort under a DISTINCT returns every row it sorted.
+    if stages.unique.measured() {
+        stages.sort.rows(out_rows.len() as u64);
+    }
     let out_rows = &mut out_rows[..live];
 
     if n_order > 0 {
@@ -1120,8 +1132,11 @@ pub(super) fn grouped_select<'a>(
     offset: u64,
     responder: &mut Responder,
 ) -> Outcome {
+    let stages = super::materialize::materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     let (out_rows, width) = match grouped_rows(
         storage, scope, from, txid, statement, agg_nodes, arena, params, hooks, correlated, None,
+        &stages,
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),
@@ -1163,7 +1178,11 @@ pub(super) fn grouped_select<'a>(
         };
     }
     let mut emitted = 0u64;
+    let below_limit = stages.below_limit();
+    below_limit.rows(start as u64);
     for row in &out_rows[start..end] {
+        below_limit.row();
+        stages.limit.row();
         let mut out = [Datum::Null; MAX_PROJ];
         for (i, slot) in out.iter_mut().take(width).enumerate() {
             *slot = match crate::sql::exec::decode_projected_col_record(row, i, arena) {

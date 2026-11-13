@@ -104,6 +104,7 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
+pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
 use cte::expand_set_tree_exec;
@@ -1089,6 +1090,7 @@ pub(crate) fn read_deferred_cte<'a>(
     arena: &'a Arena,
     query: Option<DeferredCteRead<'_, 'a>>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    let _cte = instrument::enter(instrument::Segment::Cte);
     let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
     if saved != 0 {
         // SAFETY: a nonzero address names an immutable persistent descriptor
@@ -11919,6 +11921,8 @@ pub(crate) fn select_query_resumable<'a>(
     // PostgreSQL does — so a per-row error in an unreturned row does not
     // surface (constant errors already surfaced via the plan-time check).
     if limit == 0 {
+        // The limit runs and reads nothing.
+        let _limit = instrument::node(instrument::Role::Limit).start();
         if let Err(error) = scan::validate_materialized_view_reads(
             storage,
             &scope,
@@ -12047,6 +12051,9 @@ pub(crate) fn select_query_resumable<'a>(
         // scan path retains full rows until it proves an equivalent contract.
         let pax_columns =
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let scan_output = instrument::ScanOutput::current(scope.n);
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -12073,6 +12080,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &hooks,
                     )?
                 {
+                    scan_output.refiltered();
                     return Ok(true);
                 }
                 // The row's correlated subqueries run as its expressions
@@ -12134,8 +12142,10 @@ pub(crate) fn select_query_resumable<'a>(
                         }
                     }
                     emitted += 1;
+                    stages.limit.row();
                 }
-                Ok(true)
+                // A limit stops reading once it has its rows.
+                Ok(emitted < limit)
             },
         );
         if wire_full {
@@ -13215,6 +13225,8 @@ fn select_into_rows_mode<'a>(
                 outer,
             );
         }
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
         let offset =
@@ -13275,7 +13287,11 @@ fn select_into_rows_mode<'a>(
             }
         }
         let mut vals = [Datum::Null; MAX_PROJ];
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..end] {
+            below_limit.row();
+            stages.limit.row();
             for (c, slot) in vals[..n].iter_mut().enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, c, arena)?;
             }
@@ -13521,6 +13537,8 @@ fn select_into_rows_mode<'a>(
             sequences: seq,
             merge_action: None,
         };
+        let stages = materialize::materialized_stages(statement.limit.is_some());
+        let _stages = stages.start();
         let (rows, width) = grouped_rows(
             storage,
             &scope,
@@ -13533,6 +13551,7 @@ fn select_into_rows_mode<'a>(
             &hooks,
             outer_subs.correlated,
             outer,
+            &stages,
         )?;
         let offset =
             super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
@@ -13540,7 +13559,11 @@ fn select_into_rows_mode<'a>(
             super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..start + n] {
+            below_limit.row();
+            stages.limit.row();
             let mut out = [Datum::Null; MAX_PROJ];
             for (i, slot) in out.iter_mut().take(width).enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, i, arena)?;
@@ -13622,6 +13645,10 @@ fn select_into_rows_mode<'a>(
             merge_action: None,
         };
         let srf_call = find_srf(statement.items);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let result = instrument::node(instrument::Role::Result);
+        let _result = result.start();
         let project_set =
             prepare_fromless_projection(statement, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
@@ -13659,7 +13686,9 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
+            result.row();
             if produced >= offset {
+                stages.limit.row();
                 emit(&vals[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -13877,6 +13906,8 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
+        let stages = materialize::materialized_stages(limit != u64::MAX);
+        let _stages = stages.start();
         let (rows, width, deferred, identities_at) = materialized_rows(
             storage,
             &scope,
@@ -13894,6 +13925,7 @@ fn select_into_rows_mode<'a>(
                 && !statement.with_ties
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            &stages,
         )?;
         materialize::materialized_rows_into(
             storage,
@@ -13913,6 +13945,7 @@ fn select_into_rows_mode<'a>(
             outer,
             limit,
             offset,
+            &stages,
             &mut |values| {
                 emit(values)?;
                 Ok(true)
@@ -13922,10 +13955,13 @@ fn select_into_rows_mode<'a>(
     }
     let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
     let stop_after = offset.saturating_add(limit);
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
     if stop_after == 0 {
         return Ok(());
     }
     let mut produced = 0u64;
+    let scan_output = instrument::ScanOutput::current(scope.n);
 
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
@@ -13943,6 +13979,7 @@ fn select_into_rows_mode<'a>(
                 &hooks,
             )?
         {
+            scan_output.refiltered();
             return Ok(true);
         }
         // The row's correlated subqueries run as its expressions reach them.
@@ -13974,6 +14011,7 @@ fn select_into_rows_mode<'a>(
                 outer,
             )?;
             if produced >= offset {
+                stages.limit.row();
                 emit(&projected[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -13995,6 +14033,7 @@ fn select_into_rows_mode<'a>(
                     outer,
                 )?;
                 if produced >= offset {
+                    stages.limit.row();
                     emit(&projected[..n])?;
                 }
                 produced = produced.saturating_add(1);

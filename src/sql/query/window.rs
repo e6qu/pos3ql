@@ -25,7 +25,7 @@ use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
-    collect_grouped_sublinks, pax_column_demand, project_row, record_star_width,
+    collect_grouped_sublinks, instrument, pax_column_demand, project_row, record_star_width,
     rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
     sql_fail, sql_ok, window_row,
 };
@@ -2895,11 +2895,19 @@ pub(crate) fn window_select<'a>(
         responder.command_complete(tag.as_str())?;
         return sql_ok();
     }
+    let stages = super::materialize::materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     let rows = match project_window_rows(
         // The top-level query has no enclosing row to resolve against.
         storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
         None,
     )
+    // A sort or distinct above the window reads every row it computes.
+    .inspect(|rows| {
+        if stages.sort.measured() || stages.unique.measured() {
+            stages.window.rows(rows.rows.len() as u64);
+        }
+    })
     .and_then(|rows| {
         if statement.distinct {
             rows.distinct(storage, txid, arena)
@@ -2919,14 +2927,20 @@ pub(crate) fn window_select<'a>(
     // Emit under OFFSET/LIMIT.
     let mut emitted = 0u64;
     let mut skipped = 0u64;
+    let below_limit = [stages.unique, stages.sort, stages.window]
+        .into_iter()
+        .find(|node| node.measured())
+        .unwrap_or(instrument::Node::NONE);
     for &i in order.iter() {
+        if emitted >= limit {
+            break;
+        }
+        below_limit.row();
         if skipped < offset {
             skipped += 1;
             continue;
         }
-        if emitted >= limit {
-            break;
-        }
+        stages.limit.row();
         match super::emit_data_row(storage, txid, arena, responder, proj_rows[i]) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),

@@ -6775,7 +6775,11 @@ fn eval_full_inner<'a>(
             hooks.subs.map_or(&[], |subs| subs.statement),
             &mut scope,
         );
-        let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
+        let sublink =
+            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let evaluated = deferred.evaluate(expression, arena, params, outer, hooks.sequences);
+        drop(sublink);
+        let values = match evaluated? {
             SubqueryResult::Scalar { value, witness } => {
                 scalars = [(expression as *const Expr, value, witness)];
                 SubqueryValues {
@@ -6841,7 +6845,11 @@ fn eval_full_inner<'a>(
             hooks.subs.map_or(&[], |subs| subs.statement),
             &mut scope,
         );
-        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
+        let sublink =
+            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences);
+        drop(sublink);
+        let result = result?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),

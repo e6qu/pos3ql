@@ -32925,7 +32925,7 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             super::guc::PlannerSettings::EMPTY
         };
-        let plan = super::explain::plan_statement(
+        let mut plan = super::explain::plan_statement(
             context.storage(),
             context.txn.txid,
             planned.statement,
@@ -32956,17 +32956,19 @@ fn execute_plpgsql_dynamic_explain(
             let touched_mark = txn.touched().len();
             let started = std::time::Instant::now();
             responder.begin_discard_query_output(options.serialize);
-            let execution = engine.execute_explained_statement(
-                planned.statement,
-                arena,
-                planned.arguments,
-                txn,
-                guc,
-                cursors,
-                responder,
-            );
+            let execution = plan.analyze(arena, options.timing, || {
+                engine.execute_explained_statement(
+                    planned.statement,
+                    arena,
+                    planned.arguments,
+                    txn,
+                    guc,
+                    cursors,
+                    &mut *responder,
+                )
+            });
             let output = responder.finish_discard_query_output();
-            match execution {
+            match execution? {
                 Err(_) => {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -92403,6 +92405,11 @@ pub(super) fn collect_matches<'a>(
         let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
+        // The write's scan of its target, as EXPLAIN ANALYZE counts it:
+        // each visible row it matched or its filter removed.
+        let scan =
+            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
+        let _scan = scan.start();
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(());
@@ -92443,6 +92450,9 @@ pub(super) fn collect_matches<'a>(
                             error
                         )
                     })?;
+                scan.row();
+            } else {
+                scan.filtered();
             }
             Ok::<(), SqlError>(())
         };

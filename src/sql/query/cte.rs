@@ -3643,6 +3643,8 @@ fn materialize_query_cte<'a>(
     arena: &'a Arena,
     enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    // A WITH query run once is its own block of an explained plan.
+    let _cte = super::instrument::enter(super::instrument::Segment::Cte);
     let tree = arena
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
@@ -5787,6 +5789,8 @@ fn materialize_recursive<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    // A WITH query run once is its own block of an explained plan.
+    let _cte = super::instrument::enter(super::instrument::Segment::Cte);
     let (base_tree, recursive_tree, union_all) = recursive_parts(cte.query, cte.name)?;
     // References to earlier CTEs inline now; the self-reference stays a bare
     // table name (it is not in `outer`'s bindings) for per-iteration binding.

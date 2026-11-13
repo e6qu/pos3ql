@@ -19,8 +19,8 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, Outcome, QueryScope, ResolvedColumn, arena_full, correlated_in_expression,
-    correlated_scan_conjuncts, correlated_where_passes, has_project_set, pax_column_demand,
-    postpone_cost, prepare_project_set, project_row_skipping, record_star_width,
+    correlated_scan_conjuncts, correlated_where_passes, has_project_set, instrument,
+    pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping, record_star_width,
     resolve_order_target, scan_source_recycling_with_indexed_candidates,
     scan_source_recycling_with_pax_columns, sql_fail, sql_ok,
 };
@@ -1878,6 +1878,7 @@ pub(crate) fn materialized_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     rank_window: Option<usize>,
+    stages: &instrument::Stages,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
     let visible_collations = projected_collations(storage, txid, arena, statement, scope)?;
@@ -2019,6 +2020,7 @@ pub(crate) fn materialized_rows<'a>(
     // DISTINCT ON dedups on its keys *after* the sort (below), so the first
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
+    let scanned = live;
     if statement.distinct && n_on == 0 {
         live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
@@ -2057,6 +2059,10 @@ pub(crate) fn materialized_rows<'a>(
             },
             |_| arena_full(),
         )?;
+    }
+    // A sort under a DISTINCT returns every row it sorted.
+    if stages.unique.measured() {
+        stages.sort.rows(scanned as u64);
     }
 
     // DISTINCT ON: keep the first row of each run of equal ON keys.
@@ -2929,6 +2935,17 @@ pub(crate) fn extend_ties(
 /// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
 /// with LIMIT/OFFSET and emit.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+/// The stages of a materialized query that `EXPLAIN ANALYZE` counts. A
+/// `LIMIT` stops PostgreSQL's `Unique` early, after fewer sorted rows than
+/// the deduplication before the sort reads, so that sort is not counted.
+pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
+    let mut stages = instrument::Stages::current();
+    if stages.unique.measured() && limited {
+        stages.sort = instrument::Node::NONE;
+    }
+    stages
+}
+
 pub(crate) fn materialized_select<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
@@ -2950,6 +2967,8 @@ pub(crate) fn materialized_select<'a>(
             offset, responder,
         );
     }
+    let stages = materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     let (rows, width, deferred, identities_at) = match materialized_rows(
         storage,
         scope,
@@ -2967,6 +2986,7 @@ pub(crate) fn materialized_select<'a>(
             && !statement.with_ties
             && statement.locking.is_empty())
         .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+        &stages,
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),
@@ -2990,6 +3010,7 @@ pub(crate) fn materialized_select<'a>(
         None,
         limit,
         offset,
+        &stages,
         &mut |values| match super::emit_data_row(storage, txid, arena, responder, values) {
             Ok(Ok(())) => Ok(true),
             Ok(Err(error)) => Err(error),
@@ -3032,6 +3053,7 @@ pub(crate) fn materialized_rows_into<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     limit: u64,
     offset: u64,
+    stages: &instrument::Stages,
     emit: &mut dyn FnMut(&[Datum<'a>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
     let mut order_collations = [Collation::None; MAX_PROJ];
@@ -3167,13 +3189,16 @@ pub(crate) fn materialized_rows_into<'a>(
     } else {
         window
     };
+    let below_limit = stages.below_limit();
     for (index, row) in rows.iter().take(projection_window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
         finalize_projected_row(
             row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,
             &mut out,
         )?;
+        below_limit.row();
         if (index as u64) >= offset && index < window {
+            stages.limit.row();
             let keep_emitting = emit(&out[..width])?;
             emitted += 1;
             if !keep_emitting {

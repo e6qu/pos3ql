@@ -21930,7 +21930,7 @@ impl Engine {
                     Ok(rewritten) => rewritten,
                     Err(error) => return Ok(Err(error)),
                 };
-                let plan = match rewritten.as_ref() {
+                let mut plan = match rewritten.as_ref() {
                     Some(_) => None,
                     None => {
                         let plan = with_prepared_parameter_types(parameter_types, || {
@@ -21978,18 +21978,30 @@ impl Engine {
                     } else {
                         params
                     };
-                    let execution = with_prepared_parameter_types(parameter_types, || {
-                        self.execute_explained_statement(
-                            planned_statement,
-                            arena,
-                            execution_params,
-                            txn,
-                            guc,
-                            cursors,
-                            responder,
-                        )
-                    });
+                    let mut run = || {
+                        with_prepared_parameter_types(parameter_types, || {
+                            self.execute_explained_statement(
+                                planned_statement,
+                                arena,
+                                execution_params,
+                                txn,
+                                guc,
+                                cursors,
+                                &mut *responder,
+                            )
+                        })
+                    };
+                    // The plan counts what each of its nodes does as the
+                    // statement runs.
+                    let execution = match plan.as_mut() {
+                        Some(plan) => plan.analyze(arena, options.timing, run),
+                        None => Ok(run()),
+                    };
                     let output = responder.finish_discard_query_output();
+                    let execution = match execution {
+                        Ok(execution) => execution,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     match execution {
                         Err(wire) => return Err(wire),
                         Ok(Err(error)) => return Ok(Err(error)),

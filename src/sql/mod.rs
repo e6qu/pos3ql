@@ -13298,6 +13298,8 @@ impl Engine {
                 }
             }
             if let Some((error, statement)) = &rejected {
+                // The statements before the rejected one completed.
+                send_held_command_complete(txn, responder)?;
                 // PostgreSQL finds some analysis errors before the deferred
                 // one: an unknown type, the FROM clause, and earlier output
                 // columns.
@@ -18708,8 +18710,7 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         // A C routine's body is its link symbol, checked as it resolved.
-        let check_body =
-            guc.check_function_bodies() && routine.language != ast::RoutineLanguage::C;
+        let check_body = guc.check_function_bodies() && routine.language != ast::RoutineLanguage::C;
         let result = (|| {
             let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
                 match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
@@ -21610,6 +21611,9 @@ impl Engine {
                 | Stmt::Reset(_)
                 | Stmt::SetTransaction { .. }
                 | Stmt::SetTransactionSnapshot(_)
+                | Stmt::SetRole { .. }
+                | Stmt::SetSessionAuthorization { .. }
+                | Stmt::SetConstraints { .. }
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
@@ -25284,8 +25288,8 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let mut originals = [catalog::dependencies::ObjectAddress::new(0, 0, 0);
-            crate::storage::MAX_EXTENSIONS];
+        let mut originals =
+            [catalog::dependencies::ObjectAddress::new(0, 0, 0); crate::storage::MAX_EXTENSIONS];
         let mut count = 0usize;
         for name in names {
             match self.storage.extension_slot(name, txn.txid) {
@@ -25326,8 +25330,7 @@ impl Engine {
             Err(error) => Ok(Err(error)),
             Ok(Some(filter)) => responder.with_dependency_report(filter, |responder| {
                 self.drop_extension_members(
-                    names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc,
-                    responder,
+                    names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc, responder,
                 )
             }),
             Ok(None) => self.drop_extension_members(
@@ -28061,7 +28064,10 @@ fn release_transaction_locks(storage: &Storage, transaction: u32) {
 
 /// Sends the held CommandComplete of an earlier statement of this Query
 /// once its transaction boundary has passed.
-fn send_held_command_complete(txn: &mut TxnState, responder: &mut Responder) -> Result<(), WireFull> {
+fn send_held_command_complete(
+    txn: &mut TxnState,
+    responder: &mut Responder,
+) -> Result<(), WireFull> {
     match txn.held_command_complete.take() {
         Some((_, tag)) => responder.command_complete(tag.as_str()),
         None => Ok(()),

@@ -4361,7 +4361,8 @@ impl<'a> Parser<'a> {
         if body.is_some_and(|body| {
             !matches!(
                 body,
-                crate::sql::ast::RoutineBody::String(_) | crate::sql::ast::RoutineBody::Library { .. }
+                crate::sql::ast::RoutineBody::String(_)
+                    | crate::sql::ast::RoutineBody::Library { .. }
             ) && language != crate::sql::ast::RoutineLanguage::Sql
         }) {
             return Err(ParseError {

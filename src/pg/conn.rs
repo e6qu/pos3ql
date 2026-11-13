@@ -6522,7 +6522,10 @@ fn command_completion_in(mut bytes: &[u8]) -> Option<&str> {
     None
 }
 
-fn command_tag_rows(tag: &str, rows: u64) -> crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }> {
+fn command_tag_rows(
+    tag: &str,
+    rows: u64,
+) -> crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }> {
     use core::fmt::Write as _;
 
     let Some((prefix, count)) = tag.rsplit_once(' ') else {

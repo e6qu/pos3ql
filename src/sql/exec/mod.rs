@@ -2252,9 +2252,9 @@ pub fn create_foreign_table(
         }
         if wrapper.is_some_and(|wrapper| {
             matches!(
-            wrapper.validator,
-            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
-        )
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         }) && let Err(error) =
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
         {
@@ -2486,11 +2486,11 @@ fn resolve_foreign_handler(
         ));
     }
     match routine.language {
-        crate::storage::RoutineLanguage::Native(crate::storage::NativeRoutine::PostgresFdwHandler) => {
-            Ok(crate::storage::foreign::ForeignDataHandler::Postgres {
-                routine: crate::storage::routine_oid(&routine),
-            })
-        }
+        crate::storage::RoutineLanguage::Native(
+            crate::storage::NativeRoutine::PostgresFdwHandler,
+        ) => Ok(crate::storage::foreign::ForeignDataHandler::Postgres {
+            routine: crate::storage::routine_oid(&routine),
+        }),
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "foreign-data handler {} is not supported",
@@ -2513,7 +2513,10 @@ fn resolve_foreign_validator(
     let routine = foreign_routine(
         storage,
         written.as_str(),
-        &[crate::sql::types::oid::TEXT_ARRAY, crate::sql::types::oid::OID],
+        &[
+            crate::sql::types::oid::TEXT_ARRAY,
+            crate::sql::types::oid::OID,
+        ],
         txid,
     )?;
     match routine.language {
@@ -2530,9 +2533,7 @@ fn resolve_foreign_validator(
     }
 }
 
-fn foreign_routine_name(
-    name: super::ast::QualName<'_>,
-) -> Result<StackStr<256>, SqlError> {
+fn foreign_routine_name(name: super::ast::QualName<'_>) -> Result<StackStr<256>, SqlError> {
     use core::fmt::Write as _;
     let mut written = StackStr::new();
     if let Some(schema) = name.schema {
@@ -2646,7 +2647,7 @@ pub fn create_foreign_data_wrapper(
         validator,
         crate::storage::foreign::ForeignDataValidator::Postgres { .. }
     ) && let Err(error) =
-            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
     {
         return sql_fail(error);
     }
@@ -2717,11 +2718,10 @@ pub fn create_foreign_server(
         Err(error) => return sql_fail(error),
     };
     if matches!(
-            wrapper.validator,
-            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
-        )
-        && let Err(error) =
-            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
+        wrapper.validator,
+        crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+    ) && let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
     {
         return sql_fail(error);
     }
@@ -3226,7 +3226,8 @@ pub fn alter_foreign_data_wrapper(
                 };
             }
             if let Some(validator) = validator {
-                definition.validator = match resolve_foreign_validator(storage, validator, txn.txid) {
+                definition.validator = match resolve_foreign_validator(storage, validator, txn.txid)
+                {
                     Ok(validator) => validator,
                     Err(error) => return sql_fail(error),
                 };
@@ -3239,10 +3240,9 @@ pub fn alter_foreign_data_wrapper(
                 definition.validator,
                 crate::storage::foreign::ForeignDataValidator::Postgres { .. }
             ) && let Err(error) = validate_postgres_foreign_options(
-                    &definition.options,
-                    PostgresForeignOptionContext::Wrapper,
-                )
-            {
+                &definition.options,
+                PostgresForeignOptionContext::Wrapper,
+            ) {
                 return sql_fail(error);
             }
             if definition.handler != prior_handler
@@ -3344,14 +3344,12 @@ pub fn alter_foreign_server(
                 ));
             };
             if matches!(
-            wrapper.validator,
-            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
-        )
-                && let Err(error) = validate_postgres_foreign_options(
-                    &definition.options,
-                    PostgresForeignOptionContext::Server,
-                )
-            {
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            ) && let Err(error) = validate_postgres_foreign_options(
+                &definition.options,
+                PostgresForeignOptionContext::Server,
+            ) {
                 return sql_fail(error);
             }
         }
@@ -3415,9 +3413,9 @@ pub fn alter_user_mapping(
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
             matches!(
-            wrapper.validator,
-            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
-        )
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         })
         && let Err(error) = validate_postgres_foreign_options(
             &definition.options,
@@ -4091,9 +4089,9 @@ fn alter_foreign_table_as(
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
             matches!(
-            wrapper.validator,
-            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
-        )
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         })
     {
         if let Err(error) =
@@ -50814,6 +50812,46 @@ pub(crate) fn drop_routine(
                 return sql_fail(error);
             }
             let support_oid = crate::storage::routine_oid(&routine);
+            // A wrapper whose handler or validator this routine is goes with
+            // it; the dependency report already refused it without CASCADE.
+            loop {
+                let dependent = storage
+                    .foreign_wrappers(txn.txid)
+                    .find(|(_, entry)| {
+                        let wrapper = entry.definition_for(txn.txid);
+                        wrapper.handler.routine_oid() == support_oid
+                            || wrapper.validator.routine_oid() == support_oid
+                    })
+                    .map(|(_, entry)| entry.definition_for(txn.txid).name);
+                let Some(wrapper) = dependent else {
+                    break;
+                };
+                if !cascade {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop function {} because other objects depend on it",
+                        routine.name_for(txn.txid).as_str()
+                    ));
+                }
+                let names = [wrapper.as_str()];
+                match responder.without_command_complete(|responder| {
+                    drop_foreign_data_wrappers(
+                        storage,
+                        wal,
+                        txn,
+                        &mut *scratch,
+                        seq_session,
+                        &names,
+                        false,
+                        true,
+                        arena,
+                        responder,
+                    )
+                }) {
+                    Ok(Ok(())) => {}
+                    other => return other,
+                }
+            }
             if routine_has_cast_operator_dependents(storage, txn.txid, support_oid) && !cascade {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,

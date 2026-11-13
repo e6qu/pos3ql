@@ -36,3 +36,6 @@ SELECT a FROM ic355 ORDER BY a;
 SELECT count(*) FROM ic355_log;
 DROP TABLE ic355_child, ic355_parent, ic355, ic355_range, ic355_log;
 DROP FUNCTION ic355_note();
+-- SET takes no snapshot, so BEGIN after it can still choose the isolation.
+SET ROLE postgres \; BEGIN ISOLATION LEVEL REPEATABLE READ \; SHOW transaction_isolation \; COMMIT;
+RESET ROLE;

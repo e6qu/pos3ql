@@ -6577,7 +6577,9 @@ impl<'a> Expr<'a> {
 
     fn contains_call_in(&self, scope: CallScope) -> bool {
         match self {
-            Expr::Call { args, .. } if scope == CallScope::Routines && self.is_row_constructor() => {
+            Expr::Call { args, .. }
+                if scope == CallScope::Routines && self.is_row_constructor() =>
+            {
                 args.iter().any(|argument| argument.contains_call_in(scope))
             }
             Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
@@ -6647,7 +6649,9 @@ impl<'a> Expr<'a> {
                     || whens
                         .iter()
                         .any(|(c, r)| c.contains_call_in(scope) || r.contains_call_in(scope))
-                    || otherwise.map(|o| o.contains_call_in(scope)).unwrap_or(false)
+                    || otherwise
+                        .map(|o| o.contains_call_in(scope))
+                        .unwrap_or(false)
             }
             Expr::Array(items) => items.iter().any(|e| e.contains_call_in(scope)),
             // A subquery-bearing default is rejected elsewhere; treat it as

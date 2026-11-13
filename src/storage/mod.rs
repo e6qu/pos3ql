@@ -4621,9 +4621,12 @@ struct EnforcerSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An index binding change, keyed by the index's catalog slot as well as its
+/// identity: an index rewritten in place (a renamed composite field in its
+/// key) drops its slot and creates another with the same identity.
 pub(crate) enum BindingChange {
-    IndexCreate { created_at: u64 },
-    IndexDrop { created_at: u64 },
+    IndexCreate { created_at: u64, slot: u32 },
+    IndexDrop { created_at: u64, slot: u32 },
     IndexState { created_at: u64, revision: u64 },
     TableDefinition { revision: u64 },
 }
@@ -16083,8 +16086,13 @@ struct TransactionIdentityState {
 }
 
 impl TransactionIdentityState {
+    /// PostgreSQL reserves identities 0-2 (invalid, bootstrap, frozen), which
+    /// always read as committed; ordinary transactions start at 3.
+    const FIRST_NORMAL: u64 = 3;
+
     fn next(&self) -> Result<u32, SqlError> {
         self.latest
+            .max(Self::FIRST_NORMAL - 1)
             .checked_add(1)
             .and_then(|next| u32::try_from(next).ok())
             .ok_or_else(|| {
@@ -34303,9 +34311,8 @@ impl Storage {
                 let oid = self
                     .routine_type_oid(argument.ctype, argument.user_type, txid)
                     .unwrap_or(argument.ctype.oid());
-                let _ = described.write_str(
-                    crate::sql::catalog::format_type_oid(self, txid, oid, -1).as_str(),
-                );
+                let _ = described
+                    .write_str(crate::sql::catalog::format_type_oid(self, txid, oid, -1).as_str());
             }
             let _ = described.write_char(')');
         }
@@ -40768,9 +40775,11 @@ impl Storage {
         let change = match operation {
             IndexBindingOperation::Create => BindingChange::IndexCreate {
                 created_at: index.created_at,
+                slot: slot as u32,
             },
             IndexBindingOperation::Drop => BindingChange::IndexDrop {
                 created_at: index.created_at,
+                slot: slot as u32,
             },
             IndexBindingOperation::State => BindingChange::IndexState {
                 created_at: index.created_at,
@@ -52069,6 +52078,7 @@ impl Storage {
                 transaction,
                 BindingChange::IndexCreate {
                     created_at: index.created_at,
+                    slot: slot as u32,
                 },
             );
         }
@@ -52085,6 +52095,7 @@ impl Storage {
                 txid,
                 BindingChange::IndexDrop {
                     created_at: index.created_at,
+                    slot: slot as u32,
                 },
             );
         }

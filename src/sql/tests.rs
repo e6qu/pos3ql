@@ -11633,7 +11633,7 @@ fn transaction_identity_types_functions_catalogs_and_storage_match_postgresql() 
     assert_eq!(
         data_rows(&stored),
         [
-            "xid8|pg_snapshot|txid_snapshot|xid8[]|pg_snapshot[]|t|f|f|t|committed|committed|t|t|{3,1}|{3:3:}"
+            "xid8|pg_snapshot|txid_snapshot|xid8[]|pg_snapshot[]|t|f|f|t|committed|committed|t|t|{4,1}|{4:4:}"
         ],
         "{}",
         String::from_utf8_lossy(&stored)
@@ -65570,6 +65570,7 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
                         .index_visible_to(slot, txid)
                         .unwrap()
                         .created_at,
+                    slot: slot as u32,
                 },
             )
             .unwrap_err();

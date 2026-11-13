@@ -430,12 +430,7 @@ other shipped descriptions are listed); `pg_type`, `pg_operator` and
 `pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
 physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
 describe commands match PostgreSQL 18.6 except: `\dF`, `\dFd` and `\dFt`
-list only the `simple` and `english` text search objects; `\dfS+` lists
-`postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
-PostgreSQL has them only in the schema of an installed `postgres_fdw`
-extension (`postgres_fdw` is not an extension package: `CREATE EXTENSION
-postgres_fdw` fails with `extension "postgres_fdw" is not available`, and `pg_available_extensions` lists only `plpgsql` under
-`$system`, the default control path); and `\dfS+` over 3,400 routines takes about twice as long as
+list only the `simple` and `english` text search objects; and `\dfS+` over 3,400 routines takes about twice as long as
 PostgreSQL (0.5 s against 0.24 s in release builds on one host, 2026-11-13)
 because each row's calls repeat overload resolution and expression typing
 that PostgreSQL does once while planning. Parameter inference walks a statement in its own order rather than
@@ -530,7 +525,19 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule's multi-row `INSERT ... VALUES` action
+`pg_constraint` omits the system catalogs' own not-null constraints.
+The built-in `postgres_fdw` extension's routines cannot be called directly
+(`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need
+connections cached past their transaction, which pos3ql closes at transaction
+end, and `postgres_fdw_validator` is run only by wrapper DDL. `CREATE
+EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
+read-only virtual schema. A foreign key cannot reference columns covered only
+by a unique index (`CREATE UNIQUE INDEX`), which PostgreSQL accepts. A
+qualified type name with an unknown schema (`'1'::nope.int4`) reports `type
+"nope.int4" does not exist` (`42704`) where PostgreSQL reports `schema "nope"
+does not exist` (`3F000`). A literal passed to a function's `regclass`
+argument (`nextval('nope')`) is converted when the call runs, so its error has
+no cursor position. A rewrite rule's multi-row `INSERT ... VALUES` action
 resolves each column's type across its rows as a `VALUES` list does, so
 `VALUES ('1'::text, 3), (2, DEFAULT)` into a `text` column fails with `VALUES
 types text and integer cannot be matched` where PostgreSQL converts each value

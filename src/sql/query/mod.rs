@@ -96,6 +96,7 @@ pub(crate) use catalog_images::{
 pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;
 mod view_write;
+pub(crate) use cte::select_reads_repeatably;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
 pub use view_write::{
@@ -1700,6 +1701,15 @@ pub(crate) fn with_routine_invocation_scope<R>(
     };
     let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
     // Keep the guard private: a caller cannot forget it and leave dangling TLS.
+    let _scope = RoutineInvocationScope(prior);
+    execute()
+}
+
+/// Runs `execute` with no active invocation log. A streamed write source
+/// calls no routine, so it keeps no receipts: reading its rows again in a
+/// later attempt cannot shift the write's own log.
+pub(crate) fn without_routine_invocations<R>(execute: impl FnOnce() -> R) -> R {
+    let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(None));
     let _scope = RoutineInvocationScope(prior);
     execute()
 }
@@ -16376,15 +16386,17 @@ pub struct MatchedFromRow<'m, 'r> {
 }
 
 /// Copies every source's visible columns of a joined row, in FROM order and
-/// with a null-extended source as NULLs, so they outlive the scan and any
-/// storage change made before the row is used.
+/// with a null-extended source as NULLs, then each source's `tableoid` (the
+/// leaf table its row came from; NULL for a source storing no rows), so
+/// they outlive the scan and any storage change made before the row is used.
 fn detached_join_values<'a, 'r>(
     row: &JoinRow<'_, 'a, '_>,
     scratch: &'a Arena,
     arena: &'r Arena,
 ) -> Result<&'r [Datum<'r>], SqlError> {
+    let columns = row.scope.stored_columns();
     let values = scratch
-        .alloc_slice_with(row.scope.stored_columns(), |_| Datum::Null)
+        .alloc_slice_with(columns + row.scope.n, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut offset = 0;
     for table in 0..row.scope.n {
@@ -16393,6 +16405,9 @@ fn detached_join_values<'a, 'r>(
             values[offset..offset + width].copy_from_slice(&source[..width]);
         }
         offset += width;
+        if row.scope.stores_rows(table) {
+            values[columns + table] = row.table_oid(table)?;
+        }
     }
     Ok(crate::sql::exec::detached_values(values, arena)?)
 }
@@ -16563,20 +16578,29 @@ impl<'a> ReturningJoin<'a> {
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'a>, SqlError> {
         let total = self.scope.stored_columns();
-        if target.len() + from.len() != total {
+        // The FROM items' values end with each item's `tableoid`.
+        let sources = self.scope.n - 1;
+        if target.len() + from.len() != total + sources {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "RETURNING join row has {} of {} columns",
                 target.len() + from.len(),
-                total
+                total + sources
             ));
         }
+        let from_columns = from.len() - sources;
+        // Columns of every item, then every item's `tableoid`; the target's is
+        // read from the changed row instead.
         let values = arena
-            .alloc_slice_with(total, |index| {
+            .alloc_slice_with(total + self.scope.n, |index| {
                 if index < target.len() {
                     target[index]
-                } else {
+                } else if index < total {
                     from[index - target.len()]
+                } else if index == total {
+                    Datum::Null
+                } else {
+                    from[from_columns + index - total - 1]
                 }
             })
             .map_err(|_| arena_full())?;

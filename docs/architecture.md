@@ -85,7 +85,7 @@ rows of a write (see below).
 
 **Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
 `DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
-first select their rows: `INSERT ... SELECT` materializes its source rows,
+first select their rows: `INSERT ... SELECT` opens its source (below),
 `UPDATE` and `DELETE` collect the target rows and lock each one, and `MERGE`
 joins its source and target. Nothing has changed yet, so a cold read or a row
 lock wait in this phase rolls the statement back to its start (row images,
@@ -222,7 +222,21 @@ from a query (`SELECT f()`): its writes' `AFTER` triggers can run DDL and
 call routines; a wait inside them restarts the statement, as any wait in
 such a call does.
 
-`INSERT ... SELECT` materializes its source first; an output item that
+**`INSERT ... SELECT` streams a repeatable source.** A source that calls
+no volatile built-in (`random()`, `nextval`, ...) and no user routine, and
+that the retained reader runs (see [retained plan tree](#retained-plan-tree);
+a single table the general executor would read through an index keeps that
+path), streams: it reads as of the statement's start, holds one source row
+at a time in a fixed 512 KiB block of the arena (an arena with less
+than 1 MiB free materializes the source instead), and
+each row is written before the next is read, so `INSERT INTO archive
+SELECT * FROM orders` copies any number of rows in fixed memory and a
+source reading its own target sees none of the new rows, as in PostgreSQL.
+Its reads keep no invocation-log receipts. A restarted attempt reads the
+source again and skips, by count, the rows earlier attempts wrote; the
+source reads the same rows each time, so the count finds the unfinished
+row. Any other source materializes first, in the work arena, where a
+source larger than the arena fails with `54000`; an output item there that
 calls a volatile user routine is split so that the source reads only its
 other parts, and the row phase runs the calls as each row is inserted, as
 PostgreSQL computes its output list.
@@ -724,8 +738,10 @@ outputs, as scrollable cursors over such shapes do now.
 *Design; not yet implemented (see PLAN.md, write phases).* PostgreSQL runs a
 data-modifying `WITH` query, a rule's action and an `INSERT ... SELECT`
 source as plan nodes the consuming statement pulls rows from. pos3ql runs
-each of them to completion first, which orders their `AFTER` events before
-the consumer's and keeps a materialized copy of every source row.
+the first two to completion first, which orders their `AFTER` events before
+the consumer's; a repeatable `INSERT ... SELECT` source already streams (see
+[execution model](#execution-model)), and one with volatile or routine calls
+still materializes.
 
 Every `AFTER` event of the statement, its sub-statements' included, already
 fires at the statement's end in the order the events were queued, as
@@ -741,9 +757,10 @@ its events already follow the main statement's.
   node (see [retained plan tree](#retained-plan-tree)) whose step writes one
   source row and yields its `RETURNING` row. The consumer pulls it like a
   scan; an unreferenced query is drained after the main statement, last one
-  first, as PostgreSQL's `ExecPostprocessPlan` does. `INSERT ... SELECT`
-  reads its source through the same node interface instead of materializing
-  it, so the source holds one row in the statement workspace at a time. The
+  first, as PostgreSQL's `ExecPostprocessPlan` does. An `INSERT ... SELECT`
+  source with volatile or routine calls reads through the same node
+  interface instead of materializing, once it keeps its own invocation log
+  and sequence replay cursor. The
   two go together: a write that consumes a producer only interleaves with
   it once it pulls one source row per row it writes.
 - **Retained selections.** A producer's step cannot select its rows again

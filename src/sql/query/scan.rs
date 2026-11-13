@@ -4435,8 +4435,13 @@ impl<'v> JoinRow<'_, 'v, '_> {
                     Some(_) => self.scope.relation_oid(table),
                 }
             }
-            JoinRowValues::Flat { offsets, .. } => {
+            JoinRowValues::Flat { values, offsets } => {
                 offsets.get(table).ok_or_else(missing)?;
+                // A window row keeps each item's leaf oid after its columns.
+                let total = self.scope.stored_columns();
+                if values.len() == total + self.scope.n {
+                    return Ok(values[total + table]);
+                }
                 self.scope.flat_relation_oid(table)
             }
         }

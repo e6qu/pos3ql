@@ -375,10 +375,11 @@ pub(super) fn merge_through_instead_triggers<'a>(
     let no_transitions = row_progress::capture_lengths([None; row_progress::CAPTURES]);
     let (first_position, mut affected_count, mut resumed_match) = match progress.as_deref() {
         Some(progress) => {
-            let resumed = match progress.resume_rows(positions, |_| None) {
-                Ok(resumed) => resumed,
-                Err(error) => return sql_fail(error),
-            };
+            let resumed =
+                match progress.resume_rows(|position| (position < positions).then_some(None)) {
+                    Ok(resumed) => resumed,
+                    Err(error) => return sql_fail(error),
+                };
             let matched = match progress.resumed_state(arena) {
                 Ok(Some(state)) => match restore_merge_state(state, unacted, matched_by_source) {
                     Ok(matched) => matched,
@@ -826,7 +827,6 @@ pub(super) fn merge_through_instead_triggers<'a>(
             Some(progress),
             &rows_outcome,
             txn,
-            positions,
             [None; row_progress::CAPTURES],
             &storage.row_work,
         ) {

@@ -41,8 +41,8 @@ impl<'a> TransitionRowSets<'a> {
 
 /// Transition row directories, grown in the statement arena as rows are
 /// captured, so a write whose rows stream from their source needs no count up
-/// front. Directories survive per-row rewinds; encoded rows live in the fixed
-/// statement arena and exhaustion is a named error.
+/// front. Directories and encoded rows live in the arena's persistent tail,
+/// so they survive per-row rewinds; exhaustion is a named error.
 pub(super) struct TransitionCapture<'a> {
     old: crate::mem::arena::ArenaList<'a, &'a [u8]>,
     new: crate::mem::arena::ArenaList<'a, &'a [u8]>,
@@ -61,7 +61,7 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        let row = encode_projected_pub(values, arena)?;
+        let row = encode_projected_persistent_pub(values, arena)?;
         self.old
             .push(row)
             .map_err(|_| super::super::query::arena_full_pub())
@@ -72,7 +72,7 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        let row = encode_projected_pub(values, arena)?;
+        let row = encode_projected_persistent_pub(values, arena)?;
         self.new
             .push(row)
             .map_err(|_| super::super::query::arena_full_pub())

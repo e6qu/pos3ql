@@ -164,8 +164,9 @@ is owned.
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
   statements nested deeper than `write_step_levels` fail the same way with
-  `54000` naming that setting. `INSERT ... SELECT` materializes its source
-  before writing. Volatile user routine calls in its output list (also a
+  `54000` naming that setting. `INSERT ... SELECT` streams a source that calls
+  no volatile built-in and no user routine, and materializes any other
+  source before writing. Volatile user routine calls in its output list (also a
   rule action's `VALUES` over several rows) run as each row is inserted, as
   in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,
   aggregate arguments or a `UNION`/`INTERSECT`/`EXCEPT` branch still run
@@ -174,7 +175,15 @@ is owned.
   separate invocation logs, since the source then runs ahead of the rows by
   a different amount in each attempt. A data-modifying `WITH` sub-statement runs to completion
   before the main statement reads it, where PostgreSQL interleaves them row
-  by row, so a call in the main statement sees all of its rows. A PL/pgSQL
+  by row, so a call in the main statement sees all of its rows. PostgreSQL
+  18.6 runs `WITH w1 AS (INSERT INTO a SELECT g ... RETURNING x), w2 AS
+  (INSERT INTO b SELECT x, note('b', x) FROM w1 RETURNING x) SELECT
+  note('main', x) FROM w2` as BEFORE a 1, b 1, main 1, BEFORE a 2, ... and
+  queues AFTER a 1, AFTER b 1, AFTER a 2, ...; a query read only partly
+  (`LIMIT 2`) still writes every row after the main query's reads. Matching
+  that needs the producer nodes of the design, which need the main query to
+  be a retained reader of CTE scans (not yet admitted) so a write can run
+  between its reads. A PL/pgSQL
   `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
@@ -637,11 +646,6 @@ field "a"`.
 cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no
 position: parameters carry no source position for assignment analysis.
-A window query, or an `UPDATE ... FROM` or `DELETE ... USING` `RETURNING`
-list, that reads the `tableoid` of a partitioned table or inheritance parent
-in a `FROM` item fails with `0A000`: those paths flatten each joined row
-without the leaf it came from (`JoinRowValues::Flat`, materialized joined
-rows); carrying the leaf oid as a hidden trailing value there fixes it.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.

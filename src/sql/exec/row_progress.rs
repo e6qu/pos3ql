@@ -79,7 +79,6 @@ struct RowStart {
 
 struct RowResume {
     start: RowStart,
-    selected: usize,
     transitions: [Option<transition_rows::SavedTransitionRows>; CAPTURES],
     /// The changed row's old and new values, for its `RETURNING` stage.
     returning: Option<transition_rows::SavedTransitionRows>,
@@ -684,11 +683,13 @@ impl RowProgress {
     /// After the rows are selected again: checks that the selection is the
     /// one already partly changed and returns the first row to change, the
     /// count of changed rows and their saved transition rows.
-    /// `row_at` names a selected row's stored identity, when it has one.
+    /// `row_at` names a selected row's stored identity, when it has one, and
+    /// is `None` past the selection. A streamed source does not know its
+    /// rows ahead: it answers `Some(None)` and checks that it reaches the
+    /// first row as it skips the changed ones.
     pub(super) fn resume_rows<'p>(
         &'p self,
-        selected: usize,
-        row_at: impl FnOnce(usize) -> Option<PhysicalRow>,
+        row_at: impl FnOnce(usize) -> Option<Option<PhysicalRow>>,
     ) -> Result<ResumedRows<'p>, SqlError> {
         let Some(resume) = &self.resume else {
             return Ok(ResumedRows {
@@ -697,10 +698,7 @@ impl RowProgress {
                 transitions: [None; CAPTURES],
             });
         };
-        if resume.selected != selected
-            || resume.start.index >= selected
-            || !same_row(row_at(resume.start.index), resume.start.row)
-        {
+        if !row_at(resume.start.index).is_some_and(|row| same_row(row, resume.start.row)) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "a resumed write selected different rows"
@@ -986,11 +984,10 @@ impl RowProgress {
     /// the earlier rows' transition rows so the next attempt can continue.
     pub(super) fn interrupt(
         &mut self,
-        selected: usize,
         captures: [Option<&TransitionCapture<'_>>; CAPTURES],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
-        self.interrupt_with(selected, None, captures, pool)
+        self.interrupt_with(None, captures, pool)
     }
 
     /// [`Self::interrupt`] for a write over stored rows: a selection of
@@ -1067,12 +1064,11 @@ impl RowProgress {
         } else {
             None
         };
-        self.interrupt_with(selection.len(), kept, captures, pool)
+        self.interrupt_with(kept, captures, pool)
     }
 
     fn interrupt_with(
         &mut self,
-        selected: usize,
         kept_selection: Option<SavedSelection>,
         captures: [Option<&TransitionCapture<'_>>; CAPTURES],
         pool: &std::sync::Arc<LeasePool>,
@@ -1100,7 +1096,6 @@ impl RowProgress {
         }
         self.resume = Some(RowResume {
             start,
-            selected,
             transitions,
             returning,
             state: self.state.take(),
@@ -1258,7 +1253,6 @@ pub(super) fn settle_rows(
     progress: Option<&mut RowProgress>,
     outcome: &Outcome,
     txn: &TxnState,
-    selected: usize,
     captures: [Option<&TransitionCapture<'_>>; CAPTURES],
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<(), SqlError> {
@@ -1267,7 +1261,7 @@ pub(super) fn settle_rows(
     };
     match outcome {
         Ok(Err(error)) if progress.stops_for(error) && txn.pending_write_completion.is_none() => {
-            progress.interrupt(selected, captures, pool)
+            progress.interrupt(captures, pool)
         }
         _ => {
             progress.finish_rows();

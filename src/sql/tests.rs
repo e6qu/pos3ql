@@ -86,6 +86,7 @@ mod shared_statistics;
 mod special_datetime_inputs;
 mod sql_function_results;
 mod stored_relation_sources;
+mod streamed_insert_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;

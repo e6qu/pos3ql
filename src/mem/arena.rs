@@ -223,6 +223,45 @@ impl Arena {
         Ok(each(&region.arena))
     }
 
+    /// Lends a fixed block of `capacity` bytes from this arena's front to a
+    /// child arena whose rewinds never touch the parent's later allocations.
+    /// The child and its bytes are ordinary front allocations: they stay
+    /// valid until the parent rewinds below them, and are never dropped.
+    pub(crate) fn alloc_front_block(&self, capacity: usize) -> Result<&Arena, ArenaFull> {
+        let capacity = capacity.next_multiple_of(ARENA_ALIGN);
+        if capacity == 0 {
+            return Err(self.full(1));
+        }
+        let layout =
+            Layout::from_size_align(capacity, ARENA_ALIGN).map_err(|_| self.full(capacity))?;
+        let base = self.alloc_raw(layout)?;
+        let header = self.alloc_raw(Layout::new::<Arena>())?.cast::<Arena>();
+        // SAFETY: the header slot is fresh, aligned and sized for an Arena.
+        // Arena memory is never dropped, so the child never runs Arena::drop
+        // and never frees the parent's bytes it borrows.
+        unsafe {
+            header.write(Arena {
+                what: self.what,
+                base,
+                capacity,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(capacity),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                borrowed: None,
+                retained_front: Cell::new(0),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            });
+            Ok(&*header)
+        }
+    }
+
+    /// Bytes still available to front allocations.
+    pub(crate) fn remaining(&self) -> usize {
+        self.allocation_limit().saturating_sub(self.offset.get())
+    }
+
     /// Reclaims a scoped workspace while retaining only its encoded output.
     /// The output is moved into this arena, including when this is a borrowed
     /// row arena; temporary child-persistent values do not pin its workspace.

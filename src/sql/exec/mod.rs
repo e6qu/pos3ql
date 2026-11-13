@@ -87707,16 +87707,15 @@ pub(crate) fn update<'a>(
                 updated += 1;
                 continue;
             }
-            if let Some(progress) = progress.as_deref_mut()
-                && let Err(error) = progress.begin_row(
-                    i,
-                    Some(scratch[i]),
-                    updated,
-                    row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
-                    txn,
-                    responder,
-                )
-            {
+            if let Err(error) = row_progress::start_selected_row(
+                progress.as_deref_mut(),
+                i,
+                scratch[i],
+                updated,
+                row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+                txn,
+                responder,
+            ) {
                 return sql_fail(error);
             }
             match dml_row_available(storage, txn, scratch[i], "updated") {
@@ -88554,6 +88553,16 @@ pub(crate) fn update<'a>(
             }
             updated += 1;
         }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            scratch.len(),
+            updated,
+            row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
+        }
         sql_ok()
     })();
     if let Some(progress) = progress {
@@ -89150,16 +89159,15 @@ pub(crate) fn delete<'a>(
                 deleted += 1;
                 continue;
             }
-            if let Some(progress) = progress.as_deref_mut()
-                && let Err(error) = progress.begin_row(
-                    i,
-                    Some(scratch[i]),
-                    deleted,
-                    row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
-                    txn,
-                    responder,
-                )
-            {
+            if let Err(error) = row_progress::start_selected_row(
+                progress.as_deref_mut(),
+                i,
+                scratch[i],
+                deleted,
+                row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+                txn,
+                responder,
+            ) {
                 return sql_fail(error);
             }
             match dml_row_available(storage, txn, scratch[i], "deleted") {
@@ -89489,6 +89497,16 @@ pub(crate) fn delete<'a>(
                 return sql_fail(error);
             }
             deleted += 1;
+        }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            scratch.len(),
+            deleted,
+            row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
         }
         sql_ok()
     })();

@@ -782,9 +782,14 @@ run by retained readers whose calls hand off on their row; an
 `INSERT ... SELECT` step reading another; and a top-level `INSERT ... SELECT`
 reading one, which the engine drives the same way. After the main query,
 every data-modifying query runs to its end, last one first, as PostgreSQL's
-`ExecPostprocessPlan` does. Any other reader (a join, a sort, a `SELECT`
-without calls) reads the query whole at its first read, and an `UPDATE`,
-`DELETE` or `MERGE` query runs whole at its first read. A wait inside a step
+`ExecPostprocessPlan` does. A `SELECT` reader without calls reads row by
+row too, so a query read only partly (`LIMIT`) finishes after the queries
+nothing read. An `UPDATE`, `DELETE` or `MERGE` query's step ends at the start
+of the row after one that returned a row, as an `INSERT ... VALUES` step
+does; its row progress keeps the selected rows, so the next step continues
+at that row. A sort, aggregate or window reader reads its whole input first,
+as PostgreSQL's does. A join reader reads the query whole at its first read,
+which matches PostgreSQL only when its plan hashes the query. A wait inside a step
 runs the statement again from its first start: the main write's row
 progress would otherwise roll back over the step's rows.
 

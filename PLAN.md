@@ -157,9 +157,16 @@ is owned.
   partly, or not at all, then run to their end, last one first. The reader
   is a `SELECT` whose single `FROM` item is the query (also each query of a
   `UNION ALL` of such `SELECT`s), another such `INSERT ... SELECT`, or a
-  top-level `INSERT ... SELECT` from it; any other reader (a join, a sort, a
-  `SELECT` without calls) reads the query whole at its first read, as
-  before, and an `UPDATE`, `DELETE` or `MERGE` query runs whole at its first
+  top-level `INSERT ... SELECT` from it, with or without calls; an
+  `UPDATE`, `DELETE` or `MERGE` query returns each row before it changes the
+  next, as an `INSERT ... VALUES` does. A sort, aggregate or window reader
+  reads its whole input first, as PostgreSQL's does. A join reader reads the
+  query whole at its first read: that matches PostgreSQL when its plan
+  hashes the query, but not when its plan streams the query (a nested loop
+  under a `LATERAL` item over it, or a hash join that hashes the other,
+  smaller input). Matching those needs a retained join node that pulls the
+  query as its outer input and PostgreSQL's choice of which input to hash,
+  which follows its cost estimates rather than the statement's shape.
   read. A wait inside a step runs the statement again from its first start.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
@@ -581,10 +588,10 @@ queries, including data-modifying ones, in one new command as PostgreSQL
 does; a cursor's query with data-modifying `WITH` queries runs at its first
 read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
-`WITH` `UPDATE`, `DELETE` or `MERGE`, or one read by a join, a sort or a
-query without calls, runs whole at its first read, so a trigger's or called
-function's notices arrive in a different order than PostgreSQL's
-interleaved execution. The index behind a primary key or unique
+`WITH` query read by a join runs whole at its first read, so where
+PostgreSQL's plan streams the query (a `LATERAL` item over it, or a join
+that hashes the other input) a trigger's or called function's effects
+arrive in a different order than PostgreSQL's (see Write phases). The index behind a primary key or unique
 constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,

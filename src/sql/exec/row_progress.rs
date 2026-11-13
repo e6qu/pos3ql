@@ -1432,6 +1432,29 @@ pub(super) fn start_row<'a>(
     Ok(None)
 }
 
+/// Before selected row `index` of an `UPDATE` or `DELETE`: as
+/// [`start_row`], a data-modifying `WITH` query's step that returned its row
+/// ends here, so its reader reads that row before this one runs.
+pub(super) fn start_selected_row(
+    progress: Option<&mut RowProgress>,
+    index: usize,
+    row: PhysicalRow,
+    changed: u64,
+    transitions: CaptureLengths,
+    txn: &TxnState,
+    responder: &Responder<'_>,
+) -> Result<(), SqlError> {
+    let Some(progress) = progress else {
+        return Ok(());
+    };
+    progress.begin_row(index, Some(row), changed, transitions, txn, responder)?;
+    if progress.produce_until.is_some_and(|until| changed >= until) {
+        progress.produced = true;
+        return Err(query::producer_yield());
+    }
+    Ok(())
+}
+
 /// After a write's last row: the step of a data-modifying `WITH` query that
 /// returned its row ends at index `index`, past the rows, so its reader
 /// reads the row before the query finds its end, as in PostgreSQL.

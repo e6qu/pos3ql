@@ -2944,9 +2944,17 @@ impl<'a> RetainedSelect<'a> {
         // Likewise it groups them itself.
         let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
         // A statement-mode SELECT is read here only for its routine calls;
-        // others keep the general executor's index access paths.
-        let handoff_only =
-            mode == RetainedMode::Statement && statement_use == StatementUse::Handoff;
+        // others keep the general executor's index access paths. One that
+        // reads a data-modifying `WITH` query is read here with or without
+        // calls, so the query writes each row as it is read.
+        let reads_write_query = statement.from.as_ref().is_some_and(|from| {
+            from.base.cte.is_some_and(|cte| {
+                matches!(cte.source, crate::sql::ast::MaterializedCteSource::Write(_))
+            })
+        });
+        let handoff_only = mode == RetainedMode::Statement
+            && statement_use == StatementUse::Handoff
+            && !reads_write_query;
         // Only a reader that returns its rows once runs subqueries before
         // them; a declared cursor or an appended query does not.
         let Some(sublinks) = statement_sublinks(statement, storage, txid, arena)? else {

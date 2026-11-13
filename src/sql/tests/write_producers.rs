@@ -146,3 +146,59 @@ fn a_query_read_row_by_row_keeps_its_memory_fixed() {
         assert_eq!(data_rows(&output).len(), 400);
     });
 }
+
+#[test]
+fn update_delete_and_merge_queries_return_each_row_before_the_next() {
+    with_engine("write-producer-update-delete-merge", |engine, budget| {
+        run_with(engine, budget, SETUP);
+        run_with(
+            engine,
+            budget,
+            "CREATE TRIGGER wp_a_before_change BEFORE UPDATE ON wp_a \
+             FOR EACH ROW EXECUTE FUNCTION wp_row(); \
+             CREATE TABLE wp_keys (x int); INSERT INTO wp_keys VALUES (2), (5); \
+             INSERT INTO wp_a VALUES (1), (2), (3); TRUNCATE wp_log",
+        );
+        // Results from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w AS (UPDATE wp_a SET x = x + 10 RETURNING x) \
+             SELECT wp_note('main', x) FROM w; \
+             SELECT string_agg(msg, ',' ORDER BY n) FROM wp_log; TRUNCATE wp_log",
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "11",
+                "12",
+                "13",
+                "BEFORE wp_a 11,main 11,BEFORE wp_a 12,main 12,BEFORE wp_a 13,main 13"
+            ]
+        );
+        // A reader without calls that reads one row: the unread query runs
+        // before the rest of the one read partly.
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w1 AS (DELETE FROM wp_a WHERE x > 11 RETURNING x), \
+                  w2 AS (INSERT INTO wp_a VALUES (40) RETURNING x) \
+             SELECT x FROM w1 LIMIT 1; \
+             SELECT string_agg(msg, ',' ORDER BY n) FROM wp_log; TRUNCATE wp_log",
+        );
+        assert_eq!(data_rows(&output), ["12", "BEFORE wp_a 40"]);
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w AS (MERGE INTO wp_a t USING wp_keys s ON t.x = s.x + 9 \
+                        WHEN MATCHED THEN UPDATE SET x = t.x * 2 \
+                        WHEN NOT MATCHED THEN INSERT VALUES (s.x) RETURNING t.x) \
+             SELECT wp_note('main', x) FROM w; \
+             SELECT string_agg(msg, ',' ORDER BY n) FROM wp_log; TRUNCATE wp_log",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["22", "5", "BEFORE wp_a 22,main 22,BEFORE wp_a 5,main 5"]
+        );
+    });
+}

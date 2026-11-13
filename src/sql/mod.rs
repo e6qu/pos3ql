@@ -15876,13 +15876,17 @@ impl Engine {
         let snapshot = self.storage.read_snapshot();
         let calls = invocations.write_query_child(arena);
         let attempt_mark = arena.mark();
-        // An `INSERT ... VALUES` evaluates each row as it writes it and skips
-        // the rows earlier steps wrote by index: a read of one row runs it
-        // until it returns a row. Any other write runs whole.
-        let values =
-            matches!(with[write.index].dml, Some(Stmt::Insert(insert)) if insert.select.is_none());
+        // An `INSERT ... VALUES`, `UPDATE`, `DELETE` or `MERGE` writes its
+        // rows in turn and resumes at the unfinished one: a read of one row
+        // runs it until it returns a row, as PostgreSQL's ModifyTable
+        // returns each row before it reads the next.
+        let row_by_row = match with[write.index].dml {
+            Some(Stmt::Insert(insert)) => insert.select.is_none(),
+            Some(Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)) => true,
+            _ => false,
+        };
         let (produced, _) = invocations.producer_state(key);
-        let produce = (values && write.row.is_some()).then_some(produced as u64 + 1);
+        let produce = (row_by_row && write.row.is_some()).then_some(produced as u64 + 1);
         // Rows an attempt returned stay returned: the next attempt continues
         // at the unfinished row. Their journal region is known at the end.
         let first = invocations.producer_state(key).0;

@@ -9,7 +9,7 @@ Queries a PostgreSQL 18.6 reference server (database template1) for the
 descriptions of schemas, languages, access methods, types and operators whose
 OIDs initdb assigns from the catalog data files (below 10000, the same on every
 platform), plus the plpgsql extension and language that initdb creates, keyed
-by OID. Built-in text search objects are keyed by name instead: initdb numbers
+by the OID the pinned CI image gives them. Built-in text search objects are keyed by name instead: initdb numbers
 the snowball ones after importing the platform's collations. It writes both
 lists sorted together with the SHA-256 digests of the extraction SQL and its
 `psql -At` output. `check` fails when the
@@ -38,7 +38,11 @@ text_search = (("pg_ts_parser", "prsname", "prsnamespace"),
                ("pg_ts_template", "tmplname", "tmplnamespace"),
                ("pg_ts_dict", "dictname", "dictnamespace"),
                ("pg_ts_config", "cfgname", "cfgnamespace"))
-sql = ("SELECT coalesce(jsonb_agg(jsonb_build_array(d.classoid::integer, d.objoid::integer, "
+# initdb numbers plpgsql after the platform's collations; renumber it to the
+# pinned CI image, where dsnowball_init (the first such object) is 13232.
+pinned_oid = ("d.objoid::integer - CASE WHEN d.objoid >= 'dsnowball_init'::regproc "
+              "THEN 'dsnowball_init'::regproc::integer - 13232 ELSE 0 END")
+sql = ("SELECT coalesce(jsonb_agg(jsonb_build_array(d.classoid::integer, " + pinned_oid + ", "
        "d.description) ORDER BY d.classoid, d.objoid), '[]') FROM pg_description d "
        "WHERE d.objsubid = 0 AND (d.classoid::regclass::text IN ("
        + ", ".join(f"'{name}'" for name in classes)

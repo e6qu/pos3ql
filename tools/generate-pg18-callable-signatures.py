@@ -11,7 +11,9 @@ rewrites CALLABLE_TYPE_NAMES, PostgreSQL's format_type name of every type a
 pg_proc row uses, and CALLABLE_INITIAL_ACLS, the initdb proacl of every
 routine that has one (read from template1, which no session changes), each
 with its own SQL and result digests. With no OIDs it only re-verifies the
-recorded digests and index.
+recorded digests and index. The recorded SQL renumbers the objects initdb
+creates after importing the platform's collations to the pinned CI image, so
+requested OIDs use that numbering on every build.
 """
 import argparse, hashlib, json, re, subprocess, sys
 parser = argparse.ArgumentParser()
@@ -28,7 +30,7 @@ s = open(path).read()
 a = s.index('/* Exact extraction SQL:\n') + len('/* Exact extraction SQL:\n')
 b = s.index('\n*/', a)
 sql = s[a:b]
-m = re.search(r'WHERE p\.oid IN \(([0-9,]+)\)', sql)
+m = re.search(r'WHERE [^\n]*? IN \(([0-9,]+)\)', sql)
 listed = [int(x) for x in m.group(1).split(',')]
 listed = sorted(set(listed) | set(oids))
 sql = sql[:m.start(1)] + ','.join(map(str, listed)) + sql[m.end(1):]

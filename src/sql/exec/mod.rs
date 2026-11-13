@@ -43365,8 +43365,8 @@ fn text_search_support_routine(name: QualName<'_>) -> Result<i32, SqlError> {
         "dispell_lexize" => Ok(3732),
         "thesaurus_init" => Ok(3740),
         "thesaurus_lexize" => Ok(3741),
-        "dsnowball_init" => Ok(13_638),
-        "dsnowball_lexize" => Ok(13_639),
+        "dsnowball_init" => Ok(crate::sql::catalog::DSNOWBALL_INIT_OID),
+        "dsnowball_lexize" => Ok(crate::sql::catalog::DSNOWBALL_LEXIZE_OID),
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "text search support routine {} is not executable",

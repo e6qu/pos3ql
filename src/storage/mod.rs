@@ -3873,7 +3873,9 @@ const _: () = assert!(BUILTIN_TEXT_SEARCH_OBJECTS <= 128);
 /// Slots the built-in objects of `postgres`, `template1` and `template0` take.
 pub(crate) const BUILTIN_TEXT_SEARCH_SLOTS: usize = 3 * BUILTIN_TEXT_SEARCH_OBJECTS;
 const SNOWBALL_CONFIGURATIONS: usize = 29;
-const FIRST_SNOWBALL_DICTIONARY_OID: i32 = 13_235;
+use crate::sql::catalog::{
+    DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID, FIRST_SNOWBALL_DICTIONARY_OID, SNOWBALL_TEMPLATE_OID,
+};
 
 /// The languages with a built-in Snowball configuration, in initdb's order.
 pub(crate) fn builtin_snowball_languages()
@@ -3925,7 +3927,11 @@ pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearc
         2 => template("synonym", 3730, TextSearchTemplateKind::Synonym),
         3 => template("ispell", 3733, TextSearchTemplateKind::Ispell),
         4 => template("thesaurus", 3742, TextSearchTemplateKind::Thesaurus),
-        5 => template("snowball", 13_234, TextSearchTemplateKind::Snowball),
+        5 => template(
+            "snowball",
+            SNOWBALL_TEMPLATE_OID,
+            TextSearchTemplateKind::Snowball,
+        ),
         6 => TextSearchDefinition::Dictionary {
             schema: pg_catalog,
             name: name("simple"),
@@ -3966,7 +3972,7 @@ pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearc
                     name: name(text.as_str()),
                     oid: dictionary_oid(language),
                     owner: 10,
-                    template: 13_234,
+                    template: SNOWBALL_TEMPLATE_OID,
                     options,
                     behavior: TextSearchDictionaryBehavior::Snowball {
                         language,
@@ -4077,9 +4083,7 @@ impl TextSearchTemplateKind {
         (Self::Synonym, 3728, 3729),
         (Self::Ispell, 3731, 3732),
         (Self::Thesaurus, 3740, 3741),
-        // `snowball_create.sql` defines these after initdb imports collations;
-        // they are the OIDs `pg_proc` lists (catalog_callable_signatures.rs).
-        (Self::Snowball, 13_638, 13_639),
+        (Self::Snowball, DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID),
     ];
 
     /// The kind whose `init` and `lexize` routines these are; `init` is

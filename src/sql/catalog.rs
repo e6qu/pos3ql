@@ -110,8 +110,19 @@ pub(crate) struct SynthTable<'a> {
 const FIRST_USER_OID: i32 = 16384;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
-// PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
-const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
+/// initdb draws every OID it assigns after importing the platform's collations
+/// from one counter, so these objects' OIDs depend on the reference's locale
+/// and ICU set. They follow the pinned CI reference image (`postgres:18` on
+/// Debian trixie: three libc and 870 ICU 76 collations), where
+/// `snowball_create.sql`'s `dsnowball_init` is the first such object; a
+/// Homebrew build on macOS numbers the same objects 406 higher. Capture of
+/// `information_schema`: actions/runs/40192510296.
+pub(crate) const DSNOWBALL_INIT_OID: i32 = 13_232;
+pub(crate) const DSNOWBALL_LEXIZE_OID: i32 = DSNOWBALL_INIT_OID + 1;
+pub(crate) const SNOWBALL_TEMPLATE_OID: i32 = DSNOWBALL_INIT_OID + 2;
+/// Each Snowball dictionary is followed by its configuration.
+pub(crate) const FIRST_SNOWBALL_DICTIONARY_OID: i32 = DSNOWBALL_INIT_OID + 3;
+pub(crate) const INFORMATION_SCHEMA_NS_OID: i32 = DSNOWBALL_INIT_OID + 61;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
@@ -159,18 +170,18 @@ const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
-/// The `plpgsql` extension, language and handler OIDs of the PostgreSQL 18.6
-/// reference initdb whose routine rows `catalog_callable_signatures` records.
-pub(crate) const PLPGSQL_EXTENSION_OID: i32 = 14_049;
-const PLPGSQL_CALL_HANDLER_OID: i32 = 14_050;
-const PLPGSQL_INLINE_HANDLER_OID: i32 = 14_051;
-const PLPGSQL_VALIDATOR_OID: i32 = 14_052;
+/// The `plpgsql` extension, language and handler OIDs; initdb creates them
+/// last, after the collations (see `DSNOWBALL_INIT_OID`).
+pub(crate) const PLPGSQL_EXTENSION_OID: i32 = DSNOWBALL_INIT_OID + 411;
+const PLPGSQL_CALL_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 1;
+const PLPGSQL_INLINE_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 2;
+const PLPGSQL_VALIDATOR_OID: i32 = PLPGSQL_EXTENSION_OID + 3;
 pub(crate) const PLPGSQL_HANDLER_OIDS: [i32; 3] = [
     PLPGSQL_CALL_HANDLER_OID,
     PLPGSQL_INLINE_HANDLER_OID,
     PLPGSQL_VALIDATOR_OID,
 ];
-pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = 14_053;
+pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = PLPGSQL_EXTENSION_OID + 4;
 /// `pg_proc.prolang` of a stored routine.
 pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLanguage) -> i32 {
     match language {
@@ -495,6 +506,44 @@ mod callable_contract_tests {
     use super::*;
 
     #[test]
+    fn initdb_objects_after_collations_follow_one_numbering() {
+        let callable =
+            |oid| builtin_callable_by_oid(oid).map(|routine| (routine.schema, routine.name));
+        let routine = |oid| {
+            builtin_properties::ROUTINES
+                .iter()
+                .find(|routine| routine.oid == oid)
+                .map(|routine| routine.name)
+        };
+        for (oid, name) in [
+            (DSNOWBALL_INIT_OID, "dsnowball_init"),
+            (DSNOWBALL_LEXIZE_OID, "dsnowball_lexize"),
+            (PLPGSQL_CALL_HANDLER_OID, "plpgsql_call_handler"),
+            (PLPGSQL_INLINE_HANDLER_OID, "plpgsql_inline_handler"),
+            (PLPGSQL_VALIDATOR_OID, "plpgsql_validator"),
+        ] {
+            assert_eq!(callable(oid), Some(("pg_catalog", name)));
+            assert_eq!(routine(oid), Some(name));
+        }
+        assert_eq!(
+            callable(INFORMATION_SCHEMA_NS_OID + 1),
+            Some(("information_schema", "_pg_expandarray"))
+        );
+        for class in [PG_LANGUAGE_OID, PG_EXTENSION_OID] {
+            let object = if class == PG_LANGUAGE_OID {
+                PLPGSQL_LANGUAGE_OID
+            } else {
+                PLPGSQL_EXTENSION_OID
+            };
+            assert!(object_descriptions::OBJECT_DESCRIPTIONS.contains(&(
+                class,
+                object,
+                "PL/pgSQL procedural language"
+            )));
+        }
+    }
+
+    #[test]
     fn planner_procedures_match_every_callable_declaration() {
         let numeric = builtin_planner_procedure(1701).unwrap();
         assert_eq!(numeric.volatility, 0);
@@ -559,7 +608,11 @@ mod callable_contract_tests {
         for oid in [6183, 6184] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().cost, 100.0);
         }
-        assert!(builtin_planner_procedure(13700).unwrap().forbidden);
+        assert!(
+            builtin_planner_procedure(INFORMATION_SCHEMA_NS_OID + 1)
+                .unwrap()
+                .forbidden
+        );
     }
 
     #[test]
@@ -25042,8 +25095,8 @@ fn text_search_regproc<'a>(oid: i32, arena: &'a Arena) -> Result<Datum<'a>, SqlE
         3732 => "dispell_lexize",
         3740 => "thesaurus_init",
         3741 => "thesaurus_lexize",
-        13_638 => "dsnowball_init",
-        13_639 => "dsnowball_lexize",
+        DSNOWBALL_INIT_OID => "dsnowball_init",
+        DSNOWBALL_LEXIZE_OID => "dsnowball_lexize",
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,

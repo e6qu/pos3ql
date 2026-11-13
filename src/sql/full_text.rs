@@ -94,7 +94,8 @@ pub enum TextSearchLexeme<'a> {
 
 impl TextSearchConfig {
     pub const SIMPLE: Self = Self(3_748);
-    pub const ENGLISH: Self = Self(13_248);
+    /// `english` follows `english_stem`, the seventh Snowball dictionary.
+    pub const ENGLISH: Self = Self(crate::sql::catalog::FIRST_SNOWBALL_DICTIONARY_OID + 13);
 
     /// The built-in configuration with this name, matched as an unquoted,
     /// optionally `pg_catalog`-qualified identifier.

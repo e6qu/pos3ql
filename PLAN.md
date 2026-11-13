@@ -474,7 +474,15 @@ call fails with `22P02`. A rule action that names its table's renamed column wit
 names from the stored query text.
 An exclusion constraint element must be a column: an expression
 (`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
-the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the
+the stored constraint keeps no element expressions. Supporting them needs
+per-element expression text in the constraint's journal and checkpoint
+records, element evaluation in the conflict scan, `indkey` 0 and `indexprs`
+in `pg_index`, and handling of every path that copies or renumbers
+exclusion columns (`LIKE`, inheritance, partition attach, `DROP COLUMN`,
+column renames). A deferred unique or exclusion constraint that fails when an
+implicit transaction commits reports its error after the statement's
+`CommandComplete` (psql prints `INSERT 0 1` and then the error), where
+PostgreSQL commits before sending the last statement's `CommandComplete`. A statement's own catalog scans, including those through views, read the
 catalog as the statement began (images built at its start), so `SELECT mk(g),
 (SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as

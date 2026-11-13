@@ -124,6 +124,20 @@ def simple_query(s, text):
             return out
 
 
+def simple_query_blocks(s, text):
+    """Sends `text` as one Query message per transaction block: a BEGIN in a
+    Query makes everything before it in that Query part of the block, so
+    setup that must commit on its own goes in its own message, as psql
+    sends each statement."""
+    out = []
+    parts = text.split("BEGIN; ")
+    for index, part in enumerate(parts):
+        query = part if index == 0 else "BEGIN; " + part
+        if query.strip():
+            out.extend(simple_query(s, query))
+    return out
+
+
 def read_until_ready(s):
     out = []
     while True:
@@ -6224,7 +6238,7 @@ def test_sequence_rename_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE SCHEMA wire_sequence_rename_schema; "
         "CREATE SEQUENCE wire_sequence_rename_source START WITH 10 INCREMENT BY 2; "
@@ -6274,7 +6288,7 @@ def test_schema_rename_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE SCHEMA wire_schema_rename_source; "
         "CREATE TYPE wire_schema_rename_source.mood AS ENUM ('calm', 'storm'); "
@@ -6314,7 +6328,7 @@ def test_materialized_view_metadata_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE TABLE wire_matview_metadata_source (value integer); "
         "INSERT INTO wire_matview_metadata_source VALUES (7), (9); "

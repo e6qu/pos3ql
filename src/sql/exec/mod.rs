@@ -4287,42 +4287,72 @@ fn validate_partitioned_unique_keys<Definition0: crate::storage::DefinitionBacki
     let Some(crate::storage::PartitionScheme { keys, n_keys, .. }) = def.partition.scheme else {
         return Ok(());
     };
-    let includes_keys = |columns: &[u16]| {
-        keys[..usize::from(n_keys)]
-            .iter()
-            .all(|key| columns.contains(key))
+    // PostgreSQL's `DefineIndex`: each partition key column must be a key
+    // column, compared with equality by an exclusion constraint.
+    let lacks = |kind: &str, key: u16| {
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "{} constraint on table \"{}\" lacks column \"{}\" which is part of the partition key.",
+                kind,
+                def.name.as_str(),
+                def.columns()[usize::from(key)].name.as_str()
+            )),
+            None,
+        );
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unique constraint on partitioned table must include all partitioning columns"
+        )
     };
+    let keys = &keys[..usize::from(n_keys)];
     for (column, metadata) in def.columns().iter().enumerate() {
-        if (metadata.unique || metadata.primary) && !includes_keys(&[column as u16]) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "unique constraint on partitioned table must include all partitioning columns"
+        if (metadata.unique || metadata.primary)
+            && let Some(&key) = keys.iter().find(|key| usize::from(**key) != column)
+        {
+            return Err(lacks(
+                if metadata.primary {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+                key,
             ));
         }
     }
     for unique in def.uniques() {
-        if !includes_keys(unique.columns()) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "unique constraint on partitioned table must include all partitioning columns"
+        if let Some(&key) = keys.iter().find(|key| !unique.columns().contains(key)) {
+            return Err(lacks(
+                if unique.kind.is_primary() {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+                key,
             ));
         }
     }
     for exclusion in def.exclusions() {
-        let includes_equal_partition_keys = keys[..usize::from(n_keys)].iter().all(|key| {
-            exclusion
-                .columns()
-                .iter()
-                .position(|column| column == key)
-                .is_some_and(|position| {
-                    exclusion.operators[position].binary() == crate::sql::ast::BinaryOp::Eq
-                })
-        });
-        if !includes_equal_partition_keys {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "exclusion constraint on partitioned table must include all partitioning columns with equality operators"
-            ));
+        for &key in keys {
+            let mut matched = false;
+            for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+                if element != crate::storage::ExclusionElement::Column(key) {
+                    continue;
+                }
+                if operator.binary() != crate::sql::ast::BinaryOp::Eq {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot match partition key to index on column \"{}\" using non-equal operator \"{}\"",
+                        def.columns()[usize::from(key)].name.as_str(),
+                        operator.sql()
+                    ));
+                }
+                matched = true;
+                break;
+            }
+            if !matched {
+                return Err(lacks("EXCLUDE", key));
+            }
         }
     }
     Ok(())
@@ -4446,15 +4476,8 @@ fn build_partitioned_table_def(
             }
             for index in 0..def.n_exclusions {
                 let constraint = def.exclusions[index];
-                def.exclusions[index].name = auto_key_name(
-                    storage,
-                    &def,
-                    constraint.columns(),
-                    "excl",
-                    txid,
-                    None,
-                    crate::storage::GeneratedNameClass::IndexConstraint,
-                )?;
+                def.exclusions[index].name =
+                    ddl::auto_exclusion_name(storage, &def, &constraint, txid, None, arena)?;
             }
             let resolved_bound = resolve_partition_bound(
                 storage,
@@ -4702,8 +4725,8 @@ fn build_inherited_table_def(
         }
     }
     for index in 0..definition.n_exclusions {
-        definition.exclusions[index].columns =
-            remap_columns(&definition, &own, definition.exclusions[index].columns())?;
+        definition.exclusions[index] =
+            remap_exclusion(&definition, &own, &definition.exclusions[index])?;
     }
     Ok(definition)
 }
@@ -6301,19 +6324,9 @@ fn copy_like_constraints(
                         crate::storage::MAX_EXCLUSIONS
                     ));
                 }
-                let columns = remap_columns(def, &source, source_exclusion.columns())?;
-                let mut exclusion = *source_exclusion;
-                exclusion.columns[..source_exclusion.n_cols]
-                    .copy_from_slice(&columns[..source_exclusion.n_cols]);
-                exclusion.name = auto_key_name(
-                    storage,
-                    def,
-                    &columns[..source_exclusion.n_cols],
-                    "excl",
-                    txid,
-                    None,
-                    crate::storage::GeneratedNameClass::IndexConstraint,
-                )?;
+                let mut exclusion = remap_exclusion(def, &source, source_exclusion)?;
+                exclusion.name =
+                    ddl::auto_exclusion_name(storage, def, &exclusion, txid, None, arena)?;
                 def.exclusions[def.n_exclusions] = exclusion;
                 def.n_exclusions += 1;
             }
@@ -6851,6 +6864,9 @@ fn next_auto_value<'x>(
 )]
 enum Arbiter<'a> {
     Any,
+    /// `ON CONSTRAINT` naming an immediate exclusion constraint (DO NOTHING
+    /// only), by position in the definition's exclusions.
+    Exclusion(usize),
     Keys {
         columns: [u16; crate::storage::MAX_INDEX_COLS],
         expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
@@ -6870,6 +6886,25 @@ impl<'a> Arbiter<'a> {
     ) -> Result<Self, SqlError> {
         Ok(match self {
             Self::Any => Self::Any,
+            // A partition's clone compares the same elements, its columns
+            // matched by name.
+            Self::Exclusion(position) => {
+                let constraint = &logical.exclusions()[*position];
+                let cloned = remap_exclusion(physical, logical, constraint)?;
+                Self::Exclusion(
+                    physical
+                        .exclusions()
+                        .iter()
+                        .position(|candidate| same_exclusion_body(candidate, &cloned))
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "partition has no clone of exclusion constraint \"{}\"",
+                                constraint.name.as_str()
+                            )
+                        })?,
+                )
+            }
             Self::Keys {
                 columns,
                 expressions,
@@ -6891,6 +6926,15 @@ fn same_index_expression(stored: &str, target: &str) -> bool {
         || (target.starts_with('(')
             && target.ends_with(')')
             && stored == target[1..target.len() - 1].trim())
+}
+
+/// An exclusion constraint consulted by an `ON CONFLICT` arbiter, with the
+/// proposed row's element values.
+#[derive(Clone, Copy)]
+struct ExclusionArbiter<'e, 'a> {
+    scan: constraints::ExclusionScan<'e, 'a>,
+    predicate: Option<&'a Expr<'a>>,
+    keys: constraints::ExclusionKeys<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -6949,10 +6993,7 @@ fn arbiter_by_name<Definition0: crate::storage::DefinitionBacking>(
     for uk in def.uniques() {
         if uk.name.as_str() == name {
             if uk.timing.is_deferrable() {
-                return Err(sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "ON CONFLICT does not support deferrable unique constraints as arbiters"
-                ));
+                return Err(deferrable_arbiter(def, uk.name));
             }
             let n = uk.n_cols;
             cols[..n].copy_from_slice(uk.columns());
@@ -6970,6 +7011,26 @@ fn arbiter_by_name<Definition0: crate::storage::DefinitionBacking>(
         }
     }
     Ok(None)
+}
+
+/// PostgreSQL's refusal of a deferrable unique or exclusion constraint as an
+/// `ON CONFLICT` arbiter.
+fn deferrable_arbiter<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: SqlName,
+) -> SqlError {
+    crate::sql::eval::stash_object_diagnostic(
+        None,
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            name.as_str(),
+        ),
+    );
+    sql_err!(
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"
+    )
 }
 
 /// Resolves an `ON CONFLICT` clause's arbiter, raising PostgreSQL's analysis
@@ -7071,6 +7132,23 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
         ));
     }
     if let Some(cname) = oc.constraint {
+        if let Some(position) = def
+            .exclusions()
+            .iter()
+            .position(|exclusion| exclusion.name.as_str() == cname)
+        {
+            let exclusion = &def.exclusions()[position];
+            if exclusion.timing.is_deferrable() {
+                return Err(deferrable_arbiter(def, exclusion.name));
+            }
+            if oc.update.is_some() {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "ON CONFLICT DO UPDATE not supported with exclusion constraints"
+                ));
+            }
+            return Ok(Arbiter::Exclusion(position));
+        }
         if let Some((cols, n, nulls_not_distinct)) = arbiter_by_name(def, cname)? {
             return Ok(Arbiter::Keys {
                 columns: cols,
@@ -7091,6 +7169,23 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
             sqlstate::SYNTAX_ERROR,
             "ON CONFLICT DO UPDATE requires inference specification or constraint name"
         ));
+    }
+    // Without a target every unique and exclusion constraint arbitrates, and
+    // a deferrable one cannot.
+    if let Some(name) = def
+        .uniques()
+        .iter()
+        .filter(|key| key.timing.is_deferrable())
+        .map(|key| key.name)
+        .chain(
+            def.exclusions()
+                .iter()
+                .filter(|exclusion| exclusion.timing.is_deferrable())
+                .map(|exclusion| exclusion.name),
+        )
+        .next()
+    {
+        return Err(deferrable_arbiter(def, name));
     }
     Ok(Arbiter::Any)
 }
@@ -7181,6 +7276,63 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
         });
         next_partial += 1;
     }
+    // The exclusion constraints this arbiter consults, each parsed once.
+    let exclusion_arbiters = arena
+        .alloc_slice_with(def.n_exclusions, |_| None::<ExclusionArbiter<'_, 'a>>)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (position, (slot, exclusion)) in exclusion_arbiters
+        .iter_mut()
+        .zip(def.exclusions())
+        .enumerate()
+    {
+        let consulted = match arbiter {
+            Arbiter::Any => !exclusion.timing.is_deferrable(),
+            Arbiter::Exclusion(selected) => *selected == position,
+            Arbiter::Keys { .. } => false,
+        };
+        if !consulted {
+            continue;
+        }
+        let predicate = match &exclusion.predicate {
+            Some(text) => Some(crate::sql::parser::parse_expr(
+                arena
+                    .alloc_str(text.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?,
+                arena,
+            )?),
+            None => None,
+        };
+        let scan = constraints::ExclusionScan::new(exclusion, arena)?;
+        let member = predicate.map_or(Ok(true), |predicate| {
+            constraints::index_predicate_matches(storage, txid, def, values, predicate, arena)
+        })?;
+        let keys = scan.keys(storage, txid, def, values, arena)?;
+        // A row outside the predicate or with a NULL element meets nothing.
+        if member && !keys[..exclusion.len()].iter().any(Datum::is_null) {
+            *slot = Some(ExclusionArbiter {
+                scan,
+                predicate,
+                keys,
+            });
+        }
+    }
+    let exclusion_arbiters = &*exclusion_arbiters;
+    let exclusion_hit = |other: &[Datum<'_>]| -> Result<bool, SqlError> {
+        for arbiter in exclusion_arbiters.iter().flatten() {
+            if let Some(predicate) = arbiter.predicate
+                && !constraints::index_predicate_matches(
+                    storage, txid, def, other, predicate, arena,
+                )?
+            {
+                continue;
+            }
+            let other_keys = arbiter.scan.keys(storage, txid, def, other, arena)?;
+            if arbiter.scan.conflicts(&arbiter.keys, &other_keys, arena)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let mut found = None;
     let read = storage.validation_read();
     read.for_each_row_state(
@@ -7290,8 +7442,12 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                                 )
                             }
                         }
+                        Arbiter::Exclusion(_) => exclusion_hit(&other),
                         // No target (DO NOTHING): any unique violation is a conflict.
                         Arbiter::Any => {
+                            if exclusion_hit(&other)? {
+                                return Ok(true);
+                            }
                             for (i, c) in def.columns().iter().enumerate() {
                                 if c.unique && key_hit(&[i as u16], false)? {
                                     return Ok(true);
@@ -65876,6 +66032,30 @@ fn rewrite_table_owned_column_references(
         )?;
     }
     for exclusion in renamed.exclusions.iter_mut().take(renamed.n_exclusions) {
+        *exclusion = exclusion.map_elements(|element| {
+            Ok(match element {
+                crate::storage::ExclusionElement::Column(column) => {
+                    crate::storage::ExclusionElement::Column(column)
+                }
+                crate::storage::ExclusionElement::Expression(text) => {
+                    let rewritten: crate::util::StackStr<
+                        { crate::storage::EXCLUSION_EXPRESSIONS_MAX },
+                    > = rewrite_table_column_reference(
+                        text,
+                        &current,
+                        &target_shape,
+                        rename,
+                        catalog,
+                        arena,
+                    )?;
+                    crate::storage::ExclusionElement::Expression(
+                        arena
+                            .alloc_str(rewritten.as_str())
+                            .map_err(|_| crate::sql::eval::arena_full())?,
+                    )
+                }
+            })
+        })?;
         if let Some(predicate) = exclusion.predicate {
             exclusion.predicate = Some(rewrite_table_column_reference(
                 predicate.as_str(),
@@ -90123,6 +90303,117 @@ fn rename_stored_constraint(def: &mut TableDefBuilder, from: &str, to: SqlName) 
     false
 }
 
+/// The columns an exclusion constraint's expression elements and predicate
+/// reference.
+pub(super) fn exclusion_text_references<Definition0: crate::storage::DefinitionBacking>(
+    exclusion: &crate::storage::ExclusionConstraint,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let mut referenced = ColumnSet::EMPTY;
+    let texts = exclusion
+        .elements()
+        .filter_map(|element| match element {
+            crate::storage::ExclusionElement::Expression(text) => Some(text),
+            crate::storage::ExclusionElement::Column(_) => None,
+        })
+        .chain(exclusion.predicate.as_ref().map(|text| text.as_str()));
+    for text in texts {
+        let source = arena
+            .alloc_str(text)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let expression = crate::sql::parser::parse_expr(source, arena)?;
+        referenced |= check_referenced_columns(expression, definition)?;
+    }
+    Ok(referenced)
+}
+
+/// PostgreSQL's `findDependentObjects` for a dropped column that an exclusion
+/// constraint's expression element or predicate reads: the constraint is not
+/// an automatic dependent of that column (unlike one of its column elements),
+/// so RESTRICT fails and CASCADE reports it. `drop_column_constraints` then
+/// removes it.
+fn exclusion_column_dependents(
+    storage: &Storage,
+    txid: u32,
+    definition: &TableDefBuilder,
+    column: usize,
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    let visible = storage.path().entries().iter().any(|entry| match entry {
+        crate::storage::PathEntry::Schema(slot) => {
+            storage.schema_def_for(*slot as usize, txid).name == definition.schema
+        }
+        _ => false,
+    });
+    let mut table = crate::util::StackStr::<160>::new();
+    if !visible {
+        let _ = write!(table, "{}.", definition.schema.as_str());
+    }
+    let _ = write!(table, "{}", definition.name.as_str());
+    let column_name = definition.columns()[column].name;
+    let mut detail =
+        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut count = 0usize;
+    for exclusion in definition.exclusions() {
+        if exclusion
+            .element_columns()
+            .any(|key| usize::from(key) == column)
+            || !exclusion_text_references(exclusion, definition, arena)?.contains(column)
+        {
+            continue;
+        }
+        if count != 0 {
+            let _ = detail.write_char('\n');
+        }
+        if cascade {
+            let _ = write!(
+                detail,
+                "drop cascades to constraint {} on table {}",
+                exclusion.name.as_str(),
+                table.as_str()
+            );
+        } else {
+            let _ = write!(
+                detail,
+                "constraint {} on table {} depends on column {} of table {}",
+                exclusion.name.as_str(),
+                table.as_str(),
+                column_name.as_str(),
+                table.as_str()
+            );
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    if detail.is_truncated() || table.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "exclusion constraint dependency report exceeds its fixed buffer"
+        ));
+    }
+    if cascade {
+        return dependency_report::send_cascade_lines(responder, detail.as_str(), count);
+    }
+    crate::sql::eval::stash_diagnostic(
+        Some(detail),
+        Some(crate::util::StackStr::from_str(
+            "Use DROP ... CASCADE to drop the dependent objects too.",
+        )),
+    );
+    Err(sql_err!(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        "cannot drop column {} of table {} because other objects depend on it",
+        column_name.as_str(),
+        definition.name.as_str()
+    ))
+}
+
 fn drop_column_constraints(
     definition: &mut TableDefBuilder,
     column: usize,
@@ -90174,17 +90465,24 @@ fn drop_column_constraints(
 
     write = 0;
     for read in 0..definition.n_exclusions {
-        let mut exclusion = definition.exclusions[read];
-        if exclusion.columns().contains(&(column as u16)) {
+        let exclusion = definition.exclusions[read];
+        // A column element goes with its column; an expression or predicate
+        // reference reaches here only after the caller's CASCADE check.
+        if exclusion
+            .element_columns()
+            .any(|key| usize::from(key) == column)
+            || exclusion_text_references(&exclusion, definition, arena)?.contains(column)
+        {
             remember(exclusion.name)?;
             continue;
         }
-        for key_column in &mut exclusion.columns[..exclusion.n_cols] {
-            if usize::from(*key_column) > column {
-                *key_column -= 1;
-            }
-        }
-        definition.exclusions[write] = exclusion;
+        definition.exclusions[write] = exclusion.map_columns(|key| {
+            Ok(if usize::from(key) > column {
+                key - 1
+            } else {
+                key
+            })
+        })?;
         write += 1;
     }
     definition.n_exclusions = write;
@@ -90243,14 +90541,17 @@ fn drop_column_constraints(
 /// writes. Comparison errors must stop the rewrite before it is journaled.
 /// PostgreSQL's index-build error when two rewritten rows `a` and `b`
 /// conflict under a unique key or exclusion constraint of `new_def`.
-fn rewritten_key_conflict<Definition0: crate::storage::DefinitionBacking>(
+#[allow(clippy::too_many_arguments)]
+fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     transaction: u32,
+    table_index: usize,
     new_def: &crate::storage::TableDefinition<Definition0>,
     expressions: &ParsedChecks,
-    a: &[Datum],
-    b: &[Datum],
-    arena: &Arena,
+    exclusion_scans: &[constraints::ExclusionScan<'_, 'a>],
+    a: &[Datum<'a>],
+    b: &[Datum<'a>],
+    arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let matches_key = |columns: &[u16], nulls_not_distinct: bool| -> Result<bool, SqlError> {
         if columns.len() > crate::storage::MAX_INDEX_COLS {
@@ -90314,7 +90615,7 @@ fn rewritten_key_conflict<Definition0: crate::storage::DefinitionBacking>(
         catalog: Some(&catalog),
         ..super::eval::NO_HOOKS
     };
-    for (index, exclusion) in new_def.exclusions().iter().enumerate() {
+    for index in 0..new_def.exclusions().len() {
         if let Some(predicate) = expressions[crate::storage::MAX_CHECKS + index] {
             let left = RowCtx {
                 table_oid: None,
@@ -90338,24 +90639,28 @@ fn rewritten_key_conflict<Definition0: crate::storage::DefinitionBacking>(
                 continue;
             }
         }
-        let mut conflict = true;
-        for position in 0..exclusion.n_cols {
-            let column = exclusion.columns[position] as usize;
-            if a[column].is_null() || b[column].is_null() {
-                conflict = false;
-                break;
+        let scan = &exclusion_scans[index];
+        let mark = arena.mark();
+        let result = (|| {
+            let left = scan.keys(storage, transaction, new_def, a, arena)?;
+            let right = scan.keys(storage, transaction, new_def, b, arena)?;
+            if scan.conflicts(&left, &right, arena)? {
+                return Err(constraints::index_build_exclusion_violation(
+                    scan,
+                    storage,
+                    transaction,
+                    table_index,
+                    new_def,
+                    &right,
+                    &left,
+                    arena,
+                ));
             }
-            let operator = exclusion.operators[position].binary();
-            if !super::eval::exclusion_operator(operator, a[column], b[column], arena)? {
-                conflict = false;
-                break;
-            }
-        }
-        if conflict {
-            return Err(constraints::index_build_exclusion_violation(
-                new_def, exclusion, b, a,
-            ));
-        }
+            Ok(())
+        })();
+        // SAFETY: both rows' keys are consumed; only an owned error escapes.
+        unsafe { arena.rewind_to(mark) };
+        result?;
     }
     Ok(())
 }
@@ -91186,13 +91491,12 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.n_fkeys += 1;
     }
     for constraint in parent.exclusions() {
-        let columns = remap_columns(child, parent, constraint.columns())?;
-        if child.exclusions().iter().any(|existing| {
-            existing.columns() == &columns[..constraint.n_cols]
-                && existing.operators[..existing.n_cols]
-                    == constraint.operators[..constraint.n_cols]
-                && existing.predicate == constraint.predicate
-        }) {
+        let mut inherited = remap_exclusion(child, parent, constraint)?;
+        if child
+            .exclusions()
+            .iter()
+            .any(|existing| same_exclusion_body(existing, &inherited))
+        {
             continue;
         }
         if child.n_exclusions == crate::storage::MAX_EXCLUSIONS {
@@ -91201,18 +91505,15 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 "too many exclusion constraints"
             ));
         }
-        let mut inherited = *constraint;
         inherited.identity = None;
         inherited.index_identity = None;
-        inherited.columns = columns;
-        inherited.name = auto_key_name(
+        inherited.name = ddl::auto_exclusion_name(
             storage,
             child,
-            &columns[..constraint.n_cols],
-            "excl",
+            &inherited,
             transaction,
             Some(child_slot),
-            crate::storage::GeneratedNameClass::IndexConstraint,
+            arena,
         )?;
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
@@ -91300,9 +91601,20 @@ fn same_exclusion_body(
     left: &crate::storage::ExclusionConstraint,
     right: &crate::storage::ExclusionConstraint,
 ) -> bool {
-    left.columns() == right.columns()
-        && left.operators[..left.n_cols] == right.operators[..right.n_cols]
-        && left.predicate == right.predicate
+    left.same_elements(right) && left.predicate == right.predicate
+}
+
+/// `constraint` of `source` over `target`'s columns: column elements follow
+/// their names, and expressions, which name their columns, are kept.
+fn remap_exclusion<
+    Definition0: crate::storage::DefinitionBacking,
+    Definition1: crate::storage::DefinitionBacking,
+>(
+    target: &crate::storage::TableDefinition<Definition0>,
+    source: &crate::storage::TableDefinition<Definition1>,
+    constraint: &crate::storage::ExclusionConstraint,
+) -> Result<crate::storage::ExclusionConstraint, SqlError> {
+    constraint.map_columns(|column| Ok(remap_columns(target, source, &[column])?[0]))
 }
 
 /// Applies removals and name changes from a partitioned parent to one
@@ -91392,8 +91704,7 @@ fn synchronize_inherited_constraint_changes<
         }
     }
     for old in old_parent.exclusions() {
-        let mut inherited = *old;
-        inherited.columns = remap_columns(child, old_parent, old.columns())?;
+        let inherited = remap_exclusion(child, old_parent, old)?;
         if !new_parent
             .exclusions()
             .iter()
@@ -94061,6 +94372,11 @@ fn alter_table_relation(
                         ));
                     }
                 }
+                if let Err(error) = exclusion_column_dependents(
+                    storage, txn.txid, &new_def, i, *cascade, arena, responder,
+                ) {
+                    return sql_fail(error);
+                }
                 if let Some(original_index) = original_index
                     && let Err(error) = apply_column_drop_dependencies(
                         storage,
@@ -95184,6 +95500,20 @@ fn alter_table_relation(
     if let Err(error) = validate_partitioned_unique_keys(&new_def) {
         return sql_fail(error);
     }
+    if retyped_any {
+        for index in 0..new_def.n_exclusions {
+            new_def.exclusions[index] = match crate::sql::exec::ddl::revalidate_exclusion(
+                storage,
+                &new_def,
+                &new_def.exclusions[index],
+                txn.txid,
+                arena,
+            ) {
+                Ok(exclusion) => exclusion,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
     if (generated_changed || added_any)
         && let Err(error) =
             crate::sql::exec::ddl::validate_generated_refs(&new_def, None, storage, txn.txid, arena)
@@ -95518,6 +95848,21 @@ fn alter_table_relation(
     // Cross-row constraints must see the transformed image set rather than the
     // old rows still installed in storage.
     if has_rewrite {
+        // Each exclusion constraint's expression elements are parsed once
+        // for every pair of rewritten rows.
+        let exclusion_scans = match arena
+            .alloc_slice_with(new_def.n_exclusions, |_| constraints::ExclusionScan::EMPTY)
+        {
+            Ok(scans) => scans,
+            Err(_) => return sql_fail(crate::sql::eval::arena_full()),
+        };
+        for (scan, exclusion) in exclusion_scans.iter_mut().zip(new_def.exclusions()) {
+            *scan = match constraints::ExclusionScan::new(exclusion, arena) {
+                Ok(scan) => scan,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        let exclusion_scans = &*exclusion_scans;
         for (a, image) in rewritten_images.iter().enumerate() {
             let abytes = image.as_ref().expect("rewritten input retained");
             let mut avals = [Datum::Null; MAX_COLUMNS];
@@ -95533,8 +95878,10 @@ fn alter_table_relation(
                 if let Err(error) = rewritten_key_conflict(
                     storage,
                     txn.txid,
+                    table_index,
                     &new_def,
                     &checks,
+                    exclusion_scans,
                     &avals[..new_def.n_columns],
                     &bvals[..new_def.n_columns],
                     arena,
@@ -95962,6 +96309,7 @@ fn alter_table_relation(
                     .expect("a descendant has a direct partition parent");
                 let direct_parent =
                     (*storage.table_def(usize::from(direct_parent.parent), txn.txid)).clone();
+                let mut gained_constraints = false;
                 for action in statement.actions {
                     match action {
                         AlterAction::AddConstraint(_) => {
@@ -95987,6 +96335,7 @@ fn alter_table_relation(
                                 dependent.n_checks,
                                 dependent.n_uniques,
                                 dependent.n_fkeys,
+                                dependent.n_exclusions,
                                 column_flags(crate::storage::RelationDefinition::from_definition(
                                     &dependent,
                                 )),
@@ -96002,17 +96351,20 @@ fn alter_table_relation(
                             ) {
                                 return sql_fail(error);
                             }
-                            changed |= before
+                            let gained = before
                                 != (
                                     dependent.n_checks,
                                     dependent.n_uniques,
                                     dependent.n_fkeys,
+                                    dependent.n_exclusions,
                                     column_flags(
                                         crate::storage::RelationDefinition::from_definition(
                                             &dependent,
                                         ),
                                     ),
                                 );
+                            changed |= gained;
+                            gained_constraints |= gained;
                         }
                         AlterAction::DropConstraint { .. }
                         | AlterAction::RenameConstraint { .. } => {}
@@ -96053,6 +96405,14 @@ fn alter_table_relation(
                     continue;
                 }
                 if let Err(error) = crate::storage::constraint_names::table(&mut dependent) {
+                    return sql_fail(error);
+                }
+                // A partition's existing rows must satisfy the constraints it
+                // gains, as PostgreSQL builds each cloned index.
+                if gained_constraints
+                    && let Err(error) =
+                        validate_all_rows(storage, descendant, &dependent, txn.txid, arena, false)
+                {
                     return sql_fail(error);
                 }
                 let mut mapping = [None; MAX_COLUMNS];

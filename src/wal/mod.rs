@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 20;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 21;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1233,7 +1233,13 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         n += 1
             + exclusion.name.as_str().len()
             + 3
-            + exclusion.n_cols * 6
+            + exclusion
+                .elements()
+                .map(|element| match element {
+                    crate::storage::ExclusionElement::Column(_) => 7,
+                    crate::storage::ExclusionElement::Expression(text) => 7 + text.len(),
+                })
+                .sum::<usize>()
             + 2
             + exclusion
                 .predicate
@@ -1553,13 +1559,25 @@ fn append_table_payload<B: DefinitionBacking>(
     for exclusion in def.exclusions() {
         ok &= name_bytes(buffer, exclusion.name.as_str());
         ok &= buffer.append(&[
-            exclusion.n_cols as u8,
+            exclusion.len() as u8,
             exclusion.timing.code(),
             exclusion.method.code(),
         ]);
-        for position in 0..exclusion.n_cols {
-            ok &= buffer.append(&exclusion.columns[position].to_le_bytes());
-            ok &= buffer.append(&exclusion.operators[position].oid().to_le_bytes());
+        // Each element: tag 0 and a column position, or tag 1 and a
+        // length-prefixed canonical expression; then the operator OID.
+        for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+            match element {
+                crate::storage::ExclusionElement::Column(column) => {
+                    ok &= buffer.append(&[0]);
+                    ok &= buffer.append(&column.to_le_bytes());
+                }
+                crate::storage::ExclusionElement::Expression(text) => {
+                    ok &= buffer.append(&[1]);
+                    ok &= buffer.append(&(text.len() as u16).to_le_bytes());
+                    ok &= buffer.append(text.as_bytes());
+                }
+            }
+            ok &= buffer.append(&operator.oid().to_le_bytes());
         }
         let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
         ok &=
@@ -8737,20 +8755,38 @@ fn decode_op_inner<'a>(
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
                 let meta = payload.get(at..at + 3)?;
                 at += 3;
-                exclusion.n_cols = meta[0] as usize;
-                if exclusion.n_cols == 0 || exclusion.n_cols > MAX_INDEX_COLS {
+                let n_cols = meta[0] as usize;
+                if n_cols == 0 || n_cols > MAX_INDEX_COLS {
                     return None;
                 }
                 exclusion.timing = crate::storage::ConstraintTiming::from_code(meta[1])?;
                 exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(meta[2])?;
-                for position in 0..exclusion.n_cols {
-                    exclusion.columns[position] =
-                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                    at += 2;
-                    exclusion.operators[position] = crate::storage::ExclusionOperator::from_oid(
+                for _ in 0..n_cols {
+                    let tag = *payload.get(at)?;
+                    at += 1;
+                    let element = match tag {
+                        0 => {
+                            let column =
+                                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                            at += 2;
+                            crate::storage::ExclusionElement::Column(column)
+                        }
+                        1 => {
+                            let len = usize::from(u16::from_le_bytes(
+                                payload.get(at..at + 2)?.try_into().ok()?,
+                            ));
+                            at += 2;
+                            let text = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
+                            at += len;
+                            crate::storage::ExclusionElement::Expression(text)
+                        }
+                        _ => return None,
+                    };
+                    let operator = crate::storage::ExclusionOperator::from_oid(
                         i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
                     )?;
                     at += 4;
+                    exclusion.push(element, operator).ok()?;
                 }
                 let predicate_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
@@ -15677,9 +15713,18 @@ mod tests {
         def.n_fkeys = 1;
         let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
         exclusion.name = SqlName::parse("t_id_excl").unwrap();
-        exclusion.columns[0] = 0;
-        exclusion.operators[0] = crate::storage::ExclusionOperator::from_oid(3897).unwrap();
-        exclusion.n_cols = 1;
+        exclusion
+            .push(
+                crate::storage::ExclusionElement::Column(0),
+                crate::storage::ExclusionOperator::from_oid(3897).unwrap(),
+            )
+            .unwrap();
+        exclusion
+            .push(
+                crate::storage::ExclusionElement::Expression("int4range(id, id + 1, '[]')"),
+                crate::storage::ExclusionOperator::from_oid(3888).unwrap(),
+            )
+            .unwrap();
         exclusion.predicate = Some(crate::util::StackStr::from_str("id > 0"));
         exclusion.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
         def.exclusions[0] = exclusion;
@@ -15772,6 +15817,11 @@ mod tests {
                 decoded.exclusions[0].identity,
                 definition.exclusions[0].identity
             );
+            assert!(
+                decoded.exclusions[0]
+                    .elements()
+                    .eq(definition.exclusions[0].elements())
+            );
             assert_eq!(
                 decoded.column_constraint_identity(0),
                 definition.column_constraint_identity(0)
@@ -15779,6 +15829,41 @@ mod tests {
         });
         assert!(pool.lease::<u8>(bytes).is_ok());
         assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn table_payload_rejects_unknown_and_overlong_exclusion_elements() {
+        let definition = sample_def();
+        let operation = WalOp::CreateTable {
+            identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+            definition: (&definition).into(),
+        };
+        let mut budget = Budget::new(encoded_payload_len(&operation));
+        let mut buffer = FixedBuf::new(
+            &mut budget,
+            "table payload",
+            encoded_payload_len(&operation),
+        )
+        .unwrap();
+        assert!(append_payload(&mut buffer, &operation));
+        let payload = buffer.readable().to_vec();
+        assert!(decode_table_payload(&payload).is_some());
+        let expression = b"int4range(id, id + 1, '[]')";
+        let at = payload
+            .windows(expression.len())
+            .position(|window| window == expression)
+            .unwrap();
+        // The element's tag precedes its two-byte length.
+        assert_eq!(payload[at - 3], 1);
+        let mut unknown_tag = payload.clone();
+        unknown_tag[at - 3] = 2;
+        assert!(decode_table_payload(&unknown_tag).is_none());
+        let mut overlong = payload.clone();
+        overlong[at - 2..at].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(decode_table_payload(&overlong).is_none());
+        let mut invalid_text = payload;
+        invalid_text[at] = 0xff;
+        assert!(decode_table_payload(&invalid_text).is_none());
     }
 
     fn collect_replay(wal: &mut Wal) -> Vec<String> {
@@ -16174,8 +16259,15 @@ mod tests {
         );
         assert_eq!(restored.n_exclusions, 1);
         assert_eq!(
+            restored.exclusions[0].elements().collect::<Vec<_>>(),
+            [
+                crate::storage::ExclusionElement::Column(0),
+                crate::storage::ExclusionElement::Expression("int4range(id, id + 1, '[]')"),
+            ]
+        );
+        assert_eq!(
             (
-                restored.exclusions[0].operators[0],
+                restored.exclusions[0].operators()[0],
                 restored.exclusions[0].timing,
                 restored.exclusions[0]
                     .predicate

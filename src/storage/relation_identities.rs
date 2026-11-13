@@ -401,7 +401,30 @@ impl Storage {
                                 "restored exclusion index has no identity"
                             )
                         })?;
-                        if !backing(identity, Some(key.name), key.columns(), false) {
+                        let backed = indexes.iter().any(|index| {
+                            index.database == database.oid
+                                && index.ddl_state != super::CatalogDdlState::Absent
+                                && index.relation == super::IndexRelationSource::Table
+                                && index.created_at == identity.created_at()
+                                && index.schema == definition.schema
+                                && index.table == definition.name
+                                && index.name == key.name
+                                && !index.unique
+                                && index.n_cols == key.len()
+                                && key.elements().enumerate().all(|(position, element)| {
+                                    match element {
+                                        super::ExclusionElement::Column(column) => {
+                                            index.expressions[position].is_none()
+                                                && index.columns[position] == column
+                                        }
+                                        super::ExclusionElement::Expression(text) => index
+                                            .expressions[position]
+                                            .as_ref()
+                                            .is_some_and(|stored| stored.as_str() == text),
+                                    }
+                                })
+                        });
+                        if !backed {
                             check(identity.created_at())?;
                         }
                     }

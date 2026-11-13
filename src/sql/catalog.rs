@@ -9574,11 +9574,18 @@ fn parent_constraint<Definition: crate::storage::DefinitionBacking>(
         let child_exclusion = child
             .exclusions()
             .iter()
-            .find(|exclusion| exclusion.columns() == child_columns)?;
+            .find(|exclusion| exclusion.name.as_str() == index.name.as_str())?;
+        // Column elements match by name; expressions name their columns.
+        let child_columns_in_parent = child_exclusion
+            .map_columns(|column| {
+                parent
+                    .column_index(child.columns()[usize::from(column)].name.as_str())
+                    .map(|column| column as u16)
+                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column is absent"))
+            })
+            .ok()?;
         for exclusion in parent.exclusions() {
-            if exclusion.columns() == columns
-                && exclusion.operators[..exclusion.n_cols]
-                    == child_exclusion.operators[..child_exclusion.n_cols]
+            if exclusion.same_elements(&child_columns_in_parent)
                 && exclusion.predicate == child_exclusion.predicate
             {
                 return Some((
@@ -9812,13 +9819,25 @@ fn visit_indexes(
             {
                 continue;
             }
+            // An expression element is attribute 0 of the key, its source
+            // read back through `index_expression_source`.
+            let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+            let mut expression_keys = [false; crate::storage::MAX_INDEX_COLS];
+            for (position, element) in exclusion.elements().enumerate() {
+                match element {
+                    crate::storage::ExclusionElement::Column(column) => columns[position] = column,
+                    crate::storage::ExclusionElement::Expression(_) => {
+                        expression_keys[position] = true;
+                    }
+                }
+            }
             visit(mk(
                 exclusion
                     .index_identity
                     .expect("admitted exclusion index has an identity")
                     .oid(),
-                exclusion.columns(),
-                [false; crate::storage::MAX_INDEX_COLS],
+                &columns[..exclusion.len()],
+                expression_keys,
                 &[],
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
@@ -10160,7 +10179,24 @@ fn index_expression_source(
     if !info.expression_keys[position] {
         return None;
     }
-    info_index(storage, info, txid)?.expressions[position]
+    if let Some(index) = info_index(storage, info, txid) {
+        return index.expressions[position];
+    }
+    // A constraint-created exclusion index keeps its keys on the constraint.
+    let table = storage.table_def(info.table_slot, txid);
+    let exclusion = info
+        .is_exclusion
+        .then(|| {
+            table
+                .exclusions()
+                .iter()
+                .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
+        })
+        .flatten()?;
+    match exclusion.element(position) {
+        crate::storage::ExclusionElement::Expression(text) => Some(StackStr::from_str(text)),
+        crate::storage::ExclusionElement::Column(_) => None,
+    }
 }
 
 fn info_index(storage: &Storage, info: &IdxInfo, txid: u32) -> Option<crate::storage::IndexDef> {
@@ -10420,6 +10456,12 @@ pub(crate) fn reindex_candidates<'a>(
             .index_slot(table.schema.as_str(), index.name.as_str(), txid)
             .and_then(|slot| storage.index_visible_to(slot, txid))
             .filter(|definition| explicit_index_oid(definition) == index.oid);
+        // A constraint-created exclusion index keeps its expression keys on
+        // the constraint; the replacement index carries them itself.
+        let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, expression) in expressions.iter_mut().enumerate().take(index.n_cols) {
+            *expression = index_expression_source(storage, &index, position, txid);
+        }
         let definition = explicit.unwrap_or_else(|| crate::storage::IndexDef {
             database: storage.current_database_oid(),
             created_at: table
@@ -10437,6 +10479,7 @@ pub(crate) fn reindex_candidates<'a>(
             },
             method: index.method,
             columns: index.columns,
+            expressions,
             include_columns: index.include_columns,
             collations: index.collations,
             explicit_collations: index.explicit_collations,
@@ -15686,21 +15729,52 @@ pub fn constraint_def_text<'a>(
                 .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                 .expect("exclusion index has its constraint");
             let _ = write!(rendered, "EXCLUDE USING {} (", exclusion.method.name());
-            for position in 0..exclusion.n_cols {
+            for (position, (element, operator)) in
+                exclusion.elements().zip(exclusion.operators()).enumerate()
+            {
                 if position != 0 {
                     let _ = rendered.write_str(", ");
                 }
-                write_identifier(
-                    &mut rendered,
-                    table.columns()[exclusion.columns[position] as usize]
-                        .name
-                        .as_str(),
-                );
-                let _ = write!(rendered, " WITH {}", exclusion.operators[position].sql());
+                match element {
+                    crate::storage::ExclusionElement::Column(column) => write_identifier(
+                        &mut rendered,
+                        table.columns()[usize::from(column)].name.as_str(),
+                    ),
+                    crate::storage::ExclusionElement::Expression(text) => {
+                        let source = arena.alloc_str(text).map_err(|_| arena_full())?;
+                        let expression = super::parser::parse_expr(source, arena)?;
+                        let _ = rendered.write_str(index_expression_display(
+                            storage, txid, &table, expression, source, pretty, arena,
+                        )?);
+                    }
+                }
+                let _ = write!(rendered, " WITH {}", operator.sql());
             }
             let _ = rendered.write_str(")");
             if let Some(predicate) = &exclusion.predicate {
-                let _ = write!(rendered, " WHERE ({})", predicate.as_str());
+                let source = arena
+                    .alloc_str(predicate.as_str())
+                    .map_err(|_| arena_full())?;
+                let expression = super::parser::parse_expr(source, arena)?;
+                let deparsed = deparse::deparse_expression(
+                    &deparse::Context {
+                        storage,
+                        txid,
+                        arena,
+                        dependencies: None,
+                        table: Some(&table),
+                        parameters: &[],
+                        joined: &[],
+                        pretty,
+                        qualify: false,
+                        domain_value: None,
+                        bare: None,
+                    },
+                    expression,
+                    deparse::Destination::Condition,
+                    arena,
+                )?;
+                let _ = write!(rendered, " WHERE ({})", deparsed.unwrap_or(source));
             }
             append_constraint_attributes(
                 &mut rendered,
@@ -20551,11 +20625,7 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?,  // confupdtype (n/a for non-FK)
                 text(" ", arena)?,  // confdeltype
-                attnum_array(
-                    &info.columns[..info.n_cols],
-                    &storage.table_def(info.table_slot, txid),
-                    arena,
-                )?,
+                key_attnum_array(info, &storage.table_def(info.table_slot, txid), arena)?,
                 Datum::Null,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
@@ -20579,7 +20649,7 @@ fn pg_constraint_values<'a>(
                         .iter()
                         .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                         .expect("exclusion index has its constraint");
-                    exclusion_operator_array(&exclusion.operators[..exclusion.n_cols], arena)?
+                    exclusion_operator_array(exclusion.operators(), arena)?
                 } else {
                     Datum::Null
                 },
@@ -21570,6 +21640,27 @@ fn attnum_array<'a, Definition0: crate::storage::DefinitionBacking>(
             Datum::Int4(i32::from(
                 table.attribute_number(usize::from(columns[index])),
             ))
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(vals, arena)?,
+    })
+}
+
+/// An index constraint's `conkey`: attribute 0 for an expression key.
+fn key_attnum_array<'a>(
+    info: &IdxInfo,
+    table: &crate::storage::TableDef,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let vals = arena
+        .alloc_slice_with(info.n_cols, |index| {
+            Datum::Int4(if info.expression_keys[index] {
+                0
+            } else {
+                i32::from(table.attribute_number(usize::from(info.columns[index])))
+            })
         })
         .map_err(|_| arena_full())?;
     Ok(Datum::Array {

@@ -457,23 +457,33 @@ index keys and predicates are bound to the routines, operators, types and
 collations they named when written (see
 [stored expressions](docs/architecture.md#stored-expressions)): a later
 search path, rename or schema move changes nothing, and dropping a named
-object reports and cascades to them. Exclusion predicates, statistics
-expressions, trigger `WHEN` conditions and domain constraints still keep
-routine and type names as SQL text, so renaming or moving a routine or type
-one of them names fails with `0A000`, as does renaming an enum value any
-stored expression casts to; binding them follows the same dependency-list
-pattern. Renaming an enum value that a cast literal in a SQL-standard routine
+object reports and cascades to them. Exclusion constraint elements and
+predicates keep names as SQL text, so one that names a user-defined function,
+operator or type fails with `0A000`. Statistics expressions, trigger `WHEN`
+conditions and domain constraints also keep routine and type names as SQL
+text, so renaming or moving a routine or type one of them names fails with
+`0A000`, as does renaming an enum value any stored expression casts to;
+binding them follows the same dependency-list pattern. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`.
-An exclusion constraint element must be a column: an expression
-(`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
-the stored constraint keeps no element expressions. Supporting them needs
-per-element expression text in the constraint's journal and checkpoint
-records, element evaluation in the conflict scan, `indkey` 0 and `indexprs`
-in `pg_index`, and handling of every path that copies or renumbers
-exclusion columns (`LIKE`, inheritance, partition attach, `DROP COLUMN`,
-column renames). A deferred unique or exclusion check that fails at commit runs before
+An exclusion constraint element may be a column, a function call or a
+parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
+Its elements' expressions together hold at most 256 bytes of stored text;
+more fails with `54000`. An element may name the default operator class of
+its type (`range_ops`); another operator class or a `COLLATE` on a
+collatable element fails with `0A000`. `ALTER COLUMN ... TYPE` keeps the
+OIDs of the key and exclusion indexes over the column, where PostgreSQL
+rebuilds them with new OIDs, so after it a row that violates two
+constraints can report the other one first. `DROP COLUMN` of a column an
+exclusion expression or predicate reads lists those constraints in their own
+`2BP01` report, separately from views, policies and routines that also depend
+on the column, and reports `cannot drop column ...` where PostgreSQL, when
+inheritance children drop the column too, reports `cannot drop desired
+object(s) ...`. `ON CONFLICT DO NOTHING` without a target refuses a table
+with a deferrable unique or exclusion constraint with `55000` even for a row
+an earlier arbiter would skip, and an inference target with an index
+predicate (`ON CONFLICT (a) WHERE a > 0`) fails with `42601`. A deferred unique or exclusion check that fails at commit runs before
 or after the row's deferred constraint triggers by a separate queue, where
 PostgreSQL fires it among them in trigger-name order
 (`PK_ConstraintTrigger`, `Unique_ConstraintTrigger`), so a deferred trigger's

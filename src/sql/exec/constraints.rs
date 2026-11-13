@@ -569,49 +569,156 @@ fn duplicate_key_error<'v>(
     }
 }
 
-/// Stashes PostgreSQL's DETAIL and constraint fields for a conflict between
-/// `values` and `other` under `exclusion`.
-fn stash_exclusion_conflict(
-    duplicate: DuplicateKey,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    exclusion: &crate::storage::ExclusionConstraint,
-    values: &[Datum],
-    other: &[Datum],
-) -> Result<(), SqlError> {
-    let names = || {
-        exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| def.columns()[*column as usize].name.as_str())
+/// An exclusion constraint's elements prepared for one scan: each expression
+/// element is parsed once into the arena and evaluated per row.
+#[derive(Clone, Copy)]
+pub(crate) struct ExclusionScan<'e, 'a> {
+    exclusion: &'e crate::storage::ExclusionConstraint,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
+    sources: [Option<&'a str>; crate::storage::MAX_INDEX_COLS],
+}
+
+/// One row's element values under an exclusion constraint.
+pub(crate) type ExclusionKeys<'a> = [Datum<'a>; crate::storage::MAX_INDEX_COLS];
+
+impl<'e, 'a> ExclusionScan<'e, 'a> {
+    /// A placeholder with no elements, for filling fixed storage.
+    pub(crate) const EMPTY: Self = Self {
+        exclusion: &crate::storage::ExclusionConstraint::EMPTY,
+        columns: [0; crate::storage::MAX_INDEX_COLS],
+        expressions: [None; crate::storage::MAX_INDEX_COLS],
+        sources: [None; crate::storage::MAX_INDEX_COLS],
     };
-    let mut existing_text = DetailText::new();
-    write_key_description(
-        &mut existing_text,
-        "key",
-        &mut names(),
-        &mut exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| other[*column as usize]),
-    );
-    let existing = match duplicate {
-        DuplicateKey::Write => "existing ",
-        DuplicateKey::IndexBuild => "",
-    };
-    let detail = key_detail(
-        &mut names(),
-        &mut exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| values[*column as usize]),
-        format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
-    )?;
-    crate::sql::eval::stash_object_diagnostic(
-        Some(detail.as_str()),
-        crate::sql::eval::ErrorObjects::table_constraint(
-            def.schema.as_str(),
-            def.name.as_str(),
-            exclusion.name.as_str(),
-        ),
-    );
-    Ok(())
+
+    pub(crate) fn new(
+        exclusion: &'e crate::storage::ExclusionConstraint,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let mut scan = Self {
+            exclusion,
+            columns: [0; crate::storage::MAX_INDEX_COLS],
+            expressions: [None; crate::storage::MAX_INDEX_COLS],
+            sources: [None; crate::storage::MAX_INDEX_COLS],
+        };
+        for (position, element) in exclusion.elements().enumerate() {
+            match element {
+                crate::storage::ExclusionElement::Column(column) => scan.columns[position] = column,
+                crate::storage::ExclusionElement::Expression(text) => {
+                    let source = arena
+                        .alloc_str(text)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    scan.sources[position] = Some(source);
+                    scan.expressions[position] =
+                        Some(crate::sql::parser::parse_expr(source, arena)?);
+                }
+            }
+        }
+        Ok(scan)
+    }
+
+    /// `row`'s element values, in the order `def` lays out its columns.
+    pub(crate) fn keys(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+        row: &[Datum<'a>],
+        arena: &'a Arena,
+    ) -> Result<ExclusionKeys<'a>, SqlError> {
+        let n = self.exclusion.len();
+        index_key_values(
+            storage,
+            txid,
+            def,
+            row,
+            &self.columns[..n],
+            &self.expressions[..n],
+            arena,
+        )
+    }
+
+    /// Whether two rows' elements all conflict; a NULL element never does.
+    pub(crate) fn conflicts(
+        &self,
+        left: &ExclusionKeys<'_>,
+        right: &ExclusionKeys<'_>,
+        arena: &Arena,
+    ) -> Result<bool, SqlError> {
+        for (position, operator) in self.exclusion.operators().iter().enumerate() {
+            if left[position].is_null() || right[position].is_null() {
+                return Ok(false);
+            }
+            if !crate::sql::eval::exclusion_operator(
+                operator.binary(),
+                left[position],
+                right[position],
+                arena,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Stashes PostgreSQL's DETAIL and constraint fields for a conflict
+    /// between `values` and `other`. An expression element is described as
+    /// `pg_get_indexdef_columns` prints it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stash_conflict(
+        &self,
+        duplicate: DuplicateKey,
+        storage: &Storage,
+        txid: u32,
+        table_index: usize,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+        values: &ExclusionKeys<'_>,
+        other: &ExclusionKeys<'_>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        let n = self.exclusion.len();
+        let mut names = [""; crate::storage::MAX_INDEX_COLS];
+        for (position, name) in names.iter_mut().enumerate().take(n) {
+            *name = match (self.expressions[position], self.sources[position]) {
+                (Some(expression), Some(source)) => crate::sql::catalog::index_key_display(
+                    storage,
+                    txid,
+                    table_index,
+                    expression,
+                    source,
+                    arena,
+                )?,
+                _ => def.columns()[usize::from(self.columns[position])]
+                    .name
+                    .as_str(),
+            };
+        }
+        let mut existing_text = DetailText::new();
+        write_key_description(
+            &mut existing_text,
+            "key",
+            &mut names[..n].iter().copied(),
+            &mut other[..n].iter().copied(),
+        );
+        let existing = match duplicate {
+            DuplicateKey::Write => "existing ",
+            DuplicateKey::IndexBuild => "",
+        };
+        let detail = key_detail(
+            &mut names[..n].iter().copied(),
+            &mut values[..n].iter().copied(),
+            format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
+        )?;
+        crate::sql::eval::stash_object_diagnostic(
+            Some(detail.as_str()),
+            crate::sql::eval::ErrorObjects::table_constraint(
+                def.schema.as_str(),
+                def.name.as_str(),
+                self.exclusion.name.as_str(),
+            ),
+        );
+        Ok(())
+    }
 }
 
 /// The 23P01 error for a conflict with exclusion constraint `name`.
@@ -631,14 +738,28 @@ fn exclusion_violation(duplicate: DuplicateKey, name: SqlName) -> SqlError {
 }
 
 /// The index-build exclusion violation between rows `values` and `other`.
-pub(crate) fn index_build_exclusion_violation(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_build_exclusion_violation<'a>(
+    scan: &ExclusionScan<'_, 'a>,
+    storage: &Storage,
+    txid: u32,
+    table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    exclusion: &crate::storage::ExclusionConstraint,
-    values: &[Datum],
-    other: &[Datum],
+    values: &ExclusionKeys<'_>,
+    other: &ExclusionKeys<'_>,
+    arena: &'a Arena,
 ) -> SqlError {
-    match stash_exclusion_conflict(DuplicateKey::IndexBuild, def, exclusion, values, other) {
-        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, exclusion.name),
+    match scan.stash_conflict(
+        DuplicateKey::IndexBuild,
+        storage,
+        txid,
+        table_index,
+        def,
+        values,
+        other,
+        arena,
+    ) {
+        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, scan.exclusion.name),
         Err(error) => error,
     }
 }
@@ -2728,17 +2849,51 @@ fn check_fk_child(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enforce_exclusion_constraint(
+fn enforce_exclusion_constraint<'a>(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
-    values: &[Datum],
+    values: &[Datum<'a>],
     self_rowid: Option<u64>,
     txid: u32,
     exclusion: &crate::storage::ExclusionConstraint,
     predicate: Option<&Expr>,
-    arena: &Arena,
+    arena: &'a Arena,
+    read: Option<ValidationRead>,
+    duplicate: DuplicateKey,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = enforce_exclusion_constraint_in(
+        storage,
+        table_index,
+        def,
+        values,
+        self_rowid,
+        txid,
+        exclusion,
+        predicate,
+        arena,
+        read,
+        duplicate,
+    );
+    // SAFETY: the parsed elements and every evaluated key are consumed by the
+    // scan; only an owned error with its stashed diagnostic escapes.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_exclusion_constraint_in<'a>(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &[Datum<'a>],
+    self_rowid: Option<u64>,
+    txid: u32,
+    exclusion: &crate::storage::ExclusionConstraint,
+    predicate: Option<&Expr>,
+    arena: &'a Arena,
     read: Option<ValidationRead>,
     duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
@@ -2767,6 +2922,12 @@ fn enforce_exclusion_constraint(
     if !predicate_holds(values)? {
         return Ok(());
     }
+    let scan = ExclusionScan::new(exclusion, arena)?;
+    let keys = scan.keys(storage, txid, def, values, arena)?;
+    // A NULL element conflicts with nothing.
+    if keys[..exclusion.len()].iter().any(Datum::is_null) {
+        return Ok(());
+    }
     let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
         use core::ops::ControlFlow;
         if self_rowid == Some(rowid) {
@@ -2779,6 +2940,7 @@ fn enforce_exclusion_constraint(
         let Some(home) = home else {
             return Ok(ControlFlow::Continue(()));
         };
+        let row_mark = arena.mark();
         let conflicts = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             decoder.decode(bytes, &mut other)?;
@@ -2786,25 +2948,25 @@ fn enforce_exclusion_constraint(
             if !predicate_holds(other)? {
                 return Ok(false);
             }
-            for position in 0..exclusion.n_cols {
-                let column = exclusion.columns[position] as usize;
-                if values[column].is_null() || other[column].is_null() {
-                    return Ok(false);
-                }
-                let operator = exclusion.operators[position].binary();
-                if !crate::sql::eval::exclusion_operator(
-                    operator,
-                    values[column],
-                    other[column],
-                    arena,
-                )? {
-                    return Ok(false);
-                }
+            let other_keys = scan.keys(storage, txid, def, other, arena)?;
+            if !scan.conflicts(&keys, &other_keys, arena)? {
+                return Ok(false);
             }
-            stash_exclusion_conflict(duplicate, def, exclusion, values, other)?;
+            scan.stash_conflict(
+                duplicate,
+                storage,
+                txid,
+                table_index,
+                def,
+                &keys,
+                &other_keys,
+                arena,
+            )?;
             Ok(true)
-        })?;
-        if conflicts {
+        });
+        // SAFETY: the other row's keys and description were consumed above.
+        unsafe { arena.rewind_to(row_mark) };
+        if conflicts? {
             return Err(exclusion_violation(duplicate, exclusion.name));
         }
         Ok(ControlFlow::Continue(()))

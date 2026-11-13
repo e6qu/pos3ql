@@ -1570,7 +1570,7 @@ run_corpus() { # host port outfile file diagnostics
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT extname FROM pg_extension WHERE extname LIKE 'pos3ql_%' ORDER BY extname DESC" |
+    -c "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC" |
   while IFS= read -r extension; do
     [[ -z "$extension" ]] && continue
     extension=${extension//\"/\"\"}

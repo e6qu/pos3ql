@@ -1,7 +1,8 @@
 //! Stored expressions that keep routine and type names as SQL text without a
-//! captured binding (exclusion predicates, statistics expressions, trigger
-//! conditions and domain constraints) would be left unresolvable by renaming
-//! or moving a routine or type they name, so the rename is refused. CHECK
+//! captured binding (exclusion elements and predicates, statistics
+//! expressions, trigger conditions and domain constraints) would be left
+//! unresolvable by renaming or moving a routine or type they name, so the
+//! rename is refused. CHECK
 //! constraints, column defaults and generation expressions, and index keys
 //! and predicates are bound to what they name and refuse only enum label
 //! renames, whose spellings stay text.
@@ -158,14 +159,19 @@ impl Storage {
                         .map(|check| check.expression.as_str()),
                 )
                 .filter(|_| matches!(target, StoredTextName::EnumLabels { .. }));
-            let named =
-                bound
-                    .chain(definition.exclusions().iter().filter_map(|exclusion| {
-                        exclusion.predicate.as_ref().map(|text| text.as_str())
-                    }))
-                    .try_fold(false, |found, text| {
-                        Ok::<_, SqlError>(found || target.named_by(text, arena)?)
-                    })?;
+            let named = bound
+                .chain(definition.exclusions().iter().flat_map(|exclusion| {
+                    exclusion
+                        .elements()
+                        .filter_map(|element| match element {
+                            super::ExclusionElement::Expression(text) => Some(text),
+                            super::ExclusionElement::Column(_) => None,
+                        })
+                        .chain(exclusion.predicate.as_ref().map(|text| text.as_str()))
+                }))
+                .try_fold(false, |found, text| {
+                    Ok::<_, SqlError>(found || target.named_by(text, arena)?)
+                })?;
             if named {
                 return refuse("table", definition.name.as_str());
             }

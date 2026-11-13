@@ -873,6 +873,29 @@ impl Context<'_> {
         }
     }
 
+    /// A function argument: unlike an operator operand, whose cross-type
+    /// operators (`int24pl`, `float48pl`) take it as it is, every coercion
+    /// to the parameter type is printed (`int4range(a, b::integer)` for a
+    /// `smallint` column).
+    fn write_argument(
+        &self,
+        expression: &Expr<'_>,
+        expected: Option<i32>,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        if matches!(expression, Expr::Str(_) | Expr::Null) {
+            return self.literal(expression, expected.unwrap_or(oid::TEXT), output);
+        }
+        match (self.type_of(expression)?, expected) {
+            (Some(natural), Some(expected)) if natural != expected => {
+                self.wrapped(expression, None, Parent::Cast, true, output)?;
+                output.push("::")?;
+                self.type_name(expected, output)
+            }
+            _ => self.write(expression, expected, output),
+        }
+    }
+
     fn open(&self, output: &mut Output<'_>) -> Result<(), SqlError> {
         if self.pretty {
             Ok(())
@@ -1387,6 +1410,35 @@ impl Context<'_> {
                     {
                         self.bare(operand, output)
                     }
+                    // An object identifier cast to a `reg*` type is a constant
+                    // PostgreSQL prints by its object's name, as bound
+                    // expressions store a named object's identifier.
+                    Expr::Int(object)
+                        if ColType::from_oid(target).is_some_and(ColType::is_reg_object) =>
+                    {
+                        let ctype = ColType::from_oid(target).expect("checked above");
+                        let catalog = crate::sql::query::storage_catalog(
+                            self.storage,
+                            output.arena,
+                            self.txid,
+                        );
+                        let Ok(object) = u32::try_from(*object) else {
+                            return output.unsupported();
+                        };
+                        let named = match crate::sql::eval::regobject_cast(
+                            crate::sql::types::Datum::Oid(object),
+                            ctype,
+                            Some(&catalog),
+                            output.arena,
+                        ) {
+                            Ok(value) => output
+                                .arena
+                                .alloc_str_display(value)
+                                .map_err(|_| arena_full())?,
+                            Err(_) => return output.unsupported(),
+                        };
+                        self.constant(named, target, output)
+                    }
                     _ => {
                         self.wrapped(operand, Some(None), Parent::Cast, true, output)?;
                         output.push("::")?;
@@ -1556,7 +1608,7 @@ impl Context<'_> {
                     if index != 0 {
                         output.push(", ")?;
                     }
-                    self.write(argument, Some(parameter_oids[index]), output)?;
+                    self.write_argument(argument, Some(parameter_oids[index]), output)?;
                 }
                 self.call_close(expression, output)
             }
@@ -1618,7 +1670,7 @@ impl Context<'_> {
                     let expected = (crate::storage::PolymorphicType::from_oid(parameter).is_none()
                         && parameter != oid::ANY)
                         .then_some(parameter);
-                    self.write(argument, expected, output)?;
+                    self.write_argument(argument, expected, output)?;
                 }
                 self.call_close(expression, output)
             }

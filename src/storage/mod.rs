@@ -1978,6 +1978,30 @@ impl ExclusionOperator {
     };
 }
 
+/// One element an exclusion constraint compares: a table column, or a
+/// canonical expression over the table's columns (PostgreSQL's `indkey` 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionElement<'a> {
+    Column(u16),
+    Expression(&'a str),
+}
+
+/// Where one element's key lives inside its constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExclusionKey {
+    Column(u16),
+    /// A span of `ExclusionConstraint::expression_text`.
+    Expression {
+        start: u16,
+        len: u16,
+    },
+}
+
+/// Exclusion constraints keep their elements beside each other in one
+/// bounded text so a table definition stays fixed-size; the elements' total
+/// canonical expression text cannot exceed this many bytes.
+pub(crate) const EXCLUSION_EXPRESSIONS_MAX: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ExclusionConstraint {
     pub(crate) identity: Option<ConstraintIdentity>,
@@ -1985,9 +2009,12 @@ pub struct ExclusionConstraint {
     pub name: SqlName,
     /// The index access method that enforces the constraint.
     pub method: crate::sql::ast::IndexAccessMethod,
-    pub columns: [u16; MAX_INDEX_COLS],
-    pub operators: [ExclusionOperator; MAX_INDEX_COLS],
-    pub n_cols: usize,
+    /// Elements are written only through `push`, so a key never names text
+    /// outside `expression_text`.
+    keys: [ExclusionKey; MAX_INDEX_COLS],
+    operators: [ExclusionOperator; MAX_INDEX_COLS],
+    n_cols: usize,
+    expression_text: StackStr<EXCLUSION_EXPRESSIONS_MAX>,
     pub predicate: Option<StackStr<EXCLUSION_PREDICATE_MAX>>,
     pub timing: ConstraintTiming,
 }
@@ -1998,15 +2025,126 @@ impl ExclusionConstraint {
         index_identity: None,
         name: SqlName::EMPTY,
         method: crate::sql::ast::IndexAccessMethod::Gist,
-        columns: [0; MAX_INDEX_COLS],
+        keys: [ExclusionKey::Column(0); MAX_INDEX_COLS],
         operators: [ExclusionOperator::RANGE_EQUAL; MAX_INDEX_COLS],
         n_cols: 0,
+        expression_text: StackStr::new(),
         predicate: None,
         timing: ConstraintTiming::NotDeferrable,
     };
 
-    pub fn columns(&self) -> &[u16] {
-        &self.columns[..self.n_cols]
+    pub const fn len(&self) -> usize {
+        self.n_cols
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.n_cols == 0
+    }
+
+    pub fn element(&self, position: usize) -> ExclusionElement<'_> {
+        match self.keys[..self.n_cols][position] {
+            ExclusionKey::Column(column) => ExclusionElement::Column(column),
+            ExclusionKey::Expression { start, len } => ExclusionElement::Expression(
+                &self.expression_text.as_str()
+                    [usize::from(start)..usize::from(start) + usize::from(len)],
+            ),
+        }
+    }
+
+    pub fn elements(&self) -> impl Iterator<Item = ExclusionElement<'_>> + Clone + '_ {
+        (0..self.n_cols).map(|position| self.element(position))
+    }
+
+    pub fn operators(&self) -> &[ExclusionOperator] {
+        &self.operators[..self.n_cols]
+    }
+
+    /// The table columns that are elements themselves (`conkey` entries
+    /// other than 0).
+    pub fn element_columns(&self) -> impl Iterator<Item = u16> + Clone + '_ {
+        self.elements().filter_map(|element| match element {
+            ExclusionElement::Column(column) => Some(column),
+            ExclusionElement::Expression(_) => None,
+        })
+    }
+
+    /// Whether both constraints compare the same elements with the same
+    /// operators.
+    pub fn same_elements(&self, other: &Self) -> bool {
+        self.operators() == other.operators() && self.elements().eq(other.elements())
+    }
+
+    /// Appends one element. Exhaustion of the element or expression-text
+    /// reservation is `54000`.
+    pub(crate) fn push(
+        &mut self,
+        element: ExclusionElement<'_>,
+        operator: ExclusionOperator,
+    ) -> Result<(), SqlError> {
+        if self.n_cols == MAX_INDEX_COLS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "cannot use more than {} columns in an index",
+                MAX_INDEX_COLS
+            ));
+        }
+        self.keys[self.n_cols] = match element {
+            ExclusionElement::Column(column) => ExclusionKey::Column(column),
+            ExclusionElement::Expression(text) => {
+                let start = self.expression_text.len();
+                if text.is_empty() || start + text.len() > EXCLUSION_EXPRESSIONS_MAX {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "exclusion constraint expressions exceed {} bytes",
+                        EXCLUSION_EXPRESSIONS_MAX
+                    ));
+                }
+                let _ = core::fmt::Write::write_str(&mut self.expression_text, text);
+                ExclusionKey::Expression {
+                    start: start as u16,
+                    len: text.len() as u16,
+                }
+            }
+        };
+        self.operators[self.n_cols] = operator;
+        self.n_cols += 1;
+        Ok(())
+    }
+
+    /// This constraint with no elements yet, for rebuilding them.
+    pub(crate) fn without_elements(&self) -> Self {
+        let mut cleared = *self;
+        cleared.n_cols = 0;
+        cleared.expression_text = StackStr::new();
+        cleared
+    }
+
+    /// Renumbers each column element through `map`; expressions, which
+    /// name their columns, are kept.
+    pub(crate) fn map_columns(
+        &self,
+        mut map: impl FnMut(u16) -> Result<u16, SqlError>,
+    ) -> Result<Self, SqlError> {
+        let mut mapped = *self;
+        for key in &mut mapped.keys[..self.n_cols] {
+            if let ExclusionKey::Column(column) = key {
+                *column = map(*column)?;
+            }
+        }
+        Ok(mapped)
+    }
+
+    /// Rebuilds the elements through `map`, which sees each element and
+    /// returns its replacement; the operators are kept.
+    pub(crate) fn map_elements<'t>(
+        &self,
+        mut map: impl FnMut(ExclusionElement<'_>) -> Result<ExclusionElement<'t>, SqlError>,
+    ) -> Result<Self, SqlError> {
+        let mut mapped = self.without_elements();
+        for position in 0..self.n_cols {
+            mapped.push(map(self.element(position))?, self.operators[position])?;
+        }
+        Ok(mapped)
     }
 }
 
@@ -19327,6 +19465,39 @@ fn rename_table_sql_identity(
             .iter_mut()
             .take(definition.n_exclusions)
         {
+            let mut renamed_elements = false;
+            let mapped = exclusion.map_elements(|element| {
+                Ok(match element {
+                    ExclusionElement::Column(column) => ExclusionElement::Column(column),
+                    ExclusionElement::Expression(text) => {
+                        let mut source = StackStr::<EXCLUSION_EXPRESSIONS_MAX>::from_str(text);
+                        renamed_elements |= rename_schema_qualified_sql(
+                            &mut source,
+                            &mut [],
+                            old,
+                            new,
+                            crate::sql::parser::StoredSqlKind::Expression,
+                            arena,
+                        )?;
+                        if source.is_truncated() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "exclusion constraint expressions exceed {} bytes",
+                                EXCLUSION_EXPRESSIONS_MAX
+                            ));
+                        }
+                        ExclusionElement::Expression(
+                            arena
+                                .alloc_str(source.as_str())
+                                .map_err(|_| crate::sql::eval::arena_full())?,
+                        )
+                    }
+                })
+            })?;
+            if renamed_elements {
+                *exclusion = mapped;
+                changed = true;
+            }
             if let Some(predicate) = &mut exclusion.predicate {
                 changed |= rename_schema_qualified_sql(
                     predicate,

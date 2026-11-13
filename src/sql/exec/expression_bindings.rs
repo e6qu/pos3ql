@@ -76,6 +76,28 @@ impl CapturedDependencies {
     }
 }
 
+/// Refuses `text`, an exclusion constraint element or predicate, when it
+/// names a user-defined routine, operator or type. Exclusion constraints keep
+/// these expressions as plain text with no captured binding, so such an
+/// object could be dropped or replaced under the constraint.
+pub(crate) fn reject_unbound_exclusion_names<B: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<B>,
+    text: &str,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let captured = collect_expression_dependencies(storage, def, text, txid, arena)?;
+    if let Some(dependency) = captured.entries().first() {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "exclusion constraint expressions cannot name user-defined objects such as \"{}\"",
+            dependency.name.as_str()
+        ));
+    }
+    Ok(())
+}
+
 /// Captures the dependencies of `owner`, whose stored text is `text`, under
 /// the current search path.
 pub(crate) fn capture_expression_dependencies(

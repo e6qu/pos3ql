@@ -5514,10 +5514,14 @@ fn relation_identity_recovery_accepts_only_matching_inline_backing_relations() {
     definition.n_exclusions = 1;
     definition.exclusions[0] = ExclusionConstraint {
         name: SqlName::parse("inline_recovery_value_exclusion").unwrap(),
-        columns: [1; MAX_INDEX_COLS],
-        n_cols: 1,
         ..ExclusionConstraint::EMPTY
     };
+    definition.exclusions[0]
+        .push(
+            super::ExclusionElement::Column(1),
+            super::ExclusionOperator::from_oid(3882).unwrap(),
+        )
+        .unwrap();
     let table = storage.create_table(definition).unwrap();
     let definition = storage.table_def(table, 0);
     let backing = IndexDef {

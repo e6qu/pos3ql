@@ -1482,14 +1482,13 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         variable_conflict: parsed.variable_conflict,
                         print_strict_params: parsed.print_strict_params,
                     };
-                    let result =
-                        validate_plpgsql_variable_uses(
-                            &program,
-                            parsed.locals,
-                            false,
-                            &|_| None,
-                            scratch,
-                        );
+                    let result = validate_plpgsql_variable_uses(
+                        &program,
+                        parsed.locals,
+                        false,
+                        &|_| None,
+                        scratch,
+                    );
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),

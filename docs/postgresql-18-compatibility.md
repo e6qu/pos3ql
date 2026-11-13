@@ -331,6 +331,22 @@ Syntax and errors:
   initialized in order each time it is entered, outside its own exception
   handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
   "b" differs from block's label "a"`).
+- A routine's parameters are PL/pgSQL variables under their names and as
+  `$1`, `$2`, ... in declaration order, output parameters included, so
+  `$1` sees an assignment made through the parameter's name and `$2 := 'x'`
+  sets an unnamed `OUT` parameter. `a ALIAS FOR $1` (or for a parameter's
+  name, an earlier variable, `label.x`, or a trigger's `NEW` and `OLD`)
+  declares another name for the same variable: `a := a + 1` changes `$1`.
+  An alias of a name that is not declared fails when the routine is created
+  (`variable "$2" does not exist`).
+- `FOR a, b IN SELECT ...` (or `EXECUTE`, or a data change with
+  `RETURNING`) assigns each row's columns to the listed scalar variables in
+  order: missing columns are NULL, extra ones ignored, and a loop without
+  rows leaves them all NULL. A single scalar variable takes the first column.
+  `strict_multi_assignment` reports a count mismatch. Integer and cursor
+  loops take one variable (`integer FOR loop must have only one target
+  variable`), and a record in the list fails (`"r" is not a scalar
+  variable`).
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
@@ -353,7 +369,12 @@ Syntax and errors:
   placeholders named `plpgsql.anything` are then removed with `WARNING:
   invalid configuration parameter name "plpgsql.foo", removing it`, and a
   later `SET plpgsql.bar = 'y'` fails with `42602` (`"plpgsql" is a reserved
-  prefix.`). `plpgsql.check_asserts = off` skips `ASSERT` statements.
+  prefix.`). A rejected value warns once for the session's own `SET` and
+  once for each transaction level (`SAVEPOINT`) that assigned it, even to the
+  same value. `ALTER SYSTEM` changes no session: before loading it stores any
+  `plpgsql.*` value unchecked, and `ALTER SYSTEM RESET plpgsql.foo` (like
+  `ALTER ROLE ... RESET`) removes a setting under the reserved prefix.
+  `plpgsql.check_asserts = off` skips `ASSERT` statements.
 - PL/pgSQL's extra checks follow `plpgsql.extra_warnings` (a `WARNING`) and
   `plpgsql.extra_errors` (an `ERROR`, which wins), each `none`, `all` or a
   list such as `too_many_rows, strict_multi_assignment`.

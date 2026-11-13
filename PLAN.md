@@ -546,37 +546,22 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
-Loading PL/pgSQL inside a transaction warns once for an invalid
-`plpgsql.*` value that both the session and the transaction set (`SET
-plpgsql.extra_warnings = 'bad'; BEGIN; SET plpgsql.extra_warnings = 'bad';`
-then PL/pgSQL code); PostgreSQL warns for each level.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
 fail with `42P01`. `MERGE` into a view whose every action has an `INSTEAD OF`
 trigger, directly or through views above it, fails with `0A000` (`MERGE into
 view "v" through its INSTEAD OF triggers is not supported`); PostgreSQL fires
 the triggers.
-PL/pgSQL `ALIAS FOR` declarations (`a ALIAS FOR $1`) fail with `42601`, and a
-`FOR` loop over a query into several variables (`FOR a, b IN SELECT ...`)
-fails with `expected one PL/pgSQL identifier`; PostgreSQL supports both.
-A string literal that fails its input as an operator's operand in a query
-without `FROM` (`SELECT 1 + 'x'`, PL/pgSQL `v := v + 'x'`) has no cursor
-position; PostgreSQL positions it at the literal.
-`ROW(...)::t` for a table's row type fails
-with `42846`, and `COALESCE` of two different tables' rows is accepted where
-PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
-A field selection error (`(1).x`) has no cursor position.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
-relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
-`USING` sources, and subqueries in that list fail with `0A000` where
-PostgreSQL evaluates them. A rule condition's `OLD` or `NEW` that the event
-lacks (`ON INSERT ... WHERE OLD.n > 0`) is reported without its cursor
-position, and a missing field of a PL/pgSQL record variable read in a `DO`
-body (`RAISE NOTICE '%', r.nope`) carries a position where PostgreSQL names
-the expression in `CONTEXT`. Selecting a field of a named composite cast to
-`record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
-field of a NULL `record` parameter names the expression in `CONTEXT`, which
-PostgreSQL omits because it raises the error while evaluating, not planning.
-PostgreSQL evaluates them.
+relation and the statement's `FROM` or `USING` items (`UPDATE v ... FROM o
+RETURNING o.label, *`), but a subquery in that list fails with `0A000` where
+PostgreSQL evaluates it.
+An error inside a statement or expression of a PL/pgSQL body is positioned
+in it (`QUERY` and `LINE`), except at a name the lexer folded (`OLD.n`,
+`NOSUCH`) or a `$n` beyond the routine's parameters, which report no
+position: the statement's parsed names keep no map to the text.
+A NULL row of a named type passed to a PL/pgSQL `record` parameter
+(`f(NULL::t)`) is an unassigned record whose field reads fail with `55000`,
+where PostgreSQL reads the type's fields as NULL.
 `PREPARE p(t1) AS UPDATE t SET c = $1` with a parameter type the column
 cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no

@@ -16510,7 +16510,13 @@ impl Engine {
                     };
                     let action = if use_returning {
                         match Self::rule_action_with_returning(
-                            storage, statement, columns, action, txn.txid, arena,
+                            storage,
+                            statement,
+                            columns,
+                            transition.sources,
+                            action,
+                            txn.txid,
+                            arena,
                         ) {
                             Ok(action) => action,
                             Err(error) => return Ok(Err(error)),
@@ -16651,26 +16657,21 @@ impl Engine {
         storage: &Storage,
         statement: &'a Stmt<'a>,
         columns: &'a [&'a str],
+        sources: &'a [query::RuleReturningSource<'a>],
         action: &'a Stmt<'a>,
         txid: u32,
         arena: &'a Arena,
     ) -> Result<&'a Stmt<'a>, SqlError> {
-        let (outer, table, alias, other_sources) = match statement {
-            Stmt::Insert(insert) => (insert.returning, insert.table, None, false),
-            Stmt::Update(update) => (
-                update.returning,
-                update.table,
-                update.alias,
-                update.from.is_some(),
-            ),
-            Stmt::Delete(delete) => (
-                delete.returning,
-                delete.table,
-                delete.alias,
-                delete.using.is_some(),
-            ),
+        let (outer, table, alias, from) = match statement {
+            Stmt::Insert(insert) => (insert.returning, insert.table, None, None),
+            Stmt::Update(update) => (update.returning, update.table, update.alias, update.from),
+            Stmt::Delete(delete) => (delete.returning, delete.table, delete.alias, delete.using),
             _ => unreachable!("rewrite input is data-modifying"),
         };
+        let other_sources = from.is_some();
+        // The list reads the sources when each FROM or USING item is one.
+        let items = from.map_or(0, |from| 1 + from.joins.len());
+        let sources = if sources.len() == items { sources } else { &[] };
         let entries = query::rule_returning_entries(action, storage, txid, arena)?;
         let items = query::rule_returning_items(
             outer,
@@ -16679,6 +16680,7 @@ impl Engine {
                 schema: alias.is_none().then_some(table.schema).flatten(),
                 columns,
                 other_sources,
+                sources,
             },
             entries,
             storage,

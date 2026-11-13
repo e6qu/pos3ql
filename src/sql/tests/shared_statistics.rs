@@ -108,9 +108,13 @@ fn prepared_definition_statistics_resolve_cold_with_the_shared_pool_full() {
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 session.success(&mut engine,
                     "CREATE TABLE prepared_statistics(a integer,b integer); CREATE TABLE statistics_quota(); \
-                     INSERT INTO prepared_statistics VALUES(1,10),(2,20); ANALYZE prepared_statistics; \
-                     BEGIN; ANALYZE statistics_quota; \
-                     ALTER TABLE prepared_statistics ALTER COLUMN a TYPE integer USING a+1", true);
+                     INSERT INTO prepared_statistics VALUES(1,10),(2,20); ANALYZE prepared_statistics", true);
+                session.success(
+                    &mut engine,
+                    "BEGIN; ANALYZE statistics_quota; \
+                     ALTER TABLE prepared_statistics ALTER COLUMN a TYPE integer USING a+1",
+                    true,
+                );
                 assert_eq!(session.transaction.statistics_undo().len(), 1);
                 assert_eq!(data_rows(&session.success(&mut engine,
                     "SELECT attname FROM pg_stats WHERE tablename='prepared_statistics' ORDER BY attname", true)), ["b"]);

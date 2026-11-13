@@ -12043,7 +12043,16 @@ mod tests {
                 assert!(conn.txn.commit_admission().is_none());
                 assert_eq!(count(conn.send.readable(), wire::MSG_ROW_DESCRIPTION), 1);
                 assert_eq!(count(conn.send.readable(), wire::MSG_DATA_ROW), 1);
-                assert_eq!(count(conn.send.readable(), wire::MSG_COMMAND_COMPLETE), 2);
+                // A simple Query reports its last tag only after the commit
+                // succeeds; each Execute reports its own before Sync commits.
+                assert_eq!(
+                    count(conn.send.readable(), wire::MSG_COMMAND_COMPLETE),
+                    if extended || outcome == "resume" {
+                        2
+                    } else {
+                        1
+                    }
+                );
                 assert_eq!(count(conn.send.readable(), wire::MSG_READY_FOR_QUERY), 1);
                 assert_eq!(
                     has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),

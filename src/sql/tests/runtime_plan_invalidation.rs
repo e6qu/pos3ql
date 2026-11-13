@@ -336,7 +336,8 @@ fn extended_output_exhaustion_releases_checked_input_receipts_in_explicit_transa
              CREATE DOMAIN overflow_checked AS overflow_choice CHECK(overflow_allowed(VALUE)); \
              SET check_function_bodies=off; CREATE FUNCTION overflow_body() RETURNS integer \
              LANGUAGE sql SET search_path=public AS $$SELECT cardinality('{a}'::overflow_checked[])$$; \
-             SET check_function_bodies=on; BEGIN", true);
+             SET check_function_bodies=on", true);
+        session.success(&mut engine, "BEGIN", true);
         session.arena.reset();
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_extended(

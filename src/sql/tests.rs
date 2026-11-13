@@ -998,7 +998,7 @@ fn statement_row_paths_survive_partition_moves_cascades_refresh_and_cold_recover
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
             assert_eq!(
-                data_rows(&session.success(
+                data_rows(&session.success_script(
                     &mut engine,
                     include_str!(
                         "../../tests/external/differential_exact/14_statement_row_paths.sql"
@@ -1298,7 +1298,7 @@ fn private_index_schema_names_and_comments_survive_rollback_and_cold_recovery() 
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
             assert_eq!(
-                data_rows(&session.success(
+                data_rows(&session.success_script(
                     &mut engine,
                     include_str!(
                         "../../tests/external/differential_exact/11_index_schema_names.sql"
@@ -2510,7 +2510,8 @@ fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_re
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; BEGIN; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
+                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient", false);
+                session.success(&mut engine, "BEGIN; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -4828,7 +4829,7 @@ fn metadata_savepoints_keep_sequence_values_and_routine_comments() {
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        let output = session.success(
+        let output = session.success_script(
             &mut engine,
             include_str!("../../tests/external/differential_exact/07_metadata_savepoints.sql"),
             true,
@@ -4941,7 +4942,8 @@ fn view_replacement_preserves_identity_without_spare_catalog_slots() {
             data_rows(&session.success(&mut engine, identity_sql, true)),
             original
         );
-        session.success(&mut engine, "DROP VIEW retained_view; BEGIN; CREATE VIEW discarded_view AS SELECT 1 AS value; DROP VIEW discarded_view; COMMIT; CREATE VIEW final_view AS SELECT 1 AS value", true);
+        session.success(&mut engine, "DROP VIEW retained_view", true);
+        session.success(&mut engine, "BEGIN; CREATE VIEW discarded_view AS SELECT 1 AS value; DROP VIEW discarded_view; COMMIT; CREATE VIEW final_view AS SELECT 1 AS value", true);
         assert_eq!(
             data_rows(&session.success(&mut engine, "SELECT value FROM final_view", true)),
             ["1"]
@@ -5020,7 +5022,8 @@ fn materialized_view_recreation_keeps_comments_with_their_original_object() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let comment = "SELECT obj_description('commented_matview'::regclass)";
-        session.success(&mut engine, "CREATE MATERIALIZED VIEW commented_matview AS SELECT 1 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'original'; BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 2 AS value", true);
+        session.success(&mut engine, "CREATE MATERIALIZED VIEW commented_matview AS SELECT 1 AS value; COMMENT ON MATERIALIZED VIEW commented_matview IS 'original'", true);
+        session.success(&mut engine, "BEGIN; DROP MATERIALIZED VIEW commented_matview; CREATE MATERIALIZED VIEW commented_matview AS SELECT 2 AS value", true);
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
@@ -5215,7 +5218,16 @@ fn query_lifecycle_parent_rollback_preserves_earlier_rule_deletion() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         session.success(&mut engine, creation, true);
-        session.success(&mut engine, "CREATE RULE remembered_rule AS ON INSERT TO rule_parent DO INSTEAD NOTHING; BEGIN; DROP RULE remembered_rule ON rule_parent; SAVEPOINT before_parent_drop", true);
+        session.success(
+            &mut engine,
+            "CREATE RULE remembered_rule AS ON INSERT TO rule_parent DO INSTEAD NOTHING",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "BEGIN; DROP RULE remembered_rule ON rule_parent; SAVEPOINT before_parent_drop",
+            true,
+        );
         session.success(
             &mut engine,
             &format!("DROP {kind} rule_parent; ROLLBACK TO before_parent_drop"),
@@ -6080,8 +6092,18 @@ fn table_catalog_lifecycle_create_drop_commit_and_reuse_do_not_publish_old_rows(
          INSERT INTO lifecycle_retired VALUES (7); DROP TABLE lifecycle_retired; COMMIT; \
          SELECT count(*) FROM pg_class WHERE relname = 'lifecycle_retired'; \
          CREATE TABLE lifecycle_retired(id integer PRIMARY KEY); \
-         SELECT count(*) FROM lifecycle_retired; INSERT INTO lifecycle_retired VALUES (9); \
-         BEGIN; DROP TABLE lifecycle_retired; ROLLBACK; SELECT id FROM lifecycle_retired; \
+         SELECT count(*) FROM lifecycle_retired; INSERT INTO lifecycle_retired VALUES (9)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["0", "0"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP TABLE lifecycle_retired; ROLLBACK; SELECT id FROM lifecycle_retired; \
          DROP TABLE lifecycle_retired",
     );
     assert!(
@@ -6089,7 +6111,7 @@ fn table_catalog_lifecycle_create_drop_commit_and_reuse_do_not_publish_old_rows(
         "{}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(data_rows(&output), ["0", "0", "9"]);
+    assert_eq!(data_rows(&output), ["9"]);
 }
 
 #[test]
@@ -12462,11 +12484,20 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&prepared_rollback)
     );
+    let view = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_prepared_view AS SELECT 1 AS id",
+    );
+    assert!(
+        !String::from_utf8_lossy(&view).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&view)
+    );
     let prepared_view = run_with(
         &mut engine,
         &mut budget,
-        "CREATE VIEW durable_prepared_view AS SELECT 1 AS id; \
-         BEGIN; SELECT * FROM durable_prepared_view; \
+        "BEGIN; SELECT * FROM durable_prepared_view; \
          PREPARE TRANSACTION 'object-view-lock'",
     );
     assert!(
@@ -12822,8 +12853,15 @@ fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
          SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'rule_mode_audit'; \
          ALTER TABLE rule_mode_source ENABLE RULE rule_mode_audit; \
          INSERT INTO rule_mode_source VALUES (4); \
-         SELECT id FROM rule_mode_audit ORDER BY id; \
-         BEGIN; ALTER TABLE rule_mode_source DISABLE RULE rule_mode_audit; ROLLBACK; \
+         SELECT id FROM rule_mode_audit ORDER BY id",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["D", "R", "A", "3", "4"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TABLE rule_mode_source DISABLE RULE rule_mode_audit; ROLLBACK; \
          INSERT INTO rule_mode_source VALUES (5); \
          SELECT id FROM rule_mode_audit ORDER BY id; \
          CREATE VIEW rule_mode_view AS SELECT id FROM rule_mode_source; \
@@ -12833,11 +12871,7 @@ fn rewrite_rule_enablement_controls_tables_and_rejects_view_changes() {
     );
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
-    assert_eq!(
-        data_rows(&output),
-        ["D", "R", "A", "3", "4", "3", "4", "5", "O", "5"],
-        "{text}"
-    );
+    assert_eq!(data_rows(&output), ["3", "4", "5", "O", "5"], "{text}");
 
     let view = run_with(
         &mut engine,
@@ -12890,8 +12924,12 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
              CREATE SERVER locked_mode_server FOREIGN DATA WRAPPER locked_mode_fdw; \
              CREATE FOREIGN TABLE locked_mode_foreign(value integer) SERVER locked_mode_server; \
              CREATE ROLE denied_view_mode; \
-             GRANT USAGE ON SCHEMA public TO denied_view_mode; \
-             BEGIN; SELECT value FROM locked_rule_view; \
+             GRANT USAGE ON SCHEMA public TO denied_view_mode",
+            true,
+        );
+        reader.success(
+            &mut engine,
+            "BEGIN; SELECT value FROM locked_rule_view; \
              SELECT value FROM locked_mode_table FOR UPDATE",
             true,
         );
@@ -18540,6 +18578,108 @@ fn run_with_fixed_memory_and_ddl_capacity(
     buffer.readable().to_vec()
 }
 
+/// Splits a script where psql ends each statement: at a semicolon outside
+/// quotes, dollar quotes, comments and parentheses. Meta-commands are rejected.
+fn psql_statements(script: &str) -> Vec<&str> {
+    let bytes = script.as_bytes();
+    let mut statements = Vec::new();
+    let (mut start, mut at, mut depth) = (0, 0, 0usize);
+    let mut blank = true;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let next = bytes.get(at + 1).copied();
+        if blank && byte == b'\\' {
+            panic!("psql meta-command in script: {}", &script[at..]);
+        }
+        match byte {
+            b'-' if next == Some(b'-') => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+                continue;
+            }
+            b'/' if next == Some(b'*') => {
+                let mut nesting = 0usize;
+                while at < bytes.len() {
+                    if bytes[at..].starts_with(b"/*") {
+                        nesting += 1;
+                        at += 2;
+                    } else if bytes[at..].starts_with(b"*/") {
+                        nesting -= 1;
+                        at += 2;
+                        if nesting == 0 {
+                            break;
+                        }
+                    } else {
+                        at += 1;
+                    }
+                }
+                continue;
+            }
+            b'\'' | b'"' => {
+                let escapes = byte == b'\''
+                    && at > 0
+                    && matches!(bytes[at - 1], b'E' | b'e')
+                    && !(at > 1
+                        && (bytes[at - 2].is_ascii_alphanumeric() || bytes[at - 2] == b'_'));
+                at += 1;
+                while at < bytes.len() {
+                    if escapes && bytes[at] == b'\\' {
+                        at += 2;
+                    } else if bytes[at] == byte {
+                        at += 1;
+                        if bytes.get(at) != Some(&byte) {
+                            break;
+                        }
+                        at += 1;
+                    } else {
+                        at += 1;
+                    }
+                }
+                blank = false;
+                continue;
+            }
+            b'$' if at == 0
+                || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') =>
+            {
+                let tag_end = bytes[at + 1..]
+                    .iter()
+                    .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+                    .map(|length| at + 1 + length);
+                if let Some(tag_end) = tag_end
+                    && bytes[tag_end] == b'$'
+                    && !bytes[at + 1].is_ascii_digit()
+                {
+                    let tag = &script[at..=tag_end];
+                    let body = tag_end + 1;
+                    let close = script[body..]
+                        .find(tag)
+                        .unwrap_or_else(|| panic!("unterminated dollar quote {tag}"));
+                    at = body + close + tag.len();
+                    blank = false;
+                    continue;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => {
+                statements.push(&script[start..=at]);
+                start = at + 1;
+                blank = true;
+                at += 1;
+                continue;
+            }
+            _ => {}
+        }
+        blank &= byte.is_ascii_whitespace();
+        at += 1;
+    }
+    if !blank {
+        statements.push(&script[start..]);
+    }
+    statements
+}
+
 struct ConfiguredTransactionSession {
     connection_id: i32,
     send: crate::mem::FixedBuf,
@@ -18617,6 +18757,16 @@ impl ConfiguredTransactionSession {
         let status = self.execute_status(engine, sql, fixed_memory);
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
+    }
+
+    /// Runs a script one statement per Query, as psql sends the external
+    /// corpus, so a BEGIN does not take in the statements before it.
+    fn success_script(&mut self, engine: &mut Engine, script: &str, fixed_memory: bool) -> Vec<u8> {
+        let mut output = Vec::new();
+        for statement in psql_statements(script) {
+            output.extend(self.success(engine, statement, fixed_memory));
+        }
+        output
     }
 
     fn success(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
@@ -19223,10 +19373,12 @@ fn configured_catalog_version_pools_do_not_allocate_while_serving() {
 fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
     for (label, metadata, row_bytes, failing_insert) in [
         (
+            // Only a row that meets a possible duplicate is queued for the
+            // deferred recheck: three duplicates exceed two obligations.
             "deferred-metadata",
             2,
             crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
-            "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
+            "INSERT INTO bounded_deferred VALUES(1, 'x'), (1, 'x'), (1, 'x'), (1, 'x')",
         ),
         (
             // One in-memory page and no spill file: an event larger than the
@@ -19244,7 +19396,8 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine, "CREATE TABLE bounded_deferred(id int UNIQUE DEFERRABLE INITIALLY DEFERRED, body text); CREATE TABLE bounded_deferred_audit(id int); CREATE FUNCTION bounded_deferred_trace() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO bounded_deferred_audit VALUES(NEW.id); RETURN NULL; END$$; CREATE CONSTRAINT TRIGGER bounded_deferred_trigger AFTER INSERT ON bounded_deferred DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bounded_deferred_trace(); BEGIN; SAVEPOINT before_exhaustion", false);
+        session.success(&mut engine, "CREATE TABLE bounded_deferred(id int UNIQUE DEFERRABLE INITIALLY DEFERRED, body text); CREATE TABLE bounded_deferred_audit(id int); CREATE FUNCTION bounded_deferred_trace() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO bounded_deferred_audit VALUES(NEW.id); RETURN NULL; END$$; CREATE CONSTRAINT TRIGGER bounded_deferred_trigger AFTER INSERT ON bounded_deferred DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bounded_deferred_trace()", false);
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_exhaustion", false);
         let exhausted = session.execute(&mut engine, failing_insert, true);
         assert!(
             String::from_utf8_lossy(&exhausted).contains("54000"),
@@ -22758,31 +22911,28 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
           WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;
          ALTER VIEW view_output_gateway RENAME COLUMN published_value TO current_value;
          SELECT current_value FROM view_output_gateway;
-         SELECT published_value FROM view_output_dependent;
-         BEGIN;
+         SELECT published_value FROM view_output_dependent;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["9", "9", "11", "published_value", "9", "11", "9", "11"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
          ALTER VIEW view_output_gateway RENAME COLUMN current_value TO temporary_value;
          SELECT temporary_value FROM view_output_gateway;
          ROLLBACK;
          SELECT current_value FROM view_output_gateway;",
     );
     assert_eq!(
-        data_rows(&created),
-        [
-            "9",
-            "9",
-            "11",
-            "published_value",
-            "9",
-            "11",
-            "9",
-            "11",
-            "9",
-            "11",
-            "9",
-            "11"
-        ],
+        data_rows(&rolled_back),
+        ["9", "11", "9", "11"],
         "{}",
-        String::from_utf8_lossy(&created)
+        String::from_utf8_lossy(&rolled_back)
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -26054,13 +26204,22 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
         .unwrap();
     let before_columns = engine.storage.table_statistics(table, 0).columns;
     assert!(engine.checkpoint().unwrap());
-    let prepared = run_with(
+    let journal = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE journal_index_hint(id integer);
          CREATE INDEX journal_hint_index ON journal_index_hint(id);
-         DROP INDEX journal_hint_index;
-         BEGIN;
+         DROP INDEX journal_hint_index;",
+    );
+    assert!(
+        !message_types(&journal).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&journal)
+    );
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
          INSERT INTO relation_estimates SELECT generate_series(9,16), NULL;
          ANALYZE relation_estimates;
          COMMENT ON TABLE relation_estimates IS 'prepared comment';
@@ -26461,8 +26620,17 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         &mut engine,
         &mut budget,
         "CREATE TABLE durable_acl_journal_empty(id integer);
-         REVOKE ALL PRIVILEGES ON durable_acl_journal_empty FROM postgres;
-         BEGIN;
+         REVOKE ALL PRIVILEGES ON durable_acl_journal_empty FROM postgres;",
+    );
+    assert!(
+        !message_types(&journal).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&journal)
+    );
+    let journal = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
          GRANT SELECT ON durable_acl_empty TO unprivileged;
          PREPARE TRANSACTION 'durable-acl-grants';",
     );
@@ -27063,11 +27231,21 @@ fn catalog_creation_prepared_type_owner_locks_survive_disposable_disk_recovery()
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let role = run_with(
+                    &mut engine,
+                    &mut budget,
+                    "CREATE ROLE prepared_type_owner SUPERUSER",
+                );
+                assert!(
+                    !message_types(&role).contains(&b'E'),
+                    "{}",
+                    String::from_utf8_lossy(&role)
+                );
                 let output = run_with(
                     &mut engine,
                     &mut budget,
                     &format!(
-                        "CREATE ROLE prepared_type_owner SUPERUSER; SET ROLE prepared_type_owner; BEGIN; {definition}; PREPARE TRANSACTION 'type-owner-lock'"
+                        "SET ROLE prepared_type_owner; BEGIN; {definition}; PREPARE TRANSACTION 'type-owner-lock'"
                     ),
                 );
                 assert!(
@@ -49604,15 +49782,24 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         "{}",
         String::from_utf8_lossy(&collision)
     );
-    let altered = run_with(
+    let moved = run_with(
         &mut engine,
         &mut budget,
         "ALTER MATERIALIZED VIEW materialized_old SET SCHEMA materialized_target;
          ALTER MATERIALIZED VIEW materialized_target.materialized_old RENAME TO materialized_new;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new SET TABLESPACE materialized_space;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new
-           ALTER COLUMN value SET STATISTICS 61, SET (fillfactor = 80);
-         BEGIN;
+           ALTER COLUMN value SET STATISTICS 61, SET (fillfactor = 80);",
+    );
+    assert!(
+        !message_types(&moved).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&moved)
+    );
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new SET (fillfactor = 90);
          ROLLBACK;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new
@@ -59578,6 +59765,18 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
                 observed integer GENERATED ALWAYS AS ((value).x) STORED, CHECK ((value).x > 0));
             INSERT INTO history_point_rules(value) VALUES (ROW(6,7)::history_point);
             ALTER TYPE history_point ADD ATTRIBUTE z integer;
+        ",
+            4 << 20,
+        );
+        assert!(
+            error_sqlstates(&setup).is_empty(),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let setup = run_with_fixed_memory(
+            &mut engine,
+            &budget,
+            "
             BEGIN;
             SAVEPOINT original_field;
             ALTER TYPE history_point RENAME ATTRIBUTE x TO temporary_field;
@@ -61454,8 +61653,12 @@ fn type_definition_transactions_follow_dependencies_after_pending_domain_moves()
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine,
         "CREATE DOMAIN type_dep_parent AS integer; CREATE DOMAIN type_dep_child AS type_dep_parent; \
-         CREATE TABLE type_dep_rows(value type_dep_child); INSERT INTO type_dep_rows VALUES (1); \
-         BEGIN; ALTER DOMAIN type_dep_parent RENAME TO type_dep_moved; SAVEPOINT before_check", true);
+         CREATE TABLE type_dep_rows(value type_dep_child); INSERT INTO type_dep_rows VALUES (1)", true);
+    session.success(
+        &mut engine,
+        "BEGIN; ALTER DOMAIN type_dep_parent RENAME TO type_dep_moved; SAVEPOINT before_check",
+        true,
+    );
     let rejected = session.execute(
         &mut engine,
         "ALTER DOMAIN type_dep_moved ADD CHECK (VALUE > 10)",
@@ -61484,9 +61687,13 @@ fn type_definition_transactions_follow_dependencies_after_pending_domain_moves()
     session.success(&mut engine,
         "CREATE SCHEMA type_dep_source; CREATE SCHEMA type_dep_target; \
          CREATE DOMAIN type_dep_source.value AS integer; \
-         CREATE TABLE type_dep_outside(value type_dep_source.value); INSERT INTO type_dep_outside VALUES (5); \
-         BEGIN; ALTER DOMAIN type_dep_source.value SET SCHEMA type_dep_target; \
-         DROP SCHEMA type_dep_source CASCADE; COMMIT", true);
+         CREATE TABLE type_dep_outside(value type_dep_source.value); INSERT INTO type_dep_outside VALUES (5)", true);
+    session.success(
+        &mut engine,
+        "BEGIN; ALTER DOMAIN type_dep_source.value SET SCHEMA type_dep_target; \
+         DROP SCHEMA type_dep_source CASCADE; COMMIT",
+        true,
+    );
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT value FROM type_dep_outside", true)),
         ["5"]
@@ -63645,7 +63852,11 @@ fn unique_key_writer_waits_then_rechecks_the_committed_outcome() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    owner.success(&mut engine, "CREATE TABLE unique_wait (id int primary key)", true);
+    owner.success(
+        &mut engine,
+        "CREATE TABLE unique_wait (id int primary key)",
+        true,
+    );
     owner.success(
         &mut engine,
         "BEGIN; INSERT INTO unique_wait VALUES (1)",
@@ -63695,7 +63906,12 @@ fn parked_statement_keeps_finished_rows_and_rewinds_the_waiting_row() {
     let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
     owner.success(
         &mut engine,
-        "CREATE TABLE replay_rows (id int primary key); BEGIN; INSERT INTO replay_rows VALUES (2)",
+        "CREATE TABLE replay_rows (id int primary key)",
+        true,
+    );
+    owner.success(
+        &mut engine,
+        "BEGIN; INSERT INTO replay_rows VALUES (2)",
         true,
     );
     let sql = "INSERT INTO replay_rows VALUES (1), (2)";
@@ -65319,8 +65535,12 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
     session.success(
         &mut engine,
         "CREATE TABLE cache_creation(a integer, b integer); \
-         INSERT INTO cache_creation VALUES (1, 10), (2, 20); \
-         BEGIN; CREATE UNIQUE INDEX cache_creation_a ON cache_creation(a); \
+         INSERT INTO cache_creation VALUES (1, 10), (2, 20)",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; CREATE UNIQUE INDEX cache_creation_a ON cache_creation(a); \
          SAVEPOINT before_second_index",
         true,
     );
@@ -67879,7 +68099,7 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
         "unsupported ordering directions and right types retain the exact Sort path: {fallback:?}"
     );
 
-    let overlay = data_rows(&run_with(
+    let mut overlay = data_rows(&run_with(
         &mut engine,
         &mut budget,
         "INSERT INTO knn_gist VALUES
@@ -67889,13 +68109,17 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
              (5, '(0.25,0)', '(0.25,0)', '(0.5,0.5),(0.25,0)',
               '((0.25,0),(0.5,0),(0.25,0.5))', 'five');
          SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 3;
-         SELECT id FROM knn_spgist ORDER BY kd <-> point '(0,0)' LIMIT 3;
-         BEGIN;
+         SELECT id FROM knn_spgist ORDER BY kd <-> point '(0,0)' LIMIT 3",
+    ));
+    overlay.extend(data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
          UPDATE knn_gist SET location = '(20,0)' WHERE id = 5;
          EXPLAIN SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 2;
          SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 2;
          ROLLBACK",
-    ));
+    )));
     assert_eq!(
         overlay
             .windows(3)
@@ -69076,9 +69300,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
             "BEGIN; ALTER POLICY wide_allow ON wide_policy_target TO public,postgres,{};\
              SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow';\
              ROLLBACK;\
-             ALTER POLICY wide_allow ON wide_policy_target TO {};\
-             BEGIN; ALTER POLICY wide_restrict_39 ON wide_policy_target USING (false); ROLLBACK;\
-             DROP POLICY wide_restrict_1 ON wide_policy_target",
+             ALTER POLICY wide_allow ON wide_policy_target TO {};",
             (0..=POLICY_ROLE_WIDTH)
                 .map(|index| format!("wide_policy_role_{index}"))
                 .collect::<Vec<_>>()
@@ -69095,6 +69317,17 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
         String::from_utf8_lossy(&observed)
     );
     assert_eq!(data_rows(&observed), ["99"]);
+    let observed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER POLICY wide_restrict_39 ON wide_policy_target USING (false); ROLLBACK;\
+         DROP POLICY wide_restrict_1 ON wide_policy_target",
+    );
+    assert!(
+        !message_types(&observed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&observed)
+    );
     let observed = run_with(
         &mut engine,
         &mut budget,
@@ -71098,8 +71331,12 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE INDEX covered_note ON covered_rows (key) INCLUDE (note); \
-         BEGIN; CREATE INDEX rolled_cover ON covered_rows (key) INCLUDE (payload); ROLLBACK",
+        "CREATE INDEX covered_note ON covered_rows (key) INCLUDE (note)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; CREATE INDEX rolled_cover ON covered_rows (key) INCLUDE (payload); ROLLBACK",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -75767,8 +76004,15 @@ fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() 
          ALTER TABLE not_null_inherit_parent \
            ALTER CONSTRAINT not_null_inherit_parent_id_not_null INHERIT; \
          SELECT attnotnull FROM pg_attribute \
-          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'; \
-         BEGIN; ALTER TABLE not_null_inherit_parent \
+          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["1", "t", "t|0|t", "1", "t"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TABLE not_null_inherit_parent \
            ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; ROLLBACK; \
          SELECT connoinherit FROM pg_constraint \
           WHERE conrelid = 'not_null_inherit_parent'::regclass \
@@ -75776,11 +76020,7 @@ fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() 
     );
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
-    assert_eq!(
-        data_rows(&output),
-        ["1", "t", "t|0|t", "1", "t", "f"],
-        "{text}"
-    );
+    assert_eq!(data_rows(&output), ["f"], "{text}");
     let only = run_with(
         &mut engine,
         &mut budget,
@@ -98215,7 +98455,12 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
         preparing.success(
             &mut engine,
-            "CREATE TABLE receipt_orders(id integer); BEGIN; INSERT INTO receipt_orders VALUES (1)",
+            "CREATE TABLE receipt_orders(id integer)",
+            false,
+        );
+        preparing.success(
+            &mut engine,
+            "BEGIN; INSERT INTO receipt_orders VALUES (1)",
             false,
         );
         engine.commit_wal().unwrap();
@@ -98430,7 +98675,7 @@ fn parallel_commit_begin_keeps_one_transaction_and_sequence_gaps() {
         }
         assert!(complete, "transaction boundaries did not finish");
         assert!(error_sqlstates(session.send.readable()).is_empty());
-        assert_eq!(data_rows(session.send.readable()), ["0|", "2"]);
+        assert_eq!(data_rows(session.send.readable()), ["0|NULL", "2"]);
         assert_eq!(
             message_types(session.send.readable())
                 .iter()

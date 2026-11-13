@@ -33779,9 +33779,22 @@ pub(super) fn trigger_record_row<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    // A named composite's fields keep their declared type modifiers, which
+    // PostgreSQL compares too; a record's fields carry none here.
+    let mut field_mods = [-1; crate::storage::MAX_COMPOSITE_FIELDS];
     let fields = match value {
         Datum::Null => return Ok(None),
-        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        Datum::Composite { slot, fields } => {
+            let definition = storage.require_row_type_definition(slot, txid)?;
+            for (target, field) in field_mods.iter_mut().zip(definition.active_fields()) {
+                *target = field.type_mod;
+            }
+            fields
+        }
+        Datum::Record(fields) => {
+            field_mods.fill(i32::MIN);
+            fields
+        }
         _ if source == TriggerRowSource::Return => {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -33828,9 +33841,25 @@ pub(super) fn trigger_record_row<'a>(
         let declared = storage
             .routine_type_oid(column.ctype, column.user_type, txid)
             .unwrap_or(column.ctype.oid());
-        if field.type_oid != declared && field.type_oid != column.ctype.oid() {
-            let returned = crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?;
-            let expected = crate::sql::catalog::format_type_name(storage, txid, declared)?;
+        let returned_mod = field_mods.get(index).copied().unwrap_or(i32::MIN);
+        // A record's field modifier is not tracked: a value that its
+        // column's modifier would change came from another modifier.
+        let unfitted = returned_mod == i32::MIN
+            && column.type_mod >= 0
+            && apply_typmod(field.value, column.ctype, column.type_mod, arena)
+                .and_then(|fitted| compare_datums(&fitted, &field.value))
+                .map_or(true, |ordering| !ordering.is_eq());
+        if (field.type_oid != declared && field.type_oid != column.ctype.oid())
+            || (returned_mod != i32::MIN && returned_mod != column.type_mod)
+            || unfitted
+        {
+            let returned = if returned_mod >= 0 {
+                crate::sql::catalog::format_type_oid(storage, txid, field.type_oid, returned_mod)
+            } else {
+                crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?
+            };
+            let expected =
+                crate::sql::catalog::format_type_oid(storage, txid, declared, column.type_mod);
             return Err(mismatch(format_args!(
                 "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
                 returned.as_str(),

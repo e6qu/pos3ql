@@ -582,9 +582,14 @@ another view, or that computes a column, fails with `0A000` (`writing through
 view "v" is not supported`) where PostgreSQL writes the base relation and
 rejects only an assignment to a computed column; `MERGE` into an
 automatically updatable view fails the same way.
-A trigger's returned row is checked by column type identity only: a
-`varchar(5)` column accepts a returned `varchar(10)` field where PostgreSQL
-also compares type modifiers. `ROW(...)::t` for a table's row type fails
+A trigger's returned `record` (as opposed to a named row type) keeps no
+field type modifiers, so a returned `varchar(10)` field fails only when its
+value does not fit the `varchar(5)` column, and its `DETAIL` names the
+field's type without the modifier; PostgreSQL compares the modifiers. Record
+fields need a type modifier carried from every source that sets one (casts,
+query columns, row variables). A constant assigned to a `NEW` field that
+fails its column's modifier (`NEW.v := 'abcdefgh'`) lacks PostgreSQL's
+`PL/pgSQL assignment` context line. `ROW(...)::t` for a table's row type fails
 with `42846`, and `COALESCE` of two different tables' rows is accepted where
 PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
 A field selection error (`(1).x`) has no cursor position.

@@ -249,7 +249,7 @@ pub(crate) fn session_schemas() -> SessionSchemas {
 
 /// Maximum number of readable settings published per statement for
 /// `current_setting`. Comfortably covers the `SHOW ALL` set plus a margin.
-pub const MAX_SESSION_SETTINGS: usize = 64;
+pub const MAX_SESSION_SETTINGS: usize = crate::sql::SETTING_NAMES.len();
 
 /// A per-statement snapshot of the session's readable settings (name → value),
 /// published like the session user so `current_setting` reads exactly what

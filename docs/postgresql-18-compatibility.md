@@ -1035,6 +1035,41 @@ files: a sort, grouping or hash table that outgrows the workspace fails with
 `54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
 file and restart to let larger sorts run.
 
+### Planner settings
+
+PostgreSQL's planner settings (every `pg_settings` row in a "Query Tuning"
+category, such as `enable_seqscan`, `random_page_cost` or `geqo`) steer how a
+query is planned; they never change its result. pos3ql accepts all 52 with
+PostgreSQL 18's values, units, ranges, errors, `SHOW` text, `pg_settings` row,
+`SET LOCAL`, routine `SET` clause and `EXPLAIN (SETTINGS)` line.
+
+Where pos3ql's planner has the same choice, the setting decides it:
+
+- `enable_seqscan`, `enable_indexscan` and `enable_bitmapscan` choose between
+  a sequential scan and an index scan (a bitmap heap scan for BRIN and GIN
+  indexes). For example, `SET enable_indexscan = off` makes
+  `SELECT * FROM t WHERE id = 5` read `t` sequentially.
+- `enable_hashjoin` and `enable_nestloop` choose between a hash join and a
+  nested loop, and `enable_material` drops the `Materialize` step `EXPLAIN`
+  shows over a nested loop's inner sequential scan.
+- When every way to run a step is disabled, the step still runs and `EXPLAIN`
+  marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
+  followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
+  `Seq Scan on t` with `Disabled: true`. A disabled sort or hashed aggregate is
+  marked the same way.
+
+The other settings name plan types or cost inputs pos3ql's planner does not
+have, so they change no plan, just as disabling an unused method changes
+nothing in PostgreSQL: there is no merge join (`enable_mergejoin`), parallel
+query, JIT, genetic optimizer, memoize, incremental sort, TID scan or
+partitionwise planning, and pos3ql's costs come from its own storage model
+rather than `seq_page_cost`-style constants. Two choices PostgreSQL makes
+differently: with index scans disabled PostgreSQL can still read a B-tree
+index through a bitmap heap scan, which pos3ql does not have, so pos3ql scans
+sequentially; and with sequential scans disabled PostgreSQL can read a whole
+table through any B-tree index, while pos3ql uses an index only for a
+condition or ordering it serves.
+
 ### Cursor capacity
 
 Each cursor reserves `cursor_bytes` for rows, `cursor_query_bytes` for its query,

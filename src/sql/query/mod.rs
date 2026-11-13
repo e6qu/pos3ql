@@ -111,6 +111,7 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
+mod outer_joins;
 mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
@@ -127,6 +128,7 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
+pub(crate) use pullup::pull_up_subqueries;
 
 /// Whether `expression` calls a volatile function. With `except_nextval`,
 /// `nextval` does not count (`contain_volatile_functions_not_nextval`).

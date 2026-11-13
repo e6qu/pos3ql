@@ -227,6 +227,7 @@ impl<'r> Writer<'r> {
             pretty: self.pretty,
             qualify: self.qualify || nested || own != 1,
             domain_value: None,
+            bare: None,
         }
     }
 

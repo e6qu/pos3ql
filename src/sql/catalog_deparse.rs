@@ -46,6 +46,9 @@ pub(crate) struct Context<'s> {
     /// Qualify every column, as PostgreSQL does when the query's range table
     /// holds more than the FROM items (a rule's `OLD` and `NEW`).
     pub qualify: bool,
+    /// The FROM item whose columns print unqualified while others are
+    /// qualified, as PostgreSQL prints a scan's own conditions.
+    pub bare: Option<&'s str>,
     /// The base type OID of the domain whose constraint is printed, which
     /// `VALUE` has.
     pub domain_value: Option<i32>,
@@ -1014,8 +1017,10 @@ impl Context<'_> {
                             let Some((source, _)) = source else {
                                 return output.unsupported();
                             };
-                            write_identifier(&mut identifier, source.printed);
-                            let _ = identifier.write_char('.');
+                            if self.bare != Some(source.printed) {
+                                write_identifier(&mut identifier, source.printed);
+                                let _ = identifier.write_char('.');
+                            }
                         }
                         write_identifier(&mut identifier, name);
                     }
@@ -1955,6 +1960,7 @@ pub(crate) fn rule_action_definition<'a>(
         pretty,
         qualify: true,
         domain_value: None,
+        bare: None,
     };
     // The target's relation, then its alias after `separator`.
     let relation = |separator: &str| {

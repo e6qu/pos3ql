@@ -398,6 +398,57 @@ fn explain_analyze_runs_a_rewritten_statement_once_and_plans_each_query() {
 }
 
 #[test]
+fn explain_refuses_rewritten_queries_it_cannot_plan() {
+    with_engine("explain-rewritten-refusals", |engine, budget| {
+        for sql in [
+            "CREATE TABLE rr_t (a int, b int)",
+            "CREATE TABLE rr_log (a int)",
+            "CREATE VIEW rr_v AS SELECT a, b FROM rr_t",
+            "CREATE RULE rr_v_insert AS ON INSERT TO rr_v DO INSTEAD \
+             INSERT INTO rr_t VALUES (new.a, new.b)",
+            "CREATE RULE rr_t_insert AS ON INSERT TO rr_t DO ALSO \
+             INSERT INTO rr_log VALUES (new.a)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let refused =
+            "ERROR 0A000 EXPLAIN of a statement a rewrite rule changes is not supported for";
+        for (sql, what) in [
+            (
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_v VALUES (1, 2)",
+                "a statement on a view",
+            ),
+            (
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_t SELECT max(a), 1 FROM rr_log",
+                "an INSERT of an aggregated or ordered query",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!("{refused} {what}")],
+                "{sql}"
+            );
+        }
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE rr_log_insert AS ON INSERT TO rr_log DO ALSO \
+             INSERT INTO rr_v VALUES (new.a, 0)",
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_log VALUES (1)"
+            )),
+            [format!(
+                "{refused} an action on a view or on a relation with rules"
+            )]
+        );
+    });
+}
+
+#[test]
 fn joined_dml_hashes_the_first_of_several_from_items() {
     with_engine("joined-dml-hash-several", |engine, budget| {
         for sql in [

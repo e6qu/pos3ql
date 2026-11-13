@@ -4544,10 +4544,14 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .or_else(|| self.outer?.outer_aggregate(call))
     }
 
-    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
-        match self.inner.statement_subqueries() {
-            [] => self.outer.map_or(&[], |outer| outer.statement_subqueries()),
-            slots => slots,
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
+        let inner = self.inner.statement_subqueries();
+        if inner.is_empty() {
+            self.outer
+                .map(|outer| outer.statement_subqueries())
+                .unwrap_or_default()
+        } else {
+            inner
         }
     }
 
@@ -4921,12 +4925,12 @@ fn with_lateral_argument_hooks<'a, C: ColumnLookup<'a>, R>(
     base_hooks: &EvalHooks<'_, 'a>,
     evaluate: impl FnOnce(&EvalHooks<'_, 'a>) -> R,
 ) -> R {
-    let slots = outer.statement_subqueries();
+    let statement = outer.statement_subqueries();
     let arguments = crate::sql::eval::SubqueryValues {
         scalars: &[],
         lists: &[],
-        deferred: slots,
-        statement: slots,
+        deferred: statement.slots,
+        statement,
         bindings: &[],
         correlated: None,
     };
@@ -7700,7 +7704,7 @@ fn scan_source_mode<'a>(
             let mut slots = None;
             let lateral_outer = crate::sql::eval::StatementSubqueryScope::wrap(
                 &chained,
-                hooks.subs.map_or(&[], |subs| subs.statement),
+                hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
                 &mut slots,
             );
             match materialize_lateral_source(

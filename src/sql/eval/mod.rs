@@ -900,9 +900,11 @@ pub trait ColumnLookup<'a> {
     /// subqueries, set operations, functions in `FROM`). A nested query
     /// prepared for a row reuses its slot, so each runs once per statement,
     /// as PostgreSQL's initPlans do, however many rows run the query around
-    /// it.
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
-        &[]
+    /// it. The scope also carries the statement's bindings for the
+    /// correlated subqueries nested in those queries, so each is analysed
+    /// once per statement however many rows run its enclosing query.
+    fn statement_subqueries(&self) -> StatementScope<'a> {
+        StatementScope::default()
     }
 
     /// Declared size/precision, or the registered shape of a record column.
@@ -1758,7 +1760,7 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).outer_aggregate(call)
     }
 
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+    fn statement_subqueries(&self) -> StatementScope<'a> {
         (**self).statement_subqueries()
     }
 
@@ -3526,9 +3528,9 @@ pub struct SubqueryValues<'h, 'a> {
     /// reaches never runs its subquery.
     pub deferred: &'h [DeferredSubquery<'h>],
     /// The statement's slots for the uncorrelated subqueries nested in the
-    /// queries it runs for each row; see
-    /// [`ColumnLookup::statement_subqueries`].
-    pub statement: &'a [DeferredSubquery<'a>],
+    /// queries it runs for each row, and its bindings for the correlated
+    /// ones; see [`ColumnLookup::statement_subqueries`].
+    pub statement: StatementScope<'a>,
     /// The correlated scalar and `ARRAY` subqueries analysed once for the
     /// statement, before any outer row.
     pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
@@ -3572,6 +3574,15 @@ impl<'h> DeferredSubquery<'h> {
             ..*slot
         })
     }
+}
+
+/// Whether `left` and `right` are the same sublink, one perhaps a per-row
+/// rewritten copy of the other (see [`Sublink`]).
+pub(crate) fn same_sublink(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    core::ptr::eq(
+        (left as *const Expr<'_>).cast::<()>(),
+        (right as *const Expr<'_>).cast::<()>(),
+    ) || Sublink::of(left).is_some_and(|sublink| Sublink::of(right) == Some(sublink))
 }
 
 /// Which sublink a subquery expression is. A query rewritten for an outer
@@ -3621,31 +3632,49 @@ impl Sublink {
     }
 }
 
-/// A row lookup that also carries the statement's slots for nested
-/// uncorrelated subqueries ([`ColumnLookup::statement_subqueries`]) into a
-/// query run for that row.
+/// The statement state a query run again for each row inherits: slots for
+/// the uncorrelated subqueries nested in it and bindings for the correlated
+/// ones.
+#[derive(Clone, Copy, Default)]
+pub struct StatementScope<'a> {
+    pub(crate) slots: &'a [DeferredSubquery<'a>],
+    pub(crate) bindings: Option<crate::sql::query::NestedBindings<'a>>,
+}
+
+impl StatementScope<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty() && self.bindings.is_none()
+    }
+}
+
+/// A row lookup that also carries the statement's scope for nested
+/// subqueries ([`ColumnLookup::statement_subqueries`]) into a query run for
+/// that row.
 pub(crate) struct StatementSubqueryScope<'r, 'a> {
     pub(crate) row: &'r dyn ColumnLookup<'a>,
-    pub(crate) slots: &'a [DeferredSubquery<'a>],
+    pub(crate) scope: StatementScope<'a>,
 }
 
 impl<'a> StatementSubqueryScope<'_, 'a> {
-    /// `row`, carrying `slots` unless it already carries the statement's.
+    /// `row`, carrying `statement` unless it already carries the statement's.
     pub(crate) fn wrap<'r>(
         row: &'r dyn ColumnLookup<'a>,
-        slots: &'a [DeferredSubquery<'a>],
+        statement: StatementScope<'a>,
         scope: &'r mut Option<StatementSubqueryScope<'r, 'a>>,
     ) -> &'r dyn ColumnLookup<'a> {
-        if slots.is_empty() || !row.statement_subqueries().is_empty() {
+        if statement.is_empty() || !row.statement_subqueries().is_empty() {
             return row;
         }
-        &*scope.insert(StatementSubqueryScope { row, slots })
+        &*scope.insert(StatementSubqueryScope {
+            row,
+            scope: statement,
+        })
     }
 }
 
 impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
-        self.slots
+    fn statement_subqueries(&self) -> StatementScope<'a> {
+        self.scope
     }
 
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
@@ -6737,7 +6766,7 @@ fn eval_full_inner<'a>(
         let mut scope = None;
         let outer = StatementSubqueryScope::wrap(
             row,
-            hooks.subs.map_or(&[], |subs| subs.statement),
+            hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
         let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
@@ -6747,7 +6776,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }
@@ -6803,7 +6832,7 @@ fn eval_full_inner<'a>(
         let mut scope = None;
         let outer = StatementSubqueryScope::wrap(
             row,
-            hooks.subs.map_or(&[], |subs| subs.statement),
+            hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
         let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
@@ -6825,7 +6854,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }
@@ -6839,7 +6868,7 @@ fn eval_full_inner<'a>(
                     scalars: &[],
                     lists: &lists,
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }

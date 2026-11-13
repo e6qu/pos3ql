@@ -479,7 +479,7 @@ their rows.
 nested in a query the statement runs again for each row (a correlated or
 `LATERAL` subquery, a set-operation branch, a function in `FROM`) has a slot
 in the statement arena's persistent tail, made when the statement prepares
-its subqueries (`nested_statement_slots` in `src/sql/query/subquery.rs`).
+its subqueries (`nested_statement_scope` in `src/sql/query/subquery.rs`).
 Every run of the query around it reaches the slot through the row it runs
 for (`ColumnLookup::statement_subqueries`), so `SELECT (SELECT x + (SELECT
 nextval('s')) FROM z WHERE x <= t.id) FROM t` calls `nextval` once. A slot is
@@ -489,7 +489,14 @@ copy, as PostgreSQL plans one subquery per copy. A correlated subquery is bound 
 types (`SubqueryBinding`): a scalar or `ARRAY` one keeps its result type, the
 executor that runs it and its aggregate states, which each outer row copies;
 an `EXISTS` one its executor; a row one its row type; an `IN`/`ANY`/`ALL` one
-its comparison collations and column types.
+its comparison collations and column types. A correlated subquery nested in
+a query the statement runs for each row is bound the first time that query
+runs, in a fixed 64 KiB workspace carved from the statement arena's
+persistent tail (`NestedBindings`), and every later run reuses the binding;
+the statement's scope carries the table of these bindings with its slots.
+Only sublinks written in the statement are kept there; one expanded from a
+view as its query runs is bound for that run. Filling the workspace fails
+the statement with SQLSTATE 54000.
 
 **Built: correlated subqueries where evaluation reaches them.** A query's
 correlated subqueries are deferred like its uncorrelated ones, without a

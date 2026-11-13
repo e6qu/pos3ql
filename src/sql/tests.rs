@@ -101419,3 +101419,38 @@ fn spilled_grouping_keys_read_enclosing_aggregates() {
         );
     }
 }
+
+/// `DROP SCHEMA ... CASCADE` journals a view's triggers as dropped before the
+/// view itself, so recovery can still resolve each trigger's target.
+#[test]
+fn schema_drop_journals_view_triggers_before_their_view() {
+    let config = test_config("schema-drop-view-triggers");
+    {
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SCHEMA s; CREATE TABLE s.t (a int); \
+             CREATE VIEW s.v AS SELECT * FROM s.t; \
+             CREATE FUNCTION s.tf() RETURNS trigger LANGUAGE plpgsql \
+               AS $$BEGIN RETURN NEW; END$$; \
+             CREATE TRIGGER g INSTEAD OF INSERT ON s.v FOR EACH ROW EXECUTE FUNCTION s.tf(); \
+             DROP SCHEMA s CASCADE",
+            false,
+        );
+        drop(session);
+        drop(engine);
+    }
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 's'",
+            false
+        )),
+        ["0"]
+    );
+}

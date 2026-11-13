@@ -4855,6 +4855,10 @@ fn recursive_key_columns<'a>(
         .map_err(|_| arena_full())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a recursive query's described columns and optional statement parameters"
+)]
 fn prepare_recursive_decoration<'a>(
     cte: &'a Cte<'a>,
     base_names: &[&'a str],

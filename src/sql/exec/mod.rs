@@ -16962,6 +16962,11 @@ pub(crate) fn drop_schema(
                     ) {
                         return sql_fail(error);
                     }
+                    // The view's triggers are journaled as dropped before
+                    // the view, so recovery can still resolve their target.
+                    if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, *v) {
+                        return sql_fail(error);
+                    }
                     if !temporary {
                         let lsn = storage.bump_lsn();
                         if let Err(e) = wal.stage_reserved(

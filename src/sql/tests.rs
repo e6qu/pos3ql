@@ -13530,9 +13530,9 @@ fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
         "CREATE TABLE rule_set_source(id integer); \
          CREATE SEQUENCE rule_set_sequence; \
          CREATE RULE rule_set_action AS ON INSERT TO rule_set_source DO ALSO ( \
-           SELECT nextval('rule_set_sequence') WHERE NEW.id > 0 \
+           SELECT nextval('rule_set_sequence') WHERE true \
            UNION ALL \
-           SELECT nextval('rule_set_sequence') WHERE NEW.id < 0; \
+           SELECT nextval('rule_set_sequence') WHERE false; \
            NOTIFY rule_set_changed, 'rewritten'; \
          )",
     );
@@ -13541,6 +13541,16 @@ fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
+    // A set operation's members belong to the action's query level, so they
+    // cannot read the rule's NEW row, as in PostgreSQL.
+    let member = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "CREATE RULE rule_set_member AS ON INSERT TO rule_set_source DO ALSO \
+           SELECT 1 WHERE NEW.id > 0 UNION ALL SELECT 2",
+    );
+    assert_eq!(error_sqlstates(&member), ["42P10"]);
     let inserted = run_as(
         &mut engine,
         &mut budget,

@@ -115,7 +115,7 @@ fn push_name(output: &mut Output<'_>, name: &str) -> Result<(), SqlError> {
 }
 
 /// The scope a nested query sees: the enclosing scope one level further out.
-fn nested<'x>(scope: &[Joined<'x>], arena: &'x Arena) -> Result<&'x [Joined<'x>], SqlError> {
+fn outward<'x>(scope: &[Joined<'x>], arena: &'x Arena) -> Result<&'x [Joined<'x>], SqlError> {
     arena
         .alloc_slice_with(scope.len(), |index| Joined {
             level: scope[index].level.saturating_add(1),
@@ -195,7 +195,7 @@ fn values_rows<'x>(
 
 /// One output column of an analyzed query.
 #[derive(Clone, Copy)]
-struct Output1<'x> {
+struct Target<'x> {
     expression: &'x Expr<'x>,
     /// The name the query gives it (`tle->resname`).
     name: &'x str,
@@ -210,7 +210,7 @@ struct Level<'x> {
     scope: &'x [Joined<'x>],
     /// The level's own items (the front of `scope`).
     own: usize,
-    targets: &'x [Output1<'x>],
+    targets: &'x [Target<'x>],
 }
 
 impl<'r> Writer<'r> {
@@ -353,7 +353,7 @@ impl<'r> Writer<'r> {
             .map_err(full)?;
         let scope: &'x [Joined<'x>] = scope;
         let mut targets = ArenaList::new(arena);
-        let star = |targets: &mut ArenaList<'x, Output1<'x>>,
+        let star = |targets: &mut ArenaList<'x, Target<'x>>,
                     part: &[(u16, u16)]|
          -> Result<(), SqlError> {
             for &(entry, column) in part {
@@ -366,7 +366,7 @@ impl<'r> Writer<'r> {
                     .alloc(Expr::Column { qualifier, name })
                     .map_err(full)?;
                 targets
-                    .push(Output1 {
+                    .push(Target {
                         expression,
                         name,
                         column: Some(name),
@@ -397,7 +397,7 @@ impl<'r> Writer<'r> {
                         }
                     );
                     targets
-                        .push(Output1 {
+                        .push(Target {
                             expression,
                             name: alias
                                 .unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
@@ -481,7 +481,7 @@ impl<'r> Writer<'r> {
                         entry.name = "";
                     }
                 }
-                nested(copy, arena)?
+                outward(copy, arena)?
             };
             let Some(columns) = self.output_columns(visible, cte.query, arena)? else {
                 return Ok(None);
@@ -560,7 +560,8 @@ impl<'r> Writer<'r> {
         let SetTree::Select(first) = leftmost else {
             return output.unsupported();
         };
-        let leaves = nested_scope(ctes, arena)?;
+        // A set operation's leaves read under its `WITH` queries.
+        let leaves = outward(ctes, arena)?;
         let Some(columns) = self.output_columns(leaves, first, arena)? else {
             return output.unsupported();
         };
@@ -591,8 +592,7 @@ impl<'r> Writer<'r> {
                     _ => return output.unsupported(),
                 };
                 output.push(crate::stack_format!(24, "{}", position).as_str())?;
-                let type_oid = columns[position - 1].type_oid;
-                order_direction(order, type_oid, output)?;
+                order_direction(order, output)?;
             }
         }
         let context = self.context(ctes, true, 0);
@@ -621,7 +621,7 @@ impl<'r> Writer<'r> {
             "WITH "
         };
         // A query reads under the level's own names and the queries around.
-        let scope = nested(level.scope, arena)?;
+        let scope = outward(level.scope, arena)?;
         for cte in select.with {
             output.push(separator)?;
             push_name(output, cte.name)?;
@@ -881,8 +881,7 @@ impl<'r> Writer<'r> {
                 }
                 let expression = target(bind(order.expression)?, false);
                 sort_group(&context, expression, output)?;
-                let type_oid = context.type_of(expression)?;
-                order_direction(order, type_oid, output)?;
+                order_direction(order, output)?;
             }
         }
         self.limits(&context, select, output)?;
@@ -994,7 +993,7 @@ impl<'r> Writer<'r> {
     fn targets(
         &self,
         context: &Context<'_>,
-        targets: &[Output1<'_>],
+        targets: &[Target<'_>],
         naming: Naming<'_>,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
@@ -1166,15 +1165,6 @@ impl<'r> Writer<'r> {
     }
 }
 
-/// A scope for the leaves of a set operation: the level's `WITH` queries
-/// and everything around it, one level further out.
-fn nested_scope<'x>(
-    scope: &'x [Joined<'x>],
-    arena: &'x Arena,
-) -> Result<&'x [Joined<'x>], SqlError> {
-    nested(scope, arena)
-}
-
 /// Renames a derived item's leading columns by its alias column list.
 fn rename<'x>(
     columns: &'x [Column<'x>],
@@ -1259,7 +1249,7 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                 }
             })
             .map_err(full)?;
-        nested(joined, self.arena)
+        outward(joined, self.arena)
     }
 
     fn named(&self, alias: Option<&'x str>, name: &'x str) -> Result<&'x str, SqlError> {
@@ -1410,8 +1400,7 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
         if item.cte.is_some() || item.bound_table.is_some() || item.view_access.is_some() {
             return Ok(None);
         }
-        if let Some(members) = item.join_members {
-            let _ = members;
+        if item.join_members.is_some() {
             let Some(Select {
                 from: Some(inner), ..
             }) = item.subquery
@@ -1756,11 +1745,7 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
             if paren {
                 output.push(")")?;
             }
-            let names = match (join.using, join.natural) {
-                (Some(using), _) => Some((using.columns, using.alias)),
-                (None, true) => None,
-                _ => None,
-            };
+            let names = join.using.map(|using| (using.columns, using.alias));
             if join.using.is_some() || join.natural {
                 let merged = self.take();
                 output.push(" USING (")?;
@@ -1888,7 +1873,7 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
         }
         if let Some(subquery) = item.subquery {
             output.push("(")?;
-            let scope = nested(self.scope, self.arena)?;
+            let scope = outward(self.scope, self.arena)?;
             self.writer.query(
                 scope,
                 subquery,
@@ -1903,10 +1888,8 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
             )?;
             output.push(") ")?;
             push_name(output, entry.printed)?;
-            let mut rows = ArenaList::new(self.arena);
-            let values = values_rows(subquery, &mut rows)?;
-            let renamed = item.col_alias.is_some_and(|aliases| !aliases.is_empty());
-            if renamed || (!values && false) {
+            // A derived item's column list prints when it renamed columns.
+            if item.col_alias.is_some_and(|aliases| !aliases.is_empty()) {
                 self.column_aliases(&entry, output)?;
             }
             return Ok(());
@@ -2092,11 +2075,7 @@ fn sort_group(
 }
 
 /// `get_rule_orderby`'s direction: the default `<` ordering prints nothing.
-fn order_direction(
-    order: &OrderBy<'_>,
-    _type_oid: Option<i32>,
-    output: &mut Output<'_>,
-) -> Result<(), SqlError> {
+fn order_direction(order: &OrderBy<'_>, output: &mut Output<'_>) -> Result<(), SqlError> {
     if order.descending {
         output.push(" DESC")?;
         if !order.nulls_first {
@@ -2185,7 +2164,7 @@ pub(super) fn window_spec(
                 output.push(", ")?;
             }
             sort_group(context, order.expression, output)?;
-            order_direction(order, None, output)?;
+            order_direction(order, output)?;
         }
         space = true;
     }
@@ -2247,7 +2226,7 @@ pub(super) fn sublink<'x>(
         qualify: false,
     };
     // Expressions outside a query layout start the query at no indentation.
-    let scope = nested(context.joined, arena)?;
+    let scope = outward(context.joined, arena)?;
     writer.query(
         scope,
         select,

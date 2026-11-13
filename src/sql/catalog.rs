@@ -16566,6 +16566,29 @@ pub(crate) fn view_def_text_pretty<'a>(
             .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;
         let dependencies = query.dependencies.view();
+        // A transaction whose catalog snapshot predates the view's current
+        // query reads its own version's text, deparsed under current names.
+        let text = stored.expect("checked stored text");
+        if text.strip_suffix(';') != Some(sql) {
+            let text = arena
+                .alloc_str(text.trim().trim_end_matches(';'))
+                .map_err(|_| arena_full())?;
+            if let Ok(select) = crate::sql::parser::parse_query(text, arena)
+                && let Some(deparsed) = deparse::view_definition(
+                    storage,
+                    txid,
+                    select,
+                    None,
+                    names,
+                    layout,
+                    view.options_for(txid).query_origin,
+                    arena,
+                )?
+            {
+                return Ok(Some(deparsed));
+            }
+            return Ok(stored);
+        }
         if let Ok(select) = crate::sql::query::parse_stored_query(
             sql,
             query.input_source.unwrap_or(sql),

@@ -4584,11 +4584,10 @@ pub(super) fn visit_plan_rows(
     if options.format == ExplainFormat::Text {
         return visit_text_rows(plan, options, actual, settings, |line| emit(line));
     }
-    let mark = arena.mark();
-    let result = render_document(&[(plan, actual)], options, settings, arena).and_then(&mut emit);
-    // SAFETY: the document is not retained past `emit`.
-    unsafe { arena.rewind_to(mark) };
-    result
+    // The document stays in the statement arena: `emit` may keep its row
+    // there (a PL/pgSQL `EXECUTE ... INTO` copies it into the same arena), so
+    // rewinding past it would free a value still in use.
+    render_document(&[(plan, actual)], options, settings, arena).and_then(&mut emit)
 }
 
 /// An expression rewrite's failure: the arena filled, or the rewrite's own

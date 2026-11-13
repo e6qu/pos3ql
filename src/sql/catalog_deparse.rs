@@ -40,6 +40,9 @@ pub(crate) struct Context<'s> {
     pub joined: &'s [Joined<'s>],
     /// `PRETTYFLAG_PAREN`: parentheses only where precedence requires them.
     pub pretty: bool,
+    /// The base type OID of the domain whose constraint is printed, which
+    /// `VALUE` has.
+    pub domain_value: Option<i32>,
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -146,6 +149,12 @@ fn operator_type(type_oid: i32) -> i32 {
 
 impl Context<'_> {
     fn column_type(&self, qualifier: Option<&str>, name: &str) -> Result<Option<i32>, SqlError> {
+        if qualifier.is_none()
+            && name == "value"
+            && let Some(type_oid) = self.domain_value
+        {
+            return Ok(Some(type_oid));
+        }
         if qualifier.is_none()
             && let Some(parameter) = self
                 .parameters
@@ -413,7 +422,16 @@ impl Context<'_> {
         right: &Expr<'_>,
     ) -> Result<(Option<i32>, Option<i32>), SqlError> {
         let (left, right) = (self.type_of(left)?, self.type_of(right)?);
-        Ok(match (left.map(operator_type), right.map(operator_type)) {
+        // A domain operand is coerced to its base type, as a relabeling the
+        // deparser prints as a cast.
+        let seen = |type_oid: i32| {
+            operator_type(super::domain_root_type_oid(
+                self.storage,
+                self.txid,
+                type_oid,
+            ))
+        };
+        Ok(match (left.map(seen), right.map(seen)) {
             (Some(left), None) => (Some(left), Some(left)),
             (None, Some(right)) => (Some(right), Some(right)),
             (None, None) => (Some(oid::TEXT), Some(oid::TEXT)),
@@ -746,6 +764,9 @@ impl Context<'_> {
             Expr::Column { qualifier, name } => {
                 if self.column_type(*qualifier, name)?.is_none() {
                     return output.unsupported();
+                }
+                if qualifier.is_none() && *name == "value" && self.domain_value.is_some() {
+                    return output.push("VALUE");
                 }
                 let mut identifier = crate::util::StackStr::<260>::new();
                 if self.joined.len() > 1 {
@@ -1520,6 +1541,7 @@ pub(crate) fn view_definition<'a>(
         parameters: &[],
         joined: &joined[..count],
         pretty,
+        domain_value: None,
     };
     let mut output = Output {
         arena,

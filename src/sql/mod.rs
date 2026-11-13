@@ -2241,6 +2241,14 @@ fn logical_replica_identity(
             })
         }
         crate::storage::ReplicaIdentityMode::Index => {
+            if let Some(key) = definition.key_index_marks.replica_identity {
+                return Ok(LogicalReplicaIdentity {
+                    wire: pgoutput::ReplicaIdentity::Index,
+                    key_mask: definition
+                        .key_index_columns(key)
+                        .unwrap_or(ColumnSet::EMPTY),
+                });
+            }
             let mut selected = None;
             for slot in 0..storage.index_count() {
                 let Some(index) = storage.index_visible_to(slot, 0) else {
@@ -22101,7 +22109,7 @@ impl Engine {
                     )));
                 }
                 responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
+                    sqlstate::DUPLICATE_OBJECT,
                     stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
                 )?;
                 responder.command_complete("CREATE EXTENSION")?;
@@ -25458,7 +25466,7 @@ impl Engine {
         if self.storage.extension_slot(name, txn.txid).is_some() {
             if if_not_exists {
                 responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
+                    sqlstate::DUPLICATE_OBJECT,
                     stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
                 )?;
                 responder.command_complete("CREATE EXTENSION")?;
@@ -25569,7 +25577,7 @@ impl Engine {
             Ok(Some(plan)) => plan,
             Ok(None) => {
                 responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
+                    sqlstate::DUPLICATE_OBJECT,
                     stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
                 )?;
                 responder.command_complete("CREATE EXTENSION")?;
@@ -27945,10 +27953,7 @@ fn apply_prepared_table_wal_payload(
             )
         })?;
     storage.restore_table_type_inputs(&mut definition, inputs, transaction_id)?;
-    if storage
-        .table_access_method_name(definition.access_method, transaction_id)
-        .is_none()
-    {
+    if !storage.table_access_method_valid(&definition, transaction_id) {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "prepared transaction references an unknown table access method"
@@ -29047,10 +29052,7 @@ fn apply_table_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), 
             )
         })?;
     storage.restore_table_type_inputs(&mut definition, inputs, 0)?;
-    if storage
-        .table_access_method_name(definition.access_method, 0)
-        .is_none()
-    {
+    if !storage.table_access_method_valid(&definition, 0) {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "journal table references an unknown access method"

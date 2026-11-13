@@ -5595,13 +5595,6 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     a == b || (is_integer(a) && is_integer(b)) || (is_oid(a) && is_oid(b))
 }
 
-/// Extracts every equi-join key for a two-table hash join: each
-/// `probe_col = build_col` conjunct in the ON clause or the WHERE that is a
-/// plain column reference into each table with a type compatible with `=`.
-/// Returns the matched pairs (probe column, build column). The keys only
-/// generate candidates — the full ON and WHERE still run at the leaf, so a
-/// missed extraction never changes a result, only the access path.
-#[allow(clippy::type_complexity)]
 /// The scope column a join key names, written `column`, `table.column` or
 /// `schema.table.column`; `None` for any other expression.
 fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedColumn> {
@@ -5622,6 +5615,12 @@ fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedC
 /// Up to eight (probe column, build column) join key pairs and their count.
 type JoinKeyPairs = ([(usize, usize); 8], usize);
 
+/// Extracts every equi-join key for a two-table hash join: each
+/// `probe_col = build_col` conjunct in the ON clause or the WHERE that is a
+/// plain column reference into each table with a type compatible with `=`.
+/// Returns the matched pairs (probe column, build column). The keys only
+/// generate candidates — the full ON and WHERE still run at the leaf, so a
+/// missed extraction never changes a result, only the access path.
 fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
@@ -5777,42 +5776,39 @@ pub(crate) fn derived_key_plan<'a>(
     let where_count = flatten(where_clause, &mut where_flat);
     let on_conjuncts = &on_flat[..on_count];
     let where_conjuncts = &where_flat[..where_count];
-    let build_key = |expression: &Expr<'a>| match *expression {
-        Expr::Column { qualifier, name } => match scope.find_column(qualifier, name) {
-            Ok(ResolvedColumn::Table(table, column)) if table == build_table => Some(column),
-            _ => None,
-        },
+    let build_key = |expression: &Expr<'a>| match key_column(scope, expression) {
+        Some(ResolvedColumn::Table(table, column)) if table == build_table => Some(column),
         _ => None,
     };
     let probe_key = |expression: &'a Expr<'a>| -> Option<(KeyProbe<'a>, ColType, Collation)> {
+        if let Some(ResolvedColumn::Table(table, column)) = key_column(scope, expression)
+            && order[..depth].contains(&table)
+        {
+            let column_def = &scope.defs.get(table)?.columns[column];
+            return Some((
+                KeyProbe::Source { table, column },
+                column_def.ctype,
+                column_def.collation,
+            ));
+        }
+        // An outer reference of a correlated subquery is a bare or
+        // table-qualified column this scope cannot see.
         let Expr::Column { qualifier, name } = *expression else {
             return None;
         };
-        match scope.find_column(qualifier, name) {
-            Ok(ResolvedColumn::Table(table, column)) if order[..depth].contains(&table) => {
-                let column_def = &scope.defs.get(table)?.columns[column];
-                Some((
-                    KeyProbe::Source { table, column },
-                    column_def.ctype,
-                    column_def.collation,
-                ))
-            }
-            Ok(_) => None,
-            Err(error) => {
-                // Only a name this scope cannot see is an outer reference;
-                // an ambiguous or misspelled one stays an error of the scan.
-                let unseen = match qualifier {
-                    Some(qualifier) => !scope.has_entry_named(qualifier),
-                    None => error.sqlstate == sqlstate::UNDEFINED_COLUMN,
-                };
-                let outer = outer.filter(|_| unseen)?;
-                Some((
-                    KeyProbe::Outer { qualifier, name },
-                    outer.col_type(qualifier, name)?,
-                    outer.collation(qualifier, name),
-                ))
-            }
-        }
+        // Only a name this scope cannot see is an outer reference; an
+        // ambiguous or misspelled one stays an error of the scan.
+        let error = scope.find_column(qualifier, name).err()?;
+        let unseen = match qualifier {
+            Some(qualifier) => !scope.has_entry_named(qualifier),
+            None => error.sqlstate == sqlstate::UNDEFINED_COLUMN,
+        };
+        let outer = outer.filter(|_| unseen)?;
+        Some((
+            KeyProbe::Outer { qualifier, name },
+            outer.col_type(qualifier, name)?,
+            outer.collation(qualifier, name),
+        ))
     };
     let keyed = |conjunct: &&'a Expr<'a>, outer_only: bool| {
         let Expr::Binary {

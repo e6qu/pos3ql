@@ -42,6 +42,7 @@ mod indirect_execute_privileges;
 mod information_schema_domains;
 mod initplans;
 mod joined_dml_returning;
+mod key_index_marks;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;

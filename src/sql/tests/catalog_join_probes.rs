@@ -64,8 +64,7 @@ fn foreign_key_reflection_probes_descriptions_by_key() {
         ]
     );
     // A scan per outer row would visit every description for each class
-    // row; probing visits only rows sharing a key, and sources smaller than
-    // the probe threshold.
+    // row; probing visits only rows sharing a key.
     assert!(
         visited < classes * 32 && visited < classes * descriptions / 64,
         "visited {visited} rows for {classes} classes and {descriptions} descriptions"

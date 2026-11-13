@@ -1898,6 +1898,20 @@ fn create_table_kind(
         crate::storage::TableKind::Local
     };
     def.access_method = match statement.access_method {
+        crate::sql::ast::TableAccessMethod::Unspecified if def.partition.is_partitioned() => {
+            crate::storage::TableAccessMethod::Unspecified
+        }
+        // A partition takes its parent's access method when it has one.
+        crate::sql::ast::TableAccessMethod::Unspecified => def
+            .partition
+            .attachment
+            .map(|attachment| {
+                storage
+                    .table_def(usize::from(attachment.parent), txn.txid)
+                    .access_method
+            })
+            .filter(|method| *method != crate::storage::TableAccessMethod::Unspecified)
+            .unwrap_or(crate::storage::TableAccessMethod::Heap),
         crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
         crate::sql::ast::TableAccessMethod::Named(name) => {
             match storage.table_access_method(name, txn.txid) {
@@ -2021,100 +2035,103 @@ fn create_table_kind(
             def.columns[column].auto_increment = false;
         }
     }
-    let created_slot = match storage.create_table_in(def.clone(), txn.txid) {
-        Ok(slot) => {
-            let foreign_slot = if let Some(foreign) = foreign {
-                match storage.create_foreign_table_binding(
-                    crate::storage::foreign::ForeignTableDefinition {
-                        table: slot as u16,
-                        server: foreign.server,
-                        options: foreign.options,
-                        column_options: foreign.column_options,
-                    },
-                    txn.txid,
-                ) {
-                    Ok(binding) => Some(binding),
-                    Err(error) => {
-                        storage.rollback_create(slot);
-                        return sql_fail(error);
+    let declared = constraint_declaration_order(&def, statement);
+    let created_slot =
+        match storage.create_declared_table_in(def.clone(), txn.txid, Some(&declared)) {
+            Ok(slot) => {
+                let foreign_slot = if let Some(foreign) = foreign {
+                    match storage.create_foreign_table_binding(
+                        crate::storage::foreign::ForeignTableDefinition {
+                            table: slot as u16,
+                            server: foreign.server,
+                            options: foreign.options,
+                            column_options: foreign.column_options,
+                        },
+                        txn.txid,
+                    ) {
+                        Ok(binding) => Some(binding),
+                        Err(error) => {
+                            storage.rollback_create(slot);
+                            return sql_fail(error);
+                        }
                     }
+                } else {
+                    None
+                };
+                let wal_result =
+                    if def.persistence == crate::storage::RelationPersistence::Temporary {
+                        Ok(())
+                    } else {
+                        let lsn = storage.bump_lsn();
+                        wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::CreateTable {
+                                identity: storage.table_position(slot),
+                                definition: (&(*storage.table_def(slot, txn.txid)).clone()).into(),
+                            },
+                        )
+                    };
+                if let Err(e) = wal_result {
+                    // Nothing reached the journal; undo the in-memory apply.
+                    if let Some(binding) = foreign_slot {
+                        storage.foreign_catalog_rollback_create(
+                            crate::storage::foreign::ForeignObjectClass::Table,
+                            binding,
+                        );
+                    }
+                    storage.rollback_create(slot);
+                    return sql_fail(e);
                 }
-            } else {
-                None
-            };
-            let wal_result = if def.persistence == crate::storage::RelationPersistence::Temporary {
-                Ok(())
-            } else {
-                let lsn = storage.bump_lsn();
-                wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::CreateTable {
-                        identity: storage.table_position(slot),
-                        definition: (&(*storage.table_def(slot, txn.txid)).clone()).into(),
-                    },
-                )
-            };
-            if let Err(e) = wal_result {
-                // Nothing reached the journal; undo the in-memory apply.
-                if let Some(binding) = foreign_slot {
+                if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::Created(slot as u32)) {
+                    if let Some(binding) = foreign_slot {
+                        storage.foreign_catalog_rollback_create(
+                            crate::storage::foreign::ForeignObjectClass::Table,
+                            binding,
+                        );
+                    }
+                    storage.rollback_create(slot);
+                    return sql_fail(e);
+                }
+                if let Some(binding) = foreign_slot
+                    && let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::ForeignTableCreated(binding as u32),
+                    )
+                {
                     storage.foreign_catalog_rollback_create(
                         crate::storage::foreign::ForeignObjectClass::Table,
                         binding,
                     );
+                    return sql_fail(error);
                 }
-                storage.rollback_create(slot);
-                return sql_fail(e);
-            }
-            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::Created(slot as u32)) {
-                if let Some(binding) = foreign_slot {
-                    storage.foreign_catalog_rollback_create(
-                        crate::storage::foreign::ForeignObjectClass::Table,
-                        binding,
-                    );
-                }
-                storage.rollback_create(slot);
-                return sql_fail(e);
-            }
-            if let Some(binding) = foreign_slot
-                && let Err(error) = txn.record_ddl(
+                if let Err(error) = apply_default_privileges_to_new_object(
                     storage,
-                    super::txn::DdlUndo::ForeignTableCreated(binding as u32),
-                )
-            {
-                storage.foreign_catalog_rollback_create(
-                    crate::storage::foreign::ForeignObjectClass::Table,
-                    binding,
-                );
-                return sql_fail(error);
+                    txn,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::Table,
+                        slot: slot as u16,
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                slot
             }
-            if let Err(error) = apply_default_privileges_to_new_object(
-                storage,
-                txn,
-                crate::storage::AccessObject {
-                    class: crate::storage::AccessClass::Table,
-                    slot: slot as u16,
-                },
-            ) {
-                return sql_fail(error);
+            Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
+                responder.notice(
+                    crate::sql::eval::sqlstate::DUPLICATE_TABLE,
+                    stack_format!(
+                        128,
+                        "relation \"{}\" already exists, skipping",
+                        statement.name.name
+                    )
+                    .as_str(),
+                )?;
+                responder.command_complete(tag)?;
+                return sql_ok();
             }
-            slot
-        }
-        Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
-            responder.notice(
-                crate::sql::eval::sqlstate::DUPLICATE_TABLE,
-                stack_format!(
-                    128,
-                    "relation \"{}\" already exists, skipping",
-                    statement.name.name
-                )
-                .as_str(),
-            )?;
-            responder.command_complete(tag)?;
-            return sql_ok();
-        }
-        Err(e) => return sql_fail(e),
-    };
+            Err(e) => return sql_fail(e),
+        };
     def = TableDefBuilder::from_definition(&storage.table_def(created_slot, txn.txid));
     if let Some(attachment) = def.partition.attachment
         && let Err(error) = ensure_partition_indexes(
@@ -19272,6 +19289,9 @@ fn replica_identity_columns(
             Ok((!identity.is_empty()).then_some(identity))
         }
         crate::storage::ReplicaIdentityMode::Index => {
+            if let Some(key) = definition.key_index_marks.replica_identity {
+                return Ok(definition.key_index_columns(key));
+            }
             let mut identity = None;
             for index_slot in 0..storage.index_count() {
                 let Some(index) = storage.index_visible_to(index_slot, txid) else {
@@ -51308,13 +51328,120 @@ fn unrecognized_relation_parameter(name: &str) -> SqlError {
     )
 }
 
+/// The order `statement` declared `def`'s NOT NULL, key and exclusion
+/// constraints in. A key `def` copied from `LIKE` is not named and keeps the
+/// definition's own order.
+fn constraint_declaration_order(
+    def: &TableDefBuilder,
+    statement: &crate::sql::ast::CreateTable<'_>,
+) -> crate::storage::ConstraintDeclarationOrder {
+    use crate::sql::ast::TableConstraint;
+    use crate::storage::DeclaredKey;
+    let mut order = crate::storage::ConstraintDeclarationOrder::new();
+    for column in statement.columns {
+        if column.not_null
+            && let Some(index) = def.column_index(column.name)
+        {
+            order.declare_not_null(index);
+        }
+    }
+    // Each declared key with where it was written; a compact column key is
+    // written at its column.
+    let mut keys = [(usize::MAX, DeclaredKey::Column(0)); crate::storage::MAX_COLUMNS * 2];
+    let mut count = 0;
+    let mut push = |position: crate::sql::ast::SourcePosition, key| {
+        if count < keys.len() {
+            keys[count] = (position.get().unwrap_or(usize::MAX), key);
+            count += 1;
+        }
+    };
+    for column in statement.columns {
+        if column.unique
+            && let Some(index) = def.column_index(column.name)
+        {
+            push(column.source_position, DeclaredKey::Column(index as u16));
+        }
+    }
+    let mut used_uniques = [false; crate::storage::MAX_UNIQUES];
+    let declared_exclusions = statement
+        .constraints
+        .iter()
+        .filter(|constraint| matches!(constraint, TableConstraint::Exclusion { .. }))
+        .count();
+    let mut exclusion = def.n_exclusions.saturating_sub(declared_exclusions);
+    for constraint in statement.constraints {
+        let (name, columns) = match *constraint {
+            TableConstraint::PrimaryKey { name, columns, .. }
+            | TableConstraint::Unique { name, columns, .. } => (name, columns),
+            TableConstraint::Exclusion { .. } => {
+                if exclusion < def.n_exclusions {
+                    push(
+                        constraint.source_position(),
+                        DeclaredKey::Exclusion(exclusion as u16),
+                    );
+                }
+                exclusion += 1;
+                continue;
+            }
+            TableConstraint::Check { .. } | TableConstraint::ForeignKey { .. } => continue,
+        };
+        let mut indices = [0u16; crate::storage::MAX_INDEX_COLS];
+        let mut n = 0;
+        for column in columns {
+            match def.column_index(column) {
+                Some(index) if n < indices.len() => {
+                    indices[n] = index as u16;
+                    n += 1;
+                }
+                _ => break,
+            }
+        }
+        let primary = matches!(constraint, TableConstraint::PrimaryKey { .. });
+        let found = def.uniques().iter().enumerate().position(|(index, key)| {
+            !used_uniques[index]
+                && key.kind.is_primary() == primary
+                && key.columns() == &indices[..n]
+                && name.is_none_or(|name| key.name.as_str() == name)
+        });
+        match found {
+            Some(index) => {
+                used_uniques[index] = true;
+                push(
+                    constraint.source_position(),
+                    DeclaredKey::Unique(index as u16),
+                );
+            }
+            None if n == 1 => push(
+                constraint.source_position(),
+                DeclaredKey::Column(indices[0]),
+            ),
+            None => {}
+        }
+    }
+    keys[..count].sort_by_key(|(position, _)| *position);
+    for (_, key) in &keys[..count] {
+        order.declare_key(*key);
+    }
+    order
+}
+
+/// `SET ACCESS METHOD DEFAULT`: a partitioned table records none, any other
+/// table takes `default_table_access_method`.
+fn reset_access_method(definition: &TableDefBuilder) -> crate::storage::TableAccessMethod {
+    if definition.partition.is_partitioned() {
+        crate::storage::TableAccessMethod::Unspecified
+    } else {
+        crate::storage::TableAccessMethod::Heap
+    }
+}
+
 /// The first view option of a `SET (...)` list, which a table or
 /// materialized view does not have.
 fn first_view_option_name(options: &[crate::sql::ast::ViewOption]) -> &'static str {
-    match options.first() {
-        Some(crate::sql::ast::ViewOption::SecurityInvoker(_)) => "security_invoker",
-        Some(crate::sql::ast::ViewOption::SecurityBarrier(_)) => "security_barrier",
-        Some(crate::sql::ast::ViewOption::CheckOption(_)) | None => "check_option",
+    match options.first().map(|option| option.name()) {
+        Some(crate::sql::ast::ViewOptionName::SecurityInvoker) => "security_invoker",
+        Some(crate::sql::ast::ViewOptionName::SecurityBarrier) => "security_barrier",
+        Some(crate::sql::ast::ViewOptionName::CheckOption) | None => "check_option",
     }
 }
 
@@ -51532,7 +51659,7 @@ fn alter_view_inner(
     responder: &mut Responder,
     complete: bool,
 ) -> Outcome {
-    use crate::sql::ast::{AlterViewAction, ViewOption, ViewOptionName};
+    use crate::sql::ast::{AlterViewAction, ViewOptionName, ViewOptionValue};
     let AlterViewCommand {
         name,
         if_exists,
@@ -51688,20 +51815,20 @@ fn alter_view_inner(
     match action {
         AlterViewAction::SetOptions(view_options) => {
             for option in view_options {
-                options.order = options.order.with_last(option.name());
-                match option {
-                    ViewOption::SecurityInvoker(enabled) => {
-                        options.security = if *enabled {
+                options.order = options.order.with_last(option.name(), option.spelling);
+                match option.value {
+                    ViewOptionValue::SecurityInvoker(enabled) => {
+                        options.security = if enabled {
                             crate::storage::ViewSecurity::Invoker
                         } else {
                             crate::storage::ViewSecurity::Definer
                         };
                     }
-                    ViewOption::SecurityBarrier(enabled) => {
+                    ViewOptionValue::SecurityBarrier(enabled) => {
                         options.security_barrier =
-                            crate::storage::ViewSecurityBarrier::from_enabled(*enabled);
+                            crate::storage::ViewSecurityBarrier::from_enabled(enabled);
                     }
-                    ViewOption::CheckOption(option) => {
+                    ViewOptionValue::CheckOption(option) => {
                         match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
                             Ok(Some(_)) => {}
                             Ok(None) => {
@@ -54783,7 +54910,8 @@ pub fn create_table_as(
         Err(e) => return sql_fail(e),
     };
     def.access_method = match access_method {
-        crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
+        crate::sql::ast::TableAccessMethod::Unspecified
+        | crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
         crate::sql::ast::TableAccessMethod::Named(method) => {
             match storage.table_access_method(method, txn.txid) {
                 Some(method) => method,
@@ -70242,6 +70370,46 @@ pub fn reindex(
     sql_ok()
 }
 
+/// The index a table is clustered on: an ordinary index, or a primary key
+/// or unique constraint index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClusterIndex {
+    Index(usize),
+    Key(crate::storage::RelationIdentity),
+}
+
+/// The index `name` of table `table` for `CLUSTER`.
+fn cluster_index_named(
+    storage: &Storage,
+    table: usize,
+    name: &crate::sql::ast::QualName<'_>,
+    txid: u32,
+) -> Option<ClusterIndex> {
+    let definition = storage.table_def(table, txid);
+    if let Some(key) = key_index_named(&definition, name) {
+        return Some(ClusterIndex::Key(key.identity));
+    }
+    let schema = name.schema.unwrap_or(definition.schema.as_str());
+    storage
+        .index_slot(schema, name.name, txid)
+        .map(ClusterIndex::Index)
+}
+
+/// The index `table` was last clustered on.
+fn clustered_index(storage: &Storage, table: usize, txid: u32) -> Option<ClusterIndex> {
+    if let Some(key) = storage.table_def(table, txid).key_index_marks.clustered {
+        return Some(ClusterIndex::Key(key));
+    }
+    (0..storage.index_count())
+        .find(|slot| {
+            storage.index_table_slot_to(*slot, txid) == Some(table)
+                && storage
+                    .index_visible_to(*slot, txid)
+                    .is_some_and(|index| index.mutable_for(txid).clustered)
+        })
+        .map(ClusterIndex::Index)
+}
+
 /// Replaces a table's durable CLUSTER selection. `None` is the protocol's
 /// explicit `SET WITHOUT CLUSTER` state, not a default selection.
 fn set_clustered_index(
@@ -70249,8 +70417,21 @@ fn set_clustered_index(
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
     table: usize,
-    selected: Option<usize>,
+    selection: Option<ClusterIndex>,
 ) -> Result<(), SqlError> {
+    let key = match selection {
+        Some(ClusterIndex::Key(key)) => Some(key),
+        _ => None,
+    };
+    if storage.table_def(table, txn.txid).key_index_marks.clustered != key {
+        rewrite_table_metadata(storage, wal, txn, table, |next| {
+            next.key_index_marks.clustered = key;
+        })?;
+    }
+    let selected = match selection {
+        Some(ClusterIndex::Index(slot)) => Some(slot),
+        _ => None,
+    };
     if let Some(selected) = selected {
         if storage.index_table_slot_to(selected, txn.txid) != Some(table) {
             let index = storage
@@ -70317,35 +70498,22 @@ pub fn cluster(
         Ok(tables) => tables,
         Err(_) => return sql_fail(arena_full()),
     };
-    let indexes = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
+    let indexes = match arena.alloc_slice_with(storage.table_count(), |_| ClusterIndex::Index(0)) {
         Ok(indexes) => indexes,
         Err(_) => return sql_fail(arena_full()),
     };
     let mut count = 0usize;
     match target {
         crate::sql::ast::ClusterTarget::All => {
-            for index_slot in 0..storage.index_count() {
-                let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
-                    continue;
-                };
-                if !index.mutable_for(txn.txid).clustered {
+            for table in 0..storage.table_count() {
+                if !storage.table_slot_visible_to(table, txn.txid) {
                     continue;
                 }
-                let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "clustered index \"{}\" has no table",
-                        index.name_for(txn.txid).as_str()
-                    ));
+                let Some(selected) = clustered_index(storage, table, txn.txid) else {
+                    continue;
                 };
-                if count == tables.len() {
-                    return sql_fail(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many clustered relations"
-                    ));
-                }
                 tables[count] = table;
-                indexes[count] = index_slot;
+                indexes[count] = selected;
                 count += 1;
             }
         }
@@ -70357,24 +70525,19 @@ pub fn cluster(
             let definition = storage.table_def(table_slot, txn.txid);
             let index_slot = match index {
                 Some(index_name) => {
-                    let schema = index_name.schema.unwrap_or(definition.schema.as_str());
-                    let Some(slot) = storage.index_slot(schema, index_name.name, txn.txid) else {
+                    let Some(selected) =
+                        cluster_index_named(storage, table_slot, &index_name, txn.txid)
+                    else {
                         return sql_fail(sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
                             "index \"{}\" does not exist",
                             index_name.name
                         ));
                     };
-                    slot
+                    selected
                 }
                 None => {
-                    let selected = (0..storage.index_count()).find(|slot| {
-                        storage.index_table_slot_to(*slot, txn.txid) == Some(table_slot)
-                            && storage
-                                .index_visible_to(*slot, txn.txid)
-                                .is_some_and(|index| index.mutable_for(txn.txid).clustered)
-                    });
-                    let Some(slot) = selected else {
+                    let Some(slot) = clustered_index(storage, table_slot, txn.txid) else {
                         return sql_fail(sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
                             "there is no previously clustered index for table \"{}\"",
@@ -87666,7 +87829,6 @@ fn alter_table_relation(
             txn,
             ReplicaIdentityAlter {
                 table_index,
-                edit_target,
                 definition: def,
                 target: *target,
             },
@@ -87717,8 +87879,7 @@ fn alter_table_relation(
     }
 
     if let [AlterAction::SetCluster(index)] = statement.actions {
-        let schema = index.schema.unwrap_or(def.schema.as_str());
-        let Some(index_slot) = storage.index_slot(schema, index.name, txn.txid) else {
+        let Some(selected) = cluster_index_named(storage, table_index, index, txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "index \"{}\" for table \"{}\" does not exist",
@@ -87726,7 +87887,9 @@ fn alter_table_relation(
                 def.name.as_str()
             ));
         };
-        if storage.index_table_slot_to(index_slot, txn.txid) != Some(table_index) {
+        if let ClusterIndex::Index(index_slot) = selected
+            && storage.index_table_slot_to(index_slot, txn.txid) != Some(table_index)
+        {
             return sql_fail(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "\"{}\" is not an index for table \"{}\"",
@@ -87734,7 +87897,7 @@ fn alter_table_relation(
                 def.name.as_str()
             ));
         }
-        if let Err(error) = set_clustered_index(storage, wal, txn, table_index, Some(index_slot)) {
+        if let Err(error) = set_clustered_index(storage, wal, txn, table_index, Some(selected)) {
             return sql_fail(error);
         }
         if emit_completion {
@@ -87872,7 +88035,10 @@ fn alter_table_relation(
                             Err(error) => return sql_fail(error),
                         };
                 }
-                AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Heap) => {
+                AlterAction::SetAccessMethod(
+                    crate::sql::ast::TableAccessMethod::Heap
+                    | crate::sql::ast::TableAccessMethod::Unspecified,
+                ) => {
                     new_def.access_method = crate::storage::TableAccessMethod::Heap;
                 }
                 AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Named(name)) => {
@@ -87888,7 +88054,7 @@ fn alter_table_relation(
                     };
                 }
                 AlterAction::ResetAccessMethod => {
-                    new_def.access_method = crate::storage::TableAccessMethod::Heap;
+                    new_def.access_method = reset_access_method(&new_def);
                 }
                 AlterAction::SetPersistence(persistence) => {
                     if def.persistence == crate::storage::RelationPersistence::Temporary {
@@ -88401,7 +88567,8 @@ fn alter_table_relation(
             }
             AlterAction::SetAccessMethod(method) => {
                 new_def.access_method = match method {
-                    crate::sql::ast::TableAccessMethod::Heap => {
+                    crate::sql::ast::TableAccessMethod::Heap
+                    | crate::sql::ast::TableAccessMethod::Unspecified => {
                         crate::storage::TableAccessMethod::Heap
                     }
                     crate::sql::ast::TableAccessMethod::Named(name) => {
@@ -88419,10 +88586,10 @@ fn alter_table_relation(
                 };
             }
             AlterAction::ResetAccessMethod => {
-                new_def.access_method = crate::storage::TableAccessMethod::Heap;
+                new_def.access_method = reset_access_method(&new_def);
             }
             AlterAction::SetReplicaIdentity(target) => {
-                let (mode, selected) = match resolve_replica_identity_target(
+                let selection = match resolve_replica_identity_target(
                     storage,
                     table_index,
                     &new_def,
@@ -88432,8 +88599,9 @@ fn alter_table_relation(
                     Ok(selection) => selection,
                     Err(error) => return sql_fail(error),
                 };
-                new_def.replica_identity = mode;
-                replica_identity_selection = Some(selected);
+                new_def.replica_identity = selection.mode;
+                new_def.key_index_marks.replica_identity = selection.key;
+                replica_identity_selection = Some(selection.index);
             }
             AlterAction::SetCluster(_)
             | AlterAction::ClearCluster
@@ -90888,24 +91056,115 @@ fn stage_replica_identity_selection(
     Ok(())
 }
 
+/// A primary key or unique constraint index of a table, which has no index
+/// slot of its own.
+struct KeyIndex {
+    identity: crate::storage::RelationIdentity,
+    name: SqlName,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_cols: usize,
+    deferrable: bool,
+}
+
+/// `definition`'s primary key or unique constraint index named `name`.
+fn key_index_named<Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
+    name: &crate::sql::ast::QualName<'_>,
+) -> Option<KeyIndex> {
+    if name
+        .schema
+        .is_some_and(|schema| schema != definition.schema.as_str())
+    {
+        return None;
+    }
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if (metadata.primary || metadata.unique)
+            && definition
+                .column_key_name(column)
+                .is_some_and(|key| key.as_str() == name.name)
+        {
+            let mut columns = [0; crate::storage::MAX_INDEX_COLS];
+            columns[0] = column as u16;
+            return Some(KeyIndex {
+                identity: definition.column_index_identity(column)?,
+                name: definition.column_key_name(column)?,
+                columns,
+                n_cols: 1,
+                deferrable: false,
+            });
+        }
+    }
+    definition
+        .uniques()
+        .iter()
+        .find(|key| key.name.as_str() == name.name)
+        .and_then(|key| {
+            Some(KeyIndex {
+                identity: key.index_identity?,
+                name: key.name,
+                columns: key.columns,
+                n_cols: key.n_cols,
+                deferrable: key.timing.is_deferrable(),
+            })
+        })
+}
+
+/// A replica identity selection: the mode, and an ordinary index or a key
+/// index for `USING INDEX`.
+struct ReplicaIdentitySelection {
+    mode: crate::storage::ReplicaIdentityMode,
+    index: Option<usize>,
+    key: Option<crate::storage::RelationIdentity>,
+}
+
 fn resolve_replica_identity_target<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table_index: usize,
     definition: &crate::storage::TableDefinition<Definition0>,
     target: crate::sql::ast::ReplicaIdentityTarget<'_>,
     txid: u32,
-) -> Result<(crate::storage::ReplicaIdentityMode, Option<usize>), SqlError> {
+) -> Result<ReplicaIdentitySelection, SqlError> {
+    let mode = |mode| ReplicaIdentitySelection {
+        mode,
+        index: None,
+        key: None,
+    };
     match target {
         crate::sql::ast::ReplicaIdentityTarget::Default => {
-            Ok((crate::storage::ReplicaIdentityMode::Default, None))
+            Ok(mode(crate::storage::ReplicaIdentityMode::Default))
         }
         crate::sql::ast::ReplicaIdentityTarget::Full => {
-            Ok((crate::storage::ReplicaIdentityMode::Full, None))
+            Ok(mode(crate::storage::ReplicaIdentityMode::Full))
         }
         crate::sql::ast::ReplicaIdentityTarget::Nothing => {
-            Ok((crate::storage::ReplicaIdentityMode::Nothing, None))
+            Ok(mode(crate::storage::ReplicaIdentityMode::Nothing))
         }
         crate::sql::ast::ReplicaIdentityTarget::Index(name) => {
+            if let Some(key) = key_index_named(definition, &name) {
+                if key.deferrable {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use non-immediate index \"{}\" as replica identity",
+                        key.name.as_str()
+                    ));
+                }
+                for &column in &key.columns[..key.n_cols] {
+                    let column = definition.columns()[usize::from(column)];
+                    if !column.not_null.is_required() {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "index \"{}\" cannot be used as replica identity because column \"{}\" is nullable",
+                            key.name.as_str(),
+                            column.name.as_str()
+                        ));
+                    }
+                }
+                return Ok(ReplicaIdentitySelection {
+                    mode: crate::storage::ReplicaIdentityMode::Index,
+                    index: None,
+                    key: Some(key.identity),
+                });
+            }
             let schema = name.schema.unwrap_or(definition.schema.as_str());
             let slot = storage.index_slot(schema, name.name, txid).ok_or_else(|| {
                 sql_err!(
@@ -90915,7 +91174,11 @@ fn resolve_replica_identity_target<Definition0: crate::storage::DefinitionBackin
                 )
             })?;
             validate_replica_identity_index(storage, table_index, definition, slot, txid)?;
-            Ok((crate::storage::ReplicaIdentityMode::Index, Some(slot)))
+            Ok(ReplicaIdentitySelection {
+                mode: crate::storage::ReplicaIdentityMode::Index,
+                index: Some(slot),
+                key: None,
+            })
         }
     }
 }
@@ -90988,7 +91251,6 @@ fn validate_replica_identity_index<Definition0: crate::storage::DefinitionBackin
 
 struct ReplicaIdentityAlter<'a> {
     table_index: usize,
-    edit_target: crate::storage::TableDefinitionTarget,
     definition: TableDef,
     target: crate::sql::ast::ReplicaIdentityTarget<'a>,
 }
@@ -91004,11 +91266,10 @@ fn alter_table_replica_identity(
 ) -> Outcome {
     let ReplicaIdentityAlter {
         table_index,
-        edit_target,
         definition,
         target,
     } = alteration;
-    let (mode, selected) = match resolve_replica_identity_target(
+    let selection = match resolve_replica_identity_target(
         storage,
         table_index,
         &definition,
@@ -91018,11 +91279,35 @@ fn alter_table_replica_identity(
         Ok(selection) => selection,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = stage_replica_identity_selection(storage, wal, txn, table_index, selected) {
+    if let Err(error) =
+        stage_replica_identity_selection(storage, wal, txn, table_index, selection.index)
+    {
         return sql_fail(error);
     }
-    let mut next = TableDefBuilder::from_definition(&definition);
-    next.replica_identity = mode;
+    if let Err(error) = rewrite_table_metadata(storage, wal, txn, table_index, |next| {
+        next.replica_identity = selection.mode;
+        next.key_index_marks.replica_identity = selection.key;
+    }) {
+        return sql_fail(error);
+    }
+    if emit_completion {
+        responder.command_complete(tag)?;
+    }
+    sql_ok()
+}
+
+/// Replaces a table's definition with `update` applied, keeping its rows.
+fn rewrite_table_metadata(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    update: impl FnOnce(&mut TableDefBuilder),
+) -> Result<(), SqlError> {
+    let (edit_target, definition) = storage.select_table_definition(table_index, txn.txid);
+    let definition = &definition;
+    let mut next = TableDefBuilder::from_definition(definition);
+    update(&mut next);
     let mut mapping = [None; MAX_COLUMNS];
     let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
     for column in 0..definition.n_columns {
@@ -91031,7 +91316,7 @@ fn alter_table_replica_identity(
     }
     if definition.persistence != crate::storage::RelationPersistence::Temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::BeginTableRewrite {
@@ -91040,41 +91325,29 @@ fn alter_table_replica_identity(
                 preserve_rows: true,
                 column_mapping: wal_mapping,
             },
-        ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage
+        )?;
+        storage
             .prepare_table_key_names(edit_target, &mut next, &mapping)
-            .and_then(|()| storage.reserve_table_catalog_identities(&mut next))
-        {
-            return sql_fail(error);
-        }
+            .and_then(|()| storage.reserve_table_catalog_identities(&mut next))?;
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_index),
                 definition: (&next).into(),
             },
-        ) {
-            return sql_fail(error);
-        }
+        )?;
     }
-    if let Err(error) = txn.write_table_definition(
+    txn.write_table_definition(
         storage,
         edit_target,
         next,
         &mapping,
         false,
         crate::storage::ColumnSet::EMPTY,
-    ) {
-        return sql_fail(error);
-    }
-    if emit_completion {
-        responder.command_complete(tag)?;
-    }
-    sql_ok()
+    )
+    .map(|_| ())
 }
 
 /// Explicit backing relations attach to named keys. Keep both existing

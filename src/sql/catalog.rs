@@ -8265,7 +8265,16 @@ fn acl<'a>(
             && entry.object.slot != u16::MAX
     });
     if !storage.object_acl_defined(object, txid) {
-        return Ok(Datum::Null);
+        if !storage.is_initdb_template_database(object) {
+            return Ok(Datum::Null);
+        }
+        // initdb's `REVOKE CREATE, TEMPORARY ... FROM PUBLIC` leaves PUBLIC
+        // `CONNECT` ahead of the owner's privileges.
+        let owner = catalog_owner_name(storage, catalog_owner(storage, object, txid), txid);
+        let owner = super::types::acl_identifier(owner.as_str());
+        let public = stack_format!(160, "=c/{}", owner.as_str());
+        let owned = stack_format!(160, "{0}=CTc/{0}", owner.as_str());
+        return builtin_acl(&[public.as_str(), owned.as_str()], arena);
     }
     let values = arena
         .alloc_slice_with(storage.acl_entry_count() + 1, |_| Datum::Null)
@@ -8367,6 +8376,19 @@ fn acl<'a>(
         }
     }
     ordered[..ordered_count].sort_unstable_by_key(|(order, _)| *order);
+    // initdb writes a database-owned schema's ACL with `pg_database_owner`
+    // first, and later grants keep that item in place.
+    let database_owned = matches!(
+        catalog_owner(storage, object, txid),
+        CatalogOwner::DatabaseOwner
+    );
+    if database_owned
+        && let Some(position) = ordered[..ordered_count]
+            .iter()
+            .position(|(_, slot)| storage.acl_identity(*slot, txid) == (owner as u16, owner as u16))
+    {
+        ordered[..=position].rotate_right(1);
+    }
     for (position, (_, slot)) in ordered[..ordered_count].iter().copied().enumerate() {
         let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txid);
@@ -8387,8 +8409,13 @@ fn acl<'a>(
         if privileges.0 == 0 && !owner_entry {
             continue;
         }
-        let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-            .then(|| storage.role_name(grantee as usize, txid));
+        let grantee_name = (grantee != crate::storage::PUBLIC_ROLE).then(|| {
+            if database_owned && grantee == owner as u16 {
+                SqlName::parse("pg_database_owner").expect("built-in role fits")
+            } else {
+                storage.role_name(grantee as usize, txid)
+            }
+        });
         let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
         let grantor_name = if matches!(
             catalog_owner(storage, object, txid),
@@ -9228,6 +9255,7 @@ fn write_statistics_keys<const N: usize>(
                 parameters: &[],
                 joined: &[],
                 pretty: true,
+                domain_value: None,
             },
             source.as_str(),
             deparse::Destination::Value,
@@ -9351,6 +9379,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                     parameters: &[],
                     joined: &[],
                     pretty: false,
+                    domain_value: None,
                 },
                 expression.as_str(),
                 deparse::Destination::Value,
@@ -10003,7 +10032,13 @@ pub(crate) fn replica_identity_index_oid(
     let table_slot = (0..storage.table_count()).find(|slot| {
         storage.table_slot_visible_to(*slot, txid) && user_table_oid(storage, *slot) == relation_oid
     })?;
-    let mode = storage.table_def(table_slot, txid).replica_identity;
+    let definition = storage.table_def(table_slot, txid);
+    let mode = definition.replica_identity;
+    let key = definition
+        .key_index_marks
+        .replica_identity
+        .map(|key| key.oid());
+    drop(definition);
     let mut selected = None;
     visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot || selected.is_some() {
@@ -10015,7 +10050,9 @@ pub(crate) fn replica_identity_index_oid(
             }
             crate::storage::ReplicaIdentityMode::Index => index
                 .explicit_definition
-                .is_some_and(|definition| definition.replica_identity),
+                .map_or(key == Some(index.oid), |definition| {
+                    definition.replica_identity
+                }),
             crate::storage::ReplicaIdentityMode::Full
             | crate::storage::ReplicaIdentityMode::Nothing => false,
         };
@@ -12346,6 +12383,7 @@ fn write_sql_body(
         parameters: routine.parameters(),
         joined: &[],
         pretty: false,
+        domain_value: None,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
     let _formal = super::exec::enter_routine_parameter_types(
@@ -12923,6 +12961,7 @@ pub fn trigger_def_text<'a>(
                         parameters: &[],
                         joined: &joined,
                         pretty,
+                        domain_value: None,
                     },
                     when.as_str(),
                     deparse::Destination::Condition,
@@ -13041,6 +13080,7 @@ fn write_routine_arguments(
                 parameters: &[],
                 joined: &[],
                 pretty: false,
+                domain_value: None,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -15126,6 +15166,37 @@ fn append_constraint_attributes(
     }
 }
 
+/// The type a value of `type_oid` has under its domains (`getBaseType`):
+/// `type_oid` itself unless it is a domain.
+pub(crate) fn domain_root_type_oid(storage: &Storage, txid: u32, type_oid: i32) -> i32 {
+    let mut current = type_oid;
+    // Each step moves to a domain created earlier, so the walk ends.
+    while matches!(
+        crate::storage::NamedTypeKind::from_oid(current),
+        Some((crate::storage::NamedTypeKind::Domain, _, false))
+    ) {
+        let Some(slot) = (0..storage.domain_count()).find(|slot| {
+            storage.domain_slot_visible_to(*slot, txid)
+                && domain_oid(storage, *slot, txid) == current
+        }) else {
+            return current;
+        };
+        current = domain_base_oid(storage, &storage.domain_for(slot, txid), txid);
+    }
+    current
+}
+
+/// `pg_type.typbasetype` of a domain: its parent domain or its base type.
+fn domain_base_oid(storage: &Storage, domain: &crate::storage::DomainDef, txid: u32) -> i32 {
+    match domain.base_domain {
+        Some(parent) => storage
+            .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
+            .map(|slot| domain_oid(storage, slot, txid))
+            .expect("visible domain retains its parent identity"),
+        None => domain.base.oid(),
+    }
+}
+
 /// The schema-qualified foreign-key definition used by catalog clients and
 /// dump/restore.
 pub fn constraint_def_text<'a>(
@@ -15230,6 +15301,7 @@ pub fn constraint_def_text<'a>(
                 parameters: &[],
                 joined: &[],
                 pretty,
+                domain_value: None,
             };
             match deparse::deparse(
                 &context,
@@ -15289,7 +15361,23 @@ pub fn constraint_def_text<'a>(
                 txid,
                 arena,
             )?;
-            let _ = write!(rendered, "CHECK (({}))", expression);
+            let context = deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: &[],
+                joined: &[],
+                pretty,
+                domain_value: Some(domain_base_oid(storage, &domain, txid)),
+            };
+            match deparse::deparse(&context, expression, deparse::Destination::Condition, arena)? {
+                Some(deparsed) => {
+                    let _ = write!(rendered, "CHECK ({deparsed})");
+                }
+                None => {
+                    let _ = write!(rendered, "CHECK (({}))", expression);
+                }
+            }
             append_constraint_attributes(
                 &mut rendered,
                 crate::storage::ConstraintTiming::NotDeferrable,
@@ -16077,6 +16165,7 @@ pub fn index_def_text<'a>(
                     parameters: &[],
                     joined: &[],
                     pretty,
+                    domain_value: None,
                 },
                 predicate.as_str(),
                 deparse::Destination::Condition,
@@ -16148,6 +16237,7 @@ fn index_expression_display<'a>(
             parameters: &[],
             joined: &[],
             pretty,
+            domain_value: None,
         },
         source,
         deparse::Destination::Value,
@@ -19266,10 +19356,10 @@ fn pg_class<'a>(
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
                 // A foreign table has no table access method.
-                Datum::Int4(match table_def.access_method {
-                    _ if relkind == "f" => 0,
-                    crate::storage::TableAccessMethod::Heap => 2,
-                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
+                Datum::Int4(if relkind == "f" {
+                    0
+                } else {
+                    table_def.access_method.relam()
                 }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
@@ -19634,27 +19724,15 @@ fn pg_class<'a>(
         let mut option_count = 0;
         let options = view.options_for(txid);
         for option in options.order.names() {
-            option_values[option_count] = text(
-                match option {
-                    crate::sql::ast::ViewOptionName::SecurityInvoker => match options.security {
-                        crate::storage::ViewSecurity::Invoker => "security_invoker=true",
-                        crate::storage::ViewSecurity::Definer => "security_invoker=false",
-                    },
-                    crate::sql::ast::ViewOptionName::SecurityBarrier => {
-                        match options.security_barrier.reloption() {
-                            Some(true) => "security_barrier=true",
-                            Some(false) => "security_barrier=false",
-                            None => unreachable!("listed view options are set"),
-                        }
-                    }
-                    crate::sql::ast::ViewOptionName::CheckOption => match options.check_option {
-                        Some(crate::storage::ViewCheckOption::Local) => "check_option=local",
-                        Some(crate::storage::ViewCheckOption::Cascaded) => "check_option=cascaded",
-                        None => unreachable!("listed view options are set"),
-                    },
-                },
-                arena,
-            )?;
+            let mut listed = crate::util::StackStr::<32>::new();
+            let name = match option {
+                crate::sql::ast::ViewOptionName::SecurityInvoker => "security_invoker",
+                crate::sql::ast::ViewOptionName::SecurityBarrier => "security_barrier",
+                crate::sql::ast::ViewOptionName::CheckOption => "check_option",
+            };
+            write!(listed, "{name}={}", options.order.spelling(option))
+                .map_err(|_| super::eval::arena_full())?;
+            option_values[option_count] = text(listed.as_str(), arena)?;
             option_count += 1;
         }
         let reloptions = if option_count != 0 {
@@ -21225,6 +21303,11 @@ fn pg_index<'a>(
         }
         attributes[info.n_cols..info.n_cols + info.n_include_cols]
             .copy_from_slice(&info.include_columns[..info.n_include_cols]);
+        // A key index carries its marks on its table.
+        let marks = storage.table_def(info.table_slot, txid).key_index_marks;
+        let key_marked = |mark: Option<crate::storage::RelationIdentity>| {
+            mark.map(|mark| mark.oid()) == Some(info.oid)
+        };
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -21233,7 +21316,9 @@ fn pg_index<'a>(
                 Datum::Bool(info.is_unique),
                 Datum::Bool(
                     info.explicit_definition
-                        .is_some_and(|definition| definition.clustered),
+                        .map_or(key_marked(marks.clustered), |definition| {
+                            definition.clustered
+                        }),
                 ),
                 Datum::Bool(false), // indischeckxmin
                 Datum::Bool(
@@ -21248,7 +21333,9 @@ fn pg_index<'a>(
                 ),
                 Datum::Bool(
                     info.explicit_definition
-                        .is_some_and(|definition| definition.replica_identity),
+                        .map_or(key_marked(marks.replica_identity), |definition| {
+                            definition.replica_identity
+                        }),
                 ),
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
@@ -26999,13 +27086,7 @@ fn pg_type<'a>(
         if !storage.domain_slot_visible_to(slot, txid) {
             continue;
         }
-        let base_oid = match d.base_domain {
-            Some(parent) => storage
-                .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
-                .map(|slot| domain_oid(storage, slot, txid))
-                .expect("visible domain retains its parent identity"),
-            None => d.base.oid(),
-        };
+        let base_oid = domain_base_oid(storage, &d, txid);
         let array_oid =
             crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
         // A domain and its array take the base type's default collation.

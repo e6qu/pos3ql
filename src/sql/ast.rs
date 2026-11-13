@@ -125,18 +125,25 @@ impl ViewSecurityBarrier {
 /// PostgreSQL's three view options.  Parsing them as a closed state keeps a
 /// later executor from treating a misspelled option as inert catalog text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewOption {
+pub enum ViewOptionValue {
     CheckOption(ViewCheckOption),
     SecurityBarrier(bool),
     SecurityInvoker(bool),
 }
 
+/// A view option with its value as written, which `reloptions` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewOption {
+    pub value: ViewOptionValue,
+    pub spelling: crate::storage::ReloptionSpelling,
+}
+
 impl ViewOption {
     pub const fn name(self) -> ViewOptionName {
-        match self {
-            Self::CheckOption(_) => ViewOptionName::CheckOption,
-            Self::SecurityBarrier(_) => ViewOptionName::SecurityBarrier,
-            Self::SecurityInvoker(_) => ViewOptionName::SecurityInvoker,
+        match self.value {
+            ViewOptionValue::CheckOption(_) => ViewOptionName::CheckOption,
+            ViewOptionValue::SecurityBarrier(_) => ViewOptionName::SecurityBarrier,
+            ViewOptionValue::SecurityInvoker(_) => ViewOptionName::SecurityInvoker,
         }
     }
 }
@@ -3919,6 +3926,9 @@ impl RelationStorageOptionNames {
 /// durable relation definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableAccessMethod<'a> {
+    /// No `USING` clause: a partitioned table records none, and any other
+    /// table takes its partition parent's or `default_table_access_method`.
+    Unspecified,
     Heap,
     /// A syntactically valid access-method name whose catalog resolution is
     /// deferred to execution. It cannot reach storage unless it resolves to
@@ -4895,6 +4905,9 @@ pub struct DropTable<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnDef<'a> {
+    /// Where the definition starts, which orders it among the table's
+    /// constraints as PostgreSQL numbers them.
+    pub source_position: SourcePosition,
     pub name: &'a str,
     pub type_name: &'a str,
     /// PostgreSQL atttypmod for the declared type: -1 when no `(...)` modifier.

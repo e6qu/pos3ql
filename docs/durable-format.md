@@ -161,7 +161,7 @@ inserts a missing writer.
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw15` | View position and stamp, return-rule position and stamp, encoded query, the security, barrier, check-option and `reloptions` order codes, then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
+| `vw15` | View position and stamp, return-rule position and stamp, encoded query, the security, barrier and check-option codes, the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |

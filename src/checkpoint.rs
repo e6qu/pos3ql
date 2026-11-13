@@ -4351,7 +4351,9 @@ impl Checkpointer {
                     };
                     let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
                     let access_method: i32 = parse_field(words.next(), "table access method")?;
-                    let access_method = if access_method == 2 {
+                    let access_method = if access_method == 0 {
+                        crate::storage::TableAccessMethod::Unspecified
+                    } else if access_method == 2 {
                         crate::storage::TableAccessMethod::Heap
                     } else {
                         crate::storage::TableAccessMethod::Catalog(
@@ -4360,11 +4362,6 @@ impl Checkpointer {
                             )?,
                         )
                     };
-                    if storage.table_access_method_name(access_method, 0).is_none() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "table references an unknown access method",
-                        ));
-                    }
                     let inheritance_count: usize =
                         parse_field(words.next(), "table inheritance count")?;
                     if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
@@ -5043,7 +5040,7 @@ impl Checkpointer {
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
-                Some("rls") => {
+                Some("rls2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("rls outside table"));
                     };
@@ -5063,6 +5060,11 @@ impl Checkpointer {
                         parse_field(words.next(), "replica identity mode")?,
                     )
                     .ok_or(CheckpointSetupError::Corrupt("replica identity mode"))?;
+                    def.key_index_marks = crate::storage::KeyIndexMarks::decode([
+                        parse_field(words.next(), "clustered key index")?,
+                        parse_field(words.next(), "replica identity key index")?,
+                    ])
+                    .ok_or(CheckpointSetupError::Corrupt("key index marks"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rls fields"));
                     }
@@ -10822,10 +10824,7 @@ impl Checkpointer {
                     crate::storage::TableKind::Foreign => 1,
                 },
                 definition.tablespace,
-                match definition.access_method {
-                    crate::storage::TableAccessMethod::Heap => 2,
-                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
-                },
+                definition.access_method.relam(),
                 definition.inheritance.parents_ref().len(),
             )
             .map_err(|_| {
@@ -10918,10 +10917,12 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rls {} {} {}",
+                    "rls2 {} {} {} {} {}",
                     u8::from(definition.row_level_security.enabled),
                     u8::from(definition.row_level_security.forced),
                     definition.replica_identity.code(),
+                    definition.key_index_marks.encode()[0],
+                    definition.key_index_marks.encode()[1],
                 ),
             )?;
             for (column, c) in definition.columns().iter().enumerate() {
@@ -11640,7 +11641,7 @@ impl Checkpointer {
                     view.options.encode()[0],
                     view.options.encode()[1],
                     view.options.encode()[2],
-                    view.options.encode()[3],
+                    ManifestInputBytes(&view.options.order.encode()),
                     ManifestViewColumns(view.columns),
                     ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
@@ -18131,6 +18132,11 @@ fn finish_pending(
                 "manifest column count mismatch",
             ));
         }
+        if !storage.table_access_method_valid(&definition, 0) {
+            return Err(CheckpointSetupError::Corrupt(
+                "table references an unknown access method",
+            ));
+        }
         let slot = if storage
             .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
         {
@@ -19090,10 +19096,18 @@ fn load_view(
         "view security missing",
         "view security barrier missing",
         "view check option missing",
-        "view option order missing",
     ]) {
         *code = parse_field::<u8>(words.next(), what)?;
     }
+    let listed = decode_manifest_hex_bytes(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("view option list missing"))?,
+    )?;
+    if listed.len() != crate::storage::ViewOptionOrder::ENCODED_BYTES {
+        return Err(CheckpointSetupError::Corrupt("invalid view option list"));
+    }
+    option_codes[3..].copy_from_slice(&listed);
     let options = crate::storage::ViewOptions::decode(option_codes)
         .ok_or(CheckpointSetupError::Corrupt("invalid view options"))?;
     let encoded_columns = words

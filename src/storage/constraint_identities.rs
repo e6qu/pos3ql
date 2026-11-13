@@ -375,10 +375,161 @@ pub(crate) fn validate_constraint_lifetimes(
     Ok(())
 }
 
+/// A key or exclusion constraint of a table being created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclaredKey {
+    /// The compact single-column key on this column.
+    Column(u16),
+    /// `uniques[i]`.
+    Unique(u16),
+    /// `exclusions[i]`.
+    Exclusion(u16),
+}
+
+const MAX_DECLARED_KEYS: usize = super::MAX_COLUMNS + super::MAX_UNIQUES + super::MAX_EXCLUSIONS;
+
+/// The order CREATE TABLE declared its NOT NULL, key and exclusion
+/// constraints in, by which PostgreSQL numbers them: NOT NULL constraints
+/// declared on a column in column order, then a table primary key's other
+/// columns; the primary key, then the other keys and exclusion constraints
+/// as written.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConstraintDeclarationOrder {
+    declared_not_null: super::ColumnSet,
+    keys: [DeclaredKey; MAX_DECLARED_KEYS],
+    count: usize,
+}
+
+impl ConstraintDeclarationOrder {
+    pub(crate) const fn new() -> Self {
+        Self {
+            declared_not_null: super::ColumnSet::EMPTY,
+            keys: [DeclaredKey::Column(0); MAX_DECLARED_KEYS],
+            count: 0,
+        }
+    }
+
+    /// Column `column` is NOT NULL by its own definition (`NOT NULL` or
+    /// `PRIMARY KEY`).
+    pub(crate) fn declare_not_null(&mut self, column: usize) {
+        self.declared_not_null.insert(column);
+    }
+
+    /// Appends the next declared key; a repeat keeps its first position.
+    pub(crate) fn declare_key(&mut self, key: DeclaredKey) {
+        if !self.keys[..self.count].contains(&key) && self.count < MAX_DECLARED_KEYS {
+            self.keys[self.count] = key;
+            self.count += 1;
+        }
+    }
+
+    fn keys(&self) -> &[DeclaredKey] {
+        &self.keys[..self.count]
+    }
+}
+
+/// `definition`'s key and exclusion identities, primary key first and then
+/// in `declared` order, each with its constraint and index identity; keys
+/// `declared` does not name follow in the definition's own order.
+pub(super) fn for_each_key_in_creation_order(
+    definition: &mut super::TableDefBuilder,
+    declared: Option<&ConstraintDeclarationOrder>,
+    mut visit: impl FnMut(
+        &mut Option<ConstraintIdentity>,
+        &mut Option<super::RelationIdentity>,
+    ) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let attributes = usize::from(definition.attributes.count);
+    let attribute_of = |definition: &super::TableDefBuilder, column: usize| {
+        (0..attributes).find(|&attribute| {
+            definition.attributes.slots[attribute]
+                == super::column_attributes::AttributeSlot::Live(column as u16)
+        })
+    };
+    let mut order = [DeclaredKey::Column(0); MAX_DECLARED_KEYS];
+    let mut count = 0;
+    let mut push = |key: DeclaredKey| {
+        if !order[..count].contains(&key) && count < MAX_DECLARED_KEYS {
+            order[count] = key;
+            count += 1;
+        }
+    };
+    let compact = |definition: &super::TableDefBuilder, column: usize, primary: bool| {
+        let column = &definition.columns[column];
+        if primary {
+            column.primary
+        } else {
+            column.unique
+        }
+    };
+    for attribute in 0..attributes {
+        if let super::column_attributes::AttributeSlot::Live(column) =
+            definition.attributes.slots[attribute]
+            && compact(definition, usize::from(column), true)
+        {
+            push(DeclaredKey::Column(column));
+        }
+    }
+    for (index, key) in definition.uniques().iter().enumerate() {
+        if key.kind.is_primary() {
+            push(DeclaredKey::Unique(index as u16));
+        }
+    }
+    let valid = |definition: &super::TableDefBuilder, key: DeclaredKey| match key {
+        DeclaredKey::Column(column) => {
+            usize::from(column) < definition.n_columns
+                && compact(definition, usize::from(column), false)
+        }
+        DeclaredKey::Unique(index) => usize::from(index) < definition.n_uniques,
+        DeclaredKey::Exclusion(index) => usize::from(index) < definition.n_exclusions,
+    };
+    for &key in declared.map_or(&[][..], ConstraintDeclarationOrder::keys) {
+        if valid(definition, key) {
+            push(key);
+        }
+    }
+    for attribute in 0..attributes {
+        if let super::column_attributes::AttributeSlot::Live(column) =
+            definition.attributes.slots[attribute]
+            && compact(definition, usize::from(column), false)
+        {
+            push(DeclaredKey::Column(column));
+        }
+    }
+    for index in 0..definition.n_uniques {
+        push(DeclaredKey::Unique(index as u16));
+    }
+    for index in 0..definition.n_exclusions {
+        push(DeclaredKey::Exclusion(index as u16));
+    }
+    for &key in &order[..count] {
+        match key {
+            DeclaredKey::Column(column) => {
+                let attribute = attribute_of(definition, usize::from(column))
+                    .expect("a compact key's column is live");
+                visit(
+                    &mut definition.inline_constraint_identities[attribute],
+                    &mut definition.inline_index_identities[attribute],
+                )?;
+            }
+            DeclaredKey::Unique(index) => {
+                let key = &mut definition.uniques[usize::from(index)];
+                visit(&mut key.identity, &mut key.index_identity)?;
+            }
+            DeclaredKey::Exclusion(index) => {
+                let exclusion = &mut definition.exclusions[usize::from(index)];
+                visit(&mut exclusion.identity, &mut exclusion.index_identity)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Storage {
     pub(super) fn reserve_constraint_identities(
         &self,
         definition: &mut super::TableDefBuilder,
+        declared: Option<&ConstraintDeclarationOrder>,
     ) -> Result<(), SqlError> {
         for (identity, slot) in definition
             .attribute_identities
@@ -414,17 +565,19 @@ impl Storage {
                 *identity = None;
             }
         }
-        self.reserve_table_constraints_in_creation_order(definition)?;
+        self.reserve_table_constraints_in_creation_order(definition, declared)?;
         validate_constraint_identities(definition.constraint_identities())
     }
 
     /// Stamps new table constraints in the order PostgreSQL's CREATE TABLE
     /// assigns their OIDs: column defaults, CHECK constraints, NOT NULL
-    /// constraints (primary key columns last, in key order), the primary key,
-    /// the other keys and exclusion constraints, then foreign keys.
+    /// constraints (a table primary key's undeclared columns last, in key
+    /// order), the primary key, the other keys and exclusion constraints as
+    /// `declared`, then foreign keys.
     fn reserve_table_constraints_in_creation_order(
         &self,
         definition: &mut super::TableDefBuilder,
+        declared: Option<&ConstraintDeclarationOrder>,
     ) -> Result<(), SqlError> {
         let reserve = |identity: &mut Option<ConstraintIdentity>| -> Result<(), SqlError> {
             if identity.is_none() {
@@ -473,10 +626,13 @@ impl Storage {
             live_column(definition, attribute)
                 .filter(|&column| definition.columns[column].not_null.is_required())
         };
+        let declared_not_null = |column: usize| {
+            declared.is_some_and(|declared| declared.declared_not_null.contains(column))
+        };
         for attribute in 0..attributes {
-            if not_null(definition, attribute)
-                .is_some_and(|column| !primary.contains(&(column as u16)))
-            {
+            if not_null(definition, attribute).is_some_and(|column| {
+                !primary.contains(&(column as u16)) || declared_not_null(column)
+            }) {
                 reserve(&mut definition.attribute_identities[attribute].not_null)?;
             }
         }
@@ -487,37 +643,7 @@ impl Storage {
                 reserve(&mut definition.attribute_identities[attribute].not_null)?;
             }
         }
-        let inline_key = |definition: &super::TableDefBuilder, attribute: usize, primary: bool| {
-            live_column(definition, attribute).is_some_and(|column| {
-                let column = &definition.columns[column];
-                if primary {
-                    column.primary
-                } else {
-                    column.unique && !column.primary
-                }
-            })
-        };
-        for attribute in 0..attributes {
-            if inline_key(definition, attribute, true) {
-                reserve(&mut definition.inline_constraint_identities[attribute])?;
-            }
-        }
-        for key in &mut definition.uniques[..definition.n_uniques] {
-            if key.kind.is_primary() {
-                reserve(&mut key.identity)?;
-            }
-        }
-        for attribute in 0..attributes {
-            if inline_key(definition, attribute, false) {
-                reserve(&mut definition.inline_constraint_identities[attribute])?;
-            }
-        }
-        for key in &mut definition.uniques[..definition.n_uniques] {
-            reserve(&mut key.identity)?;
-        }
-        for exclusion in &mut definition.exclusions[..definition.n_exclusions] {
-            reserve(&mut exclusion.identity)?;
-        }
+        for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
         for key in &mut definition.fkeys[..definition.n_fkeys] {
             reserve(&mut key.identity)?;
         }

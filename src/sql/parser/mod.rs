@@ -6674,26 +6674,40 @@ impl<'a> Parser<'a> {
         ),
         ParseError,
     > {
-        use crate::sql::ast::{RelationStorageOptions, ViewCheckOption, ViewOption};
+        use crate::sql::ast::{
+            RelationStorageOptions, ViewCheckOption, ViewOption, ViewOptionValue,
+        };
         let mut storage = RelationStorageOptions::DEFAULT;
-        let mut options = [ViewOption::SecurityInvoker(false); 3];
+        let mut options = [ViewOption {
+            value: ViewOptionValue::SecurityInvoker(false),
+            spelling: crate::storage::ReloptionSpelling::EMPTY,
+        }; 3];
         let mut count = 0usize;
         let mut seen = [false; 4];
         loop {
             let option = self.any_ident("relation option name")?;
             let index = if option.eq_ignore_ascii_case("security_invoker") {
-                options[count] = ViewOption::SecurityInvoker(self.reloption_bool(option)?);
+                let (enabled, spelling) = self.reloption_bool(option)?;
+                options[count] = ViewOption {
+                    value: ViewOptionValue::SecurityInvoker(enabled),
+                    spelling,
+                };
                 0
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                options[count] = ViewOption::SecurityBarrier(self.reloption_bool(option)?);
+                let (enabled, spelling) = self.reloption_bool(option)?;
+                options[count] = ViewOption {
+                    value: ViewOptionValue::SecurityBarrier(enabled),
+                    spelling,
+                };
                 1
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
                 let value = match self.peeked {
-                    Tok::Ident(value) | Tok::Str(value) => value,
+                    Tok::Ident(value) | Tok::QuotedIdent(value) | Tok::Str(value) => value,
                     _ => return Err(self.syntax_error_here()),
                 };
-                let value = if value.eq_ignore_ascii_case("local") {
+                let spelling = crate::storage::ReloptionSpelling::new(value);
+                let checked = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
@@ -6713,7 +6727,10 @@ impl<'a> Parser<'a> {
                     });
                 };
                 self.advance()?;
-                options[count] = ViewOption::CheckOption(value);
+                options[count] = ViewOption {
+                    value: ViewOptionValue::CheckOption(checked),
+                    spelling: spelling.expect("check option values are spellings"),
+                };
                 2
             } else if option.eq_ignore_ascii_case("fillfactor") {
                 self.expect_op("=")?;
@@ -6736,11 +6753,18 @@ impl<'a> Parser<'a> {
         Ok((storage, self.arena_slice(&options[..count])?))
     }
 
-    /// A boolean reloption: absent means `true`; otherwise any spelling
-    /// PostgreSQL's `parse_bool` accepts (`on`, `yes`, `1`, `t`, `of`, ...).
-    fn reloption_bool(&mut self, option: &str) -> Result<bool, ParseError> {
+    /// A boolean reloption and its spelling: absent means `true`; otherwise
+    /// any spelling PostgreSQL's `parse_bool` accepts (`on`, `yes`, `1`,
+    /// `t`, `of`, ...).
+    fn reloption_bool(
+        &mut self,
+        option: &str,
+    ) -> Result<(bool, crate::storage::ReloptionSpelling), ParseError> {
         if !self.eat_op("=")? {
-            return Ok(true);
+            return Ok((
+                true,
+                crate::storage::ReloptionSpelling::new("true").expect("a spelling"),
+            ));
         }
         let at = self.peek_at;
         let value = match self.peeked {
@@ -6754,6 +6778,7 @@ impl<'a> Parser<'a> {
         (value.trim() == value)
             .then(|| crate::sql::eval::parse_bool(value).ok())
             .flatten()
+            .zip(crate::storage::ReloptionSpelling::new(value))
             .ok_or_else(|| {
                 Self::invalid_reloption(
                     at,
@@ -7466,6 +7491,7 @@ impl<'a> Parser<'a> {
             let clauses = self.column_clauses(name, table, false, column_constraints)?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
+                    source_position: constraint_at,
                     name,
                     type_name,
                     type_mod,

@@ -1606,6 +1606,7 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
             make_def("unowned_table", &[("id", ColType::Int4, false)]),
             CatalogAllocation::New,
             TableCreation::Pending(7),
+            None,
         ));
         assert_eq!(storage.catalog_sequence.current(), sequence);
         assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
@@ -5323,6 +5324,7 @@ fn index_statistics_admission_exhaustion_preserves_catalogs_and_active_readers()
             table_definition,
             CatalogAllocation::New,
             table_creation::TableCreation::Committed,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -5446,6 +5448,7 @@ fn index_statistics_source_pins_survive_table_slot_reuse_without_cross_database_
             definition,
             CatalogAllocation::New,
             table_creation::TableCreation::Committed,
+            None,
         )
         .unwrap();
         assert_eq!(new, old);

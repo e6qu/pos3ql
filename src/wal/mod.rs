@@ -1175,7 +1175,8 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
     n += def.attributes.encoded_len();
     n += match def.access_method {
-        crate::storage::TableAccessMethod::Heap => 1,
+        crate::storage::TableAccessMethod::Unspecified
+        | crate::storage::TableAccessMethod::Heap => 1,
         crate::storage::TableAccessMethod::Catalog(_) => 5,
     };
     for (column, c) in def.columns().iter().enumerate() {
@@ -1247,7 +1248,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         }
     };
     n += 1;
-    n += 3;
+    n += 3 + 16;
     n += def
         .inline_key_names()
         .iter()
@@ -1290,6 +1291,7 @@ fn append_table_payload<B: DefinitionBacking>(
         crate::storage::TableAccessMethod::Catalog(oid) => {
             buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
         }
+        crate::storage::TableAccessMethod::Unspecified => buffer.append(&[2]),
     };
     ok &= def.attributes.append(buffer);
     for (column, c) in def.columns().iter().enumerate() {
@@ -1408,6 +1410,9 @@ fn append_table_payload<B: DefinitionBacking>(
         u8::from(def.row_level_security.forced),
         def.replica_identity.code(),
     ]);
+    for stamp in def.key_index_marks.encode() {
+        ok &= buffer.append(&stamp.to_le_bytes());
+    }
     for key in def.inline_key_names() {
         ok &= buffer.append(&key.attribute.to_le_bytes()) && name_bytes(buffer, key.name.as_str());
     }
@@ -8303,6 +8308,10 @@ fn decode_op_inner<'a>(
                     at += 4;
                     access_method
                 }
+                2 => {
+                    at += 1;
+                    crate::storage::TableAccessMethod::Unspecified
+                }
                 _ => return None,
             };
             let attributes = crate::storage::column_attributes::ColumnAttributes::<
@@ -8614,6 +8623,12 @@ fn decode_op_inner<'a>(
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
+            let mut stamps = [0u64; 2];
+            for stamp in &mut stamps {
+                *stamp = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+            }
+            def.key_index_marks = crate::storage::KeyIndexMarks::decode(stamps)?;
             let inline_keys = def
                 .columns()
                 .iter()
@@ -16355,9 +16370,18 @@ mod tests {
             security_barrier: crate::storage::ViewSecurityBarrier::Enabled,
             check_option: Some(crate::storage::ViewCheckOption::Cascaded),
             order: crate::storage::ViewOptionOrder::EMPTY
-                .with_last(crate::sql::ast::ViewOptionName::CheckOption)
-                .with_last(crate::sql::ast::ViewOptionName::SecurityInvoker)
-                .with_last(crate::sql::ast::ViewOptionName::SecurityBarrier),
+                .with_last(
+                    crate::sql::ast::ViewOptionName::CheckOption,
+                    crate::storage::ReloptionSpelling::new("CASCADED").unwrap(),
+                )
+                .with_last(
+                    crate::sql::ast::ViewOptionName::SecurityInvoker,
+                    crate::storage::ReloptionSpelling::new("on").unwrap(),
+                )
+                .with_last(
+                    crate::sql::ast::ViewOptionName::SecurityBarrier,
+                    crate::storage::ReloptionSpelling::new("1").unwrap(),
+                ),
         };
         assert!(append_payload(
             &mut payload,

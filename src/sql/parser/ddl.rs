@@ -4808,7 +4808,7 @@ impl<'a> Parser<'a> {
     /// MATERIALIZED VIEW before their AS query. The closed output is consumed
     /// directly by the durable backing relation definition.
     fn table_as_options(&mut self) -> Result<crate::sql::ast::TableAsOptions<'a>, ParseError> {
-        let mut access_method = TableAccessMethod::Heap;
+        let mut access_method = TableAccessMethod::Unspecified;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
         let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;
@@ -5684,7 +5684,7 @@ impl<'a> Parser<'a> {
                 membership: TableMembership::None,
                 persistence: RelationPersistence::Permanent,
                 on_commit: crate::sql::ast::OnCommitAction::PreserveRows,
-                access_method: TableAccessMethod::Heap,
+                access_method: TableAccessMethod::Unspecified,
                 tablespace: None,
                 storage_options: RelationStorageOptions::DEFAULT,
                 if_not_exists: false,
@@ -6507,20 +6507,20 @@ impl<'a> Parser<'a> {
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             for option in self.view_options()? {
-                option_order = option_order.with_last(option.name());
-                match option {
-                    crate::sql::ast::ViewOption::SecurityInvoker(enabled) => {
-                        security = if *enabled {
+                option_order = option_order.with_last(option.name(), option.spelling);
+                match option.value {
+                    crate::sql::ast::ViewOptionValue::SecurityInvoker(enabled) => {
+                        security = if enabled {
                             ViewSecurity::Invoker
                         } else {
                             ViewSecurity::Definer
                         };
                     }
-                    crate::sql::ast::ViewOption::CheckOption(option) => {
-                        check_option = Some(*option);
+                    crate::sql::ast::ViewOptionValue::CheckOption(option) => {
+                        check_option = Some(option);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(enabled) => {
-                        security_barrier = ViewSecurityBarrier::from_enabled(*enabled);
+                    crate::sql::ast::ViewOptionValue::SecurityBarrier(enabled) => {
+                        security_barrier = ViewSecurityBarrier::from_enabled(enabled);
                     }
                 }
             }
@@ -6540,12 +6540,20 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("cascaded")?;
                 crate::sql::ast::ViewCheckOption::Cascaded
             };
+            // PostgreSQL lists the clause as `check_option=local` or
+            // `check_option=cascaded`.
+            let spelling = crate::storage::ReloptionSpelling::new(match option {
+                crate::sql::ast::ViewCheckOption::Local => "local",
+                crate::sql::ast::ViewCheckOption::Cascaded => "cascaded",
+            })
+            .expect("check option values are spellings");
             self.expect_ident("check")?;
             self.expect_ident("option")?;
             if check_option.replace(option).is_some() {
                 return Err(Self::duplicate_reloption(at, "check_option"));
             }
-            option_order = option_order.with_last(crate::sql::ast::ViewOptionName::CheckOption);
+            option_order =
+                option_order.with_last(crate::sql::ast::ViewOptionName::CheckOption, spelling);
         }
         Ok(Stmt::CreateView {
             name,
@@ -8353,7 +8361,7 @@ impl<'a> Parser<'a> {
                     TableAccessMethod::Named(method)
                 }
             } else {
-                TableAccessMethod::Heap
+                TableAccessMethod::Unspecified
             };
             let tablespace = if self.eat_ident("tablespace")? {
                 Some(self.col_ident("tablespace name")?)
@@ -8430,7 +8438,7 @@ impl<'a> Parser<'a> {
             if foreign {
                 return Err(self.err_here("CREATE FOREIGN TABLE OF is not supported by PostgreSQL"));
             }
-            let mut access_method = TableAccessMethod::Heap;
+            let mut access_method = TableAccessMethod::Unspecified;
             let mut tablespace = None;
             let mut storage_options = RelationStorageOptions::DEFAULT;
             loop {
@@ -8473,6 +8481,7 @@ impl<'a> Parser<'a> {
         // list has that identifier immediately followed by `,` or `)`; a column
         // definition has a type after it.
         let mut pending_first_col = None;
+        let first_at = self.peek_at;
         if matches!(self.peeked, Tok::Ident(w)
             if !matches!(w, "like" | "constraint" | "primary" | "unique" | "check" | "foreign"))
         {
@@ -8503,7 +8512,7 @@ impl<'a> Parser<'a> {
                 );
             }
             // Otherwise it is a column definition whose name we already read.
-            pending_first_col = Some(first_ident);
+            pending_first_col = Some((first_at, first_ident));
         }
         let mut columns = ArenaList::new(self.arena);
         let mut cons = ArenaList::new(self.arena);
@@ -8519,7 +8528,7 @@ impl<'a> Parser<'a> {
             // The first column's name was pre-read to tell a definition list
             // from a `CREATE TABLE ... AS` column-name list; use it, skipping the
             // LIKE / constraint forms it cannot be.
-            let col_name = if let Some(pre_read) = pending_first_col.take() {
+            let (column_at, col_name) = if let Some(pre_read) = pending_first_col.take() {
                 pre_read
             } else {
                 // `LIKE source [INCLUDING ...]` copies another table's columns in
@@ -8567,7 +8576,7 @@ impl<'a> Parser<'a> {
                 if cons_name.is_some() {
                     return Err(self.syntax_error_here());
                 }
-                self.col_ident("column name")?
+                (constraint_at, self.col_ident("column name")?)
             };
             let warnings_before = self.warnings.len();
             let (type_name, type_mod) = self.type_name_mod()?;
@@ -8608,6 +8617,7 @@ impl<'a> Parser<'a> {
             self.push(
                 &mut columns,
                 ColumnDef {
+                    source_position: SourcePosition::new(Some(column_at)),
                     name: col_name,
                     type_name,
                     type_mod,
@@ -8645,7 +8655,7 @@ impl<'a> Parser<'a> {
         } else {
             PartitionClause::None
         };
-        let mut access_method = TableAccessMethod::Heap;
+        let mut access_method = TableAccessMethod::Unspecified;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
         let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;

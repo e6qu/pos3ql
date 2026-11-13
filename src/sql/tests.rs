@@ -1604,7 +1604,9 @@ fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoin
     const QUERIES: &str = "SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
          SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
     const AFTER: &str = "ALTER VIEW ad_v ALTER a SET DEFAULT 6;
+         ALTER TABLE ad_t ALTER b DROP EXPRESSION;
          ALTER TABLE ad_t ALTER a TYPE bigint;
+         ALTER TABLE ad_t ALTER b SET DEFAULT 0;
          SELECT count(*) = 0 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity;
          SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
     for checkpoint in [false, true] {

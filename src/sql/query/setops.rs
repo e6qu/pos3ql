@@ -140,11 +140,11 @@ pub fn set_query<'a>(
     if let Err(e) = sort_set_rows(storage, txid, arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
-    let offset = match exec::eval_offset_pub(q.offset, arena, params, &bound_hooks) {
+    let offset = match exec::eval_offset_pub(q.offset, arena, params, &bound_hooks, None) {
         Ok(o) => o,
         Err(e) => return sql_fail(e),
     };
-    let limit = match exec::eval_limit_pub(q.limit, arena, params, &bound_hooks) {
+    let limit = match exec::eval_limit_pub(q.limit, arena, params, &bound_hooks, None) {
         Ok(l) => l,
         Err(e) => return sql_fail(e),
     };
@@ -293,8 +293,8 @@ pub(crate) fn set_query_into_rows<'a>(
         query.order_by,
         &columns[..column_count],
     )?;
-    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks)?;
-    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks)?;
+    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks, None)?;
+    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks, None)?;
     let start = (offset as usize).min(rows.len());
     let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
     if query.with_ties && limit > 0 && end < rows.len() && end > start {
@@ -808,8 +808,8 @@ pub(crate) fn external_set_body_into<'a>(
     else {
         return Ok(());
     };
-    let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks)?;
-    let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks)?;
+    let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks, outer)?;
+    let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks, outer)?;
     // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
     // output without ORDER BY retains the multiset merge order.
     let run = if order_by.is_empty() {
@@ -916,11 +916,11 @@ fn external_set_query<'a>(
         Ok(run) => run,
         Err(error) => return sql_fail(error),
     };
-    let offset = match exec::eval_offset_pub(query.offset, arena, params, &bound_hooks) {
+    let offset = match exec::eval_offset_pub(query.offset, arena, params, &bound_hooks, None) {
         Ok(offset) => offset,
         Err(error) => return sql_fail(error),
     };
-    let limit = match exec::eval_limit_pub(query.limit, arena, params, &bound_hooks) {
+    let limit = match exec::eval_limit_pub(query.limit, arena, params, &bound_hooks, None) {
         Ok(limit) => limit,
         Err(error) => return sql_fail(error),
     };

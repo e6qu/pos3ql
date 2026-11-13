@@ -5961,6 +5961,7 @@ fn infer_type_unpositioned(
                 Expr::QuantifiedSubquery { operator, .. } => *operator,
                 _ => crate::sql::ast::BinaryOp::Eq,
             };
+            crate::sql::query::check_sublink_columns(expression, operand, select)?;
             if crate::sql::eval::row_constructor_fields(operand).is_none()
                 && let Some((column_oid, _)) = columns.subquery_type(&Expr::Subquery(select))?
             {

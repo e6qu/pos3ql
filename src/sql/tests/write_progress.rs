@@ -187,6 +187,16 @@ impl ColdTable {
         self.run_held(sql, extended, true, during_wait)
     }
 
+    /// Commits the writer's implicit transaction, as a Sync message does
+    /// after extended-protocol statements.
+    fn sync(&mut self) {
+        if self.writer.transaction.is_implicit() {
+            self.engine
+                .commit_txn(&mut self.writer.transaction, &self.writer.guc)
+                .unwrap();
+        }
+    }
+
     fn rows(&mut self, sql: &str) -> Vec<String> {
         self.run(sql, false, |_, _| {});
         let output = self.writer.send.readable().to_vec();
@@ -1187,6 +1197,11 @@ fn restartable_statements_finish_without_block_caches() {
                 let mut rows = data_rows(&output);
                 rows.sort();
                 assert_eq!(rows, returned, "{context}");
+                // Without a Sync the BEGIN below would take the extended
+                // statement into its block, and the ROLLBACK would erase it.
+                if extended {
+                    cold.sync();
+                }
                 // Reading synchronously from the start downloads each block
                 // the plan reads; each wait adds at most its own GET and one
                 // repeat before the statement reads synchronously.

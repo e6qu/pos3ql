@@ -1499,7 +1499,7 @@ pub use projected::{
 };
 
 mod ddl;
-mod dependency_report;
+pub(crate) mod dependency_report;
 pub(crate) mod expression_bindings;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
@@ -2241,7 +2241,10 @@ pub fn create_foreign_table(
     };
     let wrapper = storage.foreign_wrapper_by_slot(server_definition.wrapper as usize, txn.txid);
     if wrapper.is_some_and(|wrapper| {
-        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
     }) && let Err(error) =
         validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Table)
     {
@@ -2258,7 +2261,10 @@ pub fn create_foreign_table(
             return sql_fail(error);
         }
         if wrapper.is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         }) && let Err(error) =
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
         {
@@ -2464,44 +2470,137 @@ pub fn import_foreign_schema(
     sql_ok()
 }
 
+/// The routine a wrapper's `HANDLER name` names, found as PostgreSQL's
+/// `lookup_fdw_handler_func` does: `name()` returning `fdw_handler`. pos3ql
+/// runs only the handler bound to postgres_fdw's native code.
 fn resolve_foreign_handler(
+    storage: &Storage,
     handler: super::ast::ForeignDataHandler<'_>,
+    txid: u32,
 ) -> Result<crate::storage::foreign::ForeignDataHandler, SqlError> {
-    match handler {
-        super::ast::ForeignDataHandler::None => {
-            Ok(crate::storage::foreign::ForeignDataHandler::None)
-        }
-        super::ast::ForeignDataHandler::Function(name)
-            if name.name.eq_ignore_ascii_case("postgres_fdw_handler") =>
-        {
-            Ok(crate::storage::foreign::ForeignDataHandler::Postgres)
-        }
-        super::ast::ForeignDataHandler::Function(name) => Err(sql_err!(
+    let super::ast::ForeignDataHandler::Function(name) = handler else {
+        return Ok(crate::storage::foreign::ForeignDataHandler::None);
+    };
+    let written = foreign_routine_name(name)?;
+    let routine = foreign_routine(storage, written.as_str(), &[], txid)?;
+    let returns_handler = matches!(
+        routine.kind,
+        crate::storage::RoutineKind::Function { result }
+            if result.ctype == ColType::Pseudo(crate::sql::types::PseudoType::FdwHandler)
+    );
+    if !returns_handler {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "function {} must return type fdw_handler",
+            written.as_str()
+        ));
+    }
+    match routine.language {
+        crate::storage::RoutineLanguage::Native(
+            crate::storage::NativeRoutine::PostgresFdwHandler,
+        ) => Ok(crate::storage::foreign::ForeignDataHandler::Postgres {
+            routine: crate::storage::routine_oid(&routine),
+        }),
+        _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "native foreign-data handler {} is not supported",
-            name.name
+            "foreign-data handler {} is not supported",
+            written.as_str()
         )),
     }
 }
 
+/// The routine a wrapper's `VALIDATOR name` names: `name(text[], oid)`, as
+/// PostgreSQL's `lookup_fdw_validator_func` finds it.
 fn resolve_foreign_validator(
+    storage: &Storage,
     validator: super::ast::ForeignDataValidator<'_>,
+    txid: u32,
 ) -> Result<crate::storage::foreign::ForeignDataValidator, SqlError> {
-    match validator {
-        super::ast::ForeignDataValidator::None => {
-            Ok(crate::storage::foreign::ForeignDataValidator::None)
-        }
-        super::ast::ForeignDataValidator::Function(name)
-            if name.name.eq_ignore_ascii_case("postgres_fdw_validator") =>
-        {
-            Ok(crate::storage::foreign::ForeignDataValidator::Postgres)
-        }
-        super::ast::ForeignDataValidator::Function(name) => Err(sql_err!(
+    let super::ast::ForeignDataValidator::Function(name) = validator else {
+        return Ok(crate::storage::foreign::ForeignDataValidator::None);
+    };
+    let written = foreign_routine_name(name)?;
+    let routine = foreign_routine(
+        storage,
+        written.as_str(),
+        &[
+            crate::sql::types::oid::TEXT_ARRAY,
+            crate::sql::types::oid::OID,
+        ],
+        txid,
+    )?;
+    match routine.language {
+        crate::storage::RoutineLanguage::Native(
+            crate::storage::NativeRoutine::PostgresFdwValidator,
+        ) => Ok(crate::storage::foreign::ForeignDataValidator::Postgres {
+            routine: crate::storage::routine_oid(&routine),
+        }),
+        _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "native foreign-data validator {} is not supported",
-            name.name
+            "foreign-data validator {} is not supported",
+            written.as_str()
         )),
     }
+}
+
+fn foreign_routine_name(name: super::ast::QualName<'_>) -> Result<StackStr<256>, SqlError> {
+    use core::fmt::Write as _;
+    let mut written = StackStr::new();
+    if let Some(schema) = name.schema {
+        let _ = write!(written, "{schema}.");
+    }
+    let _ = written.write_str(name.name);
+    if written.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::NAME_TOO_LONG,
+            "foreign-data routine name is too long"
+        ));
+    }
+    Ok(written)
+}
+
+/// The stored routine `written(arguments)` with exactly these argument
+/// types, or PostgreSQL's `function ... does not exist`.
+fn foreign_routine(
+    storage: &Storage,
+    written: &str,
+    arguments: &[i32],
+    txid: u32,
+) -> Result<crate::storage::RoutineDef, SqlError> {
+    let missing = || {
+        use core::fmt::Write as _;
+        let mut signature = StackStr::<256>::new();
+        let _ = write!(signature, "{written}(");
+        for (index, oid) in arguments.iter().enumerate() {
+            let separator = if index == 0 { "" } else { ", " };
+            let name = builtin_type_name_fixed(*oid);
+            let _ = write!(
+                signature,
+                "{separator}{}",
+                name.as_ref().map_or("?", |name| name.as_str())
+            );
+        }
+        let _ = signature.write_char(')');
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {} does not exist",
+            signature.as_str()
+        )
+    };
+    let slot = storage
+        .routine_slot_for_function_call_syntax_oids(written, arguments, false, txid)
+        .ok_or_else(missing)?;
+    let routine = storage.routine_for(slot, txid);
+    let exact = routine.argument_count == arguments.len()
+        && routine
+            .arguments()
+            .iter()
+            .zip(arguments)
+            .all(|(argument, oid)| argument.user_type.is_none() && argument.ctype.oid() == *oid);
+    if !exact {
+        return Err(missing());
+    }
+    Ok(routine)
 }
 
 fn bounded_foreign_value(
@@ -2542,11 +2641,11 @@ pub fn create_foreign_data_wrapper(
             "permission denied to create foreign-data wrapper"
         ));
     }
-    let handler = match resolve_foreign_handler(command.handler) {
+    let handler = match resolve_foreign_handler(storage, command.handler, txn.txid) {
         Ok(handler) => handler,
         Err(error) => return sql_fail(error),
     };
-    let validator = match resolve_foreign_validator(command.validator) {
+    let validator = match resolve_foreign_validator(storage, command.validator, txn.txid) {
         Ok(validator) => validator,
         Err(error) => return sql_fail(error),
     };
@@ -2554,9 +2653,11 @@ pub fn create_foreign_data_wrapper(
         Ok(options) => options,
         Err(error) => return sql_fail(error),
     };
-    if validator == crate::storage::foreign::ForeignDataValidator::Postgres
-        && let Err(error) =
-            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
+    if matches!(
+        validator,
+        crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+    ) && let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
     {
         return sql_fail(error);
     }
@@ -2626,9 +2727,11 @@ pub fn create_foreign_server(
         Ok(options) => options,
         Err(error) => return sql_fail(error),
     };
-    if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
-        && let Err(error) =
-            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
+    if matches!(
+        wrapper.validator,
+        crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+    ) && let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
     {
         return sql_fail(error);
     }
@@ -2847,7 +2950,10 @@ pub fn create_user_mapping(
     };
     let wrapper = storage.foreign_wrapper_by_slot(server.wrapper as usize, txn.txid);
     if wrapper.is_some_and(|wrapper| {
-        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
     }) && let Err(error) =
         validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Mapping)
     {
@@ -3124,13 +3230,14 @@ pub fn alter_foreign_data_wrapper(
         } => {
             let prior_handler = definition.handler;
             if let Some(handler) = handler {
-                definition.handler = match resolve_foreign_handler(handler) {
+                definition.handler = match resolve_foreign_handler(storage, handler, txn.txid) {
                     Ok(handler) => handler,
                     Err(error) => return sql_fail(error),
                 };
             }
             if let Some(validator) = validator {
-                definition.validator = match resolve_foreign_validator(validator) {
+                definition.validator = match resolve_foreign_validator(storage, validator, txn.txid)
+                {
                     Ok(validator) => validator,
                     Err(error) => return sql_fail(error),
                 };
@@ -3139,12 +3246,13 @@ pub fn alter_foreign_data_wrapper(
                 Ok(options) => options,
                 Err(error) => return sql_fail(error),
             };
-            if definition.validator == crate::storage::foreign::ForeignDataValidator::Postgres
-                && let Err(error) = validate_postgres_foreign_options(
-                    &definition.options,
-                    PostgresForeignOptionContext::Wrapper,
-                )
-            {
+            if matches!(
+                definition.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            ) && let Err(error) = validate_postgres_foreign_options(
+                &definition.options,
+                PostgresForeignOptionContext::Wrapper,
+            ) {
                 return sql_fail(error);
             }
             if definition.handler != prior_handler
@@ -3245,12 +3353,13 @@ pub fn alter_foreign_server(
                     "foreign-data wrapper for server does not exist"
                 ));
             };
-            if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
-                && let Err(error) = validate_postgres_foreign_options(
-                    &definition.options,
-                    PostgresForeignOptionContext::Server,
-                )
-            {
+            if matches!(
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            ) && let Err(error) = validate_postgres_foreign_options(
+                &definition.options,
+                PostgresForeignOptionContext::Server,
+            ) {
                 return sql_fail(error);
             }
         }
@@ -3313,7 +3422,10 @@ pub fn alter_user_mapping(
     if storage
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         })
         && let Err(error) = validate_postgres_foreign_options(
             &definition.options,
@@ -3986,7 +4098,10 @@ fn alter_foreign_table_as(
     if storage
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+                wrapper.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            )
         })
     {
         if let Err(error) =
@@ -29383,6 +29498,11 @@ fn execute_procedural_query<T>(
                     arena,
                     continuation,
                     snapshot,
+                    if fresh_snapshot {
+                        crate::sql::query::CatalogReads::Fresh
+                    } else {
+                        crate::sql::query::CatalogReads::Statement
+                    },
                     context.txn,
                     sqlprep,
                     cursors,
@@ -29859,6 +29979,11 @@ fn eval_procedural_expression_in<'a>(
                 arena,
                 continuation.as_deref_mut(),
                 snapshot,
+                if row.invocation.fresh_snapshots {
+                    crate::sql::query::CatalogReads::Fresh
+                } else {
+                    crate::sql::query::CatalogReads::Statement
+                },
                 context.txn,
                 sqlprep,
                 cursors,
@@ -47025,6 +47150,8 @@ fn check_routine_result_type(
         return Ok(());
     }
     Err(match language {
+        // A C routine's contract is its native code's.
+        RoutineLanguage::C => return Ok(()),
         RoutineLanguage::Sql => sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "SQL functions cannot return type {}",
@@ -47048,6 +47175,7 @@ fn check_routine_argument_type(
         return Ok(());
     }
     match language {
+        RoutineLanguage::C => Ok(()),
         RoutineLanguage::Sql => Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "SQL functions cannot have arguments of type {}",
@@ -47062,24 +47190,80 @@ fn check_routine_argument_type(
     }
 }
 
+/// A native routine backs catalog uses such as a foreign-data wrapper's
+/// handler; pos3ql runs none of them as a called function.
+pub(crate) fn reject_native_routine_call(
+    routine: &crate::storage::RoutineDef,
+    txid: u32,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    if !matches!(routine.language, crate::storage::RoutineLanguage::Native(_)) {
+        return Ok(());
+    }
+    let mut message = StackStr::<192>::new();
+    let _ = write!(message, "function {}(", routine.name_for(txid).as_str());
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let _ = write!(message, "{separator}{}", argument.ctype.name());
+    }
+    let _ = message.write_str(") is not supported");
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "{}",
+        message.as_str()
+    ))
+}
+
+/// The native routine a `LANGUAGE C` routine binds to: pos3ql loads no
+/// shared libraries, so only the modules it implements resolve.
+fn native_routine(file: &str, symbol: &str) -> Result<crate::storage::NativeRoutine, SqlError> {
+    let module = crate::storage::NativeModule::from_path(file).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "native library \"{}\" is not built into pos3ql",
+            file
+        )
+    })?;
+    crate::storage::NativeRoutine::from_symbol(module, symbol).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not find function \"{}\" in file \"{}\"",
+            symbol,
+            file
+        )
+    })
+}
+
 pub(crate) fn resolve_routine_declaration(
     storage: &Storage,
     txn: &TxnState,
     routine: &CreateRoutine<'_>,
     guc: &crate::sql::guc::GucState,
 ) -> Result<ResolvedRoutineDeclaration, SqlError> {
-    let (body_kind, _) = match routine.body {
-        super::ast::RoutineBody::String(body) => (crate::storage::RoutineBodyKind::String, body),
-        super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
-        super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
+    let body_kind = match routine.body {
+        super::ast::RoutineBody::String(_) | super::ast::RoutineBody::Library { .. } => {
+            crate::storage::RoutineBodyKind::String
+        }
+        super::ast::RoutineBody::Return(_) => crate::storage::RoutineBodyKind::Return,
+        super::ast::RoutineBody::Atomic(_) => crate::storage::RoutineBodyKind::Atomic,
     };
-    let language = match routine.language {
-        RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
-        RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
+    let language = match (routine.language, routine.body) {
+        (RoutineLanguage::Sql, _) => crate::storage::RoutineLanguage::Sql,
+        (RoutineLanguage::PlPgSql, _) => crate::storage::RoutineLanguage::PlPgSql,
+        (RoutineLanguage::C, super::ast::RoutineBody::Library { file, symbol }) => {
+            crate::storage::RoutineLanguage::Native(native_routine(
+                file,
+                symbol.unwrap_or(routine.name.name),
+            )?)
+        }
+        (RoutineLanguage::C, _) => {
+            unreachable!("the parser gives a C routine its object file")
+        }
     };
     let language_name = match routine.language {
         RoutineLanguage::Sql => "sql",
         RoutineLanguage::PlPgSql => "plpgsql",
+        RoutineLanguage::C => "c",
     };
     storage.require_language_usage(language_name, txn.txid)?;
     if routine.language == RoutineLanguage::Sql {
@@ -47825,11 +48009,7 @@ pub(crate) fn validate_routine_body(
                     .map(|column| column.ctype)
             })
     };
-    let body_text = match routine.body {
-        super::ast::RoutineBody::String(body)
-        | super::ast::RoutineBody::Return(body)
-        | super::ast::RoutineBody::Atomic(body) => body,
-    };
+    let body_text = routine.body.stored_text(routine.name.name);
     let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
         validation_inputs
     } else {
@@ -48181,11 +48361,7 @@ pub(crate) fn create_routine(
         body_kind,
         replaced,
     } = declaration;
-    let body_text = match routine.body {
-        super::ast::RoutineBody::String(body)
-        | super::ast::RoutineBody::Return(body)
-        | super::ast::RoutineBody::Atomic(body) => body,
-    };
+    let body_text = routine.body.stored_text(routine.name.name);
     let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
         &[][..]
     } else {
@@ -51097,6 +51273,46 @@ pub(crate) fn drop_routine(
                 return sql_fail(error);
             }
             let support_oid = crate::storage::routine_oid(&routine);
+            // A wrapper whose handler or validator this routine is goes with
+            // it; the dependency report already refused it without CASCADE.
+            loop {
+                let dependent = storage
+                    .foreign_wrappers(txn.txid)
+                    .find(|(_, entry)| {
+                        let wrapper = entry.definition_for(txn.txid);
+                        wrapper.handler.routine_oid() == support_oid
+                            || wrapper.validator.routine_oid() == support_oid
+                    })
+                    .map(|(_, entry)| entry.definition_for(txn.txid).name);
+                let Some(wrapper) = dependent else {
+                    break;
+                };
+                if !cascade {
+                    return sql_fail(sql_err!(
+                        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                        "cannot drop function {} because other objects depend on it",
+                        routine.name_for(txn.txid).as_str()
+                    ));
+                }
+                let names = [wrapper.as_str()];
+                match responder.without_command_complete(|responder| {
+                    drop_foreign_data_wrappers(
+                        storage,
+                        wal,
+                        txn,
+                        &mut *scratch,
+                        seq_session,
+                        &names,
+                        false,
+                        true,
+                        arena,
+                        responder,
+                    )
+                }) {
+                    Ok(Ok(())) => {}
+                    other => return other,
+                }
+            }
             if routine_has_cast_operator_dependents(storage, txn.txid, support_oid) && !cascade {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -67232,9 +67448,10 @@ pub fn create_index(
             };
             expression_refs[i] = Some(index_column.expression);
             match catalog_column_type(storage, txn.txid, type_oid) {
-                // Expression keys are stored in the row encoding, which keeps
-                // row values only as columns of a named composite type.
-                Some((ColType::Record | ColType::Composite(_), _)) => {
+                // A named composite key, the whole row `(t)` included, is
+                // stored like a composite column; an anonymous record has no
+                // stored form or ordering.
+                Some((ColType::Record, _) | (ColType::Composite(_), None)) => {
                     // A whole row of an unknown relation is the analysis
                     // error PostgreSQL reports first.
                     fn unknown_whole_row(
@@ -67262,9 +67479,16 @@ pub fn create_index(
                             index_column.expression,
                         ));
                     }
+                    // PostgreSQL's index column name: a call's function name,
+                    // `expr` for other expressions.
+                    let name = match describe::derived_name(index_column.expression) {
+                        "?column?" => "expr",
+                        name => name,
+                    };
                     return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "index expressions of a row type are not supported"
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "column \"{}\" has pseudo-type record",
+                        name
                     ));
                 }
                 Some((ctype, user_type)) => {
@@ -68457,20 +68681,66 @@ fn ensure_partition_index_in(
         pending_parent_drop_txid: None,
         ..parent
     };
-    let existing = (0..storage.index_count()).find(|slot| {
-        storage.index_table_slot_to(*slot, txn.txid) == Some(partition)
+    // PostgreSQL's `AttachPartitionEnsureIndexes` takes the partition's
+    // first equivalent index in OID order. An index created for a parent's
+    // constraint takes only the index of the same kind of partition
+    // constraint; a constraint's index is given its own slot to attach.
+    let parent_constraint = key_constraint_kind(&parent_def, parent.created_at);
+    let mut existing: Option<(i32, Option<usize>, usize)> = None;
+    for slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(slot, txn.txid) != Some(partition) {
+            continue;
+        }
+        let Some(candidate) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        let candidate = candidate.definition_for(txn.txid);
+        let definition = candidate.mutable_for(txn.txid);
+        if definition.parent.is_none()
+            && definition.kind.live()
+            && (matching == PartitionIndexMatch::AnyEquivalent || definition.kind.valid())
+            && parent_constraint
+                .is_none_or(|kind| key_constraint_kind(&table, candidate.created_at) == Some(kind))
+            && index_definitions_compatible(&copy, &candidate)
+            && existing.is_none_or(|(oid, ..)| candidate.relation_oid() < oid)
+        {
+            existing = Some((candidate.relation_oid(), Some(slot), 0));
+        }
+    }
+    let mark = arena.mark();
+    let keys = crate::sql::catalog::reindex_candidates(
+        storage,
+        txn.txid,
+        core::slice::from_ref(&partition),
+        None,
+        arena,
+    )?;
+    for (position, key) in keys.iter().enumerate() {
+        let oid = key.definition.relation_oid();
+        if !key.exclusion
             && storage
-                .index_visible_to(*slot, txn.txid)
-                .is_some_and(|candidate| {
-                    let candidate = candidate.definition_for(txn.txid);
-                    let definition = candidate.mutable_for(txn.txid);
-                    definition.parent.is_none()
-                        && definition.kind.live()
-                        && (matching == PartitionIndexMatch::AnyEquivalent
-                            || definition.kind.valid())
-                        && index_definitions_compatible(&copy, &candidate)
-                })
-    });
+                .indexes_for(table.schema.as_str(), table.name.as_str(), txn.txid)
+                .all(|index| index.created_at != key.definition.created_at)
+            && key_constraint_kind(&table, key.definition.created_at)
+                .is_some_and(|kind| parent_constraint.is_none_or(|parent| parent == kind))
+            && index_definitions_compatible(&copy, &key.definition)
+            && existing.is_none_or(|(existing, ..)| oid < existing)
+        {
+            existing = Some((oid, None, position));
+        }
+    }
+    let existing = match existing {
+        Some((_, Some(slot), _)) => Some(slot),
+        Some((_, None, position)) => Some(materialize_index_definition(
+            storage,
+            wal,
+            txn,
+            &keys[position],
+        )?),
+        None => None,
+    };
+    // SAFETY: the candidates were copied into the catalog where kept.
+    unsafe { arena.rewind_to(mark) };
     if let Some(slot) = existing {
         let mut definition = storage
             .index_visible_to(slot, txn.txid)
@@ -68513,6 +68783,32 @@ fn ensure_partition_index_in(
         )?;
     }
     Ok(())
+}
+
+/// Whether the index created at `created_at` belongs to a primary key
+/// (`Some(true)`) or unique constraint (`Some(false)`) of `table`.
+fn key_constraint_kind<B: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<B>,
+    created_at: u64,
+) -> Option<bool> {
+    let created = |identity: Option<crate::storage::RelationIdentity>| {
+        identity.is_some_and(|identity| identity.created_at() == created_at)
+    };
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .find(|(column, metadata)| {
+            (metadata.primary || metadata.unique) && created(table.column_index_identity(*column))
+        })
+        .map(|(_, metadata)| metadata.primary)
+        .or_else(|| {
+            table
+                .uniques()
+                .iter()
+                .find(|key| created(key.index_identity))
+                .map(|key| key.kind.is_primary())
+        })
 }
 
 /// PostgreSQL's `DetachPartitionFinalize` for indexes: the detached
@@ -70665,19 +70961,8 @@ pub fn drop_index(
                     name.name
                 ));
             }
-            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
-                && attached_constraint_index(
-                    storage,
-                    &storage.table_def(table, txn.txid),
-                    definition.name_for(txn.txid).as_str(),
-                    txn.txid,
-                ) == Some(slot)
-            {
-                return sql_fail(constraint_requires_index(
-                    name.name,
-                    storage.table_def(table, txn.txid).name.as_str(),
-                ));
-            }
+            // An attached partition's index, even a constraint's, goes only
+            // with its parent index.
             if let Some(parent) = definition.mutable_for(txn.txid).parent {
                 use crate::sql::catalog::dependencies::ObjectAddress;
                 let parent = storage
@@ -70697,6 +70982,19 @@ pub fn drop_index(
                         0,
                     ),
                     arena,
+                ));
+            }
+            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
+                && attached_constraint_index(
+                    storage,
+                    &storage.table_def(table, txn.txid),
+                    definition.name_for(txn.txid).as_str(),
+                    txn.txid,
+                ) == Some(slot)
+            {
+                return sql_fail(constraint_requires_index(
+                    name.name,
+                    storage.table_def(table, txn.txid).name.as_str(),
                 ));
             }
             if build == crate::sql::ast::IndexBuildMode::Concurrent
@@ -70749,6 +71047,11 @@ pub fn drop_index(
                 }
                 return sql_ok();
             }
+            if let Err(error) =
+                drop_attached_key_constraints(storage, wal, txn, slot, cascade, responder)
+            {
+                return sql_fail(error);
+            }
             for descendant in (0..storage.index_count()).rev() {
                 if index_descends_from(storage, descendant, slot, txn.txid)
                     && let Err(error) = stage_index_drop(storage, wal, txn, descendant)
@@ -70760,6 +71063,18 @@ pub fn drop_index(
                 return sql_fail(error);
             }
         } else if let Some(table) = constraint_index_table(storage, *name, txn.txid) {
+            if let Some((index, parent, _)) =
+                crate::sql::catalog::inherited_constraint_index(storage, txn.txid, table, name.name)
+            {
+                use crate::sql::catalog::dependencies::ObjectAddress;
+                return sql_fail(dependency_report::required_by(
+                    storage,
+                    txn.txid,
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
+                    arena,
+                ));
+            }
             return sql_fail(constraint_requires_index(
                 name.name,
                 storage.table_def(table, txn.txid).name.as_str(),
@@ -86242,9 +86557,91 @@ fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
     None
 }
 
-/// An attached constraint and its backing relation share the constraint
-/// name and exact key positions. This is the durable dependency proof: it
-/// survives WAL and checkpoint replay without a parallel mutable flag.
+/// A partition's key constraint whose index descends from `slot` depends on
+/// that index: `DROP INDEX` refuses it, or with `CASCADE` drops the
+/// constraint with its index, as PostgreSQL's dependency walk does.
+fn drop_attached_key_constraints(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    for descendant in 0..storage.index_count() {
+        if !index_descends_from(storage, descendant, slot, txn.txid) {
+            continue;
+        }
+        let Some(table) = storage.index_table_slot_to(descendant, txn.txid) else {
+            continue;
+        };
+        let index = storage
+            .index_visible_to(descendant, txn.txid)
+            .expect("a descendant index is visible");
+        let name = index.name_for(txn.txid);
+        let (target, current) = storage.select_table_definition(table, txn.txid);
+        if attached_constraint_index(storage, &current, name.as_str(), txn.txid) != Some(descendant)
+        {
+            continue;
+        }
+        let parent = index
+            .mutable_for(txn.txid)
+            .parent
+            .and_then(|parent| storage.index_visible_to(usize::from(parent), txn.txid))
+            .expect("a descendant index has a visible parent");
+        let line = stack_format!(
+            256,
+            "constraint {} on table {} depends on index {}",
+            name.as_str(),
+            current.name.as_str(),
+            parent.name_for(txn.txid).as_str()
+        );
+        if !cascade {
+            use core::fmt::Write;
+            let separator = if detail.as_str().is_empty() { "" } else { "\n" };
+            let _ = write!(detail, "{separator}{}", line.as_str());
+            continue;
+        }
+        responder
+            .notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "drop cascades to constraint {} on table {}",
+                    name.as_str(),
+                    current.name.as_str()
+                )
+                .as_str(),
+            )
+            .map_err(wire_to_sql)?;
+        let mut next = TableDefBuilder::from_definition(&current);
+        drop_dependent_foreign_keys(storage, wal, txn, table, &mut next, name.as_str(), true)?;
+        drop_named_constraint(&mut next, name.as_str());
+        txn.drop_constraint(table as u32, name)?;
+        stage_table_definition(storage, wal, txn, target, current, next)?;
+        stage_index_drop(storage, wal, txn, descendant)?;
+    }
+    if detail.as_str().is_empty() {
+        return Ok(());
+    }
+    let name = storage
+        .index_visible_to(slot, txn.txid)
+        .expect("the dropped index is visible")
+        .name_for(txn.txid);
+    crate::sql::eval::stash_diagnostic(
+        Some(detail),
+        Some(StackStr::from_str(
+            "Use DROP ... CASCADE to drop the dependent objects too.",
+        )),
+    );
+    Err(sql_err!(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        "cannot drop index {} because other objects depend on it",
+        name.as_str()
+    ))
+}
+
 /// PostgreSQL's refusal to drop the index a constraint owns.
 fn constraint_requires_index(index: &str, table: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
@@ -87543,8 +87940,21 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 PartitionInheritance::ParentAlter => child.columns[index].not_null.add_inherited(),
             };
         }
-        child.columns[index].unique |= expected.unique;
-        child.columns[index].primary |= expected.primary;
+        // A partition's equivalent single-column key constraint written as a
+        // table constraint is attached instead of gaining a second one.
+        let equivalent_key = child.uniques().iter().any(|existing| {
+            existing.columns() == [index as u16]
+                && existing.timing == crate::storage::ConstraintTiming::NotDeferrable
+                && if expected.primary {
+                    existing.kind.is_primary()
+                } else {
+                    existing.kind == crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                }
+        });
+        if !equivalent_key {
+            child.columns[index].unique |= expected.unique;
+            child.columns[index].primary |= expected.primary;
+        }
         if expected.is_identity {
             child.columns[index].auto_increment = true;
             child.columns[index].is_identity = true;
@@ -87565,7 +87975,19 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             existing.kind == constraint.kind
                 && existing.timing == constraint.timing
                 && existing.columns() == &columns[..constraint.n_cols]
-        }) {
+        }) || (constraint.n_cols == 1
+            && constraint.timing == crate::storage::ConstraintTiming::NotDeferrable
+            && match constraint.kind {
+                crate::storage::UniqueKeyKind::Primary => {
+                    child.columns[usize::from(columns[0])].primary
+                }
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct => {
+                    let column = &child.columns[usize::from(columns[0])];
+                    column.unique && !column.primary
+                }
+                crate::storage::UniqueKeyKind::UniqueNullsNotDistinct => false,
+            })
+        {
             continue;
         }
         if child.n_uniques == crate::storage::MAX_UNIQUES {
@@ -91517,6 +91939,32 @@ fn alter_table_relation(
                 cascade,
             } => {
                 let attached_index = attached_constraint_index(storage, &new_def, name, txn.txid);
+                // A partition's key attached to its parent's goes only with
+                // the parent's constraint.
+                let inherited = crate::sql::catalog::inherited_constraint_index(
+                    storage,
+                    txn.txid,
+                    table_index,
+                    name,
+                );
+                if let Some((index, parent, false)) = inherited {
+                    use crate::sql::catalog::dependencies::ObjectAddress;
+                    return sql_fail(dependency_report::required_by(
+                        storage,
+                        txn.txid,
+                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
+                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
+                        arena,
+                    ));
+                }
+                if inherited.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot drop inherited constraint \"{}\" of relation \"{}\"",
+                        name,
+                        def.name.as_str()
+                    ));
+                }
                 if named_key_columns(&new_def, name).is_some()
                     && let Err(error) = drop_dependent_foreign_keys(
                         storage,

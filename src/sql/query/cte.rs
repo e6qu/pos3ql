@@ -4645,47 +4645,12 @@ pub(super) fn select_contains_function(
     {
         return true;
     }
-    if let Some(from) = select.from {
-        let table_has_it = |table: &TableRef<'_>| {
-            table
-                .subquery
-                .is_some_and(|query| select_contains_function(query, matches))
-                // A WITH query not yet read runs, with its calls, where this
-                // query first reads it.
-                || table.cte.is_some_and(|cte| match cte.source {
-                    crate::sql::ast::MaterializedCteSource::Deferred(deferred) => {
-                        deferred.rows.load(core::sync::atomic::Ordering::Relaxed) == 0
-                            && set_tree_contains_function(deferred.tree, matches)
-                    }
-                    _ => false,
-                })
-                || table.func_args.is_some_and(|arguments| {
-                    matches(table.table, arguments.len())
-                        || arguments.iter().any(|argument| expression_has_it(argument))
-                })
-                || table.rows_from.is_some_and(|tables| {
-                    tables.iter().any(|table| {
-                        table.func_args.is_some_and(|arguments| {
-                            matches(table.table, arguments.len())
-                                || arguments.iter().any(|argument| expression_has_it(argument))
-                        }) || table
-                            .subquery
-                            .is_some_and(|query| select_contains_function(query, matches))
-                    })
-                })
-                || table.sample.is_some_and(|sample| {
-                    expression_has_it(sample.percentage)
-                        || sample.repeatable.is_some_and(expression_has_it)
-                })
-        };
-        if table_has_it(&from.base)
-            || from
-                .joins
-                .iter()
-                .any(|join| table_has_it(&join.table) || join.on.is_some_and(expression_has_it))
-        {
-            return true;
-        }
+    if select
+        .from
+        .as_ref()
+        .is_some_and(|from| from_contains_function(from, matches))
+    {
+        return true;
     }
     select
         .set_body
@@ -4694,6 +4659,145 @@ pub(super) fn select_contains_function(
             .with
             .iter()
             .any(|cte| select_contains_function(cte.query, matches))
+}
+
+fn from_contains_function(
+    from: &crate::sql::ast::FromClause<'_>,
+    matches: &impl Fn(&str, usize) -> bool,
+) -> bool {
+    let expression_has_it =
+        |expression: &Expr<'_>| expression_contains_function(expression, matches);
+    let table_has_it = |table: &TableRef<'_>| {
+        table
+            .subquery
+            .is_some_and(|query| select_contains_function(query, matches))
+            // A WITH query not yet read runs, with its calls, where this
+            // query first reads it.
+            || table.cte.is_some_and(|cte| match cte.source {
+                crate::sql::ast::MaterializedCteSource::Deferred(deferred) => {
+                    deferred.rows.load(core::sync::atomic::Ordering::Relaxed) == 0
+                        && set_tree_contains_function(deferred.tree, matches)
+                }
+                _ => false,
+            })
+            || table.func_args.is_some_and(|arguments| {
+                matches(table.table, arguments.len())
+                    || arguments.iter().any(|argument| expression_has_it(argument))
+            })
+            || table.rows_from.is_some_and(|tables| {
+                tables.iter().any(|table| {
+                    table.func_args.is_some_and(|arguments| {
+                        matches(table.table, arguments.len())
+                            || arguments.iter().any(|argument| expression_has_it(argument))
+                    }) || table
+                        .subquery
+                        .is_some_and(|query| select_contains_function(query, matches))
+                })
+            })
+            || table.sample.is_some_and(|sample| {
+                expression_has_it(sample.percentage)
+                    || sample.repeatable.is_some_and(expression_has_it)
+            })
+    };
+    table_has_it(&from.base)
+        || from
+            .joins
+            .iter()
+            .any(|join| table_has_it(&join.table) || join.on.is_some_and(expression_has_it))
+}
+
+/// Whether any statement clause calls a function `matches` accepts,
+/// subqueries included.
+pub(super) fn statement_contains_function(
+    statement: &Stmt<'_>,
+    matches: &impl Fn(&str, usize) -> bool,
+) -> bool {
+    use crate::sql::ast::MergeActionRef;
+    let expression_has_it =
+        |expression: &Expr<'_>| expression_contains_function(expression, matches);
+    let returning_has_it = |items: &[SelectItem<'_>]| {
+        items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expression_has_it(expression)
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
+        })
+    };
+    match statement {
+        Stmt::Select(select) => select_contains_function(select, matches),
+        Stmt::SetQuery(query) => {
+            set_tree_contains_function(query.body, matches)
+                || query
+                    .order_by
+                    .iter()
+                    .any(|order| expression_has_it(order.expression))
+                || query.limit.is_some_and(expression_has_it)
+                || query.offset.is_some_and(expression_has_it)
+        }
+        Stmt::With { ctes, statement } => {
+            ctes.iter().any(|cte| match cte.dml {
+                Some(dml) => statement_contains_function(dml, matches),
+                None => select_contains_function(cte.query, matches),
+            }) || statement_contains_function(statement, matches)
+        }
+        Stmt::Insert(insert) => {
+            insert
+                .select
+                .is_some_and(|select| select_contains_function(select, matches))
+                || insert
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .any(|expression| expression_has_it(expression))
+                || insert.on_conflict.is_some_and(|conflict| {
+                    conflict.update.is_some_and(|assignments| {
+                        assignments
+                            .iter()
+                            .any(|(_, expression)| expression_has_it(expression))
+                    }) || conflict.update_where.is_some_and(expression_has_it)
+                })
+                || returning_has_it(insert.returning.items)
+        }
+        Stmt::Update(update) => {
+            update
+                .from
+                .is_some_and(|from| from_contains_function(from, matches))
+                || update
+                    .assignments
+                    .iter()
+                    .any(|(_, expression)| expression_has_it(expression))
+                || update.where_clause.is_some_and(expression_has_it)
+                || returning_has_it(update.returning.items)
+        }
+        Stmt::Delete(delete) => {
+            delete
+                .using
+                .is_some_and(|from| from_contains_function(from, matches))
+                || delete.where_clause.is_some_and(expression_has_it)
+                || returning_has_it(delete.returning.items)
+        }
+        Stmt::Merge(merge) => {
+            merge
+                .source
+                .subquery
+                .is_some_and(|query| select_contains_function(query, matches))
+                || expression_has_it(merge.on)
+                || merge.whens.iter().any(|when| {
+                    when.condition().is_some_and(expression_has_it)
+                        || match when.action() {
+                            MergeActionRef::Update(assignments) => assignments
+                                .iter()
+                                .any(|(_, expression)| expression_has_it(expression)),
+                            MergeActionRef::Insert { values, .. } => values
+                                .iter()
+                                .any(|expression| expression_has_it(expression)),
+                            MergeActionRef::Delete | MergeActionRef::DoNothing => false,
+                        }
+                })
+                || returning_has_it(merge.returning.items)
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn set_tree_contains_function(

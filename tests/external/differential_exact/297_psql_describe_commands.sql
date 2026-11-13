@@ -32,9 +32,13 @@ CREATE FOREIGN TABLE describe_foreign (a int) SERVER describe_server;
 \dAo btree integer_ops
 \dAp btree float_ops
 \dA+
-SELECT name, default_version, comment FROM pg_available_extensions() ORDER BY name;
+-- PostgreSQL's $system directory also holds contrib packages pos3ql does not
+-- build in; compare the ones both provide.
+SELECT name, default_version, comment FROM pg_available_extensions()
+ WHERE name IN ('plpgsql', 'postgres_fdw') OR name LIKE 'pos3ql%' ORDER BY name;
 SELECT (e).name, (e).version, (e).requires
-  FROM (SELECT pg_available_extension_versions() AS e) AS versions ORDER BY 1, 2;
+  FROM (SELECT pg_available_extension_versions() AS e) AS versions
+ WHERE (e).name IN ('plpgsql', 'postgres_fdw') OR (e).name LIKE 'pos3ql%' ORDER BY 1, 2;
 SELECT lanname, lanispl, lanpltrusted, lanplcallfoid::regproc, laninline::regproc,
        lanvalidator::regproc
   FROM pg_language ORDER BY lanname;

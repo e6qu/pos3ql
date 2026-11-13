@@ -6318,28 +6318,25 @@ impl Checkpointer {
                         },
                     ));
                 }
-                Some("fdw") => {
+                Some("fdw2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "foreign wrapper slot")?;
                     let created_at: u64 = parse_field(words.next(), "foreign wrapper sequence")?;
                     let owner = decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("foreign wrapper owner missing"),
                     )?)?;
-                    let handler = match parse_field::<u8>(words.next(), "foreign wrapper handler")?
-                    {
-                        0 => crate::storage::foreign::ForeignDataHandler::None,
-                        1 => crate::storage::foreign::ForeignDataHandler::Postgres,
-                        _ => {
-                            return Err(CheckpointSetupError::Corrupt(
-                                "invalid foreign wrapper handler",
-                            ));
-                        }
-                    };
+                    let handler = crate::storage::foreign::ForeignDataHandler::from_routine_oid(
+                        parse_field::<i32>(words.next(), "foreign wrapper handler")?,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid foreign wrapper handler",
+                    ))?;
                     let validator =
-                        match parse_field::<u8>(words.next(), "foreign wrapper validator")? {
-                            0 => crate::storage::foreign::ForeignDataValidator::None,
-                            1 => crate::storage::foreign::ForeignDataValidator::Postgres,
-                            _ => {
+                        match crate::storage::foreign::ForeignDataValidator::from_routine_oid(
+                            parse_field::<i32>(words.next(), "foreign wrapper validator")?,
+                        ) {
+                            Some(validator) => validator,
+                            None => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "invalid foreign wrapper validator",
                                 ));
@@ -8584,7 +8581,9 @@ impl Checkpointer {
                     {
                         continue;
                     }
-                    if package_slot != storage.extension_packages().count() {
+                    if package_slot + storage.system_extension_package_count()
+                        != storage.extension_packages().count()
+                    {
                         return Err(CheckpointSetupError::Corrupt(
                             "extension package slots are not ordered",
                         ));
@@ -8684,7 +8683,7 @@ impl Checkpointer {
                     })?;
                     storage
                         .install_durable_extension_script(
-                            package_slot,
+                            package_slot + storage.system_extension_package_count(),
                             from,
                             to,
                             effective,
@@ -11543,18 +11542,12 @@ impl Checkpointer {
             let mut line = StackStr::<12_288>::new();
             let _ = write!(
                 line,
-                "fdw {} {} {} {} {} {} {}",
+                "fdw2 {} {} {} {} {} {} {}",
                 slot,
                 entry.created_at,
                 manifest_hex::<130>(owner.as_str()),
-                match definition.handler {
-                    crate::storage::foreign::ForeignDataHandler::None => 0,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => 1,
-                },
-                match definition.validator {
-                    crate::storage::foreign::ForeignDataValidator::None => 0,
-                    crate::storage::foreign::ForeignDataValidator::Postgres => 1,
-                },
+                definition.handler.routine_oid(),
+                definition.validator.routine_oid(),
                 manifest_hex::<130>(definition.name.as_str()),
                 definition.options.entries().len(),
             );
@@ -12880,7 +12873,11 @@ impl Checkpointer {
         // The availability catalog is durable independently of installed
         // extensions. SQL and control metadata are immutable objects; the CAS
         // manifest publishes their ordered, bounded catalog in one step.
-        for (package_slot, package) in storage.extension_packages() {
+        // Built-in packages come from the binary and are not persisted:
+        // durable slots count from the first configured package.
+        let system_packages = storage.system_extension_package_count();
+        for (storage_slot, package) in storage.extension_packages().skip(system_packages) {
+            let package_slot = storage_slot - system_packages;
             let metadata = encode_extension_package(*package)?;
             let metadata_key = stack_format!(
                 80,
@@ -12893,7 +12890,7 @@ impl Checkpointer {
                 &mut self.manifest_output,
                 format_args!("xpk {} {}", package_slot, metadata_key.as_str()),
             )?;
-            for (_, script) in storage.extension_scripts_for(package_slot) {
+            for (_, script) in storage.extension_scripts_for(storage_slot) {
                 let effective = encode_extension_package(script.effective)?;
                 let effective_key = stack_format!(
                     80,
@@ -18024,6 +18021,12 @@ fn encode_extension_package(
     let code = match package.code {
         crate::storage::ExtensionPackageCode::Sql => 0,
         crate::storage::ExtensionPackageCode::NativeLibrary => 1,
+        crate::storage::ExtensionPackageCode::Builtin(_) => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a built-in extension package is not persisted"
+            ));
+        }
     };
     write!(
         encoded,

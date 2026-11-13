@@ -3361,6 +3361,8 @@ impl ColType {
             // stored column or a durable routine); the code is a loud sentinel
             // with no `from_code` inverse, so any leak into the persistence
             // layer fails visibly at reload.
+            // A built-in `LANGUAGE C` handler routine persists its result.
+            Self::Pseudo(PseudoType::FdwHandler) => 250,
             Self::Record | Self::Pseudo(_) => 46,
             // The code marks "an enum column"; *which* enum is carried
             // alongside as the type name (slots are not stable across restart),
@@ -3444,6 +3446,7 @@ impl ColType {
             223 => Self::Geometry(GeometryKind::Polygon),
             224 => Self::Geometry(GeometryKind::Line),
             225 => Self::Geometry(GeometryKind::Circle),
+            250 => Self::Pseudo(PseudoType::FdwHandler),
             // Declarations acquire a creation only after their saved reference binds.
             54 => Self::Enum(None),
             66 => Self::Composite(None),

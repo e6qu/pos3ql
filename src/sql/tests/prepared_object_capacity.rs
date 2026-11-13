@@ -46,7 +46,8 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         );
         session.success(
             &mut engine,
-            "CREATE FOREIGN DATA WRAPPER cycle_left HANDLER postgres_fdw_handler; \
+            "CREATE EXTENSION postgres_fdw; \
+             CREATE FOREIGN DATA WRAPPER cycle_left HANDLER postgres_fdw_handler; \
              CREATE FOREIGN DATA WRAPPER cycle_right",
             false,
         );

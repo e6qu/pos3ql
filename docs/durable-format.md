@@ -112,6 +112,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 | 160 | Trigger alteration | Ten-byte position, prior name, target kind, table schema and name, new name, enabled mode, then the complete `WHEN` condition (two-byte length plus one, zero when absent). Kind 57, without the condition, is rejected. |
 | 161 | Index alteration | Schema, index name and mutable settings, then the complete key expressions (four-byte presence mask over the 32 key positions; each present expression as a two-byte length and text) and predicate (flag byte, then two-byte length and text). Kind 71, without the expressions, is rejected. |
+| 171 | Foreign-data wrapper | Slot, creation stamp, owner, presence byte, then name, the handler's and validator's four-byte `pg_proc` OIDs (0 for none) and the options. Kind 115, with one postgres_fdw flag byte each, is rejected. |
 
 Other payload rules:
 
@@ -163,7 +164,9 @@ inserts a missing writer.
 | Record | Contents and rules |
 |---|---|
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
-| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
+| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. A routine's language code is 0 (SQL), 1 (PL/pgSQL), 2 (internal aggregate) or 16 plus a native routine code for a `LANGUAGE C` routine bound to built-in postgres_fdw code (0 handler, 1 validator, 2 and 3 `get_connections` 1.1 and 1.2, 4 `disconnect`, 5 `disconnect_all`). Such a handler's `fdw_handler` result persists as type code 250. |
+| `fdw2` | Foreign-data wrapper slot, creation stamp, owner, handler and validator `pg_proc` OIDs (0 for none), name and options. The earlier `fdw` record, with 0/1 flags, is rejected. |
+| `xpk`, `xsc` | Available extension packages and their version scripts, numbered after the packages built into the binary (`$system`'s postgres_fdw), which are never persisted. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
 | `vw16` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, then the security, barrier, check-option and query-origin codes (query origin: 0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`; it decides whether `pg_get_viewdef` qualifies columns), the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |

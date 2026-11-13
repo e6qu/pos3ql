@@ -173,6 +173,8 @@ const SQL_LANGUAGE_OID: i32 = 14;
 /// The `plpgsql` extension, language and handler OIDs; initdb creates them
 /// last, after the collations (see `DSNOWBALL_INIT_OID`).
 pub(crate) const PLPGSQL_EXTENSION_OID: i32 = DSNOWBALL_INIT_OID + 411;
+/// The comment of the `plpgsql` extension package.
+const PLPGSQL_EXTENSION_COMMENT: &str = "PL/pgSQL procedural language";
 const PLPGSQL_CALL_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 1;
 const PLPGSQL_INLINE_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 2;
 const PLPGSQL_VALIDATOR_OID: i32 = PLPGSQL_EXTENSION_OID + 3;
@@ -188,6 +190,7 @@ pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLangua
         crate::storage::RoutineLanguage::Sql => SQL_LANGUAGE_OID,
         crate::storage::RoutineLanguage::PlPgSql => PLPGSQL_LANGUAGE_OID,
         crate::storage::RoutineLanguage::Internal => INTERNAL_LANGUAGE_OID,
+        crate::storage::RoutineLanguage::Native(_) => C_LANGUAGE_OID,
     }
 }
 
@@ -554,8 +557,8 @@ mod callable_contract_tests {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
         assert_eq!(planner_properties::PROCEDURES.len(), 3397);
-        // Every PostgreSQL 18.6 pg_proc row, plus the two local FDW callbacks.
-        assert_eq!(callable_signatures::CALLABLES.len(), 3415);
+        // Every PostgreSQL 18.6 pg_proc row.
+        assert_eq!(callable_signatures::CALLABLES.len(), 3413);
         assert!(
             planner_properties::PROCEDURES
                 .iter()
@@ -626,21 +629,6 @@ mod callable_contract_tests {
             });
             assert!(signature.arguments.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS);
             assert!(signature.required_arguments <= signature.arguments.len());
-        }
-        for (oid, name, result, arguments, volatility) in [
-            (540000, "postgres_fdw_handler", 3115, &[][..], "v"),
-            (540001, "postgres_fdw_validator", 2278, &[1009, 26][..], "s"),
-        ] {
-            let declaration = builtin_callable_by_oid(oid).unwrap();
-            assert_eq!(declaration.name, name);
-            assert_eq!(declaration.result_oid, result);
-            assert_eq!(declaration.arguments, arguments);
-            assert_eq!(declaration.catalog.volatility, volatility);
-            assert_eq!(declaration.catalog.source, name);
-            assert!(declaration.catalog.strict);
-            assert_eq!(declaration.catalog.language, 12);
-            assert_eq!(declaration.catalog.parallel, "s");
-            assert!(declaration.defaults.is_none());
         }
     }
 }
@@ -1048,20 +1036,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         1,
         "v"
     ),
-    IntrinsicRoutine {
-        oid: 540_000,
-        name: "postgres_fdw_handler",
-        argument_types: "",
-        argument_count: 0,
-        volatility: "v",
-    },
-    IntrinsicRoutine {
-        oid: 540_001,
-        name: "postgres_fdw_validator",
-        argument_types: "1009 26",
-        argument_count: 2,
-        volatility: "s",
-    },
     IntrinsicRoutine {
         oid: 715,
         name: "lo_create",
@@ -7975,16 +7949,6 @@ fn column_statistics_options_datum<'a>(
     })
 }
 
-fn foreign_routine_oid(storage: &Storage, txid: u32, name: &str) -> Result<i32, SqlError> {
-    routine_oid_by_name(storage, txid, name, false)?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "foreign-data routine \"{}\" is missing from pg_proc",
-            name
-        )
-    })
-}
-
 fn pg_foreign_data_wrapper<'a>(
     storage: &Storage,
     txid: u32,
@@ -8003,18 +7967,8 @@ fn pg_foreign_data_wrapper<'a>(
                 Datum::Int4(entry.oid()),
                 text(wrapper.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
-                Datum::Int4(match wrapper.handler {
-                    crate::storage::foreign::ForeignDataHandler::None => 0,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => {
-                        foreign_routine_oid(storage, txid, "postgres_fdw_handler")?
-                    }
-                }),
-                Datum::Int4(match wrapper.validator {
-                    crate::storage::foreign::ForeignDataValidator::None => 0,
-                    crate::storage::foreign::ForeignDataValidator::Postgres => {
-                        foreign_routine_oid(storage, txid, "postgres_fdw_validator")?
-                    }
-                }),
+                Datum::Int4(wrapper.handler.routine_oid()),
+                Datum::Int4(wrapper.validator.routine_oid()),
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -10226,6 +10180,12 @@ fn bound_index_source<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a super::ast::Expr<'a>, SqlError> {
+    if info.is_exclusion {
+        // An exclusion constraint keeps its predicate as name-resolved text;
+        // its index has no explicit definition to bind it through.
+        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+        return super::parser::parse_expr(source, arena);
+    }
     let index = info_index(storage, info, txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
     super::exec::expression_bindings::bound_index_expression(
@@ -10333,6 +10293,28 @@ pub(crate) struct IndexMaintenanceTarget {
 }
 
 /// Includes the implicit constraint and TOAST indexes exposed by the catalogs.
+/// The index of `table`'s key or exclusion constraint `name`, the parent
+/// index it is attached to, and whether the constraint itself is a
+/// partition's copy of its parent's.
+pub(crate) fn inherited_constraint_index(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    name: &str,
+) -> Option<(i32, i32, bool)> {
+    let mut found = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index.table_slot == table
+            && index.constraint_identity.is_some()
+            && index.name.as_str() == name
+            && let Some(parent) = index.index_parent_oid
+        {
+            found = Some((index.oid, parent, index.constraint_parent.is_some()));
+        }
+    });
+    found
+}
+
 pub(crate) fn index_maintenance_target(
     storage: &Storage,
     txid: u32,
@@ -12406,6 +12388,7 @@ pub fn function_def_text<'a>(
         match routine.language {
             crate::storage::RoutineLanguage::Sql => "sql",
             crate::storage::RoutineLanguage::PlPgSql => "plpgsql",
+            crate::storage::RoutineLanguage::Native(_) => "c",
             crate::storage::RoutineLanguage::Internal => {
                 unreachable!("non-aggregate stored routine has an executable language")
             }
@@ -12472,7 +12455,12 @@ pub fn function_def_text<'a>(
             if delimiter.is_truncated() {
                 return Err(routine_definition_too_large());
             }
-            let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
+            let _ = definition.write_str("AS ");
+            // A C routine prints its object file before its link symbol.
+            if let crate::storage::RoutineLanguage::Native(native) = routine.language {
+                let _ = write!(definition, "'{}', ", native.module().path());
+            }
+            let _ = write!(definition, "{0}{body}{0}", delimiter.as_str());
         }
         crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic => {
             write_sql_body(&mut definition, storage, txid, slot, &routine, arena)?;
@@ -21189,11 +21177,25 @@ fn pg_available_extensions<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_available_extensions", false);
-    let count = storage.extension_packages().count();
+    let system = usize::from(storage.system_extension_packages());
+    let count = storage.extension_packages().count() + system;
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // `$system` holds the plpgsql package initdb installs.
+    if system == 1 {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                text("1.0", arena)?,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+    }
     for (index, (_, package)) in storage.extension_packages().enumerate() {
+        let index = index + system;
         let installed = storage
             .extension_slot(package.name.as_str(), txid)
             .map(|slot| storage.extension(slot).definition_to(txid).2);
@@ -21229,6 +21231,23 @@ fn pg_available_extension_versions<'a>(
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut emitted: [Option<(usize, crate::storage::ExtensionVersion)>; 256] = [None; 256];
     let mut count = 0usize;
+    if storage.system_extension_packages() {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text("pg_catalog", arena)?,
+                Datum::Null,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+        count = 1;
+    }
     for (package_slot, package) in storage.extension_packages() {
         for (_, script) in storage.extension_scripts_for(package_slot) {
             if emitted[..count].contains(&Some((package_slot, script.to))) {
@@ -24599,7 +24618,12 @@ fn pg_proc<'a>(
                     },
                     arena,
                 )?,
-                Datum::Null,
+                match routine.language {
+                    crate::storage::RoutineLanguage::Native(native) => {
+                        text(native.module().path(), arena)?
+                    }
+                    _ => Datum::Null,
+                },
                 Datum::Bool(routine.attributes.strict),
                 Datum::Bool(routine.attributes.leakproof),
                 if routine.config_count == 0 {
@@ -28817,8 +28841,8 @@ fn info_foreign_data_wrappers<'a>(
                 Datum::Null,
                 match wrapper.handler {
                     crate::storage::foreign::ForeignDataHandler::None => Datum::Null,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => {
-                        text("internal", arena)?
+                    crate::storage::foreign::ForeignDataHandler::Postgres { .. } => {
+                        text("c", arena)?
                     }
                 },
             ],

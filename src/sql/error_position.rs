@@ -662,7 +662,12 @@ pub(crate) fn expression_error(
             } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
                 at_parsed_offset(error, source_position.get())
             } else if let Expr::Str(literal) = operand
-                && state.starts_with("22")
+                && (state.starts_with("22")
+                    // An object-identifier type's input looks the name up:
+                    // any failure of it is the literal's.
+                    || crate::sql::types::ColType::from_sql_name(type_name)
+                        .is_some_and(crate::sql::types::ColType::is_reg_object)
+                        && error.sqlstate.internal_control().is_none())
                 && !is_type_modifier_failure(message)
             {
                 at_subject(error, literal)

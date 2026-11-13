@@ -24,7 +24,9 @@ SELECT prosecdef, proowner::regrole FROM pg_proc WHERE oid = 'has_table_privileg
 SET ROLE abr_caller;
 SELECT has_table_privilege('abr_t', 'select'), current_user;
 RESET ROLE;
-ALTER FUNCTION has_table_privilege(text, text) SECURITY INVOKER OWNER TO postgres;
+-- OWNER TO is its own ALTER FUNCTION form; restore the built-in for later fixtures.
+ALTER FUNCTION has_table_privilege(text, text) SECURITY INVOKER;
+ALTER FUNCTION has_table_privilege(text, text) OWNER TO postgres;
 SET ROLE abr_caller;
 SELECT has_table_privilege('abr_t', 'select');
 RESET ROLE;

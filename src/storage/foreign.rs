@@ -181,15 +181,55 @@ impl ForeignOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A wrapper's handler: `Postgres` names, by `pg_proc` OID, the `LANGUAGE C`
+/// routine bound to postgres_fdw's native handler.
 pub(crate) enum ForeignDataHandler {
     None,
-    Postgres,
+    Postgres { routine: i32 },
+}
+
+impl ForeignDataHandler {
+    /// The durable form: the routine OID, or 0 for no handler.
+    pub(crate) const fn routine_oid(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Postgres { routine } => routine,
+        }
+    }
+
+    pub(crate) const fn from_routine_oid(oid: i32) -> Option<Self> {
+        match oid {
+            0 => Some(Self::None),
+            routine if routine > 0 => Some(Self::Postgres { routine }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A wrapper's validator, by the OID of the routine bound to postgres_fdw's
+/// native validator.
 pub(crate) enum ForeignDataValidator {
     None,
-    Postgres,
+    Postgres { routine: i32 },
+}
+
+impl ForeignDataValidator {
+    /// The durable form: the routine OID, or 0 for no validator.
+    pub(crate) const fn routine_oid(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Postgres { routine } => routine,
+        }
+    }
+
+    pub(crate) const fn from_routine_oid(oid: i32) -> Option<Self> {
+        match oid {
+            0 => Some(Self::None),
+            routine if routine > 0 => Some(Self::Postgres { routine }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +252,7 @@ impl ForeignDataWrapperDefinition {
     /// wrapper created without a handler.
     pub(crate) fn require_handler(&self) -> Result<(), SqlError> {
         match self.handler {
-            ForeignDataHandler::Postgres => Ok(()),
+            ForeignDataHandler::Postgres { .. } => Ok(()),
             ForeignDataHandler::None => Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "foreign-data wrapper \"{}\" has no handler",

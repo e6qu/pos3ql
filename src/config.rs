@@ -224,7 +224,9 @@ pub struct Config {
     /// ordinary view.
     pub max_rules: usize,
     /// Colon-separated PostgreSQL extension roots; controls live below each
-    /// root's `extension` directory. Empty selects only durable packages.
+    /// root's `extension` directory. `$system` names the built-in packages
+    /// (`plpgsql`), as PostgreSQL's does. Empty selects the durable packages
+    /// and `$system`, PostgreSQL's default.
     pub extension_control_path: String,
     /// Number of installation and update scripts retained at startup.
     pub max_extension_scripts: usize,

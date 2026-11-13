@@ -868,6 +868,11 @@ impl ReplicationClient {
         }
     }
 
+    /// Whether a subscription worker owns this client's connection.
+    pub fn is_bound(&self) -> bool {
+        self.stream.is_some()
+    }
+
     pub fn unbind(&mut self) {
         self.stream = None;
         self.endpoint = None;

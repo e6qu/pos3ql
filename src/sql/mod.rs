@@ -12860,9 +12860,9 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
             parser.capture_type_inputs();
-            // One Query message owns an implicit transaction until an explicit
-            // BEGIN boundary. PostgreSQL commits preceding simple-query commands
-            // before opening that block, so ROLLBACK cannot erase them.
+            // One Query message owns an implicit transaction; a BEGIN in it
+            // makes that transaction explicit, so a later ROLLBACK also
+            // erases the statements before the BEGIN.
             // Freeze this statement's clock before anything anchors a transaction
             // to it, so `now()` and `statement_timestamp()` agree on a lone
             // statement as they do in PostgreSQL.
@@ -12959,6 +12959,7 @@ impl Engine {
                 let (statement, source_start, source_end, has_type_inputs) =
                     statement.as_ref().expect("parsed query statement");
                 let source = &text[*source_start..*source_end];
+                send_held_command_complete(txn, responder)?;
                 if statement_index != resume_statement {
                     txn.enter_statement_timeout(StatementTimeoutEntry::Command {
                         timeout_ms: guc.statement_timeout_ms(),
@@ -13066,40 +13067,6 @@ impl Engine {
                     responder.error(e.sqlstate, e.message.as_str())?;
                     return Ok(ExecutionStatus::Complete);
                 }
-                if matches!(statement, Stmt::Begin(..))
-                    && txn.is_implicit()
-                    && let Err(error) = self.commit_txn_with_triggers(
-                        txn,
-                        guc,
-                        crate::sql::txn::CommitTarget::Ordinary,
-                        CursorCommitContext {
-                            cursors,
-                            plans: Some(sqlprep),
-                            arena,
-                        },
-                        arena,
-                        responder,
-                    )
-                {
-                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
-                        && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
-                    {
-                        return Ok(ExecutionStatus::Blocked {
-                            completed_statements: statement_index,
-                            output_mark: responder.mark(),
-                            wait: if txn.staged_commit().is_some()
-                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                            {
-                                StatementWait::ObjectIo
-                            } else {
-                                StatementWait::Lock
-                            },
-                        });
-                    }
-                    responder.error(error.sqlstate, error.message.as_str())?;
-                    return Ok(ExecutionStatus::Complete);
-                }
                 match self.wait_for_cache_capacity(
                     statement,
                     txn,
@@ -13135,6 +13102,7 @@ impl Engine {
                     Some(self.storage.advisory_journal()),
                 );
                 let output_mark = responder.mark();
+                responder.hold_command_complete();
                 let statement_mark =
                     txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
                 let plan_owner = sqlprep
@@ -13447,8 +13415,17 @@ impl Engine {
                     });
                 }
                 txn.compact_completed_constraints();
+                // Only the last statement's tag waits for the commit.
+                txn.held_command_complete = responder
+                    .take_held_command_complete()
+                    .map(|tag| (statement_index, tag));
+                if statement_index + 1 < statement_count {
+                    send_held_command_complete(txn, responder)?;
+                }
             }
             if let Some((error, statement)) = &rejected {
+                // The statements before the rejected one completed.
+                send_held_command_complete(txn, responder)?;
                 // PostgreSQL finds some analysis errors before the deferred
                 // one: an unknown type, the FROM clause, and earlier output
                 // columns.
@@ -13476,6 +13453,8 @@ impl Engine {
             }
             // Implicit transactions commit at end of message — except a COPY
             // FROM in flight, whose statement does not end until CopyDone.
+            // The last statement's tag follows the commit, as PostgreSQL
+            // commits before reporting it.
             if txn.is_implicit()
                 && self.pending_copy.is_none()
                 && let Err(e) = self.commit_txn_with_triggers(
@@ -13508,9 +13487,27 @@ impl Engine {
                     });
                 }
                 responder.error(e.sqlstate, e.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
             }
+            send_held_command_complete(txn, responder)?;
             Ok(ExecutionStatus::Complete)
         })();
+        match result {
+            // A statement that runs again reports its own tag.
+            Ok(ExecutionStatus::Blocked {
+                completed_statements,
+                ..
+            }) if txn
+                .held_command_complete
+                .is_some_and(|(statement, _)| statement >= completed_statements) =>
+            {
+                txn.held_command_complete = None
+            }
+            Ok(ExecutionStatus::Blocked { .. }) => {}
+            // A tag still held when the message ends belongs to a statement
+            // whose end or commit failed.
+            Ok(ExecutionStatus::Complete) | Err(WireFull) => txn.held_command_complete = None,
+        }
         if !type_input_plans::has_active_plan() {
             sqlprep
                 .routine_inputs
@@ -14967,6 +14964,7 @@ impl Engine {
                         scratch,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -17624,6 +17622,7 @@ impl Engine {
         frame: &Arena,
         mut continuation: Option<&mut Option<query::RoutineInvocationState>>,
         source_snapshot: u32,
+        catalog_reads: query::CatalogReads,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -17637,8 +17636,7 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
-        // A volatile routine's statement reads the catalog as it is now.
-        let _fresh_catalog_reads = if source_snapshot == crate::storage::SNAPSHOT_ALL {
+        let _fresh_catalog_reads = if catalog_reads == query::CatalogReads::Fresh {
             match query::enter_fresh_catalog_reads() {
                 Ok(scope) => Some(scope),
                 Err(error) => return Ok(Err(error)),
@@ -17838,6 +17836,7 @@ impl Engine {
                     frame,
                     None,
                     source_snapshot,
+                    query::CatalogReads::Statement,
                     txn,
                     sqlprep,
                     cursors,
@@ -17869,6 +17868,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -18872,7 +18872,8 @@ impl Engine {
             Ok(declaration) => declaration,
             Err(error) => return Ok(Err(error)),
         };
-        let check_body = guc.check_function_bodies();
+        // A C routine's body is its link symbol, checked as it resolved.
+        let check_body = guc.check_function_bodies() && routine.language != ast::RoutineLanguage::C;
         let result = (|| {
             let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
                 match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
@@ -21773,6 +21774,9 @@ impl Engine {
                 | Stmt::Reset(_)
                 | Stmt::SetTransaction { .. }
                 | Stmt::SetTransactionSnapshot(_)
+                | Stmt::SetRole { .. }
+                | Stmt::SetSessionAuthorization { .. }
+                | Stmt::SetConstraints { .. }
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
@@ -23989,15 +23993,25 @@ impl Engine {
                     responder.command_complete(start.command_name())?;
                     return Ok(Ok(()));
                 }
-                if let Err(error) = self.ensure_txn(txn, TxnMode::Explicit, guc) {
-                    return Ok(Err(error));
-                }
                 if let Some(isolation) = characteristics.isolation
                     && let Err(error) = self.storage.validate_transaction_isolation(isolation)
                 {
                     return Ok(Err(error));
                 }
-                txn.apply_begin_characteristics(*characteristics);
+                // In a multi-statement Query, BEGIN turns the implicit
+                // transaction block, with the statements before it, into an
+                // explicit one, as PostgreSQL does. Characteristics a query
+                // before it already fixed fail the implicit transaction.
+                let applied = if txn.is_active() {
+                    txn.apply_characteristics(*characteristics)
+                        .and_then(|()| self.ensure_txn(txn, TxnMode::Explicit, guc))
+                } else {
+                    self.ensure_txn(txn, TxnMode::Explicit, guc)
+                        .and_then(|()| txn.apply_characteristics(*characteristics))
+                };
+                if let Err(error) = applied {
+                    return Ok(Err(error));
+                }
                 responder.command_complete(start.command_name())?;
                 Ok(Ok(()))
             }
@@ -24881,8 +24895,11 @@ impl Engine {
                     | Stmt::ReleaseSavepoint(_)
                     | Stmt::RollbackToSavepoint(_)
                     | Stmt::CreateExtension { .. }
-                    | Stmt::AlterExtension { .. }
                     | Stmt::DropExtension { .. }
+            ) || matches!(
+                statement,
+                Stmt::AlterExtension { action, .. }
+                    if !matches!(action, ast::AlterExtensionAction::Member { .. })
             ) {
                 let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                 return Ok(Err(sql_err!(
@@ -25449,8 +25466,77 @@ impl Engine {
         })
     }
 
+    /// PostgreSQL's `DROP EXTENSION`: one dependency walk from the named
+    /// extensions decides `RESTRICT` and reports `CASCADE`, so an object that
+    /// depends on a member, but is not one, needs `CASCADE`. The members
+    /// themselves are dropped silently.
     #[allow(clippy::too_many_arguments)]
     fn drop_extension(
+        &mut self,
+        names: &[&str],
+        if_exists: bool,
+        cascade: bool,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut originals =
+            [catalog::dependencies::ObjectAddress::new(0, 0, 0); crate::storage::MAX_EXTENSIONS];
+        let mut count = 0usize;
+        for name in names {
+            match self.storage.extension_slot(name, txn.txid) {
+                Some(slot) if count < originals.len() => {
+                    originals[count] = catalog::dependencies::ObjectAddress::new(
+                        catalog::PG_EXTENSION_OID,
+                        self.storage.extension(slot).oid(),
+                        0,
+                    );
+                    count += 1;
+                }
+                Some(_) => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "DROP EXTENSION names more than {} extensions",
+                        crate::storage::MAX_EXTENSIONS
+                    )));
+                }
+                None if if_exists => {}
+                None => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "extension \"{}\" does not exist",
+                        name
+                    )));
+                }
+            }
+        }
+        let report = exec::dependency_report::report_drop(
+            &self.storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        );
+        match report {
+            Err(error) => Ok(Err(error)),
+            Ok(Some(filter)) => responder.with_dependency_report(filter, |responder| {
+                self.drop_extension_members(
+                    names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc, responder,
+                )
+            }),
+            Ok(None) => self.drop_extension_members(
+                names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc, responder,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drop_extension_members(
         &mut self,
         names: &[&str],
         if_exists: bool,
@@ -25491,13 +25577,6 @@ impl Engine {
                         self.storage.extension(dependency.object.slot as usize).name;
                     dependent_count += 1;
                 }
-            }
-            if dependent_count != 0 && !cascade {
-                return Ok(Err(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop extension \"{}\" because other extensions depend on it",
-                    name
-                )));
             }
             for dependent in &dependent_extensions[..dependent_count] {
                 let targets = [dependent.as_str()];
@@ -26156,6 +26235,7 @@ impl Engine {
                 frame,
                 None,
                 command,
+                query::CatalogReads::Statement,
                 txn,
                 sqlprep,
                 cursors,
@@ -26473,6 +26553,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -26509,6 +26590,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -28220,6 +28302,18 @@ fn release_transaction_locks(storage: &Storage, transaction: u32) {
     storage.release_object_locks(transaction);
     storage.release_row_locks(transaction);
     storage.release_advisory_transaction_locks(transaction);
+}
+
+/// Sends the held CommandComplete of an earlier statement of this Query
+/// once its transaction boundary has passed.
+fn send_held_command_complete(
+    txn: &mut TxnState,
+    responder: &mut Responder,
+) -> Result<(), WireFull> {
+    match txn.held_command_complete.take() {
+        Some((_, tag)) => responder.command_complete(tag.as_str()),
+        None => Ok(()),
+    }
 }
 
 fn finish_transaction_cleanup(

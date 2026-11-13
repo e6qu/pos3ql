@@ -505,9 +505,6 @@ fn statement_sublinks<'a>(
         if !super::subquery::stable_uncorrelated(node, storage, txid, arena) {
             return Ok(None);
         }
-        // A FROM item the subquery's FROM cannot resolve as written (a view,
-        // which the general executor expands as it runs the subquery) is not
-        // kept, and the statement runs there, reporting any real error itself.
         let (Expr::Subquery(select)
         | Expr::Exists(select)
         | Expr::ArraySubquery(select)
@@ -517,6 +514,8 @@ fn statement_sublinks<'a>(
         else {
             return Ok(None);
         };
+        // A view in FROM is expanded only by the general executor as the
+        // subquery runs; that statement runs there and reports its own errors.
         if !super::subquery::select_from_resolves(select, storage, txid, arena)? {
             return Ok(None);
         }

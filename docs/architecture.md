@@ -813,8 +813,9 @@ PostgreSQL reads every catalog relation a statement scans under the
 statement's snapshot, so `SELECT mk(g), (SELECT count(*) FROM pg_class) FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts the tables that
 existed when the statement began. Before a query that calls a user routine
-runs, pos3ql builds an image of every `pg_catalog` relation the query names,
-directly or through views, in the query workspace's `catalog_image_bytes`
+runs, and before any data change, compound query or `WITH` statement runs
+(a trigger may change the catalog), pos3ql builds an image of every
+`pg_catalog` relation the statement names, directly or through views, in the query workspace's `catalog_image_bytes`
 arena, and the query's scans read those images until it ends. A query that
 calls no user routine cannot change the catalog while it runs, and builds its
 images as it first reads each relation. A volatile routine's statements read

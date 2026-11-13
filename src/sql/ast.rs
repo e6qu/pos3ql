@@ -3547,6 +3547,13 @@ impl PartialEq for MaterializedCteSource<'_> {
     }
 }
 
+/// Which calls [`Expr::contains_call`] looks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallScope {
+    Any,
+    Routines,
+}
+
 impl Expr<'_> {
     /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
     /// these field by field with SQL-standard NULL semantics, while every
@@ -4714,6 +4721,23 @@ pub enum RoutineBody<'a> {
     String(&'a str),
     Return(&'a str),
     Atomic(&'a str),
+    /// `AS 'file' [, 'link symbol']` of a `LANGUAGE C` routine; without a
+    /// symbol the routine's name is its symbol.
+    Library {
+        file: &'a str,
+        symbol: Option<&'a str>,
+    },
+}
+
+impl<'a> RoutineBody<'a> {
+    /// The text `pg_proc.prosrc` keeps: a C routine's link symbol, which
+    /// defaults to the routine's `name`.
+    pub fn stored_text(self, name: &'a str) -> &'a str {
+        match self {
+            Self::String(body) | Self::Return(body) | Self::Atomic(body) => body,
+            Self::Library { symbol, .. } => symbol.unwrap_or(name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4767,6 +4791,8 @@ pub enum RoutineVolatility {
 pub enum RoutineLanguage {
     Sql,
     PlPgSql,
+    /// Binds to a native routine pos3ql implements for a built-in module.
+    C,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6658,7 +6684,23 @@ impl<'a> Expr<'a> {
     /// non-constant DEFAULT (`now()`, `nextval(...)`, `random()`, …) that must be
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
+        self.contains_call_in(CallScope::Any)
+    }
+
+    /// Whether evaluating the expression can run a routine: a `ROW(...)`
+    /// constructor only assembles its fields, so the planner can treat
+    /// `ROW(1, 'a')::t` as the constant PostgreSQL folds it to.
+    pub fn calls_routine(&self) -> bool {
+        self.contains_call_in(CallScope::Routines)
+    }
+
+    fn contains_call_in(&self, scope: CallScope) -> bool {
         match self {
+            Expr::Call { args, .. }
+                if scope == CallScope::Routines && self.is_row_constructor() =>
+            {
+                args.iter().any(|argument| argument.contains_call_in(scope))
+            }
             Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
@@ -6684,11 +6726,11 @@ impl<'a> Expr<'a> {
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
-            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_call(),
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_call_in(scope),
             Expr::Slice { base, lower, upper } => {
-                base.contains_call()
-                    || lower.is_some_and(|e| e.contains_call())
-                    || upper.is_some_and(|e| e.contains_call())
+                base.contains_call_in(scope)
+                    || lower.is_some_and(|e| e.contains_call_in(scope))
+                    || upper.is_some_and(|e| e.contains_call_in(scope))
             }
             Expr::Binary { left, right, .. }
             | Expr::Subscript {
@@ -6699,9 +6741,9 @@ impl<'a> Expr<'a> {
                 operand: left,
                 array: right,
                 ..
-            } => left.contains_call() || right.contains_call(),
+            } => left.contains_call_in(scope) || right.contains_call_in(scope),
             Expr::InList { operand, list, .. } => {
-                operand.contains_call() || list.iter().any(|e| e.contains_call())
+                operand.contains_call_in(scope) || list.iter().any(|e| e.contains_call_in(scope))
             }
             Expr::Like {
                 operand,
@@ -6709,26 +6751,28 @@ impl<'a> Expr<'a> {
                 escape,
                 ..
             } => {
-                operand.contains_call()
-                    || pattern.contains_call()
-                    || escape.is_some_and(|expression| expression.contains_call())
+                operand.contains_call_in(scope)
+                    || pattern.contains_call_in(scope)
+                    || escape.is_some_and(|expression| expression.contains_call_in(scope))
             }
             Expr::Match {
                 operand, pattern, ..
-            } => operand.contains_call() || pattern.contains_call(),
+            } => operand.contains_call_in(scope) || pattern.contains_call_in(scope),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
             } => {
-                operand.map(|o| o.contains_call()).unwrap_or(false)
+                operand.map(|o| o.contains_call_in(scope)).unwrap_or(false)
                     || whens
                         .iter()
-                        .any(|(c, r)| c.contains_call() || r.contains_call())
-                    || otherwise.map(|o| o.contains_call()).unwrap_or(false)
+                        .any(|(c, r)| c.contains_call_in(scope) || r.contains_call_in(scope))
+                    || otherwise
+                        .map(|o| o.contains_call_in(scope))
+                        .unwrap_or(false)
             }
-            Expr::Array(items) => items.iter().any(|e| e.contains_call()),
+            Expr::Array(items) => items.iter().any(|e| e.contains_call_in(scope)),
             // A subquery-bearing default is rejected elsewhere; treat it as
             // non-foldable to be safe.
             Expr::Subquery(_)

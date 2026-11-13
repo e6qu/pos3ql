@@ -807,7 +807,17 @@ pub(super) fn dependencies<'a>(
 ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
     let constraints = super::pg_constraint_values(storage, transaction, arena)?;
     let definition = super::schema::require("pg_constraint", false);
-    let [kind, oid, domain, table, key, index, parent, referenced] = [
+    let [
+        kind,
+        oid,
+        domain,
+        table,
+        key,
+        index,
+        parent,
+        referenced,
+        parent_constraint,
+    ] = [
         "contype",
         "oid",
         "contypid",
@@ -816,6 +826,7 @@ pub(super) fn dependencies<'a>(
         "conindid",
         "confrelid",
         "confkey",
+        "conparentid",
     ]
     .map(|name| {
         definition
@@ -901,6 +912,27 @@ pub(super) fn dependencies<'a>(
                 0,
                 b'i',
             )?;
+            // PostgreSQL's `ConstraintSetParentConstraint`: a partition's
+            // constraint goes with its parent's or with the partition.
+            let parent = integer(values[parent_constraint])?;
+            if parent != 0 {
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CONSTRAINT_OID,
+                    parent,
+                    0,
+                    b'P',
+                )?;
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CLASS_OID,
+                    table,
+                    0,
+                    b'S',
+                )?;
+            }
         } else if constraint_kind == b'f' {
             push(
                 super::PG_CONSTRAINT_OID,
@@ -923,7 +955,22 @@ pub(super) fn dependencies<'a>(
         }
     }
     for index in indexes {
+        // PostgreSQL's `IndexSetParentIndex`: a partition's index goes with
+        // its parent index or with the partition.
+        let partition_edges = index
+            .index_parent_oid
+            .map(|parent| [(parent, b'P'), (index.table_oid, b'S')]);
         if index.constraint_identity.is_some() {
+            for (referenced, kind) in partition_edges.into_iter().flatten() {
+                push(
+                    super::PG_CLASS_OID,
+                    index.oid,
+                    super::PG_CLASS_OID,
+                    referenced,
+                    0,
+                    kind,
+                )?;
+            }
             continue;
         }
         let table = storage.table_def(index.table_slot, transaction);
@@ -983,6 +1030,16 @@ pub(super) fn dependencies<'a>(
                     )?;
                 }
             }
+        }
+        for (referenced, kind) in partition_edges.into_iter().flatten() {
+            push(
+                super::PG_CLASS_OID,
+                index.oid,
+                super::PG_CLASS_OID,
+                referenced,
+                0,
+                kind,
+            )?;
         }
         // The objects the key expressions name, then those the predicate
         // names, normally: two separately deduplicated sets.

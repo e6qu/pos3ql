@@ -427,10 +427,7 @@ shipped `pg_description` text and `pg_conversion` lists no built-in rows (the
 other shipped descriptions are listed); `pg_type`, `pg_operator` and
 `pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
 physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
-describe commands match PostgreSQL 18.6 except: `\dfS+` lists
-`postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
-PostgreSQL has them only in the schema of an installed `postgres_fdw`
-extension; and `\dfS+` over 3,400 routines takes about twice as long as
+describe commands match PostgreSQL 18.6 except: `\dfS+` over 3,400 routines takes about twice as long as
 PostgreSQL (0.5 s against 0.24 s in release builds on one host, 2026-11-13)
 because each row's calls repeat overload resolution and expression typing
 that PostgreSQL does once while planning. Parameter inference walks a statement in its own order rather than
@@ -463,25 +460,28 @@ one of them names fails with `0A000`, as does renaming an enum value any
 stored expression casts to; binding them follows the same dependency-list
 pattern. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
-call fails with `22P02`. An index key whose value is a whole row
-(`CREATE INDEX ON t ((t))`) fails with `0A000`: evaluation yields an anonymous
-record, and only named composite types have a stored value form (a table's
-row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
-`NEW.` or `OLD.` fails the rename with `0A000`. A
-partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
-its parent's plain unique index, so attaching such a partition builds a
-separate copy where PostgreSQL reuses the constraint's index; constraint
-indexes need a durable link to a parent index first.
+call fails with `22P02`. A rule action that names its table's renamed column without
+`NEW.` or `OLD.` fails the rename with `0A000`.
 An exclusion constraint element must be a column: an expression
 (`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
-the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the
+the stored constraint keeps no element expressions. Supporting them needs
+per-element expression text in the constraint's journal and checkpoint
+records, element evaluation in the conflict scan, `indkey` 0 and `indexprs`
+in `pg_index`, and handling of every path that copies or renumbers
+exclusion columns (`LIKE`, inheritance, partition attach, `DROP COLUMN`,
+column renames). A deferred unique or exclusion check that fails at commit runs before
+or after the row's deferred constraint triggers by a separate queue, where
+PostgreSQL fires it among them in trigger-name order
+(`PK_ConstraintTrigger`, `Unique_ConstraintTrigger`), so a deferred trigger's
+notice can precede the error that PostgreSQL reports first. A statement's own catalog scans, including those through views, read the
 catalog as the statement began (images built at its start), so `SELECT mk(g),
 (SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as
-PostgreSQL's statement snapshot does; a volatile routine's queries see the
-change. A STABLE or IMMUTABLE SQL function's catalog query still reads the
-catalog as it is when it runs, where PostgreSQL reads it under the calling
-statement's snapshot. `pg_get_viewdef`, `pg_views`,
+PostgreSQL's statement snapshot does, and so does a data change whose
+trigger creates tables; a volatile routine's queries see the change. A
+STABLE or IMMUTABLE SQL function reads the catalog under its calling
+statement's snapshot too: the images its body reads, through nested
+non-volatile SQL functions, are built when the statement starts. `pg_get_viewdef`, `pg_views`,
 `pg_get_ruledef` and `pg_rules` print every view's and rule's query as
 PostgreSQL deparses it, in its indented layout and wrap column, from the
 stored query, never its stored text: subqueries, functions (including ones
@@ -574,12 +574,27 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints.
+The built-in `postgres_fdw` extension's routines cannot be called directly
+(`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need
+connections cached past their transaction, which pos3ql closes at transaction
+end, and `postgres_fdw_validator` is run only by wrapper DDL. `CREATE
+EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
+read-only virtual schema. A foreign key cannot reference columns covered only
+by a unique index (`CREATE UNIQUE INDEX`), which PostgreSQL accepts. A
+qualified type name with an unknown schema (`'1'::nope.int4`) reports `type
+"nope.int4" does not exist` (`42704`) where PostgreSQL reports `schema "nope"
+does not exist` (`3F000`). A literal passed to a function's `regclass`
+argument (`nextval('nope')`) is converted when the call runs, so its error has
+no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`, so comparing one with an
+untyped literal (`WHERE t = '(1,a)'`) fails with `42883` where PostgreSQL
+reports `0A000`; whole-row index keys (`CREATE INDEX ON t ((t))`) do have the
+row type. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or

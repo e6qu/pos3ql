@@ -117,41 +117,112 @@ fn encode_catalog_rows<'a>(
     Ok(encoded)
 }
 
-/// Builds, at the start of a query that calls a user routine, the image of
-/// every `pg_catalog` relation it reads, directly or through views, under the
-/// statement's catalog snapshot: a routine the query calls that changes the
-/// catalog leaves the query's own scans reading the catalog as it began, as
-/// PostgreSQL's statement snapshot does. Other statements' scans build the
-/// same images when they first read a relation, which nothing they run can
-/// have changed.
+/// Builds, at the start of a query that calls a user routine or of a data
+/// change, the image of every `pg_catalog` relation it reads, directly or
+/// through views, under the statement's catalog snapshot: a routine or
+/// trigger that changes the catalog leaves the statement's own scans reading
+/// the catalog as it began, as PostgreSQL's statement snapshot does. Other
+/// statements' scans build the same images when they first read a relation,
+/// which nothing they run can have changed.
 pub(crate) fn prebuild_statement_catalog_images(
     statement: &crate::sql::ast::Stmt<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    // Only a query that can run a user routine can change the catalog
-    // before its own scans read it.
-    let crate::sql::ast::Stmt::Select(select) = statement else {
-        return Ok(());
-    };
-    if !super::cte::select_contains_function(select, &|name, arguments| {
-        storage.has_callable_candidate(name, arguments, txid)
-    }) {
-        return Ok(());
+    // Only a statement that can run a user routine can change the catalog
+    // before its own scans read it. A plain query is judged by its calls; a
+    // compound query or a data change (whose triggers run routines) always
+    // takes its images first.
+    use crate::sql::ast::Stmt;
+    match statement {
+        Stmt::Select(select)
+            if super::cte::select_contains_function(select, &|name, arguments| {
+                storage.has_callable_candidate(name, arguments, txid)
+            }) => {}
+        Stmt::SetQuery(_)
+        | Stmt::With { .. }
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_) => {}
+        _ => return Ok(()),
     }
     super::catalog_images::pin_statement_images();
+    prebuild_statement_relations(statement, storage, txid, 0, arena)
+}
+
+/// Builds the images `statement` reads and those read by the non-volatile
+/// SQL functions it calls, which run under the statement's snapshot.
+fn prebuild_statement_relations(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
     let path = storage.path();
     let mut failure = None;
     super::cte::statement_relations_of(statement, &mut |table| {
         if failure.is_none()
-            && let Err(error) = prebuild_relation(table, &path, storage, txid, 0, arena)
+            && let Err(error) = prebuild_relation(table, &path, storage, txid, depth, arena)
         {
             failure = Some(error);
         }
         0
     });
-    failure.map_or(Ok(()), Err)
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if depth >= MAX_PREBUILD_VIEW_DEPTH {
+        return Ok(());
+    }
+    let failure = core::cell::RefCell::new(None);
+    let call = |name: &str, arity: usize| {
+        if failure.borrow().is_none()
+            && let Err(error) = prebuild_function_bodies(name, arity, storage, txid, depth, arena)
+        {
+            *failure.borrow_mut() = Some(error);
+        }
+        // Visit every call.
+        false
+    };
+    super::cte::statement_contains_function(statement, &call);
+    failure.into_inner().map_or(Ok(()), Err)
+}
+
+/// Builds the images read by the bodies of the non-volatile SQL functions
+/// that a call of `name` with `arity` arguments could select.
+fn prebuild_function_bodies(
+    name: &str,
+    arity: usize,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut bodies = crate::mem::arena::ArenaList::new(arena);
+    storage.visit_stable_sql_function_bodies(name, arity, txid, &mut |kind, body| {
+        let text = match kind {
+            crate::storage::RoutineBodyKind::Return => arena
+                .alloc_str_display(format_args!("SELECT {body}"))
+                .map_err(|_| arena_full())?,
+            crate::storage::RoutineBodyKind::String | crate::storage::RoutineBodyKind::Atomic => {
+                arena.alloc_str(body).map_err(|_| arena_full())?
+            }
+        };
+        bodies.push(text).map_err(|_| arena_full())
+    })?;
+    for &body in bodies.as_slice() {
+        // A body that does not parse fails when the function is called.
+        let Ok(mut parser) = crate::sql::parser::Parser::new(body, arena) else {
+            continue;
+        };
+        while let Ok(Some(statement)) = parser.next_stmt() {
+            prebuild_statement_relations(&statement, storage, txid, depth + 1, arena)?;
+        }
+    }
+    Ok(())
 }
 
 const MAX_PREBUILD_VIEW_DEPTH: usize = 16;

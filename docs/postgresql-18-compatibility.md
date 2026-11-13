@@ -8,7 +8,9 @@ tested surface must fail with an error rather than being accepted and ignored.
 
 **User example:** `psql`, a driver, and `pg_restore` work on the tested paths.
 A PostgreSQL extension that contains a C library cannot be installed, even
-though its `CREATE EXTENSION` command is recognized.
+though its `CREATE EXTENSION` command is recognized. The one exception is
+`postgres_fdw`, which pos3ql builds in: `CREATE EXTENSION postgres_fdw`
+installs it as PostgreSQL does.
 
 The server reports version `18.4 (pos3ql 0.1)`. The vendored PostgreSQL
 regression slice is pinned to PostgreSQL 18.6; older test fixtures keep their
@@ -1160,6 +1162,20 @@ The SQL extension lifecycle works: control and version scripts, updates,
 dependencies, trusted installation, relocation, membership, ownership, comments,
 catalogs, transactions, dump/restore, and recovery. Repository fixture packages
 test it.
+
+`postgres_fdw` is built in and found in `$system`, the default
+`extension_control_path` entry, like PostgreSQL's own contrib packages:
+`CREATE EXTENSION postgres_fdw` runs PostgreSQL 18.6's versions 1.0 to 1.2
+scripts, which create `postgres_fdw_handler`, `postgres_fdw_validator` and
+the `postgres_fdw` wrapper in the target schema. Before that, no handler
+exists. Their `LANGUAGE C` functions (`AS '$libdir/postgres_fdw', 'symbol'`)
+bind to pos3ql's implementation: a wrapper uses them as its handler and
+validator, but calling one directly (`SELECT postgres_fdw_validator(...)`,
+`postgres_fdw_get_connections()`, `postgres_fdw_disconnect(...)`,
+`postgres_fdw_disconnect_all()`) fails with `0A000`. A `LANGUAGE C` function
+of any other library fails with `0A000`; an unknown symbol of
+`$libdir/postgres_fdw` fails with `42883`. Other packages in PostgreSQL's
+`$system` directory are not available.
 
 Third-party extensions, SQL-only or native, are not certified. PostgreSQL C
 libraries, server ABI and hooks, background workers, native procedural

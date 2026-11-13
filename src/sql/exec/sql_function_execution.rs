@@ -40,6 +40,9 @@ struct SqlSource {
     /// PostgreSQL's planner runs an IMMUTABLE function called with constant
     /// arguments instead of inlining it.
     planned_with_constants: bool,
+    /// A volatile function's statements read the catalog as it is when they
+    /// run; others read it under the calling statement's snapshot.
+    catalog_reads: query::CatalogReads,
 }
 
 impl SqlSource {
@@ -739,6 +742,7 @@ impl SqlExecution {
                 (self.policy == query::RoutineExecution::Retained)
                     .then_some(&mut self.pending_query),
                 snapshot,
+                self.source.catalog_reads,
                 context.txn,
                 sqlprep,
                 cursors,
@@ -1211,6 +1215,13 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 stored,
                 inlinable: inlinable_declaration(routine),
                 planned_with_constants: planned_with_constants(routine, constant_arguments),
+                catalog_reads: if routine.attributes.volatility
+                    == crate::storage::RoutineVolatility::Volatile
+                {
+                    query::CatalogReads::Fresh
+                } else {
+                    query::CatalogReads::Statement
+                },
             },
             arguments,
             result,

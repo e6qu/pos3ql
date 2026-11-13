@@ -396,3 +396,49 @@ fn explain_analyze_runs_a_rewritten_statement_once_and_plans_each_query() {
         assert_eq!(document.matches("\"Triggers\": [").count(), 2);
     });
 }
+
+#[test]
+fn joined_dml_hashes_the_first_of_several_from_items() {
+    with_engine("joined-dml-hash-several", |engine, budget| {
+        for sql in [
+            "CREATE TABLE hm (id int, v int, note text)",
+            "CREATE TABLE km (id int, w int)",
+            "CREATE TABLE um (k int, z text)",
+            "INSERT INTO hm SELECT g, g, 'n' FROM generate_series(1, 40) g",
+            "INSERT INTO km SELECT g, g + 100 FROM generate_series(1, 40) g",
+            "INSERT INTO um SELECT g + 100, 'z' || g FROM generate_series(1, 40) g",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let before = crate::sql::query::target_hash_builds();
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE hm SET note = um.z FROM km JOIN um ON km.w = um.k \
+             WHERE hm.v = km.id AND hm.id <= 3 RETURNING hm.id, hm.note",
+        );
+        assert_eq!(sorted_rows(&output), ["1|z1", "2|z2", "3|z3"]);
+        assert_eq!(crate::sql::query::target_hash_builds() - before, 1);
+        let explain = run_with(
+            engine,
+            budget,
+            "EXPLAIN (COSTS OFF) DELETE FROM hm USING km JOIN um ON km.w = um.k \
+             WHERE hm.v = km.id",
+        );
+        assert_eq!(
+            data_rows(&explain),
+            [
+                "Delete on hm",
+                "  ->  Nested Loop",
+                "        Join Filter: (km.w = um.k)",
+                "        ->  Hash Join",
+                "              Hash Cond: (hm.v = km.id)",
+                "              ->  Seq Scan on hm",
+                "              ->  Hash",
+                "                    ->  Seq Scan on km",
+                "        ->  Materialize",
+                "              ->  Seq Scan on um",
+            ]
+        );
+    });
+}

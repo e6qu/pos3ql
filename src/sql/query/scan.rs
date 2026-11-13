@@ -7938,7 +7938,7 @@ fn scan_source_mode<'a>(
             }
             let access = indexed.filter(|access| access.table == order[depth]);
             // A target hash join's build already scanned this source once.
-            let hashed = (depth == 0 && access.is_none())
+            let hashed = (depth == 0 && order[0] == 0 && access.is_none())
                 .then_some(scope.target_hash_candidates)
                 .flatten();
             let candidates = access.map(|access| access.rowids).or(hashed);

@@ -602,7 +602,7 @@ fn join_quals<'a>(
             .max()
             .expect("a join conjunct reads relations");
         if hash
-            && count_relations == 2
+            && depth == 1
             && let Some(equality) = equijoin(conjunct, &resolve, order[0], arena)?
         {
             hash_conds[hash_count] = equality;
@@ -2321,7 +2321,9 @@ pub(super) fn plan_modification<'a>(
             cache_blocks = cache_blocks.saturating_add(node.cache_blocks);
             source_nodes[table] = node;
         }
-        let hashed = scope.n == 1
+        // The target hash-joins the first FROM item it reads; later items
+        // join that result in nested loops.
+        let hashed = order[0] == 0
             && query::target_hash_plan(storage, target, alias, from, predicate, txid, arena)?
                 .is_some();
         let target_definition = storage.table_def(target_slot, txid);
@@ -2381,8 +2383,12 @@ pub(super) fn plan_modification<'a>(
             }
         }
         let join_kind = |position: usize| (position >= 2).then(|| from.joins[position - 2].kind);
+        let hash_at = |position: usize| hashed && position == 1;
         let join = PlanNode {
-            name: StackStr::from_str(join_node(join_kind(relations_count - 1), hashed)),
+            name: StackStr::from_str(join_node(
+                join_kind(relations_count - 1),
+                hash_at(relations_count - 1),
+            )),
             depth: top_depth as u8,
             total_cost: total_cost + rows as f64 * 0.01,
             rows,
@@ -2391,7 +2397,14 @@ pub(super) fn plan_modification<'a>(
             cache_blocks,
             ..PlanNode::EMPTY
         }
-        .with_qual(QualLabel::HashCond, hash_cond)
+        .with_qual(
+            QualLabel::HashCond,
+            if relations_count == 2 {
+                hash_cond
+            } else {
+                None
+            },
+        )
         .with_qual(
             QualLabel::JoinFilter,
             join_filters[relations_count - 1].take(),
@@ -2400,26 +2413,31 @@ pub(super) fn plan_modification<'a>(
         for position in (1..relations_count - 1).rev() {
             plan.push(
                 PlanNode {
-                    name: StackStr::from_str(join_node(join_kind(position), false)),
+                    name: StackStr::from_str(join_node(join_kind(position), hash_at(position))),
                     depth: (top_depth + relations_count - 1 - position) as u8,
                     ..PlanNode::EMPTY
                 }
+                .with_qual(
+                    QualLabel::HashCond,
+                    if position == 1 { hash_cond } else { None },
+                )
                 .with_qual(QualLabel::JoinFilter, join_filters[position].take()),
             )?;
         }
         let target_scan = target_scan.with_qual(QualLabel::Filter, filters[0].take());
         push_scan(&mut plan, target_scan)?;
-        for &table in &order[..scope.n] {
+        for (position, &table) in order[..scope.n].iter().enumerate() {
             let mut node = source_nodes[table];
             let sequential = node.name.as_str() == "Seq Scan";
             if sequential {
                 node = node.with_qual(QualLabel::Filter, filters[table + 1].take());
             }
+            let hash = hash_at(position + 1);
             // A hash join hashes its inner relation; a nested loop rescans its
             // inner sequential scan from a materialized copy.
-            if sequential || hashed {
+            if sequential || hash {
                 plan.push(PlanNode {
-                    name: StackStr::from_str(if hashed { "Hash" } else { "Materialize" }),
+                    name: StackStr::from_str(if hash { "Hash" } else { "Materialize" }),
                     depth: node.depth,
                     total_cost: node.total_cost,
                     rows: node.rows,

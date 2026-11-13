@@ -529,8 +529,9 @@ is pos3ql's (FROM order, or its selectivity order for comma lists), which
 can differ from PostgreSQL's cost-based order. The executor has no merge
 join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
 pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
-USING` hash a single FROM table joined by equality, as a `SELECT` of the
-two tables would; other FROM lists run as a nested loop. For a
+USING` hash their first FROM table when it is joined to the target by
+equality, as a `SELECT` of the two tables would, and join later FROM items to
+it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
 statement a rewrite rule changes, an `INSERT ... SELECT` action of an
 `INSERT` of several rows or of a query reading tables, an `INSERT` of an
 aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of

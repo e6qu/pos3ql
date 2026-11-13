@@ -575,11 +575,36 @@ pub(crate) fn target_hash_plan<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<TargetHashPlan>, SqlError> {
-    if !from.joins.is_empty() || from.base.sample.is_some() || from.base.lateral {
+    if from.base.sample.is_some() || from.base.lateral {
         return Ok(None);
     }
-    let (scope, joined) =
-        super::dependencies::dml_join_scope(storage, target, alias, Some(from), txid, arena, None)?;
+    // Only the first FROM item is hashed; the conditions decide every
+    // joined row afterwards, so later items join its candidates as before.
+    // A comma list the planner reorders hashes only when the first item
+    // still runs first.
+    if from.joins.iter().all(|join| join.kind.is_cross()) && !from.joins.is_empty() {
+        let schema = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+        if schema.lateral[..schema.n].iter().any(|&lateral| lateral)
+            || super::join_order(storage, &schema, where_clause, arena)?[0] != 0
+        {
+            return Ok(None);
+        }
+    }
+    let first = &*arena
+        .alloc(FromClause {
+            base: from.base,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let (scope, joined) = super::dependencies::dml_join_scope(
+        storage,
+        target,
+        alias,
+        Some(first),
+        txid,
+        arena,
+        None,
+    )?;
     if scope.n != 2 || scope.derived[1].is_some() || scope.slots[1] == usize::MAX {
         return Ok(None);
     }
@@ -595,7 +620,7 @@ pub(crate) fn target_hash_plan<'a>(
         return Ok(None);
     }
     // An index on the FROM item's own conditions selects its rows instead.
-    let source = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    let source = QueryScope::resolve_schema(storage, first, txid, arena, None)?;
     if super::index_access_plan(storage, &source, txid, where_clause, arena)?.is_some() {
         return Ok(None);
     }

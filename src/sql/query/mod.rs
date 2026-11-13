@@ -10792,7 +10792,7 @@ fn check_select_types<'a>(
         .chain(statement.where_clause)
         .chain(statement.having)
     {
-        subquery::check_compared_literals(expression, Some(scope), storage, txid, arena)?;
+        subquery::check_subquery_literals(expression, Some(scope), storage, txid, arena)?;
     }
     Ok(())
 }

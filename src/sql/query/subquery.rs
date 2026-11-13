@@ -810,7 +810,7 @@ pub(super) fn check_subquery_literals<'a>(
 /// column's type while PostgreSQL analyses the query, so `'zz' IN (SELECT
 /// int_column ...)` and `'zz' = (SELECT int_column ...)` fail before the
 /// subquery runs, even when no row reaches the comparison.
-pub(super) fn check_compared_literals<'a>(
+fn check_compared_literals<'a>(
     expression: &'a Expr<'a>,
     outer: Option<&QueryScope<'a>>,
     storage: &Storage,

@@ -5656,6 +5656,18 @@ pub(crate) fn select_streams_with_calls(select: &Select<'_>, storage: &Storage, 
     !select_contains_function(&rest, &calls)
 }
 
+/// Whether a query calls a user-defined function or aggregate anywhere.
+pub(crate) fn select_calls_user_routines(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    select_contains_function(select, &|name, arity| {
+        storage.has_non_aggregate_routine_candidate(name, arity, txid)
+            || storage.has_aggregate_routine_candidate(name, arity, txid)
+    })
+}
+
 pub(super) fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
     select_contains_function(select, &|name, arguments| {
         super::super::ast::is_volatile_function(name)

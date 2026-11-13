@@ -235,17 +235,21 @@ source reading its own target sees none of the new rows, as in PostgreSQL.
 Its reads keep no invocation-log receipts. A restarted attempt reads the
 source again and skips, by count, the rows earlier attempts wrote; the
 source reads the same rows each time, so the count finds the unfinished
-row. A source whose volatile built-in and user routine calls are all in its
-output list, without ordering, grouping, `DISTINCT`, windows, set
-operations or row locking, is read by the engine one row at a time
-(`src/sql/driven_insert.rs`): each row's output is evaluated as the row is
-read, then the row is written, as PostgreSQL's ModifyTable pulls it. The
-row's predicate and output share one invocation log; when a call waits
-inside its body (a lock or a cold read), the write keeps that log in its
-progress (leased from `execution_control_bytes` only while the call waits)
-together with every effect before the wait, and reading the row again
-replays the calls before it and continues that call where it waited, so
-each call runs once. Any other source materializes first, in the work
+row. A source whose volatile built-in calls are all in its output list,
+without ordering, grouping, `DISTINCT`, windows, set operations or row
+locking, is read by the engine one row at a time (`src/sql/driven_insert.rs`):
+each row's output is evaluated as the row is read, then the row is written,
+as PostgreSQL's ModifyTable pulls it. The same reader runs an
+`INSERT ... SELECT` reading a data-modifying `WITH` query, also when its
+output calls user routines: the row's predicate and output share one
+invocation log, and when a call waits inside its body (a lock or a cold
+read) the write keeps that log in its progress (leased from
+`execution_control_bytes` only while the call waits) together with every
+effect before the wait; reading the row again replays the calls before it
+and continues that call where it waited, so each call runs once. A plain
+source that calls a user routine is not read this way, because the calls'
+results stay in the statement arena's retained tail until the statement
+ends. Any other source materializes first, in the work
 arena, where a source larger than the arena fails with `54000`; an output
 item there that calls a volatile user routine is split so that the source
 reads only its other parts, and the row phase runs the calls as each row is
@@ -783,8 +787,10 @@ run by retained readers whose calls hand off on their row; an
 reading one, which the engine drives the same way. After the main query,
 every data-modifying query runs to its end, last one first, as PostgreSQL's
 `ExecPostprocessPlan` does. A `SELECT` reader without calls reads row by
-row too, so a query read only partly (`LIMIT`) finishes after the queries
-nothing read. An `UPDATE`, `DELETE` or `MERGE` query's step ends at the start
+row too when that is visible (a `LIMIT` or `OFFSET`, or a `UNION ALL` of
+several readers), so a query read only partly finishes after the queries
+nothing read; otherwise it reads the queries whole, which needs less
+memory and leaves the same effects in the same order. An `UPDATE`, `DELETE` or `MERGE` query's step ends at the start
 of the row after one that returned a row, as an `INSERT ... VALUES` step
 does; its row progress keeps the selected rows, so the next step continues
 at that row. A sort, aggregate or window reader reads its whole input first,

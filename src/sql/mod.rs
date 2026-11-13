@@ -19630,6 +19630,16 @@ impl Engine {
         if queries.len() > query::MAX_RETAINED_SOURCES {
             return Ok(None);
         }
+        // A single query without calls or bounds reads every row whatever
+        // the order, so reading the `WITH` queries whole is the same; the
+        // general executor reads it in less memory.
+        if let [query] = queries
+            && query.limit.is_none()
+            && query.offset.is_none()
+            && query::select_reads_repeatably(query, &self.storage, txn.txid)
+        {
+            return Ok(None);
+        }
         let mut readers: [Option<query::RetainedSelect<'statement>>; query::MAX_RETAINED_SOURCES] =
             Default::default();
         let mut reads_writes = false;
@@ -21119,8 +21129,8 @@ impl Engine {
     /// reader of its source, as PostgreSQL's ModifyTable pulls it: a source
     /// that reads a data-modifying `WITH` query of the statement (`with`),
     /// whose steps then interleave with the insert's rows, or a source whose
-    /// output list calls volatile built-in functions or user routines,
-    /// which then stream instead of materializing. `None` when the statement is not such an insert or
+    /// output list calls volatile built-in functions, which then stream
+    /// instead of materializing. `None` when the statement is not such an insert or
     /// its source is not driven.
     #[allow(clippy::too_many_arguments)]
     fn drive_main_insert<'a>(
@@ -21151,12 +21161,14 @@ impl Engine {
                         cte.dml.is_some() && cte.name.eq_ignore_ascii_case(from.base.table)
                     })
             }),
-            // A call that waits inside its body keeps its log with the
-            // write's progress and continues there when the row is read
-            // again.
+            // A user routine's results stay in the statement arena's
+            // retained tail for the statement, so a source of any length
+            // that calls one materializes, its output calls still running
+            // as each row is written.
             None => {
                 !query::select_reads_repeatably(select, &self.storage, txn.txid)
                     && query::select_streams_with_calls(select, &self.storage, txn.txid)
+                    && !query::select_calls_user_routines(select, &self.storage, txn.txid)
             }
         };
         if !driven {

@@ -181,11 +181,16 @@ is owned.
   statements nested deeper than `write_step_levels` fail the same way with
   `54000` naming that setting. `INSERT ... SELECT`
   streams a source that calls no volatile built-in and no user routine; one
-  whose output list alone calls volatile built-ins or user routines is read
-  by the engine row by row, its output evaluated as each row is read and
-  written, a call that waits inside its body keeping its log with the
-  write and continuing there; any other source materializes before
-  writing. Volatile user routine calls in a materialized source's output
+  whose output list alone calls volatile built-ins is read by the engine row
+  by row, its output evaluated as each row is read and written; one reading
+  a data-modifying `WITH` query is read so too, a user routine call that
+  waits inside its body keeping its log with the write and continuing
+  there; any other source materializes before writing. A plain source
+  calling user routines still materializes: read row by row, each call's
+  results would stay in the statement arena's retained tail until the
+  statement ends, so a long source would exhaust it (`54000`); streaming it needs
+  per-row result storage released once the row is written. Volatile user
+  routine calls in a materialized source's output
   list (also a rule action's `VALUES` over several rows) run as each row is
   inserted, as in PostgreSQL; calls in its
   `WHERE`, join conditions, subqueries, aggregate arguments or a

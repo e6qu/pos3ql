@@ -98,7 +98,9 @@ mod cte;
 mod view_write;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
-pub(crate) use cte::{select_reads_repeatably, select_streams_with_calls};
+pub(crate) use cte::{
+    select_calls_user_routines, select_reads_repeatably, select_streams_with_calls,
+};
 pub use view_write::{
     UpdatableView, ViewRewrite, ViewWrite, and_where, conditional_instead_view_error,
     function_view_write_error, resolve_view_for_dml, resolve_view_for_merge,

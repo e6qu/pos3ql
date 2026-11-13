@@ -508,18 +508,23 @@ the options as written; keeping them needs the written order in the view's
 journal records and checkpoint image. `pg_operator` lists 27 `=` operators
 where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
 `conffeqop` are NULL where PostgreSQL lists each key column's equality
-operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef` uses PostgreSQL's
-layout, including its wrap column, only for a view
-over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
-comma or `USING` joins, subqueries or set operations; other views return their
-query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
+operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef`, `pg_views`,
+`pg_get_ruledef` and `pg_rules` print a view's or rule action's query as
+PostgreSQL deparses it, in its indented layout and wrap column, including
+subqueries, functions, explicit, `USING` and `NATURAL` joins, set operations,
+`DISTINCT ON`, windows, grouping sets, `WITH` queries, `LATERAL` items,
+`VALUES` lists, `TABLESAMPLE` and sublinks. A query that reads a function
+returning a record or composite type, a catalog relation, a `WITH` query with
+`SEARCH` or `CYCLE` or one that modifies data, or that groups or orders by a
+constant, or an expression outside the typed expression coverage, still prints
+its stored text, and a rule action's pretty form then fails with `0A000`. The
+routines and types a view's subqueries name are printed as the subquery names
+them, so after such a routine or type is renamed the view prints its stored
+text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
-INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action whose FROM list holds a subquery, a function or an explicit
-`JOIN`, or whose query combines rows with set operations, `DISTINCT ON`,
-windows or grouping sets (`DO ALSO INSERT INTO log SELECT a FROM (SELECT a
-FROM t) s`), is printed as written, and its pretty form fails with `0A000`; policy
+INTO t (a, b) VALUES (f.x, 'q'::text);`); policy
 expressions are not deparsed. `EXPLAIN` prints
 the left-deep join tree pos3ql runs, with scan filters, a hash join's
 condition and each nested loop's join filter, for relations joined by

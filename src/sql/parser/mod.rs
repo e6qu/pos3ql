@@ -41,6 +41,13 @@ type OrderLimit<'a> = (
     // `LIMIT ALL` was written.
     bool,
 );
+/// A `GROUP BY` clause: its flat expressions, expanded grouping sets and
+/// written elements.
+type GroupByClause<'a> = (
+    &'a [&'a Expr<'a>],
+    &'a [GroupingSet<'a>],
+    &'a [crate::sql::ast::GroupingElement<'a>],
+);
 /// PostgreSQL bounds the fully expanded grouping-set product at 4,096 and a
 /// single CUBE at 12 elements.
 pub const MAX_GROUPING_SETS: usize = 4_096;
@@ -10537,16 +10544,7 @@ impl<'a> Parser<'a> {
     /// Parses a flat, deduplicated grouping-expression list plus PostgreSQL's
     /// expanded grouping sets. Set bitmaps grow with the expression list and
     /// the expanded set count has PostgreSQL's exact 4,096 boundary.
-    fn group_by_clause(
-        &mut self,
-    ) -> Result<
-        (
-            &'a [&'a Expr<'a>],
-            &'a [GroupingSet<'a>],
-            &'a [crate::sql::ast::GroupingElement<'a>],
-        ),
-        ParseError,
-    > {
+    fn group_by_clause(&mut self) -> Result<GroupByClause<'a>, ParseError> {
         use crate::sql::ast::GroupingElement;
         let mut flat = ArenaList::new(self.arena);
         let mut acc = ArenaList::new(self.arena);
@@ -10725,10 +10723,6 @@ impl<'a> Parser<'a> {
         Ok((self.grouping_set_from_words(&words)?, written))
     }
 
-    #[expect(
-        clippy::type_complexity,
-        reason = "the expanded terms and their written form are built together"
-    )]
     fn grouping_term_list(
         &mut self,
         flat: &mut ArenaList<'a, &'a Expr<'a>>,

@@ -417,8 +417,10 @@ Functions and expressions:
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
   `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
-  indented layout for views over plain tables joined with `ON`, printing the
-  current names of renamed tables, functions, types and enum values
+  indented layout, wrap column and qualification for views over tables, other
+  views, subqueries, functions, joins, set operations, `WITH` queries,
+  `LATERAL` items and `VALUES` lists, naming a table read again in a nested
+  query `t_1` as PostgreSQL does and printing the current names of renamed tables, functions, types and enum values
   (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
   'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant

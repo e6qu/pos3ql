@@ -1891,12 +1891,12 @@ pub(crate) fn rule_action_definition<'a>(
     };
     output.layout = true;
     // UPDATE's FROM and DELETE's USING items join the target's level.
-    let (joined, own) = match from {
+    let joined = match from {
         Some(from) => match writer.dml_scope(&rows[..count], from, arena)? {
-            Some(level) => level,
+            Some(scope) => scope,
             None => return Ok(None),
         },
-        None => (&rows[..count], 0),
+        None => &rows[..count],
     };
     let context = Context {
         storage,
@@ -2102,7 +2102,7 @@ pub(crate) fn rule_action_definition<'a>(
                 assigned_value(&mut output, value, type_oid)?;
             }
             if let Some(from) = update.from {
-                writer.dml_from(&context, joined, own, from, " FROM ", arena, &mut output)?;
+                writer.dml_from(&context, joined, from, " FROM ", arena, &mut output)?;
             }
             condition(&mut output, update.where_clause)?;
         }
@@ -2110,7 +2110,7 @@ pub(crate) fn rule_action_definition<'a>(
             output.push(" DELETE FROM ")?;
             output.push(relation(" ").as_str())?;
             if let Some(from) = delete.using {
-                writer.dml_from(&context, joined, own, from, " USING ", arena, &mut output)?;
+                writer.dml_from(&context, joined, from, " USING ", arena, &mut output)?;
             }
             condition(&mut output, delete.where_clause)?;
         }

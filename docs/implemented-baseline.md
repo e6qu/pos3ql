@@ -755,12 +755,14 @@ and types; a column written without the view column's type modifier
 (`numeric` for `numeric(5,2)`) keeps the view's declared type, as in
 PostgreSQL. `pg_get_ruledef` and `pg_rules` print a rule as PostgreSQL
 deparses it, in both formatting modes, when its condition is an expression
-over `OLD`, `NEW` and constants and each action is `NOTIFY`, a `SELECT`, or
-an `INSERT ... VALUES` (one or more rows), `INSERT ... SELECT`, `UPDATE ...
-SET ... [FROM t] WHERE` or `DELETE ... [USING t] WHERE`, each with an optional
-`RETURNING` list and reading at most one table besides its target (for
-example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a = old.a); ...)`);
-`_RETURN` rules print their query as `pg_get_viewdef` does. Other rules
+over `OLD`, `NEW` and constants and each action is `NOTIFY`, a query, or an
+`INSERT ... VALUES` (one or more rows), `INSERT ... SELECT`, `UPDATE ... SET
+... [FROM ...] WHERE` or `DELETE ... [USING ...] WHERE`, each with an optional
+`RETURNING` list. Their queries may read subqueries, functions, joins, set
+operations, `WITH` queries and `VALUES` lists, printed as `pg_get_viewdef`
+prints them (for example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a =
+old.a); ...)`); `_RETURN` rules print their query as `pg_get_viewdef` does.
+Other rules
 return their saved SQL, and their pretty form fails with `0A000`. A missing
 rule returns NULL.
 

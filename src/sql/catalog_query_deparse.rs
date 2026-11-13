@@ -821,10 +821,9 @@ impl<'r> Writer<'r> {
             }
         }
         self.targets(&context, level.targets, naming, output)?;
-        if select.from.is_some() {
+        if let Some(from) = &select.from {
             output.keyword(" FROM ", -STD, STD, 2)?;
-            let from = select.from.as_ref().expect("checked FROM");
-            self.from_list(&context, level.scope, from, arena, output)?;
+            self.item_list(&context, level.scope, from, arena, output)?;
         }
         if let Some(condition) = select.where_clause {
             output.keyword(" WHERE ", -STD, STD, 1)?;
@@ -1073,7 +1072,7 @@ impl<'r> Writer<'r> {
     }
 
     /// `get_from_clause`: comma-separated items, wrapping each later one.
-    fn from_list<'x>(
+    fn item_list<'x>(
         &self,
         context: &Context<'x>,
         scope: &'x [Joined<'x>],
@@ -1114,14 +1113,13 @@ impl<'r> Writer<'r> {
     }
 
     /// The scope of an `UPDATE ... FROM` or `DELETE ... USING` statement:
-    /// its FROM items before `around` (the rule's rows and the target), and
-    /// how many there are.
+    /// its FROM items before `around` (the rule's rows and the target).
     pub(super) fn dml_scope<'x>(
         &self,
         around: &'x [Joined<'x>],
         from: &'x FromClause<'x>,
         arena: &'x Arena,
-    ) -> Result<Option<(&'x [Joined<'x>], usize)>, SqlError>
+    ) -> Result<Option<&'x [Joined<'x>]>, SqlError>
     where
         'r: 'x,
     {
@@ -1146,20 +1144,15 @@ impl<'r> Writer<'r> {
                 }
             })
             .map_err(full)?;
-        Ok(Some((scope, own)))
+        Ok(Some(scope))
     }
 
     /// `get_from_clause` of an `UPDATE` or `DELETE`: `keyword`, then the
     /// items `dml_scope` built, without the target.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the statement's scope, list and keyword are explicit"
-    )]
     pub(super) fn dml_from<'x>(
         &self,
         context: &Context<'x>,
         scope: &'x [Joined<'x>],
-        own: usize,
         from: &'x FromClause<'x>,
         keyword: &str,
         arena: &'x Arena,
@@ -1168,9 +1161,8 @@ impl<'r> Writer<'r> {
     where
         'r: 'x,
     {
-        let _ = own;
         output.keyword(keyword, -STD, STD, 2)?;
-        self.from_list(context, scope, from, arena, output)
+        self.item_list(context, scope, from, arena, output)
     }
 }
 
@@ -1205,10 +1197,6 @@ fn rename<'x>(
 }
 
 /// The FROM list split at its commas: each item and the joins it starts.
-#[expect(
-    clippy::type_complexity,
-    reason = "each item is its base and joins, borrowed from the FROM clause"
-)]
 fn segments<'x>(
     from: &'x FromClause<'x>,
     arena: &'x Arena,

@@ -7,6 +7,7 @@
 //! supplies the capacity. RAM and local disk see exactly the same blocks as
 //! caches; no provider identity reaches this module.
 
+use crate::sql::query::instrument::{SortMethod, SortSpace};
 use core::cmp::Ordering;
 
 use crate::mem::budget::{Budget, BudgetError};
@@ -213,6 +214,12 @@ pub(crate) struct ExternalSorter {
     level_counts: [usize; MERGE_LEVELS],
     readers: [MergeReader; MERGE_FAN_IN],
     next_ordinal: u64,
+    /// The bytes of the runs written before the input ended.
+    spilled_bytes: usize,
+    /// How the last finished sort ordered its rows.
+    space: Option<SortSpace>,
+    /// Whether [`ExternalSorter::keep_least`] dropped rows of this input.
+    bounded: bool,
 }
 
 impl ExternalSorter {
@@ -237,6 +244,9 @@ impl ExternalSorter {
             level_counts: [0; MERGE_LEVELS],
             readers: core::array::from_fn(|_| MergeReader::new()),
             next_ordinal: 0,
+            spilled_bytes: 0,
+            space: None,
+            bounded: false,
         })
     }
 
@@ -247,6 +257,9 @@ impl ExternalSorter {
         self.level_counts = [0; MERGE_LEVELS];
         self.writer.reset();
         self.next_ordinal = 0;
+        self.spilled_bytes = 0;
+        self.space = None;
+        self.bounded = false;
         for reader in &mut self.readers {
             reader.cursor = None;
             reader.current_len = 0;
@@ -330,7 +343,26 @@ impl ExternalSorter {
         store: &mut dyn BlockStore,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<Option<ExternalRun>, SqlError> {
+        // Input that fits one chunk is sorted in memory before its single
+        // run is written for reading; more input merges the runs it spilled.
+        let spilled = self.level_counts.iter().any(|&count| count != 0);
+        let chunk_bytes = self.chunk_len + self.row_count * core::mem::size_of::<BufferedRow>();
         self.flush_chunk(store, compare)?;
+        self.space = Some(if spilled {
+            SortSpace {
+                method: SortMethod::ExternalMerge,
+                bytes: self.spilled_bytes,
+            }
+        } else {
+            SortSpace {
+                method: if self.bounded {
+                    SortMethod::TopNHeapsort
+                } else {
+                    SortMethod::Quicksort
+                },
+                bytes: chunk_bytes,
+            }
+        });
         let mut carry: Option<ExternalRun> = None;
         for level in 0..MERGE_LEVELS {
             let mut runs = [None; MERGE_FAN_IN];
@@ -355,6 +387,39 @@ impl ExternalSorter {
             unreachable!("finish drained every merge level");
         }
         Ok(carry)
+    }
+
+    /// Called before [`ExternalSorter::finish`] under a limit of `bound`
+    /// rows: when the input fits one chunk and holds more than twice that,
+    /// keeps only the `bound` rows a stable sort puts first, as PostgreSQL's
+    /// top-N heapsort does.
+    pub(crate) fn keep_least(
+        &mut self,
+        bound: usize,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<(), SqlError> {
+        if self.level_counts.iter().any(|&count| count != 0)
+            || self.row_count <= bound.saturating_mul(2)
+        {
+            return Ok(());
+        }
+        let chunk = &self.chunk;
+        crate::util::try_heap_select_by(&mut self.rows[..self.row_count], bound, |a, b| {
+            let row = |entry: &BufferedRow| {
+                let start = entry.offset as usize + ORDINAL_BYTES;
+                let end = entry.offset as usize + entry.length as usize;
+                &chunk[start..end]
+            };
+            Ok(compare(row(a), row(b))?.then_with(|| a.ordinal.cmp(&b.ordinal)))
+        })?;
+        self.row_count = bound;
+        self.bounded = true;
+        Ok(())
+    }
+
+    /// How the last [`ExternalSorter::finish`] ordered its rows.
+    pub(crate) fn space(&self) -> Option<SortSpace> {
+        self.space
     }
 
     /// Sorts a complete run in startup memory when no chunk has spilled.
@@ -387,6 +452,7 @@ impl ExternalSorter {
         }
         self.sort_chunk(compare)?;
         self.writer.reset();
+        self.spilled_bytes = self.spilled_bytes.saturating_add(self.chunk_len);
         let rows = self.row_count as u64;
         for (position, entry) in self.rows[..self.row_count].iter().enumerate() {
             let start = entry.offset as usize;

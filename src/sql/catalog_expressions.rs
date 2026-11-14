@@ -562,6 +562,7 @@ pub(super) fn deparse<'a>(
                             pretty: false,
                             qualify: false,
                             domain_value: None,
+                            sublinks: None,
                             folded: false,
                             bare: None,
                         },
@@ -600,6 +601,7 @@ pub(super) fn deparse<'a>(
             pretty,
             qualify: false,
             domain_value: None,
+            sublinks: None,
             folded: false,
             bare: None,
         };

@@ -828,6 +828,7 @@ pub(super) fn grouped_rows<'a>(
     correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     stages: &instrument::Stages,
+    bound: Option<usize>,
 ) -> Result<(&'a [&'a [u8]], usize), SqlError> {
     // A star in a grouped select stands for its columns: expand it so each
     // expanded column is validated (and projected) like a written one —
@@ -1080,30 +1081,48 @@ pub(super) fn grouped_rows<'a>(
                 )?;
             }
         }
-        crate::mem::arena::try_stable_sort_via(
-            arena,
-            out_rows,
-            |a, b| {
-                for (k, ob) in statement.order_by.iter().enumerate() {
-                    let ordering = super::materialize::compare_ordered_key(
-                        storage,
-                        txid,
-                        order_collations[k],
-                        (ob.descending, ob.nulls_first),
-                        crate::sql::exec::ProjectedValue::column(a, width + k),
-                        crate::sql::exec::ProjectedValue::column(b, width + k),
-                    )?;
-                    if !ordering.is_eq() {
-                        return Ok(ordering);
-                    }
+        let compare = |a: &&[u8], b: &&[u8]| {
+            for (k, ob) in statement.order_by.iter().enumerate() {
+                let ordering = super::materialize::compare_ordered_key(
+                    storage,
+                    txid,
+                    order_collations[k],
+                    (ob.descending, ob.nulls_first),
+                    crate::sql::exec::ProjectedValue::column(a, width + k),
+                    crate::sql::exec::ProjectedValue::column(b, width + k),
+                )?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
                 }
-                Ok(core::cmp::Ordering::Equal)
-            },
-            |_| arena_full(),
-        )?;
+            }
+            Ok(core::cmp::Ordering::Equal)
+        };
+        // Past twice its limit's bound the sort keeps only a heap of the
+        // rows the limit returns, as PostgreSQL's does.
+        let bound = bound.filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
+        match bound {
+            Some(bound) => {
+                crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
+                    arena_full()
+                })?
+            }
+            None => {
+                crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())?
+            }
+        }
+        stages
+            .sort
+            .sorted(instrument::SortSpace::in_memory(out_rows, bound.is_some()));
     }
 
     Ok((out_rows, width))
+}
+
+/// The rows a limit over a query's sort reads, which bounds the sort: none
+/// with `WITH TIES`, which reads past them, or without a limit.
+pub(super) fn sort_bound(statement: &Select<'_>, limit: u64, offset: u64) -> Option<usize> {
+    (statement.limit.is_some() && limit != u64::MAX && !statement.with_ties)
+        .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize)
 }
 
 /// GROUP BY / plain-aggregate execution to the wire: produce the grouped rows,
@@ -1127,8 +1146,19 @@ pub(super) fn grouped_select<'a>(
     let stages = super::materialize::materialized_stages(limit != u64::MAX);
     let _stages = stages.start();
     let (out_rows, width) = match grouped_rows(
-        storage, scope, from, txid, statement, agg_nodes, arena, params, hooks, correlated, None,
+        storage,
+        scope,
+        from,
+        txid,
+        statement,
+        agg_nodes,
+        arena,
+        params,
+        hooks,
+        correlated,
+        None,
         &stages,
+        sort_bound(statement, limit, offset),
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),

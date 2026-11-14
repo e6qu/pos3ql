@@ -87,8 +87,13 @@ pub(crate) enum Role {
     Materialize(u16),
     /// The block's aggregation or grouping.
     Aggregate,
-    /// The block's window evaluation.
+    /// The block's window evaluation: its last window clause's.
     Window,
+    /// The evaluation of the window clause at this position of the
+    /// block's evaluation order, below the last.
+    WindowAgg(u16),
+    /// The sort of the input of the window clause at this position.
+    WindowSort(u16),
     /// The block's set-returning functions in its SELECT list.
     ProjectSet,
     /// The block's `ORDER BY` sort.
@@ -97,6 +102,8 @@ pub(crate) enum Role {
     Unique,
     /// The block's `LIMIT` or `OFFSET`.
     Limit,
+    /// The block's row locks (`FOR UPDATE`, `FOR SHARE`, ...).
+    LockRows,
     /// A block without relations: one computed row.
     Result,
     /// The set operation at this pre-order position of its tree.
@@ -137,6 +144,67 @@ pub(crate) struct NodeCounters {
     pub(crate) total_nanos: u64,
     /// A hash node's table, when it built one.
     pub(crate) hash: Option<HashTable>,
+    /// A sort node's method and space, when it sorted.
+    pub(crate) sort: Option<SortSpace>,
+    /// The most bytes of rows a window node held in memory.
+    pub(crate) stored: Option<usize>,
+}
+
+/// How a sort ordered its rows, under PostgreSQL's names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SortMethod {
+    /// Kept only the rows a limit returns while reading the others.
+    TopNHeapsort,
+    /// Ordered every row in memory.
+    Quicksort,
+    /// Merged sorted runs written to the spill store.
+    ExternalMerge,
+}
+
+impl SortMethod {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::TopNHeapsort => "top-N heapsort",
+            Self::Quicksort => "quicksort",
+            Self::ExternalMerge => "external merge",
+        }
+    }
+
+    /// PostgreSQL's name for where the sorted rows lived.
+    pub(crate) const fn space_type(self) -> &'static str {
+        match self {
+            Self::TopNHeapsort | Self::Quicksort => "Memory",
+            Self::ExternalMerge => "Disk",
+        }
+    }
+}
+
+/// What one sort did: its method and the bytes its rows took in memory or
+/// in the spill store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SortSpace {
+    pub(crate) method: SortMethod,
+    pub(crate) bytes: usize,
+}
+
+impl SortSpace {
+    /// An in-memory sort of `rows`, which pos3ql holds whole: their bytes
+    /// and the array ordering them. `bounded` names a sort that kept only
+    /// the rows its limit returns in its heap.
+    pub(crate) fn in_memory(rows: &[&[u8]], bounded: bool) -> Self {
+        let mut bytes = core::mem::size_of_val(rows);
+        for row in rows {
+            bytes = bytes.saturating_add(row.len());
+        }
+        Self {
+            method: if bounded {
+                SortMethod::TopNHeapsort
+            } else {
+                SortMethod::Quicksort
+            },
+            bytes,
+        }
+    }
 }
 
 /// The hash table a `Hash` node built: its final and first bucket counts
@@ -171,6 +239,8 @@ impl Slot {
                 startup_nanos: 0,
                 total_nanos: 0,
                 hash: None,
+                sort: None,
+                stored: None,
             },
             open: 0,
             started: None,
@@ -398,6 +468,28 @@ impl Node {
         });
     }
 
+    /// Records a sort the node ran; across rescans PostgreSQL reports the
+    /// one that used the most space, preferring one that spilled.
+    pub(crate) fn sorted(self, space: SortSpace) {
+        self.with(|slot, _| {
+            let rank = |space: SortSpace| (space.method == SortMethod::ExternalMerge, space.bytes);
+            if slot
+                .counters
+                .sort
+                .is_none_or(|held| rank(space) >= rank(held))
+            {
+                slot.counters.sort = Some(space);
+            }
+        });
+    }
+
+    /// Records the bytes of rows the node held, keeping the most.
+    pub(crate) fn stored(self, bytes: usize) {
+        self.with(|slot, _| {
+            slot.counters.stored = Some(slot.counters.stored.map_or(bytes, |held| held.max(bytes)));
+        });
+    }
+
     /// Counts a row the node's `Filter` removed.
     pub(crate) fn filtered(self) {
         self.with(|slot, _| slot.counters.filtered = slot.counters.filtered.saturating_add(1));
@@ -495,11 +587,12 @@ impl Drop for Loop {
 }
 
 /// The nodes of a query block's operators above its scans and joins, in
-/// PostgreSQL's order from the top: limit, distinct, sort, set-returning
-/// projection, window, aggregation.
+/// PostgreSQL's order from the top: limit, row locks, distinct, sort,
+/// set-returning projection, window, aggregation.
 #[derive(Clone, Copy)]
 pub(crate) struct Stages {
     pub(crate) limit: Node,
+    pub(crate) lock_rows: Node,
     pub(crate) unique: Node,
     pub(crate) sort: Node,
     pub(crate) project_set: Node,
@@ -513,6 +606,7 @@ impl Stages {
         if !active() {
             return Self {
                 limit: Node::NONE,
+                lock_rows: Node::NONE,
                 unique: Node::NONE,
                 sort: Node::NONE,
                 project_set: Node::NONE,
@@ -522,6 +616,7 @@ impl Stages {
         }
         Self {
             limit: node(Role::Limit),
+            lock_rows: node(Role::LockRows),
             unique: node(Role::Unique),
             sort: node(Role::Sort),
             project_set: node(Role::ProjectSet),
@@ -533,6 +628,7 @@ impl Stages {
     /// The stage the limit reads its rows from.
     pub(crate) fn below_limit(&self) -> Node {
         [
+            self.lock_rows,
             self.unique,
             self.sort,
             self.project_set,
@@ -548,6 +644,7 @@ impl Stages {
     pub(crate) fn start(&self) -> StageLoops {
         let nodes = [
             self.limit,
+            self.lock_rows,
             self.unique,
             self.sort,
             self.project_set,
@@ -563,7 +660,7 @@ impl Stages {
 
 /// One open execution of a block's stages.
 #[must_use]
-pub(crate) struct StageLoops([Node; 6]);
+pub(crate) struct StageLoops([Node; 7]);
 
 impl Drop for StageLoops {
     fn drop(&mut self) {

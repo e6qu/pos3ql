@@ -436,44 +436,53 @@ impl<'a> RowSecurityPlan<'a> {
         Ok(residual)
     }
 
-    /// The first group's security quals as the planner lists them: each
-    /// restrictive condition, then the OR of the permissive ones (none when
-    /// one of them always passes, `false` when there are none).
+    /// The security quals as the planner lists them: for each command's
+    /// policies (a write's own, then `SELECT`'s), each restrictive condition,
+    /// then the OR of the permissive ones (none when one of them always
+    /// passes, `false` when there are none). A qual an earlier command
+    /// already lists is not listed again, as PostgreSQL's
+    /// `list_append_unique` keeps it.
     pub(crate) fn security_quals(self, arena: &'a Arena) -> Result<&'a [&'a Expr<'a>], SqlError> {
-        let group = self.predicates[0];
-        let restrictive = group.iter().filter(|predicate| !predicate.permissive);
-        let mut permissive = None::<&'a Expr<'a>>;
-        let mut any_permissive = false;
-        for predicate in group.iter().filter(|predicate| predicate.permissive) {
-            any_permissive = true;
-            permissive = Some(match permissive {
-                None => predicate.expression,
-                Some(left) => arena
-                    .alloc(Expr::Binary {
-                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                        operator: crate::sql::ast::BinaryOp::Or,
-                        left,
-                        right: predicate.expression,
-                    })
-                    .map(|expression| &*expression)
-                    .map_err(|_| arena_full())?,
-            });
-        }
-        let last = if self.permissive_always[0] {
-            None
-        } else if any_permissive {
-            permissive
-        } else {
-            Some(&Expr::Bool(false))
+        let groups = usize::from(self.groups);
+        let capacity = self.predicates[..groups]
+            .iter()
+            .map(|group| group.len() + 1)
+            .sum::<usize>();
+        let quals = arena
+            .alloc_slice_with(capacity, |_| &Expr::Null)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        let mut append = |qual: &'a Expr<'a>, quals: &mut [&'a Expr<'a>]| {
+            if !quals[..count].iter().any(|listed| **listed == *qual) {
+                quals[count] = qual;
+                count += 1;
+            }
         };
-        let count = restrictive.clone().count() + usize::from(last.is_some());
-        let mut items = restrictive
-            .map(|predicate| predicate.expression)
-            .chain(last);
-        arena
-            .alloc_slice_with(count, |_| items.next().expect("counted security quals"))
-            .map(|quals| &*quals)
-            .map_err(|_| arena_full())
+        for group in 0..groups {
+            let predicates = self.predicates[group];
+            for predicate in predicates.iter().filter(|predicate| !predicate.permissive) {
+                append(predicate.expression, quals);
+            }
+            let mut permissive = None::<&'a Expr<'a>>;
+            for predicate in predicates.iter().filter(|predicate| predicate.permissive) {
+                permissive = Some(match permissive {
+                    None => predicate.expression,
+                    Some(left) => arena
+                        .alloc(Expr::Binary {
+                            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                            operator: crate::sql::ast::BinaryOp::Or,
+                            left,
+                            right: predicate.expression,
+                        })
+                        .map(|expression| &*expression)
+                        .map_err(|_| arena_full())?,
+                });
+            }
+            if !self.permissive_always[group] {
+                append(permissive.unwrap_or(&Expr::Bool(false)), quals);
+            }
+        }
+        Ok(&quals[..count])
     }
 
     /// Whether any policy condition of the plan satisfies `test`.

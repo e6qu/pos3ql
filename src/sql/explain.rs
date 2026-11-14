@@ -1945,6 +1945,70 @@ fn select_security_quals<'a>(
     }
 }
 
+/// The row-security quals an `UPDATE` or `DELETE` adds to its target's scan:
+/// its own command's policies, then, when it reads the target's columns, the
+/// `SELECT` policies, as PostgreSQL's `get_row_security_policies` lists them.
+fn write_security_quals<'a>(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    slot: usize,
+    definition: &crate::storage::TableDef,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let (command, alias, condition, assignments, returning) = match statement {
+        Stmt::Update(update) => (
+            crate::storage::PolicyCommandKind::Update,
+            update.alias,
+            update.where_clause,
+            update.assignments,
+            update.returning,
+        ),
+        Stmt::Delete(delete) => (
+            crate::storage::PolicyCommandKind::Delete,
+            delete.alias,
+            delete.where_clause,
+            &[][..],
+            delete.returning,
+        ),
+        _ => return Ok(&[]),
+    };
+    let Some(role) = storage.current_role_slot(txid) else {
+        return Ok(&[]);
+    };
+    let policies = |command| {
+        query::plan_row_security(
+            storage,
+            slot,
+            role,
+            command,
+            query::RowSecurityExpression::Using,
+            txid,
+            arena,
+        )
+    };
+    let own = policies(command)?;
+    let reads = crate::sql::exec::write_target_reads(
+        definition,
+        alias,
+        condition,
+        assignments,
+        returning,
+        storage,
+        txid,
+        arena,
+    )?;
+    let select = if reads.is_empty() {
+        None
+    } else {
+        policies(crate::storage::PolicyCommandKind::Select)?
+    };
+    match query::conjoin_row_security(own, select) {
+        Some(plan) => plan.security_quals(arena),
+        None => Ok(&[]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn single_relation_quals<'a>(
     storage: &Storage,
@@ -4792,6 +4856,129 @@ fn window_stages<'e>(
 
 /// A one-row INSERT's `Result` target list: each column's value as the
 /// planner coerced it, when the row names every column without `DEFAULT`.
+/// The VERBOSE `Output` lists of an `UPDATE` or `DELETE` of a plain table:
+/// its scan's, each assigned column's new value in column order and then the
+/// row's `ctid`, and the write's own, its `RETURNING` list, as PostgreSQL's
+/// plan projects them. An assignment or output whose planned form is not
+/// modeled leaves that list unprinted.
+fn changed_row_outputs(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    statement: &Stmt<'_>,
+    arena: &Arena,
+) -> Result<(StackStr<256>, StackStr<256>), SqlError> {
+    let table = storage.table_def(slot, txid);
+    let (assignments, alias, returning) = match statement {
+        Stmt::Update(update) => (update.assignments, update.alias, update.returning),
+        Stmt::Delete(delete) => (&[][..], delete.alias, delete.returning),
+        _ => return Ok((StackStr::new(), StackStr::new())),
+    };
+    let exposed = alias.unwrap_or(table.name.as_str());
+    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, &table)];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: Some(&table),
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: false,
+        domain_value: None,
+        folded: true,
+        bare: None,
+        sublinks: Some(&registered_sublink),
+    };
+    let columns = crate::sql::exec::AliasedDefCols {
+        definition: crate::storage::RelationDefinition::from_definition(&table),
+        alias,
+        output_aliases: &[],
+    };
+    let too_long = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN output column list exceeds 256 bytes"
+        )
+    };
+    let mut scan = StackStr::<256>::new();
+    let assigned = (|| -> Result<bool, SqlError> {
+        for column in table.columns() {
+            let Some((_, value)) = assignments
+                .iter()
+                .find(|(name, _)| *name == column.name.as_str())
+            else {
+                continue;
+            };
+            // The planner coerces a constant of another type to the column's
+            // type and folds it; a `DEFAULT` prints the planned default.
+            if matches!(value, Expr::DefaultMarker)
+                || value.is_constant(true)
+                    && crate::sql::exec::infer_type_res(value, &columns).is_ok_and(|(oid, _)| {
+                        oid != column.ctype.oid() && oid != crate::sql::types::oid::UNKNOWN
+                    })
+            {
+                return Ok(false);
+            }
+            let Some(text) = crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                value,
+                crate::sql::catalog::deparse::Destination::Assignment(column.ctype.oid()),
+                arena,
+            )?
+            else {
+                return Ok(false);
+            };
+            let _ = write!(scan, "{text}, ");
+        }
+        Ok(true)
+    })()?;
+    if !assigned {
+        scan = StackStr::new();
+    } else {
+        let _ = scan.write_str("ctid");
+    }
+    let mut written = StackStr::<256>::new();
+    for item in returning.items {
+        let separate = |written: &mut StackStr<256>| {
+            if !written.is_empty() {
+                let _ = written.write_str(", ");
+            }
+        };
+        match item {
+            SelectItem::Wildcard(_) => {
+                for column in table.columns() {
+                    separate(&mut written);
+                    let _ = written.write_str(column.name.as_str());
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                let Some(text) = crate::sql::catalog::deparse::deparse_expression(
+                    &context,
+                    expression,
+                    crate::sql::catalog::deparse::Destination::Value,
+                    arena,
+                )?
+                else {
+                    written = StackStr::new();
+                    break;
+                };
+                separate(&mut written);
+                let _ = written.write_str(text);
+            }
+            SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+                written = StackStr::new();
+                break;
+            }
+        }
+    }
+    if scan.is_truncated() || written.is_truncated() {
+        return Err(too_long());
+    }
+    Ok((scan, written))
+}
+
 fn inserted_row_output(
     storage: &Storage,
     txid: u32,
@@ -6640,13 +6827,15 @@ pub(super) fn plan_modification<'a>(
             scan.alias = target_node.alias;
             scan.key = Some(NodeKey::new(block, Role::Scan(0)));
             let definition = storage.table_def(slot, txid);
+            let security =
+                write_security_quals(storage, statement, slot, &definition, txid, arena)?;
             let (index_cond, filter) = single_relation_quals(
                 storage,
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 false,
                 arena,
@@ -6657,11 +6846,16 @@ pub(super) fn plan_modification<'a>(
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 true,
                 arena,
             )?;
+            if !storage.relation_has_descendants(slot, txid) {
+                let (read, written) = changed_row_outputs(storage, txid, slot, statement, arena)?;
+                scan.output = read;
+                plan.nodes[0].output = written;
+            }
             scan.with_qual(QualLabel::IndexCond, index_cond)
                 .with_qual(QualLabel::Filter, filter)
                 .with_verbose_qual(QualLabel::IndexCond, verbose_index_cond)

@@ -542,3 +542,77 @@ fn update_from_returning_routine_call_resumes_with_the_joined_row() {
         assert!(data_rows(&run_with(engine, budget, "SELECT * FROM t")).is_empty());
     });
 }
+
+/// EXPLAIN of an `UPDATE` or `DELETE` prints its target scan's row-security
+/// conditions as PostgreSQL 18.6 does: the write's own policies, then the
+/// `SELECT` policies when the statement reads the target, each listed once;
+/// VERBOSE prints the scan's new values and `ctid`, and the RETURNING list.
+#[test]
+fn write_explain_prints_row_security_and_verbose_outputs() {
+    with_engine("write-explain-row-security", |engine, budget| {
+        for sql in [
+            "CREATE ROLE wx_writer",
+            "CREATE TABLE wx (a int, b int, c text)",
+            "GRANT SELECT, UPDATE, DELETE ON wx TO wx_writer",
+            "ALTER TABLE wx ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY wx_select ON wx FOR SELECT USING (a > 0)",
+            "CREATE POLICY wx_update ON wx FOR UPDATE USING (b < 10)",
+            "CREATE POLICY wx_update_r ON wx AS RESTRICTIVE FOR UPDATE USING (c <> 'q')",
+            "CREATE POLICY wx_all ON wx USING (a <> 5)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let plan = |engine: &mut Engine, budget: &mut Budget, sql: &str| {
+            data_rows(&run_with(
+                engine,
+                budget,
+                &format!("SET ROLE wx_writer; {sql}; RESET ROLE"),
+            ))
+        };
+        assert_eq!(
+            plan(engine, budget, "EXPLAIN (COSTS OFF) UPDATE wx SET c = 'w'"),
+            [
+                "Update on wx",
+                "  ->  Seq Scan on wx",
+                "        Filter: ((c <> 'q'::text) AND ((b < 10) OR (a <> 5)))",
+            ]
+        );
+        assert_eq!(
+            plan(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) UPDATE wx SET c = 'w' WHERE a = 2"
+            ),
+            [
+                "Update on wx",
+                "  ->  Seq Scan on wx",
+                "        Filter: ((c <> 'q'::text) AND (a = 2) AND ((b < 10) OR (a <> 5)) \
+                 AND ((a > 0) OR (a <> 5)))",
+            ]
+        );
+        assert_eq!(
+            plan(engine, budget, "EXPLAIN (COSTS OFF) DELETE FROM wx"),
+            [
+                "Delete on wx",
+                "  ->  Seq Scan on wx",
+                "        Filter: (a <> 5)",
+            ]
+        );
+        assert_eq!(
+            plan(
+                engine,
+                budget,
+                "EXPLAIN (VERBOSE, COSTS OFF) UPDATE wx x SET c = x.c || 'w', b = b + 1 \
+                 RETURNING a, c"
+            ),
+            [
+                "Update on public.wx x",
+                "  Output: a, c",
+                "  ->  Seq Scan on public.wx x",
+                "        Output: (b + 1), (c || 'w'::text), ctid",
+                "        Filter: ((x.c <> 'q'::text) AND ((x.b < 10) OR (x.a <> 5)) \
+                 AND ((x.a > 0) OR (x.a <> 5)))",
+            ]
+        );
+    });
+}

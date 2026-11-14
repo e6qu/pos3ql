@@ -90338,6 +90338,35 @@ fn foreign_insert_retrieved<Definition0: crate::storage::DefinitionBacking>(
     Ok(mapping.map_or(columns, |mapping| mapping.column_set(columns)))
 }
 
+/// The columns of its target an `UPDATE` or `DELETE` reads: its condition's,
+/// its `SET` expressions' and its `RETURNING` list's. Reading any needs
+/// `SELECT` on them and adds the `SELECT` policies to the write's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a write's reads cover its condition, assignments and RETURNING list"
+)]
+pub(crate) fn write_target_reads<Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    condition: Option<&Expr<'_>>,
+    assignments: &[(&str, &Expr<'_>)],
+    returning: crate::sql::ast::Returning<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let mut columns = ColumnSet::EMPTY;
+    for expression in condition
+        .into_iter()
+        .chain(assignments.iter().map(|(_, expression)| *expression))
+    {
+        columns |=
+            expression_dml_target_columns(expression, definition, alias, storage, txid, arena)?;
+    }
+    columns |= returning_dml_target_columns(returning, definition, alias, storage, txid, arena)?;
+    Ok(columns)
+}
+
 fn returning_dml_target_columns<Definition0: crate::storage::DefinitionBacking>(
     returning: crate::sql::ast::Returning<'_>,
     definition: &crate::storage::TableDefinition<Definition0>,
@@ -90473,38 +90502,16 @@ pub(crate) fn update<'a>(
         targets[i] = column;
         updated_columns.insert(column);
     }
-    let reads_target = match (|| -> Result<ColumnSet, SqlError> {
-        let mut columns = ColumnSet::EMPTY;
-        if let Some(expression) = statement.where_clause {
-            columns |= expression_dml_target_columns(
-                expression,
-                def,
-                statement.alias,
-                storage,
-                txn.txid,
-                arena,
-            )?;
-        }
-        for (_, expression) in statement.assignments {
-            columns |= expression_dml_target_columns(
-                expression,
-                def,
-                statement.alias,
-                storage,
-                txn.txid,
-                arena,
-            )?;
-        }
-        columns |= returning_dml_target_columns(
-            statement.returning,
-            def,
-            statement.alias,
-            storage,
-            txn.txid,
-            arena,
-        )?;
-        Ok(columns)
-    })() {
+    let reads_target = match write_target_reads(
+        def,
+        statement.alias,
+        statement.where_clause,
+        statement.assignments,
+        statement.returning,
+        storage,
+        txn.txid,
+        arena,
+    ) {
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };
@@ -92253,28 +92260,16 @@ pub(crate) fn delete<'a>(
     {
         return sql_fail(error);
     }
-    let reads_target = match (|| -> Result<ColumnSet, SqlError> {
-        let mut columns = ColumnSet::EMPTY;
-        if let Some(expression) = statement.where_clause {
-            columns |= expression_dml_target_columns(
-                expression,
-                def,
-                statement.alias,
-                storage,
-                txn.txid,
-                arena,
-            )?;
-        }
-        columns |= returning_dml_target_columns(
-            statement.returning,
-            def,
-            statement.alias,
-            storage,
-            txn.txid,
-            arena,
-        )?;
-        Ok(columns)
-    })() {
+    let reads_target = match write_target_reads(
+        def,
+        statement.alias,
+        statement.where_clause,
+        &[],
+        statement.returning,
+        storage,
+        txn.txid,
+        arena,
+    ) {
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };

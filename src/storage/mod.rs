@@ -38631,17 +38631,32 @@ impl Storage {
                 "no partition of relation \"{}\" found for row",
                 parent.name.as_str()
             );
-            let Some(scheme) = parent.partition.scheme else {
+            // `errtable`: the relation the row was routed through.
+            let objects =
+                crate::sql::eval::ErrorObjects::table(parent.schema.as_str(), parent.name.as_str());
+            let scheme = parent.partition.scheme;
+            let keys = scheme
+                .as_ref()
+                .map_or(&[][..], |scheme| &scheme.keys[..usize::from(scheme.n_keys)]);
+            if keys.is_empty()
+                || !crate::sql::exec::key_values_visible(
+                    self,
+                    parent_slot,
+                    txid,
+                    &mut keys.iter().map(|key| Some(*key)),
+                )
+            {
+                crate::sql::eval::stash_object_diagnostic(None, objects);
                 return error;
-            };
-            let names = scheme.keys[..usize::from(scheme.n_keys)]
+            }
+            let names = keys
                 .iter()
                 .map(|key| parent.columns()[usize::from(*key)].name.as_str());
             match crate::sql::exec::partition_key_detail(&mut { names }, &mut row.key_values()) {
-                Ok(detail) => crate::sql::error_position::with_detail(
-                    error,
-                    format_args!("{}", detail.as_str()),
-                ),
+                Ok(detail) => {
+                    crate::sql::eval::stash_object_diagnostic(Some(detail.as_str()), objects);
+                    error
+                }
                 Err(error) => error,
             }
         })

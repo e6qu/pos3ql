@@ -57,7 +57,7 @@ pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
-pub(crate) use plan::{order_qual, plan_time_bool, qual_cost};
+pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
@@ -71,7 +71,7 @@ use scan::{
 };
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index, dml_index_access_plan,
-    dml_indexed_candidates, index_access_plan, ordered_index_access_plan,
+    dml_indexed_candidates, index_access_plan, index_leading_columns, ordered_index_access_plan,
     parameterized_index_access_plan, rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{

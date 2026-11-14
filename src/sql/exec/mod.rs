@@ -477,8 +477,15 @@ fn dml_row_available(
 /// A write's condition with its top-level conjuncts in PostgreSQL's
 /// `order_qual_clauses` order (cheapest first, stably), typed over the
 /// write's target.
+///
+/// PostgreSQL turns a top-level `column IN (SELECT ...)` of an uncorrelated
+/// subquery into a semi-join. Over a column that leads one of the target's
+/// B-tree keys its plan reads the subquery's rows and probes that index, so
+/// the target's other conditions see only the rows it finds; that conjunct
+/// runs first here.
 fn order_dml_condition<'a, Definition: crate::storage::DefinitionBacking>(
     condition: Option<&'a Expr<'a>>,
+    table: usize,
     def: &crate::storage::TableDefinition<Definition>,
     alias: Option<&'a str>,
     storage: &Storage,
@@ -493,7 +500,63 @@ fn order_dml_condition<'a, Definition: crate::storage::DefinitionBacking>(
         alias,
         output_aliases: &[],
     };
-    super::query::order_qual(condition, &columns, storage, txid, arena).map(Some)
+    let ordered = super::query::order_qual(condition, &columns, storage, txid, arena)?;
+    let mut conjuncts = [ordered; super::query::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::query::flatten_and(ordered, &mut conjuncts, &mut count) || count < 2 {
+        return Ok(Some(ordered));
+    }
+    let leading =
+        super::query::index_leading_columns(storage, &storage.table_def(table, txid), txid);
+    let drives = |conjunct: &'a Expr<'a>| -> Result<bool, SqlError> {
+        let Expr::InSubquery {
+            operand: Expr::Column { qualifier, name },
+            negated: false,
+            ..
+        } = conjunct
+        else {
+            return Ok(false);
+        };
+        if qualifier.is_some_and(|qualifier| {
+            !crate::sql::eval::qualifier_answers_target(columns.definition, alias, qualifier)
+        }) {
+            return Ok(false);
+        }
+        let Some(column) = def.column_index(name) else {
+            return Ok(false);
+        };
+        Ok(leading.contains(column)
+            && !super::query::expression_has_correlated_subquery(conjunct, storage, txid, arena)?)
+    };
+    let mut order = [ordered; super::query::MAX_CONJUNCTS];
+    let mut at = 0;
+    for pass in [true, false] {
+        for &conjunct in &conjuncts[..count] {
+            if drives(conjunct)? == pass {
+                order[at] = conjunct;
+                at += 1;
+            }
+        }
+    }
+    if order[..count]
+        .iter()
+        .zip(&conjuncts[..count])
+        .all(|(left, right)| core::ptr::eq(*left, *right))
+    {
+        return Ok(Some(ordered));
+    }
+    let mut rebuilt = order[0];
+    for &conjunct in &order[1..count] {
+        rebuilt = arena
+            .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operator: crate::sql::ast::BinaryOp::And,
+                left: rebuilt,
+                right: conjunct,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(Some(rebuilt))
 }
 
 /// The statement conditions a row selected by `UPDATE` or `DELETE` must still
@@ -1795,7 +1858,9 @@ use constraints::{
     enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
     table_is_referenced,
 };
-pub(crate) use constraints::{coerce_domain_value, parse_defaults, partition_key_detail};
+pub(crate) use constraints::{
+    coerce_domain_value, key_values_visible, parse_defaults, partition_key_detail,
+};
 pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
 
 #[derive(Clone, Copy)]
@@ -89451,6 +89516,7 @@ pub(crate) fn update<'a>(
     };
     folded.where_clause = match order_dml_condition(
         folded.where_clause,
+        table_index,
         def,
         folded.alias,
         storage,
@@ -91082,6 +91148,7 @@ pub(crate) fn delete<'a>(
     };
     folded.where_clause = match order_dml_condition(
         folded.where_clause,
+        table_index,
         def,
         folded.alias,
         storage,
@@ -93702,6 +93769,9 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                 )
             })?;
             return Err(constraints::index_build_unique_violation(
+                storage,
+                table_index,
+                transaction,
                 name,
                 new_def,
                 &[i as u16],
@@ -93712,6 +93782,9 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
     for uk in new_def.uniques() {
         if matches_key(uk.columns(), uk.kind.nulls_not_distinct())? {
             return Err(constraints::index_build_unique_violation(
+                storage,
+                table_index,
+                transaction,
                 uk.name,
                 new_def,
                 uk.columns(),

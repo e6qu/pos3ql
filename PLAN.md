@@ -550,9 +550,16 @@ and `SELECT` commands share runs once per row, as PostgreSQL's
 `list_append_unique` keeps it; each command's restrictive policies run
 before the OR of its permissive ones, which stops at the first that passes.
 A row no partition accepts reports its partition key
-(`Partition key of the failing row contains (id) = (21).`); like the key
-details of unique violations, it is not withheld from a role without
-`SELECT` privilege or under row security as PostgreSQL withholds it.
+(`Partition key of the failing row contains (id) = (21).`). That detail,
+and the keys of unique, exclusion and foreign key violations, show only to
+a user with `SELECT` on the table or on every key column, and never while
+row security applies to the user, as PostgreSQL decides; otherwise a unique
+violation has no detail and the others say `Key conflicts with existing
+key.`, `Key is not present in table "p".` or `Key is still referenced from
+table "c".`. A NOT NULL, CHECK or view check option violation's `Failing row
+contains (...)` still lists every column, where PostgreSQL lists only the
+columns the user may read or the statement wrote, as `(a, c) = (1, 3)`, and
+none under row security; that needs the written columns at each check.
 Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
 its cost-based plan: a query or data change on one table whose condition

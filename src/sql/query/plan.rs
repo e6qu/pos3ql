@@ -21,7 +21,7 @@ use super::{MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, ar
 /// Top-level qualification terms retained for cost ordering and join
 /// pushdown. A full 64-relation equality chain has 63 terms; leave another
 /// full chain of headroom for independent filters and BETWEEN expansion.
-pub(super) const MAX_CONJUNCTS: usize = 128;
+pub(crate) const MAX_CONJUNCTS: usize = 128;
 
 /// The set of table indices (as a bitmask) an expression references. `None` if
 /// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
@@ -358,7 +358,7 @@ pub(crate) fn check_full_join_condition(
     Ok(())
 }
 
-pub(super) fn flatten_and<'e, 'a>(
+pub(crate) fn flatten_and<'e, 'a>(
     e: &'e Expr<'a>,
     out: &mut [&'e Expr<'a>],
     n: &mut usize,
@@ -634,7 +634,21 @@ pub(crate) fn order_qual<'a>(
     }
     let mut cost = [0.0f64; MAX_CONJUNCTS];
     for (i, c) in conjunct[..n].iter().enumerate() {
-        cost[i] = qual_cost(c, columns, storage, txid, arena);
+        // A top-level `IN` or `= ANY` subquery becomes a semi-join, which
+        // runs after the relation's own conditions.
+        cost[i] = if matches!(
+            c,
+            Expr::InSubquery { negated: false, .. }
+                | Expr::QuantifiedSubquery {
+                    operator: crate::sql::ast::BinaryOp::Eq,
+                    all: false,
+                    ..
+                }
+        ) {
+            1000.0
+        } else {
+            qual_cost(c, columns, storage, txid, arena)
+        };
     }
     for i in 1..n {
         let mut j = i;
@@ -1153,18 +1167,48 @@ fn operator_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txi
 /// and AND/OR/IS NULL cost nothing. Used for the sort/limit projection
 /// postponement decision (threshold empirically pinned against PostgreSQL 18.4:
 /// items costing more than 10 operators are projected above the Sort + Limit).
-pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> f64 {
+pub(super) fn postpone_cost(e: &Expr<'_>, scope: &QueryScope<'_>, arena: &Arena) -> f64 {
     let (storage, txid) = scope.catalog();
-    qual_cost(e, &ScopeCols(scope), storage, txid, arena)
+    expression_cost(
+        e,
+        &ScopeCols(scope),
+        storage,
+        txid,
+        arena,
+        CostUse::Projection,
+    )
 }
 
-/// [`postpone_cost`] with the expression's columns typed by `columns`.
+/// Where an expression's cost is weighed. PostgreSQL turns an uncorrelated
+/// subquery in a condition into an initPlan, whose value costs nothing per
+/// row, or (`IN`, `ANY`, `ALL`) a hashed subPlan, which costs its comparisons;
+/// a projection keeps postponing every subquery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostUse {
+    Qual,
+    Projection,
+}
+
+/// A condition's per-row cost for `order_qual_clauses`, with its columns
+/// typed by `columns`.
 pub(crate) fn qual_cost(
-    e: &Expr,
+    e: &Expr<'_>,
     columns: &dyn ColTypeResolver,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
+) -> f64 {
+    expression_cost(e, columns, storage, txid, arena, CostUse::Qual)
+}
+
+/// [`postpone_cost`] with the expression's columns typed by `columns`.
+fn expression_cost(
+    e: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    use_: CostUse,
 ) -> f64 {
     use Expr::*;
     // PostgreSQL costs the *plan-time-folded* expression: a fully-constant
@@ -1223,27 +1267,29 @@ pub(crate) fn qual_cost(
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
             ..
-        } => qual_cost(operand, columns, storage, txid, arena),
+        } => expression_cost(operand, columns, storage, txid, arena, use_),
         Unary { operand, .. } => {
-            qual_cost(operand, columns, storage, txid, arena)
+            expression_cost(operand, columns, storage, txid, arena, use_)
                 + 2.0 * operator_cost(e, columns, storage, txid)
         }
-        IsNull { operand, .. } => qual_cost(operand, columns, storage, txid, arena),
-        BoundDefault { expression, .. } => qual_cost(expression, columns, storage, txid, arena),
-        Cast { operand, .. } => qual_cost(operand, columns, storage, txid, arena) + 2.0,
-        Collate { operand, .. } => qual_cost(operand, columns, storage, txid, arena),
+        IsNull { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_),
+        BoundDefault { expression, .. } => {
+            expression_cost(expression, columns, storage, txid, arena, use_)
+        }
+        Cast { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_) + 2.0,
+        Collate { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_),
         Binary {
             operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
             left,
             right,
             ..
         } => {
-            qual_cost(left, columns, storage, txid, arena)
-                + qual_cost(right, columns, storage, txid, arena)
+            expression_cost(left, columns, storage, txid, arena, use_)
+                + expression_cost(right, columns, storage, txid, arena, use_)
         }
         Binary { left, right, .. } => {
-            qual_cost(left, columns, storage, txid, arena)
-                + qual_cost(right, columns, storage, txid, arena)
+            expression_cost(left, columns, storage, txid, arena, use_)
+                + expression_cost(right, columns, storage, txid, arena, use_)
                 + 2.0 * operator_cost(e, columns, storage, txid)
                 + coercion(left, right)
         }
@@ -1255,10 +1301,10 @@ pub(crate) fn qual_cost(
             } else {
                 list.len() as f64
             };
-            qual_cost(operand, columns, storage, txid, arena)
+            expression_cost(operand, columns, storage, txid, arena, use_)
                 + list
                     .iter()
-                    .map(|x| qual_cost(x, columns, storage, txid, arena))
+                    .map(|x| expression_cost(x, columns, storage, txid, arena, use_))
                     .sum::<f64>()
                 + applications
         }
@@ -1268,8 +1314,8 @@ pub(crate) fn qual_cost(
         | Match {
             operand, pattern, ..
         } => {
-            qual_cost(operand, columns, storage, txid, arena)
-                + qual_cost(pattern, columns, storage, txid, arena)
+            expression_cost(operand, columns, storage, txid, arena, use_)
+                + expression_cost(pattern, columns, storage, txid, arena, use_)
                 + 2.0
         }
         Call {
@@ -1305,7 +1351,7 @@ pub(crate) fn qual_cost(
                 };
             let mut c = args
                 .iter()
-                .map(|a| qual_cost(a, columns, storage, txid, arena))
+                .map(|a| expression_cost(a, columns, storage, txid, arena, use_))
                 .sum::<f64>()
                 + node;
             if unifying {
@@ -1328,7 +1374,9 @@ pub(crate) fn qual_cost(
             otherwise,
             ..
         } => {
-            let mut c = operand.map_or(0.0, |o| qual_cost(o, columns, storage, txid, arena));
+            let mut c = operand.map_or(0.0, |o| {
+                expression_cost(o, columns, storage, txid, arena, use_)
+            });
             // Non-constant branch results whose type differs from the CASE's
             // unified result type carry an implicit cast, which PostgreSQL
             // counts (a constant result is pre-cast at plan time).
@@ -1349,13 +1397,14 @@ pub(crate) fn qual_cost(
                 match plan_time_bool(cond, arena) {
                     Some(false) => continue,
                     Some(true) => {
-                        c += qual_cost(result, columns, storage, txid, arena) + result_cast(result);
+                        c += expression_cost(result, columns, storage, txid, arena, use_)
+                            + result_cast(result);
                         return c;
                     }
                     None => {}
                 }
-                c += qual_cost(cond, columns, storage, txid, arena)
-                    + qual_cost(result, columns, storage, txid, arena);
+                c += expression_cost(cond, columns, storage, txid, arena, use_)
+                    + expression_cost(result, columns, storage, txid, arena, use_);
                 c += result_cast(result);
                 // The simple form compares the operand per WHEN.
                 if operand.is_some() {
@@ -1363,25 +1412,29 @@ pub(crate) fn qual_cost(
                 }
             }
             if let Some(o) = otherwise {
-                c += qual_cost(o, columns, storage, txid, arena) + result_cast(o);
+                c += expression_cost(o, columns, storage, txid, arena, use_) + result_cast(o);
             }
             c
         }
         Array(items) => items
             .iter()
-            .map(|x| qual_cost(x, columns, storage, txid, arena))
+            .map(|x| expression_cost(x, columns, storage, txid, arena, use_))
             .sum(),
         Subscript { base, index } => {
-            qual_cost(base, columns, storage, txid, arena)
-                + qual_cost(index, columns, storage, txid, arena)
+            expression_cost(base, columns, storage, txid, arena, use_)
+                + expression_cost(index, columns, storage, txid, arena, use_)
         }
         Slice { base, lower, upper } => {
-            qual_cost(base, columns, storage, txid, arena)
-                + lower.map_or(0.0, |e| qual_cost(e, columns, storage, txid, arena))
-                + upper.map_or(0.0, |e| qual_cost(e, columns, storage, txid, arena))
+            expression_cost(base, columns, storage, txid, arena, use_)
+                + lower.map_or(0.0, |e| {
+                    expression_cost(e, columns, storage, txid, arena, use_)
+                })
+                + upper.map_or(0.0, |e| {
+                    expression_cost(e, columns, storage, txid, arena, use_)
+                })
         }
         Field { base, .. } | RecordFieldIndex { base, .. } => {
-            qual_cost(base, columns, storage, txid, arena)
+            expression_cost(base, columns, storage, txid, arena, use_)
         }
         AnyAll { operand, array, .. } => {
             let elements = if let Array(items) = array {
@@ -1389,11 +1442,29 @@ pub(crate) fn qual_cost(
             } else {
                 20.0
             };
-            qual_cost(operand, columns, storage, txid, arena)
-                + qual_cost(array, columns, storage, txid, arena)
+            expression_cost(operand, columns, storage, txid, arena, use_)
+                + expression_cost(array, columns, storage, txid, arena, use_)
                 + elements
         }
         // Subqueries carry a subplan's cost in PostgreSQL and are postponed.
+        Subquery(_) | RowSubquery { .. } | Exists(_) | ArraySubquery(_)
+            if use_ == CostUse::Qual
+                && matches!(
+                    super::subquery::subquery_node_correlated(e, storage, txid, arena),
+                    Ok(false)
+                ) =>
+        {
+            0.0
+        }
+        InSubquery { operand, .. } | QuantifiedSubquery { operand, .. }
+            if use_ == CostUse::Qual
+                && matches!(
+                    super::subquery::subquery_node_correlated(e, storage, txid, arena),
+                    Ok(false)
+                ) =>
+        {
+            expression_cost(operand, columns, storage, txid, arena, use_) + 2.0
+        }
         Subquery(_)
         | RowSubquery { .. }
         | Exists(_)

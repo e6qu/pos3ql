@@ -3383,7 +3383,11 @@ pub(crate) fn select_condition_reaches_index(
 }
 
 /// The columns that lead one of the table's B-tree keys.
-fn index_leading_columns(storage: &Storage, definition: &TableDef, txid: u32) -> ColumnSet {
+pub(crate) fn index_leading_columns(
+    storage: &Storage,
+    definition: &TableDef,
+    txid: u32,
+) -> ColumnSet {
     let mut leading = ColumnSet::EMPTY;
     for (column, metadata) in definition.columns().iter().enumerate() {
         if metadata.primary || metadata.unique {

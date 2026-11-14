@@ -3347,6 +3347,21 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             tref.table
         ));
     }
+    // Of these built-ins only the `json_to_record` family returns `record`.
+    if routine.is_none()
+        && !is_json_to_record
+        && let Some(Expr::Call {
+            source_position, ..
+        }) = column_definition_list(tref)
+    {
+        return Err(crate::sql::error_position::at_source_position(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "a column definition list is only allowed for functions returning \"record\""
+            ),
+            *source_position,
+        ));
+    }
     if (is_keys || is_elems || is_each)
         && let Some(document) = tref.func_args.unwrap_or(&[]).first()
     {

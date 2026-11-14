@@ -45921,10 +45921,7 @@ impl Storage {
     /// definition, visible to `txid`, searching the current path when
     /// unqualified.
     pub fn find_domain(&self, type_name: &str, txid: u32) -> Option<DomainDef> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_domain_slot(qualifier, name, txid)
             .map(|slot| self.domain_for(slot, txid))
     }
@@ -45969,10 +45966,7 @@ impl Storage {
     /// Resolves a (possibly qualified) domain type name to its slot on the
     /// current path, visible to `txid`.
     pub fn resolve_domain_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_domain_slot(qualifier, name, txid)
     }
 
@@ -46805,10 +46799,7 @@ impl Storage {
     /// Resolves a (possibly qualified) enum type name to its slot on the current
     /// path, visible to `txid`.
     pub fn resolve_enum_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_enum_slot(qualifier, name, txid)
     }
 
@@ -47570,9 +47561,7 @@ impl Storage {
     // --- Named composite types (CREATE TYPE ... AS (...)) ---
 
     pub fn resolve_composite_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = type_name
-            .split_once('.')
-            .map_or((None, type_name), |(s, n)| (Some(s), n));
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_composite_slot(qualifier, name, txid)
     }
 

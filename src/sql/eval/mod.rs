@@ -2290,6 +2290,8 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "__json_object_bytea"
             | "__json_serialize_bytea"
             | "__json_serialize_text"
+            | "__json_fit_varchar"
+            | "__json_fit_bpchar"
             | "__json_exists_true"
             | "__json_exists_unknown"
             | "__json_exists_error"
@@ -4467,6 +4469,17 @@ fn catalog_evaluation(
         let target = ColType::from_sql_name(type_name)
             .map(ColType::oid)
             .or_else(|| catalog.user_type_oid(type_name));
+        // PostgreSQL resolves an array constructor's target type before
+        // the constructor.
+        if target.is_none() && matches!(operand, Expr::Array(_)) {
+            return Err(crate::sql::error_position::at_subject(
+                crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
+                    catalog.type_schema_exists(schema)
+                })
+                .error(),
+                type_name,
+            ));
+        }
         let source = if let Expr::Array(items) = operand
             && let Some(ColType::Array(element)) = target.and_then(|oid| {
                 constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid))
@@ -7415,7 +7428,18 @@ fn eval_full_inner<'a>(
             };
             let target_type = ColType::from_sql_name(type_name);
             if let Some(ColType::Pseudo(kind)) = target_type {
-                return pseudo_type_cast(kind, v, source_identity()?.routine_argument_oid(), arena);
+                let source_oid = source_identity()?.routine_argument_oid();
+                // An input-function refusal of an untyped literal points at
+                // the literal.
+                return pseudo_type_cast(kind, v, source_oid, arena).map_err(|error| {
+                    if source_oid == super::types::oid::UNKNOWN
+                        && error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED
+                    {
+                        crate::sql::error_position::at_expression(error, operand)
+                    } else {
+                        error
+                    }
+                });
             }
             // `cstring` converts only to the string types, element by element
             // for arrays; an array constructor converts each `cstring` item.
@@ -14365,7 +14389,8 @@ pub(crate) fn regtype_of_normalized_name<'a>(
 /// A cast to `cstring`, `unknown` or `"any"`. PostgreSQL converts a string
 /// value or an untyped literal to `cstring` through its output, keeps an
 /// untyped literal as `unknown`, and treats `"any"` as no conversion; other
-/// sources fail with `42846`, and the remaining pseudo-types accept no value.
+/// sources fail with `42846`, and the remaining pseudo-types refuse an
+/// untyped literal (`NULL` included) in their input function.
 fn pseudo_type_cast<'a>(
     kind: super::types::PseudoType,
     value: Datum<'a>,
@@ -14380,7 +14405,17 @@ fn pseudo_type_cast<'a>(
             oid::UNKNOWN | oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CSTRING
         ),
         PseudoType::Unknown => source_oid == oid::UNKNOWN,
-        _ => return Err(cast::pseudo_type_value(kind)),
+        // An untyped literal or a string, converted through I/O, reaches the
+        // input function, which refuses every value; another source has no
+        // coercion path.
+        _ if matches!(
+            source_oid,
+            oid::UNKNOWN | oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME
+        ) =>
+        {
+            return Err(cast::pseudo_type_value(kind));
+        }
+        _ => false,
     };
     if !accepted {
         return Err(sql_err!(

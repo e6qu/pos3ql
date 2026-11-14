@@ -1591,6 +1591,13 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         {
             None
         }
+        // A SQL/JSON result's length check is named as its constructor.
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__json_fit_varchar" | "__json_fit_bpchar",
+            args: [constructor, ..],
+            ..
+        } => name_of(constructor),
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__json" | "__json_unique",
@@ -1770,7 +1777,11 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
     if type_name.ends_with("[]") {
         return ColType::from_sql_name(type_name.trim_end_matches("[]"))
             .map(ColType::internal_name)
-            .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next());
+            .or_else(|| {
+                Some(
+                    crate::sql::type_name_miss::split_type_name(type_name.trim_end_matches("[]")).1,
+                )
+            });
     }
     // An array type written by its `pg_type` name (`_int4`) keeps that name.
     if let Some(ColType::Array(_)) = ColType::from_sql_name(type_name) {
@@ -1778,7 +1789,7 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
     }
     ColType::from_sql_name(type_name)
         .map(ColType::internal_name)
-        .or_else(|| type_name.rsplit('.').next())
+        .or_else(|| Some(crate::sql::type_name_miss::split_type_name(type_name).1))
 }
 
 /// PostgreSQL's output-column name for a SELECT-list expression: `name_of`
@@ -6077,7 +6088,10 @@ fn infer_type_unpositioned(
                         Ok(())
                     },
                 )?;
-            } else {
+            } else if !(matches!(operand, Expr::Array(_)) && target.is_none()) {
+                // PostgreSQL resolves an array constructor's target type
+                // before the constructor, so a missing type is reported
+                // first; the cast's evaluation reports it.
                 infer_type_res(operand, columns)?;
             }
             if let (Some(target), Some(target_oid)) = (target, target_oid) {
@@ -6676,7 +6690,9 @@ fn infer_type_unpositioned(
                     of(ColType::Json)
                 }
             }
-            "__json_serialize_text" => of(ColType::Text),
+            "__json_serialize_text" | "__json_fit_varchar" | "__json_fit_bpchar" => {
+                of(ColType::Text)
+            }
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),

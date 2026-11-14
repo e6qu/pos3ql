@@ -581,6 +581,10 @@ fn capture_explicit_cast<'a>(
         return Ok(None);
     };
     let target = infer_routine_argument_oid(expression, columns)?;
+    // A target type that does not resolve is reported by the cast itself.
+    if target == super::types::oid::UNKNOWN {
+        return Ok(None);
+    }
     let source = inline::cast_source_oid(operand, target, columns, storage, txid)?;
     if source == target || source == super::types::oid::UNKNOWN {
         return Ok(None);

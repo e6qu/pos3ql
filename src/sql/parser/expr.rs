@@ -1979,6 +1979,28 @@ impl<'a> Parser<'a> {
         Ok((result.expect("checked above"), type_name, type_mod))
     }
 
+    /// PostgreSQL coerces a SQL/JSON result to its `RETURNING` type at
+    /// assignment level, so a length modifier rejects an over-long result
+    /// instead of truncating it as the explicit cast that follows would.
+    fn sql_json_assignment_fit(
+        &mut self,
+        call: &'a Expr<'a>,
+        type_name: &str,
+        type_mod: i32,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let fit = match crate::sql::types::ColType::from_sql_name(type_name) {
+            Some(crate::sql::types::ColType::Varchar) => "__json_fit_varchar",
+            Some(crate::sql::types::ColType::Bpchar) => "__json_fit_bpchar",
+            _ => return Ok(call),
+        };
+        // The modifier carries PostgreSQL's four-byte header allowance.
+        let Some(length) = type_mod.checked_sub(4).filter(|length| *length >= 0) else {
+            return Ok(call);
+        };
+        let length = self.arena_expr(Expr::Int(i64::from(length)))?;
+        self.plain_call(fit, &[call, length])
+    }
+
     fn sql_json_result_call(
         &mut self,
         family: &str,
@@ -2012,6 +2034,7 @@ impl<'a> Parser<'a> {
         if result != "text" || (type_name.eq_ignore_ascii_case("text") && type_mod < 0) {
             return Ok(call);
         }
+        let call = self.sql_json_assignment_fit(call, type_name, type_mod)?;
         self.arena_expr(Expr::Cast {
             source_position,
             binding: CastBinding::Resolve,
@@ -2173,6 +2196,7 @@ impl<'a> Parser<'a> {
             &[input],
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
+            let call = self.sql_json_assignment_fit(call, type_name, type_mod)?;
             return self.arena_expr(Expr::Cast {
                 source_position,
                 binding: CastBinding::Resolve,
@@ -2935,6 +2959,7 @@ impl<'a> Parser<'a> {
             return self.plain_call("__json_serialize_bytea", &[aggregate]);
         }
         if result == "text" {
+            let aggregate = self.sql_json_assignment_fit(aggregate, type_name, type_mod)?;
             return self.arena_expr(Expr::Cast {
                 source_position,
                 binding: CastBinding::Resolve,

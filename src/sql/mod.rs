@@ -19052,6 +19052,16 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let routine = &match exec::resolve_routine_type_references(
+            &self.storage,
+            txn.txid,
+            routine,
+            arena,
+            responder,
+        )? {
+            Ok(routine) => routine,
+            Err(error) => return Ok(Err(error)),
+        };
         let declaration = match exec::resolve_routine_declaration(&self.storage, txn, routine, guc)
         {
             Ok(declaration) => declaration,

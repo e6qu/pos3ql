@@ -604,18 +604,24 @@ each partition's index name where PostgreSQL rebuilds them under new
 generated names (`pr_1_label_idx` after a rename). A
 btree index cannot use `text_pattern_ops` (`operator class
 "text_pattern_ops" does not exist for access method "btree"`, `42704`). A
-type name whose quoted schema contains a dot (`1::"no.pe".x`) is split at
-that dot, so its error names schema `no`. A missing type has no cursor
-position inside a `DEFAULT` expression, a column definition list,
-`json_populate_record(NULL::t, ...)` or `pg_typeof(NULL::nope.t)`;
-`ARRAY[]::nope.t[]` reports `cannot determine type of empty array` (`42P18`)
-before the type; `JSON_SERIALIZE(... RETURNING t)` rejects a type that is not
-built in while parsing (`0A000`); a routine parameter written with `%TYPE` is a
-syntax error; and PL/pgSQL declaration errors raised while compiling a block
-(`v t.a%TYPE`, `v t%ROWTYPE`) lack PostgreSQL's `compilation of PL/pgSQL
-function` CONTEXT. `1::trigger` reports `cannot accept a value of type
-trigger` (`0A000`) where PostgreSQL reports `cannot cast type integer to
-trigger` (`42846`). A literal passed to a function's `regclass`
+missing type has no cursor position inside a `DEFAULT` expression, a column
+definition list, `json_populate_record(NULL::t, ...)` or
+`pg_typeof(NULL::nope.t)`. A SQL/JSON `RETURNING` clause naming a type that
+is not built in (a domain over `text`, an enum, a missing type) fails while
+parsing with `0A000`, and `JSON_QUERY(... RETURNING varchar(3))` truncates an
+over-long result where PostgreSQL applies its `ON ERROR` behavior to the
+length error. A routine parameter or result written with `%TYPE` may name a
+table column but not a view column (`0A000`). PL/pgSQL declaration errors
+raised while compiling a block (`v t.a%TYPE`, `v t%ROWTYPE`) lack
+PostgreSQL's `compilation of PL/pgSQL function` CONTEXT; a syntax error in a
+PL/pgSQL expression or query reports `invalid expression: ...` or `invalid
+query: ...` with no cursor position, assigning an undeclared variable is
+accepted until the assignment runs, and `IF THEN` fails with `0A000` instead
+of `missing expression`. A cast to a polymorphic pseudo-type
+(`1::anyelement`) reports that the type does not exist, and a column
+definition list on `unnest` reports `function pg_catalog.unnest() does not
+exist` instead of `a column definition list is only allowed for functions
+returning "record"`. A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

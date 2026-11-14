@@ -26,16 +26,11 @@ pub(crate) enum TypeNameMiss<'a> {
 pub(crate) const NOTICE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 64;
 
 impl<'a> TypeNameMiss<'a> {
-    /// A miss for the parser's composed spelling of a type name. The schema
-    /// is the text before its first `.`, as the type catalog splits it.
+    /// A miss for the parser's composed spelling of a type name, split as
+    /// the type catalog splits it.
     pub(crate) fn of_written(written: &'a str, schema_exists: impl FnOnce(&str) -> bool) -> Self {
-        match written.split_once('.') {
-            Some((schema, _)) if !schema_exists(schema) => Self::Schema(schema),
-            _ => Self::Type {
-                schema: None,
-                name: written,
-            },
-        }
+        let (schema, name) = split_type_name(written);
+        Self::of_qualified(schema, name, schema_exists)
     }
 
     /// A miss for a type named by a separate optional schema and name.
@@ -189,8 +184,8 @@ mod tests {
         assert_eq!(
             miss,
             TypeNameMiss::Type {
-                schema: None,
-                name: "public.nope[]"
+                schema: Some("public"),
+                name: "nope[]"
             }
         );
         let error = TypeNameMiss::of_written("nope.int4", exists).error();
@@ -226,5 +221,45 @@ mod tests {
                 .as_str(),
             "type \"t\" does not exist"
         );
+    }
+}
+
+/// Splits the parser's composed spelling of a type name into its schema and
+/// name. A part that itself holds a `.` is composed double-quoted
+/// (`"my.schema".t`, `"a.b"`), so the split follows the first unquoted `.`.
+pub(crate) fn split_type_name(written: &str) -> (Option<&str>, &str) {
+    let unquote = |part: &'_ str| -> Option<(usize, usize)> {
+        part.strip_prefix('"')?.find('"').map(|end| (1, end + 1))
+    };
+    if let Some((start, end)) = unquote(written) {
+        let schema = &written[start..end];
+        return match written[end + 1..].strip_prefix('.') {
+            Some(base) => (
+                Some(schema),
+                unquote(base).map_or(base, |(start, end)| &base[start..end]),
+            ),
+            None => (None, schema),
+        };
+    }
+    match written.split_once('.') {
+        Some((schema, base)) => (
+            Some(schema),
+            unquote(base).map_or(base, |(start, end)| &base[start..end]),
+        ),
+        None => (None, written),
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_type_name;
+
+    #[test]
+    fn composed_type_names_split_at_the_first_unquoted_dot() {
+        assert_eq!(split_type_name("t"), (None, "t"));
+        assert_eq!(split_type_name("s.t"), (Some("s"), "t"));
+        assert_eq!(split_type_name("\"a.b\".t"), (Some("a.b"), "t"));
+        assert_eq!(split_type_name("s.\"t.u\""), (Some("s"), "t.u"));
+        assert_eq!(split_type_name("\"a.b\""), (None, "a.b"));
     }
 }

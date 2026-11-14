@@ -334,6 +334,20 @@ mod window;
 
 mod ddl;
 
+/// One part of a composed type name: double-quoted when it holds a `.`, so
+/// the type catalog's split (`split_type_name`) finds the qualifying dot.
+struct ComposedTypePart<'a>(&'a str);
+
+impl core::fmt::Display for ComposedTypePart<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.contains('.') {
+            write!(formatter, "\"{}\"", self.0)
+        } else {
+            formatter.write_str(self.0)
+        }
+    }
+}
+
 struct TypeInputSources<'a> {
     strings: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
     candidates: ArenaList<'a, super::type_inputs::Candidate<'a>>,
@@ -9844,6 +9858,9 @@ impl<'a> Parser<'a> {
             name,
             array: false,
         };
+        if name.contains('"') && name.contains('.') {
+            return Err(self.err_here("type name parts cannot hold both '.' and '\"'"));
+        }
         // PostgreSQL's grammar turns these unquoted keywords into
         // `pg_catalog`-qualified internal names.
         let keyword = !quoted
@@ -9880,6 +9897,9 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let mut base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
             let mut base = self.any_ident("type name")?;
+            if base.contains('"') && base.contains('.') {
+                return Err(self.err_here("type name parts cannot hold both '.' and '\"'"));
+            }
             if self.peeked == Tok::Op(".") {
                 (schema, base, base_quoted) = self.catalog_qualified_type_name(schema, base)?;
             }
@@ -9902,11 +9922,27 @@ impl<'a> Parser<'a> {
                 quoted = false;
                 let composed = self
                     .arena
-                    .alloc_str(stack_format!(128, "{}.{}", schema, base).as_str())
+                    .alloc_str(
+                        stack_format!(
+                            136,
+                            "{}.{}",
+                            ComposedTypePart(schema),
+                            ComposedTypePart(base)
+                        )
+                        .as_str(),
+                    )
                     .map_err(|_| self.err_here("type name too long"))?;
                 self.note_composed_source(composed, source.start)?;
                 composed
             };
+        } else if name.contains('.') {
+            // A quoted unqualified name holding a `.` stays one name.
+            let composed = self
+                .arena
+                .alloc_str(stack_format!(136, "{}", ComposedTypePart(name)).as_str())
+                .map_err(|_| self.err_here("type name too long"))?;
+            self.note_composed_source(composed, source.start)?;
+            name = composed;
         }
         // SQL `char` is the blank-padded character type. Only the quoted
         // catalog spelling names PostgreSQL's distinct one-byte OID 18 type.

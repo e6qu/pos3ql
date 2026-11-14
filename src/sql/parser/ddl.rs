@@ -3793,6 +3793,53 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// A routine parameter or result type: a type name, or PostgreSQL's
+    /// `table.column%TYPE` (optionally schema-qualified), kept as its written
+    /// dotted name with a `%TYPE` suffix for the catalog to resolve.
+    fn routine_type_name(&mut self) -> Result<&'a str, ParseError> {
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let start = self.peek_at;
+        let mut names = [""; 4];
+        let mut count = 0;
+        while count < names.len()
+            && let Tok::Ident(name) | Tok::QuotedIdent(name) = self.peeked
+        {
+            names[count] = name;
+            count += 1;
+            self.advance()?;
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        if count >= 2 && self.peeked == Tok::Op("%") {
+            self.advance()?;
+            if self.eat_ident("type")? {
+                let mut composed = crate::util::StackStr::<300>::new();
+                for (position, name) in names[..count].iter().enumerate() {
+                    if position != 0 {
+                        let _ = core::fmt::Write::write_char(&mut composed, '.');
+                    }
+                    let _ = core::fmt::Write::write_str(&mut composed, name);
+                }
+                let _ = core::fmt::Write::write_str(&mut composed, "%TYPE");
+                if composed.is_truncated() {
+                    return Err(self.err_here("type reference too long"));
+                }
+                let composed = self
+                    .arena
+                    .alloc_str(composed.as_str())
+                    .map_err(|_| self.err_here("type reference too long"))?;
+                self.note_composed_source(composed, start)?;
+                return Ok(composed);
+            }
+        }
+        self.lexer.reset(mark);
+        self.peeked = saved_peeked;
+        self.peek_at = saved_peek_at;
+        self.type_name()
+    }
+
     fn routine_argument(&mut self) -> Result<RoutineArgument<'a>, ParseError> {
         #[derive(Clone, Copy)]
         enum WrittenMode {
@@ -3819,7 +3866,7 @@ impl<'a> Parser<'a> {
         // a parameter boundary; otherwise restore and parse `name type`.
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
-        let candidate_type = self.type_name()?;
+        let candidate_type = self.routine_type_name()?;
         let candidate_is_complete = matches!(
             self.peeked,
             Tok::Op("," | ")" | "=") | Tok::Ident("default")
@@ -3831,7 +3878,7 @@ impl<'a> Parser<'a> {
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
             let name = self.type_function_ident("routine argument name")?;
-            (Some(name), self.type_name()?)
+            (Some(name), self.routine_type_name()?)
         };
 
         let has_default = self.eat_ident("default")? || self.eat_op("=")?;
@@ -4022,7 +4069,7 @@ impl<'a> Parser<'a> {
             } else if output_count != 0 {
                 let set_returning = has_returns && self.eat_ident("setof")?;
                 let declared_result_type = if has_returns {
-                    Some(self.type_name()?)
+                    Some(self.routine_type_name()?)
                 } else {
                     None
                 };
@@ -4038,7 +4085,7 @@ impl<'a> Parser<'a> {
             } else {
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
-                    result_type: self.type_name()?,
+                    result_type: self.routine_type_name()?,
                 }
             }
         } else {

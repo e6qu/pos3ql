@@ -44555,6 +44555,185 @@ pub(crate) fn resolve_routine_type_at(
 /// [`resolve_routine_type`] for a routine parameter (an argument, an `OUT`
 /// parameter or a `TABLE` column): PostgreSQL names a missing type without
 /// quotes and positions the error at it.
+/// PostgreSQL's `%TYPE` in a routine signature (`LookupTypeNameExtended`):
+/// `written`, the parser's `table.column%TYPE` spelling, becomes the
+/// column's type, announced with a NOTICE; any other name is kept.
+pub(crate) fn resolve_column_type_reference<'a>(
+    storage: &Storage,
+    txid: u32,
+    written: &'a str,
+    arena: &'a Arena,
+    responder: &mut Responder,
+) -> Result<Result<&'a str, SqlError>, WireFull> {
+    let Some(reference) = written.strip_suffix("%TYPE") else {
+        return Ok(Ok(written));
+    };
+    let mut names = [""; 4];
+    let mut count = 0;
+    for name in reference.split('.') {
+        if count == names.len() {
+            return Ok(Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "improper %TYPE reference (too many dotted names): {}",
+                    reference
+                ),
+                written,
+            )));
+        }
+        names[count] = name;
+        count += 1;
+    }
+    let (schema, relation, column) = match &names[..count] {
+        [relation, column] => (None, *relation, *column),
+        [schema, relation, column] => (Some(*schema), *relation, *column),
+        [_, schema, relation, column] => (Some(*schema), *relation, *column),
+        _ => {
+            return Ok(Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "improper %TYPE reference (too few dotted names): {}",
+                    reference
+                ),
+                written,
+            )));
+        }
+    };
+    let resolved = (|| {
+        let definition = match storage.resolve_relation(schema, relation, txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => storage.table_def(slot, txid),
+            Some(crate::storage::ResolvedRelation::View(_)) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "%TYPE references to view columns are not supported"
+                ));
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    relation
+                ));
+            }
+        };
+        let Some(meta) = definition
+            .columns()
+            .iter()
+            .find(|meta| meta.name.as_str() == column)
+        else {
+            return Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column,
+                    relation
+                ),
+                written,
+            ));
+        };
+        let type_oid = crate::sql::catalog::catalog_column_type_oid(storage, meta, txid)?;
+        Ok(crate::sql::catalog::format_type_oid(
+            storage, txid, type_oid, -1,
+        ))
+    })();
+    let type_name = match resolved {
+        Ok(type_name) => type_name,
+        Err(error) => return Ok(Err(error)),
+    };
+    responder.notice(
+        sqlstate::SUCCESSFUL_COMPLETION,
+        stack_format!(
+            600,
+            "type reference {} converted to {}",
+            written,
+            type_name.as_str()
+        )
+        .as_str(),
+    )?;
+    Ok(arena
+        .alloc_str(type_name.as_str())
+        .map_err(|_| arena_full()))
+}
+
+/// `routine` with each `%TYPE` parameter and result type replaced by the
+/// column type it names, as PostgreSQL resolves them before the rest of the
+/// declaration.
+pub(crate) fn resolve_routine_type_references<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &CreateRoutine<'a>,
+    arena: &'a Arena,
+    responder: &mut Responder,
+) -> Result<Result<CreateRoutine<'a>, SqlError>, WireFull> {
+    let referenced = |name: &str| name.ends_with("%TYPE");
+    let result_reference = match routine.kind {
+        super::ast::RoutineCreateKind::Function { result_type, .. } => referenced(result_type),
+        super::ast::RoutineCreateKind::OutputFunction {
+            declared_result_type: Some(result_type),
+            ..
+        } => referenced(result_type),
+        _ => false,
+    };
+    if !result_reference
+        && !routine
+            .arguments
+            .iter()
+            .any(|argument| referenced(argument.type_name))
+    {
+        return Ok(Ok(*routine));
+    }
+    let arguments = match arena.alloc_slice_copy(routine.arguments) {
+        Ok(arguments) => arguments,
+        Err(_) => return Ok(Err(arena_full())),
+    };
+    for argument in arguments.iter_mut() {
+        argument.type_name = match resolve_column_type_reference(
+            storage,
+            txid,
+            argument.type_name,
+            arena,
+            responder,
+        )? {
+            Ok(type_name) => type_name,
+            Err(error) => return Ok(Err(error)),
+        };
+    }
+    let mut resolved = *routine;
+    resolved.arguments = arguments;
+    resolved.kind = match routine.kind {
+        super::ast::RoutineCreateKind::Function {
+            result_type,
+            set_returning,
+        } => super::ast::RoutineCreateKind::Function {
+            result_type: match resolve_column_type_reference(
+                storage,
+                txid,
+                result_type,
+                arena,
+                responder,
+            )? {
+                Ok(type_name) => type_name,
+                Err(error) => return Ok(Err(error)),
+            },
+            set_returning,
+        },
+        super::ast::RoutineCreateKind::OutputFunction {
+            declared_result_type: Some(result_type),
+            set_returning,
+        } => super::ast::RoutineCreateKind::OutputFunction {
+            declared_result_type: Some(
+                match resolve_column_type_reference(storage, txid, result_type, arena, responder)? {
+                    Ok(type_name) => type_name,
+                    Err(error) => return Ok(Err(error)),
+                },
+            ),
+            set_returning,
+        },
+        kind => kind,
+    };
+    Ok(Ok(resolved))
+}
+
 pub(crate) fn resolve_routine_parameter_type(
     storage: &Storage,
     txid: u32,

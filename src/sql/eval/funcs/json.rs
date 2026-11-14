@@ -908,6 +908,7 @@ pub(crate) fn dispatch<'a>(
         && !name.starts_with("__json_array_")
         && !name.starts_with("__json_object_")
         && !name.starts_with("__json_serialize_")
+        && !name.starts_with("__json_fit_")
         && !name.starts_with("__json_exists_")
         && name != "__json_value"
         && !name.starts_with("__json_query_")
@@ -1626,6 +1627,48 @@ pub(crate) fn dispatch<'a>(
                     Err(_) if predicate.ends_with("_false") => Ok(Datum::Bool(false)),
                     Err(error) => Err(error),
                 }
+            }
+            "__json_fit_varchar" | "__json_fit_bpchar" => {
+                arity(2)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let length = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int4(length) => usize::try_from(length).ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "SQL/JSON length modifier is not a length"
+                    )
+                })?;
+                let text = match value {
+                    Datum::Text(text) | Datum::Json { text, .. } => text,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SQL/JSON character result is not text"
+                        ));
+                    }
+                };
+                // Excess made only of spaces is cut, as assignment allows.
+                let end = text
+                    .char_indices()
+                    .nth(length)
+                    .map_or(text.len(), |(at, _)| at);
+                if text[end..].chars().any(|c| c != ' ') {
+                    return Err(sql_err!(
+                        sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+                        "value too long for type {}({})",
+                        if name == "__json_fit_varchar" {
+                            "character varying"
+                        } else {
+                            "character"
+                        },
+                        length
+                    ));
+                }
+                Ok(Datum::Text(&text[..end]))
             }
             "__json_serialize_text" | "__json_serialize_bytea" => {
                 arity(1)?;

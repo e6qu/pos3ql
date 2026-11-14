@@ -19,6 +19,83 @@ jobs:
     name: Format CI
     uses: ./.github/workflows/formatting.yml
 
+  # The library test harness is the only native build the test jobs execute,
+  # so it gets its own runner and the test jobs wait for it alone. Every other
+  # target builds in parallel in native-build. Compiling either library unit
+  # peaks near 7 GB of compiler memory, the whole of a hosted macOS arm64
+  # runner, so each job builds one library unit at a time.
+  native-test-build:
+    needs: formatting
+    name: native test build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Linux arm64, macOS arm64]
+        include:
+          - platform: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cargo_jobs: 4
+          - platform: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            cargo_jobs: 3
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+      CARGO_JOBS: ${{ matrix.cargo_jobs }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native compiler target
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$NATIVE_TARGET"
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the native library test executable
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --no-run --lib --locked --profile native-ci --jobs "$CARGO_JOBS" \
+            --target "$NATIVE_TARGET" --timings --message-format=json-render-diagnostics \
+            | tee "$RUNNER_TEMP/native-test-build.jsonl"
+
+      - name: Retain native test build progress and timings
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-test-build-progress-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/native-test-build.jsonl
+            target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Prepare the exact native test executable
+        run: >-
+          python3 tools/native-test-artifact.py prepare
+          "$RUNNER_TEMP/native-test-build.jsonl" "$RUNNER_TEMP/native-test-artifact"
+          "$GITHUB_SHA" "$NATIVE_TARGET"
+
+      - name: Retain native test executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-tests-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/native-test-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   native-build:
     needs: formatting
     name: native build (${{ matrix.platform }})
@@ -30,23 +107,24 @@ jobs:
           - platform: Linux arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cargo_jobs: 4
           - platform: macOS arm64
             runner: macos-15
             target: aarch64-apple-darwin
+            cargo_jobs: 3
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       NATIVE_TARGET: ${{ matrix.target }}
+      CARGO_JOBS: ${{ matrix.cargo_jobs }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify native compiler target
-        env:
-          EXPECTED_TARGET: ${{ env.NATIVE_TARGET }}
         run: |
-          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$NATIVE_TARGET"
 
       - name: Cache Rust dependencies
         uses: actions/cache@v5
@@ -56,13 +134,18 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
-      - name: Build all native targets
+      # Together with native-test-build this covers every target that
+      # `--all-targets` selects: the library, the executable and its (empty)
+      # test harness, examples and integration tests.
+      - name: Build all other native targets
         shell: bash
         run: |
           set -o pipefail
-          cargo build --all-targets --locked --profile native-ci \
-            --target "$NATIVE_TARGET" --timings --message-format=json-render-diagnostics \
-            | tee "$RUNNER_TEMP/native-build.jsonl"
+          cargo build --lib --bins --examples --test '*' --locked --profile native-ci \
+            --jobs "$CARGO_JOBS" --target "$NATIVE_TARGET" --timings \
+            --message-format=json-render-diagnostics | tee "$RUNNER_TEMP/native-build.jsonl"
+          cargo test --no-run --bins --locked --profile native-ci \
+            --jobs "$CARGO_JOBS" --target "$NATIVE_TARGET"
 
       - name: Retain native build progress and timings
         if: always()
@@ -75,24 +158,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
-      - name: Prepare the exact native test executable
-        run: >-
-          python3 tools/native-test-artifact.py prepare
-          "$RUNNER_TEMP/native-build.jsonl" "$RUNNER_TEMP/native-test-artifact"
-          "$GITHUB_SHA" "$NATIVE_TARGET"
-
-      - name: Retain native test executable
-        uses: actions/upload-artifact@v6
-        with:
-          name: native-tests-${{ matrix.target }}-${{ github.sha }}
-          path: ${{ runner.temp }}/native-test-artifact/
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
   reactor-ownership:
-    needs: native-build
-    name: native build and test (${{ matrix.platform }}, ${{ matrix.suite }})
+    needs: native-test-build
+    name: native tests (${{ matrix.platform }}, ${{ matrix.suite }})
     strategy:
       fail-fast: false
       matrix:
@@ -171,13 +239,17 @@ jobs:
           - platform: Linux arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            cargo_jobs: 4
           - platform: macOS arm64
             runner: macos-15
             target: aarch64-apple-darwin
+            # Two concurrent library checks exceed the runner's 7 GB.
+            cargo_jobs: 1
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
       NATIVE_TARGET: ${{ matrix.target }}
+      CARGO_JOBS: ${{ matrix.cargo_jobs }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -196,7 +268,7 @@ jobs:
 
       - name: Native allocation-free boundaries
         run: >-
-          cargo clippy --all-targets --locked --profile native-ci
+          cargo clippy --all-targets --locked --profile native-ci --jobs "$CARGO_JOBS"
           --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:

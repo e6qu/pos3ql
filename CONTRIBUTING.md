@@ -164,11 +164,12 @@ temporary validation workflows before the final head.
   `POS3QL_EXACT_SHARDS`, like the SQLLogicTest query slices.
   Coverage tracing and `runtest:` correctness shards stay in separate matrix
   entries.
-- Bound compiler concurrency and debug data rather than adding time. Native
-  arm64 jobs build every target once with the `native-ci` profile and
-  `--jobs 1` (debug assertions, overflow checks and line backtraces, without
-  full variable debug data); separate test jobs run that build's library
-  executable with the full native filter lists. The artifact helper checks
+- Bound debug data rather than adding time, and keep Cargo's default job
+  count: `--jobs 1` also limits each compiler to one code-generation thread,
+  which roughly doubled the native compile of this single large crate. Native
+  arm64 jobs build every target once with the `native-ci` profile (debug
+  assertions, overflow checks and line backtraces, without full variable debug
+  data); separate test jobs run that build's library executable with the full native filter lists. The artifact helper checks
   revision, target, length and SHA-256, and restores `RUST_MIN_STACK` from the
   checked-in Cargo configuration.
 - Coverage builds and runs use the `coverage` profile (release with

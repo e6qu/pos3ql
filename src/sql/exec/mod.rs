@@ -98006,15 +98006,11 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
     })
 }
 
-/// Visits a table's visible rows (or the visible ones among `candidates`)
-/// in the physical order a sequential scan reads them: saved rows by row
-/// identity, then heap rows by heap position. PostgreSQL's data changes read
-/// their target this way, so routines they call observe earlier rows'
-/// changes in the same order.
-/// Visits a table's visible rows in the physical order a sequential scan
-/// reads them: saved rows by row identity, then heap rows by heap position.
-/// PostgreSQL's data changes read their target this way, so routines they
-/// call observe earlier rows' changes in the same order.
+/// Visits a table's visible rows in the order a sequential `SELECT` reads
+/// them, as PostgreSQL's data changes read their target: routines they call
+/// observe earlier rows' changes in that order. A table with saved row
+/// files streams its resident rows by row identity, then its saved rows;
+/// otherwise its heap rows go in heap position order.
 fn for_each_physical_row(
     storage: &Storage,
     table: usize,
@@ -98022,6 +98018,15 @@ fn for_each_physical_row(
     arena: &Arena,
     visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    if storage.spill_generation_count(table) != 0 {
+        let scan = storage.captured_row_scan_in(table, txid, arena)?;
+        // The visitor never stops the scan early.
+        let _ = scan.for_each_home(&mut |rowid, home| {
+            visit(rowid, home)?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        return Ok(());
+    }
     let count = storage.visible_row_count(table, txid)?;
     let snapshot = storage.table_row_snapshot(table, Some(arena))?;
     let ordered = arena

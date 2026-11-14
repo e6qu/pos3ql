@@ -117,65 +117,58 @@ fn into_keeps_its_row_across_a_later_rows_routine_call() {
 #[test]
 fn data_changes_select_their_target_rows_in_physical_order() {
     with_engine("notice-physical-target-order", |engine, budget| {
-        for sql in [
-            "CREATE TABLE ordered (id int, a int)",
-            "INSERT INTO ordered VALUES (1, 0), (2, 0), (3, 0)",
-            // The new version of row 1 follows rows 2 and 3.
-            "UPDATE ordered SET a = 1 WHERE id = 1",
+        run_with(
+            engine,
+            budget,
             "CREATE FUNCTION shown(i int) RETURNS int LANGUAGE plpgsql AS \
              $$ BEGIN RAISE NOTICE 'row %', i; RETURN i; END $$",
-        ] {
-            run_with(engine, budget, sql);
-        }
-        for sql in [
-            "UPDATE ordered SET a = shown(id)",
-            "DELETE FROM ordered WHERE shown(id) > 0",
-        ] {
-            run_with(engine, budget, "BEGIN");
-            let output = messages(engine, budget, sql);
-            assert_eq!(
-                output[..3],
-                [
-                    "NOTICE 00000 row 2",
-                    "NOTICE 00000 row 3",
-                    "NOTICE 00000 row 1"
-                ],
-                "{sql}"
-            );
-            run_with(engine, budget, "ROLLBACK");
-        }
-        // A condition on an index's leading column reaches the rows through
+        );
+        // Each case writes a fresh table whose row 1 was updated, so its new
+        // version follows rows 2 and 3. A sequential scan reads that order;
+        // a condition on an index's leading column reaches the rows through
         // their index entries, where an updated row keeps its first position.
-        for sql in [
-            "CREATE TABLE keyed (id int PRIMARY KEY, a int)",
-            "INSERT INTO keyed VALUES (1, 0), (2, 0), (3, 0)",
-            "UPDATE keyed SET a = 1 WHERE id = 1",
-        ] {
-            run_with(engine, budget, sql);
-        }
-        for (sql, expected) in [
+        for (case, (key, sql, expected)) in [
+            ("", "UPDATE {t} SET a = shown(id)", &["2", "3", "1"][..]),
+            ("", "DELETE FROM {t} WHERE shown(id) > 0", &["2", "3", "1"]),
             (
-                "UPDATE keyed SET a = shown(id) WHERE id < 3",
-                &["1", "2"][..],
-            ),
-            (
-                "UPDATE keyed SET a = shown(id) WHERE id IN (1, 2)",
+                " PRIMARY KEY",
+                "UPDATE {t} SET a = shown(id) WHERE id < 3",
                 &["1", "2"],
             ),
             (
-                "DELETE FROM keyed WHERE (id = 1 OR id = 2) AND shown(id) > 0",
+                " PRIMARY KEY",
+                "UPDATE {t} SET a = shown(id) WHERE id IN (1, 2)",
                 &["1", "2"],
             ),
-            ("UPDATE keyed SET a = shown(id)", &["2", "3", "1"]),
-        ] {
-            run_with(engine, budget, "BEGIN");
-            let output = messages(engine, budget, sql);
+            (
+                " PRIMARY KEY",
+                "DELETE FROM {t} WHERE (id = 1 OR id = 2) AND shown(id) > 0",
+                &["1", "2"],
+            ),
+            (
+                " PRIMARY KEY",
+                "UPDATE {t} SET a = shown(id)",
+                &["2", "3", "1"],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let table = format!("ordered_{case}");
+            for setup in [
+                format!("CREATE TABLE {table} (id int{key}, a int)"),
+                format!("INSERT INTO {table} VALUES (1, 0), (2, 0), (3, 0)"),
+                format!("UPDATE {table} SET a = 1 WHERE id = 1"),
+            ] {
+                run_with(engine, budget, &setup);
+            }
+            let sql = sql.replace("{t}", &table);
+            let output = messages(engine, budget, &sql);
             let expected: Vec<String> = expected
                 .iter()
                 .map(|id| format!("NOTICE 00000 row {id}"))
                 .collect();
-            assert_eq!(output[..expected.len()], expected[..], "{sql}");
-            run_with(engine, budget, "ROLLBACK");
+            assert_eq!(output[..output.len() - 1], expected[..], "{sql}");
         }
     });
 }

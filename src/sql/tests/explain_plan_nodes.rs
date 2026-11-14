@@ -689,3 +689,91 @@ fn with_queries_run_once_are_cte_init_plans() {
         ]
     );
 }
+
+#[test]
+fn verbose_prints_each_nodes_target_list() {
+    let (mut session, mut engine) = setup("verbose_prints_each_nodes_target_list");
+    let verbose = "VERBOSE, COSTS OFF";
+    // A scan under an aggregate returns its physical columns; an upper node
+    // prints an expression its input computed in parentheses.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT a, count(*) FROM pn_t GROUP BY a ORDER BY 2"
+        ),
+        [
+            "Sort",
+            "  Output: a, (count(*))",
+            "  Sort Key: (count(*))",
+            "  ->  HashAggregate",
+            "        Output: a, count(*)",
+            "        Group Key: pn_t.a",
+            "        ->  Seq Scan on public.pn_t",
+            "              Output: a, b",
+        ]
+    );
+    // A sort's input computes the select list and its resjunk keys.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT a + 1 FROM pn_t ORDER BY b"
+        ),
+        [
+            "Sort",
+            "  Output: ((a + 1)), b",
+            "  Sort Key: pn_t.b",
+            "  ->  Seq Scan on public.pn_t",
+            "        Output: (a + 1), b",
+        ]
+    );
+    // Locked rows carry their identities; a function scan prints its call.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT b FROM pn_t LIMIT 2 FOR UPDATE"
+        ),
+        [
+            "Limit",
+            "  Output: b, ctid",
+            "  ->  LockRows",
+            "        Output: b, ctid",
+            "        ->  Seq Scan on public.pn_t",
+            "              Output: b, ctid",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT g + 1 FROM generate_series(1, 3) g"
+        ),
+        [
+            "Function Scan on pg_catalog.generate_series g",
+            "  Output: (g + 1)",
+            "  Function Call: generate_series(1, 3)",
+        ]
+    );
+    // A DELETE's scan returns the row identity; RETURNING is the write's.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "DELETE FROM pn_u WHERE a = 3 RETURNING c"
+        ),
+        [
+            "Delete on public.pn_u",
+            "  Output: c",
+            "  ->  Seq Scan on public.pn_u",
+            "        Output: ctid",
+            "        Filter: (pn_u.a = 3)",
+        ]
+    );
+}

@@ -308,6 +308,15 @@ wait_p3() {
 wait_up "$PGHOST" "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 1; }
 wait_p3 || { echo "pos3ql not reachable on 127.0.0.1:$P3_PORT"; exit 1; }
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+# pos3ql publishes logical changes from every write. A reference below
+# `wal_level = logical` warns on CREATE PUBLICATION, and the corpora compare
+# warnings, so the oracle must run at pos3ql's level.
+reference_wal_level=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW wal_level' 2>&1)
+if [[ "$reference_wal_level" != logical ]]; then
+  printf 'FAIL: the PostgreSQL reference must run with wal_level = logical (found %s)\n' \
+    "$reference_wal_level"
+  exit 1
+fi
 
 restart_p3() {
   kill "$P3_PID" 2>/dev/null
@@ -1646,15 +1655,15 @@ reset_user_relations() { # host port
       -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
-# Schemas, standalone types, foreign-data wrappers and roles a fixture leaves
-# behind would otherwise collide with a later fixture's (or a later run's on a
-# reused reference cluster) objects of the same name. Only roles created after
-# the run's first reset (OIDs above its baseline) are dropped, so roles that
-# predate the run on a shared reference server survive; pos3ql servers are
-# disposable, so every role it did not bootstrap is dropped.
+# Schemas, standalone types, public collations, foreign-data wrappers and
+# roles a fixture leaves behind would otherwise collide with a later fixture's
+# (or a later run's on a reused reference cluster) objects of the same name.
+# Only roles created after the run's first reset (OIDs above its baseline) are
+# dropped, so roles that predate the run on a shared reference server survive;
+# pos3ql servers are disposable, so every role it did not bootstrap is dropped.
 reset_user_objects() { # host port role-baseline
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
+    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
   while IFS= read -r statement; do
     [[ -z "$statement" ]] && continue
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q -c "$statement" >/dev/null 2>&1

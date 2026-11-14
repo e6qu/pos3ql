@@ -48,6 +48,7 @@ mod joined_dml_returning;
 mod key_index_marks;
 mod key_preparation;
 mod nested_planner_inputs;
+mod notice_parity;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
@@ -102,6 +103,7 @@ mod type_input_positions;
 mod unknown_type_schema;
 mod view_reloptions;
 mod virtual_search_path;
+mod write_producers;
 mod write_progress;
 
 #[test]
@@ -23604,7 +23606,8 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
                 .iter()
                 .filter(|line| line.contains("Append"))
                 .count(),
-            WIDTH - 1,
+            // PostgreSQL flattens a chain of UNION ALL into one Append.
+            1,
             "{phase} set EXPLAIN: {}",
             String::from_utf8_lossy(&set_plan)
         );
@@ -26995,7 +26998,6 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
     tags
 }
 
-/// Extracts text values from DataRow messages, '|'-joined per row.
 /// The message text of each `NoticeResponse` in `bytes`.
 fn notice_messages(bytes: &[u8]) -> Vec<String> {
     let mut messages = Vec::new();
@@ -35007,9 +35009,9 @@ fn integer_settings_parse_and_show_like_postgresql() {
         ("'1e2'", "100ms"),
         ("'+5'", "5ms"),
     ] {
-        let out = run(&format!(
-            "SET statement_timeout = {value}; SHOW statement_timeout"
-        ));
+        // lock_timeout parses as statement_timeout does, but a tiny value
+        // cannot cancel the SHOW that follows it on a slow runner.
+        let out = run(&format!("SET lock_timeout = {value}; SHOW lock_timeout"));
         assert!(
             out.contains(shown) && !out.contains("ERROR"),
             "{value}: {out}"
@@ -54634,6 +54636,87 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body()
 }
 
 #[test]
+fn explain_analyze_counts_each_node_of_the_plan_it_runs() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE na (a int, b int); CREATE TABLE nb (k int, v int); \
+         INSERT INTO na SELECT g % 10, g FROM generate_series(1, 100) g; \
+         INSERT INTO nb SELECT g, g FROM generate_series(1, 5) g; ANALYZE na; ANALYZE nb; \
+         CREATE FUNCTION nb_count() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM nb'",
+    );
+    let analyzed = |engine: &mut _, budget: &mut _, query: &str| {
+        data_rows(&run_with(
+            engine,
+            budget,
+            &format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) {query}"),
+        ))
+    };
+    assert_eq!(
+        analyzed(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM na WHERE a > 5 LIMIT 3"
+        ),
+        [
+            "Limit (actual rows=3.00 loops=1)",
+            "  ->  Seq Scan on na (actual rows=3.00 loops=1)",
+            "        Filter: (a > 5)",
+            "        Rows Removed by Filter: 5",
+        ]
+    );
+    assert_eq!(
+        analyzed(&mut engine, &mut budget, "SELECT * FROM na LIMIT 0"),
+        [
+            "Limit (actual rows=0.00 loops=1)",
+            "  ->  Seq Scan on na (never executed)",
+        ]
+    );
+    assert_eq!(
+        analyzed(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM nb x, nb y WHERE x.k < y.k"
+        ),
+        [
+            "Nested Loop (actual rows=10.00 loops=1)",
+            "  Join Filter: (x.k < y.k)",
+            "  Rows Removed by Join Filter: 15",
+            "  ->  Seq Scan on nb x (actual rows=5.00 loops=1)",
+            "  ->  Materialize (actual rows=5.00 loops=5)",
+            "        ->  Seq Scan on nb y (actual rows=5.00 loops=1)",
+        ]
+    );
+    // A function body's own scan of the same relation is not one of the
+    // plan's nodes.
+    assert_eq!(
+        analyzed(
+            &mut engine,
+            &mut budget,
+            "SELECT nb_count() FROM nb WHERE k > 3"
+        ),
+        [
+            "Seq Scan on nb (actual rows=2.00 loops=1)",
+            "  Filter: (k > 3)",
+            "  Rows Removed by Filter: 3",
+        ]
+    );
+    let timed = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT * FROM na ORDER BY b",
+    ));
+    assert!(
+        timed
+            .iter()
+            .any(|row| row.starts_with("  ->  Seq Scan on na (actual time=")
+                && row.ends_with(" rows=100.00 loops=1)")),
+        "{timed:?}"
+    );
+}
+
+#[test]
 fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -54808,7 +54891,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
+            .any(|row| row.contains("Index Scan using ep_pkey on public.ep")),
         "{detailed:?}"
     );
 
@@ -73818,14 +73901,19 @@ fn psql_catalog_listing_contracts() {
         )),
         ["catalog_acl_owner"]
     );
+    // Holding the privilege without its grant option revokes nothing, with
+    // PostgreSQL's warning rather than an error.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE catalog_table_reader;
+         REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
+    );
+    let output = String::from_utf8_lossy(&output);
     assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut engine,
-            &mut budget,
-            "SET ROLE catalog_table_reader;
-             REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
-        ))
-        .contains("42501")
+        output.contains("no privileges could be revoked for \"catalog_owner_table\"")
+            && !output.contains("42501"),
+        "{output}"
     );
     run_with(&mut engine, &mut budget, "RESET ROLE");
     run_with(
@@ -93508,6 +93596,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
                 command: session.transaction.command_id(),
             },
             None,
+            crate::sql::exec::DmlSelection::Qualified,
         )
     })
     .unwrap();

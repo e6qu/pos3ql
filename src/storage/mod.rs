@@ -21782,7 +21782,7 @@ impl Storage {
     ) -> Option<foreign::UserMappingDefinition> {
         let entry = self.foreign_mapping_entry(slot);
         (entry.database == current_database() && entry.visible_to(txid))
-            .then(|| entry.definition_for(txid))
+            .then(|| *entry.definition_for(txid))
     }
 
     pub(crate) fn foreign_user_mapping(
@@ -38991,18 +38991,32 @@ impl Storage {
             }
         }
         match_slot.or(default).ok_or_else(|| {
-            // `ExecFindPartition`: the key values and `errtable`.
             let parent = self.table_def(parent_slot, txid);
-            let detail = row.describe(&parent);
-            crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
-                crate::sql::eval::ErrorObjects::table(parent.schema.as_str(), parent.name.as_str()),
-            );
-            sql_err!(
+            let error = sql_err!(
                 sqlstate::CHECK_VIOLATION,
                 "no partition of relation \"{}\" found for row",
                 parent.name.as_str()
-            )
+            );
+            let Some(scheme) = parent.partition.scheme else {
+                return error;
+            };
+            let names = scheme.keys[..usize::from(scheme.n_keys)]
+                .iter()
+                .map(|key| parent.columns()[usize::from(*key)].name.as_str());
+            // `ExecFindPartition`: the key values and `errtable`.
+            match crate::sql::exec::partition_key_detail(&mut { names }, &mut row.key_values()) {
+                Ok(detail) => {
+                    crate::sql::eval::stash_object_diagnostic(
+                        Some(detail.as_str()),
+                        crate::sql::eval::ErrorObjects::table(
+                            parent.schema.as_str(),
+                            parent.name.as_str(),
+                        ),
+                    );
+                    error
+                }
+                Err(error) => error,
+            }
         })
     }
 
@@ -59989,8 +60003,19 @@ impl Storage {
         input: RoutineResult,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
+        // One lock over borrowed slots: index catalogs resolve every key's
+        // default class, and most of the fixed slots are empty.
+        let catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let database = current_database();
         let mut found = None;
-        for (slot, definition) in self.operator_classes_visible_to(txid) {
+        for (slot, class) in catalog.classes.iter().enumerate() {
+            if class.database != database || !class.visible_to(txid) {
+                continue;
+            }
+            let definition = class.definition_for(txid);
             if definition.default && definition.input == input && found.replace(slot).is_some() {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,

@@ -79,6 +79,8 @@ pub(super) fn fire<'s, 'a, 'b>(
         &mut Option<&mut [Datum<'a>]>,
     ) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
+    // A trigger body's statements are not part of an explained plan.
+    let _instrument = query::instrument::suspend();
     if !matches!(context.host, PlpgsqlExecHost::Atomic { .. })
         || FIRING.with(Cell::get) != FiringHost::Outside
     {
@@ -300,6 +302,7 @@ fn run_pending_firing<'w, Definition0: crate::storage::DefinitionBacking>(
         depth: txn.trigger_depth(),
         retained: true,
         statement_end: false,
+        step: false,
     });
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {

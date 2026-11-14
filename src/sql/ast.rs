@@ -6094,6 +6094,9 @@ pub enum BoundLiteralValue<'a> {
     CheckedArrayInput(&'a [u8]),
     /// Encoded by the executor after materializing a catalog default.
     CachedDefault(&'a [u8]),
+    /// The planner's folded value of the constant expression `source`.
+    /// Matching against stored index keys reads `source`.
+    Folded(&'a [u8]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6465,7 +6468,39 @@ fn is_nonimmutable_function(name: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
+/// Whether a call of `name` with `arity` arguments may be volatile or
+/// stable: [`is_nonimmutable_function`], or a PostgreSQL 18.6 built-in
+/// overload of that arity that is not immutable (`to_tsquery(text)` reads
+/// `default_text_search_config`, where `to_tsquery(regconfig, text)` does
+/// not). The planner folds only immutable calls.
+pub(crate) fn is_nonimmutable_call(name: &str, arity: usize) -> bool {
+    is_nonimmutable_function(name)
+        || super::catalog::builtin_callable_signatures(
+            name.strip_prefix("pg_catalog.").unwrap_or(name),
+        )
+        .any(|signature| {
+            signature.catalog.volatility != "i"
+                && (signature.required_arguments..=signature.arguments.len()).contains(&arity)
+                || signature.catalog.volatility != "i"
+                    && signature.variadic_element.is_some()
+                    && arity >= signature.required_arguments
+        })
+}
+
 impl<'a> Expr<'a> {
+    /// The expression as written: a constant the planner folded reads as
+    /// its source, which names and deparses it.
+    pub(crate) fn written(&self) -> &Expr<'a> {
+        match self {
+            Expr::BoundLiteral {
+                value: BoundLiteralValue::Folded(_),
+                source,
+                ..
+            } => source.written(),
+            _ => self,
+        }
+    }
+
     /// The operands of `x IS [NOT] DISTINCT FROM y` and whether it is negated
     /// (`IS NOT DISTINCT FROM`).
     pub(crate) fn distinct_from_operands(&self) -> Option<(&'a Expr<'a>, &'a Expr<'a>, bool)> {
@@ -6690,7 +6725,7 @@ impl<'a> Expr<'a> {
                 over.is_none()
                     && !self.is_aggregate()
                     && !is_set_returning(name)
-                    && !is_nonimmutable_function(name)
+                    && !is_nonimmutable_call(name, args.len())
                     && args.iter().all(|a| a.is_constant(catalog_aware))
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant(catalog_aware)),
@@ -6936,7 +6971,7 @@ impl<'a> Expr<'a> {
     /// (PostgreSQL requires immutability, 42P17). Every other function is treated
     /// as immutable.
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
-        self.find_function(&is_nonimmutable_function)
+        self.find_function(&is_nonimmutable_call)
     }
 
     /// As [`Self::contains_nonimmutable_function`], also treating a function
@@ -6945,18 +6980,18 @@ impl<'a> Expr<'a> {
         &self,
         changed: &dyn Fn(&str) -> bool,
     ) -> Option<&str> {
-        self.find_function(&|name| is_nonimmutable_function(name) || changed(name))
+        self.find_function(&|name, arity| is_nonimmutable_call(name, arity) || changed(name))
     }
 
     /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
     pub fn contains_volatile_function(&self) -> Option<&str> {
-        self.find_function(&is_volatile_function)
+        self.find_function(&|name, _| is_volatile_function(name))
     }
 
-    pub(crate) fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
+    pub(crate) fn find_function(&self, matches: &dyn Fn(&str, usize) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
-                if matches(name) {
+                if matches(name, args.len()) {
                     return Some(name);
                 }
                 args.iter().find_map(|a| a.find_function(matches))

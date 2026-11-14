@@ -26,6 +26,10 @@ pub(crate) enum RetainedUse {
 enum StatementUse {
     Handoff,
     WriteSource,
+    /// The source of an `INSERT ... SELECT` the engine reads row by row,
+    /// handing calls off on their row; it may read data-modifying `WITH`
+    /// queries as they run.
+    Driven,
 }
 use crate::storage::{
     CursorRow, MAX_COLUMNS, RowCursor, RowCursorBuffers, SpilledRowRepresentation, rowenc,
@@ -133,6 +137,13 @@ enum RetainedSource<'a> {
         kinds: &'a [super::generator::GeneratorKind],
         generator: Option<super::generator::FunctionRows<'a>>,
     },
+    /// A data-modifying `WITH` query read as it runs: each row past the
+    /// ones it returned runs its next step, as PostgreSQL's CTE scan pulls
+    /// its ModifyTable node. `next` is `usize::MAX` once closed.
+    Produced {
+        source: crate::sql::ast::WriteQuerySource<'a>,
+        next: usize,
+    },
     /// The queries of a `UNION ALL`, read one after another as PostgreSQL's
     /// Append node does; each row is coerced to the combined column types.
     Append {
@@ -155,6 +166,7 @@ impl<'a> RetainedSource<'a> {
                     generator.rewind();
                 }
             }
+            Self::Produced { next, .. } => *next = 0,
             Self::Append { .. } => {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -173,6 +185,7 @@ impl<'a> RetainedSource<'a> {
             Self::Generated { generator, .. } => {
                 *generator = Some(super::generator::FunctionRows::finished());
             }
+            Self::Produced { next, .. } => *next = usize::MAX,
             Self::Append { branches, next, .. } => *next = branches.len(),
         }
     }
@@ -1611,6 +1624,20 @@ fn next_source_row<'a>(
             .expect("generator starts with the cursor's first fetch")
             .next_encoded(state_arena)
             .map(|row| row.map(RetainedRow::Literal)),
+        RetainedSource::Produced { source, next } => {
+            if *next == usize::MAX {
+                return Ok(None);
+            }
+            // A row not returned yet ends this read with the query's next
+            // step pending; the same read runs again after it.
+            match super::read_write_query_row(source, *next)? {
+                super::ProducedRead::Row(bytes) => {
+                    *next += 1;
+                    Ok(Some(RetainedRow::Literal(bytes)))
+                }
+                super::ProducedRead::End => Ok(None),
+            }
+        }
         RetainedSource::Append { .. } => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "appended rows are read through their plan"
@@ -1619,7 +1646,7 @@ fn next_source_row<'a>(
 }
 
 /// Collects the queries of a set tree that is only explicit `UNION ALL`.
-fn union_all_leaves<'a>(
+pub(crate) fn union_all_leaves<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
     leaves: &mut crate::mem::arena::ArenaList<'a, &'a Select<'a>>,
 ) -> Result<bool, SqlError> {
@@ -2842,6 +2869,27 @@ impl<'a> RetainedSelect<'a> {
         )
     }
 
+    /// A reader of an `INSERT ... SELECT` source the engine reads row by
+    /// row, whatever its calls.
+    pub(crate) fn open_driven_source(
+        storage: &Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        params: &[Datum<'a>],
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<Option<Self>, SqlError> {
+        Self::open_statement_for(
+            storage,
+            txid,
+            statement,
+            params,
+            arena,
+            responder,
+            StatementUse::Driven,
+        )
+    }
+
     fn open_statement_for(
         storage: &Storage,
         txid: u32,
@@ -2896,9 +2944,17 @@ impl<'a> RetainedSelect<'a> {
         // Likewise it groups them itself.
         let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
         // A statement-mode SELECT is read here only for its routine calls;
-        // others keep the general executor's index access paths.
-        let handoff_only =
-            mode == RetainedMode::Statement && statement_use == StatementUse::Handoff;
+        // others keep the general executor's index access paths. One that
+        // reads a data-modifying `WITH` query is read here with or without
+        // calls, so the query writes each row as it is read.
+        let reads_write_query = statement.from.as_ref().is_some_and(|from| {
+            from.base.cte.is_some_and(|cte| {
+                matches!(cte.source, crate::sql::ast::MaterializedCteSource::Write(_))
+            })
+        });
+        let handoff_only = mode == RetainedMode::Statement
+            && statement_use == StatementUse::Handoff
+            && !reads_write_query;
         // Only a reader that returns its rows once runs subqueries before
         // them; a declared cursor or an appended query does not.
         let Some(sublinks) = statement_sublinks(statement, storage, txid, arena)? else {
@@ -2945,11 +3001,24 @@ impl<'a> RetainedSelect<'a> {
         let generated = from
             .filter(|from| from.joins.is_empty() && from.base.is_function_source())
             .and_then(|from| retained_function_source(&from.base, storage, txid, arena));
+        // A data-modifying `WITH` query a statement reads as it runs.
+        let produced = from
+            .filter(|from| {
+                from.joins.is_empty()
+                    && from.base.sample.is_none()
+                    && mode == RetainedMode::Statement
+                    && statement_use != StatementUse::WriteSource
+            })
+            .and_then(|from| from.base.cte)
+            .and_then(|cte| match cte.source {
+                crate::sql::ast::MaterializedCteSource::Write(source) => Some(source),
+                _ => None,
+            });
         if from.is_some_and(|from| {
             !from.joins.is_empty()
                 || from.base.is_function_source() && generated.is_none()
                 || from.base.subquery.is_some() && !literals && appended.is_none()
-                || from.base.cte.is_some()
+                || from.base.cte.is_some() && produced.is_none()
                 || from.base.sample.is_some()
                 || matches!(
                     storage.resolve_relation(from.base.schema, from.base.table, txid),
@@ -2975,6 +3044,7 @@ impl<'a> RetainedSelect<'a> {
             && (mode == RetainedMode::Statement
                 || literals
                 || generated.is_some()
+                || produced.is_some()
                 || from.is_none())
             || self_sorts && (locks || from.is_none())
         {
@@ -3023,6 +3093,7 @@ impl<'a> RetainedSelect<'a> {
                     || !literals
                         && generated.is_none()
                         && appended.is_none()
+                        && produced.is_none()
                         && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
                 {
                     return Ok(None);
@@ -3092,9 +3163,9 @@ impl<'a> RetainedSelect<'a> {
             }
         }
         let binding_columns = Some(&columns);
-        let table = if let Some(from) =
-            from.filter(|_| !literals && generated.is_none() && appended.is_none())
-        {
+        let table = if let Some(from) = from.filter(|_| {
+            !literals && generated.is_none() && appended.is_none() && produced.is_none()
+        }) {
             let table = scope.slots[0];
             let definition = scope.defs.stored(0).expect("resolved physical source");
             if definition.kind != crate::storage::TableKind::Local
@@ -3134,7 +3205,12 @@ impl<'a> RetainedSelect<'a> {
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         super::check_key_types(statement, &scope, arena, storage, txid)?;
-        check_select_constants(statement, arena, storage, txid)?;
+        // A constant that calls a routine folds where routines run.
+        let statement = match super::fold_select_constants(statement, arena, storage, txid) {
+            Ok(statement) => statement,
+            Err(error) if error.requires_routine_engine() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         super::require_select_routine_execute(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
             if table.is_none() {
@@ -3379,6 +3455,11 @@ impl<'a> RetainedSelect<'a> {
                 kinds: generated,
                 generator: eliminated.then(super::generator::FunctionRows::finished),
             }
+        } else if let Some(source) = produced {
+            RetainedSource::Produced {
+                source,
+                next: if eliminated { usize::MAX } else { 0 },
+            }
         } else if literals {
             let rows = scope.derived[0].expect("literal derived source owns encoded rows");
             let scrollable = from
@@ -3525,7 +3606,12 @@ impl<'a> RetainedSelect<'a> {
         }
         let binding_columns = Some(&columns);
         check_select_types(statement, &scope, storage, txid, arena, None)?;
-        check_select_constants(statement, arena, storage, txid)?;
+        // A constant that calls a routine folds where routines run.
+        let statement = match super::fold_select_constants(statement, arena, storage, txid) {
+            Ok(statement) => statement,
+            Err(error) if error.requires_routine_engine() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let demand = match aggregates {
             Some(_) => grouping::input_demand(&scope, from, statement, arena)?,
             None => streaming_pax_columns_ordered(
@@ -4018,6 +4104,22 @@ impl<'a> RetainedSelect<'a> {
         // The caller has emitted or dropped every evaluation value of the
         // row.
         self.plan.release(state_arena);
+    }
+
+    /// Whether the reader reads its whole input or runs subqueries at its
+    /// first row, where a build that does not fit is reported.
+    pub(crate) fn prepares_ahead(&self) -> bool {
+        self.plan.sort().is_some() || self.plan.group().is_some() || !self.sublinks.is_empty()
+    }
+
+    /// The statement's RowDescription while it is unsent.
+    pub(crate) fn pending_description(&self) -> Option<&'a [ColDesc<'a>]> {
+        self.description
+    }
+
+    /// Another reader describes the result: this one sends no description.
+    pub(crate) fn discard_description(&mut self) {
+        self.description = None;
     }
 
     /// Whether the statement's RowDescription still waits for its first

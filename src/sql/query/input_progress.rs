@@ -437,10 +437,6 @@ impl RoutineInputs {
             cast_selections: RefCell::new(RetainedList::new()),
         }
     }
-    pub(super) fn begin_attempt(&self) {
-        self.next.set(0);
-    }
-
     pub(super) fn position(&self) -> usize {
         self.next.get()
     }
@@ -977,6 +973,8 @@ pub(crate) struct BodyScope {
     source_position: Option<super::InvocationSite>,
     assignment: Option<crate::sql::type_inputs::AssignmentSite>,
     in_body: bool,
+    /// A body's statements are not part of an explained plan.
+    _instrument: super::instrument::Suspended,
 }
 impl Drop for BodyScope {
     fn drop(&mut self) {
@@ -996,6 +994,7 @@ pub(crate) fn enter_body() -> BodyScope {
         source_position: CURRENT_SOURCE_POSITION.with(|current| current.replace(None)),
         assignment: CURRENT_ASSIGNMENT_SITE.with(|current| current.replace(None)),
         in_body: IN_BODY.with(|current| current.replace(true)),
+        _instrument: super::instrument::suspend(),
     }
 }
 

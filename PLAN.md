@@ -138,21 +138,36 @@ is owned.
   sub-statements still reads synchronously); a
   statement whose restarts repeat downloads without progress reads the rest
   synchronously (`statement_restart_waits`), so it finishes with empty
-  caches. The `AFTER` work (foreign key checks included) of those steps and
-  of writes inside functions called from a restartable statement still reads
-  synchronously: a step's foreign key check that waited resumed the step at a
-  completion position past its last row and then waited again without a new
-  GET, a loop the download bound does not see. A data-modifying `WITH`
-  sub-statement that the main statement reads runs to completion when first
-  read, so its `AFTER` events queue before the main statement's own, and
-  its volatile calls run before the main statement's later ones; PostgreSQL
-  runs it as the main statement reads its rows, so both interleave (one
-  that nothing reads already runs after the main statement, last one first,
-  as in PostgreSQL). Matching that order needs sub-statements that run as
-  their rows are read, by the
-  [design](docs/architecture.md#write-sub-statements-that-run-as-their-rows-are-read):
-  producer nodes over retained selections, and a streaming
-  `INSERT ... SELECT` source.
+  caches. The `AFTER` work of a top-level rule-rewritten write's steps
+  yields, also for rule steps nested in an action's own rules: the step stays
+  finished, and the statement continues with the steps after it in another
+  attempt that starts both of its replay logs (routine results and saved
+  call inputs, and sequence values) past the finished steps and that work.
+  The `AFTER` work (foreign key checks included) of a data-modifying `WITH`
+  main statement's steps, of rule steps inside a routine body, and of writes
+  inside functions called from a restartable statement still reads
+  synchronously: giving those a step completion needs the same step record
+  in their enclosing write's attempt loop, which a routine body's write and
+  the `WITH` statement's steps do not hand to it yet. A data-modifying `WITH`
+  `INSERT` runs as its rows are read, as PostgreSQL's CTE scan pulls its
+  ModifyTable node (`src/sql/driven_insert.rs`): each read past the rows it
+  returned runs one more step, which writes source rows until one returns a
+  row, so row triggers, calls and sequence values interleave with the
+  reader's and `AFTER` events queue in PostgreSQL's order; queries read only
+  partly, or not at all, then run to their end, last one first. The reader
+  is a `SELECT` whose single `FROM` item is the query (also each query of a
+  `UNION ALL` of such `SELECT`s), another such `INSERT ... SELECT`, or a
+  top-level `INSERT ... SELECT` from it, with or without calls; an
+  `UPDATE`, `DELETE` or `MERGE` query returns each row before it changes the
+  next, as an `INSERT ... VALUES` does. A sort, aggregate or window reader
+  reads its whole input first, as PostgreSQL's does. A join reader reads the
+  query whole at its first read: that matches PostgreSQL when its plan
+  hashes the query, but not when its plan streams the query (a nested loop
+  under a `LATERAL` item over it, or a hash join that hashes the other,
+  smaller input). Matching those needs a retained join node that pulls the
+  query as its outer input and PostgreSQL's choice of which input to hash,
+  which follows its cost estimates rather than the statement's shape.
+  read. A wait inside a step runs the statement again from its first start.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
@@ -164,27 +179,31 @@ is owned.
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
   statements nested deeper than `write_step_levels` fail the same way with
-  `54000` naming that setting. `INSERT ... SELECT` streams a source that calls
-  no volatile built-in and no user routine, and materializes any other
-  source before writing. Volatile user routine calls in its output list (also a
-  rule action's `VALUES` over several rows) run as each row is inserted, as
-  in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,
-  aggregate arguments or a `UNION`/`INTERSECT`/`EXCEPT` branch still run
-  before the first row, so they do not see rows the statement inserts.
-  Running those row by row needs the source and the row phase to keep
-  separate invocation logs, since the source then runs ahead of the rows by
-  a different amount in each attempt. A data-modifying `WITH` sub-statement runs to completion
-  before the main statement reads it, where PostgreSQL interleaves them row
-  by row, so a call in the main statement sees all of its rows. PostgreSQL
-  18.6 runs `WITH w1 AS (INSERT INTO a SELECT g ... RETURNING x), w2 AS
-  (INSERT INTO b SELECT x, note('b', x) FROM w1 RETURNING x) SELECT
-  note('main', x) FROM w2` as BEFORE a 1, b 1, main 1, BEFORE a 2, ... and
-  queues AFTER a 1, AFTER b 1, AFTER a 2, ...; a query read only partly
-  (`LIMIT 2`) still writes every row after the main query's reads. Matching
-  that needs the producer nodes of the design, which need the main query to
-  be a retained reader of CTE scans (not yet admitted) so a write can run
-  between its reads. A PL/pgSQL
-  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`.
+  `54000` naming that setting. `INSERT ... SELECT`
+  streams a source that calls no volatile built-in and no user routine; one
+  whose output list alone calls volatile built-ins is read by the engine row
+  by row, its output evaluated as each row is read and written; one reading
+  a data-modifying `WITH` query is read so too, a user routine call that
+  waits inside its body keeping its log with the write and continuing
+  there; any other source materializes before writing. A plain source
+  calling user routines still materializes: read row by row, each call's
+  results would stay in the statement arena's retained tail until the
+  statement ends, so a long source would exhaust it (`54000`); streaming it needs
+  per-row result storage released once the row is written. Volatile user
+  routine calls in a materialized source's output
+  list (also a rule action's `VALUES` over several rows) run as each row is
+  inserted, as in PostgreSQL; calls in its
+  `WHERE`, join conditions, subqueries, aggregate arguments or a
+  `UNION`/`INTERSECT`/`EXCEPT` branch still run before the first row, so
+  they do not see rows the statement inserts. A `WITH` `INSERT`
+  read row by row re-reads nothing between steps: its reader and analysed
+  statement stay in a 512 KiB block of the statement arena's persistent
+  tail. A PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement fails with
+  `0A000`. A data-modifying `WITH` query's rules must leave exactly one
+  statement after each action is rewritten again by its own target's rules,
+  as PostgreSQL checks before anything runs; the `RETURNING` checks come
+  first, and a rule action keeps its `RETURNING` list only when the query
+  it replaces has one.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions
@@ -465,6 +484,67 @@ binding them follows the same dependency-list pattern. Renaming an enum value th
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`.
+The differential corpora compare notices, warnings and INFO messages with
+their statement positions. The planner folds constants as PostgreSQL's
+`eval_const_expressions` does: before a `SELECT`, `INSERT ... VALUES`,
+`UPDATE` or `DELETE` reads or writes a row, each constant subexpression that
+calls an immutable routine, converts a value or runs an operator's routine
+is evaluated once and replaced with its value, so `''::tsquery` in a query
+returning three rows sends its notice once, and a constant in an arm no row
+reaches still folds and reports its error. An `INSERT` folds its `VALUES`
+rows and `RETURNING` list before its statement triggers fire. Folding gaps
+remain: aggregate arguments, window specifications, `MERGE`,
+`ON CONFLICT DO UPDATE` and `FROM` subqueries are evaluated where they run;
+join conditions and `FROM` function arguments are evaluated where they run
+(a constant in a join condition already raises its notice once, but a
+`LATERAL` function's argument raises it for each outer row); folding them
+with the target list raised the notice a second time, because the join and
+function-scan executors evaluate the written conditions and arguments
+again, so both need to read the folded clause; a parameter of a custom plan does not fold; a literal conversion
+in a prepared statement raises its notice at each `EXECUTE` where
+PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
+prepared statement to keep every converted literal, not only the typed
+inputs it keeps today; a statement a routine runs folds at each run where
+PostgreSQL folds its cached plan once per session; and PostgreSQL's
+selectivity estimate, which evaluates a stable call compared with an indexed
+column once more while planning, is not modeled.
+`UPDATE` and `DELETE` whose conditions (`WHERE`, `FROM` or `USING` items, or
+row-security policies) call a user routine or a volatile built-in qualify
+each candidate row in their change loop, just before changing it, as
+PostgreSQL's executor does: the condition's notices interleave with the
+row's `SET` expressions, triggers and `RETURNING` list, and its calls see the
+rows the statement already changed. Candidates are every row the
+statement's command snapshot sees (through the condition's index when one
+answers it), so rows this command changed are never revisited, and each
+qualified row is locked there, with read committed's recheck of a row
+changed while waiting. Row progress records the candidate position, so a
+write resumed after a routine call or a wait neither qualifies earlier
+candidates again, whether they changed or failed, nor repeats their calls;
+an uncorrelated subquery the statement keeps (an initPlan) replays at the
+log position where it first ran. Conditions without such calls select and
+lock every row first, which no client can tell apart. Remaining gaps: a
+foreign table's rows are qualified before any change; PostgreSQL orders a
+condition's conjuncts by cost and evaluates leakproof ones before
+row-security conditions (`id < 4 AND f(id)` runs `id < 4` first), where
+conditions here run row-security policies first, then the condition left to
+right; a data-modifying `WITH` sub-statement runs ahead of the main
+statement (above); and a rule action's `NEW` row evaluates every `SET`
+expression of the original statement, where PostgreSQL's rewrite evaluates
+only those the action reads. A policy that a write's `UPDATE` (or `DELETE`)
+and `SELECT` commands share runs once per row, as PostgreSQL's
+`list_append_unique` keeps it; each command's restrictive policies run
+before the OR of its permissive ones, which stops at the first that passes.
+A row no partition accepts reports its partition key
+(`Partition key of the failing row contains (id) = (21).`); like the key
+details of unique violations, it is not withheld from a role without
+`SELECT` privilege or under row security as PostgreSQL withholds it.
+Row order
+without `ORDER BY` follows a model of PostgreSQL's access path rather than
+its cost-based plan: a query or data change on one table whose condition
+constrains an index's leading column takes rows in their first-insertion
+order, as an index or bitmap scan reaches an updated row at its first
+position, and any other takes them in physical order. A table with saved row
+files read without index candidates keeps physical order.
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;
@@ -533,9 +613,16 @@ condition and each nested loop's join filter, sort and grouping keys
 on "*VALUES*"`, a derived table's own plan under its `Subquery Scan` (or in
 its place when the scan neither filters nor reshapes rows), and each outer
 join narrowed by conditions that reject its nullable side's NULLs, as
-PostgreSQL's `reduce_outer_joins` does. A derived table's scan prints no
-`Filter`, keys reading a derived table or function are not printed, and
-`VERBOSE` output names a `VALUES` list's columns by their aliases. An index scan prints the
+PostgreSQL's `reduce_outer_joins` does. A derived table's, a function's
+(`Function Scan`) and a pulled-up `VALUES` list's scan print their `Filter`, a
+grouped query its `HAVING` filter, an `OFFSET` its `Limit`, a distinct union the
+`Append` it hashes, and a relation a set operation reads again a unique name
+(`t1_1`). `VERBOSE` prints relation schemas, a single relation's conditions
+qualified, and a `VALUES` list's columns as `"*VALUES*".column1`; other nodes'
+`Output` lists stay unqualified, join conditions over a `VALUES` list or another
+derived relation are not printed, and `Sort Key`/`Group Key` items reading a
+derived table are not printed (PostgreSQL prints the expressions of the
+derived table's query); keys reading a function or a `VALUES` list are. An index scan prints the
 conditions its index consumes as `Index Cond` (indexed column first and
 unqualified), and a parameterized inner index scan filters the other join
 conditions reading it, as PostgreSQL does. Outer joins of stored tables in
@@ -546,7 +633,10 @@ relation. An outer hash join hashes its
 nullable side (a `RIGHT JOIN` shows as `Hash Left Join` probing its right
 item, as PostgreSQL plans tables of similar size), or its preserved side
 (`Hash Right Join`) when only that side fits the build; a `FULL JOIN` shows
-as `Hash Full Join`; `enable_hashjoin = off` runs each as a nested loop. Other
+as `Hash Full Join`. Its `WHERE` conditions reading only the side it never
+null-extends filter that side's scan, and its `ON` conditions reading only
+the null-extended side filter that side's scan before the build, as
+PostgreSQL places them; `enable_hashjoin = off` runs each as a nested loop. Other
 right or full joins run, and print, as a `Nested Loop Right Join` or
 `Nested Loop Full Join`, where PostgreSQL may also merge. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
@@ -555,18 +645,51 @@ join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
 pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
 USING` hash their first FROM table when it is joined to the target by
 equality, as a `SELECT` of the two tables would, and join later FROM items to
-it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
-statement a rewrite rule changes, an `INSERT ... SELECT` action of an
-`INSERT` of several rows or of a query reading tables, an `INSERT` of an
-aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
-several rows, a statement on a view with rules, and an action on a view or on
-a relation with rules of its own (which PostgreSQL rewrites again) fail with
-`0A000`. Planning them needs a `VALUES` list kept apart from a `UNION ALL`
-of rows for these rewrites, and a rewrite of each action's own rules; under `EXPLAIN ANALYZE` the statement runs
-once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
-reports actual rows only on each plan's top node, where PostgreSQL reports
-every node (`(never executed)` for nodes that did not run), because the
-executor keeps no per-node counters. Notices carry
+it in nested loops; PostgreSQL may instead hash the joined FROM items. A statement
+rewrite rules change is explained as every query PostgreSQL's rewriter
+produces, each rule action rewritten again by its target's rules; a rule
+action of several `VALUES` rows over a statement's query, several rows or
+condition fails with `0A000` (PostgreSQL joins the list into the action as a
+`VALUES` scan reading the other rows laterally). A view an `UPDATE ... FROM`
+or `DELETE ... USING` reads is pulled up only when its relations' names do
+not clash with the statement's own, where PostgreSQL renames them (`t_1`);
+otherwise its query runs under a `Subquery Scan`. Under `EXPLAIN ANALYZE` a rewritten statement runs
+once, each of its queries counted in its own plan, and its time and I/O are
+reported on its last query. `EXPLAIN` in PL/pgSQL explains rewritten
+statements the same way. `EXPLAIN ANALYZE`
+counts, per plan node, the loops, rows and the rows its `Filter` and `Join
+Filter` removed while the statement runs, and prints `(never executed)` for
+nodes that did not run: scans (also a nested loop's inner rescans and
+parameterized index scans), nested-loop and hash joins with their `Hash` and
+`Materialize` inputs, aggregation, sorts, `DISTINCT`, limits, window
+evaluation, set operations, derived tables, `VALUES` lists, a write's target
+scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
+(its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
+and the `ProjectSet` that expands set-returning calls, which also appears
+over scans), in all four formats. A hash join's `Hash` node reports the table pos3ql
+built: its bucket count (and the count it started with when it grew), one
+batch, and the bytes of its arrays as `Memory Usage`, which differ from
+PostgreSQL's allocator figures. A query without FROM drops sort, grouping
+and distinct keys that are planner constants, as PostgreSQL does (a constant
+`DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
+the constants the planner folds them into (`'2'::double precision`). Times are measured
+per loop, to the first row and to the end; in pos3ql's push-based executor a
+node's time also includes the work of the nodes reading its rows. Not yet
+shown: subplans and InitPlans (a condition with a subquery prints no
+`Filter`), semi joins, the `Sort Method`, aggregate and `Materialize`
+storage lines that PostgreSQL measures in its own allocator, per-node `Buffers` and `WAL` (reported on the top node
+only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
+heap scan's `Heap Blocks`. A node of a path the executor does not count (a
+data-modifying `WITH`, a joined `UPDATE` or `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports the
+statement's rows; a `LIMIT` that stops `Unique` early leaves its `Sort`
+without figures, as pos3ql deduplicates before sorting. Where pos3ql's plan
+differs from PostgreSQL's cost-based one the figures are those of the plan it
+shows and runs: it hashes the second of two joined relations where PostgreSQL
+may hash the smaller filtered one, joins three or more relations in nested
+loops where PostgreSQL may hash them, sorts before `DISTINCT ... ORDER BY`
+where PostgreSQL may hash first, shows no window's input `Sort` or `Window:`
+line, and does not flatten a distinct union of more than two inputs into one
+`Append`. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where
@@ -586,9 +709,10 @@ queries, including data-modifying ones, in one new command as PostgreSQL
 does; a cursor's query with data-modifying `WITH` queries runs at its first
 read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
-`WITH` query runs whole before the main query reads it, so a trigger's or
-called function's notices arrive in a different order than PostgreSQL's
-interleaved execution. The index behind a primary key or unique
+`WITH` query read by a join runs whole at its first read, so where
+PostgreSQL's plan streams the query (a `LATERAL` item over it, or a join
+that hashes the other input) a trigger's or called function's effects
+arrive in a different order than PostgreSQL's (see Write phases). The index behind a primary key or unique
 constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,

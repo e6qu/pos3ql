@@ -193,6 +193,9 @@ enum ErrorOrigin {
     /// A retained plan node's build did not fit `plan_build_bytes`; the
     /// statement can still run the general executor's way.
     PlanBuild,
+    /// A routine needs the resumable executor, which this evaluation lacks;
+    /// the general executor can run the statement.
+    RoutineEngine,
 }
 
 impl PartialEq for SqlState {
@@ -260,7 +263,10 @@ impl SqlState {
     pub(crate) fn internal_control(self) -> Option<InternalControl> {
         match self.1 {
             ErrorOrigin::Control(control) => Some(control),
-            ErrorOrigin::Sql | ErrorOrigin::InputExpression | ErrorOrigin::PlanBuild => None,
+            ErrorOrigin::Sql
+            | ErrorOrigin::InputExpression
+            | ErrorOrigin::PlanBuild
+            | ErrorOrigin::RoutineEngine => None,
         }
     }
 
@@ -364,6 +370,18 @@ impl SqlError {
     /// the general executor can run it instead.
     pub(crate) fn is_plan_build_exhausted(&self) -> bool {
         self.sqlstate.1 == ErrorOrigin::PlanBuild
+    }
+
+    /// Marks a `0A000` raised because a routine needs the resumable
+    /// executor, which the evaluation that called it lacks.
+    pub(crate) fn routine_engine_required(mut self) -> Self {
+        self.sqlstate.1 = ErrorOrigin::RoutineEngine;
+        self
+    }
+
+    /// Whether only the missing resumable executor stopped a routine call.
+    pub(crate) fn requires_routine_engine(&self) -> bool {
+        self.sqlstate.1 == ErrorOrigin::RoutineEngine
     }
 }
 
@@ -523,6 +541,81 @@ pub fn clear_eval_messages() {
     });
 }
 
+/// The most constant expressions whose folding raised notices one statement
+/// tracks; a statement that folds more fails with SQLSTATE 54000.
+pub const MAX_FOLDED_NOTICE_SOURCES: usize = 256;
+
+struct FoldedNoticeSources {
+    nodes: [usize; MAX_FOLDED_NOTICE_SOURCES],
+    len: usize,
+}
+
+std::thread_local! {
+    /// The written expressions whose folding raised notices in this
+    /// statement. Execution paths that plan the same query level fold it
+    /// again; PostgreSQL plans it once, so only the first folding's notices
+    /// are kept. The statement's parsed nodes outlive every path planning it.
+    static FOLDED_NOTICE_SOURCES: core::cell::RefCell<FoldedNoticeSources> =
+        const {
+            core::cell::RefCell::new(FoldedNoticeSources {
+                nodes: [0; MAX_FOLDED_NOTICE_SOURCES],
+                len: 0,
+            })
+        };
+}
+
+/// The number of tracked folded expressions, for an attempt that restarts
+/// and raises its notices again.
+pub fn folded_notice_mark() -> usize {
+    FOLDED_NOTICE_SOURCES.with(|sources| sources.borrow().len)
+}
+
+/// Forgets folded expressions tracked after `mark`, whose notices
+/// [`truncate_eval_messages`] withdrew.
+pub fn truncate_folded_notices(mark: usize) {
+    FOLDED_NOTICE_SOURCES.with(|sources| {
+        let mut sources = sources.borrow_mut();
+        sources.len = sources.len.min(mark);
+    });
+}
+
+/// Starts a top-level statement: no expression has been folded yet.
+pub fn clear_folded_notices() {
+    truncate_folded_notices(0);
+}
+
+/// Runs the folding `evaluate` of `source`, keeping the notices it raises
+/// only the first time this statement folds `source`.
+fn fold_once<T>(
+    source: &Expr<'_>,
+    evaluate: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let node = core::ptr::from_ref(source).addr();
+    let messages = eval_message_mark();
+    let value = evaluate()?;
+    if eval_message_mark() == messages {
+        return Ok(value);
+    }
+    FOLDED_NOTICE_SOURCES.with(|sources| {
+        let mut sources = sources.borrow_mut();
+        let len = sources.len;
+        if sources.nodes[..len].contains(&node) {
+            truncate_eval_messages(messages);
+            return Ok(value);
+        }
+        if len == MAX_FOLDED_NOTICE_SOURCES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "more than {} constant expressions raised notices while folding one statement",
+                MAX_FOLDED_NOTICE_SOURCES
+            ));
+        }
+        sources.nodes[len] = node;
+        sources.len = len + 1;
+        Ok(value)
+    })
+}
+
 pub mod sqlstate {
     pub const SYNTAX_ERROR: &str = "42601";
     pub const INVALID_NAME: &str = "42602";
@@ -668,6 +761,7 @@ pub mod sqlstate {
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const SUCCESSFUL_COMPLETION: &str = "00000";
     pub const WARNING: &str = "01000";
+    pub const WARNING_PRIVILEGE_NOT_REVOKED: &str = "01006";
     pub const UNIQUE_VIOLATION: &str = "23505";
     pub const RAISE_EXCEPTION: &str = "P0001";
     pub const NO_DATA_FOUND: &str = "P0002";
@@ -2975,6 +3069,14 @@ pub trait CatalogAccess {
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// The table OID and publication name of a visible `pg_publication_rel`
+    /// row.
+    fn publication_relation(
+        &self,
+        _oid: i32,
+    ) -> Result<Option<(i32, crate::storage::SqlName)>, SqlError> {
+        Ok(None)
+    }
     /// The name of a visible database.
     fn database_name_by_oid(&self, _oid: i32) -> Option<crate::storage::SqlName> {
         None
@@ -4010,9 +4112,15 @@ impl<'h> DeferredSubquery<'h> {
         if let Some(saved) = self.cache.and_then(|cache| cache.get().saved) {
             return read_saved_subquery(saved, self.node, arena);
         }
-        let result = self
-            .executor
-            .evaluate(expression, arena, params, row, sequences)?;
+        let result = match self.cache {
+            Some(_) => super::query::evaluate_initplan(self.node, || {
+                self.executor
+                    .evaluate(expression, arena, params, row, sequences)
+            })?,
+            None => self
+                .executor
+                .evaluate(expression, arena, params, row, sequences)?,
+        };
         if let Some(cache) = self.cache {
             cache.set(DeferredSubqueryCache {
                 saved: Some(save_subquery_result(&result, self.owner)?),
@@ -4363,11 +4471,24 @@ pub fn eval<'a>(
 /// subtrees are evaluated once here; per-row evaluation (with short-circuit)
 /// handles the rest.
 pub fn check_constant_errors<'a>(
-    expression: &Expr<'a>,
+    expression: &'a Expr<'a>,
     arena: &'a Arena,
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<(), SqlError> {
     probe_constants(|| fold_check(expression, arena, catalog).map(|_| ()))
+}
+
+/// [`fold`] as a probe: the folded boolean value, without rebuilding.
+fn fold_check<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Option<bool>, SqlError> {
+    let folding = Folding {
+        catalog,
+        replace: false,
+    };
+    Ok(fold(expression, arena, folding)?.1)
 }
 
 std::thread_local! {
@@ -4598,38 +4719,79 @@ pub(super) fn constant_evaluation(
     }
 }
 
-/// The simplification-aware core of [`check_constant_errors`], mirroring
-/// PostgreSQL's `eval_const_expressions`: it folds constant subexpressions
-/// (surfacing their errors) but simplifies `A AND FALSE`→`FALSE`,
-/// `A OR TRUE`→`TRUE`, and constant `CASE` arms — so a constant error inside a
-/// branch that simplification *drops* is not surfaced (PostgreSQL evaluates
-/// `... WHERE FALSE AND (id > (-1 % 0))` to no rows, never folding `-1 % 0`).
-/// Returns the folded boolean value when the expression provably reduces to
-/// one, else `None`.
-fn fold_check<'a>(
-    expression: &Expr<'a>,
+/// How [`fold`] treats the constant subexpressions it evaluates.
+#[derive(Clone, Copy)]
+struct Folding<'c> {
+    catalog: Option<&'c dyn CatalogAccess>,
+    /// Replace each folded subexpression with its value, so the statement
+    /// does not evaluate it again for every row. A probe only reports errors.
+    replace: bool,
+}
+
+/// PostgreSQL's planner folding (`eval_const_expressions`) of `expression`,
+/// which the statement then runs: each maximal constant subexpression that
+/// calls a routine, converts a value or runs an operator's routine is
+/// evaluated once, here, and replaced with its value. Its notices are the
+/// statement's; its error is the statement's error. Only immutable calls are
+/// constants, a strict routine with a constant NULL input folds to NULL
+/// without running, and a branch simplification drops is never evaluated.
+pub fn fold_constants<'a>(
+    expression: &'a Expr<'a>,
     arena: &'a Arena,
     catalog: Option<&dyn CatalogAccess>,
-) -> Result<Option<bool>, SqlError> {
+) -> Result<&'a Expr<'a>, SqlError> {
+    let folding = Folding {
+        catalog,
+        replace: true,
+    };
+    Ok(fold(expression, arena, folding)?.0)
+}
+
+/// The simplification-aware core of [`check_constant_errors`] and
+/// [`fold_constants`], mirroring PostgreSQL's `eval_const_expressions`: it
+/// folds constant subexpressions (surfacing their errors) but simplifies
+/// `A AND FALSE`→`FALSE`, `A OR TRUE`→`TRUE`, and constant `CASE` arms — so a
+/// constant error inside a branch that simplification *drops* is not
+/// surfaced (PostgreSQL evaluates `... WHERE FALSE AND (id > (-1 % 0))` to no
+/// rows, never folding `-1 % 0`). Returns the expression, rebuilt around its
+/// folded values when `folding.replace` is set, and the folded boolean value
+/// when the expression provably reduces to one.
+fn fold<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    folding: Folding<'_>,
+) -> Result<(&'a Expr<'a>, Option<bool>), SqlError> {
     use super::ast::BinaryOp;
+    let catalog = folding.catalog;
     let evaluation = constant_evaluation(expression, catalog)?;
     if evaluation != Some(ExpressionEvaluation::Runtime) {
-        let result = if evaluation == Some(ExpressionEvaluation::Immutable) {
-            let hooks = EvalHooks {
-                catalog,
-                ..NO_HOOKS
-            };
-            eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks)
-        } else {
-            eval(expression, arena, NO_PARAMS, &NoColumns)
+        let hooks = EvalHooks {
+            catalog,
+            ..NO_HOOKS
         };
-
-        return Ok(match result {
-            Ok(Datum::Bool(b)) => Some(b),
-            Ok(_) => None,
+        // The value replaces the expression, so it is computed as the
+        // statement would: with the catalog's routine definitions, whose
+        // strictness a folded built-in follows.
+        let evaluate = || {
+            if evaluation == Some(ExpressionEvaluation::Immutable) || folding.replace {
+                eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks)
+            } else {
+                eval(expression, arena, NO_PARAMS, &NoColumns)
+            }
+        };
+        let result = if folding.replace {
+            fold_once(expression, evaluate)
+        } else {
+            evaluate()
+        };
+        let value = match result {
+            Ok(value) => value,
             // A catalog-aware immutable expression has its lookup context:
             // missing objects are real planning errors, even without input rows.
-            // Context-free probes and unsupported execution stay for runtime.
+            // Context-free probes and unsupported execution stay for runtime,
+            // except that a folding which needs the resumable executor
+            // reports so: the statement runs where routines can.
+            Err(e) if folding.replace && e.requires_routine_engine() => return Err(e),
             Err(e)
                 if (evaluation != Some(ExpressionEvaluation::Immutable)
                     && (e.sqlstate == sqlstate::UNDEFINED_OBJECT
@@ -4637,11 +4799,44 @@ fn fold_check<'a>(
                         || e.sqlstate == sqlstate::UNDEFINED_FUNCTION))
                     || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED =>
             {
-                None
+                return Ok((expression, None));
             }
             Err(e) => return Err(e),
-        });
+        };
+        let known = match value {
+            Datum::Bool(b) => Some(b),
+            _ => None,
+        };
+        if folding.replace && runs_on_evaluation(expression, evaluation) {
+            let type_oid = expression_type_identity(expression, &NoColumns, &hooks)?;
+            let type_oid = type_oid.record_field_oid();
+            if type_oid != super::types::oid::UNKNOWN && type_oid != super::types::oid::RECORD {
+                let literal = folded_literal(expression, value, type_oid, arena)?;
+                return Ok((literal, known));
+            }
+        }
+        return Ok((expression, known));
     }
+    // A simplification settles a boolean expression that is not constant;
+    // the statement reads the settled value, never the dropped operands.
+    let settled = |known: bool| -> Result<(&'a Expr<'a>, Option<bool>), SqlError> {
+        if !folding.replace {
+            return Ok((expression, Some(known)));
+        }
+        let literal = folded_literal(
+            expression,
+            Datum::Bool(known),
+            super::types::oid::BOOL,
+            arena,
+        )?;
+        Ok((literal, Some(known)))
+    };
+    let alloc = |node: Expr<'a>| -> Result<&'a Expr<'a>, SqlError> {
+        arena
+            .alloc(node)
+            .map(|node| &*node)
+            .map_err(|_| super::query::arena_full_pub())
+    };
     match expression {
         Expr::Null
         | Expr::Bool(_)
@@ -4658,65 +4853,79 @@ fn fold_check<'a>(
         | Expr::RecursiveState { .. }
         | Expr::Param(_)
         | Expr::OuterAggregate { .. }
-        | Expr::DefaultMarker => Ok(None),
+        | Expr::DefaultMarker
+        | Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => Ok((expression, None)),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
-        // so the sibling's constant errors are never surfaced.
+        // so the sibling's constants are never evaluated.
         Expr::Binary {
-            operator: BinaryOp::And,
+            source_position,
+            operator: operator @ (BinaryOp::And | BinaryOp::Or),
             left,
             right,
-            ..
         } => {
-            // FALSE settles AND; otherwise the result is known only when both
-            // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
-            let l = fold_check(left, arena, catalog)?;
-            if l == Some(false) {
-                return Ok(Some(false));
+            // FALSE settles AND and TRUE settles OR; otherwise the result is
+            // known only when both sides fold to the other value (`TRUE AND
+            // TRUE`, `FALSE OR FALSE`), so a constant OR of dead predicates
+            // lets a CASE arm drop.
+            let settles = *operator == BinaryOp::Or;
+            let (new_left, l) = fold(left, arena, folding)?;
+            if l == Some(settles) {
+                return settled(settles);
             }
-            let r = fold_check(right, arena, catalog)?;
-            if r == Some(false) {
-                return Ok(Some(false));
+            let (new_right, r) = fold(right, arena, folding)?;
+            if r == Some(settles) {
+                return settled(settles);
             }
-            Ok(match (l, r) {
-                (Some(true), Some(true)) => Some(true),
-                _ => None,
-            })
-        }
-        Expr::Binary {
-            operator: BinaryOp::Or,
-            left,
-            right,
-            ..
-        } => {
-            // TRUE settles OR; otherwise the result is known only when both
-            // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
-            // OR of dead predicates lets a CASE arm drop.
-            let l = fold_check(left, arena, catalog)?;
-            if l == Some(true) {
-                return Ok(Some(true));
+            if l == Some(!settles) && r == Some(!settles) {
+                return settled(!settles);
             }
-            let r = fold_check(right, arena, catalog)?;
-            if r == Some(true) {
-                return Ok(Some(true));
+            if core::ptr::eq(new_left, *left) && core::ptr::eq(new_right, *right) {
+                return Ok((expression, None));
             }
-            Ok(match (l, r) {
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
-            })
+            Ok((
+                alloc(Expr::Binary {
+                    source_position: *source_position,
+                    operator: *operator,
+                    left: new_left,
+                    right: new_right,
+                })?,
+                None,
+            ))
         }
         // NOT propagates a folded boolean, so `NOT (x AND FALSE)` simplifies to
         // TRUE — which lets a CASE truncate exactly as PostgreSQL's plan-time
         // simplification does.
         Expr::Unary {
-            operator: super::ast::UnaryOp::Not,
+            source_position,
+            operator: operator @ super::ast::UnaryOp::Not,
             operand,
-            ..
-        } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
+        } => {
+            let (new_operand, known) = fold(operand, arena, folding)?;
+            if let Some(known) = known {
+                return settled(!known);
+            }
+            if core::ptr::eq(new_operand, *operand) {
+                return Ok((expression, None));
+            }
+            Ok((
+                alloc(Expr::Unary {
+                    source_position: *source_position,
+                    operator: *operator,
+                    operand: new_operand,
+                })?,
+                None,
+            ))
+        }
         Expr::Cast {
+            source_position,
             operand: Expr::Array(items),
             type_name,
-            ..
+            type_mod,
+            binding,
         } if ColType::from_sql_name(type_name)
             .or_else(|| {
                 let catalog = catalog?;
@@ -4726,149 +4935,306 @@ fn fold_check<'a>(
             })
             .is_some_and(|target| matches!(target, ColType::Array(_))) =>
         {
+            // The cast owns the element context, including nested ARRAY[]:
+            // only the elements' own constants fold, never an ARRAY[] node,
+            // whose element type the cast decides.
             fn inputs<'a>(
-                items: &[&Expr<'a>],
+                items: &'a [&'a Expr<'a>],
                 arena: &'a Arena,
-                catalog: Option<&dyn CatalogAccess>,
-            ) -> Result<(), SqlError> {
-                for item in items {
-                    match item {
-                        Expr::Array(children) => inputs(children, arena, catalog)?,
-                        _ => {
-                            fold_check(item, arena, catalog)?;
+                folding: Folding<'_>,
+            ) -> Result<&'a [&'a Expr<'a>], SqlError> {
+                let mut rebuilt: Option<&'a mut [&'a Expr<'a>]> = None;
+                for (index, item) in items.iter().enumerate() {
+                    let new = match item {
+                        Expr::Array(children) => {
+                            let new_children = inputs(children, arena, folding)?;
+                            if core::ptr::eq(new_children, *children) {
+                                *item
+                            } else {
+                                &*arena
+                                    .alloc(Expr::Array(new_children))
+                                    .map_err(|_| super::query::arena_full_pub())?
+                            }
                         }
+                        _ => fold(item, arena, folding)?.0,
+                    };
+                    if !core::ptr::eq(new, *item) && rebuilt.is_none() {
+                        rebuilt = Some(
+                            arena
+                                .alloc_slice_copy(items)
+                                .map_err(|_| super::query::arena_full_pub())?,
+                        );
+                    }
+                    if let Some(copy) = rebuilt.as_deref_mut() {
+                        copy[index] = new;
                     }
                 }
-                Ok(())
+                Ok(match rebuilt {
+                    Some(copy) => copy,
+                    None => items,
+                })
             }
-            // The cast owns the element context, including nested ARRAY[].
-            // Check source expressions without executing runtime conversions.
-            inputs(items, arena, catalog)?;
-            Ok(None)
-        }
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::BoundDefault {
-            expression: operand,
-            ..
-        }
-        | Expr::Collate { operand, .. }
-        | Expr::IsNull { operand, .. } => {
-            fold_check(operand, arena, catalog)?;
-            Ok(None)
-        }
-        Expr::Binary { left, right, .. } => {
-            fold_check(left, arena, catalog)?;
-            fold_check(right, arena, catalog)?;
-            Ok(None)
-        }
-        Expr::InList { operand, list, .. } => {
-            fold_check(operand, arena, catalog)?;
-            for e in *list {
-                fold_check(e, arena, catalog)?;
+            let new_items = inputs(items, arena, folding)?;
+            if core::ptr::eq(new_items, *items) {
+                return Ok((expression, None));
             }
-            Ok(None)
-        }
-        Expr::Like {
-            operand,
-            pattern,
-            escape,
-            ..
-        } => {
-            fold_check(operand, arena, catalog)?;
-            fold_check(pattern, arena, catalog)?;
-            if let Some(escape) = escape {
-                fold_check(escape, arena, catalog)?;
-            }
-            Ok(None)
-        }
-        Expr::Match {
-            operand, pattern, ..
-        } => {
-            fold_check(operand, arena, catalog)?;
-            fold_check(pattern, arena, catalog)?;
-            Ok(None)
+            Ok((
+                alloc(Expr::Cast {
+                    source_position: *source_position,
+                    operand: alloc(Expr::Array(new_items))?,
+                    type_name,
+                    type_mod: *type_mod,
+                    binding: *binding,
+                })?,
+                None,
+            ))
         }
         Expr::Case {
             operand,
             whens,
             otherwise,
-            ..
+            origin,
         } => {
-            if let Some(o) = operand {
-                // Operand form (`CASE x WHEN v ...`): the WHENs are compared to
-                // x, not boolean conditions, so no arm is dropped by folding.
-                fold_check(o, arena, catalog)?;
-                for (c, r) in *whens {
-                    fold_check(c, arena, catalog)?;
-                    fold_check(r, arena, catalog)?;
-                }
-            } else {
-                // Searched form: a constant-FALSE WHEN drops its THEN; a
-                // constant-TRUE WHEN makes the CASE that THEN and drops the
-                // rest — matching PostgreSQL, so a division in a dead arm
-                // (`WHEN 'a' LIKE 'b' THEN 2/0`) is never folded.
-                for (c, r) in *whens {
-                    match fold_check(c, arena, catalog)? {
-                        Some(false) => continue,
-                        Some(true) => {
-                            fold_check(r, arena, catalog)?;
-                            return Ok(None);
-                        }
-                        None => {
-                            fold_check(r, arena, catalog)?;
-                        }
+            let new_operand = operand
+                .map(|operand| fold(operand, arena, folding).map(|(new, _)| new))
+                .transpose()?;
+            let mut rebuilt: Option<&'a mut [(&'a Expr<'a>, &'a Expr<'a>)]> = None;
+            let mut reached_otherwise = true;
+            for (index, (condition, result)) in whens.iter().enumerate() {
+                let (new_condition, mut known) = fold(condition, arena, folding)?;
+                // In the operand form a WHEN is compared to the operand: with
+                // a constant operand, PostgreSQL folds that comparison too.
+                if let Some(new_operand) = new_operand {
+                    known = None;
+                    if new_operand.is_constant(catalog.is_some()) {
+                        let comparison = alloc(Expr::Binary {
+                            source_position: super::ast::SourcePosition::UNKNOWN,
+                            operator: BinaryOp::Eq,
+                            left: new_operand,
+                            right: new_condition,
+                        })?;
+                        let probe = Folding {
+                            replace: false,
+                            ..folding
+                        };
+                        known = fold(comparison, arena, probe)?.1;
                     }
                 }
+                // A constant-FALSE WHEN drops its THEN; a constant-TRUE WHEN
+                // makes the CASE that THEN and drops the rest — matching
+                // PostgreSQL, so a division in a dead arm (`WHEN 'a' LIKE 'b'
+                // THEN 2/0`) is never folded.
+                let dropped = known == Some(false);
+                let new_result = if dropped {
+                    *result
+                } else {
+                    fold(result, arena, folding)?.0
+                };
+                if (!core::ptr::eq(new_condition, *condition)
+                    || !core::ptr::eq(new_result, *result))
+                    && rebuilt.is_none()
+                {
+                    rebuilt = Some(
+                        arena
+                            .alloc_slice_copy(whens)
+                            .map_err(|_| super::query::arena_full_pub())?,
+                    );
+                }
+                if let Some(copy) = rebuilt.as_deref_mut() {
+                    copy[index] = (new_condition, new_result);
+                }
+                if known == Some(true) {
+                    reached_otherwise = false;
+                    break;
+                }
             }
-            if let Some(e) = otherwise {
-                fold_check(e, arena, catalog)?;
+            let new_otherwise = match otherwise {
+                Some(otherwise) if reached_otherwise => Some(fold(otherwise, arena, folding)?.0),
+                _ => *otherwise,
+            };
+            if rebuilt.is_none()
+                && new_operand
+                    .zip(*operand)
+                    .is_none_or(|(new, old)| core::ptr::eq(new, old))
+                && new_otherwise
+                    .zip(*otherwise)
+                    .is_none_or(|(new, old)| core::ptr::eq(new, old))
+            {
+                return Ok((expression, None));
             }
-            Ok(None)
+            Ok((
+                alloc(Expr::Case {
+                    operand: new_operand,
+                    whens: match rebuilt {
+                        Some(copy) => copy,
+                        None => whens,
+                    },
+                    otherwise: new_otherwise,
+                    origin: *origin,
+                })?,
+                None,
+            ))
         }
-        Expr::Call { args, .. } => {
-            for a in *args {
-                fold_check(a, arena, catalog)?;
-            }
-            Ok(None)
+        // Grouped evaluation finds an aggregate's result by its call's
+        // address, so an aggregate call keeps its node and its arguments
+        // evaluate for each input row; their constants only report errors.
+        Expr::Call { .. } if folding.replace && expression.is_aggregate() => {
+            let probe = Folding {
+                replace: false,
+                ..folding
+            };
+            probe_constants(|| fold(expression, arena, probe).map(|_| ()))?;
+            Ok((expression, None))
         }
-        Expr::Subquery(_)
-        | Expr::RowSubquery { .. }
+        // A window keeps its specification as written: the statement's
+        // windows are matched by their keys, which the WINDOW clause holds
+        // unfolded.
+        Expr::Call {
+            over: Some(_),
+            args,
+            filter,
+            ..
+        } if folding.replace => {
+            let mut changed = false;
+            let mut new_args: Option<&'a mut [&'a Expr<'a>]> = None;
+            for (index, argument) in args.iter().enumerate() {
+                let new = fold(argument, arena, folding)?.0;
+                if !core::ptr::eq(new, *argument) && new_args.is_none() {
+                    new_args = Some(
+                        arena
+                            .alloc_slice_copy(args)
+                            .map_err(|_| super::query::arena_full_pub())?,
+                    );
+                }
+                if let Some(copy) = new_args.as_deref_mut() {
+                    copy[index] = new;
+                }
+            }
+            let new_filter = match filter {
+                Some(filter) => Some(fold(filter, arena, folding)?.0),
+                None => None,
+            };
+            changed |= new_args.is_some();
+            changed |= new_filter
+                .zip(*filter)
+                .is_some_and(|(new, old)| !core::ptr::eq(new, old));
+            if !changed {
+                return Ok((expression, None));
+            }
+            let mut copy = *expression;
+            if let Expr::Call { args, filter, .. } = &mut copy {
+                if let Some(new_args) = new_args {
+                    *args = new_args;
+                }
+                *filter = new_filter;
+            }
+            Ok((alloc(copy)?, None))
+        }
+        Expr::Unary { .. }
+        | Expr::Cast { .. }
+        | Expr::BoundDefault { .. }
+        | Expr::Collate { .. }
+        | Expr::IsNull { .. }
+        | Expr::Binary { .. }
+        | Expr::InList { .. }
+        | Expr::Like { .. }
+        | Expr::Match { .. }
+        | Expr::Call { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
-        | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(None),
-        Expr::Array(items) => {
-            for e in *items {
-                fold_check(e, arena, catalog)?;
+        | Expr::Array(_)
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::Field { .. }
+        | Expr::RecordFieldIndex { .. }
+        | Expr::AnyAll { .. } => {
+            // Every operand folds on its own, in written order.
+            struct Failure(SqlError);
+            impl From<crate::mem::arena::ArenaFull> for Failure {
+                fn from(_: crate::mem::arena::ArenaFull) -> Self {
+                    Self(super::query::arena_full_pub())
+                }
             }
-            Ok(None)
-        }
-        Expr::Subscript { base, index } => {
-            fold_check(base, arena, catalog)?;
-            fold_check(index, arena, catalog)?;
-            Ok(None)
-        }
-        Expr::Slice { base, lower, upper } => {
-            fold_check(base, arena, catalog)?;
-            if let Some(e) = lower {
-                fold_check(e, arena, catalog)?;
-            }
-            if let Some(e) = upper {
-                fold_check(e, arena, catalog)?;
-            }
-            Ok(None)
-        }
-        Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
-            fold_check(base, arena, catalog)?;
-            Ok(None)
-        }
-        Expr::AnyAll { operand, array, .. } => {
-            fold_check(operand, arena, catalog)?;
-            fold_check(array, arena, catalog)?;
-            Ok(None)
+            let rebuilt =
+                crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<
+                    'a,
+                >|
+                 -> Result<
+                    Option<&'a Expr<'a>>,
+                    Failure,
+                > {
+                    if core::ptr::eq(node, expression) {
+                        return Ok(None);
+                    }
+                    Ok(Some(fold(node, arena, folding).map_err(Failure)?.0))
+                })
+                .map_err(|Failure(error)| error)?;
+            Ok((rebuilt, None))
         }
     }
+}
+
+/// Whether evaluating the constant `expression` runs something a statement
+/// could observe once per row: a routine, an input or cast conversion, or a
+/// catalog operator's routine. Plain literals, `ARRAY[]` of literals and
+/// built-in arithmetic stay as written. An explicit `COLLATE` inside keeps
+/// its subtree, whose collation derivation the value would lose.
+fn runs_on_evaluation(expression: &Expr<'_>, evaluation: Option<ExpressionEvaluation>) -> bool {
+    fn contains(expression: &Expr<'_>, found: &mut (bool, bool)) {
+        match expression {
+            Expr::Collate { .. } => found.1 = true,
+            Expr::Call { .. } if !expression.is_row_constructor() => found.0 = true,
+            Expr::Cast { .. } => found.0 = true,
+            _ => {}
+        }
+        let _ = super::query::walk_children(expression, &mut |child| {
+            contains(child, found);
+            Ok(())
+        });
+    }
+    if matches!(
+        expression,
+        Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
+            // A typed NULL runs no input function; calls read its type from
+            // the cast as written.
+            | Expr::Cast {
+                operand: Expr::Null,
+                ..
+            }
+    ) {
+        return false;
+    }
+    let mut found = (evaluation == Some(ExpressionEvaluation::Immutable), false);
+    contains(expression, &mut found);
+    found.0 && !found.1
+}
+
+/// `value`, the folded value of `source`, as a constant of `type_oid` that
+/// keeps `source` for naming and deparsing.
+fn folded_literal<'a>(
+    source: &'a Expr<'a>,
+    value: Datum<'_>,
+    type_oid: i32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let encoded = super::exec::encode_projected_pub(&[value], arena)?;
+    arena
+        .alloc(Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+            type_oid,
+            type_mod: expression_type_mod(source, &NoColumns),
+            collation: None,
+            source,
+        })
+        .map(|node| &*node)
+        .map_err(|_| super::query::arena_full_pub())
 }
 
 /// The `ESCAPE` operand of a LIKE or SIMILAR TO pattern. PostgreSQL takes one
@@ -6777,7 +7143,8 @@ pub(crate) fn bound_literal_value<'a>(
         crate::sql::ast::BoundLiteralValue::CheckedArrayInput(encoded) => {
             super::type_inputs::value(encoded, arena)
         }
-        crate::sql::ast::BoundLiteralValue::CachedDefault(encoded) => {
+        crate::sql::ast::BoundLiteralValue::CachedDefault(encoded)
+        | crate::sql::ast::BoundLiteralValue::Folded(encoded) => {
             let mut values = [Datum::Null];
             let width = super::exec::decode_projected_row_into(encoded, arena, &mut values)?;
             debug_assert_eq!(width, 1, "cached default contains one encoded value");
@@ -7037,7 +7404,11 @@ fn eval_full_inner<'a>(
             hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
-        let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
+        let sublink =
+            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let evaluated = deferred.evaluate(expression, arena, params, outer, hooks.sequences);
+        drop(sublink);
+        let values = match evaluated? {
             SubqueryResult::Scalar { value, witness } => {
                 scalars = [(expression as *const Expr, value, witness)];
                 SubqueryValues {
@@ -7103,7 +7474,11 @@ fn eval_full_inner<'a>(
             hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
-        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
+        let sublink =
+            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences);
+        drop(sublink);
+        let result = result?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -12978,8 +13353,8 @@ fn jsonpath_operator<'a>(
 /// operand's own error left-first, exactly as plan-time folding does).
 fn eval_logic_short_circuit<'a>(
     operator: BinaryOp,
-    left: &Expr<'a>,
-    right: &Expr<'a>,
+    left: &'a Expr<'a>,
+    right: &'a Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,

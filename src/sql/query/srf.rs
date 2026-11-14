@@ -1585,11 +1585,11 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     let values = arena
         .alloc_slice_copy(&materialized[..materialized_count])
         .map_err(|_| arena_full())?;
-    Ok(ProjectSet {
-        count: if any { max } else { 1 },
-        values,
-        any,
-    })
+    let count = if any { max } else { 1 };
+    // The rows this input row expands to, as PostgreSQL's `ProjectSet`
+    // returns them.
+    super::instrument::node(super::instrument::Role::ProjectSet).rows(count as u64);
+    Ok(ProjectSet { count, values, any })
 }
 
 /// Bind one builtin set-returning call's inputs before counting or emitting rows.
@@ -4002,7 +4002,7 @@ fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
                         }
                     };
                 let type_mod = match argument {
-                    Expr::Cast { type_mod, .. } => *type_mod,
+                    Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
                 // A single array's element column takes the table alias, as a

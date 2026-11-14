@@ -1363,7 +1363,7 @@ fn cursor_retained_reuses_fetch_memory_and_discards_move_and_skipped_rows() {
     let mut config = test_config("cursor-retained-fetch-buffer");
     config.max_cursors = 1;
     config.cursor_bytes = 32;
-    config.cursor_query_bytes = 8192;
+    config.cursor_query_bytes = 9216;
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);

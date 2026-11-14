@@ -18,7 +18,7 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Outcome, QueryScope, arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type,
-    select_into_rows_recycling, sql_fail, sql_ok,
+    instrument, select_into_rows_recycling, sql_fail, sql_ok,
 };
 
 #[derive(Clone, Copy)]
@@ -121,6 +121,8 @@ pub fn set_query<'a>(
 
     // Materialize and combine the tree.
     let collations: [Collation; MAX_PROJ] = core::array::from_fn(|index| columns[index].collation);
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
     let rows = match eval_set_tree(
         body,
         storage,
@@ -131,6 +133,7 @@ pub fn set_query<'a>(
         &target[..n_cols],
         &collations[..n_cols],
         None,
+        &mut (0, 0),
     ) {
         Ok(r) => r,
         Err(e) => return sql_fail(e),
@@ -173,7 +176,11 @@ pub fn set_query<'a>(
         }
     }
     let mut emitted = 0u64;
+    let below_limit = stages.below_limit();
+    below_limit.rows(start as u64);
     for row in &rows[start..end] {
+        below_limit.row();
+        stages.limit.row();
         let mut out = [Datum::Null; MAX_PROJ];
         for (c, slot) in out[..n_cols].iter_mut().enumerate() {
             *slot = match exec::decode_projected_col_record(row, c, arena) {
@@ -284,6 +291,7 @@ pub(crate) fn set_query_into_rows<'a>(
         &target[..column_count],
         &collations[..column_count],
         None,
+        &mut (0, 0),
     )?;
     sort_set_rows(
         storage,
@@ -560,28 +568,54 @@ fn external_set_leaf<'a>(
         .expect("spill-attached block store")
 }
 
+/// Runs a set tree into one provider-neutral run, numbering its set
+/// operations and leaves for EXPLAIN as [`eval_set_tree`] does.
 fn external_set_tree<'a>(
     tree: &'a SetTree<'a>,
     context: ExternalSetContext<'_, 'a>,
     target: &[ColType],
     sorted: bool,
+    numbers: &mut (u16, u16),
 ) -> Result<Option<ExternalRun>, SqlError> {
     let SetTree::Op {
+        syntax,
         operator,
         all,
         left,
         right,
-        ..
     } = tree
     else {
         let SetTree::Select(select) = tree else {
             unreachable!()
         };
+        let _branch = instrument::enter(instrument::Segment::Branch(numbers.1));
+        numbers.1 = numbers.1.saturating_add(1);
         return external_set_leaf(select, context, target, sorted);
     };
+    // EXPLAIN shows a `VALUES` list as one scan; its rows are not numbered
+    // branches.
+    let mut unnumbered = (0, 0);
+    let (_values, numbers, node, input) =
+        if matches!(syntax, crate::sql::ast::SetOperationSyntax::Values) {
+            (
+                Some(instrument::enter(instrument::Segment::Branch(u16::MAX))),
+                &mut unnumbered,
+                instrument::Node::NONE,
+                instrument::Node::NONE,
+            )
+        } else {
+            let node = instrument::node(instrument::Role::SetOperation(numbers.0));
+            let input = instrument::node(instrument::Role::SetInput(numbers.0));
+            numbers.0 = numbers.0.saturating_add(1);
+            (None, numbers, node, input)
+        };
+    let _loop = node.start();
+    let input_loop = input.start();
     let merge_inputs = !(*operator == SetOp::Union && *all);
-    let left_run = external_set_tree(left, context, target, sorted || merge_inputs)?;
-    let right_run = external_set_tree(right, context, target, sorted || merge_inputs)?;
+    let left_run = external_set_tree(left, context, target, sorted || merge_inputs, numbers)?;
+    let right_run = external_set_tree(right, context, target, sorted || merge_inputs, numbers)?;
+    input.rows(left_run.map_or(0, ExternalRun::rows) + right_run.map_or(0, ExternalRun::rows));
+    drop(input_loop);
 
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
@@ -728,10 +762,12 @@ fn external_set_tree<'a>(
             }
         }
     }
-    context
+    let run = context
         .storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut output_compare))
-        .expect("spill-attached block store")
+        .expect("spill-attached block store")?;
+    node.rows(run.map_or(0, ExternalRun::rows));
+    Ok(run)
 }
 
 /// Streams a set-operation body from immutable provider-neutral runs. This is
@@ -789,6 +825,9 @@ pub(crate) fn external_set_body_into<'a>(
                 )
             })?;
     }
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
+    let below_limit = stages.below_limit();
     let Some(run) = external_set_tree(
         tree,
         ExternalSetContext {
@@ -801,6 +840,7 @@ pub(crate) fn external_set_body_into<'a>(
         },
         &target[..column_count],
         false,
+        &mut (0, 0),
     )?
     else {
         return Ok(());
@@ -856,7 +896,9 @@ pub(crate) fn external_set_body_into<'a>(
         if logical >= window && !tied {
             break;
         }
+        below_limit.row();
         if logical >= offset {
+            stages.limit.row();
             let mut values = [Datum::Null; MAX_PROJ];
             for (column, value) in values.iter_mut().enumerate().take(column_count) {
                 *value = exec::decode_projected_col_record(context.row, column, arena)?;
@@ -897,6 +939,9 @@ fn external_set_query<'a>(
         ..crate::sql::eval::NO_HOOKS
     };
 
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
+    let below_limit = stages.below_limit();
     let run = match external_set_tree(
         tree,
         ExternalSetContext {
@@ -909,6 +954,7 @@ fn external_set_query<'a>(
         },
         target,
         false,
+        &mut (0, 0),
     ) {
         Ok(run) => run,
         Err(error) => return sql_fail(error),
@@ -995,7 +1041,9 @@ fn external_set_query<'a>(
             if logical >= window && !tied {
                 false
             } else {
+                below_limit.row();
                 if logical >= offset {
+                    stages.limit.row();
                     let mut values = [Datum::Null; MAX_PROJ];
                     for (column, value) in values.iter_mut().enumerate().take(target.len()) {
                         *value = match exec::decode_projected_col_record(context.row, column, arena)
@@ -1642,10 +1690,12 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
 
 /// Materializes a set tree to self-describing rows, coercing every leaf's rows
 /// to the columns' common `target` types so the combining operators can match
-/// rows by their encoded bytes.
+/// rows by their encoded bytes. Its set operations are numbered in pre-order
+/// from `numbers.0` and its leaves left to right from `numbers.1`, as EXPLAIN
+/// numbers them; a `VALUES` list is one leaf of neither kind.
 #[expect(
     clippy::too_many_arguments,
-    reason = "set tree evaluation carries statement context"
+    reason = "set evaluation carries its scope and its EXPLAIN numbering"
 )]
 fn eval_set_tree<'a>(
     tree: &'a SetTree<'a>,
@@ -1657,10 +1707,50 @@ fn eval_set_tree<'a>(
     target: &[ColType],
     collations: &[Collation],
     outer: Option<&dyn ColumnLookup<'a>>,
+    numbers: &mut (u16, u16),
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
         SetTree::Select(s) => {
+            let _branch = instrument::enter(instrument::Segment::Branch(numbers.1));
+            numbers.1 = numbers.1.saturating_add(1);
             eval_set_leaf(s, storage, txid, arena, params, sequences, target, outer)
+        }
+        SetTree::Op {
+            syntax: crate::sql::ast::SetOperationSyntax::Values,
+            operator,
+            all,
+            left,
+            right,
+        } => {
+            // EXPLAIN shows a `VALUES` list as one scan; its rows are not
+            // numbered branches.
+            let _values = instrument::enter(instrument::Segment::Branch(u16::MAX));
+            let mut unnumbered = (0, 0);
+            let l = eval_set_tree(
+                left,
+                storage,
+                txid,
+                arena,
+                params,
+                sequences,
+                target,
+                collations,
+                outer,
+                &mut unnumbered,
+            )?;
+            let r = eval_set_tree(
+                right,
+                storage,
+                txid,
+                arena,
+                params,
+                sequences,
+                target,
+                collations,
+                outer,
+                &mut unnumbered,
+            )?;
+            combine_sets(storage, txid, collations, *operator, *all, l, r, arena)
         }
         SetTree::Op {
             operator,
@@ -1669,13 +1759,22 @@ fn eval_set_tree<'a>(
             right,
             ..
         } => {
+            let node = instrument::node(instrument::Role::SetOperation(numbers.0));
+            let input = instrument::node(instrument::Role::SetInput(numbers.0));
+            numbers.0 = numbers.0.saturating_add(1);
+            let _loop = node.start();
+            let input_loop = input.start();
             let l = eval_set_tree(
-                left, storage, txid, arena, params, sequences, target, collations, outer,
+                left, storage, txid, arena, params, sequences, target, collations, outer, numbers,
             )?;
             let r = eval_set_tree(
-                right, storage, txid, arena, params, sequences, target, collations, outer,
+                right, storage, txid, arena, params, sequences, target, collations, outer, numbers,
             )?;
-            combine_sets(storage, txid, collations, *operator, *all, l, r, arena)
+            input.rows((l.len() + r.len()) as u64);
+            drop(input_loop);
+            let combined = combine_sets(storage, txid, collations, *operator, *all, l, r, arena)?;
+            node.rows(combined.len() as u64);
+            Ok(combined)
         }
     }
 }
@@ -2005,6 +2104,7 @@ pub(super) fn materialize_set_body_tied<'a>(
         target,
         &collations[..n],
         outer,
+        &mut (0, 0),
     )?;
     Ok((rows, target, n))
 }

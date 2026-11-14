@@ -23,6 +23,28 @@ pub(super) enum WriteCompletion {
     },
 }
 
+/// How a write's row phase ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowPhaseEnd {
+    /// The write processed every row it selected.
+    Exhausted,
+    /// Its RETURNING destination had every row it asked for. PostgreSQL's
+    /// executor, run with a row count, then never reaches the end of the
+    /// rows: the write fires its AFTER ROW triggers but none of its AFTER
+    /// STATEMENT triggers.
+    Stopped,
+}
+
+impl RowPhaseEnd {
+    pub(super) fn of(stopped: bool) -> Self {
+        if stopped {
+            Self::Stopped
+        } else {
+            Self::Exhausted
+        }
+    }
+}
+
 pub(super) enum CompletionReply {
     Command,
     CountOnly,
@@ -331,6 +353,7 @@ impl PendingNestedWrite {
             depth: command.trigger_depth(),
             retained: prior.is_some_and(|boundary| boundary.retained),
             statement_end: false,
+            step: false,
         });
         let result = self.completion.poll(&mut TriggerExecContext {
             host: context.host.reborrow(),
@@ -378,6 +401,9 @@ struct WriteCompletionState {
     command: u32,
     depth: u16,
     boundary: super::super::txn::StatementMark,
+    /// For one step of a rule-rewritten statement: whether its rule loop
+    /// recorded the step finished.
+    step: Option<bool>,
     /// The statement's sequence replay position where the selected event
     /// started: an event that runs again replays its own calls from here.
     event_replay: Option<sequence::StatementReplayStart>,
@@ -390,7 +416,7 @@ impl SuspendedWriteCompletion {
         context: &mut TriggerExecContext<'_, '_, '_>,
         target: crate::storage::TriggerTarget,
         transitions: TransitionRowSets<'_>,
-        boundary: super::super::txn::StatementMark,
+        boundary: super::super::txn::WriteCompletionBoundary,
     ) -> Result<Self, SqlError> {
         let mut state = context
             .storage()
@@ -423,7 +449,8 @@ impl SuspendedWriteCompletion {
                 transaction: context.txn.txid,
                 command: context.txn.command_id(),
                 depth: context.txn.trigger_depth(),
-                boundary,
+                boundary: boundary.mark,
+                step: boundary.step.then_some(false),
                 event_replay: sequence::begin_replay_cursor()?,
             })
             .map_err(control_flow::execution_full)?;
@@ -432,6 +459,26 @@ impl SuspendedWriteCompletion {
 
     pub(crate) fn boundary(&self) -> super::super::txn::StatementMark {
         self.state[0].boundary
+    }
+
+    /// Whether the completion belongs to one step of a rule-rewritten
+    /// statement, which runs another attempt for its later steps once the
+    /// completion ends.
+    pub(crate) fn step(&self) -> bool {
+        self.state[0].step.is_some()
+    }
+
+    /// The step's row count, the first time its rule loop asks: the loop
+    /// records the step finished and the completion replies with its count
+    /// only, the statement's command tag following its last step.
+    pub(crate) fn claim_step(&mut self) -> Option<u64> {
+        let state = &mut self.state[0];
+        if state.step != Some(false) {
+            return None;
+        }
+        state.step = Some(true);
+        state.cursor.reply = CompletionReply::CountOnly;
+        Some(state.cursor.completion.rows())
     }
 
     pub(super) fn poll(&mut self, context: &mut TriggerExecContext<'_, '_, '_>) -> Outcome {
@@ -550,6 +597,7 @@ pub(in crate::sql) fn resume(
         depth: txn.trigger_depth(),
         retained: true,
         statement_end: true,
+        step: false,
     });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -848,6 +896,7 @@ impl WriteCompletion {
         definition: &crate::storage::TableDefinition<Definition>,
         transitions: TransitionRowSets<'_>,
         deferred: bool,
+        end: RowPhaseEnd,
     ) -> Result<(), SqlError> {
         context.txn.queue_all_pending_row_events()?;
         let target = crate::storage::TriggerTarget::Table(table);
@@ -863,7 +912,9 @@ impl WriteCompletion {
                     )?;
                 }
             }
-            if !has_statement_triggers(context, target, event, false)? {
+            if end == RowPhaseEnd::Stopped
+                || !has_statement_triggers(context, target, event, false)?
+            {
                 continue;
             }
             let start = context.txn.begin_after_statement_triggers(table, event)?;
@@ -889,6 +940,7 @@ impl WriteCompletion {
         definition: &crate::storage::TableDefinition<Definition>,
         transitions: TransitionRowSets<'values>,
         reply: CompletionReply,
+        end: RowPhaseEnd,
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
         let command = context.txn.command_id();
@@ -904,7 +956,7 @@ impl WriteCompletion {
             ));
         };
         if let Err(error) =
-            self.queue_statement_events(&mut context, table, definition, transitions, deferred)
+            self.queue_statement_events(&mut context, table, definition, transitions, deferred, end)
         {
             return sql_fail(error);
         }
@@ -935,7 +987,7 @@ impl WriteCompletion {
                 &mut context,
                 target,
                 transitions,
-                boundary.mark,
+                boundary,
             ) {
                 Ok(pending) => pending,
                 Err(error) => return sql_fail(error),

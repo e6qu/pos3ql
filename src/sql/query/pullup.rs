@@ -2167,24 +2167,27 @@ fn equate_constants<'a>(
     };
     // The constant a `WHERE` conjunct equates `target` to.
     let constant = |target| {
-        restrictions.as_slice().iter().find_map(|conjunct| match conjunct {
-            Expr::Binary {
-                operator: crate::sql::ast::BinaryOp::Eq,
-                left,
-                right,
-                ..
-            } => {
-                let literal = |side: &'a Expr<'a>| matches!(side, Expr::Int(_) | Expr::Str(_));
-                if literal(right) && column(left) == Some(target) {
-                    Some(*right)
-                } else if literal(left) && column(right) == Some(target) {
-                    Some(*left)
-                } else {
-                    None
+        restrictions
+            .as_slice()
+            .iter()
+            .find_map(|conjunct| match conjunct {
+                Expr::Binary {
+                    operator: crate::sql::ast::BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                } => {
+                    let literal = |side: &'a Expr<'a>| matches!(side, Expr::Int(_) | Expr::Str(_));
+                    if literal(right) && column(left) == Some(target) {
+                        Some(*right)
+                    } else if literal(left) && column(right) == Some(target) {
+                        Some(*left)
+                    } else {
+                        None
+                    }
                 }
-            }
-            _ => None,
-        })
+                _ => None,
+            })
     };
     let first = own - 1;
     let joins = arena
@@ -2266,7 +2269,11 @@ fn sublink_join<'a>(
             operand,
             select,
             negated: false,
-        } => (*select, JoinKind::Semi, Some((*operand, crate::sql::ast::BinaryOp::Eq))),
+        } => (
+            *select,
+            JoinKind::Semi,
+            Some((*operand, crate::sql::ast::BinaryOp::Eq)),
+        ),
         Expr::QuantifiedSubquery {
             operand,
             operator,
@@ -2445,7 +2452,9 @@ fn sublink_join<'a>(
                     right: compared,
                 })
                 .map_err(|_| Stop::full())?;
-            super::and_where(Some(equality), condition, arena)?
+            // PostgreSQL's pulled-up condition lists the subquery's own
+            // conjuncts before the comparison.
+            super::and_where(condition, Some(equality), arena)?
         }
         _ => {
             if !read_outer {

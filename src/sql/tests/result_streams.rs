@@ -131,6 +131,12 @@ enum ColdRequest {
     FullJoinQuery,
     /// A simple Query of a grouping, which reads its whole input first.
     GroupedQuery,
+    /// A simple Query of an `EXISTS` subquery pulled up into a hash semi
+    /// join of the cold table with itself.
+    SemiJoinQuery,
+    /// A simple Query of a `NOT EXISTS` subquery pulled up into a hash anti
+    /// join whose condition no hashed row meets.
+    AntiJoinQuery,
     /// A join with a bounded derived table, which the general executor
     /// materializes in an external run written to object storage. With no
     /// block cache, each restart after a cold read loses the blocks the last
@@ -218,6 +224,22 @@ fn right_joins_stream_cold_tables() {
     cold_result_stream(
         "result-stream-cold-right-join-query",
         ColdRequest::RightJoinQuery,
+    );
+}
+
+#[test]
+fn semi_joins_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-semi-join-query",
+        ColdRequest::SemiJoinQuery,
+    );
+}
+
+#[test]
+fn anti_joins_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-anti-join-query",
+        ColdRequest::AntiJoinQuery,
     );
 }
 
@@ -366,6 +388,14 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ),
             ColdRequest::FullJoinQuery => query(
                 "SELECT a.id, a.code FROM cold_orders a FULL JOIN cold_orders b ON a.id = b.id",
+            ),
+            ColdRequest::SemiJoinQuery => query(
+                "SELECT a.id, a.code FROM cold_orders a \
+                 WHERE EXISTS (SELECT 1 FROM cold_orders b WHERE b.id = a.id)",
+            ),
+            ColdRequest::AntiJoinQuery => query(
+                "SELECT a.id, a.code FROM cold_orders a WHERE NOT EXISTS \
+                 (SELECT 1 FROM cold_orders b WHERE b.id = a.id AND b.code <> a.code)",
             ),
             ColdRequest::SpooledJoin => query(
                 "SELECT a.id, a.code FROM cold_orders a \
@@ -518,6 +548,8 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         | ColdRequest::JoinQuery
         | ColdRequest::RightJoinQuery
         | ColdRequest::FullJoinQuery
+        | ColdRequest::SemiJoinQuery
+        | ColdRequest::AntiJoinQuery
         | ColdRequest::GroupedQuery
         | ColdRequest::SpooledJoin
         | ColdRequest::CteTwice

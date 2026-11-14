@@ -73,12 +73,12 @@ pub(crate) struct Context<'s> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SublinkPlan {
     /// Run once before the query's first row: `(InitPlan 1).col1`.
-    InitPlan(u16),
+    Init(u16),
     /// Run for each row that reads it: `(SubPlan 1)`.
-    SubPlan(u16),
+    Sub(u16),
     /// An uncorrelated `IN` or `= ANY` subquery whose rows are hashed once
     /// and probed per row: `(hashed SubPlan 1).col1`.
-    HashedSubPlan(u16),
+    HashedSub(u16),
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -1909,16 +1909,16 @@ impl Context<'_> {
                     .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
             {
                 match (expression, plan) {
-                    (_, SublinkPlan::InitPlan(number)) => {
+                    (_, SublinkPlan::Init(number)) => {
                         output.push_display(format_args!("(InitPlan {number}).col1"))
                     }
-                    (Expr::Exists(_), SublinkPlan::SubPlan(number)) => {
+                    (Expr::Exists(_), SublinkPlan::Sub(number)) => {
                         output.push_display(format_args!("EXISTS(SubPlan {number})"))
                     }
-                    (Expr::ArraySubquery(_), SublinkPlan::SubPlan(number)) => {
+                    (Expr::ArraySubquery(_), SublinkPlan::Sub(number)) => {
                         output.push_display(format_args!("ARRAY(SubPlan {number})"))
                     }
-                    (_, SublinkPlan::SubPlan(number) | SublinkPlan::HashedSubPlan(number)) => {
+                    (_, SublinkPlan::Sub(number) | SublinkPlan::HashedSub(number)) => {
                         output.push_display(format_args!("(SubPlan {number})"))
                     }
                 }
@@ -2029,10 +2029,10 @@ impl Context<'_> {
         self.write(operand, None, output)?;
         output.push_display(format_args!(" {symbol} "))?;
         match plan {
-            SublinkPlan::InitPlan(number) | SublinkPlan::SubPlan(number) => {
+            SublinkPlan::Init(number) | SublinkPlan::Sub(number) => {
                 output.push_display(format_args!("(SubPlan {number}).col1))"))
             }
-            SublinkPlan::HashedSubPlan(number) => {
+            SublinkPlan::HashedSub(number) => {
                 output.push_display(format_args!("(hashed SubPlan {number}).col1))"))
             }
         }

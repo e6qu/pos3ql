@@ -138,6 +138,75 @@ fn where_subqueries_become_semi_and_anti_joins() {
             data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {query}"), true));
         assert_eq!(rows, *expected, "{query}");
     }
+    // Each hashed and looped shape returns PostgreSQL 18.6's rows from the
+    // general executor, a cursor's retained reader, and a statement whose
+    // routine call hands off row by row.
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION sj_tag(i int) RETURNS text LANGUAGE sql AS $$ SELECT 't' || i $$",
+        true,
+    );
+    let shapes: &[(&str, &str, &[&str])] = &[
+        (
+            "Hash Semi Join",
+            "SELECT id FROM big WHERE EXISTS (SELECT 1 FROM small WHERE small.aid = big.id) \
+             AND id < 20 ORDER BY id",
+            &["3", "6", "9", "12", "15", "18"],
+        ),
+        (
+            "Hash Anti Join",
+            "SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM small WHERE small.aid = big.id) \
+             AND id <= 10 ORDER BY id",
+            &["1", "2", "4", "5", "7", "8", "10"],
+        ),
+        (
+            "Hash Right Semi Join",
+            "SELECT id FROM small WHERE EXISTS \
+             (SELECT 1 FROM big WHERE big.id = small.aid AND big.v <> 0) ORDER BY id",
+            &[
+                "1", "2", "3", "4", "5", "6", "8", "9", "10", "11", "12", "13", "15", "16", "17",
+                "18", "19", "20",
+            ],
+        ),
+        (
+            "Hash Right Anti Join",
+            "SELECT id FROM small WHERE NOT EXISTS \
+             (SELECT 1 FROM big WHERE big.id = small.aid AND big.v <> 0) ORDER BY id",
+            &["7", "14"],
+        ),
+        (
+            "Nested Loop Semi Join",
+            "SELECT id FROM small WHERE EXISTS (SELECT 1 FROM big WHERE big.v > small.w) \
+             ORDER BY id",
+            &["1", "2", "3", "4", "5"],
+        ),
+        (
+            "Nested Loop Anti Join",
+            "SELECT id FROM small WHERE NOT EXISTS (SELECT 1 FROM big WHERE big.v > small.w) \
+             AND id < 9 ORDER BY id",
+            &["6", "7", "8"],
+        ),
+    ];
+    for (node, query, expected) in shapes {
+        let rows =
+            data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {query}"), true));
+        assert!(
+            rows.iter().any(|row| row.ends_with(node)),
+            "{query}: {rows:?}"
+        );
+        assert_eq!(
+            both_executors(&mut session, &mut engine, query),
+            *expected,
+            "{query}"
+        );
+        let tagged = query.replacen("SELECT id", "SELECT sj_tag(id)", 1);
+        let expected_tags: Vec<String> = expected.iter().map(|id| format!("t{id}")).collect();
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &tagged, true)),
+            expected_tags,
+            "{tagged}"
+        );
+    }
     // The materialized copy reads its scan only as far as a loop needed.
     let rows = data_rows(&session.success(
         &mut engine,
@@ -149,5 +218,74 @@ fn where_subqueries_become_semi_and_anti_joins() {
         rows.iter()
             .any(|row| row == "        ->  Seq Scan on small (actual rows=7.00 loops=1)"),
         "{rows:?}"
+    );
+}
+
+/// A compared subquery left in place prints as PostgreSQL 18.6 prints its
+/// subplan, and `<> ALL` keeps its own form in plans and view definitions.
+#[test]
+fn compared_subplans_print_their_comparison() {
+    let config = test_config("compared-subplans");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE co (id int, v int); CREATE TABLE ci (id int, oid int); \
+         INSERT INTO co SELECT g, g % 5 FROM generate_series(1, 30) g; \
+         INSERT INTO ci SELECT g, g * 2 FROM generate_series(1, 20) g; \
+         ANALYZE co; ANALYZE ci",
+        true,
+    );
+    let plans: &[(&str, &[&str])] = &[
+        (
+            "SELECT id FROM co WHERE id IN (SELECT oid FROM ci) OR v = 1",
+            &[
+                "Seq Scan on co",
+                "  Filter: ((ANY (id = (hashed SubPlan 1).col1)) OR (v = 1))",
+                "  SubPlan 1",
+                "    ->  Seq Scan on ci",
+            ],
+        ),
+        (
+            "SELECT id FROM co WHERE id NOT IN (SELECT oid FROM ci)",
+            &[
+                "Seq Scan on co",
+                "  Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))",
+                "  SubPlan 1",
+                "    ->  Seq Scan on ci",
+            ],
+        ),
+        (
+            "SELECT id FROM co WHERE id <> ALL (SELECT oid FROM ci)",
+            &[
+                "Seq Scan on co",
+                "  Filter: (ALL (id <> (SubPlan 1).col1))",
+                "  SubPlan 1",
+                "    ->  Materialize",
+                "          ->  Seq Scan on ci",
+            ],
+        ),
+    ];
+    for (query, expected) in plans {
+        let rows =
+            data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {query}"), true));
+        assert_eq!(rows, *expected, "{query}");
+    }
+    session.success(&mut engine, "INSERT INTO ci VALUES (99, NULL)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM co WHERE id <> ALL (SELECT oid FROM ci); \
+             SELECT count(*) FROM co WHERE id <> ALL (SELECT oid FROM ci WHERE oid IS NOT NULL); \
+             CREATE VIEW cv AS SELECT id FROM co WHERE id <> ALL (SELECT oid FROM ci); \
+             SELECT pg_get_viewdef('cv')",
+            true,
+        )),
+        [
+            "0",
+            "15",
+            " SELECT id\n   FROM co\n  WHERE (id <> ALL ( SELECT ci.oid\n           FROM ci));"
+        ]
     );
 }

@@ -512,7 +512,7 @@ thread_local! {
     static SUBPLANS: core::cell::RefCell<([(usize, crate::sql::catalog::deparse::SublinkPlan); MAX_SUBPLANS], usize)> =
         const {
             core::cell::RefCell::new(
-                ([(0, crate::sql::catalog::deparse::SublinkPlan::InitPlan(0)); MAX_SUBPLANS], 0),
+                ([(0, crate::sql::catalog::deparse::SublinkPlan::Init(0)); MAX_SUBPLANS], 0),
             )
         };
 }
@@ -542,10 +542,10 @@ fn register_subplan(
         let number = u16::try_from(count + 1).expect("bounded by MAX_SUBPLANS");
         let plan = match (correlated, compared) {
             (false, Compared::Hashed) => {
-                crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number)
+                crate::sql::catalog::deparse::SublinkPlan::HashedSub(number)
             }
-            (false, Compared::No) => crate::sql::catalog::deparse::SublinkPlan::InitPlan(number),
-            _ => crate::sql::catalog::deparse::SublinkPlan::SubPlan(number),
+            (false, Compared::No) => crate::sql::catalog::deparse::SublinkPlan::Init(number),
+            _ => crate::sql::catalog::deparse::SublinkPlan::Sub(number),
         };
         subplans.0[count] = (core::ptr::from_ref(select) as usize, plan);
         subplans.1 = count + 1;
@@ -588,6 +588,16 @@ fn registered_sublink(select: *const ()) -> Option<crate::sql::catalog::deparse:
     })
 }
 
+/// Whether a nested loop reads its inner sequential scan through a
+/// `Materialize` node. PostgreSQL's `match_unsorted_outer` offers a
+/// materialized inner path beside the plain one when `enable_material` is
+/// on, and `add_path` keeps the cheaper: `cost_material` charges for the
+/// first scan and saves only on rescans, so with at most one outer row,
+/// which never rescans, the plain inner path wins.
+fn nested_loop_materializes(outer_rows: u64, enable_material: bool) -> bool {
+    enable_material && outer_rows > 1
+}
+
 /// The query of a subquery EXPLAIN can show as a subplan.
 fn sublink_query<'e>(expression: &'e Expr<'e>) -> Option<&'e Select<'e>> {
     match expression {
@@ -608,7 +618,7 @@ fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
         registered &= sublink_query(node)
             .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
             .is_some_and(|plan| {
-                correlated || matches!(plan, crate::sql::catalog::deparse::SublinkPlan::InitPlan(_))
+                correlated || matches!(plan, crate::sql::catalog::deparse::SublinkPlan::Init(_))
             });
     });
     registered
@@ -2971,7 +2981,7 @@ fn plan_sublinks<'a>(
         // PostgreSQL rescans an uncorrelated subquery it compares row by
         // row from a materialized copy.
         let nodes: &'a [PlanNode] = if !correlated && compared == Compared::Scanned {
-            let wrapped = arena
+            arena
                 .alloc_slice_with(count + 1, |index| match index {
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
@@ -2986,15 +2996,14 @@ fn plan_sublinks<'a>(
                         ..nodes[index - 1]
                     },
                 })
-                .map_err(|_| arena_full())?;
-            wrapped
+                .map_err(|_| arena_full())?
         } else {
             &nodes[..count]
         };
         let number = match register_subplan(select, correlated, compared)? {
-            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
-            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
-            | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,
+            crate::sql::catalog::deparse::SublinkPlan::Init(number)
+            | crate::sql::catalog::deparse::SublinkPlan::Sub(number)
+            | crate::sql::catalog::deparse::SublinkPlan::HashedSub(number) => number,
         };
         planned
             .push(Sublink {
@@ -4066,8 +4075,8 @@ fn plan_pulled_select<'a>(
                 .with_qual(QualLabel::Filter, post_filters[position].take()),
             )?;
         }
-        // The outer relation's estimated rows: PostgreSQL rescans the inner
-        // relation itself rather than a materialized copy for one outer row.
+        // The first relation's estimated rows, the outer side of the first
+        // nested loop.
         let mut outer_rows = u64::MAX;
         for (position, &table) in table_order[..scope.n].iter().enumerate() {
             let depth = if n == 1 {
@@ -4088,7 +4097,15 @@ fn plan_pulled_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
-            if position == 0 {
+            // PostgreSQL estimates a relation never analyzed as at least ten
+            // pages of rows (`estimate_rel_size`), where pos3ql counts its
+            // resident rows: only collected statistics give the outer
+            // side's estimate here, and without them the copy stays.
+            if position == 0
+                && scope.derived[table].is_none()
+                && scope.slots[table] != usize::MAX
+                && storage.has_planning_statistics(scope.slots[table])
+            {
                 outer_rows = scan.rows;
             }
             // PostgreSQL scans a function in FROM with a `Function Scan`.
@@ -4109,9 +4126,13 @@ fn plan_pulled_select<'a>(
             }
             let position_role = u16::try_from(table).map_err(|_| arena_full())?;
             scan.key = key(Role::Scan(position_role));
+            // A deeper level's outer side is a join, whose row estimate
+            // this plan does not model: it keeps the materialized copy.
             let sequential = scan.name.as_str() == "Seq Scan"
-                && crate::sql::guc::planner_methods().material
-                && !(n == 2 && outer_rows <= 1);
+                && nested_loop_materializes(
+                    if n == 2 { outer_rows } else { u64::MAX },
+                    crate::sql::guc::planner_methods().material,
+                );
             scan = scan
                 .with_qual(QualLabel::IndexCond, index_conds[table].take())
                 .with_qual(QualLabel::Filter, filters[table].take());
@@ -4257,8 +4278,8 @@ fn postpones_select_list(storage: &Storage, txid: u32, statement: &Select<'_>) -
                 .is_some_and(|plan| {
                     matches!(
                         plan,
-                        crate::sql::catalog::deparse::SublinkPlan::SubPlan(_)
-                            | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(_)
+                        crate::sql::catalog::deparse::SublinkPlan::Sub(_)
+                            | crate::sql::catalog::deparse::SublinkPlan::HashedSub(_)
                     )
                 });
         });

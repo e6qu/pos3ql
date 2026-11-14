@@ -6514,10 +6514,10 @@ pub(crate) struct HashJoinPlan<'a> {
 /// query's own (`Hash Right Semi Join`, `Hash Right Anti Join`), whose rows
 /// the subquery's then probe.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FilterJoin {
-    anti: bool,
+pub(crate) struct FilterJoin {
+    pub(crate) anti: bool,
     /// The query's own rows probe the hashed subquery rows.
-    probes_left: bool,
+    pub(crate) probes_left: bool,
 }
 
 /// A hash plan's sources and keys, as a retained reader rebuilds it.
@@ -6634,6 +6634,11 @@ impl<'a> HashJoinPlan<'a> {
     /// Whether probe rows nothing matched are returned NULL-extended.
     pub(crate) fn preserves_probe_rows(&self) -> bool {
         self.preserves_probe_rows
+    }
+
+    /// The semi or anti join a pulled-up subquery's hash plan runs.
+    pub(crate) fn filter_join(&self) -> Option<FilterJoin> {
+        self.filter_join
     }
 
     pub(crate) fn key_layout(&self) -> HashKeyLayout<'_> {

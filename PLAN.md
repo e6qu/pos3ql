@@ -699,19 +699,28 @@ list (`make_sort_input_target`), which hosts the list's subplans; execution
 still evaluates the list before sorting, so such a subplan runs, and a
 routine is called, once per input row where PostgreSQL runs it only for the
 rows the sort and limit return. A top-level query's `WHERE` conjunct
-`EXISTS`, `NOT EXISTS` or `x IN` over a subquery that reads one stored table
-with only a non-volatile condition (correlated for `EXISTS`, uncorrelated
-for `IN`) becomes a semi or anti join, as PostgreSQL's `pull_up_sublinks`
-makes it, and runs as one: two relations joined by column equalities hash
-the smaller side (`Hash Semi Join`, `Hash Anti Join`, or the `Hash Right`
-forms when the query's relation is smaller), others loop over a
-materialized copy (`Nested Loop Semi Join`), whose scan reads only as far
-as a loop needed. Such a subquery stays a subplan when it reads a relation
-named like one of the query's, when a second subquery reads the same
-relation (PostgreSQL names it `t_1`), and PostgreSQL's alternatives of
+`EXISTS`, `NOT EXISTS`, `x IN` or `x op ANY` over a subquery that reads one
+stored table with only a non-volatile condition (correlated for `EXISTS`;
+`IN` and `ANY` may be correlated too, as in PostgreSQL 18) becomes a semi or
+anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one:
+two relations joined by column equalities hash the smaller side (`Hash Semi
+Join`, `Hash Anti Join`, or the `Hash Right` forms when the query's
+relation is smaller), others loop over a materialized copy (`Nested Loop
+Semi Join`), whose scan reads only as far as a loop needed, or over the
+inner scan itself when the outer side estimates one row. A joined column
+equated to a query column the `WHERE` equates to a constant takes the
+constant (`o.id = 30` and `i.oid = o.id` give `i.oid = 30`). Result streams
+read these joins in the retained reader, which waits on cold reads at any
+level. A compared subquery left in place prints as its comparison with the
+subplan's column (`(ANY (id = (hashed SubPlan 1).col1))`, `(ALL (id <>
+(SubPlan 1).col1))` over a `Materialize`), and `<> ALL` keeps its own form
+rather than becoming `NOT IN`. Such a subquery stays a subplan when it reads
+a relation named like one of the query's, when a second subquery reads the
+same relation (PostgreSQL names it `t_1`), and PostgreSQL's alternatives of
 hashing an expression key (`(big.id + 1) = b2.id`) or joining the unique
-subquery rows (`Hash Join` over a `HashAggregate`) are not planned. Not
-yet shown: `IN`/`ANY`/`ALL`/row
+subquery rows (`Hash Join` over a `HashAggregate`) are not planned; pos3ql
+probes an index per outer row where PostgreSQL's costs may prefer a hash
+join or a bitmap scan. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name

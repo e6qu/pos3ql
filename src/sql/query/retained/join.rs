@@ -30,10 +30,10 @@ pub(super) struct JoinLevel<'a> {
     /// The scope index this level reads.
     table: usize,
     /// The level's source and current row; [`RetainedRow::Null`] is a LEFT
-    /// JOIN's NULL-extended row.
+    /// or anti join's NULL-extended row.
     scan: ScanNode<'a>,
-    /// A LEFT JOIN keeps an unmatched row of the levels above it.
-    left: bool,
+    /// How the level's rows join the rows of the levels above it.
+    join: LevelJoin,
     /// The bound ON condition, including USING/NATURAL equalities.
     on: Option<&'a Expr<'a>>,
     /// Error-safe WHERE conjuncts whose tables are all bound at this level.
@@ -49,6 +49,27 @@ pub(super) struct JoinLevel<'a> {
     hash: Option<HashTable>,
     /// A RIGHT or FULL join's inner level: which of its rows found a partner.
     right: Option<RightMatches>,
+}
+
+/// How one level's passing rows join the current row of the levels above.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LevelJoin {
+    /// Each passing row joins.
+    Inner,
+    /// LEFT or FULL: a NULL row joins when no row passes.
+    Left,
+    /// A pulled-up `EXISTS` or `IN`: the first passing row joins, and the
+    /// level then ends for the row above.
+    Semi,
+    /// A pulled-up `NOT EXISTS`: a NULL row joins when no row passes; a
+    /// passing row ends the level and joins nothing.
+    Anti,
+    /// The hashed query rows of PostgreSQL's `Hash Right Semi Join`: each
+    /// joins at its first passing probe row and never again.
+    RightSemi,
+    /// The hashed query rows of `Hash Right Anti Join`: a passing row only
+    /// sets its match flag; the rows never matched return after the probe.
+    RightAnti,
 }
 
 /// One flag per row of a RIGHT or FULL join's inner source, by its position
@@ -108,6 +129,8 @@ pub(super) struct HashShape {
     /// The build rows no probe row matched return after the probe; the
     /// build then keeps rows whose key has a NULL, outside every bucket.
     preserve_build: bool,
+    /// The semi or anti join of a pulled-up subquery's plan.
+    filter: Option<crate::sql::query::scan::FilterJoin>,
 }
 
 #[derive(Clone, Copy)]
@@ -412,7 +435,12 @@ pub(super) fn join_shape<'a>(
     // is a table or literal list.
     for (index, join) in from.joins.iter().enumerate() {
         match join.kind {
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left => {}
+            JoinKind::Inner
+            | JoinKind::Cross
+            | JoinKind::Comma
+            | JoinKind::Left
+            | JoinKind::Semi
+            | JoinKind::Anti => {}
             JoinKind::Right | JoinKind::Full if scope.n == 2 => {
                 if join.kind == JoinKind::Full
                     && let Some(on) = join.on
@@ -505,7 +533,13 @@ pub(super) fn join_shape<'a>(
             count,
             capacity: layout.capacity,
             preserve_probe: plan.preserves_probe_rows(),
-            preserve_build: plan.preserves_build_rows(),
+            // A right anti join returns the hashed query rows nothing
+            // matched, as a right join returns its unmatched build rows.
+            preserve_build: plan.preserves_build_rows()
+                || plan
+                    .filter_join()
+                    .is_some_and(|join| join.anti && !join.probes_left),
+            filter: plan.filter_join(),
         };
         shape.keys[..count].copy_from_slice(layout.keys);
         shape.collations[..count].copy_from_slice(layout.collations);
@@ -661,19 +695,37 @@ pub(super) fn open_levels<'a>(
     let outer_join = |table: usize| (table > 0).then(|| from.joins[table - 1].kind);
     // A hash join keeps the unmatched rows its plan names; a nested loop
     // keeps a LEFT or FULL join's outer rows and a RIGHT or FULL join's
-    // inner rows.
-    let (left_join, right_join) = match shape.hash {
-        Some(hash) => (hash.preserve_probe, hash.preserve_build),
-        None => (
-            false,
-            from.joins
+    // inner rows. A right semi join flags its hashed rows but returns no
+    // unmatched ones.
+    let (hash_join, right_join, right_flags) = match shape.hash {
+        Some(hash) => {
+            let join = match hash.filter {
+                Some(filter) => match (filter.probes_left, filter.anti) {
+                    (true, false) => LevelJoin::Semi,
+                    (true, true) => LevelJoin::Anti,
+                    (false, false) => LevelJoin::RightSemi,
+                    (false, true) => LevelJoin::RightAnti,
+                },
+                None if hash.preserve_probe => LevelJoin::Left,
+                None => LevelJoin::Inner,
+            };
+            (
+                join,
+                hash.preserve_build,
+                hash.preserve_build || join == LevelJoin::RightSemi,
+            )
+        }
+        None => {
+            let right = from
+                .joins
                 .iter()
-                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full)),
-        ),
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
+            (LevelJoin::Inner, right, right)
+        }
     };
     // The flags grow as the joining pass reads the right item: counting
     // its rows first would read storage before the join could wait.
-    let mut right = if right_join {
+    let mut right = if right_flags {
         let rows = scope.derived[shape.order[1]].map_or(64, <[_]>::len);
         Some(RightMatches {
             flags: storage
@@ -719,10 +771,14 @@ pub(super) fn open_levels<'a>(
                     pending: None,
                     decoded_columns: masks[depth],
                 },
-                left: if shape.hash.is_some() {
-                    depth == 1 && left_join
-                } else {
-                    matches!(outer_join(table), Some(JoinKind::Left | JoinKind::Full))
+                join: match outer_join(table) {
+                    _ if shape.hash.is_some() && depth == 1 => hash_join,
+                    _ if shape.hash.is_some() => LevelJoin::Inner,
+                    Some(JoinKind::Left | JoinKind::Full) => LevelJoin::Left,
+                    Some(JoinKind::Semi) => LevelJoin::Semi,
+                    Some(JoinKind::Anti) => LevelJoin::Anti,
+                    Some(JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Right)
+                    | None => LevelJoin::Inner,
                 },
                 on: on[depth],
                 pushdown: pushdown[depth],
@@ -903,6 +959,17 @@ impl<'a> JoinState<'a> {
                 }
             }
             let level = &mut self.levels[depth];
+            if level.scan.pending.is_none()
+                && matches!(level.join, LevelJoin::Semi | LevelJoin::Anti)
+                && level.matched
+            {
+                // A semi join's row joined, or an anti join's row passed or
+                // its NULL row joined: the level ends for the row above.
+                level.restart = true;
+                self.depth -= 1;
+                self.finish_row(state_arena);
+                continue;
+            }
             if level.scan.pending.is_none() {
                 let mark = state_arena.mark();
                 // A hash level's entry, which indexes its match flags.
@@ -959,7 +1026,7 @@ impl<'a> JoinState<'a> {
                         if let Some(right) = &mut level.right {
                             right.current = entry.unwrap_or(right.read);
                             right.read += 1;
-                            if pass == RightPass::Joining {
+                            if pass != RightPass::Unmatched {
                                 right.cover(right.current)?;
                             } else {
                                 // Rows no left row reached (none, when the
@@ -980,7 +1047,10 @@ impl<'a> JoinState<'a> {
                             }
                         }
                     }
-                    None if level.left && !level.matched && pass != RightPass::Unmatched => {
+                    None if matches!(level.join, LevelJoin::Left | LevelJoin::Anti)
+                        && !level.matched
+                        && pass != RightPass::Unmatched =>
+                    {
                         // No partner: the levels above join a NULL row here.
                         level.matched = true;
                         level.scan.pending = Some(PendingRow {
@@ -1037,14 +1107,28 @@ impl<'a> JoinState<'a> {
                 }
                 level.checked = true;
                 level.matched = true;
+                let mut joined_before = false;
                 if let Some(right) = &mut level.right {
-                    *right
+                    let flag = right
                         .flags
                         .as_mut_slice()
                         .get_mut(right.current)
                         .ok_or_else(|| {
                             sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed")
-                        })? = 1;
+                        })?;
+                    joined_before = *flag != 0;
+                    *flag = 1;
+                }
+                let joins = match level.join {
+                    LevelJoin::Inner | LevelJoin::Left | LevelJoin::Semi => true,
+                    LevelJoin::RightSemi => !joined_before,
+                    LevelJoin::Anti | LevelJoin::RightAnti => false,
+                };
+                if !joins {
+                    let pending = level.scan.pending.take().expect("checked join row");
+                    level.checked = false;
+                    unsafe { state_arena.rewind_to(pending.mark) };
+                    continue;
                 }
             }
             if depth + 1 < self.levels.len() {

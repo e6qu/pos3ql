@@ -229,9 +229,13 @@ fn constant_value_in(
         ..crate::sql::eval::NO_HOOKS
     };
     // Planning folds the constant only to classify it; the statement's own
-    // evaluation raises its notices.
+    // evaluation raises its notices, and its error where PostgreSQL's
+    // folding reaches it: after the constants folded before it, whose
+    // notices it then follows. A constant whose value is a data exception
+    // (class 22, such as `1/0`) is not classified.
     let mut folded = None;
-    crate::sql::eval::probe_constants(|| {
+    let messages = crate::sql::eval::eval_message_mark();
+    let probed = crate::sql::eval::probe_constants(|| {
         folded = super::inspect_parameters(|parameters| {
             crate::sql::eval::eval_full(
                 expression,
@@ -249,8 +253,15 @@ fn constant_value_in(
             })
         })?;
         Ok(())
-    })?;
-    Ok(folded)
+    });
+    match probed {
+        Ok(()) => Ok(folded),
+        Err(error) if error.sqlstate.as_str().starts_with("22") => {
+            crate::sql::eval::truncate_eval_messages(messages);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether PostgreSQL's planner folds `expression`, which names no column

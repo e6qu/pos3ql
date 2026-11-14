@@ -8,6 +8,8 @@ pub(crate) enum RetainedListError {
     Storage(ArenaSliceError),
 }
 
+/// A handle and length: copying it names the same entries.
+#[derive(Clone, Copy)]
 pub(crate) struct RetainedList<T: Copy + 'static> {
     entries: Option<ArenaSliceHandle<T>>,
     len: usize,

@@ -88,10 +88,6 @@ struct RowResume {
     returning: Option<transition_rows::SavedTransitionRows>,
     /// Statement-wide row state the write keeps besides its counters.
     state: Option<transition_rows::SavedTransitionRows>,
-    /// The foreign rows a batched INSERT queued before the unfinished row:
-    /// postgres_fdw sends them when a batch fills or the statement ends,
-    /// never because the statement paused for a routine call.
-    foreign_batches: Option<transition_rows::SavedTransitionRows>,
     /// A PL/pgSQL `INTO` destination's count of returned rows and its first
     /// row, from the attempts before this one.
     into_rows: Option<transition_rows::SavedTransitionRows>,
@@ -248,7 +244,6 @@ pub(crate) struct RowProgress {
     command: Option<SuspendedTriggerSql>,
     returning: Option<transition_rows::SavedTransitionRows>,
     state: Option<transition_rows::SavedTransitionRows>,
-    foreign_batches: Option<transition_rows::SavedTransitionRows>,
     started: bool,
     unrestartable: bool,
     /// One record per level at which multi-step statements nest inside one
@@ -309,7 +304,6 @@ impl RowProgress {
             command: None,
             returning: None,
             state: None,
-            foreign_batches: None,
             started: false,
             unrestartable: false,
             implicit_level: 0,
@@ -695,7 +689,6 @@ impl RowProgress {
         self.resume = None;
         self.returning = None;
         self.state = None;
-        self.foreign_batches = None;
         Ok(())
     }
 
@@ -1020,8 +1013,9 @@ impl RowProgress {
     }
 
     /// Keeps the foreign rows a batched INSERT queued, one encoded row per
-    /// target table, with the unfinished row, so the next attempt queues
-    /// them again instead of sending them at the pause.
+    /// target table, as its row state with the unfinished row, so the next
+    /// attempt queues them again: postgres_fdw sends them when a batch
+    /// fills or the statement ends, never because the statement paused.
     pub(super) fn keep_foreign_batches(
         &mut self,
         targets: &[&[u8]],
@@ -1030,7 +1024,7 @@ impl RowProgress {
         if self.running.is_none() {
             return Ok(());
         }
-        self.foreign_batches = Some(transition_rows::SavedTransitionRows::capture(
+        self.state = Some(transition_rows::SavedTransitionRows::capture(
             TransitionRows {
                 old: targets,
                 new: &[],
@@ -1048,7 +1042,7 @@ impl RowProgress {
         match self
             .resume
             .as_ref()
-            .and_then(|resume| resume.foreign_batches.as_ref())
+            .and_then(|resume| resume.state.as_ref())
         {
             Some(saved) => Ok(saved.restore(arena)?.old),
             None => Ok(&[]),
@@ -1419,7 +1413,6 @@ impl RowProgress {
             transitions,
             returning,
             state: self.state.take(),
-            foreign_batches: self.foreign_batches.take(),
             into_rows: None,
             selection: kept_selection,
         });

@@ -865,7 +865,9 @@ row by row) and the row-by-row `WHERE ctid = $1` commands (a stored generated
 column that depends on an updated one set to `DEFAULT`, `RETURNING` all
 columns only for an `AFTER` row trigger) match,
 with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
-and `differential_exact/504`. Remaining differences: joins, aggregates,
+and `differential_exact/504`. Remaining differences: joins of foreign tables on the
+same server (`foreign_join_ok`), aggregates (`foreign_grouping_ok`), a
+window's `ORDER BY` as the remote order,
 `DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
 `COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
 with `RETURNING` runs row by row (PostgreSQL ships the `RETURNING` columns

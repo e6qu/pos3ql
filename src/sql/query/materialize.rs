@@ -2394,6 +2394,7 @@ fn prelock_external_run<'a>(
     recheck: &mut LockedRowRecheck<'_, 'a>,
     limit: u64,
     offset: u64,
+    sort: instrument::Node,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let window = offset.saturating_add(limit);
@@ -2446,6 +2447,8 @@ fn prelock_external_run<'a>(
                 if past_window && !(statement.with_ties && limit > 0) {
                     false
                 } else {
+                    // The row locks read this row from the sort.
+                    sort.row();
                     decode_source_rowids(
                         row,
                         plan.identities_at,
@@ -2613,8 +2616,8 @@ pub(crate) fn external_materialized_into<'a>(
     let _stages = stages.start();
     let below_limit = stages.below_limit();
     // A sort under a DISTINCT returns every row it sorted; one under row
-    // locks returns each row its locks read.
-    let sorted_rows = if stages.unique.measured() || stages.lock_rows.measured() {
+    // locks returns the rows the lock pass reads.
+    let sorted_rows = if stages.unique.measured() {
         stages.sort
     } else {
         instrument::Node::NONE
@@ -2773,6 +2776,7 @@ pub(crate) fn external_materialized_into<'a>(
             recheck,
             limit,
             offset,
+            stages.sort,
             arena,
         )?;
     }

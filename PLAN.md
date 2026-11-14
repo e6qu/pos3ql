@@ -603,9 +603,16 @@ with one plain `SELECT` where postgres_fdw declares a cursor and fetches
 `fetch_size` rows at a time), and `batch_size` is not honored. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
-has only its own `pg_constraint` row: PostgreSQL also lists one clone per
-partition of the referenced table (`pc_a_fkey_1`, whose `conindid` is that
-partition's index). `ALTER COLUMN ... TYPE` on a partitioned table keeps
+has one `pg_constraint` clone, with its two RI action triggers, per
+referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
+when made and kept), added and removed as partitions are created, attached,
+detached and dropped; a referenced partition's violations, `DETACH` and
+`DROP` report it as PostgreSQL does. A table can hold at most 256 such
+clones (`54000`). Attaching a partition that already has an equivalent
+foreign key under another name adds the parent's copy beside it, where
+PostgreSQL adopts the existing key (`tryAttachPartitionForeignKey`), and a
+key's insert and update check triggers take OIDs before its clones' action
+triggers, where PostgreSQL creates them after. `ALTER COLUMN ... TYPE` on a partitioned table keeps
 each partition's index name where PostgreSQL rebuilds them under new
 generated names (`pr_1_label_idx` after a rename). A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which

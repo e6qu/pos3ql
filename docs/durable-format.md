@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v44` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v45` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -121,7 +121,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 24: version byte, ten-byte catalog
+- **Table definition payload** is version 25: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
   column's NOT NULL inheritance byte carries inheritability in bit 0 and
   PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
@@ -136,7 +136,16 @@ Other payload rules:
   every key column), then the four-byte creation stamp of the referenced
   table's unique index the key depends on (PostgreSQL's `conindid`; zero is
   rejected). The manifest's `fkey` line carries the same four codes, count,
-  positions and stamp after the validation code. Each exclusion constraint
+  positions and stamp after the validation code. After the inline key names
+  come the foreign keys' partition clones (PostgreSQL's `pg_constraint` row
+  per partition of a referenced partitioned table): a two-byte count of at
+  most 256, then for each the four-byte creation stamp of the key it belongs
+  to, the referenced partition's ten-byte catalog position and the clone's
+  name. Each clone's own creation stamp follows the table's other constraint
+  stamps, last. A duplicate (key, partition) pair or an empty name is
+  rejected. The manifest writes each clone as an `fkclone <key stamp>
+  <partition slot> <partition stamp> <hex name>` line after the `fkey`
+  lines. Each exclusion constraint
   element is a tag byte, `0` with a two-byte column position or `1` with a
   two-byte length and that many bytes of canonical UTF-8 expression text,
   then the four-byte operator OID (a runnable built-in or a user-defined

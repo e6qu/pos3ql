@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod aggregate_levels;
+mod alter_type_rebuild;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
 mod bound_definition_renames;

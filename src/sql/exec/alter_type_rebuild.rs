@@ -937,6 +937,13 @@ pub(super) fn rebuild_retyped_dependents(
             expression_only: old.expression_only,
         };
         spec.keys[..keys.len()].copy_from_slice(keys);
+        let owner = storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Statistics,
+                slot: slot as u16,
+            },
+            txid,
+        );
         let temporary = storage.table_def(usize::from(old.table), txid).persistence
             == crate::storage::RelationPersistence::Temporary;
         storage.drop_extended_statistics(slot, txid)?;
@@ -972,6 +979,21 @@ pub(super) fn rebuild_retyped_dependents(
         ) {
             storage.rollback_extended_statistics_create(created);
             return Err(error);
+        }
+        // `ATPostAlterTypeParse` keeps the statistics object's owner.
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Statistics,
+            slot: created as u16,
+        };
+        if storage.object_owner(object, txid) != owner {
+            let prior = storage.set_object_owner(object, owner, txid);
+            if let Err(error) = txn.record_ddl(
+                storage,
+                crate::sql::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+            ) {
+                storage.restore_object_owner(object, prior);
+                return Err(error);
+            }
         }
     }
     Ok(())

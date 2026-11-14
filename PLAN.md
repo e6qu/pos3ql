@@ -553,15 +553,7 @@ access method that accepts its type, built-in (`text_pattern_ops`) or a
 user-defined btree class, a `COLLATE`, and, under btree, `DESC` and `NULLS
 FIRST/LAST`; its operator may be user-defined when the class's family holds
 it, and runs through the operator's function. Operator class options on an
-element fail with `0A000`. `ALTER COLUMN ... TYPE` keeps the
-OIDs of everything over the column, where PostgreSQL's
-`ATPostAlterTypeCleanup` rebuilds them with new OIDs: the key, exclusion and
-explicit indexes and their constraints, `CHECK` constraints, foreign keys
-that reference the column's key or include the column (and so their RI
-triggers) and extended statistics. After it a row that violates two
-constraints can report the other one first. Giving a rebuilt index a new
-OID means re-keying its physical value binding, whose identity is the
-index's creation stamp, as `REINDEX` does when it swaps in a built copy. `DROP COLUMN` of a column an
+element fail with `0A000`. `DROP COLUMN` of a column an
 exclusion expression or predicate reads lists those constraints in their own
 `2BP01` report, separately from views, policies and routines that also depend
 on the column, and reports `cannot drop column ...` where PostgreSQL, when
@@ -757,9 +749,7 @@ triggers, where PostgreSQL creates them after: a key's four trigger OIDs
 derive from its one constraint identity, so the check triggers need their own
 identity, allocated after the clones, which changes the stored key layout.
 Adopting a key needs a durable link from a partition's key to its parent's
-in place of matching by name. `ALTER COLUMN ... TYPE` on a partitioned table keeps
-each partition's index name where PostgreSQL rebuilds them under new
-generated names (`pr_1_label_idx` after a rename). A btree index may use
+in place of matching by name. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

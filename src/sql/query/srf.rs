@@ -4002,7 +4002,7 @@ fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
                         }
                     };
                 let type_mod = match argument {
-                    Expr::Cast { type_mod, .. } => *type_mod,
+                    Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
                 // A single array's element column takes the table alias, as a

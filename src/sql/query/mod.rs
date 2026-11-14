@@ -10868,7 +10868,7 @@ where
                     _ => super::exec::routine_result_metadata(expression, &columns),
                 };
                 let type_mod = match expression {
-                    Expr::Cast { type_mod, .. } => *type_mod,
+                    Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
                     _ => metadata.map_or(-1, |metadata| metadata.type_mod),
                 };
                 let collation =
@@ -15413,8 +15413,9 @@ pub fn describe_scope_items<'q>(
                     }
                 };
                 // A bare column carries its declared modifier and a cast its
-                // target's, as RowDescription reports them; anything computed
-                // is -1 — the rule PostgreSQL follows.
+                // target's (also once the planner folded it to a constant),
+                // as RowDescription reports them; anything computed is -1 —
+                // the rule PostgreSQL follows.
                 let field_meta = match expression {
                     Expr::Field { base, field } if user_type.is_none() => {
                         Some(super::exec::record_field_metadata(base, field, &resolver)?)
@@ -15434,7 +15435,7 @@ pub fn describe_scope_items<'q>(
                     Expr::Column { qualifier, name } => {
                         scope_column_type_mod(scope, outer, *qualifier, name)
                     }
-                    Expr::Cast { type_mod, .. } => *type_mod,
+                    Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
                     _ => field_meta.map_or(-1, |meta| meta.type_mod),
                 };
                 let name = arena.alloc_str(name).map_err(|_| arena_full())?;

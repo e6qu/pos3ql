@@ -647,10 +647,11 @@ prefix would show only on spilled tables. `=` on a B-tree key whose columns
 cover the query shows `Index Scan` where PostgreSQL shows `Index Only Scan`;
 EXPLAIN names an index-only scan only for an ordered plan. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). A PL/pgSQL assignment to a
-nested field (`r.a.b := 1` or `label.r.a.b := 1`) fails when the routine is
-compiled (`42601` or `0A000`), where PostgreSQL assigns a field of a
-composite field or reports `42804` when it runs; `label.r.a := 1` assigns the
-field of the row variable the labelled block declares. A literal passed to a function's `regclass`
+sub-field (`r.a.b := 1`, `label.r.a.b := 1`, `r.a.b.c := 1`) of a trigger's
+`NEW` or `OLD` row fails with `42601`; a declared row or record variable's
+works as in PostgreSQL. When a block label and a row variable share the
+first word, the variable wins only when it is declared at least as deep as
+the labelled block's variable, where PostgreSQL compares block by block. A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

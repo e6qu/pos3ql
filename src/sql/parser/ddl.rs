@@ -1216,10 +1216,9 @@ impl<'a> Parser<'a> {
             return Ok(&[]);
         }
         loop {
+            // A repeated name fails as PostgreSQL's transformGenericOptions
+            // reports it, once the statement runs.
             let name = self.any_ident("foreign option name")?;
-            if options.as_slice().iter().any(|option| option.name == name) {
-                return Err(self.err_here("foreign option specified more than once"));
-            }
             let value = self.str_literal("foreign option value")?;
             self.push(&mut options, ForeignOption { name, value })?;
             if self.eat_op(")")? {
@@ -1235,7 +1234,6 @@ impl<'a> Parser<'a> {
     ) -> Result<&'a [ForeignOptionAction<'a>], ParseError> {
         self.expect_op("(")?;
         let mut options = ArenaList::new(self.arena);
-        let mut names = ArenaList::new(self.arena);
         if self.eat_op(")")? {
             return Ok(&[]);
         }
@@ -1248,11 +1246,9 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("add")?;
                 0u8
             };
+            // Actions apply in order: a repeated ADD fails as a duplicate and a
+            // repeated DROP as a missing option, as in PostgreSQL.
             let name = self.any_ident("foreign option name")?;
-            if names.as_slice().contains(&name) {
-                return Err(self.err_here("foreign option specified more than once"));
-            }
-            self.push(&mut names, name)?;
             let action = if operation == 2 {
                 ForeignOptionAction::Drop(name)
             } else {
@@ -3686,38 +3682,8 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("INSTEAD OF triggers cannot have column lists"));
             }
         }
-        if !matches!(transition_tables, TriggerTransitionTables::None) {
-            if event_count != 1 {
-                return Err(self.err_here(
-                    "transition tables cannot be specified for triggers with more than one event",
-                ));
-            }
-            if !matches!(timing, TriggerTiming::After) {
-                return Err(self.err_here("transition tables are only valid for AFTER triggers"));
-            }
-            if events[..event_count].contains(&TriggerEvent::Truncate) {
-                return Err(self.err_here("TRUNCATE triggers cannot have transition tables"));
-            }
-            if transition_tables.old().is_some()
-                && !events[..event_count]
-                    .iter()
-                    .any(|event| matches!(event, TriggerEvent::Update | TriggerEvent::Delete))
-            {
-                return Err(self.err_here("OLD TABLE requires UPDATE or DELETE"));
-            }
-            if transition_tables.new_table().is_some()
-                && !events[..event_count]
-                    .iter()
-                    .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
-            {
-                return Err(self.err_here("NEW TABLE requires INSERT or UPDATE"));
-            }
-            if !update_columns.is_empty() {
-                return Err(
-                    self.err_here("UPDATE OF column lists cannot be used with transition tables")
-                );
-            }
-        }
+        // Transition tables are checked once the relation is known, in
+        // PostgreSQL's CreateTrigger order.
         // The condition stays a slice of the statement, so its analysis
         // errors carry their position.
         let when = self

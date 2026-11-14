@@ -20466,6 +20466,10 @@ impl core::fmt::Display for PlpgsqlVariableName {
 #[derive(Clone, Copy)]
 struct TriggerLocalAssignment<'a> {
     name: PlpgsqlVariableName,
+    /// Sub-fields after a three-part target (`r.a.b.c := ...` keeps `c`):
+    /// PL/pgSQL resolves at most three words as the target variable and
+    /// assigns the rest as field indirection.
+    path: &'a [&'a str],
     expression: &'a Expr<'a>,
     // Dependencies include the original target's subscripts after lowering.
     exception_variables: bool,
@@ -23852,6 +23856,55 @@ fn parse_plpgsql_assignment_target<'a>(
     Ok(((None, *qualifier, column), expression))
 }
 
+/// The words of a dotted identifier chain (`a.b."C"`), each with its byte
+/// offset, or `None` when `text` is anything else.
+fn plpgsql_dotted_words<'a>(
+    text: &str,
+    arena: &'a Arena,
+) -> Result<Option<&'a [(usize, &'a str)]>, SqlError> {
+    let mut words = [(0usize, StackStr::<64>::new()); 8];
+    let mut count = 0;
+    let complete = arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(text, scratch);
+            loop {
+                let Ok(token) = lexer.next_token() else {
+                    return false;
+                };
+                match token {
+                    Tok::Ident(word) | Tok::QuotedIdent(word) if count < words.len() => {
+                        words[count] = (lexer.token_start(), StackStr::from_str(word));
+                        count += 1;
+                    }
+                    _ => return false,
+                }
+                match lexer.next_token() {
+                    Ok(Tok::Op(".")) => {}
+                    Ok(Tok::Eof) => return true,
+                    _ => return false,
+                }
+            }
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    if !complete {
+        return Ok(None);
+    }
+    let mut out = [(0usize, ""); 8];
+    for (slot, (offset, word)) in out.iter_mut().zip(&words[..count]) {
+        *slot = (
+            *offset,
+            arena
+                .alloc_str(word.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+        );
+    }
+    arena
+        .alloc_slice_copy(&out[..count])
+        .map(|words| Some(&*words))
+        .map_err(|_| super::query::arena_full_pub())
+}
+
 fn parse_trigger_local_assignment<'a>(
     statement: &'a str,
     arena: &'a Arena,
@@ -23865,6 +23918,17 @@ fn parse_trigger_local_assignment<'a>(
         return Ok(None);
     }
     let expression = parse_plpgsql_expression(expression, arena)?;
+    // Words past the third are sub-fields, as in PL/pgSQL's grammar.
+    let (name, path) = match plpgsql_dotted_words(name, arena)? {
+        Some(words) if words.len() > 3 => {
+            let head = &name[..words[3].0 - 1];
+            let path = arena
+                .alloc_slice_with(words.len() - 3, |index| words[index + 3].1)
+                .map_err(|_| super::query::arena_full_pub())?;
+            (head.trim_end().trim_end_matches('.'), &*path)
+        }
+        _ => (name, &[][..]),
+    };
     let (target, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
     let (block, label, name) = target;
     let label = label
@@ -23875,6 +23939,7 @@ fn parse_trigger_local_assignment<'a>(
         .transpose()?;
     Ok(Some(TriggerLocalAssignment {
         name: PlpgsqlVariableName { label, name, block },
+        path,
         expression,
         exception_variables: super::plpgsql_inputs::references_exception_variables(
             statement, arena,
@@ -28181,6 +28246,32 @@ fn validate_plpgsql_variable_uses(
                     {
                         Ok(())
                     }
+                    // `r.a.b` assigns sub-field `b` of row variable `r`'s
+                    // field `a`.
+                    None if let Some(first) = target.block
+                        && plpgsql_names_row(
+                            PlpgsqlVariableName::plain(first),
+                            locals,
+                            shadowed,
+                            has_parameter,
+                        )
+                        && let Some(constant) = binding_constant(
+                            PlpgsqlVariableName::plain(first),
+                            locals,
+                            shadowed,
+                            has_parameter,
+                        ) =>
+                    {
+                        if constant {
+                            Err(sql_err!(
+                                sqlstate::ERROR_IN_ASSIGNMENT,
+                                "variable \"{}\" is declared CONSTANT",
+                                first.as_str()
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    }
                     None => Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
                         "\"{}\" is not a known variable",
@@ -31481,7 +31572,7 @@ fn plpgsql_element_assignment<'a>(
 fn assigned_value<'e, 'a>(expression: &'e Expr<'a>) -> &'e Expr<'a> {
     match expression {
         Expr::Call {
-            name: "__jsonb_subscript_set" | "__array_subscript_set",
+            name: "__jsonb_subscript_set" | "__array_subscript_set" | "__assign_path",
             args: [_, value, ..],
             ..
         } => value,
@@ -35403,6 +35494,237 @@ fn coerce_plpgsql_table_rowtype<'a>(
     Ok(Datum::Record(&*fields))
 }
 
+/// Whether a declared variable holds a row: a record, composite or row type.
+fn plpgsql_local_is_row(local: &TriggerLocalDecl) -> bool {
+    local.record_shape.is_some() || matches!(local.ctype, ColType::Record | ColType::Composite(_))
+}
+
+/// PL/pgSQL's assignment through fields of a composite field (`r.a.x :=
+/// 1`, `blk.r.a.x := 1`, `r.a.x.y := 1`). Of a three-word target PL/pgSQL
+/// takes the first word as a row variable when one is declared at least as
+/// deep as a block of that label declaring the second word; any further
+/// words are sub-fields. The assignment becomes one to the record's field
+/// whose value is the field with its sub-field replaced, after checking the
+/// sub-fields as PostgreSQL does while planning the assignment.
+fn plpgsql_field_path_assignment<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'a>],
+    assignment: TriggerLocalAssignment<'a>,
+) -> Result<TriggerLocalAssignment<'a>, SqlError> {
+    let name = assignment.name;
+    use crate::sql::eval::CatalogAccess as _;
+    use core::fmt::Write as _;
+    let Some(first) = name.block else {
+        return Ok(assignment);
+    };
+    let Some(second) = name.label else {
+        return Ok(assignment);
+    };
+    let arena = context.arena;
+    let as_variable = locals.iter().rposition(|local| {
+        local.name == first && local.alias.is_none() && plpgsql_local_is_row(local)
+    });
+    let as_label = name
+        .record()
+        .and_then(|record| locals.iter().rposition(|local| record.names(local)));
+    let text = |name: SqlName| -> Result<&'a str, SqlError> {
+        arena
+            .alloc_str(name.as_str())
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let variable_reading =
+        as_variable.is_some_and(|variable| as_label.is_none_or(|label| variable >= label));
+    let (record, field, base) = if variable_reading {
+        let base = arena
+            .alloc(Expr::Column {
+                qualifier: Some(text(first)?),
+                name: text(second)?,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        (
+            as_variable.expect("the variable reading found it"),
+            second,
+            &*base,
+        )
+    } else {
+        let Some(record) = as_label else {
+            return Ok(assignment);
+        };
+        if assignment.path.is_empty() {
+            return Ok(assignment);
+        }
+        let base = arena
+            .alloc(Expr::SchemaColumn {
+                schema: text(first)?,
+                table: text(second)?,
+                name: text(name.name)?,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        (record, name.name, &*base)
+    };
+    let local = locals[record];
+    let mut steps = [""; 8];
+    let mut count = 0;
+    if variable_reading {
+        steps[0] = text(name.name)?;
+        count = 1;
+    }
+    for step in assignment.path {
+        if count == steps.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL assignment target has more than {} sub-fields",
+                steps.len()
+            ));
+        }
+        steps[count] = step;
+        count += 1;
+    }
+    let steps = &steps[..count];
+    let statement = crate::sql::error_context::innermost_assignment();
+    let planning_error = |error: SqlError, positioned: bool| -> SqlError {
+        let Some(statement) = statement else {
+            return error;
+        };
+        let written = statement.trim_start();
+        let first_word = &written[..written.find('.').unwrap_or(written.len())];
+        match in_procedural_query::<()>(
+            statement,
+            crate::sql::error_context::QueryMode::Assignment,
+            false,
+            || {
+                Err(if positioned {
+                    crate::sql::error_position::at_subject(error, first_word)
+                } else {
+                    error
+                })
+            },
+        ) {
+            Err(error) => error,
+            Ok(()) => unreachable!("the planning error is returned"),
+        }
+    };
+    let storage = context.storage();
+    let txid = context.txn.txid;
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let record_fields = match (values[record], local.ctype) {
+        (Datum::Record(fields) | Datum::Composite { fields, .. }, _) => Some(fields),
+        (Datum::Null, ColType::Composite(Some(_))) => {
+            let type_oid = storage
+                .routine_type_oid(local.ctype, local.user_type, txid)
+                .unwrap_or(local.ctype.oid());
+            catalog.null_composite_fields(type_oid, arena)?
+        }
+        _ => None,
+    };
+    let Some(record_fields) = record_fields else {
+        return Err(planning_error(
+            unassigned_record(local.name.as_str()),
+            false,
+        ));
+    };
+    let Some(field_type) = record_fields
+        .iter()
+        .find(|candidate| candidate.name == field.as_str())
+        .map(|candidate| candidate.type_oid)
+    else {
+        return Err(planning_error(
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "record \"{}\" has no field \"{}\"",
+                local.name.as_str(),
+                field.as_str()
+            ),
+            false,
+        ));
+    };
+    let mut type_oid = field_type;
+    for (index, step) in steps.iter().enumerate() {
+        let column = if index == 0 {
+            local.name.as_str()
+        } else {
+            steps[index - 1]
+        };
+        let type_name = || crate::sql::catalog::format_type_name(storage, txid, type_oid);
+        let Some(fields) = catalog.null_composite_fields(type_oid, arena)? else {
+            return Err(planning_error(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot assign to field \"{}\" of column \"{}\" because its type {} is not a composite type",
+                    step,
+                    column,
+                    type_name()?.as_str()
+                ),
+                true,
+            ));
+        };
+        let Some(next) = fields.iter().find(|candidate| candidate.name == *step) else {
+            return Err(planning_error(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "cannot assign to field \"{}\" of column \"{}\" because there is no such column in data type {}",
+                    step,
+                    column,
+                    type_name()?.as_str()
+                ),
+                true,
+            ));
+        };
+        type_oid = next.type_oid;
+    }
+    let mut kinds = StackStr::<8>::new();
+    for _ in steps {
+        let _ = kinds.write_char('f');
+    }
+    let alloc = |expression| {
+        arena
+            .alloc(expression)
+            .map(|expression| &*expression)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let mut arguments = [base; 12];
+    arguments[0] = base;
+    arguments[1] = assignment.expression;
+    arguments[2] = alloc(Expr::Int(i64::from(field_type)))?;
+    arguments[3] = alloc(Expr::Str(
+        arena
+            .alloc_str(kinds.as_str())
+            .map_err(|_| super::query::arena_full_pub())?,
+    ))?;
+    for (slot, step) in arguments[4..].iter_mut().zip(steps) {
+        *slot = alloc(Expr::Str(step))?;
+    }
+    let arguments = arena
+        .alloc_slice_copy(&arguments[..4 + steps.len()])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let expression = alloc(Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        bound_oid: None,
+        bound_strict: None,
+        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        name: "__assign_path",
+        args: arguments,
+        argument_names: &[],
+        variadic: false,
+        star: false,
+        distinct: false,
+        order_by: &[],
+        over: None,
+        filter: None,
+    })?;
+    Ok(TriggerLocalAssignment {
+        name: if variable_reading {
+            PlpgsqlVariableName::qualified(Some(first), second)
+        } else {
+            name
+        },
+        path: &[],
+        expression,
+        ..assignment
+    })
+}
+
 fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
@@ -37763,6 +38085,12 @@ fn execute_trigger_step_in<'a>(
                 Ok(Some(TriggerFlow::Return(result)))
             }),
             TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
+                let assignment = plpgsql_field_path_assignment(
+                    context,
+                    locals,
+                    &local_values[..locals.len()],
+                    assignment,
+                )?;
                 if let Some(record) =
                     trigger_record_field_target(locals, definition, assignment.name)
                 {
@@ -43532,6 +43860,9 @@ pub fn create_trigger(
                         "ROW triggers with transition tables are not supported on partitions"
                     )
                 });
+            }
+            if let Err(error) = validate_transition_tables(trigger) {
+                return sql_fail(error);
             }
             (
                 crate::storage::TriggerTarget::Table(table as u16),
@@ -87883,6 +88214,69 @@ fn insert_has_row_trigger(
         };
         table = usize::from(attachment.parent);
     }
+}
+
+/// PostgreSQL's CreateTrigger checks of a `REFERENCING` clause once the
+/// relation accepts transition tables, in its order.
+fn validate_transition_tables(
+    trigger: &crate::sql::ast::CreateTrigger<'_>,
+) -> Result<(), SqlError> {
+    use crate::sql::ast::{TriggerEvent, TriggerTransitionTables};
+    if matches!(trigger.transition_tables, TriggerTransitionTables::None) {
+        return Ok(());
+    }
+    if !matches!(trigger.timing, TriggerTiming::After) {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "transition table name can only be specified for an AFTER trigger"
+        ));
+    }
+    if trigger.events.contains(&TriggerEvent::Truncate) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "TRUNCATE triggers with transition tables are not supported"
+        ));
+    }
+    let row_events = trigger
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TriggerEvent::Insert | TriggerEvent::Update | TriggerEvent::Delete
+            )
+        })
+        .count();
+    if row_events != 1 {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transition tables cannot be specified for triggers with more than one event"
+        ));
+    }
+    if !trigger.update_columns.is_empty() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transition tables cannot be specified for triggers with column lists"
+        ));
+    }
+    let has = |wanted: &[TriggerEvent]| trigger.events.iter().any(|event| wanted.contains(event));
+    if trigger.transition_tables.old().is_some()
+        && !has(&[TriggerEvent::Update, TriggerEvent::Delete])
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "OLD TABLE can only be specified for a DELETE or UPDATE trigger"
+        ));
+    }
+    if trigger.transition_tables.new_table().is_some()
+        && !has(&[TriggerEvent::Insert, TriggerEvent::Update])
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "NEW TABLE can only be specified for an INSERT or UPDATE trigger"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether an `AFTER ROW INSERT` trigger of a foreign table or one of its

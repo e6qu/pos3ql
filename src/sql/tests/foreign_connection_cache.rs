@@ -259,3 +259,37 @@ fn postgres_fdw_caches_connections_and_spells_its_remote_commands() {
     );
     assert_eq!(data_rows(&closed), ["0"]);
 }
+
+#[test]
+fn foreign_tables_refuse_merge_and_transition_tables() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER refusing; \
+         CREATE SERVER refusing_server FOREIGN DATA WRAPPER refusing; \
+         CREATE FOREIGN TABLE refused (id integer) SERVER refusing_server; \
+         CREATE FUNCTION refused_audit() RETURNS trigger LANGUAGE plpgsql \
+           AS $$ BEGIN RETURN NULL; END $$",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    for (statement, expected) in [
+        (
+            "MERGE INTO refused USING (VALUES (1)) v(x) ON id = x WHEN MATCHED THEN DELETE",
+            "cannot execute MERGE on relation \"refused\"",
+        ),
+        (
+            "CREATE TRIGGER refused_audit AFTER INSERT ON refused REFERENCING NEW TABLE AS n \
+             FOR EACH STATEMENT EXECUTE FUNCTION refused_audit()",
+            "Triggers on foreign tables cannot have transition tables.",
+        ),
+        (
+            "ALTER SERVER refusing_server OPTIONS (ADD a '1', ADD a '2')",
+            "option \"a\" provided more than once",
+        ),
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains(expected), "{statement}: {rendered}");
+    }
+}

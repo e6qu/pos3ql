@@ -54,6 +54,11 @@ pub(crate) trait Frame {
     fn begin_dynamic(&self, _text: *const str) -> bool {
         false
     }
+
+    /// Whether this frame writes no line for an error with a cursor.
+    fn omitted_when_positioned(&self) -> bool {
+        false
+    }
 }
 
 /// A dynamic query (`EXECUTE`) whose text is known once its string has been
@@ -351,8 +356,9 @@ impl Frame for CopyFrame<'_> {
     }
 }
 
-/// A PL/pgSQL function compiled for a call it cannot serve, as PostgreSQL's
-/// `plpgsql_compile_callback` reports such an error.
+/// A PL/pgSQL function being compiled, as PostgreSQL's
+/// `plpgsql_compile_error_callback` reports an error raised meanwhile: an
+/// error with a cursor position is positioned in the body and gets no line.
 pub(crate) struct PlpgsqlCompilationFrame<'a> {
     pub(crate) name: &'a str,
 }
@@ -361,10 +367,103 @@ impl Frame for PlpgsqlCompilationFrame<'_> {
     fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
         write!(
             out,
-            "compilation of PL/pgSQL function \"{}\" near line 1",
-            self.name
+            "compilation of PL/pgSQL function \"{}\" near line {}",
+            self.name,
+            compilation_line()
         )
     }
+
+    fn omitted_when_positioned(&self) -> bool {
+        true
+    }
+}
+
+/// The PL/pgSQL body being compiled and the latest piece of it the compiler
+/// read, as addresses, while [`within_plpgsql_compilation`] runs: PostgreSQL
+/// reports the line of its latest token.
+#[derive(Clone, Copy)]
+struct Compilation {
+    active: bool,
+    start: usize,
+    len: usize,
+    at: usize,
+}
+
+const NO_COMPILATION: Compilation = Compilation {
+    active: false,
+    start: 0,
+    len: 0,
+    at: 0,
+};
+
+std::thread_local! {
+    static COMPILATION: Cell<Compilation> = const { Cell::new(NO_COMPILATION) };
+}
+
+/// Runs `compile`, a PL/pgSQL compilation of the function `name`, adding
+/// PostgreSQL's `compilation of PL/pgSQL function` context to its errors.
+pub(crate) fn within_plpgsql_compilation<T>(
+    name: &str,
+    compile: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    struct Restore(Compilation);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPILATION.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(COMPILATION.with(|slot| {
+        slot.replace(Compilation {
+            active: true,
+            ..NO_COMPILATION
+        })
+    }));
+    within(&PlpgsqlCompilationFrame { name }, compile)
+}
+
+/// Names `body` as the text being compiled.
+pub(crate) fn compiling_body(body: &str) {
+    COMPILATION.with(|slot| {
+        if slot.get().active {
+            let start = body.as_ptr() as usize;
+            slot.set(Compilation {
+                active: true,
+                start,
+                len: body.len(),
+                at: start,
+            });
+        }
+    });
+}
+
+/// Records that the compiler has read `piece`, a slice of the body.
+pub(crate) fn compiling_at(piece: &str) {
+    let at = piece.as_ptr() as usize + piece.trim_end().len();
+    COMPILATION.with(|slot| {
+        let compilation = slot.get();
+        if compilation.active
+            && compilation.len > 0
+            && at >= compilation.start
+            && at <= compilation.start + compilation.len
+        {
+            slot.set(Compilation { at, ..compilation });
+        }
+    });
+}
+
+fn compilation_line() -> usize {
+    let compilation = COMPILATION.with(Cell::get);
+    if !compilation.active || compilation.len == 0 {
+        return 1;
+    }
+    // The body outlives the compilation whose error this line reports.
+    let read = unsafe {
+        core::slice::from_raw_parts(
+            compilation.start as *const u8,
+            compilation.at - compilation.start,
+        )
+    };
+    1 + read.iter().filter(|&&byte| byte == b'\n').count()
 }
 
 /// A PL/pgSQL declaration's type that does not parse, as PostgreSQL's
@@ -526,7 +625,9 @@ fn write_frames(out: &mut dyn Write, mut position: Option<usize>) -> Result<Inte
             _ => false,
         };
         lines.pending_line = true;
-        frame.write_line(&mut lines, positioned)?;
+        if !(position.is_some() && frame.omitted_when_positioned()) {
+            frame.write_line(&mut lines, positioned)?;
+        }
         node = current.previous;
     }
     Ok(Internal {

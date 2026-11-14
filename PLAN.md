@@ -611,24 +611,11 @@ generated names (`pr_1_label_idx` after a rename). A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte, but the planner does not yet scan
 one for a `LIKE 'ab%'` prefix or the `~<~` family of operators, which
-PostgreSQL turns into an index range. A missing type has no cursor position inside a `DEFAULT` expression, a column
-definition list, `json_populate_record(NULL::t, ...)` or
-`pg_typeof(NULL::nope.t)`. A SQL/JSON `RETURNING` clause naming a type that
-is not built in (a domain over `text`, an enum, a missing type) fails while
-parsing with `0A000`, and `JSON_QUERY(... RETURNING varchar(3))` truncates an
-over-long result where PostgreSQL applies its `ON ERROR` behavior to the
-length error. A routine parameter or result written with `%TYPE` may name a
-table column but not a view column (`0A000`). PL/pgSQL declaration errors
-raised while compiling a block (`v t.a%TYPE`, `v t%ROWTYPE`) lack
-PostgreSQL's `compilation of PL/pgSQL function` CONTEXT; a syntax error in a
-PL/pgSQL expression or query reports `invalid expression: ...` or `invalid
-query: ...` with no cursor position, assigning an undeclared variable is
-accepted until the assignment runs, and `IF THEN` fails with `0A000` instead
-of `missing expression`. A cast to a polymorphic pseudo-type
-(`1::anyelement`) reports that the type does not exist, and a column
-definition list on `unnest` reports `function pg_catalog.unnest() does not
-exist` instead of `a column definition list is only allowed for functions
-returning "record"`. A literal passed to a function's `regclass`
+PostgreSQL turns into an index range. A routine parameter or result written with `%TYPE` may name a
+table column but not a view column (`0A000`). A PL/pgSQL assignment to a
+three-part name (`x.y.z := 1`, a labelled row variable's field) fails with
+`0A000`, where PostgreSQL assigns `label.row.field` or reports `"x.y.z" is
+not a known variable`. A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
@@ -683,8 +670,8 @@ cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no
 position: parameters carry no source position for assignment analysis.
 COPY to or from a server file or program,
-`COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
-RETURNING` a non-JSON, non-string type are rejected with `0A000`.
+`COPY ... FREEZE` and a COPY `ENCODING` other than UTF8 are rejected with
+`0A000`.
 `COPY FROM` into a view with an `INSTEAD OF INSERT` trigger fails with
 `0A000` where PostgreSQL inserts each row through the trigger, and a refused
 `COPY FROM` into a view or sequence does not validate its options before

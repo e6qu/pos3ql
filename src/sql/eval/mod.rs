@@ -1324,6 +1324,16 @@ pub(crate) fn expression_type_identity<'a>(
         operand, type_name, ..
     } = expression
     {
+        if let Some(nonarray) = super::types::unchanged_polymorphic_cast(type_name) {
+            if matches!(operand, Expr::Str(_)) {
+                return Ok(ExpressionTypeIdentity::Known(super::types::oid::UNKNOWN));
+            }
+            let identity = expression_type_identity(operand, row, hooks)?;
+            if nonarray {
+                reject_polymorphic_array(identity.routine_argument_oid(), type_name)?;
+            }
+            return Ok(identity);
+        }
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
             if ctype == super::types::ColType::Pseudo(super::types::PseudoType::Any) {
                 // An untyped literal stays `unknown`.
@@ -4471,7 +4481,10 @@ fn catalog_evaluation(
             .or_else(|| catalog.user_type_oid(type_name));
         // PostgreSQL resolves an array constructor's target type before
         // the constructor.
-        if target.is_none() && matches!(operand, Expr::Array(_)) {
+        if target.is_none()
+            && matches!(operand, Expr::Array(_))
+            && super::types::unchanged_polymorphic_cast(type_name).is_none()
+        {
             return Err(crate::sql::error_position::at_subject(
                 crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
                     catalog.type_schema_exists(schema)
@@ -7426,6 +7439,12 @@ fn eval_full_inner<'a>(
                 Some(element) => Ok(ExpressionTypeIdentity::Known(element.array_oid())),
                 None => expression_type_identity(operand, row, hooks),
             };
+            if let Some(nonarray) = super::types::unchanged_polymorphic_cast(type_name) {
+                if nonarray {
+                    reject_polymorphic_array(source_identity()?.routine_argument_oid(), type_name)?;
+                }
+                return Ok(v);
+            }
             let target_type = ColType::from_sql_name(type_name);
             if let Some(ColType::Pseudo(kind)) = target_type {
                 let source_oid = source_identity()?.routine_argument_oid();
@@ -14384,6 +14403,20 @@ pub(crate) fn regtype_of_normalized_name<'a>(
         )
     })?;
     regtype_of_oid(i64::from(referenced_oid), arena)
+}
+
+/// PostgreSQL's `can_coerce_type` refusal of an array cast to `anynonarray`
+/// or `anycompatiblenonarray`.
+fn reject_polymorphic_array(source_oid: i32, type_name: &str) -> Result<(), SqlError> {
+    match crate::sql::exec::coltype_of_oid(source_oid) {
+        Some(source @ ColType::Array(_)) => Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            source.name(),
+            type_name
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A cast to `cstring`, `unknown` or `"any"`. PostgreSQL converts a string

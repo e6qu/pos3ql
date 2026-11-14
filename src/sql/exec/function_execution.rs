@@ -740,6 +740,7 @@ pub(crate) fn execute<'a>(
         .map_err(|_| super::super::query::arena_full_pub())?;
     let kind = plpgsql_function_program_kind(routine);
     let (program, code) = compile_plpgsql_execution(
+        routine.name.as_str(),
         routine.body.as_str(),
         kind,
         super::routine_positionals(routine),

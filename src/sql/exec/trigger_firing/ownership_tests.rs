@@ -218,6 +218,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             NEW.id := NEW.id + n; \
             RETURN NEW; END";
         let (program, code) = compile_plpgsql_execution(
+            "trigger_function",
             source,
             PlpgsqlProgramKind::Trigger,
             0,

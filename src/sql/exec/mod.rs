@@ -5616,6 +5616,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         })
         .transpose()?;
     let (program, code) = compile_plpgsql_execution(
+        routine.name.as_str(),
         routine.body.as_str(),
         PlpgsqlProgramKind::Trigger,
         0,
@@ -23481,6 +23482,18 @@ fn trigger_control_header<'a>(
         return Ok(None);
     };
     if content[..at].trim().len() <= prefix.len() {
+        // PostgreSQL reads the condition up to its terminator and finds none.
+        if matches!(prefix, "if" | "elsif" | "while") {
+            let written = &content[at..at + terminator.len()];
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "missing expression at or near \"{}\"",
+                    written
+                ),
+                written,
+            ));
+        }
         return Ok(None);
     }
     let rest = content[at + terminator.len()..].trim();
@@ -23576,6 +23589,7 @@ fn parse_plpgsql_assignment_target<'a>(
     value: &'a Expr<'a>,
     arena: &'a Arena,
 ) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
+    let target_text = target;
     let target = parse_plpgsql_expression(target, arena)?;
     let mut current = target;
     // Innermost subscript last; each is an element or a slice's bounds.
@@ -23600,6 +23614,21 @@ fn parse_plpgsql_assignment_target<'a>(
         }
     }
     let Expr::Column { qualifier, name } = current else {
+        // A `$n` beyond the routine's parameters names no variable.
+        if let Expr::Param(number) = *current {
+            let written = target_text.trim_start();
+            let end = written
+                .find(|character: char| !(character == '$' || character.is_ascii_digit()))
+                .unwrap_or(written.len());
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "\"${}\" is not a known variable",
+                    number
+                ),
+                &written[..end],
+            ));
+        }
         return Err(unsupported_trigger_body());
     };
     let column = SqlName::parse(name)?;
@@ -24942,13 +24971,10 @@ fn parse_trigger_raise_options<'a>(
         };
         if name.trim().eq_ignore_ascii_case("errcode") {
             let expression = parse_plpgsql_expression(expression.trim(), arena)?;
-            let state = match expression {
-                Expr::Str(value) => TriggerRaiseSqlState::Parsed(
-                    parse_trigger_raised_sqlstate(value)
-                        .ok_or_else(|| invalid_trigger_sqlstate(value))?,
-                ),
-                _ => TriggerRaiseSqlState::Expression(expression),
-            };
+            // PostgreSQL reads the code when the statement runs, so an
+            // unknown constant fails only then, and the text it read is the
+            // message when none is given.
+            let state = TriggerRaiseSqlState::Expression(expression);
             if sqlstate.replace(state).is_some() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -25783,8 +25809,16 @@ fn parse_trigger_raise_sqlstate(
         return Err(unsupported_trigger_body());
     }
     let code = &value[1..value.len() - 1];
-    let state =
-        parse_trigger_raised_sqlstate(code).ok_or_else(|| invalid_trigger_sqlstate(code))?;
+    let state = parse_trigger_raised_sqlstate(code).ok_or_else(|| {
+        crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid SQLSTATE code at or near \"{}\"",
+                value
+            ),
+            value,
+        )
+    })?;
     Ok(Some((state, code)))
 }
 
@@ -25792,8 +25826,22 @@ fn parse_trigger_raised_sqlstate(code: &str) -> Option<crate::sql::eval::SqlStat
     crate::sql::eval::SqlState::parse(code)
 }
 
-fn invalid_trigger_sqlstate(code: &str) -> SqlError {
-    sql_err!(sqlstate::SYNTAX_ERROR, "invalid SQLSTATE code \"{}\"", code)
+/// The SQLSTATE a `RAISE ... USING ERRCODE` value names: five digits or
+/// upper-case letters, or a condition name spelled as PostgreSQL lists it.
+fn raised_errcode(code: &str) -> Result<crate::sql::eval::SqlState, SqlError> {
+    parse_trigger_raised_sqlstate(code)
+        .or_else(|| {
+            (!code.bytes().any(|byte| byte.is_ascii_uppercase()))
+                .then(|| plpgsql_conditions::condition_sqlstate(code))
+                .flatten()
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "unrecognized exception condition \"{}\"",
+                code
+            )
+        })
 }
 
 fn parse_plpgsql_cursor_open<'a>(
@@ -26507,6 +26555,10 @@ fn parse_trigger_statement<'a>(
             statement,
         });
     }
+    // PostgreSQL hands any other statement to its SQL parser, which reports
+    // what does not parse.
+    super::parser::parse_procedural_statement(segment, arena)
+        .map_err(|error| plpgsql_syntax_error(&error, segment, segment))?;
     Err(unsupported_trigger_body())
 }
 
@@ -26626,6 +26678,7 @@ fn parse_trigger_block<'a>(
             return Err(unsupported_trigger_body());
         }
         *at += 1;
+        crate::sql::error_context::compiling_at(segment);
         let (loop_label, loop_header) = trigger_loop_label(segment, arena)?;
         let is_loop = strip_trigger_keyword(loop_header, "for").is_some()
             || strip_trigger_keyword(loop_header, "while").is_some()
@@ -26962,7 +27015,8 @@ fn parse_plpgsql_expression<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     // PostgreSQL's expression text starts at its first token.
     let source = source.trim();
-    let expression = super::parser::parse_expr(source, arena)?;
+    let expression = super::parser::parse_procedural_expression(source, arena)
+        .map_err(|error| plpgsql_syntax_error(&error, source, source))?;
     super::plpgsql_inputs::record(
         super::plpgsql_inputs::Kind::Expression,
         core::ptr::from_ref(expression) as usize,
@@ -26972,12 +27026,47 @@ fn parse_plpgsql_expression<'a>(
     Ok(expression)
 }
 
+/// A grammar error in `parsed`, the text PostgreSQL parses for a PL/pgSQL
+/// expression or query, positioned where its cursor falls in `written`, the
+/// body text it came from. A rewritten query (`PERFORM` read as `SELECT`)
+/// shares its tail with what was written.
+fn plpgsql_syntax_error(
+    error: &super::parser::ParseError,
+    parsed: &str,
+    written: &str,
+) -> SqlError {
+    let reported = crate::sql::error_position::full_message_error(error.sqlstate, |message| {
+        let _ = write!(message, "{}", error.render(parsed));
+        Ok(())
+    });
+    let Some(cursor) = error.cursor.filter(|cursor| *cursor <= parsed.len()) else {
+        return reported;
+    };
+    let shared = parsed
+        .bytes()
+        .rev()
+        .zip(written.bytes().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let tail = parsed.len() - cursor;
+    let subject = if tail <= shared {
+        written.get(written.len() - tail..)
+    } else {
+        written.get(..0)
+    };
+    match subject {
+        Some(subject) => crate::sql::error_position::at_reference(reported, subject),
+        None => reported,
+    }
+}
+
 fn parse_plpgsql_query<'a>(
     source: &'a str,
     original: &str,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let query = super::parser::parse_query(source, arena)?;
+    let query = super::parser::parse_procedural_query(source, arena)
+        .map_err(|error| plpgsql_syntax_error(&error, source, original))?;
     super::plpgsql_inputs::record_rewritten(
         super::plpgsql_inputs::Kind::Query,
         core::ptr::from_ref(query) as usize,
@@ -26988,6 +27077,7 @@ fn parse_plpgsql_query<'a>(
     Ok(query)
 }
 
+#[cfg(test)]
 fn parse_plpgsql_program<'a>(
     body: &'a str,
     arena: &'a Arena,
@@ -27004,6 +27094,7 @@ fn parse_routine_program<'a>(
     program_kind: PlpgsqlProgramKind,
     positionals: u32,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    crate::sql::error_context::compiling_body(body);
     // A compile error points into the body where the statement wrote it, as
     // PostgreSQL's do; a body from the catalog is not in the statement.
     let (mut program, sites) = crate::sql::error_position::with_analysis_in(body, || {
@@ -27024,7 +27115,20 @@ fn parse_plpgsql_declarations<'a>(
 ) -> Result<&'a [ParsedTriggerLocalDecl<'a>], SqlError> {
     let mut locals = ProgramList::new(arena);
     for declaration in segments.iter().copied() {
+        crate::sql::error_context::compiling_at(declaration);
         let local = parse_trigger_local(declaration, arena)?;
+        if local.not_null && local.initial.is_none() && local.alias.is_none() {
+            let error = sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "variable \"{}\" must have a default value, since it's declared NOT NULL",
+                local.name.as_str()
+            );
+            // PostgreSQL points at the declaration's `NOT NULL`.
+            return Err(match plpgsql_last_word(local.source, "not") {
+                Some(written) => crate::sql::error_position::at_reference(error, written),
+                None => error,
+            });
+        }
         if locals
             .as_slice()
             .iter()
@@ -27387,11 +27491,16 @@ fn resolve_plpgsql_program_locals<'a>(
         variable_conflict: program.variable_conflict,
         print_strict_params: program.print_strict_params,
     };
+    // `found` and a trigger's special variables are declared with the
+    // routine, like its parameters.
+    let known = |name: SqlName| {
+        has_parameter(name).or_else(|| plpgsql_special_variable(parsed_kind, name.as_str()))
+    };
     validate_plpgsql_variable_uses(
         &program,
         declarations,
         parsed_kind == PlpgsqlProgramKind::Trigger,
-        has_parameter,
+        &known,
         arena,
     )?;
     Ok(program)
@@ -27598,6 +27707,7 @@ fn resolve_plpgsql_local(
     storage: &Storage,
     txid: u32,
 ) -> Result<TriggerLocalDecl, SqlError> {
+    crate::sql::error_context::compiling_at(local.source);
     if let Some(item) = local.alias {
         return Ok(TriggerLocalDecl {
             scope,
@@ -27626,6 +27736,15 @@ fn resolve_plpgsql_local(
                     error
                 }
             })?;
+            // A polymorphic type is a routine contract, never a variable's.
+            if let Some(polymorphic) = result.polymorphic_type() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "variable \"{}\" has pseudo-type {}",
+                    local.name.as_str(),
+                    polymorphic.name()
+                ));
+            }
             (result.ctype, result.user_type, type_mod, None)
         }
         ParsedPlpgsqlLocalType::Column { relation, column } => {
@@ -27640,17 +27759,10 @@ fn resolve_plpgsql_local(
     };
     if ctype.is_pseudo() && ctype != ColType::Record {
         return Err(sql_err!(
-            sqlstate::INVALID_FUNCTION_DEFINITION,
-            "PL/pgSQL local \"{}\" has pseudo-type {}",
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "variable \"{}\" has pseudo-type {}",
             local.name.as_str(),
             ctype.name()
-        ));
-    }
-    if local.not_null && local.initial.is_none() {
-        return Err(sql_err!(
-            sqlstate::NULL_VALUE_NOT_ALLOWED,
-            "variable \"{}\" must have a default value, since it's declared NOT NULL",
-            local.name.as_str()
         ));
     }
     Ok(TriggerLocalDecl {
@@ -27665,6 +27777,25 @@ fn resolve_plpgsql_local(
         not_null: local.not_null,
         alias: None,
     })
+}
+
+/// The last occurrence of the keyword `word` in `text`, outside other words.
+fn plpgsql_last_word<'s>(text: &'s str, word: &str) -> Option<&'s str> {
+    let bytes = text.as_bytes();
+    (0..=text.len().checked_sub(word.len())?)
+        .rev()
+        .find_map(|at| {
+            let candidate = text.get(at..at + word.len())?;
+            let boundary = |index: Option<usize>| {
+                index
+                    .and_then(|index| bytes.get(index))
+                    .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+            };
+            (candidate.eq_ignore_ascii_case(word)
+                && boundary(at.checked_sub(1))
+                && boundary(Some(at + word.len())))
+            .then_some(candidate)
+        })
 }
 
 fn validate_plpgsql_nested_declarations(
@@ -27690,7 +27821,14 @@ fn validate_plpgsql_nested_declarations(
     result
 }
 
+/// Compiles `source`, the body of the PL/pgSQL function `name`
+/// (`inline_code_block` for `DO`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "compilation names the routine, its body and its parameter scope"
+)]
 fn compile_plpgsql_execution<'a>(
+    name: &str,
     source: &str,
     kind: PlpgsqlProgramKind,
     positionals: u32,
@@ -27702,11 +27840,53 @@ fn compile_plpgsql_execution<'a>(
     crate::sql::guc::note_plpgsql_use();
     let written = source;
     let source = ProgramSource::capture(source, kind, positionals, &storage.execution_control)?;
-    let (parsed, code) = source.parse(arena, Some(written))?;
-    let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
-        resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
-    })?;
-    Ok((program, code))
+    crate::sql::error_context::within_plpgsql_compilation(name, || {
+        let (parsed, code) = source.parse(arena, Some(written))?;
+        let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
+            resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
+        })?;
+        Ok((program, code))
+    })
+}
+
+/// Checks the body of the PL/pgSQL routine `name` when it is created, as
+/// PostgreSQL's validator compiles it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validation names the routine, its body, its parameter scope and extra checks"
+)]
+fn validate_plpgsql_body<'a>(
+    name: &str,
+    body: &'a str,
+    arena: &'a Arena,
+    program_kind: PlpgsqlProgramKind,
+    positionals: u32,
+    storage: &Storage,
+    txid: u32,
+    has_parameter: &ParameterType<'_>,
+    check_shadowing: &mut dyn FnMut(&ParsedTriggerProgram<'_>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    crate::sql::error_context::within_plpgsql_compilation(name, || {
+        let program = parse_routine_program(body, arena, program_kind, positionals)?;
+        check_shadowing(&program)?;
+        resolve_plpgsql_program_locals(program, storage, txid, arena, has_parameter).map(drop)
+    })
+}
+
+/// Whether PL/pgSQL declares `name` for every routine of `kind`, and its
+/// type as far as assignment checks need it (a record or a scalar).
+fn plpgsql_special_variable(kind: PlpgsqlProgramKind, name: &str) -> Option<ColType> {
+    match (kind, name) {
+        (_, "found") => Some(ColType::Bool),
+        (PlpgsqlProgramKind::Trigger, "new" | "old") => Some(ColType::Record),
+        (
+            PlpgsqlProgramKind::Trigger,
+            "tg_name" | "tg_when" | "tg_level" | "tg_op" | "tg_relid" | "tg_relname"
+            | "tg_table_name" | "tg_table_schema" | "tg_nargs" | "tg_argv",
+        )
+        | (PlpgsqlProgramKind::EventTrigger, "tg_event" | "tg_tag") => Some(ColType::Text),
+        _ => None,
+    }
 }
 
 fn validate_plpgsql_variable_uses(
@@ -27750,6 +27930,33 @@ fn validate_plpgsql_variable_uses(
             // A parameter's label is its routine's name, which this check
             // does not know; execution resolves the label.
             None => has_parameter(target.name).map(|_| false),
+        }
+    }
+    /// Whether `target`, a known variable, may hold a row: a record, a
+    /// composite or a row variable. A loop's variable is not known here.
+    fn plpgsql_names_row(
+        target: PlpgsqlVariableName,
+        locals: &[TriggerLocalDecl],
+        mut shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &ParameterType<'_>,
+    ) -> bool {
+        let row = |ctype: ColType| matches!(ctype, ColType::Record | ColType::Composite(_));
+        while let Some(local) = shadowed {
+            if local.name == target.name {
+                return true;
+            }
+            shadowed = local.parent;
+        }
+        match locals.iter().rposition(|local| target.names(local)) {
+            Some(index) => match locals[index].alias {
+                Some(aliased) => {
+                    plpgsql_names_row(aliased, &locals[..index], None, has_parameter)
+                        || (aliased.label.is_none()
+                            && matches!(aliased.name.as_str(), "new" | "old"))
+                }
+                None => locals[index].record_shape.is_some() || row(locals[index].ctype),
+            },
+            None => has_parameter(target.name).is_none_or(row),
         }
     }
     /// An `ALIAS FOR` names a variable declared before it, a parameter, or
@@ -27810,6 +28017,22 @@ fn validate_plpgsql_variable_uses(
                     "variable \"{}\" is declared CONSTANT",
                     label.as_str()
                 )),
+                // Only a row or record variable has fields.
+                Some(false)
+                    if !plpgsql_names_row(
+                        PlpgsqlVariableName::plain(label),
+                        locals,
+                        shadowed,
+                        has_parameter,
+                    ) =>
+                {
+                    Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "\"{}.{}\" is not a known variable",
+                        label.as_str(),
+                        target.name.as_str()
+                    ))
+                }
                 Some(false) => Ok(()),
                 // A trigger function assigns a field of its `NEW` or `OLD`
                 // row.
@@ -27821,7 +28044,12 @@ fn validate_plpgsql_variable_uses(
                     target.name.as_str()
                 )),
             },
-            _ => Ok(()),
+            None => Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"{}\" is not a known variable",
+                target.name.as_str()
+            )),
+            Some(false) => Ok(()),
         }
     }
     fn validate_block(
@@ -28036,6 +28264,28 @@ fn validate_plpgsql_variable_uses(
                             arena,
                         )?;
                     } else {
+                        if statement.target.label.is_none()
+                            && binding_constant(statement.target, locals, shadowed, has_parameter)
+                                .is_none()
+                        {
+                            let error = sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "loop variable of loop over rows must be a record variable or list of scalar variables"
+                            );
+                            return Err(
+                                match plpgsql_target_text(
+                                    source,
+                                    Some("for"),
+                                    statement.target,
+                                    arena,
+                                ) {
+                                    Some(text) => {
+                                        crate::sql::error_position::at_subject(error, text)
+                                    }
+                                    None => error,
+                                },
+                            );
+                        }
                         reject(statement.target, Some("for"))?;
                         // A list names scalar variables only.
                         for target in statement.row_targets {
@@ -28379,18 +28629,12 @@ fn resolve_plpgsql_relation_type(
     })
 }
 
+#[cfg(test)]
 fn parse_trigger_program<'a>(
     body: &'a str,
     arena: &'a Arena,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::Trigger)
-}
-
-fn parse_event_trigger_program<'a>(
-    body: &'a str,
-    arena: &'a Arena,
-) -> Result<ParsedTriggerProgram<'a>, SqlError> {
-    parse_plpgsql_program(body, arena, PlpgsqlProgramKind::EventTrigger)
 }
 
 fn validate_plpgsql_parameter_names(parameters: &[RoutineParameterDef]) -> Result<(), SqlError> {
@@ -28431,6 +28675,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
     let (program, code) = compile_plpgsql_execution(
+        "inline_code_block",
         source,
         PlpgsqlProgramKind::Anonymous,
         0,
@@ -28506,6 +28751,7 @@ pub(crate) fn execute_event_trigger<'a>(
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
     let (program, code) = compile_plpgsql_execution(
+        routine.name.as_str(),
         routine.body.as_str(),
         PlpgsqlProgramKind::EventTrigger,
         0,
@@ -28754,6 +29000,7 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
         );
     }
     let (program, code) = compile_plpgsql_execution(
+        "inline_code_block",
         source,
         PlpgsqlProgramKind::Anonymous,
         0,
@@ -28795,6 +29042,7 @@ fn compile_plpgsql_procedure<'a>(
     arena: &'a Arena,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
     compile_plpgsql_execution(
+        routine.name.as_str(),
         routine.body.as_str(),
         PlpgsqlProgramKind::Procedure,
         routine_positionals(routine),
@@ -28878,6 +29126,7 @@ fn run_plpgsql_procedure<'a>(
         input_collation,
     )?;
     let (program, code) = compile_plpgsql_execution(
+        routine.name.as_str(),
         routine.body.as_str(),
         PlpgsqlProgramKind::Procedure,
         routine_positionals(routine),
@@ -35960,7 +36209,7 @@ fn trigger_diagnostic_str<'a>(
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
-            "RAISE diagnostic option cannot be null"
+            "RAISE statement option cannot be null"
         ));
     }
     datum_to_text(value, context.arena)
@@ -35976,7 +36225,7 @@ fn trigger_diagnostic_text<'a, const N: usize>(
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
-            "RAISE diagnostic option cannot be null"
+            "RAISE statement option cannot be null"
         ));
     }
     let value = StackStr::from_str(datum_to_text(value, context.arena)?);
@@ -35989,18 +36238,26 @@ fn trigger_diagnostic_text<'a, const N: usize>(
     Ok(value)
 }
 
+/// The SQLSTATE a `RAISE` reports, and for `USING ERRCODE` the text that
+/// named it, which is also its default message.
 fn trigger_raise_sqlstate<'a>(
     state: TriggerRaiseSqlState<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
     expressions: &mut StatementExpressions<'_>,
-) -> Result<crate::sql::eval::SqlState, SqlError> {
+) -> Result<(crate::sql::eval::SqlState, Option<&'a str>), SqlError> {
     match state {
-        TriggerRaiseSqlState::Parsed(state) => Ok(state),
+        TriggerRaiseSqlState::Parsed(state) => Ok((state, None)),
         TriggerRaiseSqlState::Expression(expression) => {
-            let code = trigger_diagnostic_text::<6>(expression, context, scope, expressions)?;
-            parse_trigger_raised_sqlstate(code.as_str())
-                .ok_or_else(|| invalid_trigger_sqlstate(code.as_str()))
+            let value = expressions.eval(context, expression, scope)?;
+            if value.is_null() {
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "RAISE statement option cannot be null"
+                ));
+            }
+            let code = datum_to_text(value, context.arena)?;
+            Ok((raised_errcode(code)?, Some(code)))
         }
     }
 }
@@ -39151,7 +39408,7 @@ fn execute_trigger_step_in<'a>(
                         &mut status.expressions,
                         &mut status.pending_query,
                     );
-                    let sqlstate =
+                    let (sqlstate, errcode) =
                         trigger_raise_sqlstate(raise.sqlstate, context, &scope, &mut expressions)?;
                     let message: &str = match raise.message {
                         Some(message) => {
@@ -39168,7 +39425,7 @@ fn execute_trigger_step_in<'a>(
                                 &scope,
                                 &mut expressions,
                             )?,
-                            None => sqlstate.as_str(),
+                            None => errcode.unwrap_or(sqlstate.as_str()),
                         },
                     };
                     let detail = raise
@@ -50447,9 +50704,17 @@ pub(crate) fn validate_routine_body(
                 } else {
                     PlpgsqlProgramKind::Function
                 };
-                let program = parse_routine_program(body_text, arena, program_kind, positionals)?;
-                check_shadowing(&program)?;
-                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+                validate_plpgsql_body(
+                    routine.name.name,
+                    body_text,
+                    arena,
+                    program_kind,
+                    positionals,
+                    storage,
+                    txn.txid,
+                    &has_parameter,
+                    &mut check_shadowing,
+                )?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
                 reject_sql_body_output_calls(
@@ -50528,9 +50793,17 @@ pub(crate) fn validate_routine_body(
                 } else {
                     PlpgsqlProgramKind::OutputFunction
                 };
-                let program = parse_routine_program(body_text, arena, program_kind, positionals)?;
-                check_shadowing(&program)?;
-                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+                validate_plpgsql_body(
+                    routine.name.name,
+                    body_text,
+                    arena,
+                    program_kind,
+                    positionals,
+                    storage,
+                    txn.txid,
+                    &has_parameter,
+                    &mut check_shadowing,
+                )?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
                         .then_some(result_column_count)
@@ -50614,9 +50887,17 @@ pub(crate) fn validate_routine_body(
                     "trigger functions require a string-literal body"
                 ));
             }
-            let program = parse_trigger_program(body_text, arena)?;
-            check_shadowing(&program)?;
-            resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+            validate_plpgsql_body(
+                routine.name.name,
+                body_text,
+                arena,
+                PlpgsqlProgramKind::Trigger,
+                0,
+                storage,
+                txn.txid,
+                &has_parameter,
+                &mut check_shadowing,
+            )?;
         }
         crate::storage::RoutineKind::EventTrigger => {
             if body_kind != crate::storage::RoutineBodyKind::String {
@@ -50625,9 +50906,17 @@ pub(crate) fn validate_routine_body(
                     "event trigger functions require a string-literal body"
                 ));
             }
-            let program = parse_event_trigger_program(body_text, arena)?;
-            check_shadowing(&program)?;
-            resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+            validate_plpgsql_body(
+                routine.name.name,
+                body_text,
+                arena,
+                PlpgsqlProgramKind::EventTrigger,
+                0,
+                storage,
+                txn.txid,
+                &has_parameter,
+                &mut check_shadowing,
+            )?;
         }
         crate::storage::RoutineKind::Procedure => {
             if body_kind == crate::storage::RoutineBodyKind::Return {
@@ -50643,14 +50932,17 @@ pub(crate) fn validate_routine_body(
                         "PL/pgSQL procedures require a string-literal body"
                     ));
                 }
-                let program = parse_routine_program(
+                validate_plpgsql_body(
+                    routine.name.name,
                     body_text,
                     arena,
                     PlpgsqlProgramKind::Procedure,
                     positionals,
+                    storage,
+                    txn.txid,
+                    &has_parameter,
+                    &mut check_shadowing,
                 )?;
-                check_shadowing(&program)?;
-                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
                 reject_sql_body_output_calls(

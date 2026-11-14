@@ -504,6 +504,18 @@ pub(crate) fn acl_identifier(name: &str) -> crate::util::StackStr<132> {
     quoted
 }
 
+/// Whether a cast to the polymorphic pseudo-type `type_name` keeps its
+/// operand unchanged, as PostgreSQL's `coerce_type` does for `anyelement`,
+/// `anynonarray`, `anycompatible` and `anycompatiblenonarray`: `Some(true)`
+/// when the operand must not be an array.
+pub(crate) fn unchanged_polymorphic_cast(type_name: &str) -> Option<bool> {
+    match type_name {
+        "anyelement" | "anycompatible" => Some(false),
+        "anynonarray" | "anycompatiblenonarray" => Some(true),
+        _ => None,
+    }
+}
+
 /// PostgreSQL pseudo-types that name routine contracts rather than values:
 /// built-in input functions take `cstring`, `format` takes `"any"`, handlers
 /// return `fdw_handler`. They identify routine signatures (`int4in(cstring)`

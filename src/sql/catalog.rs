@@ -5131,10 +5131,34 @@ pub(crate) fn validate_explicit_cast(
             super::eval::DefinedCastContext::Explicit,
         )?;
     }
+    let written_source = source;
     let source = storage
         .domain_base_type_for_oid(source, txid)
         .map_or(source, ColType::oid);
-    super::eval::validate_catalog_reference_cast(source, target)
+    let refused = || -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            format_type_name(storage, txid, written_source)?.as_str(),
+            format_type_name(storage, txid, target_oid)?.as_str()
+        ))
+    };
+    // An enum is reached only from a string, through its input.
+    if matches!(target, ColType::Enum(_))
+        && source != target.oid()
+        && source != super::types::oid::UNKNOWN
+        && ColType::from_oid(source).is_none_or(|source| super::types::type_category(source) != "S")
+    {
+        return refused();
+    }
+    // PostgreSQL names a domain target as written, not its base type.
+    super::eval::validate_catalog_reference_cast(source, target).or_else(|error| {
+        if target_oid != target.oid() && error.sqlstate.as_str() == sqlstate::CANNOT_COERCE {
+            refused()
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// PostgreSQL's `can_coerce_type` in assignment context: equal types,

@@ -7672,7 +7672,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 super::eval::NO_PARAMS,
                 sequences,
             )
-            .map(Some);
+            .map(Some)
+            .map_err(|error| {
+                // PostgreSQL names the domain, not its base type, when no
+                // cast reaches it.
+                let message = error.message.as_str();
+                match message.rfind(" to ") {
+                    Some(at)
+                        if error.sqlstate.as_str() == sqlstate::CANNOT_COERCE
+                            && message.starts_with("cannot cast type ") =>
+                    {
+                        sql_err!(
+                            sqlstate::CANNOT_COERCE,
+                            "{} to {}",
+                            &message[..at],
+                            crate::sql::type_name_miss::split_type_name(type_name).1
+                        )
+                    }
+                    _ => error,
+                }
+            });
         }
         if let Some(slot) = self.storage.resolve_composite_slot(type_name, self.txid) {
             return match value {

@@ -155,7 +155,8 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
             txid,
             arena,
         };
-        let (source_oid, _) = super::infer_type_res(expression, &columns)?;
+        let (source_oid, _) = super::infer_type_res(expression, &columns)
+            .map_err(|error| crate::sql::error_position::type_miss_within(error, expression))?;
         crate::sql::query::check_literal_operands_typed(
             expression,
             &|other| {
@@ -658,9 +659,9 @@ pub(super) fn resolve_default(
             sequences: None,
             merge_action: None,
         };
-        let source_oid =
-            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
-                .routine_argument_oid();
+        let source_oid = crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)
+            .map_err(|error| crate::sql::error_position::type_miss_within(error, expression))?
+            .routine_argument_oid();
         let target_oid = ctype.oid();
         if source_oid != crate::sql::types::oid::UNKNOWN
             && !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid)
@@ -733,7 +734,7 @@ pub(super) fn resolve_default(
     );
     // Only the verdict leaves; analysis scratch is discarded.
     unsafe { arena.rewind_to(mark) };
-    analysed?;
+    analysed.map_err(|error| crate::sql::error_position::type_miss_within(error, expression))?;
     let source = store_default_text(default_text)?;
     Ok(ColumnDefault::Expression(
         crate::sql::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
@@ -2000,6 +2001,50 @@ pub(super) fn attach_constraints(
                     expression_variables(expression, def)?
                 }
                 .single_column();
+                // PostgreSQL analyses the predicate when the constraint is
+                // defined: its names resolve and its result is boolean.
+                let analyse = || -> Result<(), SqlError> {
+                    let mark = arena.mark();
+                    let analysed = super::infer_type_res(
+                        expression,
+                        &super::CatalogCols {
+                            definition: Some(crate::storage::RelationDefinition::from_definition(
+                                def,
+                            )),
+                            alias: None,
+                            output_aliases: &[],
+                            storage,
+                            txid,
+                            arena,
+                        },
+                    )
+                    .and_then(|(type_oid, _)| {
+                        if type_oid == ColType::Bool.oid()
+                            || type_oid == crate::sql::types::oid::UNKNOWN
+                        {
+                            return Ok(());
+                        }
+                        Err(crate::sql::error_position::at_expression(
+                            sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "argument of CHECK must be type boolean, not type {}",
+                                crate::sql::catalog::format_type_name(storage, txid, type_oid)?
+                                    .as_str()
+                            ),
+                            expression,
+                        ))
+                    });
+                    // Only the verdict leaves; analysis scratch is discarded.
+                    unsafe { arena.rewind_to(mark) };
+                    analysed
+                };
+                if merge_equivalent {
+                    crate::sql::error_position::with_analysis(analyse)?;
+                } else {
+                    analyse().inspect_err(|error| {
+                        crate::sql::error_position::take_position(error);
+                    })?;
+                }
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,

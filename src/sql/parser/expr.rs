@@ -1941,12 +1941,17 @@ impl<'a> Parser<'a> {
             near: None,
             detail: None,
         };
+        // A type the catalog names (a domain, an enum) is reached by the cast
+        // that follows the call, which also reports a type that does not
+        // exist: JSON_QUERY and JSON_SERIALIZE convert their text through
+        // its input, a constructor casts its `json` result.
         let Some(column_type) = column_type else {
-            return Err(failure(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                format_args!("SQL/JSON RETURNING type \"{type_name}\" is not supported"),
-                None,
-            ));
+            return Ok(match function {
+                SqlJsonReturning::Query | SqlJsonReturning::Serialize => {
+                    ("text", type_name, type_mod)
+                }
+                SqlJsonReturning::Constructor => ("json", type_name, type_mod),
+            });
         };
         let name = column_type.name();
         match (function, result) {
@@ -1968,13 +1973,8 @@ impl<'a> Parser<'a> {
                 ))?;
                 return Ok(default);
             }
-            (SqlJsonReturning::Query, None) => {
-                return Err(failure(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    format_args!("JSON_QUERY RETURNING {name} is not supported"),
-                    None,
-                ));
-            }
+            // Any other type takes the result's text through its input.
+            (SqlJsonReturning::Query, None) => return Ok(("text", type_name, type_mod)),
         }
         Ok((result.expect("checked above"), type_name, type_mod))
     }
@@ -2031,6 +2031,17 @@ impl<'a> Parser<'a> {
             _ => unreachable!(),
         };
         let call = self.plain_call(name, args)?;
+        // PostgreSQL reports a refused conversion to a catalog type without
+        // a cursor.
+        if crate::sql::types::ColType::from_sql_name(type_name).is_none() {
+            return self.arena_expr(Expr::Cast {
+                source_position: SourcePosition::UNKNOWN,
+                binding: CastBinding::Resolve,
+                operand: call,
+                type_name,
+                type_mod,
+            });
+        }
         if result != "text" || (type_name.eq_ignore_ascii_case("text") && type_mod < 0) {
             return Ok(call);
         }
@@ -2433,6 +2444,14 @@ impl<'a> Parser<'a> {
         self.push(&mut args, wrapper_expr)?;
         let quotes_expr = self.arena_expr(Expr::Str(quotes))?;
         self.push(&mut args, quotes_expr)?;
+        // A text-family result converts to its RETURNING type inside the
+        // call, so the conversion's failure takes the ON ERROR behavior.
+        if result == "text" {
+            let type_name_expr = self.arena_expr(Expr::Str(type_name))?;
+            self.push(&mut args, type_name_expr)?;
+            let type_mod_expr = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+            self.push(&mut args, type_mod_expr)?;
+        }
         let call = self.plain_call(
             match result {
                 "json" => "__json_query_json",
@@ -2958,7 +2977,7 @@ impl<'a> Parser<'a> {
         if result == "bytea" {
             return self.plain_call("__json_serialize_bytea", &[aggregate]);
         }
-        if result == "text" {
+        if result == "text" || crate::sql::types::ColType::from_sql_name(type_name).is_none() {
             let aggregate = self.sql_json_assignment_fit(aggregate, type_name, type_mod)?;
             return self.arena_expr(Expr::Cast {
                 source_position,

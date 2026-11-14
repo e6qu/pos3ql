@@ -848,6 +848,44 @@ pub(crate) fn parse_query_with_string_parameters<'a>(
         })
 }
 
+/// Parses a PL/pgSQL expression, keeping the grammar error and its cursor
+/// so the routine can position it in its body.
+pub(crate) fn parse_procedural_expression<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    let expression = parser.expression(0)?;
+    if parser.peeked != Tok::Eof {
+        return Err(parser.syntax_error_here());
+    }
+    Ok(expression)
+}
+
+/// Checks that a PL/pgSQL statement parses as SQL, keeping the grammar
+/// error and its cursor.
+pub(crate) fn parse_procedural_statement(sql: &str, arena: &Arena) -> Result<(), ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    while parser.next_stmt()?.is_some() {}
+    Ok(())
+}
+
+/// Parses a PL/pgSQL query, keeping the grammar error and its cursor.
+pub(crate) fn parse_procedural_query<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    let select = parser.query_select()?;
+    if parser.peeked != Tok::Eof {
+        return Err(parser.syntax_error_here());
+    }
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| parser.arena_full("query too large for SQL arena"))
+}
+
 /// Cursor plans contain exactly one command. Parse the complete input before
 /// checking that boundary, so a later syntax error retains its SQLSTATE.
 pub(crate) fn parse_cursor_command<'a>(
@@ -4381,13 +4419,38 @@ impl<'a> Parser<'a> {
         };
         // PostgreSQL expands only an unqualified FROM UNNEST with multiple
         // positional inputs into independent catalog calls in lockstep.
+        // A column definition list follows the arrays as a last argument.
+        let definitions_at = match source.func_args.and_then(|arguments| arguments.last()) {
+            Some(Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name: "__json_record_columns",
+                source_position,
+                ..
+            }) => Some(source_position.get()),
+            _ => None,
+        };
         if source.schema.is_none()
             && source.table == "unnest"
             && !source.func_variadic
             && source.func_argument_names.is_empty()
             && let Some(arguments) = source.func_args
-            && arguments.len() > 1
+            && arguments.len() - usize::from(definitions_at.is_some()) > 1
         {
+            if let Some(at) = definitions_at {
+                return Err(ParseError {
+                    at: at.unwrap_or(self.peek_at),
+                    message: StackStr::from_str(
+                        "UNNEST() with multiple arguments cannot have a column definition list",
+                    ),
+                    near: None,
+                    sqlstate: sqlstate::SYNTAX_ERROR,
+                    cursor: at,
+                    hint: Some(
+                        "Use separate UNNEST() calls inside ROWS FROM(), and attach a column definition list to each one.",
+                    ),
+                    detail: None,
+                });
+            }
             let mut functions = ArenaList::new(self.arena);
             for argument in arguments {
                 let input = self.arena_slice(&[*argument])?;

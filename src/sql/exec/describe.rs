@@ -657,6 +657,17 @@ pub(crate) fn visit_catalog_rowtype_fields(
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
+    fn missing_type(&self, type_name: &str) -> Option<SqlError> {
+        Some(
+            crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                self.storage,
+                self.txid,
+                type_name,
+            )
+            .error(),
+        )
+    }
+
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         crate::sql::catalog::validate_enum_input_literal(
             self.storage,
@@ -2123,6 +2134,12 @@ pub trait ColTypeResolver {
     /// True only when no relation scope can answer a column reference.
     fn is_empty_scope(&self) -> bool {
         false
+    }
+
+    /// The error for a cast's type name no type of this scope's catalog
+    /// has; `None` when the scope has no catalog to tell.
+    fn missing_type(&self, _type_name: &str) -> Option<SqlError> {
+        None
     }
 
     fn type_name_fixed(
@@ -5710,8 +5727,12 @@ pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
-    infer_type_unpositioned(expression, columns)
-        .map_err(|error| crate::sql::error_position::expression_error(error, expression))
+    infer_type_unpositioned(expression, columns).map_err(|error| {
+        crate::sql::error_position::type_miss_within(
+            crate::sql::error_position::expression_error(error, expression),
+            expression,
+        )
+    })
 }
 
 fn infer_type_unpositioned(
@@ -6051,6 +6072,22 @@ fn infer_type_unpositioned(
         {
             infer_type_res(operand, columns)?
         }
+        // So does a cast to `anyelement` and its kin; an untyped literal
+        // stays `unknown`.
+        Expr::Cast {
+            operand, type_name, ..
+        } if let Some(nonarray) = crate::sql::types::unchanged_polymorphic_cast(type_name) => {
+            let (type_oid, len) = infer_type_res(operand, columns)?;
+            if nonarray && matches!(coltype_of_oid(type_oid), Some(ColType::Array(_))) {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type {} to {}",
+                    coltype_of_oid(type_oid).map_or("record", ColType::name),
+                    type_name
+                ));
+            }
+            (type_oid, len)
+        }
         Expr::Cast {
             operand, type_name, ..
         } => {
@@ -6133,8 +6170,13 @@ fn infer_type_unpositioned(
             }
             match ColType::from_sql_name(type_name) {
                 Some(t) => of(t),
-                // A resolver without a catalog cannot identify a user type.
-                None => (oid::UNKNOWN, -2),
+                None => match columns.missing_type(type_name) {
+                    Some(error) => {
+                        return Err(crate::sql::error_position::at_reference(error, type_name));
+                    }
+                    // A resolver without a catalog cannot identify a user type.
+                    None => (oid::UNKNOWN, -2),
+                },
             }
         }
         Expr::IsNull { operand, .. } => {

@@ -101064,6 +101064,8 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
         };
         let (table, _, _) = row.local_parts();
         let layout = retained_rows.layout(table)?;
+        crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0))
+            .checkpoint();
         let qualified = conditions.qualify(
             storage,
             txn.txid,
@@ -101074,6 +101076,14 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             self.hash,
             arena,
         )?;
+        // The target's scan, as EXPLAIN ANALYZE counts its filter.
+        let scan =
+            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
+        if qualified.is_some() {
+            scan.row();
+        } else {
+            scan.filtered();
+        }
         let Some(joined) = qualified else {
             retained_rows.set_current_joined(row, None);
             return Ok(None);
@@ -101237,7 +101247,10 @@ pub(super) fn collect_matches<'a>(
                             error
                         )
                     })?;
-                scan.row();
+                // A candidate counts when the change loop qualifies it.
+                if selection == DmlSelection::Qualified {
+                    scan.row();
+                }
             } else {
                 scan.filtered();
             }

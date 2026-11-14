@@ -80,6 +80,9 @@ struct PlanNode {
     /// The subplans this node is nested in: PostgreSQL indents each
     /// subplan two columns past its parent's children.
     shift: u8,
+    /// A `Subquery Scan` that returns every row of its child unchanged,
+    /// reported with its child's figures.
+    passthrough: bool,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -265,6 +268,7 @@ impl PlanNode {
         schema: StackStr::new(),
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
 }
 
@@ -407,6 +411,7 @@ impl<'a> Plan<'a> {
         let counters = arena
             .alloc_slice_with(self.count, |index| slots[index].counters())
             .map_err(|_| query::arena_full_pub())?;
+        mirror_passthrough(nodes, counters);
         self.measured = Some(counters);
         Ok(result)
     }
@@ -420,7 +425,7 @@ impl<'a> Plan<'a> {
         let node = &self.nodes[index];
         let counters = self
             .measured
-            .filter(|_| node.key.is_some())
+            .filter(|_| node.key.is_some() || node.passthrough)
             .map(|measured| measured[index])
             .map(|mut counters| {
                 // Execution filters a `VALUES` list's rows as it builds them:
@@ -2742,6 +2747,7 @@ fn scan_node<'a>(
         schema,
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -4956,6 +4962,7 @@ fn physical_scan_node(
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
         subplan: None,
         shift: 0,
+        passthrough: false,
     }
 }
 
@@ -5111,6 +5118,7 @@ fn push_set_tree(
                 schema: StackStr::new(),
                 subplan: None,
                 shift: 0,
+                passthrough: false,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -5555,6 +5563,7 @@ pub(super) fn plan_modification<'a>(
             .unwrap_or_default(),
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -7208,11 +7217,28 @@ pub(super) fn analyze_rewritten<'a, R>(
             let counters = arena
                 .alloc_slice_with(plan.count, |index| slots[start + index].counters())
                 .map_err(|_| query::arena_full_pub())?;
+            mirror_passthrough(&plan.nodes[..plan.count], counters);
             plan.measured = Some(counters);
             start += plan.count;
         }
     }
     Ok(result)
+}
+
+/// Gives each passthrough `Subquery Scan` the figures of its child, the
+/// node after it, from the last such scan up.
+fn mirror_passthrough(nodes: &[PlanNode], counters: &mut [NodeCounters]) {
+    for index in (0..nodes.len().saturating_sub(1)).rev() {
+        if nodes[index].passthrough {
+            let child = counters[index + 1];
+            counters[index] = NodeCounters {
+                hash: None,
+                sort: None,
+                stored: None,
+                ..child
+            };
+        }
+    }
 }
 
 /// EXPLAIN of a statement a rewrite rule changes: each query the rule

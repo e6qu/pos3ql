@@ -1457,10 +1457,16 @@ fn write_extension_qualified_identifier<const N: usize>(
 }
 
 pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
+    let returned = |items: &[ast::SelectItem<'_>]| {
+        if items.is_empty() { 0 } else { emitted_rows }
+    };
     match statement {
-        // PostgreSQL's ModifyTable node reports zero output rows even when its
-        // RETURNING projection sends rows to the client.
-        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => 0,
+        // PostgreSQL's ModifyTable node returns the rows of its RETURNING
+        // list, and none without one.
+        Stmt::Insert(insert) => returned(insert.returning.items),
+        Stmt::Update(update) => returned(update.returning.items),
+        Stmt::Delete(delete) => returned(delete.returning.items),
+        Stmt::Merge(merge) => returned(merge.returning.items),
         Stmt::With { statement, .. } => explained_root_rows(statement, emitted_rows),
         _ => emitted_rows,
     }
@@ -18128,6 +18134,37 @@ impl Engine {
             // A rejected shape owns no retained reader or arena description.
             unsafe { arena.rewind_to(mark) };
         }
+        self.execute_select_attempts(
+            statement,
+            arena,
+            params,
+            source_snapshot,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )
+    }
+
+    /// Runs a read-only SELECT in attempts: an attempt that stops for a
+    /// routine call the resumable executor runs (a PL/pgSQL function)
+    /// withdraws its output, the call completes, and the next attempt
+    /// replays every completed call's result. `EXPLAIN ANALYZE` counts the
+    /// last attempt, which runs the whole statement.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_attempts(
+        &mut self,
+        statement: &ast::Select<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        source_snapshot: u32,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         let invocations = query::RoutineInvocationState::new(
             arena,
             crate::sql::query::RoutineExecution::StatementReplay,
@@ -18143,6 +18180,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
+            query::instrument::restart();
             let output_mark = responder.attempt_mark();
             let outcome = self.execute_select_once(
                 statement,
@@ -18742,6 +18780,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
+            query::instrument::restart();
             let attempt_arena_mark = arena.mark();
             let attempt_mark = responder.attempt_mark();
             let output_mark = attempt_mark.output();
@@ -19048,6 +19087,8 @@ impl Engine {
         if let Err(error) = invocations.require_replay() {
             return Ok(Err(error));
         }
+        // The routine's own statements are not part of an analyzed plan.
+        let _instrument = query::instrument::suspend();
         if let query::PendingRoutineTarget::WriteQuery(write) = pending.target {
             return type_input_plans::with_owner(pending.plan_owner, || {
                 self.complete_pending_write(
@@ -19342,6 +19383,7 @@ impl Engine {
         let Some(call) = invocations.suspended.borrow_mut().take() else {
             return Ok(Err(query::inactive_pending_call()));
         };
+        let _instrument = query::instrument::suspend();
         let query::SuspendedRoutineCall {
             mut body,
             timing,
@@ -20905,80 +20947,55 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        match statement {
-            Stmt::Select(select) => self.execute_select_once(
-                select,
-                arena,
-                params,
-                txn,
-                (sqlprep, cursors),
-                guc,
-                None,
-                responder,
-            ),
+        // The statement runs on the resumable executor, as when it is not
+        // explained, so routines that need it (PL/pgSQL) run in its attempts.
+        let select = match statement {
+            Stmt::Select(select) => Some(select),
             // A set query runs as the Select form subqueries carry, so its
             // data-modifying CTEs and routine calls run as a SELECT's do.
             Stmt::SetQuery(query) => match query::set_query_select(query, arena) {
-                Ok(select) => self.execute_select_once(
+                Ok(select) => Some(select),
+                Err(error) => return Ok(Err(error)),
+            },
+            _ => None,
+        };
+        match statement {
+            Stmt::Select(_) | Stmt::SetQuery(_)
+                if select.is_some_and(|select| select.with.iter().all(|cte| cte.dml.is_none())) =>
+            {
+                let select = select.expect("a SELECT is selected");
+                let source_snapshot = txn.command_id().saturating_add(1);
+                self.execute_select_attempts(
                     select,
                     arena,
                     params,
+                    source_snapshot,
                     txn,
-                    (sqlprep, cursors),
-                    guc,
-                    None,
-                    responder,
-                ),
-                Err(error) => Ok(Err(error)),
-            },
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                let connection_id = self.work.connection_id();
-                let (work, row_buffers) = self.work.cursor_parts();
-                Self::execute_data_modification(
-                    &mut self.storage,
-                    &mut self.dml_scratch,
-                    work,
-                    statement,
-                    exec::DmlAuthorization::Invoker,
-                    txn,
-                    params,
-                    guc,
+                    sqlprep,
                     cursors,
-                    row_buffers,
+                    guc,
                     responder,
-                    None,
-                    None,
-                    connection_id,
                 )
             }
-            Stmt::Merge(_) => {
-                let (work, row_buffers) = self.work.cursor_parts();
-                Self::execute_merge(
-                    &mut self.storage,
-                    work,
-                    statement,
-                    txn,
+            Stmt::Select(_) | Stmt::SetQuery(_) => {
+                let select = select.expect("a SELECT is selected");
+                self.execute_modification_resumable(
+                    &Stmt::Select(*select),
+                    arena,
                     params,
-                    guc,
+                    txn,
+                    sqlprep,
                     cursors,
-                    row_buffers,
+                    guc,
                     responder,
-                    None,
-                    None,
                 )
             }
-            Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes,
-                statement,
-                arena,
-                params,
-                txn,
-                (sqlprep, cursors),
-                guc,
-                responder,
-                None,
-                None,
-                None,
+            Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::Merge(_)
+            | Stmt::With { .. } => self.execute_modification_resumable(
+                statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,

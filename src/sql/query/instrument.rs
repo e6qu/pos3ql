@@ -225,6 +225,9 @@ pub(crate) struct Slot {
     open: u32,
     started: Option<std::time::Instant>,
     first_row: Option<u64>,
+    /// Rows a write's change loop finished qualifying or removing, which a
+    /// later attempt does not see again: [`restart`] keeps them.
+    carried: Option<(u64, u64)>,
 }
 
 impl Slot {
@@ -245,6 +248,7 @@ impl Slot {
             open: 0,
             started: None,
             first_row: None,
+            carried: None,
         }
     }
 
@@ -325,6 +329,32 @@ pub(crate) fn next_query() {
         BLOCK.with(|block| block.set(BlockId::ROOT.child(Segment::Query(position))));
         registry.next_query = Some(position.saturating_add(1));
     }
+}
+
+/// Starts another attempt of the analyzed statement, which runs it again
+/// from its first row after an earlier attempt stopped for a routine call:
+/// the counters restart, so they report the attempt that completes.
+pub(crate) fn restart() {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; no `Node` of the statement is open between
+    // attempts, and nothing else borrows the registry here.
+    let registry = unsafe { registry.as_mut() };
+    let slots = unsafe { &mut *registry.slots.as_ptr() };
+    for slot in slots.iter_mut() {
+        let carried = slot.carried;
+        *slot = Slot::new(slot.key);
+        if let Some((rows, filtered)) = carried {
+            slot.carried = carried;
+            slot.counters.rows = rows;
+            slot.counters.filtered = filtered;
+        }
+    }
+    if registry.next_query.is_some() {
+        registry.next_query = Some(0);
+    }
+    BLOCK.with(|block| block.set(BlockId::ROOT));
 }
 
 /// Hides the counters from statements a routine or trigger body runs, until
@@ -487,6 +517,16 @@ impl Node {
     pub(crate) fn stored(self, bytes: usize) {
         self.with(|slot, _| {
             slot.counters.stored = Some(slot.counters.stored.map_or(bytes, |held| held.max(bytes)));
+        });
+    }
+
+    /// Marks the start of a candidate row in a write's change loop: the
+    /// rows qualified or removed before it are final. An attempt that
+    /// resumes the write starts at the row it left unfinished, so
+    /// [`restart`] keeps the counts up to that row's start.
+    pub(crate) fn checkpoint(self) {
+        self.with(|slot, _| {
+            slot.carried = Some((slot.counters.rows, slot.counters.filtered));
         });
     }
 

@@ -384,14 +384,15 @@ fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
             "{predicate}"
         );
     }
-    // A routine call in the constructor is evaluated per row instead.
+    // An immutable call in the constructor folds too (PostgreSQL 18.6
+    // probes the key with `'(7,x7)'::wr`).
     assert_eq!(
         rows(
             &mut engine,
             &mut budget,
             "EXPLAIN (COSTS OFF) SELECT a FROM wr WHERE wr = ROW(abs(-7), 'x7')::wr",
         ),
-        vec!["Seq Scan on wr"]
+        vec!["Index Scan using wr_row on wr"]
     );
     rows(
         &mut engine,

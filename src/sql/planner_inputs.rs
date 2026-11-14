@@ -1045,7 +1045,7 @@ impl Engine {
         ancestors: &[i32],
     ) -> Result<Result<(), SqlError>, WireFull> {
         // A top-level statement that folds its constants reports their
-        // arithmetic errors where its folding reaches them.
+        // data exceptions where its folding reaches them.
         let folds = ancestors.is_empty()
             && outer.is_none()
             && matches!(

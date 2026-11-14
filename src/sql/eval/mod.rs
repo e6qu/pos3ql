@@ -543,8 +543,9 @@ std::thread_local! {
 /// Runs planning-input discovery of a statement whose execution folds its
 /// constants (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Discovery classifies
 /// constants before the statement folds them, in its own order; a constant
-/// whose arithmetic fails there is the statement's error where PostgreSQL's
-/// planner folds it, after the warnings of the constants folded before it.
+/// whose evaluation fails there with a data exception is the statement's
+/// error where PostgreSQL's planner folds it, after the warnings of the
+/// constants folded before it.
 /// The folding raises it (see [`finish_folding`]).
 pub fn defer_fold_errors<R>(run: impl FnOnce() -> R) -> R {
     let previous = DEFER_FOLD_ERRORS.with(|defer| defer.replace(true));
@@ -554,14 +555,12 @@ pub fn defer_fold_errors<R>(run: impl FnOnce() -> R) -> R {
 }
 
 /// Defers `error`, raised while discovery classified a constant of the
-/// statement itself, when discovery defers folding errors: the arithmetic
-/// errors constant folding raises (`1/0`, overflow).
+/// statement itself, when discovery defers folding errors: the data
+/// exceptions constant folding raises (`1/0`, overflow, bad arguments).
 pub fn defer_fold_error(error: SqlError) -> Result<(), SqlError> {
     let deferrable = DEFER_FOLD_ERRORS.with(core::cell::Cell::get)
-        && matches!(
-            error.sqlstate.as_str(),
-            sqlstate::DIVISION_BY_ZERO | sqlstate::NUMERIC_OUT_OF_RANGE
-        );
+        && error.sqlstate.internal_control().is_none()
+        && error.sqlstate.as_str().starts_with("22");
     if !deferrable {
         return Err(error);
     }

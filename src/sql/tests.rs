@@ -34993,9 +34993,9 @@ fn integer_settings_parse_and_show_like_postgresql() {
         ("'1e2'", "100ms"),
         ("'+5'", "5ms"),
     ] {
-        let out = run(&format!(
-            "SET statement_timeout = {value}; SHOW statement_timeout"
-        ));
+        // lock_timeout parses as statement_timeout does, but a tiny value
+        // cannot cancel the SHOW that follows it on a slow runner.
+        let out = run(&format!("SET lock_timeout = {value}; SHOW lock_timeout"));
         assert!(
             out.contains(shown) && !out.contains("ERROR"),
             "{value}: {out}"

@@ -474,9 +474,14 @@ user-defined btree class, a `COLLATE`, and, under btree, `DESC` and `NULLS
 FIRST/LAST`; its operator may be user-defined when the class's family holds
 it, and runs through the operator's function. Operator class options on an
 element fail with `0A000`. `ALTER COLUMN ... TYPE` keeps the
-OIDs of the key and exclusion indexes over the column, where PostgreSQL
-rebuilds them with new OIDs, so after it a row that violates two
-constraints can report the other one first. `DROP COLUMN` of a column an
+OIDs of everything over the column, where PostgreSQL's
+`ATPostAlterTypeCleanup` rebuilds them with new OIDs: the key, exclusion and
+explicit indexes and their constraints, `CHECK` constraints, foreign keys
+that reference the column's key or include the column (and so their RI
+triggers) and extended statistics. After it a row that violates two
+constraints can report the other one first. Giving a rebuilt index a new
+OID means re-keying its physical value binding, whose identity is the
+index's creation stamp, as `REINDEX` does when it swaps in a built copy. `DROP COLUMN` of a column an
 exclusion expression or predicate reads lists those constraints in their own
 `2BP01` report, separately from views, policies and routines that also depend
 on the column, and reports `cannot drop column ...` where PostgreSQL, when
@@ -600,7 +605,11 @@ and adds `remote SQL command: ...`, as postgres_fdw reports it; the remote
 command differs from postgres_fdw's own (an `INSERT` reads back
 `RETURNING ctid::text` and every column, and a scan reads the whole table
 with one plain `SELECT` where postgres_fdw declares a cursor and fetches
-`fetch_size` rows at a time), and `batch_size` is not honored. `CREATE
+`fetch_size` rows at a time), and `batch_size` is not honored. The read-back
+only tells an inserted row from one `ON CONFLICT DO NOTHING` skipped and
+feeds the local `RETURNING` list and row triggers; postgres_fdw's text needs
+the caller to name the columns those read and to take the row count from the
+command tag. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per
@@ -623,8 +632,12 @@ operator, as PostgreSQL's operator families do. It does not yet turn a
 `C`, `>=`/`<`) index range with the pattern kept as a filter, nor scan a
 pattern-class key for an explicit `~<~`-family range: those keys get their
 own physical binding, whose range plans need PostgreSQL's prefix and
-histogram selectivity to choose its bitmap scan; `=` on a pattern-class key
-shows `Index Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
+histogram selectivity to choose its bitmap scan. Any B-tree range (`id >= 5
+AND id < 9`, also under `enable_seqscan = off`) is planned as a sequential
+scan until its value binding is durably complete, so a range derived from a
+prefix would show only on spilled tables. `=` on a B-tree key whose columns
+cover the query shows `Index Scan` where PostgreSQL shows `Index Only Scan`;
+EXPLAIN names an index-only scan only for an ordered plan. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). A PL/pgSQL assignment to a
 nested field (`r.a.b := 1` or `label.r.a.b := 1`) fails when the routine is
 compiled (`42601` or `0A000`), where PostgreSQL assigns a field of a

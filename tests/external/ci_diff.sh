@@ -866,7 +866,7 @@ foreign_hidden=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 \
   -c 'SET ROLE pos3ql_fdw_observer; SELECT bool_and(umoptions IS NULL) FROM pg_user_mapping' \
   2>/dev/null)
-if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n3\n4\n6\n7\n8\n9' \
+if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3\n4\n6\n7' \
       && $foreign_denied_status -ne 0 && $foreign_merge_denied_status -ne 0 \
       && "$foreign_hidden" == t ]]; then
   ok "foreign scans and MERGE enforce privileges and hide other mappings"

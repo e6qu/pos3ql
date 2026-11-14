@@ -510,14 +510,21 @@ folds `RETURNING`, each action's assignments or values and condition, then
 its join condition, before its statement triggers fire. Folding gaps
 remain: aggregate arguments, window specifications, `FROM` subqueries and a
 `MERGE` into a view are evaluated where they run; join conditions inside a
-parenthesized join are not folded; a parameter of a custom plan does not fold; a literal conversion
-in a prepared statement raises its notice at each `EXECUTE` where
-PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
-prepared statement to keep every converted literal, not only the typed
-inputs it keeps today; a statement a routine runs folds at each run where
+parenthesized join are not folded; a parameter of a custom plan does not fold; a statement a routine runs folds at each run where
 PostgreSQL folds its cached plan once per session; and PostgreSQL's
 selectivity estimate, which evaluates a stable call compared with an indexed
 column once more while planning, is not modeled.
+`PREPARE` converts each literal as PostgreSQL's parse analysis does: a
+literal cast to a built-in type (`''::tsquery`, `int4 '7'`, `'{1}'::int[]`)
+and an untyped literal the analysis converts (an inserted or assigned value,
+a comparison operand, a built-in routine's argument) run their input
+function once there, raising its notice or error, and the prepared
+statement keeps the converted values (with its text, in its
+`prepared_bytes` slot; more fails with `54000`), which each `EXECUTE` reads.
+A cast's length coercion (`'123.45'::numeric(3,1)`) and constant folding
+(`1/0`) run when the statement is planned, at each `EXECUTE`. Remaining: a
+statement prepared through the extended protocol's Parse still converts its
+literals at each Execute, and an input notice carries no cursor position.
 `UPDATE` and `DELETE` whose conditions (`WHERE`, `FROM` or `USING` items, or
 row-security policies) call a user routine or a volatile built-in qualify
 each candidate row in their change loop, just before changing it, as
@@ -545,15 +552,17 @@ after the relation's own conditions, except that a write runs it first
 when an index leads with its column, as PostgreSQL's plan then reads the
 subquery's rows and probes the index. Under row security each policy condition runs
 before the statement's conditions, except that a leakproof conjunct of a
-single-relation query or write cheaper than ten operators and than the first
-policy condition runs before the policies. A foreign table's candidate
+single-relation query or write cheaper than ten operators runs before the
+first policy condition when it costs less, and right after it otherwise,
+as PostgreSQL's `order_qual_clauses` sorts by security level and cost; a
+write's WITH CHECK options test the OR of the permissive policies before
+each restrictive one. `EXPLAIN` of a single-relation query prints the
+policy conditions in its scan's `Filter` in that order. A foreign table's candidate
 rows are read again by their remote row identity and qualified in the
 change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
 ... USING` whose target reaches a foreign table's rows qualifies them
-before any change; such a leakproof conjunct that costs at
-least as much as the first policy condition runs after every policy
-condition, where PostgreSQL runs it right after the first; `EXPLAIN` prints
-a scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
+before any change; `EXPLAIN` of `UPDATE` and `DELETE` prints the target
+scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
 `DELETE ... USING` cost a routine reading a joined item's column as one
 operator; a data-modifying `WITH` sub-statement runs ahead of the main
 statement (above). A rule action reads the triggering statement's
@@ -561,10 +570,16 @@ expression for each `OLD` or `NEW` reference it (or its rule's condition)
 makes, as PostgreSQL's rewriter substitutes them: it evaluates only the
 `SET` expressions, single `VALUES` row expressions and column defaults it
 reads, once per reference, while an `INSERT` reading a query or several
-`VALUES` rows evaluates each input column once per row. Those expressions
-form a derived relation the action reads, which is evaluated for every row
-before the action's own expressions run, where PostgreSQL interleaves them
-row by row. A policy that a write's `UPDATE` (or `DELETE`)
+`VALUES` rows evaluates each input column once per row. An action reading
+only those expressions evaluates them row by row, interleaved with its own
+expressions, and an `INSERT ... SELECT` statement's query without volatile
+output is pulled up into it the same way. Remaining: an action that also
+reads other relations (its own `FROM`, an `UPDATE` or `DELETE` action, or
+several `VALUES` rows), and an `INSERT` statement whose query has volatile
+output, read a derived relation evaluated for every row first, where
+PostgreSQL's subquery scan streams it; an `INSERT ... SELECT` whose
+condition and output both call routines evaluates every row's condition
+before the outputs. A policy that a write's `UPDATE` (or `DELETE`)
 and `SELECT` commands share runs once per row, as PostgreSQL's
 `list_append_unique` keeps it; each command's restrictive policies run
 before the OR of its permissive ones, which stops at the first that passes.
@@ -576,9 +591,16 @@ row security applies to the user, as PostgreSQL decides; otherwise a unique
 violation has no detail and the others say `Key conflicts with existing
 key.`, `Key is not present in table "p".` or `Key is still referenced from
 table "c".`. A NOT NULL, CHECK or view check option violation's `Failing row
-contains (...)` still lists every column, where PostgreSQL lists only the
-columns the user may read or the statement wrote, as `(a, c) = (1, 3)`, and
-none under row security; that needs the written columns at each check.
+contains (...)` follows `ExecBuildSlotValueDescription`: a user without
+`SELECT` on the table sees only the columns they may read or the statement
+wrote, named (`(a, c) = (1, 3)`), no detail when there are none, and none
+while row security applies. The written columns are an `INSERT`'s (or
+`COPY`'s) target columns, an `UPDATE`'s `SET` columns, those of every
+`MERGE` action and, under `ON CONFLICT DO UPDATE`, both. Remaining: an
+`INSERT ... SELECT *` without a column list counts every column as written,
+and a view written through `INSTEAD OF` triggers and a subscription's
+applied rows list every column. Revoking a table privilege revokes it on
+each column too.
 Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
 its cost-based plan: a query or data change on one table whose condition

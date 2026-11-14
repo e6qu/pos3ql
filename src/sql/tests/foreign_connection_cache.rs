@@ -500,6 +500,7 @@ fn explain_verbose_shows_postgres_fdw_remote_sql() {
             "  Remote SQL: INSERT INTO public.ft(id, note) VALUES ($1, $2)",
             "  Batch Size: 1",
             "  ->  Result",
+            "        Output: 1, 'a'::text",
         ]
     );
 }

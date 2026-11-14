@@ -1601,7 +1601,8 @@ impl<'a> ForeignSelectPlan<'a> {
     ) -> Result<&'a Select<'a>, SqlError> {
         let mut local = *statement;
         local.where_clause = self.local_where;
-        if self.order_pushed {
+        // `WITH TIES` reads the order to find the ties it keeps.
+        if self.order_pushed && !statement.with_ties {
             local.order_by = &[];
         }
         if self.limit_pushed {

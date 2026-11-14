@@ -61,6 +61,9 @@ pub(crate) struct Context<'s> {
     /// The base type OID of the domain whose constraint is printed, which
     /// `VALUE` has.
     pub domain_value: Option<i32>,
+    /// Print a planned expression, as EXPLAIN does: the planner folds a
+    /// coerced numeric literal into a constant of the coerced type.
+    pub folded: bool,
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -222,6 +225,32 @@ pub(crate) fn deparse<'a>(
 
 /// Deparses a parsed expression, such as one whose names were bound to the
 /// catalog identities they captured at CREATE.
+/// The text of a numeric literal, negated or not.
+fn numeric_literal_text(expression: &Expr<'_>) -> Option<crate::util::StackStr<64>> {
+    let mut text = crate::util::StackStr::<64>::new();
+    let (negative, literal) = match expression {
+        Expr::Unary {
+            operator: UnaryOp::Neg,
+            operand,
+            ..
+        } => (true, *operand),
+        literal => (false, literal),
+    };
+    if negative {
+        let _ = text.write_char('-');
+    }
+    match literal {
+        Expr::Int(value) => {
+            let _ = write!(text, "{value}");
+        }
+        Expr::NumericLit(written) => {
+            let _ = text.write_str(written);
+        }
+        _ => return None,
+    }
+    (!text.is_truncated()).then_some(text)
+}
+
 pub(crate) fn deparse_expression<'a>(
     context: &Context<'_>,
     expression: &Expr<'_>,
@@ -865,6 +894,21 @@ impl Context<'_> {
         match (natural, expected) {
             // A row is a `record` without a coercion.
             (Some(natural), Some(expected)) if natural != expected && expected != oid::RECORD => {
+                if self.folded
+                    && let Some(text) = numeric_literal_text(expression)
+                    && let Some(ctype) = ColType::from_oid(expected)
+                    && let Ok(value) = crate::sql::eval::cast_to(
+                        crate::sql::types::Datum::Text(text.as_str()),
+                        ctype,
+                        output.arena,
+                    )
+                {
+                    let value = output
+                        .arena
+                        .alloc_str_display(value)
+                        .map_err(|_| arena_full())?;
+                    return self.constant(value, expected, output);
+                }
                 self.wrapped(expression, None, Parent::Cast, true, output)?;
                 output.push("::")?;
                 self.type_name(expected, output)
@@ -2542,6 +2586,7 @@ pub(crate) fn rule_action_definition<'a>(
         pretty,
         qualify: true,
         domain_value: None,
+        folded: false,
         bare: None,
     };
     // The target's relation, then its alias after `separator`.

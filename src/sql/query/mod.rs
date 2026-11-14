@@ -121,8 +121,10 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
+pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
+pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -887,6 +889,50 @@ pub(crate) use srf::{
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
+/// Whether a SELECT list calls a set-returning function, which PostgreSQL
+/// evaluates in a `ProjectSet` node.
+pub(crate) fn has_set_returning_items(
+    items: &[SelectItem<'_>],
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    has_project_set(items, storage, txid)
+}
+
+/// Whether a key of a FROM-less query is a constant PostgreSQL's planner
+/// drops from its sort and grouping keys: it reads no volatile function, set
+/// or subquery.
+pub(crate) fn fromless_key_is_constant(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    if expression_has_project_set(expression, storage, txid) {
+        return Ok(false);
+    }
+    if expression.contains_subquery() {
+        return Ok(false);
+    }
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    Ok(!predicate_safety::expression_properties(
+        expression,
+        &columns,
+        storage,
+        txid,
+        predicate_safety::AnalysisStage::RuntimeProjection,
+        arena,
+    )?
+    .volatile)
+}
+
 mod group;
 use group::{grouped_rows, grouped_select};
 
@@ -1191,6 +1237,7 @@ pub(crate) fn read_deferred_cte<'a>(
     arena: &'a Arena,
     query: Option<DeferredCteRead<'_, 'a>>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    let _cte = instrument::enter(instrument::Segment::Cte);
     let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
     if saved != 0 {
         // SAFETY: a nonzero address names an immutable persistent descriptor
@@ -8518,6 +8565,10 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         Some(w) => where_passes(w, arena, params, row, hooks)?,
         None => true,
     };
+    let aggregate = instrument::node(instrument::Role::Aggregate);
+    if pass {
+        instrument::node(instrument::Role::Result).row();
+    }
     if !statement.group_by.is_empty() && !pass {
         // Zero input rows grouped: zero groups, zero output rows (a plain
         // aggregate still emits its one row over the empty input).
@@ -8566,9 +8617,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
             Datum::Bool(true)
         );
         if !held {
+            aggregate.filtered();
             return Ok(None);
         }
     }
+    aggregate.row();
     Ok(Some((ptrs, values)))
 }
 
@@ -8927,6 +8980,64 @@ pub(crate) fn check_rule_insert_returning<'a>(
 /// with OLD and NEW typed by `transition`: a query's relations, operators
 /// and types, and a data-changing statement's condition and assignments.
 /// Nothing is read or written.
+/// PostgreSQL's grouping check of a rule action's query: the rule's OLD and
+/// NEW are range table entries of the action's own query, so a grouped
+/// query reads them only through its grouping keys or aggregates.
+fn check_rule_query_grouping(select: &Select<'_>) -> Result<(), SqlError> {
+    fn ungrouped<'a>(expression: &'a Expr<'a>, keys: &[&Expr<'_>]) -> Result<(), SqlError> {
+        if keys.iter().any(|key| **key == *expression) || expression.is_aggregate_use() {
+            return Ok(());
+        }
+        if let Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } = expression
+            && (qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new"))
+        {
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier,
+                    name
+                ),
+                qualifier,
+            ));
+        }
+        if matches!(
+            expression,
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. }
+        ) {
+            return Ok(());
+        }
+        walk_children(expression, &mut |child| ungrouped(child, keys))
+    }
+    let items = || {
+        select.items.iter().filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        })
+    };
+    let grouped = !select.group_by.is_empty()
+        || select.having.is_some()
+        || items().chain(select.having).any(|expression| {
+            let mut aggregate = false;
+            let _ = walk_expression_tree(expression, &mut |node| {
+                aggregate |= node.is_aggregate_use();
+            });
+            aggregate
+        });
+    if !grouped {
+        return Ok(());
+    }
+    for expression in items().chain(select.having) {
+        ungrouped(expression, select.group_by)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn analyse_rule_action<'a>(
     statement: &'a Stmt<'a>,
     storage: &'a Storage,
@@ -8949,6 +9060,7 @@ pub(crate) fn analyse_rule_action<'a>(
                     Some(transition),
                 )?;
                 analyse_select(select, storage, txid, arena, Some(transition))?;
+                check_rule_query_grouping(select)?;
                 if select.from.is_none() && select.set_body.is_none() {
                     let catalog = storage_catalog(storage, arena, txid);
                     let columns = super::eval::RuntimeColumnTypes {
@@ -8980,8 +9092,45 @@ pub(crate) fn analyse_rule_action<'a>(
         Stmt::SetQuery(query) => {
             analyse_set_tree(query.body, storage, txid, arena, Some(transition))
         }
+        Stmt::Insert(insert)
+            if insert
+                .select
+                .is_some_and(|select| select.set_body.is_none() && select.from.is_some()) =>
+        {
+            // The inserted query is analysed as a SELECT action is, with
+            // OLD and NEW as its outer row.
+            let select = insert.select.expect("checked above");
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let analysed = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    Some(transition),
+                )?;
+                analyse_select(select, storage, txid, arena, Some(transition))
+            });
+            unsafe { arena.rewind_to(mark) };
+            analysed?;
+            check_rule_query_grouping(select)?;
+            validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
+        }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-            analyse_dml_condition(statement, storage, txid, arena, Some(transition))?;
+            if let Stmt::Insert(crate::sql::ast::Insert {
+                select: Some(select),
+                ..
+            }) = statement
+            {
+                check_rule_query_grouping(select)?;
+            }
+            // Views the action reads are analysed through their queries.
+            let expanded =
+                cte::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            analyse_dml_condition(expanded, storage, txid, arena, Some(transition))?;
             validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
         }
         _ => Ok(()),
@@ -12204,6 +12353,8 @@ pub(crate) fn select_query_resumable<'a>(
     // PostgreSQL does — so a per-row error in an unreturned row does not
     // surface (constant errors already surfaced via the plan-time check).
     if limit == 0 {
+        // The limit runs and reads nothing.
+        let _limit = instrument::node(instrument::Role::Limit).start();
         if let Err(error) = scan::validate_materialized_view_reads(
             storage,
             &scope,
@@ -12332,6 +12483,9 @@ pub(crate) fn select_query_resumable<'a>(
         // scan path retains full rows until it proves an equivalent contract.
         let pax_columns =
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let scan_output = instrument::ScanOutput::current(scope.n);
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -12358,6 +12512,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &hooks,
                     )?
                 {
+                    scan_output.refiltered();
                     return Ok(true);
                 }
                 // The row's correlated subqueries run as its expressions
@@ -12419,8 +12574,10 @@ pub(crate) fn select_query_resumable<'a>(
                         }
                     }
                     emitted += 1;
+                    stages.limit.row();
                 }
-                Ok(true)
+                // A limit stops reading once it has its rows.
+                Ok(emitted < limit)
             },
         );
         if wire_full {
@@ -12700,6 +12857,7 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     {
         return Ok(srf::ProjectSet::empty());
     }
+    instrument::node(instrument::Role::Result).row();
     prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
 }
 
@@ -12920,6 +13078,13 @@ pub(crate) fn constant_select_resumable<'a>(
         merge_action: None,
     };
 
+    // EXPLAIN ANALYZE's nodes: the one-row `Result`, the stages above it
+    // and a `ProjectSet` expanding set-returning calls.
+    let mut stages = instrument::Stages::current();
+    // A `LIMIT 0` never runs the projection below it.
+    let projected = core::mem::replace(&mut stages.project_set, instrument::Node::NONE);
+    let _stages = stages.start();
+    let result_node = instrument::node(instrument::Role::Result);
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
     // over one virtual input row (zero when WHERE is false) and emits at most
     // one output row.
@@ -12977,6 +13142,8 @@ pub(crate) fn constant_select_resumable<'a>(
             );
         }
         responder.row_description(&columns[..n])?;
+        let _result = result_node.start();
+        let _projected = projected.start();
         let hook_data = match fromless_aggregate_hooks(
             statement,
             agg_nodes.as_slice(),
@@ -13023,6 +13190,7 @@ pub(crate) fn constant_select_resumable<'a>(
                 Ok(Err(error)) => return sql_fail(error),
                 Err(wire) => return Err(wire),
             }
+            stages.limit.row();
             rows = 1;
         }
         let tag = stack_format!(48, "SELECT {}", rows);
@@ -13131,6 +13299,8 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(l) => l,
             Err(e) => return sql_fail(e),
         };
+    let _result = (limit != 0).then(|| result_node.start());
+    let _projected = (limit != 0).then(|| projected.start());
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -13226,6 +13396,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(live) => live,
             Err(error) => return sql_fail(error),
         };
+        stages.unique.rows(live as u64);
     }
     let out_rows = &mut out_rows[..live];
     let mut order_collations = [super::ast::Collation::None; MAX_PROJ];
@@ -13281,6 +13452,7 @@ pub(crate) fn constant_select_resumable<'a>(
         if let Err(error) = sorted {
             return sql_fail(error);
         }
+        stages.sort.rows(out_rows.len() as u64);
     }
 
     let start = (offset as usize).min(out_rows.len());
@@ -13315,6 +13487,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),
         }
+        stages.limit.row();
         rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);
@@ -13500,6 +13673,8 @@ fn select_into_rows_mode<'a>(
                 outer,
             );
         }
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
         let offset =
@@ -13560,7 +13735,11 @@ fn select_into_rows_mode<'a>(
             }
         }
         let mut vals = [Datum::Null; MAX_PROJ];
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..end] {
+            below_limit.row();
+            stages.limit.row();
             for (c, slot) in vals[..n].iter_mut().enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, c, arena)?;
             }
@@ -13696,6 +13875,9 @@ fn select_into_rows_mode<'a>(
                 inner: &super::eval::NoColumns,
                 outer,
             };
+            let stages = instrument::Stages::current();
+            let _stages = stages.start();
+            let _result = instrument::node(instrument::Role::Result).start();
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -13744,6 +13926,7 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
+            stages.limit.row();
             emit(&vals[..n])?;
             return Ok(());
         };
@@ -13806,6 +13989,8 @@ fn select_into_rows_mode<'a>(
             sequences: seq,
             merge_action: None,
         };
+        let stages = materialize::materialized_stages(statement.limit.is_some());
+        let _stages = stages.start();
         let (rows, width) = grouped_rows(
             storage,
             &scope,
@@ -13818,6 +14003,7 @@ fn select_into_rows_mode<'a>(
             &hooks,
             outer_subs.correlated,
             outer,
+            &stages,
         )?;
         let offset =
             super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
@@ -13825,7 +14011,11 @@ fn select_into_rows_mode<'a>(
             super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..start + n] {
+            below_limit.row();
+            stages.limit.row();
             let mut out = [Datum::Null; MAX_PROJ];
             for (i, slot) in out.iter_mut().take(width).enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, i, arena)?;
@@ -13907,6 +14097,10 @@ fn select_into_rows_mode<'a>(
             merge_action: None,
         };
         let srf_call = find_srf(statement.items);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let result = instrument::node(instrument::Role::Result);
+        let _result = result.start();
         let project_set =
             prepare_fromless_projection(statement, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
@@ -13945,6 +14139,7 @@ fn select_into_rows_mode<'a>(
                 }
             }
             if produced >= offset {
+                stages.limit.row();
                 emit(&vals[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -14162,6 +14357,8 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
+        let stages = materialize::materialized_stages(limit != u64::MAX);
+        let _stages = stages.start();
         let (rows, width, deferred, identities_at) = materialized_rows(
             storage,
             &scope,
@@ -14179,6 +14376,7 @@ fn select_into_rows_mode<'a>(
                 && !statement.with_ties
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            &stages,
         )?;
         materialize::materialized_rows_into(
             storage,
@@ -14198,6 +14396,7 @@ fn select_into_rows_mode<'a>(
             outer,
             limit,
             offset,
+            &stages,
             &mut |values| {
                 emit(values)?;
                 Ok(true)
@@ -14207,10 +14406,13 @@ fn select_into_rows_mode<'a>(
     }
     let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
     let stop_after = offset.saturating_add(limit);
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
     if stop_after == 0 {
         return Ok(());
     }
     let mut produced = 0u64;
+    let scan_output = instrument::ScanOutput::current(scope.n);
 
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
@@ -14228,6 +14430,7 @@ fn select_into_rows_mode<'a>(
                 &hooks,
             )?
         {
+            scan_output.refiltered();
             return Ok(true);
         }
         // The row's correlated subqueries run as its expressions reach them.
@@ -14259,6 +14462,7 @@ fn select_into_rows_mode<'a>(
                 outer,
             )?;
             if produced >= offset {
+                stages.limit.row();
                 emit(&projected[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -14280,6 +14484,7 @@ fn select_into_rows_mode<'a>(
                     outer,
                 )?;
                 if produced >= offset {
+                    stages.limit.row();
                     emit(&projected[..n])?;
                 }
                 produced = produced.saturating_add(1);
@@ -17040,4 +17245,13 @@ pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeC
         Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
         _ => None,
     }
+}
+
+/// Visits `expression` and every expression below it, subqueries excepted.
+fn walk_expression_tree<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a Expr<'a>),
+) -> Result<(), SqlError> {
+    visit(expression);
+    walk_children(expression, &mut |child| walk_expression_tree(child, visit))
 }

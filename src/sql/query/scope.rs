@@ -2430,6 +2430,10 @@ impl<'d> QueryScope<'d> {
         };
         let rows: &'a [&'a [u8]];
         let external_run;
+        // The derived table's query is its own block of an explained plan.
+        let _block = super::instrument::enter(super::instrument::Segment::Derived(
+            u16::try_from(self.n).unwrap_or(u16::MAX),
+        ));
         if storage.spill_attached() {
             // A stable all-equal sort is an insertion-order spool. Resetting
             // one leased producer cannot disturb a nested child's producer.

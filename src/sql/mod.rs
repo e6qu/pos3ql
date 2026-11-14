@@ -73,6 +73,7 @@ pub mod regex;
 mod result_stream;
 pub(crate) use result_stream::{StreamStep, stream_open_respools};
 mod routine_input_identity;
+pub(crate) mod rule_rewrite;
 pub mod ryu;
 pub mod sequence;
 pub mod sha512;
@@ -15206,8 +15207,8 @@ impl Engine {
             }
         };
         match statement {
-            Stmt::Explain { .. } => {
-                responder.row_description(&[ColDesc::new("QUERY PLAN", types::oid::TEXT, -1)])?;
+            Stmt::Explain { options, .. } => {
+                responder.row_description(&[explain::result_column(options.format)])?;
                 Ok(true)
             }
             Stmt::With { statement, .. } => {
@@ -15412,7 +15413,13 @@ impl Engine {
         }
         for cte in with {
             if let Some(dml) = cte.dml {
-                check_cte_rules(&self.storage, dml, txn)?;
+                rule_rewrite::check_with_query(
+                    &self.storage,
+                    txn.txid,
+                    guc.session_replication_role(),
+                    dml,
+                    arena,
+                )?;
             }
         }
         let deferred = query::with_active_routine_invocations(|context| {
@@ -16343,6 +16350,23 @@ impl Engine {
                 )));
             }
         }
+        // PostgreSQL rewrites the whole statement before any of it runs:
+        // recursion and the shapes its rules cannot take fail first.
+        if rule_rewrite::statement_is_rewritten(
+            storage,
+            txn.txid,
+            guc.session_replication_role(),
+            statement,
+        ) && let Err(error) = rule_rewrite::walk_rewritten(
+            storage,
+            txn.txid,
+            guc.session_replication_role(),
+            statement,
+            arena,
+            &mut |_| Ok(()),
+        ) {
+            return Ok(Err(error));
+        }
         if storage
             .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
             .next()
@@ -16503,6 +16527,18 @@ impl Engine {
                         },
                     };
                 }
+                if let (Stmt::Insert(_), Some(views)) = (statement, inherited)
+                    && let Err(error) = exec::overlay_view_rule_defaults(
+                        storage,
+                        views,
+                        &definition,
+                        &mut rule_defaults,
+                        txn.txid,
+                        arena,
+                    )
+                {
+                    return Ok(Err(error));
+                }
                 let columns = match arena.alloc_slice_copy(&names[..definition.n_columns]) {
                     Ok(columns) => &*columns,
                     Err(_) => return Ok(Err(query::arena_full_pub())),
@@ -16611,18 +16647,6 @@ impl Engine {
                 definition.mode == crate::storage::RewriteMode::Instead
                     && definition.condition.is_none()
             });
-        if outer_returns_rows
-            && let Err(error) = check_rule_returning(
-                storage,
-                target,
-                event,
-                relation.name,
-                guc.session_replication_role(),
-                txn.txid,
-            )
-        {
-            return Ok(Err(error));
-        }
         // A view written only through conditional INSTEAD rules leaves the
         // rest of the write to its base, which PostgreSQL refuses.
         if let crate::storage::RuleTarget::View(view) = target
@@ -16776,7 +16800,7 @@ impl Engine {
         };
         let mut original_rows = 0u64;
         if insert_event && !suppress_original {
-            match steps.begin(progress.as_deref_mut(), txn, responder) {
+            match steps.begin(progress.as_deref_mut(), txn, responder, storage) {
                 Ok(Some(affected)) => original_rows = affected,
                 Ok(None) => {
                     let outcome = responder.without_command_complete(|responder| {
@@ -16841,7 +16865,7 @@ impl Engine {
             };
             let definition = rule.definition_for(txn.txid);
             last_name = Some(definition.name);
-            if let Err(error) = txn.enter_rule(rule.oid(), relation.name) {
+            if let Err(error) = txn.enter_rule() {
                 return Ok(Err(error));
             }
             let action_result = (|| -> Result<Result<(), SqlError>, WireFull> {
@@ -16992,47 +17016,50 @@ impl Engine {
                     } else {
                         action
                     };
-                    let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder) {
-                        Ok(Some(affected)) => affected,
-                        Ok(None) => {
-                            let outcome = Self::execute_rule_action(
-                                storage,
-                                scratch,
-                                arena,
-                                action,
-                                rule_authorization,
-                                txn,
-                                params,
-                                guc,
-                                cursors,
-                                row_buffers,
-                                responder,
-                                if use_returning { capture.take() } else { None },
-                                use_returning,
-                                // A statement returning rows sends only those.
-                                outer_returns_rows && !use_returning,
-                                connection_id,
-                                progress.as_deref_mut(),
-                            );
-                            steps.end_step(txn);
-                            let outcome = outcome?;
-                            if let Err(error) = outcome {
-                                return Ok(Err(steps.stop_step(
-                                    progress.as_deref_mut(),
-                                    txn,
-                                    error,
+                    let action_rows =
+                        match steps.begin(progress.as_deref_mut(), txn, responder, storage) {
+                            Ok(Some(affected)) => affected,
+                            Ok(None) => {
+                                let outcome = Self::execute_rule_action(
+                                    storage,
+                                    scratch,
                                     arena,
-                                    &storage.row_work,
-                                )));
+                                    action,
+                                    rule_authorization,
+                                    txn,
+                                    params,
+                                    guc,
+                                    cursors,
+                                    row_buffers,
+                                    responder,
+                                    if use_returning { capture.take() } else { None },
+                                    use_returning,
+                                    // A statement returning rows sends only those.
+                                    outer_returns_rows && !use_returning,
+                                    connection_id,
+                                    progress.as_deref_mut(),
+                                );
+                                steps.end_step(txn);
+                                let outcome = outcome?;
+                                if let Err(error) = outcome {
+                                    return Ok(Err(steps.stop_step(
+                                        progress.as_deref_mut(),
+                                        txn,
+                                        error,
+                                        arena,
+                                        &storage.row_work,
+                                    )));
+                                }
+                                let action_rows = responder.take_affected_rows().unwrap_or(0);
+                                if let Err(error) =
+                                    steps.finish(progress.as_deref_mut(), action_rows)
+                                {
+                                    return Ok(Err(error));
+                                }
+                                action_rows
                             }
-                            let action_rows = responder.take_affected_rows().unwrap_or(0);
-                            if let Err(error) = steps.finish(progress.as_deref_mut(), action_rows) {
-                                return Ok(Err(error));
-                            }
-                            action_rows
-                        }
-                        Err(error) => return Ok(Err(error)),
-                    };
+                            Err(error) => return Ok(Err(error)),
+                        };
                     // PostgreSQL's command tag counts the rows of the last
                     // INSTEAD action with the original's command type.
                     fn command(mut statement: &Stmt<'_>) -> u8 {
@@ -17065,7 +17092,7 @@ impl Engine {
         }
 
         if !insert_event && !suppress_original {
-            match steps.begin(progress.as_deref_mut(), txn, responder) {
+            match steps.begin(progress.as_deref_mut(), txn, responder, storage) {
                 Ok(Some(affected)) => original_rows = affected,
                 Ok(None) => {
                     let outcome = responder.without_command_complete(|responder| {
@@ -17278,6 +17305,7 @@ impl Engine {
             // PostgreSQL sends a SELECT action's rows before the statement's
             // command tag.
             Stmt::Select(select) => responder.without_command_complete(|responder| {
+                query::instrument::next_query();
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 if select.from.is_some() {
                     query::select_query(
@@ -17302,6 +17330,7 @@ impl Engine {
                 }
             }),
             Stmt::SetQuery(query) => responder.without_command_complete(|responder| {
+                query::instrument::next_query();
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 query::set_query(
                     storage,
@@ -17315,6 +17344,7 @@ impl Engine {
                 )
             }),
             Stmt::Notify { channel, payload } => {
+                query::instrument::next_query();
                 let payload = match payload {
                     Some(payload) => match notify::payload(payload) {
                         Ok(payload) => payload,
@@ -17632,6 +17662,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::INSERT)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17693,7 +17724,15 @@ impl Engine {
                             Ok(check) => check,
                             Err(error) => return Ok(Err(error)),
                         };
-                        if view.base_view.is_some() {
+                        if view.base_view.is_some()
+                            || base_has_rules(
+                                storage,
+                                view.base,
+                                crate::storage::RewriteEvent::Insert,
+                                guc,
+                                txn.txid,
+                            )
+                        {
                             // The levels write into a view with its own
                             // triggers or rules, as PostgreSQL's rewriter
                             // then rewrites the write on that view.
@@ -17721,9 +17760,10 @@ impl Engine {
                         }
                         (rewritten, Some(check), authorization)
                     }
-                    Ok(None) => (insert, None, authorization),
+                    Ok(None) => (insert, inherited, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::insert(
                     storage,
                     txn,
@@ -17753,6 +17793,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::UPDATE)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17814,7 +17855,15 @@ impl Engine {
                             Ok(check) => check,
                             Err(error) => return Ok(Err(error)),
                         };
-                        if view.base_view.is_some() {
+                        if view.base_view.is_some()
+                            || base_has_rules(
+                                storage,
+                                view.base,
+                                crate::storage::RewriteEvent::Update,
+                                guc,
+                                txn.txid,
+                            )
+                        {
                             // The levels write into a view with its own
                             // triggers or rules, as PostgreSQL's rewriter
                             // then rewrites the write on that view.
@@ -17842,9 +17891,10 @@ impl Engine {
                         }
                         (rewritten, Some(check), authorization)
                     }
-                    Ok(None) => (update, None, authorization),
+                    Ok(None) => (update, inherited, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::update(
                     storage,
                     txn,
@@ -17872,6 +17922,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::DELETE)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17923,7 +17974,15 @@ impl Engine {
                             Ok(authorization) => authorization,
                             Err(error) => return Ok(Err(error)),
                         };
-                        if view.base_view.is_some() {
+                        if view.base_view.is_some()
+                            || base_has_rules(
+                                storage,
+                                view.base,
+                                crate::storage::RewriteEvent::Delete,
+                                guc,
+                                txn.txid,
+                            )
+                        {
                             // A DELETE has no check options or defaults.
                             let rewritten = match arena.alloc(Stmt::Delete(*rewritten)) {
                                 Ok(rewritten) => &*rewritten,
@@ -17952,6 +18011,7 @@ impl Engine {
                     Ok(None) => (delete, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::delete(
                     storage,
                     txn,
@@ -23167,7 +23227,7 @@ impl Engine {
                 }
                 // A statement a rewrite rule changes is explained as the
                 // queries the rule produces.
-                let rewritten = match explain::rewritten_queries(
+                let mut rewritten = match explain::rewritten_queries(
                     &self.storage,
                     txn.txid,
                     planned_statement,
@@ -23176,7 +23236,7 @@ impl Engine {
                     Ok(rewritten) => rewritten,
                     Err(error) => return Ok(Err(error)),
                 };
-                let plan = match rewritten.as_ref() {
+                let mut plan = match rewritten.as_ref() {
                     Some(_) => None,
                     None => {
                         let plan = with_prepared_parameter_types(parameter_types, || {
@@ -23184,6 +23244,7 @@ impl Engine {
                                 &self.storage,
                                 txn.txid,
                                 planned_statement,
+                                query::instrument::BlockId::ROOT,
                                 arena,
                             )
                         });
@@ -23224,18 +23285,33 @@ impl Engine {
                     } else {
                         params
                     };
-                    let execution = with_prepared_parameter_types(parameter_types, || {
-                        self.execute_explained_statement(
-                            planned_statement,
-                            arena,
-                            execution_params,
-                            txn,
-                            (&mut *sqlprep, &mut *cursors),
-                            guc,
-                            responder,
-                        )
-                    });
+                    let mut run = || {
+                        with_prepared_parameter_types(parameter_types, || {
+                            self.execute_explained_statement(
+                                planned_statement,
+                                arena,
+                                execution_params,
+                                txn,
+                                (&mut *sqlprep, &mut *cursors),
+                                guc,
+                                &mut *responder,
+                            )
+                        })
+                    };
+                    // The plan counts what each of its nodes does as the
+                    // statement runs.
+                    let execution = match (plan.as_mut(), rewritten.as_mut()) {
+                        (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                        (None, Some(queries)) => {
+                            explain::analyze_rewritten(queries, arena, options.timing, run)
+                        }
+                        (None, None) => Ok(run()),
+                    };
                     let output = responder.finish_discard_query_output();
+                    let execution = match execution {
+                        Ok(execution) => execution,
+                        Err(error) => return Ok(Err(error)),
+                    };
                     match execution {
                         Err(wire) => return Err(wire),
                         Ok(Err(error)) => return Ok(Err(error)),
@@ -33714,21 +33790,29 @@ impl<'a> RuleSteps<'a> {
         progress: Option<&mut exec::RowProgress>,
         txn: &mut TxnState,
         responder: &Responder,
+        storage: &Storage,
     ) -> Result<Option<u64>, SqlError> {
         let index = self.finished.len();
+        // Each rewritten statement after the first sees the earlier ones'
+        // changes, as PostgreSQL runs them as separate commands.
+        let see_earlier_steps = |txn: &TxnState| {
+            storage.set_read_snapshot(storage.read_snapshot().max(txn.command_id()));
+        };
         let Some(progress) = progress else {
-            // Each rewritten statement after the first sees the earlier
-            // ones' changes, as PostgreSQL runs them as separate commands.
             if self.started {
                 txn.begin_command()?;
             }
             self.started = true;
+            see_earlier_steps(txn);
             // Without step progress a suspended completion could not be
             // recorded: the step's AFTER work runs inline.
             txn.write_completion_boundary = None;
             return Ok(None);
         };
         if progress.begin_step_at(self.level, index, true, txn, responder)? {
+            // A step this attempt resumes runs in its recorded command, and
+            // still sees the earlier steps, finished here or before.
+            see_earlier_steps(txn);
             txn.write_completion_boundary = self.outer.map(|outer| txn::WriteCompletionBoundary {
                 command: txn.command_id(),
                 depth: txn.trigger_depth(),
@@ -33817,153 +33901,6 @@ impl<'a> RuleSteps<'a> {
             _ => error,
         }
     }
-}
-
-/// A rule-rewritten write with `RETURNING` needs exactly one rule action that
-/// returns rows whenever an `INSTEAD` rule replaces the original statement,
-/// as PostgreSQL's rewriter checks before it runs anything.
-fn check_rule_returning(
-    storage: &Storage,
-    target: crate::storage::RuleTarget,
-    event: crate::storage::RewriteEvent,
-    relation: &str,
-    replication_role: crate::sql::guc::SessionReplicationRole,
-    txid: u32,
-) -> Result<(), SqlError> {
-    let rules = || storage.firing_rules_for(target, event, replication_role, txid);
-    let returning_rules = rules()
-        .filter(|(_, rule)| rule.definition_for(txid).returning_action.is_some())
-        .count();
-    if returning_rules > 1 {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot have RETURNING lists in multiple rules"
-        ));
-    }
-    let instead = rules()
-        .any(|(_, rule)| rule.definition_for(txid).mode == crate::storage::RewriteMode::Instead);
-    if !instead || returning_rules != 0 {
-        return Ok(());
-    }
-    let command = match event {
-        crate::storage::RewriteEvent::Insert => "INSERT",
-        crate::storage::RewriteEvent::Update => "UPDATE",
-        crate::storage::RewriteEvent::Delete => "DELETE",
-        crate::storage::RewriteEvent::Select => "SELECT",
-    };
-    Err(error_position::with_computed_hint(
-        sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot perform {} RETURNING on relation \"{}\"",
-            command,
-            relation
-        ),
-        format_args!(
-            "You need an unconditional ON {command} DO INSTEAD rule with a RETURNING clause."
-        ),
-    ))
-}
-
-/// PostgreSQL's rewriter accepts a data-modifying `WITH` sub-statement whose
-/// rules leave exactly one data-modifying statement; it rejects the others
-/// before anything runs.
-fn check_cte_rules(storage: &Storage, dml: &Stmt<'_>, txn: &TxnState) -> Result<(), SqlError> {
-    let (relation, event) = match dml {
-        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
-        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
-        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
-        _ => return Ok(()),
-    };
-    let returns_rows = query::statement_returns_rows(dml);
-    let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
-        Some(crate::storage::ResolvedRelation::Table(slot)) => {
-            crate::storage::RuleTarget::Table(slot as u16)
-        }
-        Some(crate::storage::ResolvedRelation::View(slot)) => {
-            crate::storage::RuleTarget::View(slot as u16)
-        }
-        _ => return Ok(()),
-    };
-    let replication_role = crate::sql::guc::active_session_replication_role()?;
-    let rules = || storage.firing_rules_for(target, event, replication_role, txn.txid);
-    if rules().next().is_none() {
-        return Ok(());
-    }
-    // The sub-statement's own rewrite comes first, with its RETURNING check.
-    if returns_rows {
-        check_rule_returning(
-            storage,
-            target,
-            event,
-            relation.name,
-            replication_role,
-            txn.txid,
-        )?;
-    }
-    let unconditional_instead = rules().any(|(_, rule)| {
-        let definition = rule.definition_for(txn.txid);
-        definition.mode == crate::storage::RewriteMode::Instead && definition.condition.is_none()
-    });
-    let actions: usize = rules()
-        .map(|(_, rule)| rule.definition_for(txn.txid).action_sql().count())
-        .sum();
-    let statements = actions + usize::from(!unconditional_instead);
-    let unsupported = |what: &str| {
-        sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{} rules are not supported for data-modifying statements in WITH",
-            what
-        )
-    };
-    if statements == 0 {
-        return Err(unsupported("DO INSTEAD NOTHING"));
-    }
-    if statements == 1 {
-        let notify = rules().any(|(_, rule)| {
-            rule.definition_for(txn.txid).action_sql().any(|action| {
-                action
-                    .trim_start()
-                    .get(..6)
-                    .is_some_and(|word| word.eq_ignore_ascii_case("notify"))
-            })
-        });
-        return if notify {
-            Err(unsupported("DO INSTEAD NOTIFY"))
-        } else {
-            Ok(())
-        };
-    }
-    // The rewritten statements in rule-name order; the first that is not
-    // an unconditional INSTEAD action names the error.
-    let mut last: Option<crate::storage::SqlName> = None;
-    loop {
-        let next = rules()
-            .filter(|(_, rule)| {
-                last.is_none_or(|last| rule.definition_for(txn.txid).name.as_str() > last.as_str())
-            })
-            .min_by(|(_, left), (_, right)| {
-                left.definition_for(txn.txid)
-                    .name
-                    .as_str()
-                    .cmp(right.definition_for(txn.txid).name.as_str())
-            });
-        let Some((_, rule)) = next else {
-            break;
-        };
-        let definition = rule.definition_for(txn.txid);
-        last = Some(definition.name);
-        if definition.action_sql().next().is_none() {
-            continue;
-        }
-        match (definition.mode, definition.condition.is_some()) {
-            (crate::storage::RewriteMode::Instead, true) => {
-                return Err(unsupported("conditional DO INSTEAD"));
-            }
-            (crate::storage::RewriteMode::Instead, false) => {}
-            _ => return Err(unsupported("DO ALSO")),
-        }
-    }
-    Err(unsupported("multi-statement DO INSTEAD"))
 }
 
 /// Expands one data-modifying `WITH` query against the queries before it
@@ -34055,6 +33992,30 @@ pub(crate) fn analyze_dml_cte<'a>(
             source: ast::MaterializedCteSource::Inline(&[]),
         },
     ))
+}
+
+/// Whether an auto-updatable view's base table has rules for `event`: the
+/// write on it is then rewritten again by them, as PostgreSQL's
+/// `RewriteQuery` does with the query `rewriteTargetView` produces.
+fn base_has_rules(
+    storage: &Storage,
+    base: ast::QualName<'_>,
+    event: crate::storage::RewriteEvent,
+    guc: &GucState,
+    txid: u32,
+) -> bool {
+    match storage.resolve_relation(base.schema, base.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => storage
+            .firing_rules_for(
+                crate::storage::RuleTarget::Table(slot as u16),
+                event,
+                guc.session_replication_role(),
+                txid,
+            )
+            .next()
+            .is_some(),
+        _ => false,
+    }
 }
 
 /// The columns and declared types of a rule `INSERT` action's target table

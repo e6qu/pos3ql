@@ -562,6 +562,7 @@ pub(super) fn deparse<'a>(
                             pretty: false,
                             qualify: false,
                             domain_value: None,
+                            folded: false,
                             bare: None,
                         },
                         element,
@@ -599,6 +600,7 @@ pub(super) fn deparse<'a>(
             pretty,
             qualify: false,
             domain_value: None,
+            folded: false,
             bare: None,
         };
         let destination = match destination {

@@ -199,13 +199,11 @@ is owned.
   read row by row re-reads nothing between steps: its reader and analysed
   statement stay in a 512 KiB block of the statement arena's persistent
   tail. A PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement fails with
-  `0A000`. The check that a data-modifying `WITH` query's rules leave
-  exactly one statement (its `RETURNING` check first, then the first
-  offending rule in name order) counts each rule action as one statement;
-  PostgreSQL rewrites the actions with their own targets' rules first, so an
-  action into a table with `DO INSTEAD NOTHING` leaves none there. Matching
-  it needs each stored action parsed under its rule's creation path to find
-  its target and event.
+  `0A000`. A data-modifying `WITH` query's rules must leave exactly one
+  statement after each action is rewritten again by its own target's rules,
+  as PostgreSQL checks before anything runs; the `RETURNING` checks come
+  first, and a rule action keeps its `RETURNING` list only when the query
+  it replaces has one.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions
@@ -546,9 +544,16 @@ condition and each nested loop's join filter, sort and grouping keys
 on "*VALUES*"`, a derived table's own plan under its `Subquery Scan` (or in
 its place when the scan neither filters nor reshapes rows), and each outer
 join narrowed by conditions that reject its nullable side's NULLs, as
-PostgreSQL's `reduce_outer_joins` does. A derived table's scan prints no
-`Filter`, keys reading a derived table or function are not printed, and
-`VERBOSE` output names a `VALUES` list's columns by their aliases. An index scan prints the
+PostgreSQL's `reduce_outer_joins` does. A derived table's, a function's
+(`Function Scan`) and a pulled-up `VALUES` list's scan print their `Filter`, a
+grouped query its `HAVING` filter, an `OFFSET` its `Limit`, a distinct union the
+`Append` it hashes, and a relation a set operation reads again a unique name
+(`t1_1`). `VERBOSE` prints relation schemas, a single relation's conditions
+qualified, and a `VALUES` list's columns as `"*VALUES*".column1`; other nodes'
+`Output` lists stay unqualified, join conditions over a `VALUES` list or another
+derived relation are not printed, and `Sort Key`/`Group Key` items reading a
+derived table are not printed (PostgreSQL prints the expressions of the
+derived table's query); keys reading a function or a `VALUES` list are. An index scan prints the
 conditions its index consumes as `Index Cond` (indexed column first and
 unqualified), and a parameterized inner index scan filters the other join
 conditions reading it, as PostgreSQL does. Outer joins of stored tables in
@@ -559,7 +564,10 @@ relation. An outer hash join hashes its
 nullable side (a `RIGHT JOIN` shows as `Hash Left Join` probing its right
 item, as PostgreSQL plans tables of similar size), or its preserved side
 (`Hash Right Join`) when only that side fits the build; a `FULL JOIN` shows
-as `Hash Full Join`; `enable_hashjoin = off` runs each as a nested loop. Other
+as `Hash Full Join`. Its `WHERE` conditions reading only the side it never
+null-extends filter that side's scan, and its `ON` conditions reading only
+the null-extended side filter that side's scan before the build, as
+PostgreSQL places them; `enable_hashjoin = off` runs each as a nested loop. Other
 right or full joins run, and print, as a `Nested Loop Right Join` or
 `Nested Loop Full Join`, where PostgreSQL may also merge. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
@@ -568,18 +576,51 @@ join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
 pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
 USING` hash their first FROM table when it is joined to the target by
 equality, as a `SELECT` of the two tables would, and join later FROM items to
-it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
-statement a rewrite rule changes, an `INSERT ... SELECT` action of an
-`INSERT` of several rows or of a query reading tables, an `INSERT` of an
-aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
-several rows, a statement on a view with rules, and an action on a view or on
-a relation with rules of its own (which PostgreSQL rewrites again) fail with
-`0A000`. Planning them needs a `VALUES` list kept apart from a `UNION ALL`
-of rows for these rewrites, and a rewrite of each action's own rules; under `EXPLAIN ANALYZE` the statement runs
-once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
-reports actual rows only on each plan's top node, where PostgreSQL reports
-every node (`(never executed)` for nodes that did not run), because the
-executor keeps no per-node counters. Notices carry
+it in nested loops; PostgreSQL may instead hash the joined FROM items. A statement
+rewrite rules change is explained as every query PostgreSQL's rewriter
+produces, each rule action rewritten again by its target's rules; a rule
+action of several `VALUES` rows over a statement's query, several rows or
+condition fails with `0A000` (PostgreSQL joins the list into the action as a
+`VALUES` scan reading the other rows laterally). A view an `UPDATE ... FROM`
+or `DELETE ... USING` reads is pulled up only when its relations' names do
+not clash with the statement's own, where PostgreSQL renames them (`t_1`);
+otherwise its query runs under a `Subquery Scan`. Under `EXPLAIN ANALYZE` a rewritten statement runs
+once, each of its queries counted in its own plan, and its time and I/O are
+reported on its last query. `EXPLAIN` in PL/pgSQL explains rewritten
+statements the same way. `EXPLAIN ANALYZE`
+counts, per plan node, the loops, rows and the rows its `Filter` and `Join
+Filter` removed while the statement runs, and prints `(never executed)` for
+nodes that did not run: scans (also a nested loop's inner rescans and
+parameterized index scans), nested-loop and hash joins with their `Hash` and
+`Materialize` inputs, aggregation, sorts, `DISTINCT`, limits, window
+evaluation, set operations, derived tables, `VALUES` lists, a write's target
+scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
+(its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
+and the `ProjectSet` that expands set-returning calls, which also appears
+over scans), in all four formats. A hash join's `Hash` node reports the table pos3ql
+built: its bucket count (and the count it started with when it grew), one
+batch, and the bytes of its arrays as `Memory Usage`, which differ from
+PostgreSQL's allocator figures. A query without FROM drops sort, grouping
+and distinct keys that are planner constants, as PostgreSQL does (a constant
+`DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
+the constants the planner folds them into (`'2'::double precision`). Times are measured
+per loop, to the first row and to the end; in pos3ql's push-based executor a
+node's time also includes the work of the nodes reading its rows. Not yet
+shown: subplans and InitPlans (a condition with a subquery prints no
+`Filter`), semi joins, the `Sort Method`, aggregate and `Materialize`
+storage lines that PostgreSQL measures in its own allocator, per-node `Buffers` and `WAL` (reported on the top node
+only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
+heap scan's `Heap Blocks`. A node of a path the executor does not count (a
+data-modifying `WITH`, a joined `UPDATE` or `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports the
+statement's rows; a `LIMIT` that stops `Unique` early leaves its `Sort`
+without figures, as pos3ql deduplicates before sorting. Where pos3ql's plan
+differs from PostgreSQL's cost-based one the figures are those of the plan it
+shows and runs: it hashes the second of two joined relations where PostgreSQL
+may hash the smaller filtered one, joins three or more relations in nested
+loops where PostgreSQL may hash them, sorts before `DISTINCT ... ORDER BY`
+where PostgreSQL may hash first, shows no window's input `Sort` or `Window:`
+line, and does not flatten a distinct union of more than two inputs into one
+`Append`. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where

@@ -190,6 +190,9 @@ pub(crate) struct Deparser<'t> {
     /// The name the query gives the table, which qualified columns use.
     pub(crate) exposed: &'t str,
     pub(crate) arena: &'t Arena,
+    /// Resolves the built-in functions a condition calls.
+    pub(crate) storage: &'t Storage,
+    pub(crate) txid: u32,
 }
 
 impl<'t> Deparser<'t> {
@@ -335,12 +338,19 @@ impl<'t> Deparser<'t> {
                 right,
                 ..
             } => {
+                if self.boolean_equality(*operator, left, right)?.is_some() {
+                    return Ok(boolean);
+                }
                 let (_, _, type_oid) = self.binary(*operator, left, right)?;
                 Ok(Shape::Value {
                     type_oid,
                     plain: false,
                 })
             }
+            Expr::Call { .. } => Ok(Shape::Value {
+                type_oid: self.call(expression)?.result_oid,
+                plain: false,
+            }),
             Expr::IsNull { operand, .. } => match self.shape(operand)? {
                 Shape::Value { .. } => Ok(boolean),
                 Shape::Literal(_) => Err(Stop::Local),
@@ -384,6 +394,253 @@ impl<'t> Deparser<'t> {
             Expr::NumericLit(text) => Some(Literal::Decimal(text, negative)),
             _ => None,
         }
+    }
+
+    /// `simplify_boolean_equality`: `column = true` is the column and
+    /// `column = false` its negation.
+    fn boolean_equality<'e>(
+        &self,
+        operator: BinaryOp,
+        left: &'e Expr<'e>,
+        right: &'e Expr<'e>,
+    ) -> Shipped<Option<(&'e Expr<'e>, bool)>> {
+        if !matches!(operator, BinaryOp::Eq | BinaryOp::NotEq) {
+            return Ok(None);
+        }
+        let (operand, value) = match (left, right) {
+            (operand, Expr::Bool(value)) | (Expr::Bool(value), operand) => (operand, *value),
+            _ => return Ok(None),
+        };
+        match self.column(operand) {
+            Some(column) if self.column_type(column)? == oid::BOOL => {
+                Ok(Some((operand, value != (operator == BinaryOp::Eq))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The type a literal has before a function argument coerces it.
+    fn literal_type(literal: Literal<'_>) -> i32 {
+        match literal {
+            Literal::Unknown(_) | Literal::Null => oid::UNKNOWN,
+            Literal::Bool(_) => oid::BOOL,
+            Literal::Integer(value) => {
+                if i32::try_from(value).is_ok() {
+                    oid::INT4
+                } else {
+                    oid::INT8
+                }
+            }
+            Literal::Decimal(..) => oid::NUMERIC,
+            Literal::Typed(_, type_oid) => type_oid,
+        }
+    }
+
+    /// A call of a built-in immutable function over modeled types, which
+    /// `is_foreign_expr` ships.
+    fn call(
+        &self,
+        expression: &Expr<'_>,
+    ) -> Shipped<&'static crate::sql::catalog::BuiltinCallableSignature> {
+        let Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
+            name,
+            args,
+            argument_names,
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: [],
+            over: None,
+            filter: None,
+            ..
+        } = expression
+        else {
+            return Err(Stop::Local);
+        };
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS || !argument_names.is_empty() {
+            return Err(Stop::Local);
+        }
+        let mut types = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (target, argument) in types.iter_mut().zip(*args) {
+            *target = match self.shape(argument)? {
+                Shape::Value { type_oid, .. } => type_oid,
+                Shape::Literal(literal) => Self::literal_type(literal),
+            };
+        }
+        let crate::sql::eval::RoutineCallSelection::Builtin { oid: routine, .. } =
+            self.storage.select_routine_call(
+                name,
+                &[],
+                &types[..args.len()],
+                false,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            )
+        else {
+            return Err(Stop::Local);
+        };
+        let signature = crate::sql::catalog::builtin_callable_by_oid(routine).ok_or(Stop::Local)?;
+        let modeled =
+            |type_oid: i32| crate::sql::exec::coltype_of_oid(type_oid).is_some_and(modeled_type);
+        if signature.kind != b'f'
+            || signature.returns_set
+            || signature.catalog.volatility != "i"
+            || signature.arguments.len() != args.len()
+            || !modeled(signature.result_oid)
+            || !signature
+                .arguments
+                .iter()
+                .all(|&parameter| modeled(parameter))
+        {
+            return Err(Stop::Local);
+        }
+        for (&argument, &parameter) in types[..args.len()].iter().zip(signature.arguments) {
+            let argument = operator_type(argument);
+            let parameter = operator_type(parameter);
+            let coerced = argument == parameter
+                || argument == oid::UNKNOWN
+                || matches!(
+                    (numeric_rank(argument), numeric_rank(parameter)),
+                    (Some(from), Some(to)) if from < to
+                );
+            if !coerced {
+                return Err(Stop::Local);
+            }
+        }
+        Ok(signature)
+    }
+
+    /// `cost_qual_eval`'s cost of a shippable expression, in halves of
+    /// `cpu_operator_cost`: each operator or function its procedure cost,
+    /// each implicit cast of a value one, and an array comparison half its
+    /// elements.
+    fn cost(&self, expression: &Expr<'_>) -> Shipped<u32> {
+        if self.column(expression).is_some() || Self::literal(expression).is_some() {
+            return Ok(0);
+        }
+        let value_cast = |value: &Expr<'_>, target: i32| -> Shipped<u32> {
+            Ok(match self.shape(value)? {
+                Shape::Value { type_oid, .. }
+                    if numeric_rank(type_oid).is_some()
+                        && wider_numeric(type_oid, target) == target
+                        && type_oid != target
+                        && (integer_rank(type_oid).is_none() || integer_rank(target).is_none()) =>
+                {
+                    2
+                }
+                _ => 0,
+            })
+        };
+        Ok(match expression {
+            Expr::Int(_)
+            | Expr::Unary {
+                operator: UnaryOp::Neg,
+                ..
+            } => 0,
+            Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => self.cost(operand)?,
+            Expr::Binary {
+                operator: BinaryOp::And | BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => self.cost(left)? + self.cost(right)?,
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } => match self.boolean_equality(*operator, left, right)? {
+                Some(_) => 0,
+                None => {
+                    let (_, _, result) = self.binary(*operator, left, right)?;
+                    let operand_type = match (self.shape(left)?, self.shape(right)?) {
+                        (Shape::Value { type_oid: l, .. }, Shape::Value { type_oid: r, .. }) => {
+                            wider_numeric(l, r)
+                        }
+                        (Shape::Value { type_oid, .. }, Shape::Literal(literal))
+                        | (Shape::Literal(literal), Shape::Value { type_oid, .. }) => {
+                            wider_numeric(type_oid, Self::constant_type(literal, type_oid)?)
+                        }
+                        _ => result,
+                    };
+                    2 + self.cost(left)?
+                        + self.cost(right)?
+                        + value_cast(left, operand_type)?
+                        + value_cast(right, operand_type)?
+                }
+            },
+            Expr::InList { operand, list, .. } => {
+                let element = self.in_list(operand, list)?;
+                let compared = if list.len() == 1 {
+                    2
+                } else {
+                    list.len() as u32
+                };
+                compared + self.cost(operand)? + value_cast(operand, element)?
+            }
+            Expr::Like {
+                operand, pattern, ..
+            }
+            | Expr::Match {
+                operand, pattern, ..
+            } => 2 + self.cost(operand)? + self.cost(pattern)?,
+            Expr::Call { args, .. } => {
+                let signature = self.call(expression)?;
+                let mut total = (signature.catalog.cost * 2.0).round() as u32;
+                for (argument, &parameter) in args.iter().zip(signature.arguments) {
+                    total += self.cost(argument)? + value_cast(argument, parameter)?;
+                }
+                total
+            }
+            _ => return Err(Stop::Local),
+        })
+    }
+
+    /// Whether a shipped condition is a mergejoinable equality the planner
+    /// turns into an equivalence class, whose conditions it lists after the
+    /// others; and the condition as it regenerates it, value before constant.
+    fn equivalence<'e>(
+        &self,
+        condition: &'e Expr<'e>,
+        arena: &'e Arena,
+    ) -> Result<Option<&'e Expr<'e>>, SqlError> {
+        let (left, right) = match condition {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => (*left, *right),
+            Expr::InList {
+                operand,
+                list: [item],
+                negated: false,
+            } => (*operand, *item),
+            _ => return Ok(None),
+        };
+        if matches!(
+            self.boolean_equality(BinaryOp::Eq, left, right),
+            Ok(Some(_))
+        ) {
+            return Ok(None);
+        }
+        Ok(match (self.shape(left), self.shape(right)) {
+            (Ok(Shape::Literal(Literal::Null)), _) | (_, Ok(Shape::Literal(Literal::Null))) => None,
+            (Ok(Shape::Value { .. }), Ok(Shape::Value { .. }))
+            | (Ok(Shape::Value { .. }), Ok(Shape::Literal(_))) => Some(condition),
+            (Ok(Shape::Literal(_)), Ok(Shape::Value { .. })) => Some(
+                arena
+                    .alloc(Expr::Binary {
+                        source_position: condition.source_position(),
+                        operator: BinaryOp::Eq,
+                        left: right,
+                        right: left,
+                    })
+                    .map_err(|_| arena_full())?,
+            ),
+            _ => None,
+        })
     }
 
     fn boolean_operand(&self, expression: &Expr<'_>) -> Shipped<()> {
@@ -699,6 +956,54 @@ impl<'t> Deparser<'t> {
                 self.shape(expression)?;
                 let _ = output.write_char('(');
                 self.write_connective(output, *operator, expression, true)?;
+                let _ = output.write_char(')');
+                Ok(())
+            }
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } if self.boolean_equality(*operator, left, right)?.is_some() => {
+                let Some((operand, negated)) = self.boolean_equality(*operator, left, right)?
+                else {
+                    unreachable!("checked by the guard")
+                };
+                if negated {
+                    let _ = output.write_str("(NOT ");
+                }
+                self.write(output, operand)?;
+                if negated {
+                    let _ = output.write_char(')');
+                }
+                Ok(())
+            }
+            Expr::Call { args, .. } => {
+                let signature = self.call(expression)?;
+                if signature.schema != "pg_catalog" {
+                    super::quote_identifier(output, signature.schema);
+                    let _ = output.write_char('.');
+                }
+                super::quote_identifier(output, signature.name);
+                let _ = output.write_char('(');
+                for (index, (argument, &parameter)) in
+                    args.iter().zip(signature.arguments).enumerate()
+                {
+                    if index != 0 {
+                        let _ = output.write_str(", ");
+                    }
+                    match self.shape(argument)? {
+                        Shape::Literal(literal) => self.write_constant(
+                            output,
+                            &Constant {
+                                literal,
+                                type_oid: parameter,
+                                show: 0,
+                            },
+                        )?,
+                        Shape::Value { .. } => self.write(output, argument)?,
+                    }
+                }
                 let _ = output.write_char(')');
                 Ok(())
             }
@@ -1255,6 +1560,72 @@ impl<'a> ForeignSelectPlan<'a> {
     }
 }
 
+/// Splits `predicate` into the conditions that ship, written to `output` as
+/// postgres_fdw's `appendConditions` writes them, and those kept local.
+/// The shipped ones follow `order_qual_clauses`: by evaluation cost, the
+/// equivalence-class equalities the planner regenerates after the rest.
+pub(crate) fn remote_conditions<'a, const N: usize>(
+    deparser: &Deparser<'_>,
+    predicate: Option<&'a Expr<'a>>,
+    output: &mut StackStr<N>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let conditions = conjuncts(predicate, arena)?;
+    let kept = arena
+        .alloc_slice_with(conditions.len(), |index| conditions[index])
+        .map_err(|_| arena_full())?;
+    // (condition as written remotely, regenerated equality, cost)
+    let shipped = arena
+        .alloc_slice_with(conditions.len(), |index| (conditions[index], false, 0u32))
+        .map_err(|_| arena_full())?;
+    let (mut kept_count, mut shipped_count) = (0, 0);
+    let mut probe = RemoteText::new();
+    for &condition in conditions {
+        probe.clear();
+        if deparser.try_write_condition(&mut probe, condition, "")? {
+            let (written, equivalence) = match deparser.equivalence(condition, arena)? {
+                Some(regenerated) => (regenerated, true),
+                None => (condition, false),
+            };
+            let cost = match deparser.cost(written) {
+                Ok(cost) => cost,
+                Err(Stop::Local) => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a shippable foreign condition has no modeled cost"
+                    ));
+                }
+                Err(Stop::Error(error)) => return Err(error),
+            };
+            shipped[shipped_count] = (written, equivalence, cost);
+            shipped_count += 1;
+        } else {
+            kept[kept_count] = condition;
+            kept_count += 1;
+        }
+    }
+    let shipped = &mut shipped[..shipped_count];
+    // By cost, equalities after the rest at equal cost, otherwise as
+    // written: an insertion sort, which needs no buffer.
+    for next in 1..shipped.len() {
+        let mut at = next;
+        while at > 0 && (shipped[at - 1].2, shipped[at - 1].1) > (shipped[at].2, shipped[at].1) {
+            shipped.swap(at - 1, at);
+            at -= 1;
+        }
+    }
+    for (index, &(condition, _, _)) in shipped.iter().enumerate() {
+        let separator = if index == 0 { " WHERE " } else { " AND " };
+        if !deparser.try_write_condition(output, condition, separator)? {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a regenerated foreign condition no longer ships"
+            ));
+        }
+    }
+    Ok(&kept[..kept_count])
+}
+
 /// The ORDER BY key's table column, through an output position or name.
 fn order_column(
     deparser: &Deparser<'_>,
@@ -1333,6 +1704,8 @@ pub(crate) fn plan_select<'a>(
         foreign: &foreign,
         exposed: base.alias.unwrap_or(base.table),
         arena,
+        storage,
+        txid,
     };
     plan_with(&deparser, slot, statement, arena).map(Some)
 }
@@ -1344,23 +1717,8 @@ fn plan_with<'a>(
     arena: &'a Arena,
 ) -> Result<ForeignSelectPlan<'a>, SqlError> {
     let all = ColumnSet::all(deparser.table.n_columns);
-    let conditions = conjuncts(statement.where_clause, arena)?;
     let mut remote_where = RemoteText::new();
-    let kept = arena
-        .alloc_slice_with(conditions.len(), |index| conditions[index])
-        .map_err(|_| arena_full())?;
-    let mut kept_count = 0;
-    let mut shipped = 0;
-    for &condition in conditions {
-        let separator = if shipped == 0 { " WHERE " } else { " AND " };
-        if deparser.try_write_condition(&mut remote_where, condition, separator)? {
-            shipped += 1;
-        } else {
-            kept[kept_count] = condition;
-            kept_count += 1;
-        }
-    }
-    let kept = &kept[..kept_count];
+    let kept = remote_conditions(deparser, statement.where_clause, &mut remote_where, arena)?;
     // The columns the local plan reads: its output, local conditions and
     // the clauses evaluated over the rows.
     let mut fetched = ColumnSet::from_low_word(0);
@@ -1441,7 +1799,8 @@ fn plan_with<'a>(
     for column in (0..deparser.table.n_columns).filter(|&column| ordered.contains(column)) {
         fetched.insert(column);
     }
-    if whole {
+    // A locked row is copied whole, as a foreign table's row mark is.
+    if whole || !statement.locking.is_empty() {
         fetched = all;
     }
     // LIMIT and OFFSET ship when the remote rows are the final rows.

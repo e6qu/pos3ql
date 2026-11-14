@@ -3347,7 +3347,9 @@ pub(super) fn plan_select<'a>(
                 parameterized_indexes[table],
                 ordered_index_only,
             )?;
-            scan.output = output;
+            if !aggregate {
+                scan.output = output;
+            }
             // PostgreSQL scans a function in FROM with a `Function Scan`.
             if let Some(source) = statement.from.as_ref().and_then(|from| {
                 core::iter::once(&from.base)
@@ -3405,7 +3407,9 @@ pub(super) fn plan_select<'a>(
                 }
             }
             if let Some(pushed) = &foreign_scan {
-                foreign_scan_node(&mut scan, pushed, statement, scope, storage, txid)?;
+                foreign_scan_node(
+                    &mut scan, pushed, statement, scope, storage, txid, arena, aggregate,
+                )?;
             }
             push_scan(&mut plan, scan)?;
         }
@@ -3465,6 +3469,7 @@ pub(super) fn plan_select<'a>(
 
 /// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output
 /// carries the columns of the order the remote query applies.
+#[expect(clippy::too_many_arguments, reason = "the scan's plan context")]
 fn foreign_scan_node(
     scan: &mut PlanNode,
     pushed: &crate::sql::foreign::deparse::ForeignSelectPlan<'_>,
@@ -3472,11 +3477,61 @@ fn foreign_scan_node(
     scope: &QueryScope<'_>,
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
+    aggregate: bool,
 ) -> Result<(), SqlError> {
     scan.name = StackStr::from_str("Foreign Scan");
     scan.remote_sql = remote_sql_text(pushed.sql)?;
     let table = storage.table_def(pushed.table_slot, txid);
     let exposed = scope.names[0];
+    // The scan's target list: each output expression as `VERBOSE` prints a
+    // single relation's, which the described column names approximate only
+    // for bare columns.
+    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, &table)];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: Some(&table),
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: false,
+        domain_value: None,
+        folded: true,
+        bare: None,
+    };
+    let mut output = StackStr::<256>::new();
+    for item in statement.items.iter().filter(|_| !aggregate) {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                for column in table.columns() {
+                    if !output.is_empty() {
+                        let _ = output.write_str(", ");
+                    }
+                    crate::sql::catalog::write_identifier(&mut output, column.name.as_str());
+                }
+            }
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                let Some(text) = crate::sql::catalog::deparse::deparse_expression(
+                    &context,
+                    expression,
+                    crate::sql::catalog::deparse::Destination::Value,
+                    arena,
+                )?
+                else {
+                    output = scan.output;
+                    break;
+                };
+                if !output.is_empty() {
+                    let _ = output.write_str(", ");
+                }
+                let _ = output.write_str(text);
+            }
+        }
+    }
+    scan.output = output;
     for column in (0..table.n_columns).filter(|&column| pushed.ordered.contains(column)) {
         let name = table.columns()[column].name.as_str();
         let projected = statement.items.iter().any(|item| match item {
@@ -3498,6 +3553,14 @@ fn foreign_scan_node(
             }
             crate::sql::catalog::write_identifier(&mut scan.output, name);
         }
+    }
+    // `ROW_MARK_COPY` keeps the whole row of a locked foreign table.
+    if !statement.locking.is_empty() {
+        if !scan.output.is_empty() {
+            let _ = scan.output.write_str(", ");
+        }
+        crate::sql::catalog::write_identifier(&mut scan.output, exposed);
+        let _ = scan.output.write_str(".*");
     }
     Ok(())
 }

@@ -20,10 +20,10 @@ jobs:
     uses: ./.github/workflows/formatting.yml
 
   # The library test harness is the only native build the test jobs execute,
-  # so it gets its own runner and the test jobs wait for it alone. Every other
-  # target builds in parallel in native-build. Compiling either library unit
-  # peaks near 7 GB of compiler memory, the whole of a hosted macOS arm64
-  # runner, so each job builds one library unit at a time.
+  # so it gets its own runner and the test jobs wait for it alone; every other
+  # target builds in parallel in native-build. Compiling the library test
+  # harness peaks near 7 GB of compiler memory, all of a hosted macOS arm64
+  # runner, so no runner compiles both library units at once.
   native-test-build:
     needs: formatting
     name: native test build (${{ matrix.platform }})
@@ -39,7 +39,9 @@ jobs:
           - platform: macOS arm64
             runner: macos-15
             target: aarch64-apple-darwin
-            cargo_jobs: 3
+            # The compiler swaps here; extra code-generation threads measured
+            # no faster and only add memory.
+            cargo_jobs: 1
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:
@@ -111,7 +113,9 @@ jobs:
           - platform: macOS arm64
             runner: macos-15
             target: aarch64-apple-darwin
-            cargo_jobs: 3
+            # The compiler swaps here; extra code-generation threads measured
+            # no faster and only add memory.
+            cargo_jobs: 1
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     env:

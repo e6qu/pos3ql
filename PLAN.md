@@ -958,3 +958,9 @@ limits do not count as evidence.
 [AGENTS.md](AGENTS.md) holds the engineering and change rules and
 [CONTRIBUTING.md](CONTRIBUTING.md) holds the verification gates. The roadmap is
 finished only when every milestone's "done when" is demonstrated.
+
+The macOS arm64 native test build is memory-bound: compiling the library test
+executable peaks near 7 GB, all of the hosted runner, and takes about 7 minutes
+there against under 2 minutes on a larger machine. Lower that compiler peak,
+for example by moving large test fixtures out of the library crate, before the
+library grows enough to approach the 15-minute job limit again.

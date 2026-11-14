@@ -3862,8 +3862,13 @@ fn plan_pulled_select<'a>(
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's
-    // `LockRows` does; a query without FROM has no rows to lock.
-    if !statement.locking.is_empty() && !fromless {
+    // `LockRows` does; a query without FROM has no rows to lock. A query
+    // postgres_fdw runs whole as one remote scan sends its locking clause
+    // with it: its final path replaces `LockRows` unless a local `LIMIT`
+    // remains above the scan.
+    let remote_locking =
+        foreign_scan.is_some() && statement.limit.is_none() && statement.offset.is_none();
+    if !statement.locking.is_empty() && !fromless && !remote_locking {
         add_stage(
             &mut stages,
             &mut stage_count,

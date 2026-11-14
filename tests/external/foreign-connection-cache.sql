@@ -115,6 +115,15 @@ x	d2
 \.
 SELECT count(*) FROM fdw_cache_local.calls;
 SELECT count(*) FROM fdw_cache_local.b WHERE id > 10;
+-- A routine call between queued rows does not send them early.
+CREATE FUNCTION fdw_cache_local.label(i integer) RETURNS text LANGUAGE plpgsql
+  AS $$BEGIN RETURN 'p' || i; END$$;
+INSERT INTO fdw_cache_local.b SELECT i, fdw_cache_local.label(i) FROM generate_series(31, 37) i;
+SELECT count(*) FROM fdw_cache_local.calls;
+INSERT INTO fdw_cache_local.b VALUES (41, fdw_cache_local.label(41)), (42, fdw_cache_local.label(42)),
+  (43, fdw_cache_local.label(43)), (44, fdw_cache_local.label(44));
+SELECT count(*) FROM fdw_cache_local.calls;
+SELECT id, note FROM fdw_cache_local.b WHERE id > 30 ORDER BY id;
 ALTER FOREIGN TABLE fdw_cache_local.t OPTIONS (ADD batch_size '0x10');
 INSERT INTO fdw_cache_local.t (id, note) VALUES (200, 'f'), (1, 'skipped'), (201, 'g')
   ON CONFLICT DO NOTHING;

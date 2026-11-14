@@ -89221,6 +89221,13 @@ where
         };
         let mut inserted = resumed.changed;
         let mut batches = crate::sql::foreign::ForeignInsertBatches::new();
+        if let Some(progress) = progress.as_deref()
+            && let Err(error) = progress
+                .resumed_foreign_batches(arena)
+                .and_then(|targets| batches.restore(storage, targets, arena))
+        {
+            return sql_fail(error);
+        }
         let first_row = resumed.first;
         // A streamed source's row is read inside its row, after the row's
         // start: a call or a data-modifying `WITH` query's step there runs
@@ -89657,6 +89664,7 @@ where
             rows_outcome,
             &mut batches,
             &mut inserted,
+            progress.as_deref_mut(),
             storage,
             txn.txid,
             arena,
@@ -89799,6 +89807,13 @@ where
     }
     let mut inserted = resumed.changed;
     let mut batches = crate::sql::foreign::ForeignInsertBatches::new();
+    if let Some(progress) = progress.as_deref()
+        && let Err(error) = progress
+            .resumed_foreign_batches(arena)
+            .and_then(|targets| batches.restore(storage, targets, arena))
+    {
+        return sql_fail(error);
+    }
     let first_row = resumed.first;
     let values_node =
         crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Values);
@@ -90021,6 +90036,7 @@ where
         rows_outcome,
         &mut batches,
         &mut inserted,
+        progress.as_deref_mut(),
         storage,
         txn.txid,
         arena,
@@ -90712,12 +90728,26 @@ fn finish_foreign_batches(
     outcome: Outcome,
     batches: &mut crate::sql::foreign::ForeignInsertBatches<'_>,
     inserted: &mut u64,
+    progress: Option<&mut RowProgress>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
 ) -> Outcome {
     if !batches.has_pending() {
         return outcome;
+    }
+    // A pause for a routine call or a wait keeps the queued rows with the
+    // unfinished row; the next attempt queues them again.
+    if let Some(progress) = progress
+        && matches!(&outcome, Ok(Err(error)) if progress.stops_for(error))
+    {
+        let kept = batches
+            .save(arena)
+            .and_then(|targets| progress.keep_foreign_batches(targets, &storage.row_work));
+        return match kept {
+            Ok(()) => outcome,
+            Err(error) => sql_fail(error),
+        };
     }
     let flushed = batches.flush_all(storage, txid, arena);
     *inserted = inserted.saturating_sub(batches.take_skipped());

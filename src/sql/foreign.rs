@@ -2162,6 +2162,78 @@ impl<'a> ForeignInsertBatches<'a> {
         core::mem::take(&mut self.skipped)
     }
 
+    /// The queued rows as one encoded row per target table (its slot, batch
+    /// size, `ON CONFLICT DO NOTHING`, row count and Bind fields), to keep
+    /// across a pause of the statement.
+    pub(crate) fn save<'out>(&self, arena: &'out Arena) -> Result<&'out [&'out [u8]], SqlError> {
+        let mut targets = crate::mem::arena::ArenaList::new(arena);
+        for pending in self
+            .pending
+            .iter()
+            .flatten()
+            .filter(|pending| pending.rows != 0)
+        {
+            let encoded = super::exec::encode_projected_pub(
+                &[
+                    Datum::Int8(pending.table as i64),
+                    Datum::Int8(pending.batch_size as i64),
+                    Datum::Bool(pending.on_conflict_do_nothing),
+                    Datum::Int8(pending.rows as i64),
+                    Datum::Bytea(&pending.buffer[..pending.used]),
+                ],
+                arena,
+            )?;
+            targets
+                .push(encoded)
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        Ok(targets.as_slice())
+    }
+
+    /// Queues again the rows [`Self::save`] kept.
+    pub(crate) fn restore(
+        &mut self,
+        storage: &Storage,
+        targets: &[&[u8]],
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        for (index, encoded) in targets.iter().enumerate() {
+            let field = |column| super::exec::decode_projected_col_record(encoded, column, arena);
+            let (
+                Datum::Int8(table),
+                Datum::Int8(batch_size),
+                Datum::Bool(on_conflict_do_nothing),
+                Datum::Int8(rows),
+                Datum::Bytea(fields),
+            ) = (field(0)?, field(1)?, field(2)?, field(3)?, field(4)?)
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "kept foreign INSERT batch has an invalid shape"
+                ));
+            };
+            let slot = self.pending.get_mut(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "kept foreign INSERT batches overflow"
+                )
+            })?;
+            let buffer = arena
+                .alloc_persistent_slice_with(storage.foreign_send_capacity(), |_| 0u8)
+                .map_err(|_| super::eval::arena_full())?;
+            buffer[..fields.len()].copy_from_slice(fields);
+            *slot = Some(PendingInsert {
+                table: table as usize,
+                batch_size: batch_size as usize,
+                on_conflict_do_nothing,
+                rows: rows as usize,
+                buffer,
+                used: fields.len(),
+            });
+        }
+        Ok(())
+    }
+
     /// Queues one row, or inserts it at once when the table does not batch.
     /// Returns whether the row counts as inserted now: a queued row counts
     /// until its batch reports otherwise.

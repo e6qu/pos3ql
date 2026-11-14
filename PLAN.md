@@ -881,9 +881,10 @@ PostgreSQL fetches only what the reads need. COPY FROM into a foreign table queu
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup
-and holds at most `foreign_send_bytes` (`54000` beyond). A batched INSERT also sends its queued rows when
-the statement pauses for a PL/pgSQL call or a full output buffer, which
-PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,
+and holds at most `foreign_send_bytes` (`54000` beyond). A batched INSERT keeps its queued rows in the
+statement's row progress when it pauses for a PL/pgSQL call or a wait, so
+they are sent when a batch fills or the statement ends, as PostgreSQL sends
+them. libpq options beyond host, hostaddr, port, dbname, user,
 password, connect_timeout, application_name and sslmode fail with `HV00D`.
 `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a

@@ -552,3 +552,38 @@ fn foreign_scans_fetch_batches_as_the_plan_reads_them() {
         ]
     );
 }
+
+#[test]
+fn foreign_insert_batches_wait_through_routine_calls() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FOREIGN TABLE ft OPTIONS (ADD batch_size '3'); \
+         CREATE FUNCTION label(i integer) RETURNS text LANGUAGE plpgsql \
+           AS $$BEGIN RETURN 'p' || i; END$$",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO ft SELECT i, label(i) FROM generate_series(1, 4) i",
+    );
+    assert!(
+        String::from_utf8_lossy(&inserted).contains("INSERT 0 4"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    // The calls pause the statement after each row; the queued rows still
+    // go out as full batches and the remainder at the end.
+    let batches: Vec<usize> = remote_statements(&log)
+        .iter()
+        .filter(|command| command.starts_with("INSERT "))
+        .map(|command| command.matches("($").count())
+        .collect();
+    assert_eq!(batches, [3, 1]);
+}

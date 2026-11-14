@@ -282,6 +282,83 @@ pub(crate) fn deparse_expression<'a>(
     Ok(output.supported.then(|| output.text.as_str()))
 }
 
+/// `get_const_expr` for a planner constant of a column's type, such as a
+/// partition bound: `constant`'s spellings with the column's type modifier
+/// in the label (a modifier labels even a bare decimal `numeric`), then
+/// `COLLATE` when the column's collation is not the type's default.
+pub(crate) fn column_constant<'a>(
+    storage: &Storage,
+    txid: u32,
+    value: &str,
+    column: &crate::storage::ColumnMeta,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let context = Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined: &[],
+        pretty: false,
+        qualify: false,
+        bare: None,
+        domain_value: None,
+        folded: false,
+        sublinks: None,
+    };
+    let type_oid = super::catalog_column_type_oid(storage, column, txid)?;
+    let type_mod = super::catalog_column_type_mod(column);
+    let mut output = Output::new(arena);
+    if type_mod < 0 {
+        context.constant(value, type_oid, &mut output)?;
+    } else {
+        // Only character, bit, numeric and datetime types take a modifier;
+        // of their constants only a decimal `numeric` prints bare.
+        let bare = type_oid == oid::NUMERIC
+            && value.starts_with(|first: char| first.is_ascii_digit())
+            && value.contains(['.', 'e', 'E']);
+        if bare {
+            output.push(value)?;
+        } else {
+            output.push("'")?;
+            for (index, part) in value.split('\'').enumerate() {
+                if index != 0 {
+                    output.push("''")?;
+                }
+                output.push(part)?;
+            }
+            output.push("'")?;
+        }
+        output.push("::")?;
+        context.type_name_mod(type_oid, type_mod, &mut output)?;
+    }
+    if !matches!(
+        column.collation,
+        crate::sql::ast::Collation::None | crate::sql::ast::Collation::Default
+    ) {
+        let name = super::collation_name_by_oid(storage, txid, column.collation.oid(), arena)?
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                    "cache lookup failed for collation {}",
+                    column.collation.oid()
+                )
+            })?;
+        output.push(" COLLATE ")?;
+        output.push(name)?;
+    }
+    if !output.supported {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+            "cache lookup failed for type {}",
+            type_oid
+        ));
+    }
+    Ok(output.text.as_str())
+}
+
 struct Output<'a> {
     arena: &'a Arena,
     text: ArenaString<'a>,

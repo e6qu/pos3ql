@@ -1764,6 +1764,13 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 3408,
+        name: "pg_get_partition_constraintdef",
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 2078,
         name: "set_config",
         argument_types: "25 25 16",
@@ -16146,6 +16153,624 @@ pub fn partition_key_def_text<'a>(
     )?))
 }
 
+/// `pg_get_partition_constraintdef`: the implicit constraint a partition's
+/// rows satisfy, as PostgreSQL's `generate_partition_qual` builds it from the
+/// partition bounds of the table and its partition ancestors (outermost
+/// first), printed by `deparse_expression`. `None` for a relation that is not
+/// a partition, or a default partition with no siblings to exclude.
+/// Source: <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/partitioning/partbounds.c>
+/// (`get_qual_for_hash`, `get_qual_for_list`, `get_qual_for_range`,
+/// `make_partition_op_expr`).
+pub fn partition_constraint_def_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Some(slot) = table_slot_by_oid(storage, txid, oid) else {
+        return Ok(None);
+    };
+    let mut quals = crate::mem::arena::ArenaList::new(arena);
+    let mut current = slot;
+    let mut depth = 0usize;
+    // Collect the chain from the partition up, then emit outermost first.
+    let mut chain = crate::mem::arena::ArenaList::new(arena);
+    while let Some(attachment) = storage.table_def(current, txid).partition.attachment {
+        chain.push(current).map_err(|_| arena_full())?;
+        current = usize::from(attachment.parent);
+        depth += 1;
+        if depth > storage.table_count() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "partition ancestry of relation {} is cyclic",
+                oid
+            ));
+        }
+    }
+    for &partition in chain.as_slice().iter().rev() {
+        partition_bound_quals(storage, txid, partition, &mut quals, arena)?;
+    }
+    Ok(match quals.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        all => Some(bool_text(" AND ", all, arena)?),
+    })
+}
+
+/// A partition key column as its bound qualification reads it.
+#[derive(Clone, Copy)]
+struct PartitionQualKey<'a> {
+    column: ColumnMeta,
+    /// The column, relabeled to its operator class's input type when that
+    /// differs from the column's type (`(v)::text` for `varchar`).
+    operand: &'a str,
+}
+
+/// `(left AND right ...)`: a boolean connective of already parenthesized
+/// arguments, as `get_rule_expr` prints a `BoolExpr`.
+fn bool_text<'a>(
+    connective: &str,
+    arguments: &[&str],
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let mut text = crate::mem::arena::ArenaString::new(arena);
+    let _ = text.write_char('(');
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            text.write_str(connective).map_err(|_| arena_full())?;
+        }
+        text.write_str(argument).map_err(|_| arena_full())?;
+    }
+    text.write_char(')').map_err(|_| arena_full())?;
+    Ok(text.as_str())
+}
+
+fn render_text<'a>(arena: &'a Arena, parts: &[&str]) -> Result<&'a str, SqlError> {
+    let mut text = crate::mem::arena::ArenaString::new(arena);
+    for part in parts {
+        text.write_str(part).map_err(|_| arena_full())?;
+    }
+    Ok(text.as_str())
+}
+
+/// One argument list collapsed as PostgreSQL does: a single argument stands
+/// alone, several are joined by the connective.
+fn collapse_text<'a>(
+    connective: &str,
+    arguments: &[&'a str],
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    match arguments {
+        [only] => Ok(only),
+        all => bool_text(connective, all, arena),
+    }
+}
+
+fn partition_qual_keys<'a>(
+    storage: &Storage,
+    txid: u32,
+    parent: &TableDef,
+    keys: &[u16],
+    arena: &'a Arena,
+) -> Result<&'a [PartitionQualKey<'a>], SqlError> {
+    let mut out = crate::mem::arena::ArenaList::new(arena);
+    for &key in keys {
+        let column = parent.columns()[usize::from(key)];
+        let mut name = StackStr::<160>::new();
+        write_identifier(&mut name, column.name.as_str());
+        let type_oid = catalog_column_type_oid(storage, &column, txid)?;
+        // `get_partition_operator`: the operator class's input type is the
+        // base type of a domain and `text` for `varchar`.
+        let class_type = match domain_root_type_oid(storage, txid, type_oid) {
+            super::types::oid::VARCHAR => super::types::oid::TEXT,
+            root => root,
+        };
+        let operand = if class_type == type_oid {
+            arena.alloc_str(name.as_str()).map_err(|_| arena_full())?
+        } else {
+            let mut label = StackStr::<260>::new();
+            let _ = label.write_str(format_type_oid(storage, txid, class_type, -1).as_str());
+            render_text(arena, &["(", name.as_str(), ")::", label.as_str()])?
+        };
+        out.push(PartitionQualKey { column, operand })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(out.as_slice())
+}
+
+fn partition_value_constant<'a>(
+    storage: &Storage,
+    txid: u32,
+    key: &PartitionQualKey<'_>,
+    value: OwnedDatum,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let text = datum_to_text(value.as_datum(), arena)?;
+    deparse::column_constant(storage, txid, text, &key.column, arena)
+}
+
+fn partition_operator_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    key: &PartitionQualKey<'_>,
+    operator: &str,
+    value: OwnedDatum,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let constant = partition_value_constant(storage, txid, key, value, arena)?;
+    render_text(
+        arena,
+        &["(", key.operand, " ", operator, " ", constant, ")"],
+    )
+}
+
+fn null_test_text<'a>(
+    key: &PartitionQualKey<'_>,
+    is_null: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let mut name = StackStr::<160>::new();
+    write_identifier(&mut name, key.column.name.as_str());
+    render_text(
+        arena,
+        &[
+            "(",
+            name.as_str(),
+            if is_null {
+                " IS NULL)"
+            } else {
+                " IS NOT NULL)"
+            },
+        ],
+    )
+}
+
+/// The qualification one partition's bound adds below its parent.
+fn partition_bound_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    partition: usize,
+    quals: &mut crate::mem::arena::ArenaList<'a, &'a str>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some(attachment) = storage.table_def(partition, txid).partition.attachment else {
+        return Ok(());
+    };
+    let parent_slot = usize::from(attachment.parent);
+    let parent = storage.table_def(parent_slot, txid);
+    let Some(scheme) = parent.partition.scheme else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "parent of partition {} is not partitioned",
+            user_table_oid(storage, partition)
+        ));
+    };
+    let keys = partition_qual_keys(
+        storage,
+        txid,
+        &parent,
+        &scheme.keys[..usize::from(scheme.n_keys)],
+        arena,
+    )?;
+    let push = |quals: &mut crate::mem::arena::ArenaList<'a, &'a str>, qual: &'a str| {
+        quals.push(qual).map_err(|_| arena_full())
+    };
+    match (scheme.strategy, attachment.bound) {
+        (PartitionStrategy::Hash, PartitionBound::Hash { modulus, remainder }) => {
+            let mut text = crate::mem::arena::ArenaString::new(arena);
+            let _ = write!(
+                text,
+                "satisfies_hash_partition('{}'::oid, {modulus}, {remainder}",
+                user_table_oid(storage, parent_slot) as u32
+            );
+            for key in keys {
+                let mut name = StackStr::<160>::new();
+                write_identifier(&mut name, key.column.name.as_str());
+                let _ = write!(text, ", {}", name.as_str());
+            }
+            text.write_char(')').map_err(|_| arena_full())?;
+            push(quals, text.as_str())
+        }
+        (PartitionStrategy::List, bound) => {
+            let key = keys.first().ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "list partition key has no column")
+            })?;
+            list_partition_quals(storage, txid, parent_slot, key, bound, quals, arena)
+        }
+        (PartitionStrategy::Range, PartitionBound::Default) => {
+            let mut arms = crate::mem::arena::ArenaList::new(arena);
+            for sibling in partition_siblings_in_bound_order(storage, txid, parent_slot, arena)? {
+                let Some(sibling_attachment) =
+                    storage.table_def(*sibling, txid).partition.attachment
+                else {
+                    continue;
+                };
+                let PartitionBound::Range {
+                    lower,
+                    upper,
+                    n_keys,
+                } = sibling_attachment.bound
+                else {
+                    continue;
+                };
+                let mut sibling_quals = crate::mem::arena::ArenaList::new(arena);
+                range_partition_quals(
+                    storage,
+                    txid,
+                    keys,
+                    &lower,
+                    &upper,
+                    n_keys,
+                    &mut sibling_quals,
+                    arena,
+                )?;
+                if sibling_quals.is_empty() {
+                    for key in keys {
+                        push(&mut sibling_quals, null_test_text(key, false, arena)?)?;
+                    }
+                }
+                push(
+                    &mut arms,
+                    collapse_text(" AND ", sibling_quals.as_slice(), arena)?,
+                )?;
+            }
+            if arms.is_empty() {
+                return Ok(());
+            }
+            let mut others = crate::mem::arena::ArenaList::new(arena);
+            for key in keys {
+                push(&mut others, null_test_text(key, false, arena)?)?;
+            }
+            push(&mut others, collapse_text(" OR ", arms.as_slice(), arena)?)?;
+            let others = bool_text(" AND ", others.as_slice(), arena)?;
+            push(quals, render_text(arena, &["(NOT ", others, ")"])?)
+        }
+        (
+            PartitionStrategy::Range,
+            PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            },
+        ) => {
+            for key in keys {
+                push(quals, null_test_text(key, false, arena)?)?;
+            }
+            range_partition_quals(storage, txid, keys, &lower, &upper, n_keys, quals, arena)
+        }
+        (strategy, _) => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "partition {} bound does not match its parent's {:?} strategy",
+            user_table_oid(storage, partition),
+            strategy
+        )),
+    }
+}
+
+/// The partitions of `parent` in its partition descriptor's order.
+fn partition_siblings_in_bound_order<'a>(
+    storage: &Storage,
+    txid: u32,
+    parent: usize,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let mut siblings = crate::mem::arena::ArenaList::new(arena);
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid)
+            && storage
+                .table_def(slot, txid)
+                .partition
+                .attachment
+                .is_some_and(|attachment| usize::from(attachment.parent) == parent)
+        {
+            siblings.push(slot).map_err(|_| arena_full())?;
+        }
+    }
+    let siblings = siblings.into_mut_slice().map_err(|_| arena_full())?;
+    let mut failed = None;
+    siblings.sort_unstable_by(|&left, &right| {
+        match super::exec::partition_bound_order(storage, left, right, txid) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failed.get_or_insert(error);
+                core::cmp::Ordering::Equal
+            }
+        }
+    });
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(siblings),
+    }
+}
+
+/// `get_qual_for_list`.
+fn list_partition_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    parent: usize,
+    key: &PartitionQualKey<'_>,
+    bound: PartitionBound,
+    quals: &mut crate::mem::arena::ArenaList<'a, &'a str>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut elements = crate::mem::arena::ArenaList::<OwnedDatum>::new(arena);
+    let mut has_null = false;
+    let default = match bound {
+        PartitionBound::List { values, n_values } => {
+            for value in &values[..usize::from(n_values)] {
+                if matches!(value.as_datum(), Datum::Null) {
+                    has_null = true;
+                } else {
+                    elements.push(*value).map_err(|_| arena_full())?;
+                }
+            }
+            false
+        }
+        PartitionBound::Default => {
+            // The bound datums of every other partition, sorted and unique
+            // as the partition descriptor's bound info holds them.
+            for sibling in 0..storage.table_count() {
+                if !storage.table_slot_visible_to(sibling, txid) {
+                    continue;
+                }
+                let Some(attachment) = storage.table_def(sibling, txid).partition.attachment else {
+                    continue;
+                };
+                if usize::from(attachment.parent) != parent {
+                    continue;
+                }
+                let PartitionBound::List { values, n_values } = attachment.bound else {
+                    continue;
+                };
+                for value in &values[..usize::from(n_values)] {
+                    if matches!(value.as_datum(), Datum::Null) {
+                        has_null = true;
+                    } else {
+                        elements.push(*value).map_err(|_| arena_full())?;
+                    }
+                }
+            }
+            let sorted = elements.as_mut_slice().map_err(|_| arena_full())?;
+            let mut failed = None;
+            sorted.sort_unstable_by(|left, right| {
+                match super::eval::compare_datums(&left.as_datum(), &right.as_datum()) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        failed.get_or_insert(error);
+                        core::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some(error) = failed {
+                return Err(error);
+            }
+            let mut unique = 0usize;
+            for index in 0..sorted.len() {
+                if unique == 0
+                    || !super::eval::compare_datums(
+                        &sorted[unique - 1].as_datum(),
+                        &sorted[index].as_datum(),
+                    )?
+                    .is_eq()
+                {
+                    sorted[unique] = sorted[index];
+                    unique += 1;
+                }
+            }
+            elements.truncate(unique);
+            // A default partition alone has no constraint.
+            if unique == 0 && !has_null {
+                return Ok(());
+            }
+            true
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "list partition has a non-list bound"
+            ));
+        }
+    };
+    let elements = elements.as_slice();
+    let operation = match elements {
+        [] => None,
+        [only] => Some(partition_operator_text(
+            storage, txid, key, "=", *only, arena,
+        )?),
+        many if !matches!(key.column.ctype, ColType::Array(_)) => {
+            let mut text = crate::mem::arena::ArenaString::new(arena);
+            let _ = write!(text, "({} = ANY (ARRAY[", key.operand);
+            for (index, value) in many.iter().enumerate() {
+                if index != 0 {
+                    text.write_str(", ").map_err(|_| arena_full())?;
+                }
+                let constant = partition_value_constant(storage, txid, key, *value, arena)?;
+                text.write_str(constant).map_err(|_| arena_full())?;
+            }
+            text.write_str("]))").map_err(|_| arena_full())?;
+            Some(text.as_str())
+        }
+        many => {
+            let mut arms = crate::mem::arena::ArenaList::new(arena);
+            for value in many {
+                arms.push(partition_operator_text(
+                    storage, txid, key, "=", *value, arena,
+                )?)
+                .map_err(|_| arena_full())?;
+            }
+            Some(bool_text(" OR ", arms.as_slice(), arena)?)
+        }
+    };
+    let mut result = crate::mem::arena::ArenaList::new(arena);
+    if has_null {
+        let null = null_test_text(key, true, arena)?;
+        result
+            .push(match operation {
+                Some(operation) => bool_text(" OR ", &[null, operation], arena)?,
+                None => null,
+            })
+            .map_err(|_| arena_full())?;
+    } else {
+        result
+            .push(null_test_text(key, false, arena)?)
+            .map_err(|_| arena_full())?;
+        if let Some(operation) = operation {
+            result.push(operation).map_err(|_| arena_full())?;
+        }
+    }
+    if default {
+        let all = collapse_text(" AND ", result.as_slice(), arena)?;
+        quals
+            .push(render_text(arena, &["(NOT ", all, ")"])?)
+            .map_err(|_| arena_full())
+    } else {
+        for qual in result.as_slice() {
+            quals.push(qual).map_err(|_| arena_full())?;
+        }
+        Ok(())
+    }
+}
+
+/// `get_qual_for_range` for a non-default bound, after its `IS NOT NULL`
+/// tests: equal leading bound columns become `=` conditions, then one `OR`
+/// of arms for the lower bound and one for the upper bound.
+#[expect(clippy::too_many_arguments, reason = "mirrors get_qual_for_range")]
+fn range_partition_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    keys: &[PartitionQualKey<'_>],
+    lower: &[PartitionBoundValue],
+    upper: &[PartitionBoundValue],
+    n_keys: u8,
+    quals: &mut crate::mem::arena::ArenaList<'a, &'a str>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let n = usize::from(n_keys).min(keys.len());
+    let value = |bound: PartitionBoundValue| match bound {
+        PartitionBoundValue::Value(value) => Some(value),
+        PartitionBoundValue::MinValue | PartitionBoundValue::MaxValue => None,
+    };
+    let mut first = 0usize;
+    while first < n {
+        let (Some(low), Some(high)) = (value(lower[first]), value(upper[first])) else {
+            break;
+        };
+        if !super::eval::compare_datums(&low.as_datum(), &high.as_datum())?.is_eq() {
+            break;
+        }
+        if first == n - 1 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid range bound specification"
+            ));
+        }
+        quals
+            .push(partition_operator_text(
+                storage,
+                txid,
+                &keys[first],
+                "=",
+                low,
+                arena,
+            )?)
+            .map_err(|_| arena_full())?;
+        first += 1;
+    }
+    let mut lower_arms = crate::mem::arena::ArenaList::new(arena);
+    let mut upper_arms = crate::mem::arena::ArenaList::new(arena);
+    let mut need_lower = true;
+    let mut need_upper = true;
+    let mut arm = 0usize;
+    while arm < n - first {
+        let mut lower_args = crate::mem::arena::ArenaList::new(arena);
+        let mut upper_args = crate::mem::arena::ArenaList::new(arena);
+        for column in first..n {
+            let lower_next = (column + 1 < n).then(|| lower[column + 1]);
+            let upper_next = (column + 1 < n).then(|| upper[column + 1]);
+            let lower_value = value(lower[column]);
+            let upper_value = value(upper[column]);
+            if need_lower && let Some(low) = lower_value {
+                let operator = if column - first < arm {
+                    "="
+                } else if column == n - 1
+                    || matches!(lower_next, Some(PartitionBoundValue::MinValue))
+                {
+                    ">="
+                } else {
+                    ">"
+                };
+                lower_args
+                    .push(partition_operator_text(
+                        storage,
+                        txid,
+                        &keys[column],
+                        operator,
+                        low,
+                        arena,
+                    )?)
+                    .map_err(|_| arena_full())?;
+            }
+            if need_upper && let Some(high) = upper_value {
+                let operator = if column - first < arm {
+                    "="
+                } else if matches!(upper_next, Some(PartitionBoundValue::MaxValue)) {
+                    "<="
+                } else {
+                    "<"
+                };
+                upper_args
+                    .push(partition_operator_text(
+                        storage,
+                        txid,
+                        &keys[column],
+                        operator,
+                        high,
+                        arena,
+                    )?)
+                    .map_err(|_| arena_full())?;
+            }
+            if column + 1 - first > arm {
+                if lower_value.is_none()
+                    || !matches!(lower_next, Some(PartitionBoundValue::Value(_)))
+                {
+                    need_lower = false;
+                }
+                if upper_value.is_none()
+                    || !matches!(upper_next, Some(PartitionBoundValue::Value(_)))
+                {
+                    need_upper = false;
+                }
+                break;
+            }
+        }
+        if !lower_args.is_empty() {
+            lower_arms
+                .push(collapse_text(" AND ", lower_args.as_slice(), arena)?)
+                .map_err(|_| arena_full())?;
+        }
+        if !upper_args.is_empty() {
+            upper_arms
+                .push(collapse_text(" AND ", upper_args.as_slice(), arena)?)
+                .map_err(|_| arena_full())?;
+        }
+        if !need_lower && !need_upper {
+            break;
+        }
+        arm += 1;
+    }
+    if !lower_arms.is_empty() {
+        quals
+            .push(collapse_text(" OR ", lower_arms.as_slice(), arena)?)
+            .map_err(|_| arena_full())?;
+    }
+    if !upper_arms.is_empty() {
+        quals
+            .push(collapse_text(" OR ", upper_arms.as_slice(), arena)?)
+            .map_err(|_| arena_full())?;
+    }
+    Ok(())
+}
+
 fn partition_bound_def_text(bound: PartitionBound, arena: &Arena) -> Result<&str, SqlError> {
     use core::fmt::Write as _;
 
@@ -16365,6 +16990,23 @@ fn write_range_partition_comparison<Definition0: crate::storage::DefinitionBacki
             let _ = out.write_str("))");
         }
     }
+    Ok(())
+}
+
+/// `get_range_partbound_string`: `(1, MINVALUE)`, constants unlabeled.
+pub(crate) fn write_range_bound_datums(
+    out: &mut impl core::fmt::Write,
+    values: &[PartitionBoundValue],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let _ = out.write_char('(');
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            let _ = out.write_str(", ");
+        }
+        write_partition_bound_value(out, *value, arena)?;
+    }
+    let _ = out.write_char(')');
     Ok(())
 }
 

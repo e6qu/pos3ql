@@ -32454,7 +32454,42 @@ fn partition_creation_rejects_overlapping_typed_bounds() {
          CREATE TABLE partitions_overlap PARTITION OF partitions FOR VALUES FROM (5) TO (15)",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("would overlap partition"),
+        String::from_utf8_lossy(&output).contains(
+            "partition \"partitions_overlap\" would overlap partition \"partitions_first\""
+        ),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn partition_constraint_definitions_follow_generate_partition_qual() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE qual_root (a int, b text) PARTITION BY RANGE (a); \
+         CREATE TABLE qual_low PARTITION OF qual_root FOR VALUES FROM (MINVALUE) TO (-5); \
+         CREATE TABLE qual_mid PARTITION OF qual_root FOR VALUES FROM (1) TO (10) \
+           PARTITION BY LIST (b); \
+         CREATE TABLE qual_mid_xy PARTITION OF qual_mid FOR VALUES IN ('x', 'y', 'x'); \
+         CREATE TABLE qual_mid_rest PARTITION OF qual_mid DEFAULT; \
+         CREATE TABLE qual_rest PARTITION OF qual_root DEFAULT; \
+         SELECT pg_get_partition_constraintdef(oid) FROM pg_class \
+          WHERE relname LIKE 'qual%' ORDER BY relname",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "((a IS NOT NULL) AND (a < '-5'::integer))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10) AND (NOT ((b IS NOT NULL) \
+             AND (b = ANY (ARRAY['x'::text, 'y'::text])))))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10) AND (b IS NOT NULL) \
+             AND (b = ANY (ARRAY['x'::text, 'y'::text])))",
+            "(NOT ((a IS NOT NULL) AND ((a < '-5'::integer) OR ((a >= 1) AND (a < 10)))))",
+            "NULL",
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );

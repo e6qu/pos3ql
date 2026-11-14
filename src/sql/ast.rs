@@ -4173,17 +4173,25 @@ pub enum PartitionStrategy {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PartitionBound<'a> {
-    Default,
+    /// `DEFAULT`, at its keyword (PostgreSQL's bound location).
+    Default { location: SourcePosition },
+    /// `FROM (...) TO (...)`, at its `FROM`.
     Range {
         from: &'a [&'a Expr<'a>],
         to: &'a [&'a Expr<'a>],
+        location: SourcePosition,
     },
+    /// `IN (...)`, at its `IN`.
     List {
         values: &'a [&'a Expr<'a>],
+        location: SourcePosition,
     },
+    /// `WITH (MODULUS m, REMAINDER r)`, at its `WITH`. The grammar takes
+    /// unsigned integer constants only.
     Hash {
-        modulus: &'a Expr<'a>,
-        remainder: &'a Expr<'a>,
+        modulus: i32,
+        remainder: i32,
+        location: SourcePosition,
     },
 }
 

@@ -882,8 +882,14 @@ referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
 detached and dropped; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
-clones (`54000`). `pg_get_partition_constraintdef(oid)`, which psql's `\d+`
-calls for a partition, fails with `0A000`. A btree index may use
+clones (`54000`). `pg_get_partition_constraintdef(oid)` and psql's `\d+`
+`Partition constraint:` line print the constraint PostgreSQL's
+`generate_partition_qual` builds from a partition's and its ancestors'
+bounds, and new bounds report PostgreSQL's overlap, default-conflict,
+empty-range and hash-modulus errors with the partition and value its bound
+search finds (`differential_exact/505`). Partition keys are plain columns:
+expression keys and a key `COLLATE` fail (`0A000` and a syntax error), and a
+hash key must be an integer column. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

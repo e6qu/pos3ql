@@ -8847,31 +8847,110 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {
+        let location = SourcePosition::new(Some(self.peek_at));
         if self.eat_ident("default")? {
-            return Ok(PartitionBound::Default);
+            return Ok(PartitionBound::Default { location });
         }
         self.expect_ident("for")?;
         self.expect_ident("values")?;
+        let location = SourcePosition::new(Some(self.peek_at));
         if self.eat_ident("from")? {
             let from = self.partition_bound_values()?;
             self.expect_ident("to")?;
             let to = self.partition_bound_values()?;
-            return Ok(PartitionBound::Range { from, to });
+            return Ok(PartitionBound::Range { from, to, location });
         }
         if self.eat_ident("in")? {
             return Ok(PartitionBound::List {
                 values: self.partition_bound_values()?,
+                location,
             });
         }
+        let with_at = self.peek_at;
         self.expect_ident("with")?;
         self.expect_op("(")?;
-        self.expect_ident("modulus")?;
-        let modulus = self.expression(0)?;
-        self.expect_op(",")?;
-        self.expect_ident("remainder")?;
-        let remainder = self.expression(0)?;
+        // `hash_partbound`: `NonReservedWord Iconst` elements in any order.
+        let mut modulus = None;
+        let mut remainder = None;
+        loop {
+            let at = self.peek_at;
+            let (Tok::Ident(name) | Tok::QuotedIdent(name)) = self.peeked else {
+                return Err(self.syntax_error_here());
+            };
+            self.advance()?;
+            let Tok::Num(digits) = self.peeked else {
+                return Err(self.syntax_error_here());
+            };
+            let Some(value) = digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| digits.parse::<i32>().ok())
+                .flatten()
+            else {
+                return Err(self.syntax_error_here());
+            };
+            self.advance()?;
+            let slot = match name {
+                "modulus" => &mut modulus,
+                "remainder" => &mut remainder,
+                _ => {
+                    return Err(Self::hash_bound_error(
+                        at,
+                        sqlstate::SYNTAX_ERROR,
+                        format_args!("unrecognized hash partition bound specification \"{name}\""),
+                    ));
+                }
+            };
+            if slot.is_some() {
+                return Err(Self::hash_bound_error(
+                    at,
+                    sqlstate::DUPLICATE_OBJECT,
+                    format_args!("{name} for hash partition provided more than once"),
+                ));
+            }
+            *slot = Some(value);
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
         self.expect_op(")")?;
-        Ok(PartitionBound::Hash { modulus, remainder })
+        let Some(modulus) = modulus else {
+            return Err(Self::hash_bound_error(
+                with_at,
+                sqlstate::SYNTAX_ERROR,
+                format_args!("modulus for hash partition must be specified"),
+            ));
+        };
+        let Some(remainder) = remainder else {
+            return Err(Self::hash_bound_error(
+                with_at,
+                sqlstate::SYNTAX_ERROR,
+                format_args!("remainder for hash partition must be specified"),
+            ));
+        };
+        Ok(PartitionBound::Hash {
+            modulus,
+            remainder,
+            location: SourcePosition::new(Some(with_at)),
+        })
+    }
+
+    /// An error PostgreSQL's `PartitionBoundSpec` grammar action raises at
+    /// byte `at`.
+    fn hash_bound_error(
+        at: usize,
+        sqlstate: &'static str,
+        message: core::fmt::Arguments<'_>,
+    ) -> ParseError {
+        ParseError {
+            at,
+            message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        }
     }
 
     fn partition_by_clause(&mut self) -> Result<crate::sql::ast::PartitionBy<'a>, ParseError> {

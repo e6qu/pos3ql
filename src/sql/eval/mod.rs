@@ -3328,6 +3328,17 @@ pub trait CatalogAccess {
             "partition ancestry requires catalog access"
         ))
     }
+    /// A partition's implicit constraint, as `pg_get_partition_constraintdef`.
+    fn partition_constraint_def<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "partition constraints require catalog access"
+        ))
+    }
     /// The executable `RANGE|LIST|HASH (...)` clause for a partitioned table.
     fn partition_key_def<'a>(
         &self,

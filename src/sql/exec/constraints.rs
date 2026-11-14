@@ -78,6 +78,10 @@ fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
 
 /// Whose row a NOT NULL, CHECK or view check option violation describes.
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a fixed column set passed by value to each row check"
+)]
 pub(crate) enum RowDescription {
     /// A row the current user's statement writes to the table in slot
     /// `table`, giving values to the `written` columns.

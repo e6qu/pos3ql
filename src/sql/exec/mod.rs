@@ -77795,10 +77795,6 @@ fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "COPY shares the bounded INSERT trigger and constraint context"
-)]
 /// The columns a COPY FROM gives values to, PostgreSQL's `insertedCols`.
 fn copy_columns(setup: &CopySetup) -> ColumnSet {
     let mut columns = ColumnSet::EMPTY;
@@ -77808,6 +77804,10 @@ fn copy_columns(setup: &CopySetup) -> ColumnSet {
     columns
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY shares the bounded INSERT trigger and constraint context"
+)]
 fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     frame: &crate::sql::error_context::CopyFrame<'_>,
     storage: &mut Storage,

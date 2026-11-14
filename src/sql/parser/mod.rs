@@ -10975,11 +10975,7 @@ impl<'a> Parser<'a> {
                                 binding.type_mod
                             },
                             collation: binding.collation,
-                            source: if length_coercion {
-                                *operand
-                            } else {
-                                expression
-                            },
+                            source: if length_coercion { operand } else { expression },
                         })
                         .map(|expression| &*expression)
                         .map_err(|_| self.arena_full("bound type input exceeds SQL arena"))?;

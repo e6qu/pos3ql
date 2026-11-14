@@ -720,7 +720,15 @@ same relation (PostgreSQL names it `t_1`), and PostgreSQL's alternatives of
 hashing an expression key (`(big.id + 1) = b2.id`) or joining the unique
 subquery rows (`Hash Join` over a `HashAggregate`) are not planned; pos3ql
 probes an index per outer row where PostgreSQL's costs may prefer a hash
-join or a bitmap scan. Not yet shown: row
+join or a bitmap scan. A relation never analyzed estimates its resident
+rows where PostgreSQL assumes ten pages (`estimate_rel_size`), so
+`EXPLAIN` costs and row figures differ there. A derived table kept by
+`OFFSET 0` plans as `Subquery Scan` over a `Limit`, where PostgreSQL drops
+the zero offset and the trivial subquery scan, and a nested loop of two
+such scans omits its `Join Filter` line. A `MATERIALIZED` CTE, or one read
+twice, is merged into the statement (under a generated name for the
+second read) instead of planned as PostgreSQL's `CTE c` subplan read by
+`CTE Scan on c a` nodes. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name

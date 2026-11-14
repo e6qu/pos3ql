@@ -3133,6 +3133,126 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
     }
 }
 
+/// The target column a data change's condition names in `expression`, or
+/// `WHOLE_ROW_KEY` for its whole row.
+fn dml_target_column(
+    definition: &TableDef,
+    alias: Option<&str>,
+    expression: &Expr<'_>,
+) -> Option<usize> {
+    let answers = |qualifier: &str| {
+        crate::sql::eval::qualifier_answers_target(
+            crate::storage::RelationDefinition::from_definition(definition),
+            alias,
+            qualifier,
+        )
+    };
+    match expression {
+        Expr::WholeRow(name) if answers(name) => return Some(WHOLE_ROW_KEY),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if definition.column_index(name).is_none() && answers(name) => {
+            return Some(WHOLE_ROW_KEY);
+        }
+        _ => {}
+    }
+    let Expr::Column { qualifier, name } = expression else {
+        return None;
+    };
+    if qualifier.is_some_and(|qualifier| !answers(qualifier)) {
+        return None;
+    }
+    definition.column_index(name)
+}
+
+/// Whether a data change's condition constrains the leading key column of
+/// one of the table's indexes, so PostgreSQL reaches its rows through index
+/// entries rather than a sequential scan: a comparison, an `IN` list, or an
+/// `OR` whose every branch does.
+pub(crate) fn dml_condition_reaches_index(
+    storage: &Storage,
+    definition: &TableDef,
+    alias: Option<&str>,
+    txid: u32,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    let Some(predicate) = where_clause else {
+        return false;
+    };
+    let mut leading = ColumnSet::EMPTY;
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if metadata.primary || metadata.unique {
+            leading.insert(column);
+        }
+    }
+    for key in definition.uniques() {
+        if let Some(&column) = key.columns().first() {
+            leading.insert(usize::from(column));
+        }
+    }
+    for index in storage.indexes_for(definition.schema.as_str(), definition.name.as_str(), txid) {
+        if index.n_cols > 0 && index.expressions[0].is_none() {
+            leading.insert(usize::from(index.columns[0]));
+        }
+    }
+    if leading.is_empty() {
+        return false;
+    }
+    condition_reaches_columns(predicate, definition, alias, leading)
+}
+
+fn condition_reaches_columns(
+    expression: &Expr<'_>,
+    definition: &TableDef,
+    alias: Option<&str>,
+    leading: ColumnSet,
+) -> bool {
+    match expression {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            condition_reaches_columns(left, definition, alias, leading)
+                || condition_reaches_columns(right, definition, alias, leading)
+        }
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            condition_reaches_columns(left, definition, alias, leading)
+                && condition_reaches_columns(right, definition, alias, leading)
+        }
+        Expr::InList {
+            operand,
+            list,
+            negated: false,
+            ..
+        } => {
+            dml_target_column(definition, alias, operand)
+                .is_some_and(|column| column < MAX_COLUMNS && leading.contains(column))
+                && list.iter().all(|item| dml_index_operand_is_invariant(item))
+        }
+        _ => {
+            let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
+            collect_index_constraints(
+                expression,
+                &mut |column: &Expr<'_>| dml_target_column(definition, alias, column),
+                &dml_index_operand_is_invariant,
+                &mut by_column,
+            );
+            by_column.iter().enumerate().any(|(column, set)| {
+                leading.contains(column)
+                    && (set.equality.is_some() || set.lower.is_some() || set.upper.is_some())
+            })
+        }
+    }
+}
+
 pub(crate) fn dml_index_access_plan<'a>(
     storage: &Storage,
     slot: usize,
@@ -3146,38 +3266,8 @@ pub(crate) fn dml_index_access_plan<'a>(
         return Ok(None);
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
-    let mut resolve_column = |expression: &Expr<'a>| {
-        let answers = |qualifier: &str| {
-            crate::sql::eval::qualifier_answers_target(
-                crate::storage::RelationDefinition::from_definition(definition),
-                alias,
-                qualifier,
-            )
-        };
-        match expression {
-            Expr::WholeRow(name) if answers(name) => return Some(WHOLE_ROW_KEY),
-            Expr::Column {
-                qualifier: None,
-                name,
-            } if definition.column_index(name).is_none() && answers(name) => {
-                return Some(WHOLE_ROW_KEY);
-            }
-            _ => {}
-        }
-        let Expr::Column { qualifier, name } = expression else {
-            return None;
-        };
-        if qualifier.is_some_and(|qualifier| {
-            !crate::sql::eval::qualifier_answers_target(
-                crate::storage::RelationDefinition::from_definition(definition),
-                alias,
-                qualifier,
-            )
-        }) {
-            return None;
-        }
-        definition.column_index(name)
-    };
+    let mut resolve_column =
+        |expression: &Expr<'a>| dml_target_column(definition, alias, expression);
     let Some(predicate) = where_clause else {
         return Ok(None);
     };

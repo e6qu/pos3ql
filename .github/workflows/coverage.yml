@@ -260,12 +260,13 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
-      - name: Enable PostgreSQL prepared transactions
+      - name: Enable PostgreSQL prepared transactions and logical WAL
         run: |
           postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
-            -c "ALTER SYSTEM SET max_prepared_transactions = 8"
+            -c "ALTER SYSTEM SET max_prepared_transactions = 8" \
+            -c "ALTER SYSTEM SET wal_level = logical"
           docker restart "$postgres_container"
           for _ in $(seq 1 50); do
             pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && exit 0
@@ -354,12 +355,13 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v5
-      - name: Enable PostgreSQL prepared transactions
+      - name: Enable PostgreSQL prepared transactions and logical WAL
         run: |
           postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
-            -c "ALTER SYSTEM SET max_prepared_transactions = 8"
+            -c "ALTER SYSTEM SET max_prepared_transactions = 8" \
+            -c "ALTER SYSTEM SET wal_level = logical"
           docker restart "$postgres_container"
           for _ in $(seq 1 50); do
             pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && exit 0

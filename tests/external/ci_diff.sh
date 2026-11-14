@@ -308,6 +308,15 @@ wait_p3() {
 wait_up "$PGHOST" "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 1; }
 wait_p3 || { echo "pos3ql not reachable on 127.0.0.1:$P3_PORT"; exit 1; }
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+# pos3ql publishes logical changes from every write. A reference below
+# `wal_level = logical` warns on CREATE PUBLICATION, and the corpora compare
+# warnings, so the oracle must run at pos3ql's level.
+reference_wal_level=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW wal_level' 2>&1)
+if [[ "$reference_wal_level" != logical ]]; then
+  printf 'FAIL: the PostgreSQL reference must run with wal_level = logical (found %s)\n' \
+    "$reference_wal_level"
+  exit 1
+fi
 
 restart_p3() {
   kill "$P3_PID" 2>/dev/null

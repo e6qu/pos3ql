@@ -46,6 +46,7 @@ mod joined_dml_returning;
 mod key_index_marks;
 mod key_preparation;
 mod nested_planner_inputs;
+mod notice_parity;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;

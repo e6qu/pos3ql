@@ -206,7 +206,7 @@ if [[ "$REFERENCE_MODE" == local ]]; then
     exit 1
   fi
   SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c wal_level=logical -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
     -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
 
@@ -268,6 +268,16 @@ done
 if [[ $P3_READY -ne 1 ]] || ! server_alive "$P3_PID"; then
   bad "pos3ql did not accept connections at startup (see $WORK/p3.log)"
   tail -20 "$WORK/p3.log"
+  exit 1
+fi
+
+# pos3ql publishes logical changes from every write. A reference below
+# `wal_level = logical` warns on CREATE PUBLICATION, and the corpora compare
+# warnings, so the oracle must run at pos3ql's level.
+reference_wal_level=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -d "$REFERENCE_DATABASE" \
+  -X -t -A -c 'SHOW wal_level' 2>&1)
+if [[ "$reference_wal_level" != logical ]]; then
+  bad "the PostgreSQL reference must run with wal_level = logical (found $reference_wal_level)"
   exit 1
 fi
 

@@ -467,6 +467,22 @@ binding them follows the same dependency-list pattern. Renaming an enum value th
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`.
+The differential corpora compare notices, warnings and INFO messages with
+their statement positions; three ordering gaps remain. A constant
+expression is evaluated for each row instead of once while planning, so a
+notice its input raises (`''::tsquery` in a query returning three rows) is
+sent once per row where PostgreSQL sends it once; matching needs a planning
+pass that replaces constant subexpressions with their values. `UPDATE` and
+`DELETE` evaluate every target row's `WHERE` before changing the first row,
+where PostgreSQL alternates them, so routine calls in the condition and in
+the change interleave their notices differently; matching needs the row
+selection to run lazily under the statement's command snapshot. Row order
+without `ORDER BY` follows a model of PostgreSQL's access path rather than its
+cost-based plan: a data change whose condition constrains an index's leading
+column takes rows in their first-insertion order, as an index or bitmap scan
+reaches an updated row at its first position, and any other data change takes
+them in physical order. A `SELECT` answered through an index still uses
+physical order.
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;

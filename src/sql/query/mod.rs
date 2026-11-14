@@ -69,9 +69,9 @@ use scan::{
     scan_source_with_pax_columns,
 };
 pub(crate) use scan::{
-    IndexAccessPlan, OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates,
-    index_access_plan, ordered_index_access_plan, parameterized_index_access_plan,
-    rowless_one_time_filter_passes,
+    IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index, dml_index_access_plan,
+    dml_indexed_candidates, index_access_plan, ordered_index_access_plan,
+    parameterized_index_access_plan, rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,

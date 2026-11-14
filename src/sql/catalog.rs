@@ -4986,34 +4986,37 @@ pub(crate) fn validate_literal_input(
     if !builtin {
         return Ok(());
     }
-    arena
-        .with_remaining_region(|scratch| {
-            let value = Datum::Text(text);
-            match target {
-                ColType::Array(element) if element.is_catalog_reference() => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
-                }
-                ColType::Regtype => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::regtype_cast(value, Some(&catalog), scratch)?;
-                }
-                target if target.is_reg_object() => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
-                }
-                // An input the analysis cannot run here is reported by the
-                // evaluation that converts the literal.
-                target => match super::eval::cast_to(value, target, scratch) {
-                    Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
-                    result => {
-                        result?;
+    // A probe: the evaluation that converts the literal raises its notices.
+    super::eval::probe_constants(|| {
+        arena
+            .with_remaining_region(|scratch| {
+                let value = Datum::Text(text);
+                match target {
+                    ColType::Array(element) if element.is_catalog_reference() => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
                     }
-                },
-            }
-            Ok(())
-        })
-        .map_err(|_| super::query::arena_full_pub())?
+                    ColType::Regtype => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::regtype_cast(value, Some(&catalog), scratch)?;
+                    }
+                    target if target.is_reg_object() => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
+                    }
+                    // An input the analysis cannot run here is reported by the
+                    // evaluation that converts the literal.
+                    target => match super::eval::cast_to(value, target, scratch) {
+                        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
+                        result => {
+                            result?;
+                        }
+                    },
+                }
+                Ok(())
+            })
+            .map_err(|_| super::query::arena_full_pub())?
+    })
 }
 
 /// Runs [`validate_literal_input`] for each UNKNOWN literal a selected

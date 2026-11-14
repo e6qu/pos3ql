@@ -5530,9 +5530,12 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     context.load_plpgsql()?;
     // A trigger's OLD and NEW hold no virtual generated column's value, which
     // PostgreSQL computes only when a query reads the table. A BEFORE
-    // trigger's NEW is recomputed afterwards, so it is cleared in place.
+    // trigger's NEW holds no generated value at all: the write computes its
+    // stored ones afterwards, so they are cleared in place.
     let columns = definition.columns();
-    let (old, new) = if columns.iter().any(|column| column.default.is_virtual()) {
+    let (old, new) = if columns.iter().any(|column| {
+        column.default.is_virtual() || (before && new.is_some() && column.default.is_generated())
+    }) {
         let without_virtual = |values: &[Datum<'values>]| {
             let copied = context
                 .arena
@@ -5552,7 +5555,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         let new = match new {
             Some(values) if before => {
                 for (value, column) in values.iter_mut().zip(columns) {
-                    if column.default.is_virtual() {
+                    if column.default.is_generated() {
                         *value = Datum::Null;
                     }
                 }
@@ -18839,6 +18842,19 @@ pub fn create_subscription(
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
     }
+    if options.connect == crate::sql::ast::SubscriptionConnect::Deferred {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(StackStr::from_str(
+                "To initiate replication, you must manually create the replication slot, \
+                 enable the subscription, and refresh the subscription.",
+            )),
+        );
+        responder.warning(
+            sqlstate::WARNING,
+            "subscription was created, but is not connected",
+        )?;
+    }
     Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
 }
 
@@ -29637,6 +29653,13 @@ where
             .flatten()
     }
 
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        let table = self.canonical(table);
+        self.transition_row(table)
+            .then(|| self.transition.whole_row_relation(table))
+            .flatten()
+    }
+
     fn whole_row_fields(
         &self,
         table: &str,
@@ -29832,7 +29855,11 @@ where
             return Some(self.locals[index].declared_type());
         }
         self.named(qualifier, name)
-            .map(|variable| variable.ctype)
+            .map(|variable| match (variable.ctype, variable.value) {
+                // A record variable has the type of the row it holds.
+                (ColType::Record, Datum::Composite { slot, .. }) => ColType::Composite(Some(slot)),
+                (ctype, _) => ctype,
+            })
             .or_else(|| {
                 self.record_index(qualifier, name)
                     .and_then(|index| match self.values[index] {
@@ -34615,7 +34642,10 @@ fn coerce_plpgsql_local<'a>(
             let definition = storage.table_def(usize::from(slot), txid);
             let mut target_oids = [0; MAX_COLUMNS];
             for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
-                *oid = column.ctype.oid();
+                // A domain column keeps its domain, as the row type declares.
+                *oid = storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .unwrap_or(column.ctype.oid());
             }
             let value = fit_plpgsql_row(
                 value,
@@ -34662,6 +34692,28 @@ fn coerce_plpgsql_local<'a>(
                 arena,
                 Some(sequences),
             )?
+        }
+        // A record variable takes a named composite value with its row
+        // type, whose fields keep their declared (domain) types.
+        Some(PlpgsqlRecordShape::Dynamic) | None
+            if local.ctype == ColType::Record
+                && let Datum::Composite { slot, fields } = value =>
+        {
+            let definition = storage.require_row_type_definition(slot, txid)?;
+            let typed = arena
+                .alloc_slice_copy(fields)
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (field, declared) in typed.iter_mut().zip(definition.active_fields()) {
+                if let Some(oid) =
+                    storage.routine_type_oid(declared.ctype, declared.user_type, txid)
+                {
+                    field.type_oid = oid;
+                }
+            }
+            Datum::Composite {
+                slot,
+                fields: typed,
+            }
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
             plpgsql_conversion_input(
@@ -34807,7 +34859,10 @@ fn coerce_plpgsql_table_rowtype<'a>(
             name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
-            type_oid: column.ctype.oid(),
+            // A domain column keeps its domain, as the row type declares.
+            type_oid: storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .unwrap_or(column.ctype.oid()),
             type_mod: column.type_mod,
             value: coerce_assignment(
                 source.value,
@@ -90291,12 +90346,60 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
     index_name: crate::sql::ast::QualName<'_>,
     primary: bool,
     timing: crate::sql::ast::ConstraintTiming,
-) -> Result<(), SqlError> {
+    responder: &mut Responder,
+) -> Outcome {
+    match attach_constraint_using_index_checked(
+        storage,
+        wal,
+        txn,
+        table_index,
+        definition,
+        new_definition,
+        name,
+        index_name,
+        primary,
+        timing,
+        responder,
+    ) {
+        Ok(()) => sql_ok(),
+        Err(AttachIndexError::Sql(error)) => sql_fail(error),
+        Err(AttachIndexError::Wire(wire)) => Err(wire),
+    }
+}
+
+/// A failure of [`attach_constraint_using_index`]: the statement's error, or
+/// a full send buffer while it reported the index's rename.
+enum AttachIndexError {
+    Sql(SqlError),
+    Wire(WireFull),
+}
+
+impl From<SqlError> for AttachIndexError {
+    fn from(error: SqlError) -> Self {
+        Self::Sql(error)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_constraint_using_index_checked<Definition0: crate::storage::DefinitionBacking>(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    new_definition: &mut TableDefBuilder,
+    name: Option<&str>,
+    index_name: crate::sql::ast::QualName<'_>,
+    primary: bool,
+    timing: crate::sql::ast::ConstraintTiming,
+    responder: &mut Responder,
+) -> Result<(), AttachIndexError> {
     if timing.is_deferrable() {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "attaching a deferrable constraint to an existing index is not supported"
-        ));
+        )
+        .into());
     }
     let schema = index_name.schema.unwrap_or(definition.schema.as_str());
     let slot = storage
@@ -90321,14 +90424,16 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
             "\"{}\" is not an index for table \"{}\"",
             index.name_for(txn.txid).as_str(),
             definition.name.as_str()
-        ));
+        )
+        .into());
     }
     if !index.unique {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "index \"{}\" is not unique",
             index.name_for(txn.txid).as_str()
-        ));
+        )
+        .into());
     }
     if index.predicate.is_some()
         || index.expressions[..index.n_cols]
@@ -90339,7 +90444,8 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot attach partial or expression index \"{}\" as a constraint",
             index.name_for(txn.txid).as_str()
-        ));
+        )
+        .into());
     }
     if !matches!(
         index.mutable_for(txn.txid).kind,
@@ -90349,7 +90455,8 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot attach partitioned index \"{}\" as a constraint",
             index.name_for(txn.txid).as_str()
-        ));
+        )
+        .into());
     }
     if index.descending[..index.n_cols]
         .iter()
@@ -90368,19 +90475,36 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
             sqlstate::FEATURE_NOT_SUPPORTED,
             "index \"{}\" has key semantics that cannot become a table constraint",
             index.name_for(txn.txid).as_str()
-        ));
+        )
+        .into());
     }
+    let index_relation_name = index.name_for(txn.txid);
     let constraint_name = match name {
         Some(name) => SqlName::parse(name)?,
-        None => index.name_for(txn.txid),
+        None => index_relation_name,
     };
+    if constraint_name.as_str() != index_relation_name.as_str() {
+        responder
+            .notice(
+                "00000",
+                stack_format!(
+                    256,
+                    "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"{}\" to \"{}\"",
+                    index_relation_name.as_str(),
+                    constraint_name.as_str()
+                )
+                .as_str(),
+            )
+            .map_err(AttachIndexError::Wire)?;
+    }
     if crate::sql::exec::ddl::constraint_name_taken(new_definition, constraint_name.as_str()) {
         return Err(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
             "constraint \"{}\" for relation \"{}\" already exists",
             constraint_name.as_str(),
             definition.name.as_str()
-        ));
+        )
+        .into());
     }
     if primary {
         if new_definition.columns().iter().any(|column| column.primary)
@@ -90393,7 +90517,8 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
                 sqlstate::INVALID_TABLE_DEFINITION,
                 "multiple primary keys for table \"{}\" are not allowed",
                 definition.name.as_str()
-            ));
+            )
+            .into());
         }
         for &column in &index.columns[..index.n_cols] {
             new_definition.columns[column as usize].not_null =
@@ -90418,7 +90543,13 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
         crate::storage::RelationIdentity::parse(index.created_at)
             .expect("admitted explicit index has an identity"),
     );
-    stage_index_rename(storage, wal, txn, slot, constraint_name)
+    Ok(stage_index_rename(
+        storage,
+        wal,
+        txn,
+        slot,
+        constraint_name,
+    )?)
 }
 
 fn stage_constraint_comment_rename(
@@ -94761,59 +94892,84 @@ fn alter_table_relation(
                         ));
                     }
                 }
-                if let Err(error) = exclusion_column_dependents(
-                    storage, txn.txid, &new_def, i, *cascade, arena, responder,
-                ) {
-                    return sql_fail(error);
-                }
-                if let Some(original_index) = original_index
-                    && let Err(error) = apply_column_drop_dependencies(
+                // PostgreSQL reports every object the column's drop reaches
+                // in one notice, before the executors below drop them.
+                let report = match original_index {
+                    Some(original_index) => dependency_report::report_drop(
                         storage,
-                        wal,
-                        txn,
-                        &mut *scratch,
-                        seq_session,
-                        table_index,
-                        original_index,
-                        original_column,
+                        txn.txid,
+                        &[ObjectAddress::new(
+                            super::catalog::PG_CLASS_OID,
+                            super::catalog::user_table_oid(storage, table_index),
+                            i32::from(def.attribute_number(original_index)),
+                        )],
                         *cascade,
                         arena,
                         responder,
-                    )
-                {
-                    return sql_fail(error);
-                }
-                let mut referenced_keys = [StackStr::<128>::new(); crate::storage::MAX_UNIQUES + 1];
-                let mut referenced_key_count = 0usize;
-                if new_def.columns[i].primary || new_def.columns[i].unique {
-                    let Some(name) = new_def.column_key_name(i) else {
-                        return sql_fail(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "dropped inline key has no admitted name"
-                        ));
-                    };
-                    referenced_keys[referenced_key_count] = StackStr::from_str(name.as_str());
-                    referenced_key_count += 1;
-                }
-                for key in new_def.uniques() {
-                    if key.columns().contains(&(i as u16)) {
-                        referenced_keys[referenced_key_count] =
-                            StackStr::from_str(key.name.as_str());
-                        referenced_key_count += 1;
-                    }
-                }
-                for key_name in &referenced_keys[..referenced_key_count] {
-                    if let Err(error) = drop_dependent_foreign_keys(
-                        storage,
-                        wal,
-                        txn,
-                        table_index,
-                        &mut new_def,
-                        key_name.as_str(),
-                        *cascade,
+                    ),
+                    None => Ok(None),
+                };
+                match run_reported_drop(report, responder, |responder| {
+                    if let Err(error) = exclusion_column_dependents(
+                        storage, txn.txid, &new_def, i, *cascade, arena, responder,
                     ) {
                         return sql_fail(error);
                     }
+                    if let Some(original_index) = original_index
+                        && let Err(error) = apply_column_drop_dependencies(
+                            storage,
+                            wal,
+                            txn,
+                            &mut *scratch,
+                            seq_session,
+                            table_index,
+                            original_index,
+                            original_column,
+                            *cascade,
+                            arena,
+                            responder,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                    let mut referenced_keys =
+                        [StackStr::<128>::new(); crate::storage::MAX_UNIQUES + 1];
+                    let mut referenced_key_count = 0usize;
+                    if new_def.columns[i].primary || new_def.columns[i].unique {
+                        let Some(name) = new_def.column_key_name(i) else {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "dropped inline key has no admitted name"
+                            ));
+                        };
+                        referenced_keys[referenced_key_count] = StackStr::from_str(name.as_str());
+                        referenced_key_count += 1;
+                    }
+                    for key in new_def.uniques() {
+                        if key.columns().contains(&(i as u16)) {
+                            referenced_keys[referenced_key_count] =
+                                StackStr::from_str(key.name.as_str());
+                            referenced_key_count += 1;
+                        }
+                    }
+                    for key_name in &referenced_keys[..referenced_key_count] {
+                        if let Err(error) = drop_dependent_foreign_keys(
+                            storage,
+                            wal,
+                            txn,
+                            table_index,
+                            &mut new_def,
+                            key_name.as_str(),
+                            *cascade,
+                        ) {
+                            return sql_fail(error);
+                        }
+                    }
+                    responder.send_dependency_notice()?;
+                    sql_ok()
+                })? {
+                    Ok(()) => {}
+                    Err(error) => return sql_fail(error),
                 }
                 let mut removed_constraints = [SqlName::EMPTY;
                     crate::storage::MAX_CHECKS
@@ -95496,7 +95652,8 @@ fn alter_table_relation(
                     *index,
                     *primary,
                     *timing,
-                ) {
+                    responder,
+                )? {
                     return sql_fail(error);
                 }
                 validate_definition = true;
@@ -97854,18 +98011,18 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
 /// identity, then heap rows by heap position. PostgreSQL's data changes read
 /// their target this way, so routines they call observe earlier rows'
 /// changes in the same order.
-fn for_each_physical_row<'a>(
+/// Visits a table's visible rows in the physical order a sequential scan
+/// reads them: saved rows by row identity, then heap rows by heap position.
+/// PostgreSQL's data changes read their target this way, so routines they
+/// call observe earlier rows' changes in the same order.
+fn for_each_physical_row(
     storage: &Storage,
     table: usize,
     txid: u32,
-    candidates: Option<&[u64]>,
-    arena: &'a Arena,
+    arena: &Arena,
     visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    let count = match candidates {
-        Some(rowids) => rowids.len(),
-        None => storage.visible_row_count(table, txid)?,
-    };
+    let count = storage.visible_row_count(table, txid)?;
     let snapshot = storage.table_row_snapshot(table, Some(arena))?;
     let ordered = arena
         .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
@@ -97876,34 +98033,19 @@ fn for_each_physical_row<'a>(
             )
         })?;
     let mut fill = 0usize;
-    let mut retain = |rowid, home: &crate::storage::VisibleRowHome| {
-        let slot = ordered.get_mut(fill).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "visible row count changed during a data change's scan"
-            )
-        })?;
-        *slot = Some(snapshot.retain(rowid, home)?);
-        fill += 1;
-        Ok::<(), SqlError>(())
-    };
-    match candidates {
-        Some(rowids) => {
-            for &rowid in rowids {
-                if let Some(state) = storage.row_state(table, rowid)?
-                    && let Some(home) = storage.visible_row_home(table, rowid, state, txid)?
-                {
-                    retain(rowid, &home)?;
-                }
-            }
+    storage.for_each_row_state(table, &mut |rowid, state| {
+        if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
+            let slot = ordered.get_mut(fill).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible row count changed during a data change's scan"
+                )
+            })?;
+            *slot = Some(snapshot.retain(rowid, &home)?);
+            fill += 1;
         }
-        None => storage.for_each_row_state(table, &mut |rowid, state| {
-            if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
-                retain(rowid, &home)?;
-            }
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?,
-    }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
     ordered[..fill].sort_unstable_by_key(|row| row.map(|row| row.sort_key()));
     for row in ordered[..fill].iter().copied().flatten() {
         visit(row.rowid(), row.read()?)?;
@@ -97950,8 +98092,15 @@ pub(super) fn collect_matches<'a>(
     } else {
         None
     };
+    // A condition an index can answer reaches rows through their index
+    // entries, which keep an updated row's first position as its heap chain
+    // does in PostgreSQL: rows go in row identity order. Otherwise the rows
+    // go in a sequential scan's physical order, as a SELECT reads them.
+    let index_order = indexed.is_some()
+        || (def.kind != crate::storage::TableKind::Foreign
+            && super::query::dml_condition_reaches_index(storage, &def, alias, txid, where_clause));
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
-        // Each leaf's rows follow its physical order; leaves keep theirs.
+        // Each leaf's rows follow its own order; leaves keep theirs.
         let leaf_start = scratch.len();
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
@@ -98041,16 +98190,27 @@ pub(super) fn collect_matches<'a>(
             }
             Ok::<(), SqlError>(())
         };
-        // Rows are selected, and their RETURNING lists computed, in each
-        // leaf's physical row order.
-        for_each_physical_row(
-            storage,
-            leaf,
-            txid,
-            access.map(|access| access.rowids()),
-            arena,
-            &mut visit,
-        )?;
+        if let Some(access) = access {
+            for &rowid in access.rowids() {
+                if let Some(state) = storage.row_state(leaf, rowid)?
+                    && let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)?
+                {
+                    visit(rowid, home)?;
+                }
+            }
+        } else if index_order {
+            storage.for_each_row_state(leaf, &mut |rowid, state| {
+                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+                    visit(rowid, home)?;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+        } else {
+            for_each_physical_row(storage, leaf, txid, arena, &mut visit)?;
+        }
+        if index_order {
+            scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
+        }
     }
     images.finish()
 }
@@ -98186,104 +98346,111 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        for_each_physical_row(storage, leaf, txid, None, arena, &mut |rowid, loc| {
-            storage.record_relation_tuple_read(txid, leaf, None)?;
-            // Consume-in-place, as in row_matches: the joined-row probe reads
-            // this row's values only while it runs.
-            let snapshot = loc.snapshot();
-            let mut joined = None;
-            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                let mark = arena.mark();
-                let found = (|| -> Result<bool, SqlError> {
-                    let mut physical = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, layout.schema, &mut physical)?;
-                    let mut tv = [Datum::Null; MAX_COLUMNS];
-                    layout.project(&physical, &mut tv);
-                    let context = RowCtx {
-                        table_oid: None,
-                        def: crate::storage::RelationDefinition::from_definition(def),
-                        values: &tv[..def.n_columns],
-                        alias,
-                    };
-                    if let Some(plan) = row_security
-                        && !super::query::row_security_passes(
-                            plan, &context, storage, txid, arena, params, hooks,
-                        )?
-                    {
-                        return Ok(false);
-                    }
-                    if capture.retains_joined() {
-                        joined = super::query::joined_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            arena,
-                            params,
-                            &context,
-                            None,
-                            target_hash_candidates(
-                                hash.as_ref(),
+        storage.for_each_row_state(
+            leaf,
+            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+                use core::ops::ControlFlow;
+                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                storage.record_relation_tuple_read(txid, leaf, None)?;
+                // Consume-in-place, as in row_matches: the joined-row probe reads
+                // this row's values only while it runs.
+                let snapshot = loc.snapshot();
+                let mut joined = None;
+                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                    let mark = arena.mark();
+                    let found = (|| -> Result<bool, SqlError> {
+                        let mut physical = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, layout.schema, &mut physical)?;
+                        let mut tv = [Datum::Null; MAX_COLUMNS];
+                        layout.project(&physical, &mut tv);
+                        let context = RowCtx {
+                            table_oid: None,
+                            def: crate::storage::RelationDefinition::from_definition(def),
+                            values: &tv[..def.n_columns],
+                            alias,
+                        };
+                        if let Some(plan) = row_security
+                            && !super::query::row_security_passes(
+                                plan, &context, storage, txid, arena, params, hooks,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
                                 storage,
+                                from,
                                 txid,
-                                context.values,
+                                where_clause,
                                 arena,
-                            )?,
-                            arena,
-                        )?;
-                        Ok(joined.is_some())
+                                params,
+                                &context,
+                                None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &context,
+                                &mut |_| Ok(()),
+                                None,
+                                None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
+                            )
+                        }
+                    })();
+                    // SAFETY: joined predicates retain no decoded values or front scratch.
+                    unsafe { arena.rewind_to(mark) };
+                    if !found? {
+                        return Ok(None);
+                    }
+                    Ok(Some(if capture_bytes {
+                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
                     } else {
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &context,
-                            &mut |_| Ok(()),
-                            None,
-                            None,
-                            target_hash_candidates(
-                                hash.as_ref(),
-                                storage,
-                                txid,
-                                context.values,
-                                arena,
-                            )?,
-                        )
-                    }
-                })();
-                // SAFETY: joined predicates retain no decoded values or front scratch.
-                unsafe { arena.rewind_to(mark) };
-                if !found? {
-                    return Ok(None);
-                }
-                Ok(Some(if capture_bytes {
-                    MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
-                } else {
-                    MatchedDmlRow::Identity
-                }))
-            })?;
-            if let Some(image) = found {
-                if let MatchedDmlRow::Bytes(bytes) = image {
-                    images.push(leaf, rowid, bytes)?;
-                }
-                let row = PhysicalRow::local(leaf, rowid, snapshot);
-                if let Some(joined) = joined {
-                    images.push_joined(row, joined)?;
-                }
-                scratch.push(row).map_err(|error| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "statement row selection: {}",
-                        error
-                    )
+                        MatchedDmlRow::Identity
+                    }))
                 })?;
-            }
-            Ok(())
-        })?;
+                if let Some(image) = found {
+                    if let MatchedDmlRow::Bytes(bytes) = image {
+                        images.push(leaf, rowid, bytes)?;
+                    }
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
     }
     images.finish()
 }
@@ -98412,106 +98579,113 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        for_each_physical_row(storage, leaf, txid, None, arena, &mut |rowid, loc| {
-            storage.record_relation_tuple_read(txid, leaf, None)?;
-            let snapshot = loc.snapshot();
-            let mut joined = None;
-            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                let mark = arena.mark();
-                let found = (|| -> Result<bool, SqlError> {
-                    let mut physical = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, layout.schema, &mut physical)?;
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    layout.project(&physical, &mut values);
-                    let context = RowCtx {
-                        table_oid: None,
-                        def: crate::storage::RelationDefinition::from_definition(def),
-                        values: &values[..def.n_columns],
-                        alias,
-                    };
-                    if let Some(plan) = row_security
-                        && !super::query::row_security_passes(
-                            plan, &context, storage, txid, arena, params, hooks,
-                        )?
-                    {
-                        return Ok(false);
-                    }
-                    let scope = JoinedTriggerDmlScope {
-                        row: &context,
-                        outer,
-                    };
-                    if capture.retains_joined() {
-                        joined = super::query::joined_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            arena,
-                            params,
-                            &scope,
-                            None,
-                            target_hash_candidates(
-                                hash.as_ref(),
+        storage.for_each_row_state(
+            leaf,
+            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+                use core::ops::ControlFlow;
+                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                storage.record_relation_tuple_read(txid, leaf, None)?;
+                let snapshot = loc.snapshot();
+                let mut joined = None;
+                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                    let mark = arena.mark();
+                    let found = (|| -> Result<bool, SqlError> {
+                        let mut physical = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, layout.schema, &mut physical)?;
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        layout.project(&physical, &mut values);
+                        let context = RowCtx {
+                            table_oid: None,
+                            def: crate::storage::RelationDefinition::from_definition(def),
+                            values: &values[..def.n_columns],
+                            alias,
+                        };
+                        if let Some(plan) = row_security
+                            && !super::query::row_security_passes(
+                                plan, &context, storage, txid, arena, params, hooks,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        let scope = JoinedTriggerDmlScope {
+                            row: &context,
+                            outer,
+                        };
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
                                 storage,
+                                from,
                                 txid,
-                                context.values,
+                                where_clause,
                                 arena,
-                            )?,
-                            arena,
-                        )?;
-                        Ok(joined.is_some())
+                                params,
+                                &scope,
+                                None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &scope,
+                                &mut |_| Ok(()),
+                                None,
+                                None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
+                            )
+                        }
+                    })();
+                    // SAFETY: joined predicates retain no decoded values or front scratch.
+                    unsafe { arena.rewind_to(mark) };
+                    if !found? {
+                        return Ok(None);
+                    }
+                    Ok(Some(if capture_bytes {
+                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
                     } else {
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &scope,
-                            &mut |_| Ok(()),
-                            None,
-                            None,
-                            target_hash_candidates(
-                                hash.as_ref(),
-                                storage,
-                                txid,
-                                context.values,
-                                arena,
-                            )?,
-                        )
-                    }
-                })();
-                // SAFETY: joined predicates retain no decoded values or front scratch.
-                unsafe { arena.rewind_to(mark) };
-                if !found? {
-                    return Ok(None);
-                }
-                Ok(Some(if capture_bytes {
-                    MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
-                } else {
-                    MatchedDmlRow::Identity
-                }))
-            })?;
-            if let Some(image) = found {
-                if let MatchedDmlRow::Bytes(bytes) = image {
-                    images.push(leaf, rowid, bytes)?;
-                }
-                let row = PhysicalRow::local(leaf, rowid, snapshot);
-                if let Some(joined) = joined {
-                    images.push_joined(row, joined)?;
-                }
-                scratch.push(row).map_err(|error| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "statement row selection: {}",
-                        error
-                    )
+                        MatchedDmlRow::Identity
+                    }))
                 })?;
-            }
-            Ok(())
-        })?;
+                if let Some(image) = found {
+                    if let MatchedDmlRow::Bytes(bytes) = image {
+                        images.push(leaf, rowid, bytes)?;
+                    }
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
     }
     images.finish()
 }

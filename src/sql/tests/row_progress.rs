@@ -619,3 +619,202 @@ fn self_reading_insert_select_resumes_with_its_first_source() {
     drop((writer, engine));
     std::fs::remove_dir_all(config.data_dir).unwrap();
 }
+
+const QUALIFY_SETUP: &str = "CREATE TABLE items(id int PRIMARY KEY, a bigint); \
+    INSERT INTO items VALUES (1, 1), (2, 1), (3, 1); \
+    CREATE TABLE calls(id int, total bigint, n bigint); CREATE SEQUENCE call_numbers; \
+    CREATE FUNCTION seen(x int) RETURNS bigint LANGUAGE plpgsql AS $$ \
+    DECLARE total bigint; BEGIN \
+    IF x = 2 THEN PERFORM pg_advisory_xact_lock(7); END IF; \
+    SELECT sum(a) INTO total FROM items; \
+    INSERT INTO calls VALUES (x, total, nextval('call_numbers')); \
+    RAISE NOTICE 'seen % %', x, total; RETURN total; END$$";
+
+/// `UPDATE` and `DELETE` qualify each row just before changing it, as
+/// PostgreSQL does: a condition's call sees the rows already changed, and
+/// its notices interleave with the change's own calls. Each call runs once
+/// although every call stops the write and resumes it at its row; rows that
+/// failed their condition are not qualified again. Values from PostgreSQL
+/// 18.6.
+#[test]
+fn conditions_qualify_each_row_as_it_changes() {
+    let update_calls: &[&str] = &["1|3|1", "2|3|2", "-2|3|3", "3|13|4", "-3|13|5"];
+    let update_notices: &[&str] = &[
+        "seen 1 3",
+        "seen 2 3",
+        "seen -2 3",
+        "seen 3 13",
+        "seen -3 13",
+    ];
+    let cases: &[(&str, &[&str], &[&str], &[&str])] = &[
+        (
+            "UPDATE items SET a = a + 10 + seen(-id) * 0 WHERE seen(id) + id > 4",
+            &["1|1", "2|11", "3|11"],
+            update_calls,
+            update_notices,
+        ),
+        (
+            "DO $$BEGIN UPDATE items SET a = a + 10 + seen(-id) * 0 \
+             WHERE seen(id) + id > 4; END$$",
+            &["1|1", "2|11", "3|11"],
+            update_calls,
+            update_notices,
+        ),
+        (
+            "DELETE FROM items WHERE seen(id) > 1 RETURNING id, seen(-id)",
+            &["3|1"],
+            &["1|3|1", "-1|2|2", "2|2|3", "-2|1|4", "3|1|5"],
+            &["seen 1 3", "seen -1 2", "seen 2 2", "seen -2 1", "seen 3 1"],
+        ),
+    ];
+    for &(sql, rows, calls, notices) in cases {
+        let config = test_config("row-progress-qualify");
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        writer.success(&mut engine, QUALIFY_SETUP, true);
+        let output = writer.success(&mut engine, sql, true);
+        assert_eq!(notice_messages(&output), notices, "{sql}");
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT id::text || '|' || a FROM items ORDER BY id",
+                true
+            )),
+            rows,
+            "{sql}"
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT id::text || '|' || total || '|' || n FROM calls ORDER BY n",
+                true
+            )),
+            calls,
+            "{sql}"
+        );
+        drop((writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+/// A condition's call that waits for a lock after earlier rows changed
+/// makes the statement wait with those rows kept; the write resumes at the
+/// waiting row without qualifying the earlier rows again, including the
+/// row whose condition failed. Values from PostgreSQL 18.6.
+#[test]
+fn condition_lock_waits_resume_at_the_waiting_row() {
+    let statements = [
+        "UPDATE items SET a = a + 10 WHERE seen(id) + id > 5",
+        "DO $$BEGIN UPDATE items SET a = a + 10 WHERE seen(id) + id > 5; END$$",
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for sql in statements {
+            let context = format!("{mode:?}: {sql}");
+            let mut config = test_config(&format!("row-progress-qualify-lock-{mode:?}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine, QUALIFY_SETUP, true);
+            writer.success(
+                &mut engine,
+                "UPDATE items SET a = 2 WHERE id = 3; TRUNCATE calls",
+                true,
+            );
+            holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+            let status = writer.execute_status(&mut engine, sql, true);
+            let completed = blocked_on_lock(status, &mut writer);
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+            assert_eq!(
+                resume(&mut engine, &mut writer, sql, completed),
+                ExecutionStatus::Complete,
+                "{context}"
+            );
+            let output = writer.send.readable().to_vec();
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{context}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT id::text || '|' || a FROM items ORDER BY id; \
+                     SELECT id::text || '|' || total FROM calls ORDER BY n",
+                    true
+                )),
+                ["1|1", "2|11", "3|12", "1|4", "2|4", "3|14"],
+                "{context}"
+            );
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+/// Under read committed, a row another transaction changed while the write
+/// waited for its lock is qualified again in its latest version, calling
+/// the condition's routine again as PostgreSQL's recheck does; a version
+/// that no longer qualifies is skipped. Values from PostgreSQL 18.6.
+#[test]
+fn condition_rechecks_rows_changed_while_waiting() {
+    let config = test_config("row-progress-qualify-recheck");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut holder = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE items(id int PRIMARY KEY, a bigint); \
+         INSERT INTO items VALUES (1, 1), (2, 1), (3, 1); \
+         CREATE FUNCTION small(x int, a bigint) RETURNS boolean LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE NOTICE 'small % %', x, a; RETURN a < 50; END$$",
+        true,
+    );
+    holder.success(
+        &mut engine,
+        "BEGIN; UPDATE items SET a = 100 WHERE id = 2; UPDATE items SET a = 5 WHERE id = 3",
+        true,
+    );
+    let sql = "UPDATE items SET a = a + 10 WHERE small(id, a)";
+    writer.send.clear();
+    let status = writer.execute_status(&mut engine, sql, true);
+    let completed = blocked_on_lock(status, &mut writer);
+    holder.success(&mut engine, "COMMIT", true);
+    assert_eq!(
+        resume(&mut engine, &mut writer, sql, completed),
+        ExecutionStatus::Complete
+    );
+    let output = writer.send.readable().to_vec();
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        notice_messages(&output),
+        [
+            "small 1 1",
+            "small 2 1",
+            "small 2 100",
+            "small 3 1",
+            "small 3 5"
+        ]
+    );
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "SELECT id::text || '|' || a FROM items ORDER BY id",
+            true
+        )),
+        ["1|11", "2|100", "3|15"]
+    );
+    drop((holder, writer, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}

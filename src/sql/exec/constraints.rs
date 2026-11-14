@@ -1041,6 +1041,18 @@ fn index_key_values_equal(
             return Ok(false);
         }
         let equal = match equality.operator_classes[index] {
+            // A pattern class compares strings byte by byte, whatever the
+            // key's collation.
+            crate::storage::IndexOperatorClass::Btree(class) if class.is_pattern() => {
+                compare_datums_collated(
+                    equality.storage,
+                    equality.txid,
+                    crate::sql::ast::Collation::C,
+                    value,
+                    other_value,
+                )?
+                .is_eq()
+            }
             crate::storage::IndexOperatorClass::Btree(_)
             | crate::storage::IndexOperatorClass::Hash(_)
             | crate::storage::IndexOperatorClass::Brin(_)

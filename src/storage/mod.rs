@@ -13904,6 +13904,15 @@ pub struct IndexDef {
 }
 
 impl IndexDef {
+    /// The collation key `position` is ordered and compared under: its own,
+    /// or `C` under a pattern operator class, which compares byte by byte.
+    pub(crate) fn comparison_collation(&self, position: usize) -> Collation {
+        match self.resolved_operator_classes[position] {
+            Some(IndexOperatorClass::Btree(class)) if class.is_pattern() => Collation::C,
+            _ => self.collations[position],
+        }
+    }
+
     pub(crate) const EMPTY: Self = Self {
         relation: IndexRelationSource::Table,
         database: DatabaseOid::POSTGRES,
@@ -41978,7 +41987,7 @@ impl Storage {
                     .iter()
                     .any(Option::is_some)
                 || columns.iter().enumerate().any(|(position, column)| {
-                    index.collations[position]
+                    index.comparison_collation(position)
                         != table_definition.columns[*column as usize].collation
                 });
             let mut key_mask = ColumnSet::EMPTY;
@@ -42017,8 +42026,12 @@ impl Storage {
                     | crate::sql::ast::IndexAccessMethod::Gin
                     | crate::sql::ast::IndexAccessMethod::SpGist
             );
-            want[n_want].collations[..columns.len()]
-                .copy_from_slice(&index.collations[..columns.len()]);
+            for (position, collation) in want[n_want].collations[..columns.len()]
+                .iter_mut()
+                .enumerate()
+            {
+                *collation = index.comparison_collation(position);
+            }
             want[n_want].dependency_mask = key_mask | include_mask;
             let arena = self
                 .index_arena

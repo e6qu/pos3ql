@@ -70370,7 +70370,7 @@ pub fn create_index(
                     operator_class.name
                 ));
             };
-            if crate::sql::types::BtreeOperatorClass::for_type(input.ctype) != Some(parsed) {
+            if !parsed.accepts(input.ctype) {
                 return sql_fail(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "operator class \"{}\" does not accept data type {}",

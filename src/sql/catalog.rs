@@ -16372,6 +16372,9 @@ fn write_index_key_metadata(
     }
     let options = info.operator_class_options[position];
     let builtin_name = match info.operator_classes[position] {
+        Some(crate::storage::IndexOperatorClass::Btree(class)) if !class.is_default() => {
+            Some(class.name())
+        }
         Some(crate::storage::IndexOperatorClass::Hash(class))
             if !class.is_default() || !options.is_empty() =>
         {

@@ -594,17 +594,24 @@ marked `NO INHERIT` fails with `0A000`.
 The built-in `postgres_fdw` extension's routines cannot be called directly
 (`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need
 connections cached past their transaction, which pos3ql closes at transaction
-end, and `postgres_fdw_validator` is run only by wrapper DDL. `CREATE
+end, and `postgres_fdw_validator` is run only by wrapper DDL. A foreign
+server's error keeps its SQLSTATE, message, `DETAIL`, `HINT` and `CONTEXT`
+and adds `remote SQL command: ...`, as postgres_fdw reports it; the remote
+command differs from postgres_fdw's own (an `INSERT` reads back
+`RETURNING ctid::text` and every column, and a scan reads the whole table
+with one plain `SELECT` where postgres_fdw declares a cursor and fetches
+`fetch_size` rows at a time), and `batch_size` is not honored. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has only its own `pg_constraint` row: PostgreSQL also lists one clone per
 partition of the referenced table (`pc_a_fkey_1`, whose `conindid` is that
 partition's index). `ALTER COLUMN ... TYPE` on a partitioned table keeps
 each partition's index name where PostgreSQL rebuilds them under new
-generated names (`pr_1_label_idx` after a rename). A
-btree index cannot use `text_pattern_ops` (`operator class
-"text_pattern_ops" does not exist for access method "btree"`, `42704`). A
-missing type has no cursor position inside a `DEFAULT` expression, a column
+generated names (`pr_1_label_idx` after a rename). A btree index may use
+`text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
+order and compare strings byte by byte, but the planner does not yet scan
+one for a `LIKE 'ab%'` prefix or the `~<~` family of operators, which
+PostgreSQL turns into an index range. A missing type has no cursor position inside a `DEFAULT` expression, a column
 definition list, `json_populate_record(NULL::t, ...)` or
 `pg_typeof(NULL::nope.t)`. A SQL/JSON `RETURNING` clause naming a type that
 is not built in (a domain over `text`, an enum, a missing type) fails while

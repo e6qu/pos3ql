@@ -979,11 +979,16 @@ pub(super) fn dependencies<'a>(
             // partition's goes with the parent's key or with the partition
             // (`ConstraintSetParentConstraint`).
             let parent = integer(values[parent_constraint])?;
-            let parent_table = constraints
-                .iter()
-                .find(|row| integer(row[oid_field]).is_ok_and(|candidate| candidate == parent))
-                .map(|row| integer(row[table_field]))
-                .transpose()?;
+            // Only a cloned key has a parent constraint to look up.
+            let parent_table = if parent == 0 {
+                None
+            } else {
+                constraints
+                    .iter()
+                    .find(|row| integer(row[oid_field]).is_ok_and(|candidate| candidate == parent))
+                    .map(|row| integer(row[table_field]))
+                    .transpose()?
+            };
             if parent != 0 && parent_table == Some(table) {
                 push(
                     super::PG_CONSTRAINT_OID,

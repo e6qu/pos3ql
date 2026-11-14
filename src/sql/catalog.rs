@@ -9818,14 +9818,28 @@ fn visit_indexes(
             }
             info
         };
+        // The keys whose backing relation an explicit index row already
+        // lists, found in one pass over the table's indexes.
+        let mut inline_listed = [false; crate::storage::MAX_COLUMNS];
+        let mut unique_listed = [false; crate::storage::MAX_UNIQUES];
+        let mut exclusion_listed = [false; crate::storage::MAX_EXCLUSIONS];
+        for index in storage.indexes_for_slot(slot, txid) {
+            let backs = |identity: Option<crate::storage::RelationIdentity>| {
+                identity.is_some_and(|identity| identity.created_at() == index.created_at)
+            };
+            for (column, listed) in inline_listed.iter_mut().enumerate().take(def.n_columns) {
+                *listed |= backs(def.column_index_identity(column));
+            }
+            for (key, listed) in def.uniques().iter().zip(unique_listed.iter_mut()) {
+                *listed |= backs(key.index_identity);
+            }
+            for (key, listed) in def.exclusions().iter().zip(exclusion_listed.iter_mut()) {
+                *listed |= backs(key.index_identity);
+            }
+        }
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
-            if (col.primary || col.unique)
-                && storage.indexes_for_slot(slot, txid).any(|index| {
-                    def.column_index_identity(ci)
-                        .is_some_and(|identity| identity.created_at() == index.created_at)
-                })
-            {
+            if (col.primary || col.unique) && inline_listed[ci] {
                 continue;
             }
             if col.primary {
@@ -9885,13 +9899,10 @@ fn visit_indexes(
             }
         }
         // Multi-column PK / UNIQUE constraints.
-        for uk in def.uniques() {
+        for (uk, listed) in def.uniques().iter().zip(unique_listed) {
             // A transferred or rebuilt backing relation keeps the constraint's
             // identity. Its relation identity prevents a duplicate index row.
-            if storage.indexes_for_slot(slot, txid).any(|index| {
-                uk.index_identity
-                    .is_some_and(|identity| identity.created_at() == index.created_at)
-            }) {
+            if listed {
                 continue;
             }
             visit(mk(
@@ -9916,12 +9927,8 @@ fn visit_indexes(
                 stack_str_64(uk.name.as_str()),
             ));
         }
-        for exclusion in def.exclusions() {
-            if storage.indexes_for_slot(slot, txid).any(|index| {
-                exclusion
-                    .index_identity
-                    .is_some_and(|identity| identity.created_at() == index.created_at)
-            }) {
+        for (exclusion, listed) in def.exclusions().iter().zip(exclusion_listed) {
+            if listed {
                 continue;
             }
             // An expression element is attribute 0 of the key, its source

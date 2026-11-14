@@ -41203,7 +41203,7 @@ impl<'a> StaticReturning<'a> {
     /// Continues with the rows the earlier attempts of an interrupted write
     /// returned.
     fn resume(&mut self, progress: Option<&RowProgress>, arena: &'a Arena) -> Result<(), SqlError> {
-        let Some((rows, first)) = progress
+        let Some(row_progress::ResumedIntoRows { rows, first }) = progress
             .map(|progress| progress.resumed_into_rows(arena))
             .transpose()?
             .flatten()
@@ -90346,60 +90346,12 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
     index_name: crate::sql::ast::QualName<'_>,
     primary: bool,
     timing: crate::sql::ast::ConstraintTiming,
-    responder: &mut Responder,
-) -> Outcome {
-    match attach_constraint_using_index_checked(
-        storage,
-        wal,
-        txn,
-        table_index,
-        definition,
-        new_definition,
-        name,
-        index_name,
-        primary,
-        timing,
-        responder,
-    ) {
-        Ok(()) => sql_ok(),
-        Err(AttachIndexError::Sql(error)) => sql_fail(error),
-        Err(AttachIndexError::Wire(wire)) => Err(wire),
-    }
-}
-
-/// A failure of [`attach_constraint_using_index`]: the statement's error, or
-/// a full send buffer while it reported the index's rename.
-enum AttachIndexError {
-    Sql(SqlError),
-    Wire(WireFull),
-}
-
-impl From<SqlError> for AttachIndexError {
-    fn from(error: SqlError) -> Self {
-        Self::Sql(error)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn attach_constraint_using_index_checked<Definition0: crate::storage::DefinitionBacking>(
-    storage: &mut Storage,
-    wal: &mut Wal,
-    txn: &mut TxnState,
-    table_index: usize,
-    definition: &crate::storage::TableDefinition<Definition0>,
-    new_definition: &mut TableDefBuilder,
-    name: Option<&str>,
-    index_name: crate::sql::ast::QualName<'_>,
-    primary: bool,
-    timing: crate::sql::ast::ConstraintTiming,
-    responder: &mut Responder,
-) -> Result<(), AttachIndexError> {
+) -> Result<(), SqlError> {
     if timing.is_deferrable() {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "attaching a deferrable constraint to an existing index is not supported"
-        )
-        .into());
+        ));
     }
     let schema = index_name.schema.unwrap_or(definition.schema.as_str());
     let slot = storage
@@ -90424,16 +90376,14 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
             "\"{}\" is not an index for table \"{}\"",
             index.name_for(txn.txid).as_str(),
             definition.name.as_str()
-        )
-        .into());
+        ));
     }
     if !index.unique {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "index \"{}\" is not unique",
             index.name_for(txn.txid).as_str()
-        )
-        .into());
+        ));
     }
     if index.predicate.is_some()
         || index.expressions[..index.n_cols]
@@ -90444,8 +90394,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot attach partial or expression index \"{}\" as a constraint",
             index.name_for(txn.txid).as_str()
-        )
-        .into());
+        ));
     }
     if !matches!(
         index.mutable_for(txn.txid).kind,
@@ -90455,8 +90404,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot attach partitioned index \"{}\" as a constraint",
             index.name_for(txn.txid).as_str()
-        )
-        .into());
+        ));
     }
     if index.descending[..index.n_cols]
         .iter()
@@ -90475,8 +90423,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
             sqlstate::FEATURE_NOT_SUPPORTED,
             "index \"{}\" has key semantics that cannot become a table constraint",
             index.name_for(txn.txid).as_str()
-        )
-        .into());
+        ));
     }
     let index_relation_name = index.name_for(txn.txid);
     let constraint_name = match name {
@@ -90484,18 +90431,15 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
         None => index_relation_name,
     };
     if constraint_name.as_str() != index_relation_name.as_str() {
-        responder
-            .notice(
-                "00000",
-                stack_format!(
-                    256,
-                    "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"{}\" to \"{}\"",
-                    index_relation_name.as_str(),
-                    constraint_name.as_str()
-                )
-                .as_str(),
-            )
-            .map_err(AttachIndexError::Wire)?;
+        crate::sql::eval::raise_eval_message(
+            crate::sql::eval::EvalMessageLevel::Notice,
+            sqlstate::SUCCESSFUL_COMPLETION,
+            format_args!(
+                "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"{}\" to \"{}\"",
+                index_relation_name.as_str(),
+                constraint_name.as_str()
+            ),
+        )?;
     }
     if crate::sql::exec::ddl::constraint_name_taken(new_definition, constraint_name.as_str()) {
         return Err(sql_err!(
@@ -90503,8 +90447,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
             "constraint \"{}\" for relation \"{}\" already exists",
             constraint_name.as_str(),
             definition.name.as_str()
-        )
-        .into());
+        ));
     }
     if primary {
         if new_definition.columns().iter().any(|column| column.primary)
@@ -90517,8 +90460,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
                 sqlstate::INVALID_TABLE_DEFINITION,
                 "multiple primary keys for table \"{}\" are not allowed",
                 definition.name.as_str()
-            )
-            .into());
+            ));
         }
         for &column in &index.columns[..index.n_cols] {
             new_definition.columns[column as usize].not_null =
@@ -90543,13 +90485,7 @@ fn attach_constraint_using_index_checked<Definition0: crate::storage::Definition
         crate::storage::RelationIdentity::parse(index.created_at)
             .expect("admitted explicit index has an identity"),
     );
-    Ok(stage_index_rename(
-        storage,
-        wal,
-        txn,
-        slot,
-        constraint_name,
-    )?)
+    stage_index_rename(storage, wal, txn, slot, constraint_name)
 }
 
 fn stage_constraint_comment_rename(
@@ -95652,8 +95588,7 @@ fn alter_table_relation(
                     *index,
                     *primary,
                     *timing,
-                    responder,
-                )? {
+                ) {
                     return sql_fail(error);
                 }
                 validate_definition = true;

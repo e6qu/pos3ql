@@ -166,6 +166,13 @@ pub(super) struct SavedReturning<'a> {
     pub(super) joined: Option<&'a [Datum<'a>]>,
 }
 
+/// What a PL/pgSQL `INTO` destination received in the attempts before an
+/// interrupted write's next one: its returned-row count and first row.
+pub(super) struct ResumedIntoRows<'a> {
+    pub(super) rows: u64,
+    pub(super) first: Option<&'a [Datum<'a>]>,
+}
+
 /// The unfinished row and how to roll it back, handed to the caller.
 pub(crate) struct UnfinishedRow {
     pub(crate) mark: StatementMark,
@@ -871,7 +878,7 @@ impl RowProgress {
     pub(super) fn resumed_into_rows<'out>(
         &self,
         arena: &'out Arena,
-    ) -> Result<Option<(u64, Option<&'out [Datum<'out>]>)>, SqlError> {
+    ) -> Result<Option<ResumedIntoRows<'out>>, SqlError> {
         let Some(saved) = self
             .resume
             .as_ref()
@@ -908,7 +915,7 @@ impl RowProgress {
             }
             None => None,
         };
-        Ok(Some((count, first)))
+        Ok(Some(ResumedIntoRows { rows: count, first }))
     }
 
     /// The row state an interrupted attempt kept, decoded in `arena`.

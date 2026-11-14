@@ -12245,7 +12245,7 @@ pub(crate) fn fold_insert_constants<'a>(
         }
         Ok(Some(crate::sql::ast::OnConflict {
             update: Some(if changed { assignments } else { update }),
-            update_where: conflict.update_where.map(&fold).transpose()?,
+            update_where: conflict.update_where.map(fold).transpose()?,
             ..conflict
         }))
     };
@@ -12303,14 +12303,14 @@ pub(crate) fn fold_merge_constants<'a>(
             MergeWhen::Matched { cond, action } => {
                 let action = fold_target_action(action)?;
                 MergeWhen::Matched {
-                    cond: cond.map(&fold).transpose()?,
+                    cond: cond.map(fold).transpose()?,
                     action,
                 }
             }
             MergeWhen::NotMatchedBySource { cond, action } => {
                 let action = fold_target_action(action)?;
                 MergeWhen::NotMatchedBySource {
-                    cond: cond.map(&fold).transpose()?,
+                    cond: cond.map(fold).transpose()?,
                     action,
                 }
             }
@@ -12340,7 +12340,7 @@ pub(crate) fn fold_merge_constants<'a>(
                     MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
                 };
                 MergeWhen::NotMatchedByTarget {
-                    cond: cond.map(&fold).transpose()?,
+                    cond: cond.map(fold).transpose()?,
                     action,
                 }
             }

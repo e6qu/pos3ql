@@ -626,9 +626,10 @@ own physical binding, whose range plans need PostgreSQL's prefix and
 histogram selectivity to choose its bitmap scan; `=` on a pattern-class key
 shows `Index Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). A PL/pgSQL assignment to a
-three-part name (`x.y.z := 1`, a labelled row variable's field) fails with
-`0A000`, where PostgreSQL assigns `label.row.field` or reports `"x.y.z" is
-not a known variable`. A literal passed to a function's `regclass`
+nested field (`r.a.b := 1` or `label.r.a.b := 1`) fails when the routine is
+compiled (`42601` or `0A000`), where PostgreSQL assigns a field of a
+composite field or reports `42804` when it runs; `label.r.a := 1` assigns the
+field of the row variable the labelled block declares. A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

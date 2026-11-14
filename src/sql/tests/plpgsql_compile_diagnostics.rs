@@ -110,6 +110,14 @@ fn plpgsql_compile_errors_carry_positions_or_the_compilation_line() {
                 "42601 \"y\" is not a known variable @27",
             ),
             (
+                "DO $$ DECLARE x int; BEGIN x.y.z := 1; END $$",
+                "42601 \"x.y.z\" is not a known variable @28",
+            ),
+            (
+                "DO $$ <<b>> DECLARE x int; BEGIN b.x.z := 1; END $$",
+                "42601 \"b.x.z\" is not a known variable @34",
+            ),
+            (
                 "DO $$ BEGIN FOR r IN SELECT 1 LOOP END LOOP; END $$",
                 "42601 loop variable of loop over rows must be a record variable or list of scalar variables @17",
             ),

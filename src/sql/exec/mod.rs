@@ -20344,15 +20344,46 @@ fn plpgsql_function_program_kind(routine: &crate::storage::RoutineDef) -> Plpgsq
 struct PlpgsqlVariableName {
     label: Option<SqlName>,
     name: SqlName,
+    /// `block.record.field`: the block that declares the record `label`.
+    block: Option<SqlName>,
 }
 
 impl PlpgsqlVariableName {
     const fn plain(name: SqlName) -> Self {
-        Self { label: None, name }
+        Self {
+            label: None,
+            name,
+            block: None,
+        }
     }
 
+    const fn qualified(label: Option<SqlName>, name: SqlName) -> Self {
+        Self {
+            label,
+            name,
+            block: None,
+        }
+    }
+
+    /// A three-part name never names a variable itself.
     fn names(self, local: &TriggerLocalDecl) -> bool {
-        local.name == self.name && self.label.is_none_or(|label| local.label == Some(label))
+        self.block.is_none()
+            && local.name == self.name
+            && self.label.is_none_or(|label| local.label == Some(label))
+    }
+
+    /// The record variable whose field a qualified name may assign.
+    fn record(self) -> Option<Self> {
+        Some(Self::qualified(self.block, self.label?))
+    }
+}
+
+impl core::fmt::Display for PlpgsqlVariableName {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for part in [self.block, self.label].into_iter().flatten() {
+            write!(output, "{}.", part.as_str())?;
+        }
+        output.write_str(self.name.as_str())
     }
 }
 
@@ -23612,11 +23643,15 @@ fn trigger_assignment_operator(
 /// when a subscript is a slice. Keeping one setter boundary gives trigger-row
 /// and local-variable assignment identical container creation, padding, and
 /// traversal errors.
+/// The written target's block qualifier (`block.record.field`), qualifier
+/// and name, and the value it is assigned.
+type PlpgsqlAssignmentTarget<'a> = ((Option<&'a str>, Option<&'a str>, SqlName), &'a Expr<'a>);
+
 fn parse_plpgsql_assignment_target<'a>(
     target: &'a str,
     value: &'a Expr<'a>,
     arena: &'a Arena,
-) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
+) -> Result<PlpgsqlAssignmentTarget<'a>, SqlError> {
     let target_text = target;
     let target = parse_plpgsql_expression(target, arena)?;
     let mut current = target;
@@ -23641,6 +23676,15 @@ fn parse_plpgsql_assignment_target<'a>(
             _ => break,
         }
     }
+    if let Expr::SchemaColumn {
+        schema,
+        table,
+        name,
+    } = *current
+        && subscripts.is_empty()
+    {
+        return Ok(((Some(schema), Some(table), SqlName::parse(name)?), value));
+    }
     let Expr::Column { qualifier, name } = current else {
         // A `$n` beyond the routine's parameters names no variable.
         if let Expr::Param(number) = *current {
@@ -23661,7 +23705,7 @@ fn parse_plpgsql_assignment_target<'a>(
     };
     let column = SqlName::parse(name)?;
     if subscripts.is_empty() {
-        return Ok((*qualifier, column, value));
+        return Ok(((None, *qualifier, column), value));
     }
     let mut arg_list = ArenaList::new(arena);
     arg_list
@@ -23729,7 +23773,7 @@ fn parse_plpgsql_assignment_target<'a>(
             filter: None,
         })
         .map_err(|_| super::query::arena_full_pub())?;
-    Ok((*qualifier, column, expression))
+    Ok(((None, *qualifier, column), expression))
 }
 
 fn parse_trigger_local_assignment<'a>(
@@ -23745,12 +23789,16 @@ fn parse_trigger_local_assignment<'a>(
         return Ok(None);
     }
     let expression = parse_plpgsql_expression(expression, arena)?;
-    let (qualifier, name, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
-    let label = qualifier
+    let (target, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
+    let (block, label, name) = target;
+    let label = label
         .map(|qualifier| parse_plpgsql_identifier(qualifier, arena).map(|label| label.name))
         .transpose()?;
+    let block = block
+        .map(|qualifier| parse_plpgsql_identifier(qualifier, arena).map(|block| block.name))
+        .transpose()?;
     Ok(Some(TriggerLocalAssignment {
-        name: PlpgsqlVariableName { label, name },
+        name: PlpgsqlVariableName { label, name, block },
         expression,
         exception_variables: super::plpgsql_inputs::references_exception_variables(
             statement, arena,
@@ -23916,10 +23964,10 @@ fn parse_plpgsql_variable_name(
             parse_plpgsql_identifier(source, arena)?.name,
         ));
     };
-    Ok(PlpgsqlVariableName {
-        label: Some(parse_plpgsql_identifier(&source[..first_end], arena)?.name),
-        name: parse_plpgsql_identifier(name.trim_start(), arena)?.name,
-    })
+    Ok(PlpgsqlVariableName::qualified(
+        Some(parse_plpgsql_identifier(&source[..first_end], arena)?.name),
+        parse_plpgsql_identifier(name.trim_start(), arena)?.name,
+    ))
 }
 
 fn parse_trigger_local<'a>(
@@ -24354,7 +24402,7 @@ fn plpgsql_target_text<'s>(
         None => 0,
     };
     let tail = source.get(from..)?;
-    let first = target.label.unwrap_or(target.name);
+    let first = target.block.or(target.label).unwrap_or(target.name);
     arena
         .with_remaining_region(|scratch| {
             let mut lexer = Lexer::new(tail, scratch);
@@ -24625,10 +24673,7 @@ fn take_plpgsql_into<'a>(
                     let name = identifier(next(&mut lexer, after_into)?)?;
                     end = lexer.token_end();
                     token = next(&mut lexer, after_into)?;
-                    PlpgsqlVariableName {
-                        label: Some(first),
-                        name,
-                    }
+                    PlpgsqlVariableName::qualified(Some(first), name)
                 } else {
                     PlpgsqlVariableName::plain(first)
                 };
@@ -27937,7 +27982,8 @@ fn validate_plpgsql_variable_uses(
         has_parameter: &ParameterType<'_>,
     ) -> Option<bool> {
         while let Some(local) = shadowed {
-            if local.name == target.name
+            if target.block.is_none()
+                && local.name == target.name
                 && target.label.is_none_or(|label| local.label == Some(label))
             {
                 return Some(local.constant);
@@ -27957,7 +28003,8 @@ fn validate_plpgsql_variable_uses(
             },
             // A parameter's label is its routine's name, which this check
             // does not know; execution resolves the label.
-            None => has_parameter(target.name).map(|_| false),
+            None if target.block.is_none() => has_parameter(target.name).map(|_| false),
+            None => None,
         }
     }
     /// Whether `target`, a known variable, may hold a row: a record, a
@@ -28033,45 +28080,38 @@ fn validate_plpgsql_variable_uses(
                 "variable \"{}\" is declared CONSTANT",
                 target.name.as_str()
             )),
-            // `r.f` assigns field `f` of row variable `r`.
-            None if let Some(label) = target.label => match binding_constant(
-                PlpgsqlVariableName::plain(label),
-                locals,
-                shadowed,
-                has_parameter,
-            ) {
-                Some(true) => Err(sql_err!(
-                    sqlstate::ERROR_IN_ASSIGNMENT,
-                    "variable \"{}\" is declared CONSTANT",
-                    label.as_str()
-                )),
-                // Only a row or record variable has fields.
-                Some(false)
-                    if !plpgsql_names_row(
-                        PlpgsqlVariableName::plain(label),
-                        locals,
-                        shadowed,
-                        has_parameter,
-                    ) =>
-                {
-                    Err(sql_err!(
+            // `r.f` (or `block.r.f`) assigns field `f` of row variable `r`.
+            None if let Some(record) = target.record() => {
+                match binding_constant(record, locals, shadowed, has_parameter) {
+                    Some(true) => Err(sql_err!(
+                        sqlstate::ERROR_IN_ASSIGNMENT,
+                        "variable \"{}\" is declared CONSTANT",
+                        record.name.as_str()
+                    )),
+                    // Only a row or record variable has fields.
+                    Some(false) if !plpgsql_names_row(record, locals, shadowed, has_parameter) => {
+                        Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "\"{}\" is not a known variable",
+                            target
+                        ))
+                    }
+                    Some(false) => Ok(()),
+                    // A trigger function assigns a field of its `NEW` or `OLD`
+                    // row.
+                    None if trigger
+                        && target.block.is_none()
+                        && matches!(record.name.as_str(), "new" | "old") =>
+                    {
+                        Ok(())
+                    }
+                    None => Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
-                        "\"{}.{}\" is not a known variable",
-                        label.as_str(),
-                        target.name.as_str()
-                    ))
+                        "\"{}\" is not a known variable",
+                        target
+                    )),
                 }
-                Some(false) => Ok(()),
-                // A trigger function assigns a field of its `NEW` or `OLD`
-                // row.
-                None if trigger && matches!(label.as_str(), "new" | "old") => Ok(()),
-                None => Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "\"{}.{}\" is not a known variable",
-                    label.as_str(),
-                    target.name.as_str()
-                )),
-            },
+            }
             None => Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "\"{}\" is not a known variable",
@@ -35299,9 +35339,10 @@ fn assign_trigger_local<'a>(
         // `r.f := ...` names field `f` of row variable `r` when no block
         // labelled `r` declares `f`.
         Err(error) => {
-            let Some(record) = target.label.and_then(|label| {
-                trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok()
-            }) else {
+            let Some(record) = target
+                .record()
+                .and_then(|record| trigger_local_index(locals, record).ok())
+            else {
                 return Err(error);
             };
             return assign_trigger_record_field(
@@ -35382,8 +35423,8 @@ fn local_fails_type_modifier_only<'a>(
                 coerce_plpgsql_local(unconstrained, value, storage, txid, arena, &sequences).is_ok()
             }
         } else if let Some(record) = target
-            .label
-            .and_then(|label| trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok())
+            .record()
+            .and_then(|record| trigger_local_index(locals, record).ok())
         {
             match (locals[record].record_shape, locals[record].ctype) {
                 (Some(PlpgsqlRecordShape::Table { slot, .. }), _) => storage
@@ -35569,6 +35610,7 @@ fn trigger_record_field_target(
         plpgsql_transition_alias(locals, label.as_str()).unwrap_or(label.as_str()),
     )?;
     (definition.n_columns > 0
+        && target.block.is_none()
         && trigger_local_index(locals, target).is_err()
         && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err())
     .then_some(record)
@@ -36168,10 +36210,7 @@ fn assign_trigger_record_field<'a>(
         context,
         locals,
         values,
-        PlpgsqlVariableName {
-            label: local.label,
-            name: local.name,
-        },
+        PlpgsqlVariableName::qualified(local.label, local.name),
         Datum::Record(&*fields),
     )
 }
@@ -37688,11 +37727,10 @@ fn execute_trigger_step_in<'a>(
                 if folded
                     && let Some(statement) = crate::sql::error_context::innermost_assignment()
                     && (locals.iter().any(|local| assignment.name.names(local))
-                        || assignment.name.label.is_some_and(|label| {
-                            locals
-                                .iter()
-                                .any(|local| PlpgsqlVariableName::plain(label).names(local))
-                        }))
+                        || assignment
+                            .name
+                            .record()
+                            .is_some_and(|record| locals.iter().any(|local| record.names(local))))
                 {
                     // PostgreSQL folds a constant's conversion to the target's
                     // (or a subscripted target's element) type while planning

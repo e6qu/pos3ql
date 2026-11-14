@@ -1,0 +1,27 @@
+-- A condition the planner folds to false leaves a Result with a false
+-- One-Time Filter under the query's sort, limit, row locks, aggregation and
+-- windows, which PostgreSQL 18 still plans. A set operation's sort keys
+-- name the first branch's columns, qualified by its relation, as the
+-- set operation's range table holds every branch.
+CREATE TABLE t473 (a int, b int);
+INSERT INTO t473 SELECT g % 10, g FROM generate_series(1, 100) g;
+CREATE TABLE u473 (a int, c text);
+INSERT INTO u473 SELECT g, 'x' || g FROM generate_series(1, 20) g;
+ANALYZE t473;
+ANALYZE u473;
+EXPLAIN (COSTS OFF) SELECT * FROM t473 WHERE false ORDER BY b LIMIT 2;
+EXPLAIN (COSTS OFF) SELECT * FROM t473 WHERE false LIMIT 2;
+EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM t473 WHERE false;
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t473 WHERE false GROUP BY a;
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t473 WHERE false GROUP BY a ORDER BY count(*);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t473 WHERE false;
+EXPLAIN (COSTS OFF) SELECT DISTINCT a FROM t473 WHERE false ORDER BY a;
+EXPLAIN (COSTS OFF) SELECT * FROM t473 JOIN u473 ON t473.b = u473.a WHERE false ORDER BY t473.b;
+EXPLAIN (COSTS OFF) SELECT 1 WHERE false ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT count(*) WHERE false;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT count(*) FROM t473 WHERE false;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM t473 WHERE false LIMIT 2;
+EXPLAIN (COSTS OFF) SELECT a FROM t473 UNION ALL SELECT a FROM u473 ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT a FROM t473 UNION SELECT a FROM u473 ORDER BY 1 DESC LIMIT 3;
+EXPLAIN (COSTS OFF) SELECT a AS x, b FROM t473 tt UNION ALL SELECT a, a FROM u473 ORDER BY 2 DESC, x;
+EXPLAIN (COSTS OFF) SELECT t473.a FROM t473 UNION ALL SELECT a FROM u473 ORDER BY a;

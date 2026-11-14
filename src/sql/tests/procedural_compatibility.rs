@@ -300,3 +300,28 @@ fn aliases_positional_parameters_and_loop_variable_lists() {
         ["42704 variable \"$1\" does not exist"]
     );
 }
+
+/// PostgreSQL 18.6 skips comments between PL/pgSQL statements, quotes in
+/// them included, before every statement kind.
+#[test]
+fn comments_between_plpgsql_statements_are_skipped() {
+    let (mut engine, mut session, _budget) = session_engine("procedural-comments");
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION commented(n int) RETURNS SETOF int LANGUAGE plpgsql AS $$\n\
+         DECLARE\n  i int;\n\
+         BEGIN\n\
+         -- the caller's count\n\
+         FOR i IN 1..n LOOP\n\
+           /* each one's value */ RETURN NEXT i; -- it's returned\n\
+         END LOOP;\n\
+         -- done, it's over\n\
+         RETURN;\n\
+         END\n$$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT commented(3)", true)),
+        ["1", "2", "3"]
+    );
+}

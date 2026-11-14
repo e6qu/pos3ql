@@ -43,6 +43,50 @@ pub(crate) fn try_sort_unstable_by<T, E>(
     Ok(())
 }
 
+/// Moves the `bound` least items of `items` to its front, in no particular
+/// order, without allocating: a max-heap of the kept items whose root each
+/// smaller later item replaces. The first comparison error stops it.
+pub(crate) fn try_heap_select_by<T, E>(
+    items: &mut [T],
+    bound: usize,
+    mut compare: impl FnMut(&T, &T) -> Result<core::cmp::Ordering, E>,
+) -> Result<(), E> {
+    fn sift<T, E>(
+        heap: &mut [T],
+        mut root: usize,
+        compare: &mut impl FnMut(&T, &T) -> Result<core::cmp::Ordering, E>,
+    ) -> Result<(), E> {
+        loop {
+            let mut child = 2 * root + 1;
+            if child >= heap.len() {
+                return Ok(());
+            }
+            if child + 1 < heap.len() && compare(&heap[child], &heap[child + 1])?.is_lt() {
+                child += 1;
+            }
+            if !compare(&heap[root], &heap[child])?.is_lt() {
+                return Ok(());
+            }
+            heap.swap(root, child);
+            root = child;
+        }
+    }
+    if bound == 0 || bound >= items.len() {
+        return Ok(());
+    }
+    for root in (0..bound / 2).rev() {
+        sift(&mut items[..bound], root, &mut compare)?;
+    }
+    for position in bound..items.len() {
+        let (kept, rest) = items.split_at_mut(position);
+        if compare(&rest[0], &kept[0])?.is_lt() {
+            core::mem::swap(&mut kept[0], &mut rest[0]);
+            sift(&mut kept[..bound], 0, &mut compare)?;
+        }
+    }
+    Ok(())
+}
+
 /// A fixed-capacity string on the stack; `fmt::Write` that truncates
 /// (marked) instead of failing, for error messages and number formatting
 /// on paths that must not allocate.

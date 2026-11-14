@@ -2303,7 +2303,7 @@ impl ScopeChain<'_, '_> {
 
 /// Whether a top-level subquery node references any column from the enclosing
 /// query — i.e. is correlated and must be re-evaluated per outer row.
-pub(super) fn subquery_node_correlated<'a>(
+pub(crate) fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -4848,6 +4848,8 @@ fn run_set_subquery<'a>(
             sorted,
             outer_select.order_by,
             &columns[..n_cols],
+            None,
+            super::instrument::node(super::instrument::Role::Sort),
         )?;
         &*sorted
     };

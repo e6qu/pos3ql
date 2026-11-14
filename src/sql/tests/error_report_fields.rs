@@ -1152,3 +1152,76 @@ fn case_comparisons_and_prepared_analysis_are_positioned() {
         }
     });
 }
+
+#[test]
+fn key_details_need_select_on_the_key_and_no_row_security() {
+    with_engine("withheld-key-details", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE kw; \
+             CREATE TABLE ku (id int PRIMARY KEY, b int UNIQUE); \
+             INSERT INTO ku VALUES (1, 1); \
+             GRANT INSERT ON ku TO kw; GRANT SELECT (id) ON ku TO kw; \
+             CREATE TABLE kp (id int) PARTITION BY RANGE (id); \
+             CREATE TABLE kp1 PARTITION OF kp FOR VALUES FROM (0) TO (10); \
+             GRANT INSERT ON kp TO kw; \
+             CREATE TABLE kparent (id int PRIMARY KEY); \
+             CREATE TABLE kchild (pid int REFERENCES kparent); \
+             GRANT INSERT ON kchild TO kw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SET ROLE kw; INSERT INTO ku VALUES (1, 2)",
+                    &[
+                        "E|C=23505|M=duplicate key value violates unique constraint \"ku_pkey\"|D=Key (id)=(1) already exists.|s=public|t=ku|n=ku_pkey",
+                    ],
+                ),
+                // No SELECT on b: the violation has no detail.
+                (
+                    "SET ROLE kw; INSERT INTO ku VALUES (2, 1)",
+                    &[
+                        "E|C=23505|M=duplicate key value violates unique constraint \"ku_b_key\"|s=public|t=ku|n=ku_b_key",
+                    ],
+                ),
+                (
+                    "SET ROLE kw; INSERT INTO kp VALUES (20)",
+                    &["E|C=23514|M=no partition of relation \"kp\" found for row|s=public|t=kp"],
+                ),
+                (
+                    "INSERT INTO kp VALUES (20)",
+                    &[
+                        "E|C=23514|M=no partition of relation \"kp\" found for row|D=Partition key of the failing row contains (id) = (20).|s=public|t=kp",
+                    ],
+                ),
+                (
+                    "SET ROLE kw; INSERT INTO kchild VALUES (5)",
+                    &[
+                        "E|C=23503|M=insert or update on table \"kchild\" violates foreign key constraint \"kchild_pid_fkey\"|D=Key is not present in table \"kparent\".|s=public|t=kchild|n=kchild_pid_fkey",
+                    ],
+                ),
+            ],
+        );
+        // Row security hides the key even from a reader of the table.
+        run_with(
+            engine,
+            budget,
+            "ALTER TABLE ku ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY everything ON ku USING (true) WITH CHECK (true); \
+             GRANT SELECT ON ku TO kw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE kw; INSERT INTO ku VALUES (1, 5)",
+                &[
+                    "E|C=23505|M=duplicate key value violates unique constraint \"ku_pkey\"|s=public|t=ku|n=ku_pkey",
+                ],
+            )],
+        );
+    });
+}

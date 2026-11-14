@@ -9406,6 +9406,7 @@ fn write_statistics_keys<const N: usize>(
                 pretty: true,
                 qualify: false,
                 domain_value: None,
+                sublinks: None,
                 folded: false,
                 bare: None,
             },
@@ -9535,6 +9536,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                     pretty: false,
                     qualify: false,
                     domain_value: None,
+                    sublinks: None,
                     folded: false,
                     bare: None,
                 },
@@ -9726,7 +9728,6 @@ fn visit_indexes(
         if schema.is_some_and(|schema| def.schema.as_str() != schema) {
             continue;
         }
-        let table_name = def.name.as_str();
         let toid = user_table_oid(storage, slot);
         let mk = |oid: i32,
                   columns: &[u16],
@@ -9816,12 +9817,10 @@ fn visit_indexes(
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
             if (col.primary || col.unique)
-                && storage
-                    .indexes_for(def.schema.as_str(), table_name, txid)
-                    .any(|index| {
-                        def.column_index_identity(ci)
-                            .is_some_and(|identity| identity.created_at() == index.created_at)
-                    })
+                && storage.indexes_for_slot(slot, txid).any(|index| {
+                    def.column_index_identity(ci)
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
+                })
             {
                 continue;
             }
@@ -9885,13 +9884,10 @@ fn visit_indexes(
         for uk in def.uniques() {
             // A transferred or rebuilt backing relation keeps the constraint's
             // identity. Its relation identity prevents a duplicate index row.
-            if storage
-                .indexes_for(def.schema.as_str(), table_name, txid)
-                .any(|index| {
-                    uk.index_identity
-                        .is_some_and(|identity| identity.created_at() == index.created_at)
-                })
-            {
+            if storage.indexes_for_slot(slot, txid).any(|index| {
+                uk.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            }) {
                 continue;
             }
             visit(mk(
@@ -9917,14 +9913,11 @@ fn visit_indexes(
             ));
         }
         for exclusion in def.exclusions() {
-            if storage
-                .indexes_for(def.schema.as_str(), table_name, txid)
-                .any(|index| {
-                    exclusion
-                        .index_identity
-                        .is_some_and(|identity| identity.created_at() == index.created_at)
-                })
-            {
+            if storage.indexes_for_slot(slot, txid).any(|index| {
+                exclusion
+                    .index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            }) {
                 continue;
             }
             // An expression element is attribute 0 of the key, its source
@@ -9979,7 +9972,7 @@ fn visit_indexes(
             visit(info);
         }
         // Explicit CREATE INDEX on this table.
-        for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+        for index in storage.indexes_for_slot(slot, txid) {
             let inline = def
                 .columns()
                 .iter()
@@ -10254,43 +10247,6 @@ pub(crate) fn replica_identity_index_oid(
     selected
 }
 
-fn empty_index() -> IdxInfo {
-    IdxInfo {
-        oid: 0,
-        table_oid: 0,
-        table_slot: 0,
-        table_database: crate::storage::DatabaseOid::POSTGRES,
-        table_created_at: 0,
-        name: StackStr::new(),
-        kind: crate::storage::IndexKind::Ordinary,
-        owner: 0,
-        method: crate::sql::ast::IndexAccessMethod::Btree,
-        columns: [0; crate::storage::MAX_INDEX_COLS],
-        expression_keys: [false; crate::storage::MAX_INDEX_COLS],
-        include_columns: [0; crate::storage::MAX_INDEX_COLS],
-        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
-        explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
-        operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-        resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-        operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
-            crate::storage::MAX_INDEX_COLS],
-        descending: [false; crate::storage::MAX_INDEX_COLS],
-        nulls_first: [false; crate::storage::MAX_INDEX_COLS],
-        n_cols: 0,
-        n_include_cols: 0,
-        nulls_not_distinct: false,
-        predicate: None,
-        is_primary: false,
-        is_unique: false,
-        constraint_identity: None,
-        is_exclusion: false,
-        timing: crate::storage::ConstraintTiming::NotDeferrable,
-        constraint_parent: None,
-        index_parent_oid: None,
-        explicit_definition: None,
-    }
-}
-
 fn index_expression_source(
     storage: &Storage,
     info: &IdxInfo,
@@ -10321,9 +10277,8 @@ fn index_expression_source(
 }
 
 fn info_index(storage: &Storage, info: &IdxInfo, txid: u32) -> Option<crate::storage::IndexDef> {
-    let table = storage.table_def(info.table_slot, txid);
     storage
-        .indexes_for(table.schema.as_str(), table.name.as_str(), txid)
+        .indexes_for_slot(info.table_slot, txid)
         .find(|index| index.name_for(txid).as_str() == info.name.as_str())
 }
 
@@ -10367,6 +10322,43 @@ fn bound_index_source<'a>(
 /// Materializes every visible index in the statement arena. This is sized from
 /// the actual catalog, rather than a separate arbitrary limit, so an accepted
 /// startup table/index capacity cannot silently disappear from introspection.
+fn empty_index() -> IdxInfo {
+    IdxInfo {
+        oid: 0,
+        table_oid: 0,
+        table_slot: 0,
+        table_database: crate::storage::DatabaseOid::POSTGRES,
+        table_created_at: 0,
+        name: StackStr::new(),
+        kind: crate::storage::IndexKind::Ordinary,
+        owner: 0,
+        method: crate::sql::ast::IndexAccessMethod::Btree,
+        columns: [0; crate::storage::MAX_INDEX_COLS],
+        expression_keys: [false; crate::storage::MAX_INDEX_COLS],
+        include_columns: [0; crate::storage::MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+        explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
+        operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
+            crate::storage::MAX_INDEX_COLS],
+        descending: [false; crate::storage::MAX_INDEX_COLS],
+        nulls_first: [false; crate::storage::MAX_INDEX_COLS],
+        n_cols: 0,
+        n_include_cols: 0,
+        nulls_not_distinct: false,
+        predicate: None,
+        is_primary: false,
+        is_unique: false,
+        constraint_identity: None,
+        is_exclusion: false,
+        timing: crate::storage::ConstraintTiming::NotDeferrable,
+        constraint_parent: None,
+        index_parent_oid: None,
+        explicit_definition: None,
+    }
+}
+
 fn collect_indexes<'a>(
     storage: &Storage,
     txid: u32,
@@ -12696,6 +12688,7 @@ fn write_sql_body(
         pretty: false,
         qualify: false,
         domain_value: None,
+        sublinks: None,
         folded: false,
         bare: None,
     };
@@ -13279,6 +13272,7 @@ pub fn trigger_def_text<'a>(
                         pretty,
                         qualify: false,
                         domain_value: None,
+                        sublinks: None,
                         folded: false,
                         bare: None,
                     },
@@ -13423,6 +13417,7 @@ fn write_routine_arguments(
                 pretty: false,
                 qualify: false,
                 domain_value: None,
+                sublinks: None,
                 folded: false,
                 bare: None,
             };
@@ -15877,6 +15872,7 @@ pub fn constraint_def_text<'a>(
                 pretty,
                 qualify: false,
                 domain_value: None,
+                sublinks: None,
                 folded: false,
                 bare: None,
             };
@@ -15949,6 +15945,7 @@ pub fn constraint_def_text<'a>(
                 pretty,
                 qualify: false,
                 domain_value: Some(domain_base_oid(storage, &domain, txid)),
+                sublinks: None,
                 folded: false,
                 bare: None,
                 arena,
@@ -16056,6 +16053,7 @@ pub fn constraint_def_text<'a>(
                         pretty,
                         qualify: false,
                         domain_value: None,
+                        sublinks: None,
                         folded: false,
                         bare: None,
                     },
@@ -16887,6 +16885,7 @@ pub fn index_def_text<'a>(
                     pretty,
                     qualify: false,
                     domain_value: None,
+                    sublinks: None,
                     folded: false,
                     bare: None,
                 },
@@ -16978,6 +16977,7 @@ fn index_expression_display<'a>(
             pretty,
             qualify: false,
             domain_value: None,
+            sublinks: None,
             folded: false,
             bare: None,
         },
@@ -23329,6 +23329,7 @@ fn pg_attrdef<'a>(
                         pretty: false,
                         qualify: false,
                         domain_value: None,
+                        sublinks: None,
                         folded: false,
                         bare: None,
                         arena,

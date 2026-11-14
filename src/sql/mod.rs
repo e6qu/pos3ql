@@ -16727,6 +16727,7 @@ impl Engine {
                 binding.2,
                 event != crate::storage::RewriteEvent::Insert,
                 event != crate::storage::RewriteEvent::Delete,
+                None,
             ) {
                 Ok(condition) => condition,
                 Err(error) => return Ok(Err(error)),
@@ -16865,6 +16866,10 @@ impl Engine {
                         Ok(dependencies) => dependencies,
                         Err(error) => return Ok(Err(error)),
                     };
+                // Each action query evaluates the statement's expressions
+                // its OLD and NEW references (and its rule condition's) read.
+                let references = query::TransitionReferences::new(arena);
+                let references = Some(&references);
                 let condition = match definition.condition_sql() {
                     Some(sql) => {
                         let parsed = match query::parse_stored_rule_expression(
@@ -16897,6 +16902,7 @@ impl Engine {
                             transition.new,
                             event != crate::storage::RewriteEvent::Insert,
                             event != crate::storage::RewriteEvent::Delete,
+                            references,
                         ) {
                             Ok(condition) => Some(condition),
                             Err(error) => return Ok(Err(error)),
@@ -16904,7 +16910,11 @@ impl Engine {
                     }
                     None => None,
                 };
+                let condition_references = references.map_or(0, |references| references.len());
                 for (action_index, action_sql) in definition.action_sql().enumerate() {
+                    if let Some(references) = references {
+                        references.truncate(condition_references);
+                    }
                     let parsed = match query::parse_stored_rule_statement(
                         &definition,
                         action_sql,
@@ -16935,6 +16945,7 @@ impl Engine {
                         transition.new,
                         event != crate::storage::RewriteEvent::Insert,
                         event != crate::storage::RewriteEvent::Delete,
+                        references,
                     ) {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
@@ -16966,18 +16977,18 @@ impl Engine {
                             Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
                     };
-                    if let Err(error) = query::check_rule_insert_values(
-                        action,
-                        &transition.source,
-                        storage,
-                        txn.txid,
-                        arena,
-                    ) {
+                    let source = match transition.referenced_source(references, arena) {
+                        Ok(source) => source,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if let Err(error) =
+                        query::check_rule_insert_values(action, &source, storage, txn.txid, arena)
+                    {
                         return Ok(Err(error));
                     }
                     let action = match query::attach_rule_source(
                         action,
-                        transition.source,
+                        source,
                         condition,
                         || rule_insert_target(storage, action, txn.txid, arena),
                         arena,

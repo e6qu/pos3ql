@@ -474,6 +474,91 @@ fn dml_row_available(
     )
 }
 
+/// A write's condition with its top-level conjuncts in PostgreSQL's
+/// `order_qual_clauses` order (cheapest first, stably), typed over the
+/// write's target.
+///
+/// PostgreSQL turns a top-level `column IN (SELECT ...)` of an uncorrelated
+/// subquery into a semi-join. Over a column that leads one of the target's
+/// B-tree keys its plan reads the subquery's rows and probes that index, so
+/// the target's other conditions see only the rows it finds; that conjunct
+/// runs first here.
+fn order_dml_condition<'a, Definition: crate::storage::DefinitionBacking>(
+    condition: Option<&'a Expr<'a>>,
+    table: usize,
+    def: &crate::storage::TableDefinition<Definition>,
+    alias: Option<&'a str>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(condition) = condition else {
+        return Ok(None);
+    };
+    let columns = AliasedDefCols {
+        definition: crate::storage::RelationDefinition::from_definition(def),
+        alias,
+        output_aliases: &[],
+    };
+    let ordered = super::query::order_qual(condition, &columns, storage, txid, arena)?;
+    let mut conjuncts = [ordered; super::query::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::query::flatten_and(ordered, &mut conjuncts, &mut count) || count < 2 {
+        return Ok(Some(ordered));
+    }
+    let leading =
+        super::query::index_leading_columns(storage, &storage.table_def(table, txid), txid);
+    let drives = |conjunct: &'a Expr<'a>| -> Result<bool, SqlError> {
+        let Expr::InSubquery {
+            operand: Expr::Column { qualifier, name },
+            negated: false,
+            ..
+        } = conjunct
+        else {
+            return Ok(false);
+        };
+        if qualifier.is_some_and(|qualifier| {
+            !crate::sql::eval::qualifier_answers_target(columns.definition, alias, qualifier)
+        }) {
+            return Ok(false);
+        }
+        let Some(column) = def.column_index(name) else {
+            return Ok(false);
+        };
+        Ok(leading.contains(column)
+            && !super::query::expression_has_correlated_subquery(conjunct, storage, txid, arena)?)
+    };
+    let mut order = [ordered; super::query::MAX_CONJUNCTS];
+    let mut at = 0;
+    for pass in [true, false] {
+        for &conjunct in &conjuncts[..count] {
+            if drives(conjunct)? == pass {
+                order[at] = conjunct;
+                at += 1;
+            }
+        }
+    }
+    if order[..count]
+        .iter()
+        .zip(&conjuncts[..count])
+        .all(|(left, right)| core::ptr::eq(*left, *right))
+    {
+        return Ok(Some(ordered));
+    }
+    let mut rebuilt = order[0];
+    for &conjunct in &order[1..count] {
+        rebuilt = arena
+            .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operator: crate::sql::ast::BinaryOp::And,
+                left: rebuilt,
+                right: conjunct,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(Some(rebuilt))
+}
+
 /// The statement conditions a row selected by `UPDATE` or `DELETE` must still
 /// meet in its latest version (PostgreSQL's EvalPlanQual recheck).
 struct DmlRequalify<'q, 'a, Definition: crate::storage::DefinitionBacking> {
@@ -1668,11 +1753,12 @@ pub(super) use schema::rename as stage_schema_rename;
 mod describe;
 mod routine_lookup;
 pub(crate) use describe::{
-    CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call, builtin_record_srf_call,
-    builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
-    catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
-    function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
-    static_meta_for_column, visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    AliasedDefCols, CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call,
+    builtin_record_srf_call, builtin_type_name_fixed, catalog_builtin_call_result_metadata,
+    catalog_composite_field, catalog_operator_first_argument_type, catalog_routine_record_field,
+    expand_record_call_items, function_lookup_error, numeric_log_type, procedure_lookup_error,
+    resolved_set_call, static_meta_for_column, visit_catalog_composite_fields,
+    visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -1774,7 +1860,9 @@ use constraints::{
     enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
     table_is_referenced,
 };
-pub(crate) use constraints::{coerce_domain_value, parse_defaults, partition_key_detail};
+pub(crate) use constraints::{
+    coerce_domain_value, key_values_visible, parse_defaults, partition_key_detail,
+};
 pub(crate) use foreign_key_clones::reconcile_foreign_key_clones;
 pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
 
@@ -24336,6 +24424,42 @@ fn trigger_label_prefix(statement: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((name, label[end + 2..].trim_start()))
 }
 
+/// `text` from its first token: whitespace and comments before it skipped,
+/// block comments nesting as PostgreSQL's scanner nests them.
+fn skip_leading_comments(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = text.strip_prefix("--") {
+            text = rest.find('\n').map_or("", |end| &rest[end + 1..]);
+        } else if text.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut at = 0usize;
+            let bytes = text.as_bytes();
+            while at < bytes.len() {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+            if depth != 0 {
+                // An unterminated comment is the lexer's error to report.
+                return text;
+            }
+            text = &text[at..];
+        } else {
+            return text;
+        }
+    }
+}
+
 fn trigger_control_header<'a>(
     statement: &'a str,
     arena: &Arena,
@@ -24356,7 +24480,7 @@ fn trigger_control_header<'a>(
     }
     for keyword in ["loop", "else", "begin", "declare", "exception"] {
         if let Some(rest) = strip_trigger_keyword(content, keyword) {
-            let rest = rest.trim();
+            let rest = skip_leading_comments(rest).trim_end();
             return Ok((!rest.is_empty())
                 .then_some((statement[..content_offset + keyword.len()].trim_end(), rest)));
         }
@@ -24392,7 +24516,7 @@ fn trigger_control_header<'a>(
         }
         return Ok(None);
     }
-    let rest = content[at + terminator.len()..].trim();
+    let rest = skip_leading_comments(&content[at + terminator.len()..]).trim_end();
     Ok((!rest.is_empty()).then_some((
         statement[..content_offset + at + terminator.len()].trim_end(),
         rest,
@@ -24423,34 +24547,40 @@ fn split_trigger_statements<'a>(
         let remaining = &body[start..];
         // Only offsets leave scratch. Unescaped strings and folded identifiers
         // are discarded before allocating the retained statement directory.
-        let (boundary, consumed) = arena
+        // A statement starts at its first token: comments before it are
+        // not part of it.
+        let (first, boundary, consumed) = arena
             .with_remaining_region(|scratch| {
                 let mut lexer = Lexer::new(remaining, scratch);
                 let mut depth = 0usize;
+                let mut first = None;
                 loop {
                     let token = lexer.next_token().map_err(|error| {
                         super::parse_error_to_sql(&super::parser::ParseError::lexical(
                             error, remaining,
                         ))
                     })?;
+                    if !matches!(token, Tok::Eof) && first.is_none() {
+                        first = Some(lexer.token_start());
+                    }
                     match token {
                         Tok::Op("(") => depth += 1,
                         Tok::Op(")") if depth > 0 => depth -= 1,
                         Tok::Op(";") if depth == 0 => {
-                            return Ok((lexer.token_start(), lexer.token_end()));
+                            return Ok((first, lexer.token_start(), lexer.token_end()));
                         }
                         Tok::Eof => {
                             if depth != 0 {
                                 return Err(incomplete_trigger_body());
                             }
-                            return Ok((remaining.len(), remaining.len()));
+                            return Ok((first, remaining.len(), remaining.len()));
                         }
                         _ => {}
                     }
                 }
             })
             .map_err(|_| super::query::arena_full_pub())??;
-        let statement = remaining[..boundary].trim();
+        let statement = remaining[first.unwrap_or(boundary)..boundary].trim();
         if !statement.is_empty() {
             append_trigger_control(statement, &mut statements, arena)?;
         }
@@ -58348,6 +58478,7 @@ fn stored_rule_definition<'a>(
             &transition_values[..condition_columns.count],
             condition_columns.old,
             condition_columns.new,
+            None,
         )?;
         if super::query::statement_returns_rows(action.statement) {
             let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -82869,6 +83000,12 @@ fn merge_target<'a>(
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire; the conversions apply to the folded actions.
+    let statement = match super::query::fold_merge_constants(statement, arena, storage, txn.txid) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let assignment_casts = match prepare_dml_assignment_casts(
         &Stmt::Merge(*statement),
         storage,
@@ -87956,10 +88093,27 @@ where
     };
     let refolded = !core::ptr::eq(folded.rows, statement.rows)
         || !core::ptr::eq(folded.returning.items, statement.returning.items);
+    let conflict_refolded = match (folded.on_conflict, statement.on_conflict) {
+        (Some(folded), Some(written)) => match (folded.update, written.update) {
+            (Some(folded), Some(written)) => !core::ptr::eq(folded, written),
+            _ => false,
+        },
+        _ => false,
+    };
     let statement = &folded;
-    // The conversions now apply to the folded rows.
+    // The conversions now apply to the folded rows and conflict assignments.
     let assignment_casts = match source {
         InsertSource::Statement if refolded => match prepare_dml_assignment_casts(
+            &Stmt::Insert(*statement),
+            storage,
+            txn.txid,
+            arena,
+            transition,
+        ) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        },
+        _ if conflict_refolded => match prepare_dml_assignment_casts(
             &Stmt::Insert(*statement),
             storage,
             txn.txid,
@@ -90159,8 +90313,21 @@ pub(crate) fn update<'a>(
     }
     // PostgreSQL plans the statement, folding its constants, before its
     // statement triggers fire.
-    let folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid) {
+    let mut folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid)
+    {
         Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    folded.where_clause = match order_dml_condition(
+        folded.where_clause,
+        table_index,
+        def,
+        folded.alias,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(condition) => condition,
         Err(error) => return sql_fail(error),
     };
     let statement = &folded;
@@ -90307,6 +90474,26 @@ pub(crate) fn update<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(update_security, select_security);
+    // A target-only condition may run some of its conjuncts first.
+    let row_security = if statement.from.is_none() {
+        match super::query::lead_row_security(
+            row_security,
+            statement.where_clause,
+            &AliasedDefCols {
+                definition: crate::storage::RelationDefinition::from_definition(def),
+                alias: statement.alias,
+                output_aliases: &[],
+            },
+            storage,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        row_security
+    };
     let row_security_check = match super::query::plan_row_security(
         storage,
         table_index,
@@ -91758,8 +91945,21 @@ pub(crate) fn delete<'a>(
     }
     // PostgreSQL plans the statement, folding its constants, before its
     // statement triggers fire.
-    let folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid) {
+    let mut folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid)
+    {
         Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    folded.where_clause = match order_dml_condition(
+        folded.where_clause,
+        table_index,
+        def,
+        folded.alias,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(condition) => condition,
         Err(error) => return sql_fail(error),
     };
     let statement = &folded;
@@ -91861,6 +92061,26 @@ pub(crate) fn delete<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(delete_security, select_security);
+    // A target-only condition may run some of its conjuncts first.
+    let row_security = if statement.using.is_none() {
+        match super::query::lead_row_security(
+            row_security,
+            statement.where_clause,
+            &AliasedDefCols {
+                definition: crate::storage::RelationDefinition::from_definition(def),
+                alias: statement.alias,
+                output_aliases: &[],
+            },
+            storage,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        row_security
+    };
     // A condition that reads no row of the statement runs once, before the
     // target scan, as PostgreSQL's one-time filter: when it fails, no row
     // is read and no other condition runs.
@@ -94353,6 +94573,9 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                 )
             })?;
             return Err(constraints::index_build_unique_violation(
+                storage,
+                table_index,
+                transaction,
                 name,
                 new_def,
                 &[i as u16],
@@ -94363,6 +94586,9 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
     for uk in new_def.uniques() {
         if matches_key(uk.columns(), uk.kind.nulls_not_distinct())? {
             return Err(constraints::index_build_unique_violation(
+                storage,
+                table_index,
+                transaction,
                 uk.name,
                 new_def,
                 uk.columns(),
@@ -101747,7 +101973,9 @@ pub(super) enum DmlSelection {
 /// loop, just before changing it, as PostgreSQL's executor does: when its
 /// conditions can call routines (see
 /// [`super::query::dml_qualification_calls_routines`]). A foreign table's
-/// rows are selected, qualified, before any changes.
+/// rows are qualified so too, except under `UPDATE ... FROM` or
+/// `DELETE ... USING`, whose joined candidates come from local tables and
+/// whose foreign rows are qualified before any change.
 #[allow(clippy::too_many_arguments)]
 fn qualifies_in_change_loop(
     storage: &Storage,
@@ -101759,13 +101987,15 @@ fn qualifies_in_change_loop(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
+    // A joined write reads its candidates from local leaves only.
     Ok(super::query::dml_qualification_calls_routines(
         where_clause,
         from,
         row_security,
         storage,
         txid,
-    ) && !dml_reaches_foreign_rows(storage, table_index, inheritance, txid, arena)?)
+    ) && (from.is_none()
+        || !dml_reaches_foreign_rows(storage, table_index, inheritance, txid, arena)?))
 }
 
 /// Whether the rows `UPDATE` or `DELETE` reaches include a foreign table's.
@@ -101875,6 +102105,47 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             sequences: Some(&sequences),
             merge_action: None,
         };
+        // A foreign row is read again by its remote identity and qualified
+        // on that image, as postgres_fdw's scan hands each row to the
+        // statement's conditions just before the row is changed.
+        if let PhysicalRow::Foreign {
+            table_index,
+            tuple_id,
+        } = row
+        {
+            let Some(bytes) = crate::sql::foreign::fetch_row(
+                storage,
+                table_index,
+                txn.txid,
+                tuple_id,
+                arena,
+                Some(&sequences),
+            )?
+            else {
+                return Ok(None);
+            };
+            let layout = retained_rows.layout(table_index)?;
+            let mut physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, layout.schema, &mut physical)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&physical, &mut values);
+            let _snapshot = storage.dml_expression_snapshot(self.command);
+            let qualified = row_matches_values(
+                storage,
+                txn.txid,
+                Some(table_index),
+                self.def,
+                self.alias,
+                &values[..self.def.n_columns],
+                self.where_clause,
+                arena,
+                self.params,
+                &hooks,
+                self.row_security,
+                self.outer,
+            )?;
+            return Ok(qualified.then_some(row));
+        }
         let conditions = DmlRequalify {
             def: self.def,
             alias: self.alias,

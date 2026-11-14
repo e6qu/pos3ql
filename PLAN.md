@@ -798,17 +798,28 @@ subquery rows (`Hash Join` over a `HashAggregate`) are not planned; pos3ql
 probes an index per outer row where PostgreSQL's costs may prefer a hash
 join or a bitmap scan. A relation never analyzed estimates its resident
 rows where PostgreSQL assumes ten pages (`estimate_rel_size`), so
-`EXPLAIN` costs and row figures differ there. A derived table kept by
-`OFFSET 0` plans as `Subquery Scan` over a `Limit`, where PostgreSQL drops
-the zero offset and the trivial subquery scan, and a nested loop of two
-such scans omits its `Join Filter` line. A `MATERIALIZED` CTE, or one read
-twice, is merged into the statement (under a generated name for the
-second read) instead of planned as PostgreSQL's `CTE c` subplan read by
-`CTE Scan on c a` nodes. Not yet shown: row
-subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
-and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
-merged into the statement, under a generated name when its relation's name
-clashes), an incremental sort's `ANALYZE` group lines,
+`EXPLAIN` costs and row figures differ there. A constant `OFFSET 0` or
+`LIMIT NULL` adds no `Limit` (`limit_needed`), and a join input's
+`Subquery Scan` without a filter of its own is removed
+(`trivial_subqueryscan`), so the join's conditions name the subquery's own
+relation; a relation a subquery reads again under a name the statement
+already uses prints as `t_1`. A statement's `WITH` query that PostgreSQL
+does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
+`NOT MATERIALIZED`, volatile, recursive or data-modifying) is its top node's
+`CTE name` InitPlan, numbered before the query's subqueries and read by
+`CTE Scan` nodes without a `Materialize`; a recursive one is a `Recursive
+Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
+figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
+its whole query where PostgreSQL pulls only the rows read, a
+data-modifying `WITH` query's nodes print no `ANALYZE` figures (the
+statement's restart after the deferred write resets its counters), a
+`WITH` inside a subquery is still merged into it, and a recursive term's
+join is planned as a nested loop with conditions naming the relations
+before their `_1` renaming. When a derived table or `CTE Scan` joins a
+stored relation of equal size, PostgreSQL's cost tie may pick the other
+outer or hashed side. Not yet shown: row
+subqueries as subplans, a correlated subquery of a join, an incremental
+sort's `ANALYZE` group lines,
 `VERBOSE` output lists of windows and expressions (the output columns' names
 are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only

@@ -37,9 +37,9 @@ pub(crate) enum Segment {
     /// The subquery whose query is at this address, run as a subplan: its
     /// operators count apart from the enclosing block's.
     Sublink(u64),
-    /// A `WITH` query run once. EXPLAIN does not show these yet; the
-    /// segment keeps their operators apart.
-    Cte,
+    /// The `WITH` query at this position of its list, run once: its
+    /// statement's `CTE name` InitPlan.
+    Cte(usize),
     /// The query at this position of the queries rewrite rules turn the
     /// statement into, which the top block holds.
     Query(u16),
@@ -52,7 +52,8 @@ impl Segment {
             Self::Branch(position) => (2 << 32) | position as u64,
             Self::Source => 3 << 32,
             Self::Sublink(query) => (4 << 56) ^ query,
-            Self::Cte => 5 << 32,
+            // A list position is far below 2^56 entries.
+            Self::Cte(position) => (5 << 56) ^ position as u64,
             Self::Query(position) => (6 << 32) | position as u64,
         }
     }
@@ -379,9 +380,15 @@ pub(crate) fn active() -> bool {
 }
 
 /// The block the executor is running.
-#[cfg(test)]
-fn current_block() -> BlockId {
+pub(crate) fn current_block() -> BlockId {
     BLOCK.with(Cell::get)
+}
+
+/// Runs nested blocks in `block` until the returned scope ends: a query
+/// planned in one block that runs later, from wherever it is first read.
+#[must_use]
+pub(crate) fn enter_block(block: BlockId) -> Entered {
+    Entered(BLOCK.with(|current| current.replace(block)))
 }
 
 thread_local! {

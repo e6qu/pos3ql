@@ -123,6 +123,7 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
+pub(crate) use cte::{PlannedCte, PlannedCteQuery, expand_ctes_for_plan};
 pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
@@ -1152,6 +1153,7 @@ pub(crate) struct PendingWriteQuery {
     with: (usize, usize),
     pub index: usize,
     params: (usize, usize),
+    pub block: instrument::BlockId,
     /// The row the read needs, or `None` for every row.
     pub row: Option<usize>,
 }
@@ -1163,6 +1165,7 @@ impl PendingWriteQuery {
             with: (source.with.as_ptr() as usize, source.with.len()),
             index: source.index,
             params: source.params,
+            block: source.block,
             row: None,
         }
     }
@@ -1278,7 +1281,7 @@ pub(crate) fn read_deferred_cte<'a>(
     arena: &'a Arena,
     query: Option<DeferredCteRead<'_, 'a>>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let _cte = instrument::enter(instrument::Segment::Cte);
+    let _cte = instrument::enter_block(deferred.block);
     let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
     if saved != 0 {
         // SAFETY: a nonzero address names an immutable persistent descriptor
@@ -2367,6 +2370,7 @@ impl RoutineInvocationState {
                     with: (source.with.as_ptr() as usize, source.with.len()),
                     index: source.index,
                     params: source.params,
+                    block: source.block,
                     row,
                 }),
                 arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,

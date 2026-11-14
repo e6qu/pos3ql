@@ -576,6 +576,25 @@ fn register_subplan(
     })
 }
 
+/// Takes the next subplan number for a plan no expression reads by its
+/// query: a `WITH` query run once.
+fn reserve_subplan() -> Result<u16, SqlError> {
+    SUBPLANS.with(|subplans| {
+        let mut subplans = subplans.borrow_mut();
+        let count = subplans.1;
+        if count == MAX_SUBPLANS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN subplans exceed {}",
+                MAX_SUBPLANS
+            ));
+        }
+        subplans.0[count] = (0, crate::sql::catalog::deparse::SublinkPlan::InitPlan(0));
+        subplans.1 = count + 1;
+        Ok(u16::try_from(count + 1).expect("bounded by MAX_SUBPLANS"))
+    })
+}
+
 /// How a subquery compares its rows with an operand: `IN` and `= ANY` hash
 /// an uncorrelated subquery's rows; any other comparison scans them per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -978,6 +997,20 @@ impl<'a> JoinRelation<'a> {
     }
 }
 
+/// `name` made unique among `used`, as `select_rtable_names_for_explain`
+/// names each range-table entry: a repeated name takes the first free
+/// `_1`, `_2`, ... suffix.
+fn unique_rtable_name(name: &str, used: &[StackStr<96>]) -> StackStr<96> {
+    let mut unique = StackStr::<96>::from_str(name);
+    let mut suffix = 1usize;
+    while used.iter().any(|held| held.as_str() == unique.as_str()) {
+        unique = StackStr::new();
+        let _ = write!(unique, "{name}_{suffix}");
+        suffix += 1;
+    }
+    unique
+}
+
 /// The columns of a subquery in FROM as its plan outputs them: each of its
 /// output columns that reads a column of its one stored relation prints as
 /// that relation's column (`o1.a` for `(SELECT * FROM o1) x`).
@@ -986,6 +1019,7 @@ fn subquery_outputs<'a>(
     txid: u32,
     body: &Select<'_>,
     definition: crate::storage::RelationDefinition<'a>,
+    used: &mut crate::mem::arena::ArenaList<'a, StackStr<96>>,
     arena: &'a Arena,
 ) -> Result<&'a [crate::sql::catalog::deparse::Column<'a>], SqlError> {
     let columns = arena
@@ -1011,16 +1045,21 @@ fn subquery_outputs<'a>(
         return Ok(columns);
     };
     let inner = storage.table_def(slot, txid);
-    let inner_name = &*arena
-        .alloc_str(from.base.alias.unwrap_or(from.base.table))
+    let written = from.base.alias.unwrap_or(from.base.table);
+    // The subquery's relation follows the outer query's in the range table.
+    let printed = unique_rtable_name(written, used.as_slice());
+    used.push(printed).map_err(|_| arena_full())?;
+    let printed = arena
+        .alloc_str(printed.as_str())
         .map_err(|_| arena_full())?;
+    let inner_name = written;
     let mut position = 0;
     let mut output = |name: Option<&str>| -> Result<(), SqlError> {
         if let Some(column) = columns.get_mut(position) {
             if let Some(name) = name {
                 column.merged = Some((
-                    Some(inner_name),
-                    &*arena.alloc_str(name).map_err(|_| arena_full())?,
+                    Some(printed),
+                    arena.alloc_str(name).map_err(|_| arena_full())?,
                 ));
             }
             position += 1;
@@ -3089,12 +3128,36 @@ pub(super) fn plan_select<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    plan_select_with_ctes(storage, txid, statement, &[], block, arena)
+}
+
+/// [`plan_select`] for a query whose `WITH` queries `ctes` run once, as
+/// InitPlans of its top node ahead of its subqueries'.
+fn plan_select_with_ctes<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    ctes: &[Sublink<'a>],
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
     let pulled = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
     // PostgreSQL plans, and so numbers, a query's subqueries before it
     // prints the conditions that refer to them.
     let sublinks = plan_sublinks(storage, txid, pulled, block, arena)?;
+    let sublinks = if ctes.is_empty() {
+        sublinks
+    } else {
+        arena
+            .alloc_slice_with(ctes.len() + sublinks.len(), |index| {
+                ctes.get(index)
+                    .copied()
+                    .unwrap_or_else(|| sublinks[index - ctes.len()])
+            })
+            .map_err(|_| arena_full())?
+    };
     let plan = plan_pulled_select(storage, txid, statement, pulled, block, arena)?;
     attach_subplans(plan, pulled, block, sublinks, arena)
 }
@@ -3114,12 +3177,17 @@ struct Sublink<'a> {
     number: u16,
     origin: SublinkOrigin,
     nodes: &'a [PlanNode],
+    /// The name of the `WITH` query this InitPlan runs (`CTE name`).
+    cte: Option<&'a str>,
 }
 
 thread_local! {
     /// How many subqueries deep the query being planned is: a subquery's
     /// range table entries join its statement's.
     static SUBLINK_DEPTH: core::cell::Cell<u16> = const { core::cell::Cell::new(0) };
+    /// Whether the statement being planned runs `WITH` queries as their own
+    /// plans, whose relations join the statement's range table.
+    static CTE_PLANS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// The single stored relation of each query level around the one being
     /// planned, by exposed name and slot, which a correlated subquery's
     /// conditions name qualified.
@@ -3270,10 +3338,134 @@ fn plan_sublinks<'a>(
                 number,
                 origin,
                 nodes,
+                cte: None,
             })
             .map_err(|_| arena_full())?;
     }
     Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
+}
+
+/// Plans each `WITH` query of the statement PostgreSQL runs once as an
+/// InitPlan `CTE name` of the statement's top node. `SS_process_ctes` plans
+/// them before the query's own subqueries, so they take the first subplan
+/// numbers.
+fn plan_ctes<'a>(
+    storage: &Storage,
+    txid: u32,
+    ctes: &[query::PlannedCte<'a>],
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<&'a [Sublink<'a>], SqlError> {
+    let mut planned = crate::mem::arena::ArenaList::new(arena);
+    for cte in ctes {
+        let cte_block = block.child(Segment::Cte(cte.position));
+        let plan = match cte.query {
+            // Execution runs the query as a set operation's one branch.
+            query::PlannedCteQuery::Select(select) => plan_derived(
+                storage,
+                txid,
+                select,
+                cte_block.child(Segment::Branch(0)),
+                arena,
+            )?,
+            query::PlannedCteQuery::Recursive(select) => {
+                plan_recursive_union(storage, txid, cte.name, select, cte_block, arena)?
+            }
+            query::PlannedCteQuery::Modification(statement) => {
+                plan_modification(storage, txid, statement, cte_block, arena)?
+            }
+        };
+        let number = reserve_subplan()?;
+        planned
+            .push(Sublink {
+                kind: SubplanKind::InitPlan,
+                number,
+                origin: SublinkOrigin::Items,
+                nodes: &plan.nodes[..plan.count],
+                cte: Some(cte.name),
+            })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
+}
+
+/// The plan of a recursive `WITH` query: a `Recursive Union` of its
+/// non-recursive term and its recursive term, whose self-references scan
+/// the working table (`WorkTable Scan`).
+fn plan_recursive_union<'a>(
+    storage: &Storage,
+    txid: u32,
+    name: &str,
+    select: &Select<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let Some(SetTree::Op { left, right, .. }) = select.set_body else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "recursive WITH query \"{}\" is not a UNION",
+            name
+        ));
+    };
+    let mut terms = [None, None];
+    for (position, (term, slot)) in [left, right].into_iter().zip(&mut terms).enumerate() {
+        let term_block = block.child(Segment::Branch(
+            u16::try_from(position).map_err(|_| arena_full())?,
+        ));
+        *slot = Some(match term {
+            SetTree::Select(select) => plan_derived(
+                storage,
+                txid,
+                select,
+                term_block.child(Segment::Branch(0)),
+                arena,
+            )?,
+            SetTree::Op { .. } => plan_set_query(
+                storage,
+                txid,
+                &SetQuery {
+                    with: &[],
+                    body: term,
+                    order_by: &[],
+                    limit: None,
+                    offset: None,
+                    with_ties: false,
+                    locking: &[],
+                },
+                term_block,
+                arena,
+            )?,
+        });
+    }
+    let [Some(base), Some(recursive)] = terms else {
+        unreachable!("both terms are planned");
+    };
+    let mut plan = Plan::new(arena, 1 + base.count + recursive.count)?;
+    plan.push(PlanNode {
+        name: StackStr::from_str("Recursive Union"),
+        key: Some(NodeKey::new(block, Role::SetOperation(0))),
+        rows: base.nodes[0].rows.saturating_mul(10),
+        width: base.nodes[0].width,
+        total_cost: base.nodes[0].total_cost + recursive.nodes[0].total_cost * 10.0,
+        ..PlanNode::EMPTY
+    })?;
+    for node in &base.nodes[..base.count] {
+        plan.push(PlanNode {
+            depth: node.depth + 1,
+            ..*node
+        })?;
+    }
+    for node in &recursive.nodes[..recursive.count] {
+        let mut node = *node;
+        node.depth += 1;
+        // The recursive term reads the query's own rows from the working
+        // table.
+        if node.name.as_str() == "CTE Scan" && node.relation.as_str() == name {
+            node.name = StackStr::from_str("WorkTable Scan");
+        }
+        plan.push(node)?;
+    }
+    Ok(plan)
 }
 
 /// `plan` with each subplan under the node that runs it: an InitPlan under
@@ -3355,6 +3547,18 @@ fn attach_subplans<'a>(
             if node.relation.as_str().is_empty() {
                 continue;
             }
+            // A write's scan of its target reads the write's own range
+            // table entry.
+            if let Some(target) = sublinks[index].nodes[..at].iter().position(|earlier| {
+                matches!(
+                    earlier.name.as_str(),
+                    "Insert" | "Update" | "Delete" | "Merge"
+                ) && earlier.relation == node.relation
+                    && earlier.alias == node.alias
+            }) {
+                renamed[offsets[index] + at] = renamed[offsets[index] + target];
+                continue;
+            }
             let name = node.exposed_name();
             let mut unique = StackStr::<96>::from_str(name);
             let mut suffix = 1usize;
@@ -3379,7 +3583,14 @@ fn attach_subplans<'a>(
         let sublink = &sublinks[index];
         for (at, node) in sublink.nodes.iter().enumerate() {
             let mut name = StackStr::<72>::new();
-            let _ = write!(name, "{} {}", sublink.kind.relationship(), sublink.number);
+            match sublink.cte {
+                Some(cte) => {
+                    let _ = write!(name, "CTE {cte}");
+                }
+                None => {
+                    let _ = write!(name, "{} {}", sublink.kind.relationship(), sublink.number);
+                }
+            }
             attached.push(PlanNode {
                 depth: node.depth + parent.depth + 1,
                 shift: node.shift + parent.shift + 1,
@@ -4092,6 +4303,13 @@ fn plan_pulled_select<'a>(
         if scope.n >= 2
             && let Some(from) = statement.from.as_ref()
         {
+            let mut used = crate::mem::arena::ArenaList::new(arena);
+            for name in &scope.names[..scope.n] {
+                used.push(StackStr::<96>::from_str(
+                    crate::sql::catalog::deparse::printed_name(name),
+                ))
+                .map_err(|_| arena_full())?;
+            }
             let items =
                 core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
             for (table, item) in items.enumerate().take(scope.n) {
@@ -4100,8 +4318,9 @@ fn plan_pulled_select<'a>(
                     (None, Some(body)) if values_list(body).is_none() => {
                         match scope.defs.get(table) {
                             Some(definition) => {
-                                let outputs =
-                                    subquery_outputs(storage, txid, body, definition, arena)?;
+                                let outputs = subquery_outputs(
+                                    storage, txid, body, definition, &mut used, arena,
+                                )?;
                                 let named = arena
                                     .alloc_slice_with(outputs.len(), |index| {
                                         crate::sql::catalog::deparse::Column {
@@ -4121,6 +4340,27 @@ fn plan_pulled_select<'a>(
                             None => None,
                         }
                     }
+                    // A `WITH` query's rows, read by a `CTE Scan`.
+                    (None, None) if item.cte.is_some() => match scope.defs.get(table) {
+                        Some(definition) => Some(JoinRelation {
+                            exposed: scope.names[table],
+                            definition,
+                            table: None,
+                            columns: crate::sql::catalog::deparse::Columns::Derived(
+                                arena
+                                    .alloc_slice_with(definition.n_columns, |index| {
+                                        crate::sql::catalog::deparse::Column {
+                                            name: definition.columns[index].name.as_str(),
+                                            type_oid: None,
+                                            merged: None,
+                                        }
+                                    })
+                                    .map_err(|_| arena_full())?,
+                            ),
+                            subquery: None,
+                        }),
+                        None => None,
+                    },
                     _ => None,
                 };
             }
@@ -4440,6 +4680,21 @@ fn plan_pulled_select<'a>(
                     StackStr::from_str(scope.names[table])
                 };
             }
+            // A `WITH` query run once is read with a `CTE Scan` of its rows.
+            if let Some(source) = statement.from.as_ref().and_then(|from| {
+                core::iter::once(&from.base)
+                    .chain(from.joins.iter().map(|join| &join.table))
+                    .nth(table)
+            }) && source.cte.is_some()
+            {
+                scan.name = StackStr::from_str("CTE Scan");
+                scan.relation = StackStr::from_str(source.table);
+                scan.alias = if scope.names[table] == source.table {
+                    StackStr::new()
+                } else {
+                    StackStr::from_str(scope.names[table])
+                };
+            }
             let position_role = u16::try_from(table).map_err(|_| arena_full())?;
             scan.key = key(Role::Scan(position_role));
             // A deeper level's outer side is a join, whose row estimate
@@ -4534,6 +4789,15 @@ fn plan_pulled_select<'a>(
             }
         }
         let mut plan = plan;
+        // Each subquery's relations follow the outer query's in the range
+        // table, so a name the query already uses takes a suffix.
+        let mut used = crate::mem::arena::ArenaList::new(arena);
+        for name in &scope.names[..scope.n] {
+            used.push(StackStr::<96>::from_str(
+                crate::sql::catalog::deparse::printed_name(name),
+            ))
+            .map_err(|_| arena_full())?;
+        }
         let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
         for (table, item) in items.enumerate().take(scope.n) {
             let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
@@ -4553,13 +4817,18 @@ fn plan_pulled_select<'a>(
             let derived_block = block.child(Segment::Derived(
                 u16::try_from(table).map_err(|_| arena_full())?,
             ));
-            plan = with_derived_plan(
-                plan,
-                scope.names[table],
-                passes_through,
-                plan_derived(storage, txid, body, derived_block, arena)?,
-                arena,
-            )?;
+            let derived = plan_derived(storage, txid, body, derived_block, arena)?;
+            for node in derived.nodes[..derived.count].iter_mut() {
+                if node.relation.as_str().is_empty() {
+                    continue;
+                }
+                let unique = unique_rtable_name(node.exposed_name(), used.as_slice());
+                if unique.as_str() != node.exposed_name() {
+                    node.alias = unique;
+                }
+                used.push(unique).map_err(|_| arena_full())?;
+            }
+            plan = with_derived_plan(plan, scope.names[table], passes_through, derived, arena)?;
         }
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
@@ -5584,7 +5853,7 @@ fn plan_keys(
 /// query's own: a subquery's, or the query around a subquery. PostgreSQL
 /// then qualifies the columns of sort and grouping keys.
 fn shares_range_table(statement: &Select<'_>) -> bool {
-    if SUBLINK_DEPTH.with(core::cell::Cell::get) != 0 {
+    if SUBLINK_DEPTH.with(core::cell::Cell::get) != 0 || CTE_PLANS.with(core::cell::Cell::get) {
         return true;
     }
     let mut found = false;
@@ -5638,7 +5907,10 @@ fn key_relations<'a>(
             return Ok(None);
         };
         let values = item.subquery.and_then(values_list).is_some();
-        if !(values || (item.is_function_source() && item.rows_from.is_none())) {
+        if !(values
+            || item.cte.is_some()
+            || (item.is_function_source() && item.rows_from.is_none()))
+        {
             return Ok(None);
         }
         let Some(definition) = scope.defs.get(table) else {
@@ -7310,15 +7582,21 @@ pub(super) fn plan_statement<'a>(
     let statement = fold_statement(storage, txid, statement, arena)?;
     match statement {
         Stmt::Select(select) => {
-            let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
-                return plan_data_modifying_cte_select(select, arena);
-            } else if select.with.is_empty() && !storage.has_any_view() {
-                select
-            } else {
-                // A view is read through its query (its `_RETURN` rule).
-                query::expand_ctes(select, storage, txid, arena)?
-            };
-            plan_select(storage, txid, select, block, arena)
+            if select.with.is_empty() {
+                let select = if storage.has_any_view() {
+                    // A view is read through its query (its `_RETURN` rule).
+                    query::expand_ctes(select, storage, txid, arena)?
+                } else {
+                    select
+                };
+                return plan_select(storage, txid, select, block, arena);
+            }
+            let (select, ctes) = query::expand_ctes_for_plan(select, storage, txid, arena)?;
+            let prior = CTE_PLANS.with(|planned| planned.replace(!ctes.is_empty()));
+            let plan = plan_ctes(storage, txid, ctes, block, arena)
+                .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, block, arena));
+            CTE_PLANS.with(|planned| planned.set(prior));
+            plan
         }
         Stmt::SetQuery(set_query) => {
             let body = query::expand_set_tree(
@@ -7394,39 +7672,6 @@ fn fold_statement<'a>(
         .alloc(folded)
         .map(|folded| &*folded)
         .map_err(|_| arena_full())
-}
-
-/// A data-modifying CTE's result relation exists only while the statement is
-/// executing.  Planning must not run that write merely to discover its rows,
-/// so model the consumer and each producer from the parsed boundary; ANALYZE
-/// then executes the ordinary shared CTE path to obtain the actual metrics.
-fn plan_data_modifying_cte_select<'a>(
-    select: &Select<'_>,
-    arena: &'a Arena,
-) -> Result<Plan<'a>, SqlError> {
-    let started = std::time::Instant::now();
-    let capacity = 1 + select.with.iter().filter(|cte| cte.dml.is_some()).count();
-    let mut plan = Plan::new(arena, capacity)?;
-    plan.push(PlanNode {
-        name: StackStr::from_str("CTE Scan"),
-        rows: 1_000,
-        width: 32,
-        total_cost: 10.0,
-        ..PlanNode::EMPTY
-    })?;
-    for cte in select.with.iter().filter(|cte| cte.dml.is_some()) {
-        plan.push(PlanNode {
-            name: StackStr::from_str("Data-modifying CTE"),
-            relation: StackStr::from_str(cte.name),
-            depth: 1,
-            rows: 1_000,
-            width: 32,
-            total_cost: 10.0,
-            ..PlanNode::EMPTY
-        })?;
-    }
-    plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-    Ok(plan)
 }
 
 /// PostgreSQL's structured EXPLAIN writer (`explain_format.c`): groups and
@@ -7891,10 +8136,10 @@ fn structured_node(
     }
     if !node.relation.as_str().is_empty() {
         document.text(
-            if node.name.as_str() == "Function Scan" {
-                "Function Name"
-            } else {
-                "Relation Name"
+            match node.name.as_str() {
+                "Function Scan" => "Function Name",
+                "CTE Scan" | "WorkTable Scan" => "CTE Name",
+                _ => "Relation Name",
             },
             node.relation.as_str(),
         );

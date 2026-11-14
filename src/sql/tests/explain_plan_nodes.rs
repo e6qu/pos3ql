@@ -599,3 +599,93 @@ fn offset_zero_subqueries_keep_their_boundary_without_a_limit() {
     ));
     assert_eq!(rows, ["190"]);
 }
+
+#[test]
+fn with_queries_run_once_are_cte_init_plans() {
+    let (mut session, mut engine) = setup("with_queries_run_once_are_cte_init_plans");
+    let costs = "COSTS OFF";
+    // Read once by default: inlined into the query.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS (SELECT * FROM pn_u) SELECT * FROM c"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    // Read twice: planned once, read by CTE Scans without a Materialize.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS (SELECT * FROM pn_u) SELECT * FROM c x, c y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (x.a < y.a)",
+            "  CTE c",
+            "    ->  Seq Scan on pn_u",
+            "  ->  CTE Scan on c x",
+            "  ->  CTE Scan on c y"
+        ]
+    );
+    // NOT MATERIALIZED inlines both reads, the second renamed uniquely.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS NOT MATERIALIZED (SELECT * FROM pn_u) \
+             SELECT * FROM c x, c y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (pn_u.a < pn_u_1.a)",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Materialize",
+            "        ->  Seq Scan on pn_u pn_u_1"
+        ]
+    );
+    // The CTE takes the first subplan number.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS MATERIALIZED (SELECT * FROM pn_u) SELECT * FROM c WHERE a > (SELECT 1)"
+        ),
+        [
+            "CTE Scan on c",
+            "  Filter: (a > (InitPlan 2).col1)",
+            "  CTE c",
+            "    ->  Seq Scan on pn_u",
+            "  InitPlan 2",
+            "    ->  Result"
+        ]
+    );
+    let analyzed = without_memory(plan(
+        &mut session,
+        &mut engine,
+        "ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+         SELECT * FROM r",
+    ));
+    let analyzed: Vec<_> = analyzed
+        .into_iter()
+        .filter(|line| !line.trim_start().starts_with("Storage:"))
+        .collect();
+    assert_eq!(
+        analyzed,
+        [
+            "CTE Scan on r (actual rows=5.00 loops=1)",
+            "  CTE r",
+            "    ->  Recursive Union (actual rows=5.00 loops=1)",
+            "          ->  Result (actual rows=1.00 loops=1)",
+            "          ->  WorkTable Scan on r r_1 (actual rows=0.80 loops=5)",
+            "                Filter: (n < 5)",
+            "                Rows Removed by Filter: 0"
+        ]
+    );
+}

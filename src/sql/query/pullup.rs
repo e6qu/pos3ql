@@ -1076,9 +1076,12 @@ fn nulled_with_columns(expression: &Expr<'_>) -> bool {
 /// The name each of the subquery's FROM items has after the merge. An item
 /// whose name an outer item (or an earlier merge) already exposes, such as
 /// the second read of a `NOT MATERIALIZED` CTE or a self-join through two
-/// derived tables, gets a name no SQL text can spell: longer than the 63
-/// bytes PostgreSQL keeps of an identifier, so it cannot capture a
-/// reference. PostgreSQL itself tells such items apart by range-table index.
+/// derived tables, gets a name no SQL text can spell: it holds a NUL byte,
+/// which no identifier contains, so it cannot capture a reference.
+/// PostgreSQL itself tells such items apart by range-table index; the part
+/// before the NUL is the name EXPLAIN prints for it, the first `name_N`
+/// free among the query's names, as `select_rtable_names_for_explain`
+/// makes each range-table name unique.
 fn merged_names<'a>(
     outer: &QueryScope<'a>,
     position: usize,
@@ -1123,16 +1126,20 @@ fn merged_names<'a>(
         let mut ordinal = 1usize;
         let fresh = loop {
             let mut fresh = crate::mem::arena::ArenaString::new(arena);
-            core::fmt::Write::write_fmt(
-                &mut fresh,
-                format_args!(
-                    "{name} (merged FROM item {ordinal:0>width$})",
-                    width = crate::sql::lexer::MAX_IDENTIFIER_BYTES
-                ),
-            )
-            .map_err(|_| Stop::full())?;
+            core::fmt::Write::write_fmt(&mut fresh, format_args!("{name}_{ordinal}\0merged"))
+                .map_err(|_| Stop::full())?;
             let fresh = fresh.as_str();
-            if !taken(names, index, fresh) && !inner.names[..inner.n].contains(&fresh) {
+            let printed = crate::sql::catalog::deparse::printed_name(fresh);
+            let printed_taken = |names: &[&str]| {
+                names
+                    .iter()
+                    .any(|held| crate::sql::catalog::deparse::printed_name(held) == printed)
+            };
+            if !taken(names, index, fresh)
+                && !printed_taken(&names[..index])
+                && !printed_taken(&inner.names[..inner.n])
+                && !printed_taken(&outer.names[..outer.n])
+            {
                 break fresh;
             }
             ordinal += 1;

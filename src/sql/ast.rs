@@ -3517,6 +3517,9 @@ pub(crate) enum MaterializedCteSource<'a> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeferredCteQuery<'a> {
     pub tree: &'a SetTree<'a>,
+    /// The block of an explained plan the query runs in: its statement's
+    /// `CTE name` InitPlan, wherever its rows are first read.
+    pub block: crate::sql::query::instrument::BlockId,
     /// Zero until read, then the address of the persistent
     /// [`MaterializedCteInlineSource`] naming the rows.
     pub rows: &'a core::sync::atomic::AtomicUsize,
@@ -3530,6 +3533,9 @@ pub(crate) struct WriteQuerySource<'a> {
     pub with: &'a [Cte<'a>],
     pub index: usize,
     pub params: (usize, usize),
+    /// The block of an explained plan the query runs in: its statement's
+    /// `CTE name` InitPlan, wherever it is first read.
+    pub block: crate::sql::query::instrument::BlockId,
 }
 
 #[derive(Clone, Copy)]

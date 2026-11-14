@@ -261,7 +261,7 @@ impl<'t> Deparser<'t> {
     }
 
     fn literal<'e>(expression: &'e Expr<'e>) -> Option<Literal<'e>> {
-        Some(match expression {
+        Some(match unbound(expression) {
             Expr::Str(text) => Literal::Unknown(text),
             Expr::Null => Literal::Null,
             Expr::Bool(value) => Literal::Bool(*value),
@@ -289,6 +289,7 @@ impl<'t> Deparser<'t> {
     /// `AND`/`OR`/`NOT`; `IS [NOT] NULL`; `[NOT] IN` over constants;
     /// `[NOT] [I]LIKE` without `ESCAPE`; and the POSIX regex operators.
     fn shape<'e>(&self, expression: &'e Expr<'e>) -> Shipped<Shape<'e>> {
+        let expression = unbound(expression);
         if let Some(column) = self.column(expression) {
             return Ok(Shape::Value {
                 type_oid: self.column_type(column)?,
@@ -377,7 +378,7 @@ impl<'t> Deparser<'t> {
 
     /// An integer or decimal literal, negated or not.
     fn integer<'e>(&self, expression: &'e Expr<'e>) -> Option<Literal<'e>> {
-        let (negative, operand) = match expression {
+        let (negative, operand) = match unbound(expression) {
             Expr::Unary {
                 operator: UnaryOp::Neg,
                 operand,
@@ -1244,6 +1245,60 @@ impl<'t> Deparser<'t> {
         Ok(true)
     }
 
+    /// Writes a value assigned to `column` when it ships: a constant coerced
+    /// to the column's type, or an expression the assignment coerces
+    /// implicitly.
+    pub(crate) fn try_write_assigned<const N: usize>(
+        &self,
+        output: &mut StackStr<N>,
+        value: &Expr<'_>,
+        column: usize,
+    ) -> Result<bool, SqlError> {
+        let definition = &self.table.columns()[column];
+        let target = match self.column_type(column) {
+            Ok(target) => target,
+            Err(Stop::Local) => return Ok(false),
+            Err(Stop::Error(error)) => return Err(error),
+        };
+        let mark = output.len();
+        let written = self.shape(value).and_then(|shape| match shape {
+            // A typmod'd constant prints its modifier; leave it local.
+            Shape::Literal(literal) if definition.type_mod < 0 => {
+                if !matches!(literal, Literal::Unknown(_) | Literal::Null) {
+                    Self::constant_type(literal, target)?;
+                }
+                self.write_constant(
+                    output,
+                    &Constant {
+                        literal,
+                        type_oid: target,
+                        show: 0,
+                    },
+                )
+            }
+            Shape::Literal(_) => Err(Stop::Local),
+            Shape::Value { type_oid, .. } => {
+                let (from, to) = (operator_type(type_oid), operator_type(target));
+                let coerced = from == to
+                    || numeric_rank(from).is_some() && numeric_rank(to).is_some()
+                    || from == oid::TEXT && to == oid::BPCHAR;
+                if !coerced {
+                    return Err(Stop::Local);
+                }
+                self.write(output, value)
+            }
+        });
+        match written {
+            Ok(()) if output.is_truncated() => Err(query_too_long()),
+            Ok(()) => Ok(true),
+            Err(Stop::Local) => {
+                output.truncate(mark);
+                Ok(false)
+            }
+            Err(Stop::Error(error)) => Err(error),
+        }
+    }
+
     /// Writes a constant `LIMIT` or `OFFSET` count as a `bigint`.
     fn try_write_count<const N: usize>(
         &self,
@@ -1266,6 +1321,14 @@ impl<'t> Deparser<'t> {
                 show: 0,
             },
         )
+    }
+}
+
+/// A constant the planner bound, as the literal it was written as.
+fn unbound<'e>(expression: &'e Expr<'e>) -> &'e Expr<'e> {
+    match expression {
+        Expr::BoundLiteral { source, .. } => unbound(source),
+        other => other,
     }
 }
 
@@ -1853,6 +1916,164 @@ fn plan_with<'a>(
         order_pushed,
         limit_pushed,
         sql: arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+    })
+}
+
+/// postgres_fdw's direct modification (`postgresPlanDirectModify`): an
+/// `UPDATE` (with `assignments`) or `DELETE` of one foreign table sent as one
+/// remote statement, when every condition and assigned value ships and no
+/// local trigger or generated column needs the rows. `None` when it does not
+/// apply.
+pub(crate) fn direct_modify_sql<'a>(
+    deparser: &Deparser<'_>,
+    assignments: Option<&[(&str, &'a Expr<'a>)]>,
+    predicate: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let mut conditions = RemoteText::new();
+    if !remote_conditions(deparser, predicate, &mut conditions, arena)?.is_empty() {
+        return Ok(None);
+    }
+    let mut sql = RemoteText::new();
+    match assignments {
+        Some(assignments) => {
+            let _ = sql.write_str("UPDATE ");
+            deparser.write_relation(&mut sql);
+            let _ = sql.write_str(" SET ");
+            let columns = deparser.table.columns();
+            if columns.iter().any(|column| {
+                matches!(
+                    column.default,
+                    crate::storage::ColumnDefault::Generated { .. }
+                )
+            }) || assignments
+                .iter()
+                .any(|(name, _)| !columns.iter().any(|column| column.name.as_str() == *name))
+            {
+                return Ok(None);
+            }
+            // `deparseDirectUpdateSql` lists the targets in column order.
+            let mut first = true;
+            for (column, definition) in columns.iter().enumerate() {
+                let Some(&(_, value)) = assignments
+                    .iter()
+                    .find(|(name, _)| *name == definition.name.as_str())
+                else {
+                    continue;
+                };
+                if !first {
+                    let _ = sql.write_str(", ");
+                }
+                first = false;
+                deparser.write_column(&mut sql, column);
+                let _ = sql.write_str(" = ");
+                if !deparser.try_write_assigned(&mut sql, value, column)? {
+                    return Ok(None);
+                }
+            }
+        }
+        None => {
+            let _ = sql.write_str("DELETE FROM ");
+            deparser.write_relation(&mut sql);
+        }
+    }
+    let _ = sql.write_str(conditions.as_str());
+    if sql.is_truncated() || conditions.is_truncated() {
+        return Err(query_too_long());
+    }
+    Ok(Some(
+        arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+    ))
+}
+
+/// The row-by-row form of a foreign `UPDATE` or `DELETE`
+/// (`postgresPlanForeignModify`): a scan that locks the rows the shippable
+/// conditions select, and the command each row's `ctid` then runs.
+pub(crate) struct ForeignModifyScan<'a> {
+    /// `SELECT ... ctid FROM ... FOR UPDATE`.
+    pub scan_sql: &'a str,
+    /// The columns the scan reads, before its `ctid`.
+    pub fetched: ColumnSet,
+    /// The conditions evaluated locally on each scanned row.
+    pub local_where: Option<&'a Expr<'a>>,
+    /// `UPDATE ... SET col = $2 ... WHERE ctid = $1` or
+    /// `DELETE ... WHERE ctid = $1`, with its `RETURNING` list.
+    pub modify_sql: &'a str,
+    /// The columns the command returns, in table order.
+    pub returned: ColumnSet,
+}
+
+/// Plans the row-by-row form. `updated` lists an UPDATE's assigned columns
+/// (`None` for a DELETE); `returned` the columns the statement needs back;
+/// `whole_old` whether local work needs every column of the old row.
+pub(crate) fn plan_modify_scan<'a>(
+    deparser: &Deparser<'_>,
+    updated: Option<ColumnSet>,
+    predicate: Option<&'a Expr<'a>>,
+    returned: ColumnSet,
+    whole_old: bool,
+    arena: &'a Arena,
+) -> Result<ForeignModifyScan<'a>, SqlError> {
+    let all = ColumnSet::all(deparser.table.n_columns);
+    let mut conditions = RemoteText::new();
+    let kept = remote_conditions(deparser, predicate, &mut conditions, arena)?;
+    // An UPDATE reads the whole old row to form the new one; a DELETE only
+    // what its local conditions read.
+    let mut fetched = ColumnSet::from_low_word(0);
+    let mut whole = whole_old || updated.is_some();
+    for condition in kept {
+        whole |= read_columns(deparser, condition, &mut fetched).is_none();
+    }
+    if whole {
+        fetched = all;
+    }
+    let mut scan = RemoteText::new();
+    let _ = scan.write_str("SELECT ");
+    if deparser.write_target_list(&mut scan, fetched) {
+        let _ = scan.write_str(", ctid");
+    } else {
+        scan.clear();
+        let _ = scan.write_str("SELECT ctid");
+    }
+    let _ = scan.write_str(" FROM ");
+    deparser.write_relation(&mut scan);
+    let _ = scan.write_str(conditions.as_str());
+    let _ = scan.write_str(" FOR UPDATE");
+    let mut modify = RemoteText::new();
+    match updated {
+        Some(columns) => {
+            let _ = modify.write_str("UPDATE ");
+            deparser.write_relation(&mut modify);
+            let _ = modify.write_str(" SET ");
+            let mut parameter = 2;
+            for column in (0..deparser.table.n_columns).filter(|&column| columns.contains(column)) {
+                if parameter != 2 {
+                    let _ = modify.write_str(", ");
+                }
+                deparser.write_column(&mut modify, column);
+                let _ = write!(modify, " = ${parameter}");
+                parameter += 1;
+            }
+        }
+        None => {
+            let _ = modify.write_str("DELETE FROM ");
+            deparser.write_relation(&mut modify);
+        }
+    }
+    let _ = modify.write_str(" WHERE ctid = $1");
+    if !returned.is_empty() {
+        let _ = modify.write_str(" RETURNING ");
+        deparser.write_target_list(&mut modify, returned);
+    }
+    if scan.is_truncated() || modify.is_truncated() || conditions.is_truncated() {
+        return Err(query_too_long());
+    }
+    Ok(ForeignModifyScan {
+        scan_sql: arena.alloc_str(scan.as_str()).map_err(|_| arena_full())?,
+        fetched,
+        local_where: conjoin(kept, arena)?,
+        modify_sql: arena.alloc_str(modify.as_str()).map_err(|_| arena_full())?,
+        returned,
     })
 }
 

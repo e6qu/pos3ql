@@ -89913,6 +89913,56 @@ fn foreign_insert_has_after_row_trigger(storage: &Storage, leaf: usize, txid: u3
     insert_has_row_trigger(storage, leaf, txid, TriggerTiming::After)
 }
 
+/// The columns a foreign UPDATE or DELETE reads back per row, as
+/// postgres_fdw's `deparseReturningList` chooses them: every column for a
+/// local row trigger or a view's check option, else those `RETURNING` reads.
+pub(crate) fn foreign_modify_returned(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    returning: crate::sql::ast::Returning<'_>,
+    alias: Option<&str>,
+    every_column: bool,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let definition = storage.table_def(table, txid);
+    if every_column || storage.triggers_for_table(table, txid).next().is_some() {
+        return Ok(ColumnSet::all(definition.n_columns));
+    }
+    returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)
+}
+
+/// What `EXPLAIN` shows of a foreign INSERT target: postgres_fdw's single
+/// row INSERT text and the batch size its executor would use.
+pub(crate) fn foreign_insert_explain(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    statement: &Insert<'_>,
+    arena: &Arena,
+) -> Result<(crate::sql::foreign::deparse::RemoteText, u32), SqlError> {
+    let definition = storage.table_def(table, txid);
+    let retrieved = foreign_insert_retrieved(
+        storage,
+        txid,
+        table,
+        &definition,
+        None,
+        statement,
+        None,
+        arena,
+    )?;
+    let before_row_triggers = insert_has_row_trigger(storage, table, txid, TriggerTiming::Before);
+    crate::sql::foreign::insert_explain(
+        storage,
+        table,
+        txid,
+        statement.on_conflict.is_some(),
+        retrieved,
+        before_row_triggers,
+    )
+}
+
 /// The columns a foreign INSERT reads back, as postgres_fdw's
 /// `deparseReturningList` chooses them: every column for an `AFTER ROW`
 /// trigger, else those the local `RETURNING` list and `WITH CHECK OPTION`
@@ -90189,6 +90239,112 @@ pub(crate) fn update<'a>(
             ));
         }
     }
+    // postgres_fdw sends a whole UPDATE of one foreign table when every
+    // condition and assigned value ships; the server reports its rows.
+    let fresh = progress
+        .as_ref()
+        .is_none_or(|progress| !progress.resuming());
+    let direct = match (
+        statement.from,
+        statement.returning.items,
+        &capture,
+        outer,
+        &view_check,
+    ) {
+        (None, [], None, None, None) if fresh => crate::sql::foreign::direct_modify_sql(
+            storage,
+            table_index,
+            txn.txid,
+            statement.alias.unwrap_or(statement.table.name),
+            statement.inheritance,
+            Some(statement.assignments),
+            statement.where_clause,
+            arena,
+        ),
+        _ => Ok(None),
+    };
+    match direct.and_then(|direct| {
+        direct
+            .map(|sql| {
+                // A rollback cannot undo the remote change.
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.forbid_restart();
+                }
+                crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
+            })
+            .transpose()
+    }) {
+        Ok(Some(updated)) => {
+            return write_completion::WriteCompletion::Update {
+                rows: updated,
+                columns: updated_columns,
+            }
+            .finish(
+                TriggerExecContext {
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        services: services.reborrow(),
+                    },
+                    txn,
+                    arena,
+                    params: crate::sql::eval::NO_PARAMS,
+                    responder,
+                },
+                table_index.into(),
+                def,
+                TransitionRowSets {
+                    inserted: None,
+                    updated: None,
+                    deleted: None,
+                },
+                write_completion::CompletionReply::Command,
+                write_completion::RowPhaseEnd::Exhausted,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return sql_fail(error),
+    }
+    // Otherwise postgres_fdw locks the rows its shippable conditions select
+    // and changes each by its `ctid`, returning the columns local work reads.
+    let foreign_modify = match (|| {
+        if def.kind != crate::storage::TableKind::Foreign || statement.from.is_some() {
+            return Ok(None);
+        }
+        let returned = foreign_modify_returned(
+            storage,
+            txn.txid,
+            table_index,
+            statement.returning,
+            statement.alias,
+            view_check.is_some(),
+            arena,
+        )?;
+        crate::sql::foreign::modify_scan(
+            storage,
+            table_index,
+            txn.txid,
+            statement.alias.unwrap_or(statement.table.name),
+            Some(updated_columns),
+            statement.where_clause,
+            returned,
+            true,
+            arena,
+        )
+    })() {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let foreign_local;
+    let statement = match &foreign_modify {
+        Some(plan) => {
+            foreign_local = Update {
+                where_clause: plan.local_where,
+                ..*statement
+            };
+            &foreign_local
+        }
+        None => statement,
+    };
     let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
@@ -90472,6 +90628,7 @@ pub(crate) fn update<'a>(
             },
             outer_lookup,
             selection,
+            foreign_modify.as_ref(),
         )
     };
     let retained_rows = match collect {
@@ -90698,24 +90855,8 @@ pub(crate) fn update<'a>(
             // Referential actions retain the arena-owned old values across mutation.
             let row_bytes = match (|| match (home, remote_tuple) {
                 (Some(_), None) => retained_rows.bytes(row_table, rowid),
-                (None, Some(tuple_id)) => crate::sql::foreign::fetch_row(
-                    storage,
-                    row_table,
-                    txn.txid,
-                    tuple_id,
-                    arena,
-                    Some(&crate::sql::sequence::SeqEval::new(
-                        storage,
-                        seq_session,
-                        coercion_txid,
-                    )),
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "foreign row changed before UPDATE could lock it"
-                    )
-                }),
+                // The row as its locking scan read it.
+                (None, Some(tuple_id)) => retained_rows.bytes(row_table, tuple_id.sort_key()),
                 _ => unreachable!("DML row identity has one closed variant"),
             })() {
                 Ok(b) => b,
@@ -91225,26 +91366,29 @@ pub(crate) fn update<'a>(
                 {
                     return sql_fail(error);
                 }
-                let mut remote_targets = [0usize; MAX_COLUMNS];
-                for (remote, &logical) in remote_targets
-                    .iter_mut()
-                    .zip(&targets[..statement.assignments.len()])
-                {
-                    *remote = match row_layout.columns.physical_column(logical) {
+                let mut remote_targets = ColumnSet::EMPTY;
+                for &logical in &targets[..statement.assignments.len()] {
+                    remote_targets.insert(match row_layout.columns.physical_column(logical) {
                         Ok(column) => column,
                         Err(error) => return sql_fail(error),
-                    };
+                    });
                 }
+                // The statement's own table returns what its plan asked
+                // for; a child returns every column.
+                let planned = foreign_modify.as_ref().filter(|_| row_table == table_index);
                 let changed = match crate::sql::foreign::update_row(
                     storage,
                     row_table,
                     txn.txid,
                     crate::sql::foreign::RemoteUpdate {
                         tuple_id,
-                        target_columns: &remote_targets[..statement.assignments.len()],
+                        target_columns: remote_targets,
                         values: &mut new_physical[..row_schema.len()],
+                        returned: planned
+                            .map_or(ColumnSet::all(row_schema.len()), |plan| plan.returned),
                         render: responder.render_context(),
                     },
+                    planned,
                     arena,
                     Some(&crate::sql::sequence::SeqEval::new(
                         storage,
@@ -91259,11 +91403,9 @@ pub(crate) fn update<'a>(
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
                 }
+                // postgres_fdw skips a row its remote command did not change.
                 if !changed {
-                    return sql_fail(sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "foreign row changed before UPDATE could lock it"
-                    ));
+                    continue;
                 }
                 let mut new_values = [Datum::Null; MAX_COLUMNS];
                 row_layout.project(&new_physical, &mut new_values);
@@ -91763,6 +91905,107 @@ pub(crate) fn delete<'a>(
         Err(error) => return sql_fail(error),
     };
     let statement = &folded;
+    // postgres_fdw sends a whole DELETE of one foreign table when every
+    // condition ships; the server reports the rows it removed.
+    let fresh = progress
+        .as_ref()
+        .is_none_or(|progress| !progress.resuming());
+    let direct = match (statement.using, statement.returning.items, &capture, outer) {
+        (None, [], None, None) if fresh => crate::sql::foreign::direct_modify_sql(
+            storage,
+            table_index,
+            txn.txid,
+            statement.alias.unwrap_or(statement.table.name),
+            statement.inheritance,
+            None,
+            statement.where_clause,
+            arena,
+        ),
+        _ => Ok(None),
+    };
+    match direct.and_then(|direct| {
+        direct
+            .map(|sql| {
+                // A rollback cannot undo the remote change.
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.forbid_restart();
+                }
+                crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
+            })
+            .transpose()
+    }) {
+        Ok(Some(deleted)) => {
+            return write_completion::WriteCompletion::Delete { rows: deleted }.finish(
+                TriggerExecContext {
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        services: services.reborrow(),
+                    },
+                    txn,
+                    arena,
+                    params: crate::sql::eval::NO_PARAMS,
+                    responder,
+                },
+                table_index.into(),
+                def,
+                TransitionRowSets {
+                    inserted: None,
+                    updated: None,
+                    deleted: None,
+                },
+                write_completion::CompletionReply::Command,
+                write_completion::RowPhaseEnd::Exhausted,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return sql_fail(error),
+    }
+    // Otherwise postgres_fdw locks the rows its shippable conditions select,
+    // reading what local work needs, and deletes each by its `ctid`.
+    let foreign_modify = match (|| {
+        if def.kind != crate::storage::TableKind::Foreign || statement.using.is_some() {
+            return Ok(None);
+        }
+        let whole_old = capture.is_some()
+            || storage
+                .triggers_for_table(table_index, txn.txid)
+                .next()
+                .is_some();
+        let returned = foreign_modify_returned(
+            storage,
+            txn.txid,
+            table_index,
+            statement.returning,
+            statement.alias,
+            false,
+            arena,
+        )?;
+        crate::sql::foreign::modify_scan(
+            storage,
+            table_index,
+            txn.txid,
+            statement.alias.unwrap_or(statement.table.name),
+            None,
+            statement.where_clause,
+            returned,
+            whole_old,
+            arena,
+        )
+    })() {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
+    let foreign_local;
+    let statement = match &foreign_modify {
+        Some(plan) => {
+            foreign_local = Delete {
+                where_clause: plan.local_where,
+                ..*statement
+            };
+            &foreign_local
+        }
+        None => statement,
+    };
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -92014,6 +92257,7 @@ pub(crate) fn delete<'a>(
             delete_capture,
             outer_lookup,
             selection,
+            foreign_modify.as_ref(),
         )
     };
     let retained_rows = match collect {
@@ -92229,25 +92473,10 @@ pub(crate) fn delete<'a>(
                 tuple_id,
             } = scratch[i]
             {
-                let Some(old_row) = (match crate::sql::foreign::fetch_row(
-                    storage,
-                    row_table,
-                    txn.txid,
-                    tuple_id,
-                    arena,
-                    Some(&crate::sql::sequence::SeqEval::new(
-                        storage,
-                        seq_session,
-                        coercion_txid,
-                    )),
-                ) {
+                // The row as its locking scan read it.
+                let old_row = match retained_rows.bytes(row_table, tuple_id.sort_key()) {
                     Ok(row) => row,
                     Err(error) => return sql_fail(error),
-                }) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "foreign row changed before DELETE could lock it"
-                    ));
                 };
                 // The child's row in its own columns, then in the target's.
                 let foreign_layout = match retained_rows.layout(row_table) {
@@ -92291,11 +92520,24 @@ pub(crate) fn delete<'a>(
                 {
                     return sql_fail(error);
                 }
+                let mut old_physical = [Datum::Null; MAX_COLUMNS];
+                if let Err(error) =
+                    rowenc::decode(old_row, foreign_layout.schema, &mut old_physical)
+                {
+                    return sql_fail(error);
+                }
+                // The statement's own table returns what its plan asked
+                // for; a child returns every column.
+                let width = foreign_layout.schema.len();
+                let planned = foreign_modify.as_ref().filter(|_| row_table == table_index);
                 let deleted_row = crate::sql::foreign::delete_row(
                     storage,
                     row_table,
                     txn.txid,
                     tuple_id,
+                    &mut old_physical[..width],
+                    planned.map_or(ColumnSet::all(width), |plan| plan.returned),
+                    planned,
                     arena,
                     Some(&crate::sql::sequence::SeqEval::new(
                         storage,
@@ -92307,20 +92549,14 @@ pub(crate) fn delete<'a>(
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
                 }
-                let Some(deleted_row) = (match deleted_row {
-                    Ok(row) => row,
+                // postgres_fdw skips a row its remote command did not delete.
+                match deleted_row {
+                    Ok(true) => {}
+                    Ok(false) => continue,
                     Err(error) => return sql_fail(error),
-                }) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "foreign row changed before DELETE could lock it"
-                    ));
-                };
-                let mut old_transition = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = foreign_layout.decode_logical(deleted_row, &mut old_transition)
-                {
-                    return sql_fail(error);
                 }
+                let mut old_transition = [Datum::Null; MAX_COLUMNS];
+                foreign_layout.project(&old_physical, &mut old_transition);
                 if let Err(error) = fire_partition_row_triggers(
                     storage,
                     txn,
@@ -101643,7 +101879,8 @@ fn visit_foreign_rows<'a>(
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    visit: &mut impl FnMut(PhysicalRow, &[Datum<'a>]) -> Result<(), SqlError>,
+    planned: Option<&crate::sql::foreign::deparse::ForeignModifyScan<'_>>,
+    visit: &mut impl FnMut(PhysicalRow, &'a [u8], &[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     crate::sql::foreign::visit_mutable_rows(
         storage,
@@ -101651,12 +101888,6 @@ fn visit_foreign_rows<'a>(
         txid,
         arena,
         &mut |tuple_id, row| {
-            let row = arena.alloc_slice_copy(row).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "foreign mutable-row scan exceeds the statement arena"
-                )
-            })?;
             let mut physical = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(row, layout.schema, &mut physical)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -101666,10 +101897,12 @@ fn visit_foreign_rows<'a>(
                     table_index: table,
                     tuple_id,
                 },
+                row,
                 &values[..columns],
             )
         },
         sequences,
+        planned,
     )
 }
 
@@ -101932,6 +102165,7 @@ pub(super) fn collect_matches<'a>(
     capture: DmlCapture,
     transition: Option<&dyn ColumnLookup<'a>>,
     selection: DmlSelection,
+    planned: Option<&crate::sql::foreign::deparse::ForeignModifyScan<'_>>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
@@ -101983,7 +102217,8 @@ pub(super) fn collect_matches<'a>(
                 txid,
                 arena,
                 hooks.sequences,
-                &mut |row, values| {
+                planned.filter(|_| leaf == table_index),
+                &mut |row, bytes, values| {
                     if row_matches_values(
                         storage,
                         txid,
@@ -101999,6 +102234,7 @@ pub(super) fn collect_matches<'a>(
                         transition,
                     )? {
                         push_selected(scratch, row)?;
+                        images.push(leaf, row.sort_key().1, bytes)?;
                     }
                     Ok(())
                 },
@@ -102144,7 +102380,8 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 txid,
                 arena,
                 hooks.sequences,
-                &mut |row, values| {
+                None,
+                &mut |row, bytes, values| {
                     let context = RowCtx {
                         table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(def),
@@ -102213,6 +102450,9 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                                 error
                             )
                         })?;
+                        if let PhysicalRow::Foreign { .. } = row {
+                            images.push(leaf, row.sort_key().1, bytes)?;
+                        }
                     }
                     Ok(())
                 },
@@ -102373,7 +102613,8 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                 txid,
                 arena,
                 hooks.sequences,
-                &mut |row, values| {
+                None,
+                &mut |row, bytes, values| {
                     let context = RowCtx {
                         table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(def),
@@ -102446,6 +102687,9 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                                 error
                             )
                         })?;
+                        if let PhysicalRow::Foreign { .. } = row {
+                            images.push(leaf, row.sort_key().1, bytes)?;
+                        }
                     }
                     Ok(())
                 },

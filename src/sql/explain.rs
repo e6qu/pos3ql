@@ -3467,6 +3467,185 @@ pub(super) fn plan_select<'a>(
     Ok(plan)
 }
 
+/// The plan of a foreign UPDATE or DELETE, as postgres_fdw's: one `Foreign
+/// Update`/`Foreign Delete` node when the statement ships whole, else the
+/// command each row runs above the scan that locks the rows. `false` hands
+/// a table with descendants back to the general plan.
+fn foreign_modification<'a>(
+    plan: &mut Plan<'a>,
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'_>,
+    slot: usize,
+    target_node: PlanNode,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let (assignments, inheritance, alias, table_name, predicate, returning) = match statement {
+        Stmt::Update(update) => {
+            let folded = arena
+                .alloc(query::fold_update_constants(update, arena, storage, txid)?)
+                .map_err(|_| arena_full())?;
+            (
+                Some(folded.assignments),
+                folded.inheritance,
+                folded.alias,
+                folded.table.name,
+                folded.where_clause,
+                folded.returning,
+            )
+        }
+        Stmt::Delete(delete) => {
+            let folded = arena
+                .alloc(query::fold_delete_constants(delete, arena, storage, txid)?)
+                .map_err(|_| arena_full())?;
+            (
+                None,
+                folded.inheritance,
+                folded.alias,
+                folded.table.name,
+                folded.where_clause,
+                folded.returning,
+            )
+        }
+        _ => return Ok(false),
+    };
+    if storage.relation_has_descendants(slot, txid) {
+        return Ok(false);
+    }
+    let exposed = alias.unwrap_or(table_name);
+    let direct = if returning.items.is_empty() {
+        crate::sql::foreign::direct_modify_sql(
+            storage,
+            slot,
+            txid,
+            exposed,
+            inheritance,
+            assignments,
+            predicate,
+            arena,
+        )?
+    } else {
+        None
+    };
+    let scan = |name: &str| PlanNode {
+        name: StackStr::from_str(name),
+        relation: target_node.relation,
+        alias: target_node.alias,
+        schema: target_node.schema,
+        depth: 1,
+        ..PlanNode::EMPTY
+    };
+    if let Some(sql) = direct {
+        let mut node = scan(if assignments.is_some() {
+            "Foreign Update"
+        } else {
+            "Foreign Delete"
+        });
+        node.remote_sql = remote_sql_text(sql)?;
+        plan.push(node)?;
+        return Ok(true);
+    }
+    let table = storage.table_def(slot, txid);
+    let mut updated = crate::storage::ColumnSet::EMPTY;
+    for (name, _) in assignments.unwrap_or(&[]) {
+        if let Some(column) = table.column_index(name) {
+            updated.insert(column);
+        }
+    }
+    let triggers = storage.triggers_for_table(slot, txid).next().is_some();
+    let returned = crate::sql::exec::foreign_modify_returned(
+        storage, txid, slot, returning, alias, false, arena,
+    )?;
+    let Some(planned) = crate::sql::foreign::modify_scan(
+        storage,
+        slot,
+        txid,
+        exposed,
+        assignments.is_some().then_some(updated),
+        predicate,
+        returned,
+        triggers,
+        arena,
+    )?
+    else {
+        return Ok(false);
+    };
+    plan.nodes[0].remote_sql = remote_sql_text(planned.modify_sql)?;
+    let mut node = scan("Foreign Scan");
+    node.remote_sql = remote_sql_text(planned.scan_sql)?;
+    // The new values in column order, the row identity, then the old row an
+    // UPDATE (or a trigger) needs.
+    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, &table)];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: Some(&table),
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: false,
+        domain_value: None,
+        folded: true,
+        bare: None,
+    };
+    for definition in table.columns() {
+        let Some(&(_, value)) = assignments
+            .unwrap_or(&[])
+            .iter()
+            .find(|(name, _)| *name == definition.name.as_str())
+        else {
+            continue;
+        };
+        let text = crate::sql::catalog::deparse::deparse_expression(
+            &context,
+            value,
+            crate::sql::catalog::deparse::Destination::Assignment(definition.ctype.oid()),
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN cannot print the value assigned to column \"{}\"",
+                definition.name.as_str()
+            )
+        })?;
+        if !node.output.is_empty() {
+            let _ = node.output.write_str(", ");
+        }
+        let _ = node.output.write_str(text);
+    }
+    if !node.output.is_empty() {
+        let _ = node.output.write_str(", ");
+    }
+    let _ = node.output.write_str("ctid");
+    if assignments.is_some() || triggers {
+        let _ = node.output.write_str(", ");
+        crate::sql::catalog::write_identifier(&mut node.output, exposed);
+        let _ = node.output.write_str(".*");
+    }
+    if node.output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN output column list exceeds 256 bytes"
+        ));
+    }
+    let (_, filter) = single_relation_quals(
+        storage,
+        txid,
+        exposed,
+        &table,
+        planned.local_where,
+        None,
+        true,
+        arena,
+    )?;
+    node = node.with_qual(QualLabel::Filter, filter);
+    plan.push(node)?;
+    Ok(true)
+}
+
 /// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output
 /// carries the columns of the order the remote query applies.
 #[expect(clippy::too_many_arguments, reason = "the scan's plan context")]
@@ -4598,6 +4777,28 @@ pub(super) fn plan_modification<'a>(
         batch_size: None,
     };
     plan.push(target_node)?;
+    if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
+        && storage.table_def(slot, txid).kind == crate::storage::TableKind::Foreign
+        && joined_from.is_none()
+    {
+        if let Stmt::Insert(insert) = statement {
+            let (sql, batch_size) =
+                crate::sql::exec::foreign_insert_explain(storage, txid, slot, insert, arena)?;
+            plan.nodes[0].remote_sql = remote_sql_text(sql.as_str())?;
+            plan.nodes[0].batch_size = Some(batch_size);
+        } else if foreign_modification(
+            &mut plan,
+            storage,
+            txid,
+            statement,
+            slot,
+            target_node,
+            arena,
+        )? {
+            plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            return Ok(plan);
+        }
+    }
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");

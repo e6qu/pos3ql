@@ -373,10 +373,10 @@ fn explain_analyze_runs_a_rewritten_statement_once_and_plans_each_query() {
             data_rows(&explain),
             [
                 "Insert on rw_source (actual rows=0.00 loops=1)",
-                "  ->  Result",
+                "  ->  Result (actual rows=1.00 loops=1)",
                 "",
                 "Insert on rw_log (actual rows=0.00 loops=1)",
-                "  ->  Result",
+                "  ->  Result (actual rows=1.00 loops=1)",
             ]
         );
         let rows = run_with(

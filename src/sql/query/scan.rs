@@ -5829,13 +5829,7 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
                 if qualified.is_truncated() {
                     return Err(arena_full());
                 }
-                super::srf::is_srf_name(qualified.as_str())
-                    && !matches!(
-                        tref.table,
-                        "pg_options_to_table"
-                            | "pg_get_sequence_data"
-                            | "pg_get_publication_tables"
-                    )
+                super::srf::streams_indexed_rows(qualified.as_str())
             }
             crate::storage::RoutineCallSelection::Stored(_) => false,
             crate::storage::RoutineCallSelection::Ambiguous => {

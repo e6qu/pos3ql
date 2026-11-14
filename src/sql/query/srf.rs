@@ -1476,6 +1476,22 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 }
                 return Ok(values);
             }
+            // The text search parser functions have no per-row evaluation;
+            // their FROM materialization yields the rows this call returns.
+            if matches!(*name, "ts_token_type" | "ts_parse" | "ts_debug" | "ts_stat") {
+                return builtin_table_function_values(
+                    qualified.as_str(),
+                    args,
+                    *variadic,
+                    *source_position,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                );
+            }
             if is_srf_name(written_name) {
                 let catalog = super::storage_catalog(storage, arena, txid);
                 return with_bound_srf_inputs(
@@ -1743,6 +1759,133 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
             run(bound, values)
         })
     })
+}
+
+/// The values a builtin set function in a select list returns, produced by
+/// its FROM-clause materialization: one value per row, a record when the
+/// function has several output columns.
+#[allow(clippy::too_many_arguments)]
+fn builtin_table_function_values<'a, R: ColumnLookup<'a>>(
+    qualified: &str,
+    args: &'a [&'a Expr<'a>],
+    variadic: bool,
+    source_position: crate::sql::ast::SourcePosition,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let (schema, table) = qualified
+        .split_once('.')
+        .expect("builtin set function names are schema-qualified");
+    let source = arena
+        .alloc(TableRef {
+            schema: Some(arena.alloc_str(schema).map_err(|_| arena_full())?),
+            table: arena.alloc_str(table).map_err(|_| arena_full())?,
+            alias: None,
+            subquery: None,
+            func_args: Some(args),
+            func_argument_names: &[],
+            func_variadic: variadic,
+            func_source_position: source_position,
+            rows_from: None,
+            col_alias: None,
+            inheritance: crate::sql::ast::RelationInheritance::Descendants,
+            sample: None,
+            cte: None,
+            with_ordinality: false,
+            lateral: false,
+            authorization_role: None,
+            bound_table: None,
+            view_access: None,
+            join_members: None,
+        })
+        .map_err(|_| arena_full())?;
+    let definition = table_func_def_outer(source, storage, txid, arena, params, row)?;
+    let columns = &definition.columns[..definition.n_columns];
+    let rows = table_func_base_rows_outer(
+        source,
+        storage,
+        txid,
+        arena,
+        params,
+        row,
+        Some(hooks),
+        None,
+        None,
+    )?
+    .encoded;
+    let values = arena
+        .alloc_slice_with(rows.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (value, encoded) in values.iter_mut().zip(rows) {
+        if let [_] = columns {
+            *value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            continue;
+        }
+        let fields = arena
+            .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
+                name: "",
+                type_oid: 0,
+                type_mod: -1,
+                value: Datum::Null,
+            })
+            .map_err(|_| arena_full())?;
+        for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
+            *field = crate::sql::types::RecordField {
+                name: arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| arena_full())?,
+                type_oid: storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "set function result type is absent from the catalog"
+                        )
+                    })?,
+                type_mod: column.type_mod,
+                value: crate::sql::exec::decode_projected_col_record(encoded, index, arena)?,
+            };
+        }
+        *value = Datum::Record(&*fields);
+    }
+    Ok(values)
+}
+
+/// Whether a builtin set function yields its rows through `srf_count` plus
+/// evaluation at each `srf_index`, so a spilled `LATERAL` item can stream it
+/// row by row. The rest have dedicated table-function materialization.
+pub(super) fn streams_indexed_rows(qualified: &str) -> bool {
+    let Some(name) = builtin_set_routine_name(qualified) else {
+        return false;
+    };
+    is_json_each_name(name)
+        || regex_srf_name(name).is_some()
+        || matches!(
+            name,
+            "unnest"
+                | "_pg_expandarray"
+                | "generate_series"
+                | "generate_subscripts"
+                | "string_to_table"
+                | "jsonb_path_query"
+                | "jsonb_path_query_tz"
+                | "jsonb_object_keys"
+                | "json_object_keys"
+                | "jsonb_array_elements"
+                | "json_array_elements"
+                | "jsonb_array_elements_text"
+                | "json_array_elements_text"
+                | "json_populate_recordset"
+                | "jsonb_populate_recordset"
+                | "aclexplode"
+                | "pg_listening_channels"
+                | "pg_available_extensions"
+                | "pg_available_extension_versions"
+        )
 }
 
 /// Number of output rows a set-returning call yields for the current source row.

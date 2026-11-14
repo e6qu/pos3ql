@@ -262,6 +262,12 @@ is owned.
     function arguments that are not constants, user-defined and other builtin
     set-returning functions, and column definition lists such as
     `jsonb_to_recordset(...) AS t(a int)`.
+    In object-store mode a `LATERAL` builtin call streams its rows through
+    an external run only for the functions evaluated one row at a time (the
+    generator, regex and `json`/`jsonb` families, `aclexplode`,
+    `pg_listening_channels`, `pg_available_extensions`); the others, such as
+    the `pg_partition_ancestors` call psql's `\d` makes, materialize in the
+    work arena as they do without object storage.
     A cursor over those shapes runs its query whole at its first read, with
     the snapshot taken when it opened: a scrollable cursor ordered by an
     expression that is not a source column returns saved values where

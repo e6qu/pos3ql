@@ -148,6 +148,9 @@ pub(crate) struct RowSecurityPlan<'a> {
     predicates: [&'a [PolicyPredicate<'a>]; 2],
     groups: u8,
     permissive_always: [bool; 2],
+    /// The statement's own conditions that run before the first policy
+    /// condition (see [`lead_row_security`]).
+    leading: Option<&'a Expr<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -261,7 +264,87 @@ pub(crate) fn plan_row_security<'a>(
         predicates: [&predicates[..count], &[]],
         groups: 1,
         permissive_always: [permissive_always, false],
+        leading: None,
     }))
+}
+
+/// PostgreSQL's `order_qual_clauses` of a relation under row security: each
+/// security qual (each restrictive policy, then the OR of the permissive
+/// ones) has its own security level below the statement's conditions, which
+/// run after them, but a statement condition that is leakproof and cheaper
+/// than ten operators drops to level zero and runs first when it costs less
+/// than the first security qual. `condition`'s conjuncts are already in
+/// cost order and `columns` types the relation's columns; a conjunct that
+/// reads anything else stays behind the policies.
+pub(crate) fn lead_row_security<'a>(
+    plan: Option<RowSecurityPlan<'a>>,
+    condition: Option<&'a Expr<'a>>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<RowSecurityPlan<'a>>, SqlError> {
+    let (Some(mut plan), Some(condition)) = (plan, condition) else {
+        return Ok(plan);
+    };
+    let cost =
+        |expression: &Expr<'_>| super::plan::qual_cost(expression, columns, storage, txid, arena);
+    let group = plan.predicates[0];
+    let first = match group.iter().find(|predicate| !predicate.permissive) {
+        Some(restrictive) => cost(restrictive.expression),
+        None if plan.permissive_always[0] => return Ok(Some(plan)),
+        // No permissive policy leaves a constant false qual, which the
+        // planner checks before any row is read.
+        None if !group.iter().any(|predicate| predicate.permissive) => return Ok(Some(plan)),
+        None => group
+            .iter()
+            .filter(|predicate| predicate.permissive)
+            .map(|predicate| cost(predicate.expression))
+            .sum(),
+    };
+    let mut conjuncts = [condition; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(condition, &mut conjuncts, &mut count) {
+        return Ok(Some(plan));
+    }
+    let mut leading: Option<&'a Expr<'a>> = None;
+    for &conjunct in &conjuncts[..count] {
+        if conjunct.contains_subquery() {
+            continue;
+        }
+        let conjunct_cost = cost(conjunct);
+        // Ten times `cpu_operator_cost`, in the cost model's half-operator units.
+        if conjunct_cost >= 20.0 || conjunct_cost >= first {
+            continue;
+        }
+        let Ok(properties) = super::predicate_safety::expression_properties(
+            conjunct,
+            columns,
+            storage,
+            txid,
+            super::predicate_safety::AnalysisStage::ViewPushdown,
+            arena,
+        ) else {
+            continue;
+        };
+        if properties.leaks_columns || properties.volatile {
+            continue;
+        }
+        leading = Some(match leading {
+            None => conjunct,
+            Some(left) => arena
+                .alloc(Expr::Binary {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operator: crate::sql::ast::BinaryOp::And,
+                    left,
+                    right: conjunct,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())?,
+        });
+    }
+    plan.leading = leading;
+    Ok(Some(plan))
 }
 
 impl<'a> RowSecurityPlan<'a> {
@@ -327,6 +410,13 @@ pub(crate) fn row_security_passes<'a>(
     })?;
     let mark = arena.mark();
     let result = (|| {
+        // A leakproof statement condition evaluated again later cannot be
+        // observed, so it stays in the statement's condition too.
+        if let Some(leading) = plan.leading
+            && !super::plan::conjunct_passes(leading, arena, params, row, base_hooks)?
+        {
+            return Ok(false);
+        }
         let count = plan.predicates.iter().map(|group| group.len()).sum();
         let expressions = arena
             .alloc_slice_with(count, |_| None)
@@ -7315,6 +7405,16 @@ fn scan_source_mode<'a>(
         }
         None => None,
     };
+    if scope.n == 1 {
+        security_plans[0] = lead_row_security(
+            security_plans[0],
+            where_clause,
+            &super::ScopeCols(scope),
+            storage,
+            txid,
+            arena,
+        )?;
+    }
 
     fn exact_partition_leaf<'a>(
         storage: &Storage,

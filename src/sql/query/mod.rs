@@ -57,7 +57,7 @@ pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
-pub(crate) use plan::plan_time_bool;
+pub(crate) use plan::{order_qual, plan_time_bool, qual_cost};
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
@@ -75,8 +75,8 @@ pub(crate) use scan::{
     parameterized_index_access_plan, rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{
-    RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
-    row_security_off_error, row_security_passes,
+    RowSecurityExpression, RowSecurityPlan, conjoin_row_security, lead_row_security,
+    plan_row_security, row_security_off_error, row_security_passes,
 };
 
 mod scope;

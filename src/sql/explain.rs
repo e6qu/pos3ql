@@ -508,13 +508,44 @@ fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
 
 /// PostgreSQL's order of a scan's restrictions: the others as written, then
 /// the equivalence-class equalities in the order they were written.
-fn order_restrictions(conjuncts: &mut [&Expr<'_>]) {
+fn order_restrictions(conjuncts: &mut [&Expr<'_>], cost: &dyn Fn(&Expr<'_>) -> f64) {
     let mut ordered = 0;
     for index in 0..conjuncts.len() {
         if !equivalence_clause(conjuncts[index]) {
             conjuncts[ordered..=index].rotate_right(1);
             ordered += 1;
         }
+    }
+    // `order_qual_clauses`: a stable insertion sort by per-row cost.
+    let mut costs = [0.0f64; MAX_CONJUNCTS];
+    for (slot, conjunct) in costs.iter_mut().zip(conjuncts.iter()) {
+        *slot = cost(conjunct);
+    }
+    for index in 1..conjuncts.len().min(MAX_CONJUNCTS) {
+        let mut at = index;
+        while at > 0 && costs[at - 1] > costs[at] {
+            conjuncts.swap(at - 1, at);
+            costs.swap(at - 1, at);
+            at -= 1;
+        }
+    }
+}
+
+/// The cost of a conjunct over one table, for [`order_restrictions`].
+fn table_qual_cost<'t>(
+    storage: &'t Storage,
+    txid: u32,
+    exposed: &'t str,
+    table: &'t crate::storage::TableDef,
+    arena: &'t Arena,
+) -> impl Fn(&Expr<'_>) -> f64 + 't {
+    move |conjunct| {
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(table),
+            alias: (exposed != table.name.as_str()).then_some(exposed),
+            output_aliases: &[],
+        };
+        query::qual_cost(conjunct, &columns, storage, txid, arena)
     }
 }
 
@@ -1089,7 +1120,7 @@ fn scan_filters<'a>(
 ) -> Result<bool, SqlError> {
     for (index, (exposed, table)) in relations.iter().enumerate() {
         let own = &mut own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + own_count[index]];
-        order_restrictions(own);
+        order_restrictions(own, &table_qual_cost(storage, txid, exposed, table, arena));
         let moved = &moved[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + moved_count[index]];
         filters[index] = if moved.is_empty() {
             let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
@@ -1556,7 +1587,9 @@ fn derived_relation_filter<'a>(
     {
         return Ok(None);
     }
-    order_restrictions(&mut conjuncts[..count]);
+    order_restrictions(&mut conjuncts[..count], &|conjunct| {
+        query::qual_cost(conjunct, &crate::sql::exec::NoCols, storage, txid, arena)
+    });
     let joined = [crate::sql::catalog::deparse::Joined::rule_columns(
         exposed,
         crate::sql::catalog::deparse::Columns::Derived(columns),
@@ -1620,7 +1653,10 @@ fn single_relation_quals<'a>(
             kept += 1;
         }
     }
-    order_restrictions(&mut conjuncts[..kept]);
+    order_restrictions(
+        &mut conjuncts[..kept],
+        &table_qual_cost(storage, txid, exposed, table, arena),
+    );
     let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
     let context = crate::sql::catalog::deparse::Context {
         storage,

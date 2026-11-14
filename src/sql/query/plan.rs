@@ -11,6 +11,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
 use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
+use crate::sql::exec::ColTypeResolver;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
@@ -581,6 +582,18 @@ pub(super) fn reorder_qual<'a>(
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
+    let (storage, txid) = scope.catalog();
+    order_qual(pred, &ScopeCols(scope), storage, txid, arena)
+}
+
+/// [`reorder_qual`] with the conjuncts' columns typed by `columns`.
+pub(crate) fn order_qual<'a>(
+    pred: &'a Expr<'a>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
     let mut conjunct: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
     let mut n = 0;
     if !flatten_and(pred, &mut conjunct, &mut n) || n == 0 {
@@ -619,9 +632,9 @@ pub(super) fn reorder_qual<'a>(
             at += 1;
         }
     }
-    let mut cost = [0u32; MAX_CONJUNCTS];
+    let mut cost = [0.0f64; MAX_CONJUNCTS];
     for (i, c) in conjunct[..n].iter().enumerate() {
-        cost[i] = postpone_cost(c, scope, arena);
+        cost[i] = qual_cost(c, columns, storage, txid, arena);
     }
     for i in 1..n {
         let mut j = i;
@@ -1033,6 +1046,106 @@ pub(super) fn simplify_qual<'a>(
     }
 }
 
+/// A routine's `procost`: a user routine's declared cost (PostgreSQL's
+/// default for a routine not written in C is 100), a built-in's catalog
+/// cost.
+fn procedure_cost(storage: &Storage, txid: u32, oid: i32) -> f64 {
+    if let Some(slot) = storage.routine_slot_by_oid(oid, txid) {
+        return storage
+            .routine_for(slot, txid)
+            .attributes
+            .cost_bits
+            .map_or(100.0, f64::from_bits);
+    }
+    crate::sql::catalog::builtin_planner_procedure(oid).map_or(1.0, |routine| routine.cost)
+}
+
+/// The `procost` of the routine a function call runs, which PostgreSQL's
+/// `cost_qual_eval` charges per call in units of `cpu_operator_cost`; 1 when
+/// the call names no catalog routine.
+fn routine_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txid: u32) -> f64 {
+    let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = e
+    else {
+        return 1.0;
+    };
+    if let Some(oid) = bound_oid {
+        return procedure_cost(storage, txid, *oid);
+    }
+    let mut types = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > types.len() {
+        return 1.0;
+    }
+    for (slot, argument) in types.iter_mut().zip(*args) {
+        match crate::sql::exec::infer_routine_argument_oid(argument, columns) {
+            Ok(oid) => *slot = oid,
+            Err(_) => return 1.0,
+        }
+    }
+    match storage.select_routine_call(
+        name,
+        argument_names,
+        &types[..args.len()],
+        *variadic,
+        txid,
+        crate::storage::RoutineCallKind::Function,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => storage
+            .routine_for(slot, txid)
+            .attributes
+            .cost_bits
+            .map_or(100.0, f64::from_bits),
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+            procedure_cost(storage, txid, oid)
+        }
+        _ => 1.0,
+    }
+}
+
+/// The `procost` of a user-defined operator's function; built-in operators
+/// cost 1.
+fn operator_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txid: u32) -> f64 {
+    let (name, left, right) = match e {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => (operator.operator_name(), Some(*left), *right),
+        Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Neg,
+            operand,
+            ..
+        } => (Some("-"), None, *operand),
+        _ => return 1.0,
+    };
+    let Some(name) = name else {
+        return 1.0;
+    };
+    let type_of = |x: &Expr| crate::sql::exec::infer_routine_argument_oid(x, columns);
+    let Ok(right) = type_of(right) else {
+        return 1.0;
+    };
+    let left = match left.map(type_of).transpose() {
+        Ok(left) => left,
+        Err(_) => return 1.0,
+    };
+    match storage.operator_slot_for_oids(None, name, left, Some(right), txid) {
+        Ok(Some(slot)) => storage
+            .operator_for(slot, txid)
+            .implementation
+            .routine()
+            .map_or(1.0, |function| procedure_cost(storage, txid, function)),
+        _ => 1.0,
+    }
+}
+
 /// Evaluation cost of a select-list expression in half-operator units,
 /// approximating PostgreSQL's `cost_qual_eval`: each operator or function
 /// application costs 2, an implicit numeric-family coercion costs 2, an IN
@@ -1040,15 +1153,27 @@ pub(super) fn simplify_qual<'a>(
 /// and AND/OR/IS NULL cost nothing. Used for the sort/limit projection
 /// postponement decision (threshold empirically pinned against PostgreSQL 18.4:
 /// items costing more than 10 operators are projected above the Sort + Limit).
-pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 {
+pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> f64 {
+    let (storage, txid) = scope.catalog();
+    qual_cost(e, &ScopeCols(scope), storage, txid, arena)
+}
+
+/// [`postpone_cost`] with the expression's columns typed by `columns`.
+pub(crate) fn qual_cost(
+    e: &Expr,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> f64 {
     use Expr::*;
     // PostgreSQL costs the *plan-time-folded* expression: a fully-constant
     // subtree has become a Const by then and costs nothing.
     if e.is_constant(false) {
-        return 0;
+        return 0.0;
     }
     let oid_of = |x: &Expr| -> Option<i32> {
-        crate::sql::exec::infer_type_res(x, &ScopeCols(scope))
+        crate::sql::exec::infer_type_res(x, columns)
             .ok()
             .map(|t| t.0)
     };
@@ -1069,13 +1194,13 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
     // One implicit cast (2 half-ops) when a numeric-family pair mixes types —
     // free when the coerced side is a constant, which PostgreSQL folds into a
     // pre-cast Const at plan time.
-    let coercion = |l: &Expr, r: &Expr| -> u32 {
+    let coercion = |l: &Expr, r: &Expr| -> f64 {
         match (oid_of(l).and_then(rank), oid_of(r).and_then(rank)) {
             (Some(a), Some(b)) if a != b => {
                 let coerced = if a < b { l } else { r };
-                if coerced.is_constant(false) { 0 } else { 2 }
+                if coerced.is_constant(false) { 0.0 } else { 2.0 }
             }
-            _ => 0,
+            _ => 0.0,
         }
     };
     match e {
@@ -1093,42 +1218,48 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | DefaultMarker
         | Column { .. }
         | WholeRow(_)
-        | SchemaColumn { .. } => 0,
+        | SchemaColumn { .. } => 0.0,
         Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
             ..
-        } => postpone_cost(operand, scope, arena),
-        Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
-        IsNull { operand, .. } => postpone_cost(operand, scope, arena),
-        BoundDefault { expression, .. } => postpone_cost(expression, scope, arena),
-        Cast { operand, .. } => postpone_cost(operand, scope, arena) + 2,
-        Collate { operand, .. } => postpone_cost(operand, scope, arena),
+        } => qual_cost(operand, columns, storage, txid, arena),
+        Unary { operand, .. } => {
+            qual_cost(operand, columns, storage, txid, arena)
+                + 2.0 * operator_cost(e, columns, storage, txid)
+        }
+        IsNull { operand, .. } => qual_cost(operand, columns, storage, txid, arena),
+        BoundDefault { expression, .. } => qual_cost(expression, columns, storage, txid, arena),
+        Cast { operand, .. } => qual_cost(operand, columns, storage, txid, arena) + 2.0,
+        Collate { operand, .. } => qual_cost(operand, columns, storage, txid, arena),
         Binary {
             operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
             left,
             right,
             ..
-        } => postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena),
+        } => {
+            qual_cost(left, columns, storage, txid, arena)
+                + qual_cost(right, columns, storage, txid, arena)
+        }
         Binary { left, right, .. } => {
-            postpone_cost(left, scope, arena)
-                + postpone_cost(right, scope, arena)
-                + 2
+            qual_cost(left, columns, storage, txid, arena)
+                + qual_cost(right, columns, storage, txid, arena)
+                + 2.0 * operator_cost(e, columns, storage, txid)
                 + coercion(left, right)
         }
         InList { operand, list, .. } => {
             // PostgreSQL rewrites a one-element IN to plain `=` (one operator);
             // longer lists cost half an operator per element (= ANY(array)).
             let applications = if list.len() <= 1 {
-                2
+                2.0
             } else {
-                list.len() as u32
+                list.len() as f64
             };
-            postpone_cost(operand, scope, arena)
+            qual_cost(operand, columns, storage, txid, arena)
                 + list
                     .iter()
-                    .map(|x| postpone_cost(x, scope, arena))
-                    .sum::<u32>()
+                    .map(|x| qual_cost(x, columns, storage, txid, arena))
+                    .sum::<f64>()
                 + applications
         }
         Like {
@@ -1136,7 +1267,11 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         }
         | Match {
             operand, pattern, ..
-        } => postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2,
+        } => {
+            qual_cost(operand, columns, storage, txid, arena)
+                + qual_cost(pattern, columns, storage, txid, arena)
+                + 2.0
+        }
         Call {
             name,
             bound_oid,
@@ -1164,14 +1299,14 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             let row_constructor = bound_oid.is_none() && *name == "row";
             let node =
                 if name.eq_ignore_ascii_case("coalesce") || json_constructor || row_constructor {
-                    0
+                    0.0
                 } else {
-                    2
+                    2.0 * routine_cost(e, columns, storage, txid)
                 };
             let mut c = args
                 .iter()
-                .map(|a| postpone_cost(a, scope, arena))
-                .sum::<u32>()
+                .map(|a| qual_cost(a, columns, storage, txid, arena))
+                .sum::<f64>()
                 + node;
             if unifying {
                 let unified = oid_of(e).and_then(rank);
@@ -1180,7 +1315,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
                         continue;
                     }
                     match (oid_of(a).and_then(rank), unified) {
-                        (Some(x), Some(y)) if x != y => c += 2,
+                        (Some(x), Some(y)) if x != y => c += 2.0,
                         _ => {}
                     }
                 }
@@ -1193,18 +1328,18 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             otherwise,
             ..
         } => {
-            let mut c = operand.map_or(0, |o| postpone_cost(o, scope, arena));
+            let mut c = operand.map_or(0.0, |o| qual_cost(o, columns, storage, txid, arena));
             // Non-constant branch results whose type differs from the CASE's
             // unified result type carry an implicit cast, which PostgreSQL
             // counts (a constant result is pre-cast at plan time).
             let case_rank = oid_of(e).and_then(rank);
-            let result_cast = |result: &Expr| -> u32 {
+            let result_cast = |result: &Expr| -> f64 {
                 if result.is_constant(false) {
-                    return 0;
+                    return 0.0;
                 }
                 match (oid_of(result).and_then(rank), case_rank) {
-                    (Some(a), Some(b)) if a != b => 2,
-                    _ => 0,
+                    (Some(a), Some(b)) if a != b => 2.0,
+                    _ => 0.0,
                 }
             };
             for (cond, result) in whens.iter() {
@@ -1214,40 +1349,49 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
                 match plan_time_bool(cond, arena) {
                     Some(false) => continue,
                     Some(true) => {
-                        c += postpone_cost(result, scope, arena) + result_cast(result);
+                        c += qual_cost(result, columns, storage, txid, arena) + result_cast(result);
                         return c;
                     }
                     None => {}
                 }
-                c += postpone_cost(cond, scope, arena) + postpone_cost(result, scope, arena);
+                c += qual_cost(cond, columns, storage, txid, arena)
+                    + qual_cost(result, columns, storage, txid, arena);
                 c += result_cast(result);
                 // The simple form compares the operand per WHEN.
                 if operand.is_some() {
-                    c += 2;
+                    c += 2.0;
                 }
             }
             if let Some(o) = otherwise {
-                c += postpone_cost(o, scope, arena) + result_cast(o);
+                c += qual_cost(o, columns, storage, txid, arena) + result_cast(o);
             }
             c
         }
-        Array(items) => items.iter().map(|x| postpone_cost(x, scope, arena)).sum(),
+        Array(items) => items
+            .iter()
+            .map(|x| qual_cost(x, columns, storage, txid, arena))
+            .sum(),
         Subscript { base, index } => {
-            postpone_cost(base, scope, arena) + postpone_cost(index, scope, arena)
+            qual_cost(base, columns, storage, txid, arena)
+                + qual_cost(index, columns, storage, txid, arena)
         }
         Slice { base, lower, upper } => {
-            postpone_cost(base, scope, arena)
-                + lower.map_or(0, |e| postpone_cost(e, scope, arena))
-                + upper.map_or(0, |e| postpone_cost(e, scope, arena))
+            qual_cost(base, columns, storage, txid, arena)
+                + lower.map_or(0.0, |e| qual_cost(e, columns, storage, txid, arena))
+                + upper.map_or(0.0, |e| qual_cost(e, columns, storage, txid, arena))
         }
-        Field { base, .. } | RecordFieldIndex { base, .. } => postpone_cost(base, scope, arena),
+        Field { base, .. } | RecordFieldIndex { base, .. } => {
+            qual_cost(base, columns, storage, txid, arena)
+        }
         AnyAll { operand, array, .. } => {
             let elements = if let Array(items) = array {
-                items.len() as u32
+                items.len() as f64
             } else {
-                20
+                20.0
             };
-            postpone_cost(operand, scope, arena) + postpone_cost(array, scope, arena) + elements
+            qual_cost(operand, columns, storage, txid, arena)
+                + qual_cost(array, columns, storage, txid, arena)
+                + elements
         }
         // Subqueries carry a subplan's cost in PostgreSQL and are postponed.
         Subquery(_)
@@ -1255,8 +1399,8 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | Exists(_)
         | ArraySubquery(_)
         | InSubquery { .. }
-        | QuantifiedSubquery { .. } => 1000,
-        RecursiveState { .. } => 0,
+        | QuantifiedSubquery { .. } => 1000.0,
+        RecursiveState { .. } => 0.0,
     }
 }
 

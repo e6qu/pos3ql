@@ -3299,11 +3299,9 @@ impl<'a> RetainedSelect<'a> {
                         ..super::super::eval::NO_HOOKS
                     },
                 )?;
-                // A grouping filters its input as the general executor's
-                // scan does, with the same planning-time folding.
-                if mode == RetainedMode::Statement && aggregates.is_none() {
-                    return Ok(predicate);
-                }
+                // Every stream filters its input as the general executor's
+                // scan does, with the same planning-time folding and
+                // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
                 reorder_qual(predicate, &scope, arena)
@@ -3669,11 +3667,9 @@ impl<'a> RetainedSelect<'a> {
                         ..super::super::eval::NO_HOOKS
                     },
                 )?;
-                // A grouping filters its input as the general executor's
-                // scan does, with the same planning-time folding.
-                if mode == RetainedMode::Statement && aggregates.is_none() {
-                    return Ok(predicate);
-                }
+                // Every stream filters its input as the general executor's
+                // scan does, with the same planning-time folding and
+                // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
                 reorder_qual(predicate, &scope, arena)

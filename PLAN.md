@@ -522,12 +522,21 @@ write resumed after a routine call or a wait neither qualifies earlier
 candidates again, whether they changed or failed, nor repeats their calls;
 an uncorrelated subquery the statement keeps (an initPlan) replays at the
 log position where it first ran. Conditions without such calls select and
-lock every row first, which no client can tell apart. Remaining gaps: a
-foreign table's rows are qualified before any change; PostgreSQL orders a
-condition's conjuncts by cost and evaluates leakproof ones before
-row-security conditions (`id < 4 AND f(id)` runs `id < 4` first), where
-conditions here run row-security policies first, then the condition left to
-right; a data-modifying `WITH` sub-statement runs ahead of the main
+lock every row first, which no client can tell apart. A condition's
+top-level conjuncts run in PostgreSQL's `order_qual_clauses` order: by
+per-row cost, stably, where a routine or a user-defined operator's function
+costs its declared `COST` (100 by default) times an operator, so
+`f(id) AND id < 4` runs `id < 4` first, in queries, `UPDATE`, `DELETE` and
+their `EXPLAIN` filters. Under row security each policy condition runs
+before the statement's conditions, except that a leakproof conjunct of a
+single-relation query or write cheaper than ten operators and than the first
+policy condition runs before the policies. Remaining gaps: a foreign table's
+rows are qualified before any change; such a leakproof conjunct that costs at
+least as much as the first policy condition runs after every policy
+condition, where PostgreSQL runs it right after the first; `EXPLAIN` prints
+a scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
+`DELETE ... USING` cost a routine reading a joined item's column as one
+operator; a data-modifying `WITH` sub-statement runs ahead of the main
 statement (above). A rule action reads the triggering statement's
 expression for each `OLD` or `NEW` reference it (or its rule's condition)
 makes, as PostgreSQL's rewriter substitutes them: it evaluates only the

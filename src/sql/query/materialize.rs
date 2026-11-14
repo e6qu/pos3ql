@@ -1771,7 +1771,7 @@ pub(super) fn prepare_materialization<'a>(
                 arena,
             )?;
             let sorted_expensive =
-                statement.limit.is_some() && postpone_cost(expression, scope, arena) > 20;
+                statement.limit.is_some() && postpone_cost(expression, scope, arena) > 20.0;
             if properties.volatile || sorted_expensive {
                 postponed[index] = true;
                 any_postponed = true;

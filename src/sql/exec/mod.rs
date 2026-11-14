@@ -474,6 +474,28 @@ fn dml_row_available(
     )
 }
 
+/// A write's condition with its top-level conjuncts in PostgreSQL's
+/// `order_qual_clauses` order (cheapest first, stably), typed over the
+/// write's target.
+fn order_dml_condition<'a, Definition: crate::storage::DefinitionBacking>(
+    condition: Option<&'a Expr<'a>>,
+    def: &crate::storage::TableDefinition<Definition>,
+    alias: Option<&'a str>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(condition) = condition else {
+        return Ok(None);
+    };
+    let columns = AliasedDefCols {
+        definition: crate::storage::RelationDefinition::from_definition(def),
+        alias,
+        output_aliases: &[],
+    };
+    super::query::order_qual(condition, &columns, storage, txid, arena).map(Some)
+}
+
 /// The statement conditions a row selected by `UPDATE` or `DELETE` must still
 /// meet in its latest version (PostgreSQL's EvalPlanQual recheck).
 struct DmlRequalify<'q, 'a, Definition: crate::storage::DefinitionBacking> {
@@ -1668,11 +1690,12 @@ pub(super) use schema::rename as stage_schema_rename;
 mod describe;
 mod routine_lookup;
 pub(crate) use describe::{
-    CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call, builtin_record_srf_call,
-    builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
-    catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
-    function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
-    static_meta_for_column, visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    AliasedDefCols, CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call,
+    builtin_record_srf_call, builtin_type_name_fixed, catalog_builtin_call_result_metadata,
+    catalog_composite_field, catalog_operator_first_argument_type, catalog_routine_record_field,
+    expand_record_call_items, function_lookup_error, numeric_log_type, procedure_lookup_error,
+    resolved_set_call, static_meta_for_column, visit_catalog_composite_fields,
+    visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -89421,8 +89444,20 @@ pub(crate) fn update<'a>(
     }
     // PostgreSQL plans the statement, folding its constants, before its
     // statement triggers fire.
-    let folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid) {
+    let mut folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid)
+    {
         Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    folded.where_clause = match order_dml_condition(
+        folded.where_clause,
+        def,
+        folded.alias,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(condition) => condition,
         Err(error) => return sql_fail(error),
     };
     let statement = &folded;
@@ -89569,6 +89604,26 @@ pub(crate) fn update<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(update_security, select_security);
+    // A target-only condition may run some of its conjuncts first.
+    let row_security = if statement.from.is_none() {
+        match super::query::lead_row_security(
+            row_security,
+            statement.where_clause,
+            &AliasedDefCols {
+                definition: crate::storage::RelationDefinition::from_definition(def),
+                alias: statement.alias,
+                output_aliases: &[],
+            },
+            storage,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        row_security
+    };
     let row_security_check = match super::query::plan_row_security(
         storage,
         table_index,
@@ -91020,8 +91075,20 @@ pub(crate) fn delete<'a>(
     }
     // PostgreSQL plans the statement, folding its constants, before its
     // statement triggers fire.
-    let folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid) {
+    let mut folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid)
+    {
         Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    folded.where_clause = match order_dml_condition(
+        folded.where_clause,
+        def,
+        folded.alias,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(condition) => condition,
         Err(error) => return sql_fail(error),
     };
     let statement = &folded;
@@ -91123,6 +91190,26 @@ pub(crate) fn delete<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(delete_security, select_security);
+    // A target-only condition may run some of its conjuncts first.
+    let row_security = if statement.using.is_none() {
+        match super::query::lead_row_security(
+            row_security,
+            statement.where_clause,
+            &AliasedDefCols {
+                definition: crate::storage::RelationDefinition::from_definition(def),
+                alias: statement.alias,
+                output_aliases: &[],
+            },
+            storage,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        row_security
+    };
     // A condition that reads no row of the statement runs once, before the
     // target scan, as PostgreSQL's one-time filter: when it fails, no row
     // is read and no other condition runs.

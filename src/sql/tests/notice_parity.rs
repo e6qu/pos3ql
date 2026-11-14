@@ -544,3 +544,75 @@ fn rule_actions_substitute_each_new_reference() {
         assert_eq!(data_rows(&rows), ["3|4", "6|7"]);
     });
 }
+
+#[test]
+fn conditions_run_cheapest_first_under_row_security() {
+    with_engine("notice-qual-cost-order", |engine, budget| {
+        for sql in [
+            "CREATE TABLE costed (id int, a int)",
+            "INSERT INTO costed SELECT g, g FROM generate_series(1, 4) g",
+            "CREATE FUNCTION seen(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'seen %', v; RETURN true; END $$",
+            "CREATE FUNCTION policy(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'policy %', v; RETURN true; END $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // A routine costs 100 operators, so the comparison runs first.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SELECT id FROM costed WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "SELECT 1"]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE costed SET a = a WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "UPDATE 1"]
+        );
+        for sql in [
+            "CREATE ROLE costed_reader",
+            "GRANT ALL ON costed TO costed_reader",
+            "ALTER TABLE costed ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY costed_policy ON costed USING (policy(id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The leakproof comparison runs before the policy; the routine after.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; SELECT id FROM costed WHERE seen(id) AND id < 2",
+            ),
+            [
+                "SET",
+                "NOTICE 00000 policy 1",
+                "NOTICE 00000 seen 1",
+                "SELECT 1"
+            ]
+        );
+        // Addition can fail, so it is not leakproof and waits for the policy.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; DELETE FROM costed WHERE id + 0 < 2",
+            ),
+            [
+                "SET",
+                // The UPDATE above moved row 1 to the end.
+                "NOTICE 00000 policy 2",
+                "NOTICE 00000 policy 3",
+                "NOTICE 00000 policy 4",
+                "NOTICE 00000 policy 1",
+                "DELETE 1",
+            ]
+        );
+    });
+}

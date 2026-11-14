@@ -22897,6 +22897,7 @@ impl Engine {
         if reset_workspace {
             eval::clear_eval_messages();
             eval::clear_folded_notices();
+            eval::clear_deferred_fold_error();
             event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();
@@ -25764,6 +25765,15 @@ impl Engine {
                 })
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
+        };
+        // A folding error planning-input discovery deferred stands even when
+        // no folding reached its constant.
+        let outcome = match (
+            outcome,
+            reset_workspace.then(eval::take_deferred_fold_error),
+        ) {
+            (Ok(Ok(())), Some(Some(error))) => Ok(Err(error)),
+            (outcome, _) => outcome,
         };
         let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {

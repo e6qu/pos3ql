@@ -531,6 +531,70 @@ pub fn truncate_eval_messages(mark: usize) {
     });
 }
 
+std::thread_local! {
+    /// Whether planning-input discovery defers its folding errors to the
+    /// statement's folding (see [`defer_fold_errors`]).
+    static DEFER_FOLD_ERRORS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// The first folding error discovery deferred.
+    static DEFERRED_FOLD_ERROR: core::cell::RefCell<Option<SqlError>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs planning-input discovery of a statement whose execution folds its
+/// constants (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). Discovery classifies
+/// constants before the statement folds them, in its own order; a constant
+/// whose arithmetic fails there is the statement's error where PostgreSQL's
+/// planner folds it, after the warnings of the constants folded before it.
+/// The folding raises it (see [`finish_folding`]).
+pub fn defer_fold_errors<R>(run: impl FnOnce() -> R) -> R {
+    let previous = DEFER_FOLD_ERRORS.with(|defer| defer.replace(true));
+    let result = run();
+    DEFER_FOLD_ERRORS.with(|defer| defer.set(previous));
+    result
+}
+
+/// Defers `error`, raised while discovery classified a constant of the
+/// statement itself, when discovery defers folding errors: the arithmetic
+/// errors constant folding raises (`1/0`, overflow).
+pub fn defer_fold_error(error: SqlError) -> Result<(), SqlError> {
+    let deferrable = DEFER_FOLD_ERRORS.with(core::cell::Cell::get)
+        && matches!(
+            error.sqlstate.as_str(),
+            sqlstate::DIVISION_BY_ZERO | sqlstate::NUMERIC_OUT_OF_RANGE
+        );
+    if !deferrable {
+        return Err(error);
+    }
+    DEFERRED_FOLD_ERROR.with(|deferred| {
+        let mut deferred = deferred.borrow_mut();
+        if deferred.is_none() {
+            *deferred = Some(error);
+        }
+    });
+    Ok(())
+}
+
+/// Ends the statement's folding: a folding error stands, and a deferred one
+/// the folding did not reach is reported now, before any row is read.
+pub fn finish_folding<T>(folded: Result<T, SqlError>) -> Result<T, SqlError> {
+    let deferred = DEFERRED_FOLD_ERROR.with(|deferred| deferred.borrow_mut().take());
+    match (folded, deferred) {
+        (Ok(_), Some(error)) => Err(error),
+        (folded, _) => folded,
+    }
+}
+
+/// Starts a top-level statement: no folding error is deferred.
+pub fn clear_deferred_fold_error() {
+    DEFERRED_FOLD_ERROR.with(|deferred| *deferred.borrow_mut() = None);
+}
+
+/// A deferred folding error no folding reported, which the statement
+/// reports once it ends.
+pub fn take_deferred_fold_error() -> Option<SqlError> {
+    DEFERRED_FOLD_ERROR.with(|deferred| deferred.borrow_mut().take())
+}
+
 /// Discards messages another session's evaluation left on this worker.
 pub fn clear_eval_messages() {
     PENDING_EVAL_MESSAGES.with(|pending| {
@@ -4778,6 +4842,7 @@ fn fold<'a>(
                 eval(expression, arena, NO_PARAMS, &NoColumns)
             }
         };
+        let messages = eval_message_mark();
         let result = if folding.replace {
             fold_once(expression, evaluate)
         } else {
@@ -4806,6 +4871,7 @@ fn fold<'a>(
             Datum::Bool(b) => Some(b),
             _ => None,
         };
+        let mut row_value = false;
         if folding.replace && runs_on_evaluation(expression, evaluation) {
             let type_oid = expression_type_identity(expression, &NoColumns, &hooks)?;
             let type_oid = type_oid.record_field_oid();
@@ -4813,8 +4879,14 @@ fn fold<'a>(
                 let literal = folded_literal(expression, value, type_oid, arena)?;
                 return Ok((literal, known));
             }
+            row_value = expression.is_row_constructor();
         }
-        return Ok((expression, known));
+        if !row_value {
+            return Ok((expression, known));
+        }
+        // A row has no constant of its own type: its fields fold, raising
+        // their notices once more.
+        truncate_eval_messages(messages);
     }
     // A simplification settles a boolean expression that is not constant;
     // the statement reads the settled value, never the dropped operands.
@@ -5168,22 +5240,68 @@ fn fold<'a>(
                     Ok(Some(fold(node, arena, folding).map_err(Failure)?.0))
                 })
                 .map_err(|Failure(error)| error)?;
+            // A comparison operator is strict: with a NULL constant operand
+            // it folds to NULL, as `eval_const_expressions` simplifies it.
+            if folding.replace
+                && let Expr::Binary {
+                    operator:
+                        BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq,
+                    left,
+                    right,
+                    ..
+                } = rebuilt
+                && (null_constant(left, arena)? || null_constant(right, arena)?)
+            {
+                let literal =
+                    folded_literal(expression, Datum::Null, super::types::oid::BOOL, arena)?;
+                return Ok((literal, None));
+            }
             Ok((rebuilt, None))
         }
     }
 }
 
-/// Whether evaluating the constant `expression` runs something a statement
-/// could observe once per row: a routine, an input or cast conversion, or a
-/// catalog operator's routine. Plain literals, `ARRAY[]` of literals and
-/// built-in arithmetic stay as written. An explicit `COLLATE` inside keeps
-/// its subtree, whose collation derivation the value would lose.
+/// Whether `expression` is a NULL constant: written, cast or folded.
+fn null_constant(expression: &Expr<'_>, arena: &Arena) -> Result<bool, SqlError> {
+    Ok(match expression {
+        Expr::Null => true,
+        Expr::Cast { operand, .. } => matches!(operand, Expr::Null),
+        Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+            ..
+        } => {
+            let mut values = [Datum::Null];
+            super::exec::decode_projected_row_into(encoded, arena, &mut values)?;
+            matches!(values[0], Datum::Null)
+        }
+        _ => false,
+    })
+}
+
+/// Whether the constant `expression` folds to its value: it runs a routine,
+/// an input or cast conversion, a catalog operator's routine or a built-in
+/// operator (`1 + 1` folds to `2`, as `eval_const_expressions` folds every
+/// immutable operator). Plain literals and `ARRAY[]` of literals stay as
+/// written. An explicit `COLLATE` inside keeps its subtree, whose collation
+/// derivation the value would lose.
 fn runs_on_evaluation(expression: &Expr<'_>, evaluation: Option<ExpressionEvaluation>) -> bool {
     fn contains(expression: &Expr<'_>, found: &mut (bool, bool)) {
         match expression {
             Expr::Collate { .. } => found.1 = true,
             Expr::Call { .. } if !expression.is_row_constructor() => found.0 = true,
-            Expr::Cast { .. } => found.0 = true,
+            Expr::Cast { .. } | Expr::Binary { .. } => found.0 = true,
+            // A negated number is a constant as written (`-5`).
+            Expr::Unary {
+                operator: super::ast::UnaryOp::Neg,
+                operand: Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_),
+                ..
+            } => {}
+            Expr::Unary { .. } => found.0 = true,
             _ => {}
         }
         let _ = super::query::walk_children(expression, &mut |child| {

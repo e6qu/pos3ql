@@ -229,14 +229,13 @@ fn constant_value_in(
         ..crate::sql::eval::NO_HOOKS
     };
     // Planning folds the constant only to classify it; the statement's own
-    // evaluation raises its notices, and its error where PostgreSQL's
-    // folding reaches it: after the constants folded before it, whose
-    // notices it then follows. A constant whose value is a data exception
-    // (class 22, such as `1/0`) is not classified.
+    // evaluation raises its notices.
     let mut folded = None;
+    let mut inlined = false;
     let messages = crate::sql::eval::eval_message_mark();
     let probed = crate::sql::eval::probe_constants(|| {
         folded = super::inspect_parameters(|parameters| {
+            inlined = super::inspecting_inline_arguments();
             crate::sql::eval::eval_full(
                 expression,
                 arena,
@@ -256,7 +255,11 @@ fn constant_value_in(
     });
     match probed {
         Ok(()) => Ok(folded),
-        Err(error) if error.sqlstate.as_str().starts_with("22") => {
+        // The statement's own constant fails where its folding reaches it;
+        // an inlined body's, which reads the call's arguments, fails here,
+        // during inlining.
+        Err(error) if !inlined => {
+            crate::sql::eval::defer_fold_error(error)?;
             crate::sql::eval::truncate_eval_messages(messages);
             Ok(None)
         }

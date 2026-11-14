@@ -11915,6 +11915,15 @@ pub fn fold_select_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<&'a Select<'a>, SqlError> {
+    super::eval::finish_folding(fold_select_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_select_constants_in<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a Select<'a>, SqlError> {
     if statement.from.is_none() {
         super::eval::probe_constants(|| {
             check_fromless_literal_operands(statement, arena, storage, txid)
@@ -12059,6 +12068,15 @@ pub(crate) fn fold_update_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<crate::sql::ast::Update<'a>, SqlError> {
+    super::eval::finish_folding(fold_update_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_update_constants_in<'a>(
+    statement: &crate::sql::ast::Update<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Update<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
     let fold =
         |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
@@ -12104,6 +12122,15 @@ fn assigns_through_indirection(expression: &Expr<'_>) -> bool {
 /// the range table after `RETURNING`. An `INSERT ... SELECT` source folds
 /// when it runs.
 pub(crate) fn fold_insert_constants<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    super::eval::finish_folding(fold_insert_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_insert_constants_in<'a>(
     statement: &crate::sql::ast::Insert<'a>,
     arena: &'a Arena,
     storage: &Storage,
@@ -12171,6 +12198,15 @@ pub(crate) fn fold_insert_constants<'a>(
 
 /// [`fold_update_constants`] for a `DELETE`: `RETURNING`, then `WHERE`.
 pub(crate) fn fold_delete_constants<'a>(
+    statement: &crate::sql::ast::Delete<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
+    super::eval::finish_folding(fold_delete_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_delete_constants_in<'a>(
     statement: &crate::sql::ast::Delete<'a>,
     arena: &'a Arena,
     storage: &Storage,

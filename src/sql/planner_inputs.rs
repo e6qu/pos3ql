@@ -103,6 +103,19 @@ fn parameter_known(index: u32) -> bool {
     })
 }
 
+/// Whether the parameters in view are an inlined SQL function's arguments.
+fn inspecting_inline_arguments() -> bool {
+    PARAMETERS
+        .with(core::cell::Cell::get)
+        .is_some_and(|current| match current.source {
+            ParameterSource::Bound => false,
+            ParameterSource::Inline { depth } => {
+                !super::exec::bound_parameter_context_active()
+                    && depth == super::exec::routine_parameter_depth()
+            }
+        })
+}
+
 /// Only copied facts may leave inspection; borrowed text/array values cannot.
 fn inspect_parameters<R>(
     inspect: impl for<'parameters> FnOnce(Option<&'parameters [super::types::Datum<'parameters>]>) -> R,
@@ -1031,11 +1044,24 @@ impl Engine {
         responder: &mut Responder,
         ancestors: &[i32],
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let captured =
-            match capture_planner_inputs(statement, outer, &self.storage, txn.txid, arena) {
-                Ok(captured) => captured,
-                Err(error) => return Ok(Err(error)),
-            };
+        // A top-level statement that folds its constants reports their
+        // arithmetic errors where its folding reaches them.
+        let folds = ancestors.is_empty()
+            && outer.is_none()
+            && matches!(
+                statement,
+                Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+            );
+        let capture = || capture_planner_inputs(statement, outer, &self.storage, txn.txid, arena);
+        let captured = if folds {
+            super::eval::defer_fold_errors(capture)
+        } else {
+            capture()
+        };
+        let captured = match captured {
+            Ok(captured) => captured,
+            Err(error) => return Ok(Err(error)),
+        };
         self.prepare_captured_planner_inputs_under(
             captured, arena, txn, sqlprep, cursors, guc, responder, ancestors,
         )

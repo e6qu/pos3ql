@@ -453,3 +453,85 @@ fn subqueries_run_as_numbered_init_plans_and_subplans() {
         ]
     );
 }
+
+#[test]
+fn explain_analyze_runs_plpgsql_calls_and_counts_their_rows() {
+    let (mut session, mut engine) = setup("explain_analyze_runs_plpgsql_calls");
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION pn_f(x int) RETURNS int LANGUAGE plpgsql AS \
+         $$ BEGIN RETURN x + 1; END $$",
+        true,
+    );
+    let analyzed = "ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF";
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            analyzed,
+            "SELECT pn_f(a) FROM pn_t WHERE a < 3"
+        ),
+        [
+            "Seq Scan on pn_t (actual rows=30.00 loops=1)",
+            "  Filter: (a < 3)",
+            "  Rows Removed by Filter: 70",
+        ]
+    );
+    // The change loop qualifies each row once, across the attempts the
+    // routine calls restart.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            analyzed,
+            "DELETE FROM pn_u WHERE pn_f(a) > 18 RETURNING a"
+        ),
+        [
+            "Delete on pn_u (actual rows=3.00 loops=1)",
+            "  ->  Seq Scan on pn_u (actual rows=3.00 loops=1)",
+            "        Filter: (pn_f(a) > 18)",
+            "        Rows Removed by Filter: 17",
+        ]
+    );
+}
+
+#[test]
+fn explain_plans_the_folded_statement() {
+    let (mut session, mut engine) = setup("explain_plans_the_folded_statement");
+    let costs = "COSTS OFF";
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u WHERE a > 1 + 1 AND c <> upper('x') AND 1 = 1"
+        ),
+        [
+            "Seq Scan on pn_u",
+            "  Filter: ((a > 2) AND (c <> 'X'::text))"
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u WHERE a IN (1, 1 + 1)"
+        ),
+        [
+            "Seq Scan on pn_u",
+            "  Filter: (a = ANY ('{1,2}'::integer[]))"
+        ]
+    );
+    for statement in [
+        "UPDATE pn_u SET c = 'y' WHERE 1 = 2",
+        "DELETE FROM pn_u WHERE a = NULL",
+    ] {
+        let plan = plan(&mut session, &mut engine, costs, statement);
+        assert_eq!(
+            plan[1..],
+            ["  ->  Result", "        One-Time Filter: false"],
+            "{statement}"
+        );
+    }
+}

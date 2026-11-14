@@ -2681,6 +2681,7 @@ fn finish_derived_definition<'a, 'd>(
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
@@ -3212,9 +3213,53 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
 ) -> Result<RelationDefinition<'a>, SqlError> {
+    table_func_def_unpositioned(tref, storage, txid, arena, params, columns)
+        .map_err(|error| function_type_miss(error, tref))
+}
+
+/// Positions a missing type named in a FROM function's arguments or its
+/// column definition list where it is written.
+fn function_type_miss(mut error: SqlError, tref: &TableRef<'_>) -> SqlError {
+    if !crate::sql::type_name_miss::is_type_name_miss(&error) {
+        return error;
+    }
+    for argument in tref.func_args.unwrap_or(&[]) {
+        if let Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__json_record_columns",
+            args: entries,
+            ..
+        } = argument
+        {
+            for entry in *entries {
+                if let Expr::Call {
+                    args: [_, Expr::Str(type_name), _],
+                    ..
+                } = entry
+                    && crate::sql::error_position::names_missed_type(&error, type_name)
+                {
+                    return crate::sql::error_position::at_reference(error, type_name);
+                }
+            }
+        } else {
+            error = crate::sql::error_position::type_miss_within(error, argument);
+        }
+    }
+    error
+}
+
+fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
+    tref: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+) -> Result<RelationDefinition<'a>, SqlError> {
     if let Some(functions) = tref.rows_from {
         return rows_from_def_outer(tref, functions, storage, txid, arena, params, columns);
     }
+    reject_unnest_column_definitions(tref)?;
     let routine = if sql_table_constructor(tref) {
         None
     } else {
@@ -3344,6 +3389,21 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "table function \"{}\" is not supported",
             tref.table
+        ));
+    }
+    // Of these built-ins only the `json_to_record` family returns `record`.
+    if routine.is_none()
+        && !is_json_to_record
+        && let Some(Expr::Call {
+            source_position, ..
+        }) = column_definition_list(tref)
+    {
+        return Err(crate::sql::error_position::at_source_position(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "a column definition list is only allowed for functions returning \"record\""
+            ),
+            *source_position,
         ));
     }
     if (is_keys || is_elems || is_each)
@@ -3942,7 +4002,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                         }
                     };
                 let type_mod = match argument {
-                    Expr::Cast { type_mod, .. } => *type_mod,
+                    Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
                 // A single array's element column takes the table alias, as a
@@ -4292,6 +4352,30 @@ fn capture_table_func_routine(
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
     bind_column_definitions(tref, routine, storage, txid)
+}
+
+/// `unnest` of one array returns its element type, never `record`, so it
+/// takes no column definition list; PostgreSQL rejects one before looking
+/// the function up. An unqualified `unnest` of several arrays is rejected
+/// while parsing.
+fn reject_unnest_column_definitions(tref: &TableRef<'_>) -> Result<(), SqlError> {
+    let name = tref.table.rsplit('.').next().unwrap_or(tref.table);
+    if !name.eq_ignore_ascii_case("unnest") || tref.func_args.is_none_or(|args| args.len() != 2) {
+        return Ok(());
+    }
+    let Some(Expr::Call {
+        source_position, ..
+    }) = column_definition_list(tref)
+    else {
+        return Ok(());
+    };
+    Err(crate::sql::error_position::at_source_position(
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "a column definition list is only allowed for functions returning \"record\""
+        ),
+        *source_position,
+    ))
 }
 
 /// The column definition list a function in FROM was written with: the

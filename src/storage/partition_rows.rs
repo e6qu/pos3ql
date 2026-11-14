@@ -89,7 +89,17 @@ impl<'row, 'value, B: DefinitionBacking> PartitionRow<'row, 'value, B> {
     }
 }
 
-impl PartitionKeyRow<'_, '_> {
+impl<'value> PartitionKeyRow<'_, 'value> {
+    /// The row's partition key values, in key order.
+    pub(crate) fn key_values(self) -> impl Iterator<Item = Datum<'value>> {
+        let values = self.values;
+        self.scheme
+            .keys
+            .into_iter()
+            .take(usize::from(self.scheme.n_keys))
+            .map(move |key| values.get(usize::from(key)).copied().unwrap_or(Datum::Null))
+    }
+
     pub(crate) fn all_known(self, known: &[bool]) -> bool {
         self.scheme.keys[..usize::from(self.scheme.n_keys)]
             .iter()

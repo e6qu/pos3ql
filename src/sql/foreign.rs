@@ -83,12 +83,86 @@ impl RemoteTupleId {
     }
 }
 
+std::thread_local! {
+    /// The command the foreign session is running, for the error context
+    /// PostgreSQL's `pgfdw_report_error` adds.
+    static REMOTE_COMMAND: core::cell::Cell<(*const u8, usize)> =
+        const { core::cell::Cell::new((core::ptr::null(), 0)) };
+}
+
+/// The foreign command running until this scope ends.
+struct RemoteCommandScope((*const u8, usize));
+
+impl Drop for RemoteCommandScope {
+    fn drop(&mut self) {
+        REMOTE_COMMAND.with(|command| command.set(self.0));
+    }
+}
+
+/// Names `command` as the one the foreign session runs. The scope is dropped
+/// before `command`, which every caller declares first.
+fn remote_command(command: &str) -> RemoteCommandScope {
+    RemoteCommandScope(
+        REMOTE_COMMAND.with(|current| current.replace((command.as_ptr(), command.len()))),
+    )
+}
+
+/// A foreign server's error context: its own `CONTEXT`, then the command
+/// that failed.
+struct RemoteErrorFrame<'a> {
+    context: Option<&'a str>,
+    command: Option<&'a str>,
+}
+
+impl crate::sql::error_context::Frame for RemoteErrorFrame<'_> {
+    fn write_line(&self, out: &mut dyn core::fmt::Write, _positioned: bool) -> core::fmt::Result {
+        if let Some(context) = self.context {
+            out.write_str(context)?;
+            if self.command.is_some() {
+                out.write_char('\n')?;
+            }
+        }
+        if let Some(command) = self.command {
+            write!(out, "remote SQL command: {command}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A foreign server's error as PostgreSQL's `pgfdw_report_error` re-raises
+/// it: SQLSTATE, message, `DETAIL`, `HINT` and `CONTEXT`, then the remote
+/// command; any other client failure is a local `HV000`.
 fn client_error(error: ClientError) -> SqlError {
     match error {
-        ClientError::Publisher(diagnostic) => SqlError {
-            sqlstate: diagnostic.sqlstate,
-            message: diagnostic.message,
-        },
+        ClientError::Publisher(diagnostic) => {
+            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                detail: diagnostic
+                    .detail
+                    .map(|detail| crate::util::StackStr::from_str(detail.as_str())),
+                hint: diagnostic
+                    .hint
+                    .map(|hint| crate::util::StackStr::from_str(hint.as_str())),
+                objects: crate::sql::eval::ErrorObjects::default(),
+            });
+            let (text, len) = REMOTE_COMMAND.with(core::cell::Cell::get);
+            // SAFETY: a `RemoteCommandScope` names a command that outlives it.
+            let command = (!text.is_null()).then(|| unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(text, len))
+            });
+            let frame = RemoteErrorFrame {
+                context: diagnostic.context.as_ref().map(|context| context.as_str()),
+                command,
+            };
+            match crate::sql::error_context::within(&frame, || {
+                Err::<core::convert::Infallible, _>(SqlError {
+                    sqlstate: diagnostic.sqlstate,
+                    message: diagnostic.message,
+                })
+            }) {
+                Err(error) => error,
+                Ok(never) => match never {},
+            }
+        }
         error => sql_err!(
             sqlstate::FDW_ERROR,
             "foreign PostgreSQL connection: {}",
@@ -240,6 +314,35 @@ fn enter_session(
                 Ok(())
             })?;
         }
+        // postgres_fdw's `configure_remote_session`: a search path that
+        // qualifies every remote name, and the value formats it reads.
+        for setting in [
+            "SET search_path = pg_catalog",
+            "SET timezone = 'UTC'",
+            "SET datestyle = ISO",
+            "SET intervalstyle = postgres",
+            "SET extra_float_digits = 3",
+        ] {
+            let _remote = remote_command(setting);
+            client.query(setting).map_err(client_error)?;
+            ready = false;
+            while !ready {
+                poll_client(&mut client, deadline, &mut |event| {
+                    match event {
+                        ClientEvent::Sql(SqlEvent::CommandComplete { tag: "SET" }) => {}
+                        ClientEvent::Sql(SqlEvent::Ready {
+                            transaction_status: b'I',
+                        }) => ready = true,
+                        _ => {
+                            return Err(ClientError::Protocol(
+                                crate::pg::replication_client::FrameError::Malformed,
+                            ));
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
         // postgres_fdw mirrors SERIALIZABLE and otherwise uses REPEATABLE
         // READ, preserving one remote snapshot across local statements.
         let statement_context = storage.foreign_statement_context_for(txid);
@@ -248,6 +351,7 @@ fn enter_session(
         } else {
             "BEGIN ISOLATION LEVEL REPEATABLE READ"
         };
+        let _remote = remote_command(begin);
         client.query(begin).map_err(client_error)?;
         ready = false;
         while !ready {
@@ -280,6 +384,7 @@ fn enter_session(
                     "foreign savepoint command exceeds its fixed buffer"
                 ));
             }
+            let _remote = remote_command(command.as_str());
             client.query(command.as_str()).map_err(client_error)?;
             ready = false;
             while !ready {
@@ -326,6 +431,7 @@ fn session_command(
     })?;
     let mut client = storage.foreign_client(session)?;
     (|| {
+        let _remote = remote_command(command);
         client.query(command).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
         let mut ready = false;
@@ -425,7 +531,13 @@ pub(crate) fn rollback_to_savepoint(
     savepoint_command(storage, txid, "ROLLBACK TO SAVEPOINT ", name)
 }
 
+/// PostgreSQL's `quote_identifier`, which postgres_fdw's deparser uses for
+/// every remote name: bare when it round-trips, otherwise double-quoted.
 fn quote_identifier<const N: usize>(output: &mut StackStr<N>, value: &str) {
+    if !crate::sql::eval::ident_needs_quotes(value) {
+        let _ = output.write_str(value);
+        return;
+    }
     let _ = output.write_char('"');
     for character in value.chars() {
         if character == '"' {
@@ -575,6 +687,7 @@ pub(crate) fn import_commands<'a>(
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         let deadline = Instant::now() + timeout;
+        let _remote = remote_command(query.as_str());
         client.query(query.as_str()).map_err(client_error)?;
         ready = false;
         while !ready && response_error.is_none() {
@@ -913,6 +1026,7 @@ pub(crate) fn materialize<'a>(
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
         let deadline = Instant::now() + timeout;
+        let _remote = remote_command(query.as_str());
         client.query(query.as_str()).map_err(client_error)?;
         ready = false;
         while !ready && conversion_error.is_none() {
@@ -1058,6 +1172,7 @@ pub(crate) fn visit_mutable_rows<'arena>(
     let mut response_error = None;
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
+        let _remote = remote_command(query.as_str());
         client.query(query.as_str()).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
         while !ready && response_error.is_none() {
@@ -1182,7 +1297,7 @@ pub(crate) fn insert_row<'a>(
     quote_identifier(&mut query, remote_schema);
     let _ = query.write_char('.');
     quote_identifier(&mut query, remote_table);
-    let _ = query.write_str(" (");
+    let _ = query.write_char('(');
     for (column, definition) in table.columns().iter().enumerate() {
         if column != 0 {
             let _ = query.write_str(", ");
@@ -1236,6 +1351,7 @@ pub(crate) fn insert_row<'a>(
     let mut ready = false;
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
+        let _remote = remote_command(query.as_str());
         client
             .query_params(query.as_str(), &parameters[..table.n_columns])
             .map_err(client_error)?;
@@ -1355,6 +1471,7 @@ fn remote_returning_row<'a>(
     })?;
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
+        let _remote = remote_command(query);
         client
             .query_params(query, parameters)
             .map_err(client_error)?;
@@ -1645,6 +1762,7 @@ fn execute_command(
     let mut complete = false;
     let mut client = storage.foreign_client(session)?;
     let execution = (|| -> Result<(), SqlError> {
+        let _remote = remote_command(command);
         client.query(command).map_err(client_error)?;
         let deadline = Instant::now() + timeout;
         while !ready {

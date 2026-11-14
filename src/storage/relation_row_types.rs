@@ -310,9 +310,7 @@ impl Storage {
         type_name: &str,
         txid: u32,
     ) -> Option<RowTypeRelation> {
-        let (qualifier, name) = type_name
-            .split_once('.')
-            .map_or((None, type_name), |(schema, name)| (Some(schema), name));
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         match self.resolve_relation(qualifier, name, txid)? {
             super::ResolvedRelation::Table(slot) => Some(RowTypeRelation::Table(slot)),
             super::ResolvedRelation::View(slot) => Some(RowTypeRelation::View(slot)),

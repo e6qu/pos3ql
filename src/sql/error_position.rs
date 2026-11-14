@@ -641,6 +641,58 @@ fn annotated(error: SqlError, at: Option<usize>, hint: &'static str) -> SqlError
     error
 }
 
+/// Whether `error` reports that the written type name `type_name`, or its
+/// schema, does not exist.
+pub(crate) fn names_missed_type(error: &SqlError, type_name: &str) -> bool {
+    use crate::sql::type_name_miss::{TypeNameMiss, split_type_name};
+    let (schema, name) = split_type_name(type_name);
+    let message = error.message.as_str();
+    let reported = |miss: TypeNameMiss<'_>| miss.error().message.as_str() == message;
+    schema.is_some_and(|schema| reported(TypeNameMiss::Schema(schema)))
+        || reported(TypeNameMiss::Type { schema, name })
+        || reported(TypeNameMiss::Type {
+            schema: None,
+            name: type_name,
+        })
+}
+
+/// Positions a missing type or schema raised analysing `expression` at the
+/// first cast in it that names that type, as PostgreSQL's analysis of the
+/// cast reports it in a statement it analyses. Any other error is returned
+/// as it is.
+pub(crate) fn type_miss_within(
+    error: SqlError,
+    expression: &crate::sql::ast::Expr<'_>,
+) -> SqlError {
+    use crate::sql::type_name_miss::is_type_name_miss;
+    if !is_type_name_miss(&error) {
+        return error;
+    }
+    let names = |type_name: &str| names_missed_type(&error, type_name);
+    fn find<'e>(
+        expression: &'e crate::sql::ast::Expr<'e>,
+        names: &dyn Fn(&str) -> bool,
+    ) -> Option<&'e str> {
+        if let crate::sql::ast::Expr::Cast { type_name, .. } = expression
+            && names(type_name)
+        {
+            return Some(type_name);
+        }
+        let mut found = None;
+        let _ = crate::sql::query::walk_children(expression, &mut |child| {
+            if found.is_none() {
+                found = find(child, names);
+            }
+            Ok(())
+        });
+        found
+    }
+    match find(expression, &names) {
+        Some(type_name) => at_reference(error, type_name),
+        None => error,
+    }
+}
+
 /// Positions an error raised analysing `expression` at the part PostgreSQL
 /// names: a cast's unknown type or failed constant, an unknown function or
 /// an unknown operator.
@@ -666,7 +718,7 @@ pub(crate) fn expression_error(
             source_position,
             ..
         } => {
-            if state == sqlstate::UNDEFINED_OBJECT && message.starts_with("type \"") {
+            if crate::sql::type_name_miss::is_type_name_miss(&error) {
                 at_subject(error, type_name)
             } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
                 at_parsed_offset(error, source_position.get())

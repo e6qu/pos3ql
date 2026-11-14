@@ -35,7 +35,12 @@ pub(crate) struct RowCursor {
 
 struct RowScanSource {
     snapshot: TableRowSnapshot<'static>,
+    /// Captured resident rows by row identity, the order the saved-row walk
+    /// searches to skip the rows they shadow.
     rows: ArenaSliceHandle<CapturedRowRecord>,
+    /// Positions in `rows` in a sequential scan's heap order, the order the
+    /// resident rows are returned in.
+    order: ArenaSliceHandle<u32>,
     members: ArenaSliceHandle<MemberCursor>,
     resident: usize,
     commit: u64,
@@ -104,6 +109,7 @@ impl RowCursor {
     /// generations needs.
     pub(crate) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
         Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
+            .checked_add(Arena::retained_slice_capacity::<u32>(rows)?)?
             .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)
     }
 
@@ -140,6 +146,22 @@ impl RowCursor {
                 arena.retained_slice_mut(handle).map_err(state_error)
             },
         )?;
+        // Resident rows go in a sequential scan's heap order, as the
+        // general executor and data changes read them; `rows` keeps its
+        // row-identity order for the saved-row walk's shadow search.
+        u32::try_from(rows.len()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "query cursor captured more resident rows than it can order"
+            )
+        })?;
+        let order = arena
+            .retain_slice_with(rows.len(), |index| index as u32)
+            .map_err(cursor_capacity)?;
+        {
+            let mut positions = arena.retained_slice_mut(order).map_err(state_error)?;
+            positions.sort_unstable_by_key(|&position| rows[position as usize].physical_order());
+        }
         drop(rows);
         let member_count = snapshot
             .roots()
@@ -151,6 +173,7 @@ impl RowCursor {
         self.source = Some(RowScanSource {
             snapshot,
             rows: rows_handle.expect("successful capture allocated its resident selections"),
+            order,
             members,
             resident: 0,
             commit,
@@ -199,8 +222,11 @@ impl RowCursor {
         if source.done {
             return Ok(None);
         }
-        while source.resident < rows.len() {
-            let record = &mut rows[source.resident];
+        let order = state_arena
+            .retained_slice_mut(source.order)
+            .map_err(state_error)?;
+        while source.resident < order.len() {
+            let record = &mut rows[order[source.resident] as usize];
             source.snapshot.resolve_saved(record, source.commit)?;
             let Some(home) = source.snapshot.read_record(*record)? else {
                 source.resident += 1;

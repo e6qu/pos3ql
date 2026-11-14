@@ -446,6 +446,9 @@ mod tests {
                     parent: original.name,
                     n_cols: 1,
                     n_parent_cols: 1,
+                    referenced_index: crate::storage::ReferencedIndex::Index(
+                        crate::storage::RelationIdentity::parse(1).unwrap(),
+                    ),
                     ..crate::storage::ForeignKey::EMPTY
                 };
                 let dependent = dependent.freeze(&storage.metadata_pool).unwrap();

@@ -3205,7 +3205,12 @@ impl<'a> RetainedSelect<'a> {
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         super::check_key_types(statement, &scope, arena, storage, txid)?;
-        check_select_constants(statement, arena, storage, txid)?;
+        // A constant that calls a routine folds where routines run.
+        let statement = match super::fold_select_constants(statement, arena, storage, txid) {
+            Ok(statement) => statement,
+            Err(error) if error.requires_routine_engine() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         super::require_select_routine_execute(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
             if table.is_none() {
@@ -3601,7 +3606,12 @@ impl<'a> RetainedSelect<'a> {
         }
         let binding_columns = Some(&columns);
         check_select_types(statement, &scope, storage, txid, arena, None)?;
-        check_select_constants(statement, arena, storage, txid)?;
+        // A constant that calls a routine folds where routines run.
+        let statement = match super::fold_select_constants(statement, arena, storage, txid) {
+            Ok(statement) => statement,
+            Err(error) if error.requires_routine_engine() => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let demand = match aggregates {
             Some(_) => grouping::input_demand(&scope, from, statement, arena)?,
             None => streaming_pax_columns_ordered(

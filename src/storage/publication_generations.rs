@@ -429,6 +429,9 @@ mod tests {
             parent: SqlName::parse("generation_parent").unwrap(),
             n_cols: 1,
             n_parent_cols: 1,
+            referenced_index: crate::storage::ReferencedIndex::Index(
+                crate::storage::RelationIdentity::parse(1).unwrap(),
+            ),
             ..ForeignKey::EMPTY
         };
         let child = storage.create_table(child).unwrap();

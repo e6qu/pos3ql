@@ -4986,34 +4986,37 @@ pub(crate) fn validate_literal_input(
     if !builtin {
         return Ok(());
     }
-    arena
-        .with_remaining_region(|scratch| {
-            let value = Datum::Text(text);
-            match target {
-                ColType::Array(element) if element.is_catalog_reference() => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
-                }
-                ColType::Regtype => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::regtype_cast(value, Some(&catalog), scratch)?;
-                }
-                target if target.is_reg_object() => {
-                    let catalog = super::query::storage_catalog(storage, scratch, txid);
-                    super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
-                }
-                // An input the analysis cannot run here is reported by the
-                // evaluation that converts the literal.
-                target => match super::eval::cast_to(value, target, scratch) {
-                    Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
-                    result => {
-                        result?;
+    // A probe: the evaluation that converts the literal raises its notices.
+    super::eval::probe_constants(|| {
+        arena
+            .with_remaining_region(|scratch| {
+                let value = Datum::Text(text);
+                match target {
+                    ColType::Array(element) if element.is_catalog_reference() => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
                     }
-                },
-            }
-            Ok(())
-        })
-        .map_err(|_| super::query::arena_full_pub())?
+                    ColType::Regtype => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::regtype_cast(value, Some(&catalog), scratch)?;
+                    }
+                    target if target.is_reg_object() => {
+                        let catalog = super::query::storage_catalog(storage, scratch, txid);
+                        super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
+                    }
+                    // An input the analysis cannot run here is reported by the
+                    // evaluation that converts the literal.
+                    target => match super::eval::cast_to(value, target, scratch) {
+                        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
+                        result => {
+                            result?;
+                        }
+                    },
+                }
+                Ok(())
+            })
+            .map_err(|_| super::query::arena_full_pub())?
+    })
 }
 
 /// Runs [`validate_literal_input`] for each UNKNOWN literal a selected
@@ -5131,10 +5134,34 @@ pub(crate) fn validate_explicit_cast(
             super::eval::DefinedCastContext::Explicit,
         )?;
     }
+    let written_source = source;
     let source = storage
         .domain_base_type_for_oid(source, txid)
         .map_or(source, ColType::oid);
-    super::eval::validate_catalog_reference_cast(source, target)
+    let refused = || -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            format_type_name(storage, txid, written_source)?.as_str(),
+            format_type_name(storage, txid, target_oid)?.as_str()
+        ))
+    };
+    // An enum is reached only from a string, through its input.
+    if matches!(target, ColType::Enum(_))
+        && source != target.oid()
+        && source != super::types::oid::UNKNOWN
+        && ColType::from_oid(source).is_none_or(|source| super::types::type_category(source) != "S")
+    {
+        return refused();
+    }
+    // PostgreSQL names a domain target as written, not its base type.
+    super::eval::validate_catalog_reference_cast(source, target).or_else(|error| {
+        if target_oid != target.oid() && error.sqlstate.as_str() == sqlstate::CANNOT_COERCE {
+            refused()
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// PostgreSQL's `can_coerce_type` in assignment context: equal types,
@@ -8257,7 +8284,7 @@ fn foreign_table_visible(storage: &Storage, slot: usize, txid: u32) -> bool {
 
 fn foreign_mapping_options_visible(
     storage: &Storage,
-    mapping: crate::storage::foreign::UserMappingDefinition,
+    mapping: &crate::storage::foreign::UserMappingDefinition,
     txid: u32,
 ) -> bool {
     let Some(current) = storage.current_role_slot(txid) else {
@@ -9904,15 +9931,21 @@ fn visit_indexes(
             // read back through `index_expression_source`.
             let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
             let mut expression_keys = [false; crate::storage::MAX_INDEX_COLS];
-            for (position, element) in exclusion.elements().enumerate() {
+            let mut descending = [false; crate::storage::MAX_INDEX_COLS];
+            let mut nulls_first = [false; crate::storage::MAX_INDEX_COLS];
+            for (position, (element, options)) in
+                exclusion.elements().zip(exclusion.options()).enumerate()
+            {
                 match element {
                     crate::storage::ExclusionElement::Column(column) => columns[position] = column,
                     crate::storage::ExclusionElement::Expression(_) => {
                         expression_keys[position] = true;
                     }
                 }
+                descending[position] = options.descending;
+                nulls_first[position] = options.nulls_first;
             }
-            visit(mk(
+            let mut info = mk(
                 exclusion
                     .index_identity
                     .expect("admitted exclusion index has an identity")
@@ -9920,8 +9953,8 @@ fn visit_indexes(
                 &columns[..exclusion.len()],
                 expression_keys,
                 &[],
-                [false; crate::storage::MAX_INDEX_COLS],
-                [false; crate::storage::MAX_INDEX_COLS],
+                descending,
+                nulls_first,
                 exclusion
                     .predicate
                     .map(|predicate| StackStr::from_str(predicate.as_str())),
@@ -9936,7 +9969,14 @@ fn visit_indexes(
                 Some(exclusion.method),
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
-            ));
+            );
+            for (position, options) in exclusion.options().iter().enumerate() {
+                info.collations[position] = options.collation;
+                info.explicit_collations[position] = options.explicit_collation;
+                info.operator_classes[position] = options.class;
+                info.resolved_operator_classes[position] = options.resolved_class;
+            }
+            visit(info);
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
@@ -10298,10 +10338,24 @@ fn bound_index_source<'a>(
     arena: &'a Arena,
 ) -> Result<&'a super::ast::Expr<'a>, SqlError> {
     if info.is_exclusion {
-        // An exclusion constraint keeps its predicate as name-resolved text;
-        // its index has no explicit definition to bind it through.
+        // An exclusion constraint's index keeps its expressions on the
+        // constraint, whose table holds what they were bound to.
+        let name = SqlName::parse(info.name.as_str())?;
+        let owner = match owner {
+            crate::storage::ExpressionOwner::IndexKey(position) => {
+                crate::storage::ExpressionOwner::ExclusionKey(name, position)
+            }
+            _ => crate::storage::ExpressionOwner::ExclusionPredicate(name),
+        };
         let source = arena.alloc_str(source).map_err(|_| arena_full())?;
-        return super::parser::parse_expr(source, arena);
+        return super::exec::expression_bindings::bind_table_expression(
+            super::parser::parse_expr(source, arena)?,
+            storage,
+            &storage.table_def(info.table_slot, txid),
+            owner,
+            txid,
+            arena,
+        );
     }
     let index = info_index(storage, info, txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
@@ -10728,15 +10782,7 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
     match crate::sql::identifiers::ObjectReference::parse(name)? {
         crate::sql::identifiers::ObjectReference::Oid(oid) => Ok(Some(oid as i32)),
         crate::sql::identifiers::ObjectReference::Name(parsed) => {
-            if parsed
-                .database
-                .is_some_and(|database| database != storage.current_database_name(txid))
-            {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cross-database relation references are not supported"
-                ));
-            }
+            parsed.require_database(storage.current_database_name(txid))?;
             if let Some(schema) = parsed.schema.as_ref()
                 && storage.find_schema_visible(schema.as_str(), txid).is_some()
             {
@@ -10880,15 +10926,7 @@ fn table_slot_by_written_name(
     written: &str,
 ) -> Result<Option<usize>, SqlError> {
     let parsed = crate::sql::identifiers::QualifiedObjectName::parse(written)?;
-    if parsed
-        .database
-        .is_some_and(|database| database != storage.current_database_name(txid))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cross-database relation references are not supported"
-        ));
-    }
+    parsed.require_database(storage.current_database_name(txid))?;
     let oid = relation_oid_for_name(
         storage,
         txid,
@@ -11274,6 +11312,47 @@ pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
             .flatten()
             == Some(slot),
     )
+}
+
+/// The name `pg_get_constraintdef` writes after an exclusion element's
+/// `WITH`, as `generate_operator_name` does: a built-in's bare name, a
+/// user-defined operator's bare name when it resolves alone and otherwise
+/// `OPERATOR(schema.name)`.
+pub(crate) fn exclusion_operator_name(
+    storage: &Storage,
+    txid: u32,
+    operator: crate::storage::ExclusionOperator,
+) -> Result<StackStr<160>, SqlError> {
+    use core::fmt::Write;
+    let mut text = StackStr::<160>::new();
+    if let Some(name) = operator.builtin_sql() {
+        let _ = text.write_str(name);
+        return Ok(text);
+    }
+    let slot = storage
+        .operator_slot_by_oid(operator.oid(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "cache lookup failed for operator {}",
+                operator.oid()
+            )
+        })?;
+    let definition = storage.operator_for(slot, txid);
+    if operator_oid_visibility(storage, txid, operator.oid()) == Some(true) {
+        let _ = text.write_str(definition.name.as_str());
+    } else {
+        let _ = text.write_str("OPERATOR(");
+        write_identifier(&mut text, definition.schema.as_str());
+        let _ = write!(text, ".{})", definition.name.as_str());
+    }
+    if text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "operator name exceeds its fixed reservation"
+        ));
+    }
+    Ok(text)
 }
 
 pub(crate) fn operator_class_oid_visibility(
@@ -15633,6 +15712,8 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, parent.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(")");
+        // ruleutils.c spells ON UPDATE before ON DELETE and its column list.
+        let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
         if !fk.delete_set_cols().is_empty() {
             let _ = s.write_str(" (");
@@ -15644,7 +15725,6 @@ pub fn constraint_def_text<'a>(
             }
             let _ = s.write_char(')');
         }
-        let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
             &s,
@@ -15806,8 +15886,11 @@ pub fn constraint_def_text<'a>(
                 .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                 .expect("exclusion index has its constraint");
             let _ = write!(rendered, "EXCLUDE USING {} (", exclusion.method.name());
-            for (position, (element, operator)) in
-                exclusion.elements().zip(exclusion.operators()).enumerate()
+            for (position, ((element, operator), options)) in exclusion
+                .elements()
+                .zip(exclusion.operators())
+                .zip(exclusion.options())
+                .enumerate()
             {
                 if position != 0 {
                     let _ = rendered.write_str(", ");
@@ -15819,20 +15902,42 @@ pub fn constraint_def_text<'a>(
                     ),
                     crate::storage::ExclusionElement::Expression(text) => {
                         let source = arena.alloc_str(text).map_err(|_| arena_full())?;
-                        let expression = super::parser::parse_expr(source, arena)?;
+                        let expression = super::exec::expression_bindings::bind_table_expression(
+                            super::parser::parse_expr(source, arena)?,
+                            storage,
+                            &table,
+                            crate::storage::ExpressionOwner::ExclusionKey(
+                                exclusion.name,
+                                position as u8,
+                            ),
+                            txid,
+                            arena,
+                        )?;
                         let _ = rendered.write_str(index_expression_display(
                             storage, txid, &table, expression, source, pretty, arena,
                         )?);
                     }
                 }
-                let _ = write!(rendered, " WITH {}", operator.sql());
+                write_exclusion_key_options(&mut rendered, storage, txid, options);
+                let _ = write!(
+                    rendered,
+                    " WITH {}",
+                    exclusion_operator_name(storage, txid, *operator)?.as_str()
+                );
             }
             let _ = rendered.write_str(")");
             if let Some(predicate) = &exclusion.predicate {
                 let source = arena
                     .alloc_str(predicate.as_str())
                     .map_err(|_| arena_full())?;
-                let expression = super::parser::parse_expr(source, arena)?;
+                let expression = super::exec::expression_bindings::bind_table_expression(
+                    super::parser::parse_expr(source, arena)?,
+                    storage,
+                    &table,
+                    crate::storage::ExpressionOwner::ExclusionPredicate(exclusion.name),
+                    txid,
+                    arena,
+                )?;
                 let deparsed = deparse::deparse_expression(
                     &deparse::Context {
                         storage,
@@ -16219,6 +16324,62 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
     }
 }
 
+/// An exclusion element's collation, operator class and ordering as
+/// `pg_get_indexdef_worker` prints them: a collation other than the key's
+/// own, a class other than the type's default, then `DESC` and a nulls
+/// order other than the direction's default.
+fn write_exclusion_key_options(
+    out: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    options: &crate::storage::ExclusionKeyOptions,
+) {
+    use crate::storage::IndexOperatorClass;
+    if options.explicit_collation {
+        let _ = out.write_str(" COLLATE ");
+        write_identifier(out, options.collation.name());
+    }
+    match options.class {
+        Some(IndexOperatorClass::Catalog(oid)) => {
+            if let Some(slot) = storage.operator_class_slot_by_oid(oid, txid) {
+                let definition = storage.operator_class_for(slot, txid);
+                if !definition.default {
+                    let _ = out.write_char(' ');
+                    if !storage.schema_is_on_path(definition.schema, txid) {
+                        write_identifier(out, definition.schema.as_str());
+                        let _ = out.write_char('.');
+                    }
+                    write_identifier(out, definition.name.as_str());
+                }
+            }
+        }
+        Some(class) => {
+            let name = match class {
+                IndexOperatorClass::Btree(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Hash(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Gist(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::SpGist(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Brin(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Gin(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Catalog(_) => None,
+            };
+            if let Some(name) = name {
+                let _ = out.write_char(' ');
+                write_identifier(out, name);
+            }
+        }
+        None => {}
+    }
+    if options.descending {
+        let _ = out.write_str(" DESC");
+        if !options.nulls_first {
+            let _ = out.write_str(" NULLS LAST");
+        }
+    } else if options.nulls_first {
+        let _ = out.write_str(" NULLS FIRST");
+    }
+}
+
 /// The complete `CREATE INDEX` statement returned by `pg_get_indexdef`.
 fn write_index_key_metadata(
     out: &mut impl core::fmt::Write,
@@ -16246,6 +16407,9 @@ fn write_index_key_metadata(
     }
     let options = info.operator_class_options[position];
     let builtin_name = match info.operator_classes[position] {
+        Some(crate::storage::IndexOperatorClass::Btree(class)) if !class.is_default() => {
+            Some(class.name())
+        }
         Some(crate::storage::IndexOperatorClass::Hash(class))
             if !class.is_default() || !options.is_empty() =>
         {
@@ -18060,80 +18224,132 @@ fn pg_publication_namespace<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+/// `pg_publication_rel`'s class OID.
+pub(crate) const PG_PUBLICATION_REL_OID: i32 = 6106;
+
+/// One table a publication lists explicitly, as a `pg_publication_rel` row:
+/// its row identity, its publication and table, and its column list.
+#[derive(Clone, Copy)]
+pub(crate) struct PublicationRelation {
+    pub(crate) oid: i32,
+    pub(crate) publication_slot: usize,
+    pub(crate) publication_oid: i32,
+    /// The table's position in its publication's list.
+    pub(crate) position: usize,
+    pub(crate) table: usize,
+    pub(crate) columns: crate::storage::ColumnSet,
+}
+
+/// Visits every `pg_publication_rel` row in catalog order. The rows are
+/// numbered in this order, so it is the one source of their identities.
+pub(crate) fn visit_publication_relations(
+    storage: &Storage,
+    txid: u32,
+    visit: &mut dyn FnMut(PublicationRelation) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mut count = 0i32;
+    for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
+        let definition = publication.definition_for(txid);
+        if definition.all_tables {
+            continue;
+        }
+        for (position, (member, columns)) in definition.tables[..definition.table_count]
+            .iter()
+            .zip(&definition.table_column_masks[..definition.table_count])
+            .enumerate()
+        {
+            visit(PublicationRelation {
+                oid: FIRST_USER_OID + 90_000 + count,
+                publication_slot: slot,
+                publication_oid: publication.oid(),
+                position,
+                table: usize::from(*member),
+                columns: *columns,
+            })?;
+            count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The `pg_publication_rel` row with identity `oid`.
+pub(crate) fn publication_relation_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<PublicationRelation>, SqlError> {
+    let mut found = None;
+    visit_publication_relations(storage, txid, &mut |relation| {
+        if relation.oid == oid {
+            found = Some(relation);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn pg_publication_rel<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_publication_rel", false);
-    let row_capacity = storage
-        .publications_with_slots_visible_to(txid)
-        .map(|(_, publication)| {
-            let definition = publication.definition_for(txid);
-            if definition.all_tables {
-                0
-            } else {
-                definition.table_count
-            }
-        })
-        .sum();
+    let mut row_capacity = 0usize;
+    visit_publication_relations(storage, txid, &mut |_| {
+        row_capacity += 1;
+        Ok(())
+    })?;
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
-        let definition = publication.definition_for(txid);
-        if definition.all_tables {
-            continue;
+    visit_publication_relations(storage, txid, &mut |relation| {
+        let publication = storage
+            .publication_at(relation.publication_slot)
+            .definition_for(txid);
+        let filter = publication.table_filters.get(relation.position);
+        let prqual = if filter.is_empty() {
+            Datum::Null
+        } else {
+            let rendered = stack_format!(66, "({filter})");
+            text(rendered.as_str(), arena)?
+        };
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_publication_rel exceeds {} rows",
+                rows.len()
+            ));
         }
-        for (index, (member, column_mask)) in definition.tables[..definition.table_count]
-            .iter()
-            .zip(&definition.table_column_masks[..definition.table_count])
-            .enumerate()
-        {
-            let filter = definition.table_filters.get(index);
-            let prqual = if filter.is_empty() {
-                Datum::Null
-            } else {
-                let rendered = stack_format!(66, "({filter})");
-                text(rendered.as_str(), arena)?
-            };
-            if count == rows.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pg_publication_rel exceeds {} rows",
-                    rows.len()
-                ));
-            }
-            let prattrs = if column_mask.is_empty() {
-                Datum::Null
-            } else {
-                let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
-                let mut attribute_count = 0usize;
-                for column in 0..crate::storage::MAX_COLUMNS {
-                    if column_mask.contains(column) {
-                        attributes[attribute_count] = column as u16;
-                        attribute_count += 1;
-                    }
+        let prattrs = if relation.columns.is_empty() {
+            Datum::Null
+        } else {
+            let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
+            let mut attribute_count = 0usize;
+            for column in 0..crate::storage::MAX_COLUMNS {
+                if relation.columns.contains(column) {
+                    attributes[attribute_count] = column as u16;
+                    attribute_count += 1;
                 }
-                int2vector(
-                    &attributes[..attribute_count],
-                    Some(&storage.table_def(usize::from(*member), txid)),
-                    arena,
-                )?
-            };
-            rows[count] = row(
-                &[
-                    Datum::Int4(6106),
-                    Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
-                    Datum::Int4(publication.oid()),
-                    Datum::Int4(user_table_oid(storage, *member as usize)),
-                    prqual,
-                    prattrs,
-                ],
+            }
+            int2vector(
+                &attributes[..attribute_count],
+                Some(&storage.table_def(relation.table, txid)),
                 arena,
-            )?;
-            count += 1;
-        }
-    }
+            )?
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(PG_PUBLICATION_REL_OID),
+                Datum::Int4(relation.oid),
+                Datum::Int4(relation.publication_oid),
+                Datum::Int4(user_table_oid(storage, relation.table)),
+                prqual,
+                prattrs,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    })?;
     finish(definition, &rows[..count], arena)
 }
 
@@ -20749,23 +20965,12 @@ fn pg_constraint_values<'a>(
         let fk = storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
         let constraint_parent_oid =
             inherited_foreign_key_parent_oid(storage, txid, info.child_slot, &fk);
-        // conindid points at the parent's unique/PK index backing the referenced
-        // columns, which JDBC joins to for foreign-key metadata.
-        let conindid = indexes
-            .iter()
-            .find(|ix| {
-                ix.table_oid == info.confrelid
-                    && ix.is_unique
-                    && ix.predicate.is_none()
-                    && !ix.expression_keys[..ix.n_cols]
-                        .iter()
-                        .any(|expression| *expression)
-                    && ix.n_cols == fk.n_parent_cols
-                    && fk.parent_cols[..fk.n_parent_cols]
-                        .iter()
-                        .all(|column| ix.columns[..ix.n_cols].contains(column))
-            })
-            .map_or(0, |ix| ix.oid);
+        // conindid is the referenced table's unique index the key depends on.
+        let conindid = fk
+            .referenced_index
+            .identity()
+            .expect("admitted foreign key has a referenced index")
+            .oid();
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -22002,7 +22207,9 @@ fn index_collations<'a>(
     let mut values = [0_i32; crate::storage::MAX_INDEX_COLS];
     let table = storage.table_def(info.table_slot, txid);
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
-        let collation = if info.explicit_definition.is_some() {
+        // An explicit index and an exclusion constraint's index keep each
+        // key's collation.
+        let collation = if info.explicit_definition.is_some() || info.is_exclusion {
             info.collations[position]
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
@@ -22259,6 +22466,11 @@ fn pg_attribute<'a>(
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // `attinhcount` of each output row: how many direct parents, ordinary or
+    // partitioned, also have the column.
+    let inheritance_counts = arena
+        .alloc_slice_with(capacity, |_| 0i16)
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for attributes in builtin_rows.iter().filter(|attributes| {
         matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
@@ -22288,20 +22500,38 @@ fn pg_attribute<'a>(
                 slot: slot as u16,
             },
         };
+        let foreign_binding = storage.foreign_table(slot as u16, txid);
         for (i, c) in storage.table_def(slot, txid).columns().iter().enumerate() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
-            let foreign_column_options =
-                if let Some((_, binding)) = storage.foreign_table(slot as u16, txid) {
-                    let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
-                    for option in binding.column_options.options_for(i as u16) {
-                        options.restore_option(option.name.as_str(), option.value.as_str())?;
-                    }
-                    foreign_options_datum(&options, arena)?
-                } else {
-                    Datum::Null
-                };
+            let foreign_column_options = if let Some((_, binding)) = &foreign_binding {
+                let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+                for option in binding.column_options.options_for(i as u16) {
+                    options.restore_option(option.name.as_str(), option.value.as_str())?;
+                }
+                foreign_options_datum(&options, arena)?
+            } else {
+                Datum::Null
+            };
+            inheritance_counts[n] = table_definition
+                .inheritance
+                .parents_ref()
+                .iter()
+                .map(|parent| usize::from(*parent))
+                .chain(
+                    table_definition
+                        .partition
+                        .attachment
+                        .map(|attachment| usize::from(attachment.parent)),
+                )
+                .filter(|parent| {
+                    storage
+                        .table_def(*parent, txid)
+                        .column_index(c.name.as_str())
+                        .is_some()
+                })
+                .count() as i16;
             out[n] = row(
                 &[
                     Datum::Int4(user_table_oid(storage, slot)),
@@ -22357,7 +22587,7 @@ fn pg_attribute<'a>(
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i32::from(table_definition.attribute_number(i))),
                     text("i", arena)?,
-                    Datum::Bool(true),
+                    Datum::Bool(c.local),
                     column_statistics_options_datum(c.statistics_options, arena)?,
                     foreign_column_options,
                     Datum::Bool(false),
@@ -22449,6 +22679,7 @@ fn pg_attribute<'a>(
                 user_type: field.user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
             out[n] = row(
                 &[
@@ -22689,7 +22920,10 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    for target in &mut out[dynamic_start..n] {
+    for (target, inheritance_count) in out[dynamic_start..n]
+        .iter_mut()
+        .zip(&inheritance_counts[dynamic_start..n])
+    {
         let source = *target;
         let smallint = |value: Datum<'a>| match value {
             Datum::Int4(value) => i16::try_from(value).map(Datum::Int2).map_err(|_| {
@@ -22761,7 +22995,7 @@ fn pg_attribute<'a>(
                 character(source[10])?,
                 source[14],
                 source[17],
-                Datum::Int2(0),
+                Datum::Int2(*inheritance_count),
                 source[8],
                 smallint(source[13])?,
                 source[22],
@@ -29764,6 +29998,7 @@ fn info_column_type_usage<'a>(
                 user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
             append(
                 view.schema_for(txid).as_str(),

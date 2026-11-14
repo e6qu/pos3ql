@@ -88,6 +88,9 @@ struct RowResume {
     returning: Option<transition_rows::SavedTransitionRows>,
     /// Statement-wide row state the write keeps besides its counters.
     state: Option<transition_rows::SavedTransitionRows>,
+    /// A PL/pgSQL `INTO` destination's count of returned rows and its first
+    /// row, from the attempts before this one.
+    into_rows: Option<transition_rows::SavedTransitionRows>,
     /// A selection of foreign rows. The remote session keeps the earlier
     /// rows' changes, so selecting them again would find their new versions
     /// or miss them; the next attempt continues with these rows instead.
@@ -165,6 +168,13 @@ pub(super) struct SavedReturning<'a> {
     pub(super) new: Option<&'a [Datum<'a>]>,
     /// The joined row of `UPDATE ... FROM` or `DELETE ... USING`.
     pub(super) joined: Option<&'a [Datum<'a>]>,
+}
+
+/// What a PL/pgSQL `INTO` destination received in the attempts before an
+/// interrupted write's next one: its returned-row count and first row.
+pub(super) struct ResumedIntoRows<'a> {
+    pub(super) rows: u64,
+    pub(super) first: Option<&'a [Datum<'a>]>,
 }
 
 /// The unfinished row and how to roll it back, handed to the caller.
@@ -664,6 +674,7 @@ impl RowProgress {
     /// [`Self::finish_step`] at a claimed `level`.
     pub(crate) fn finish_step_at(&mut self, level: usize) -> Result<(), SqlError> {
         let end = ReplayPoint::capture()?;
+        query::forget_initplans();
         let steps = &mut self.steps[level];
         steps.finished += 1;
         steps.start = None;
@@ -1000,6 +1011,92 @@ impl RowProgress {
         Ok(())
     }
 
+    /// Keeps a PL/pgSQL `INTO` destination's returned-row count and first
+    /// row with the interrupted row, so the next attempt's destination
+    /// continues with the rows the earlier attempts returned. Without an
+    /// interrupted row the write will not continue, and nothing is kept.
+    pub(super) fn keep_into_rows(
+        &mut self,
+        rows: u64,
+        first: Option<&[Datum<'_>]>,
+        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        let Some(resume) = self.resume.as_mut() else {
+            return Ok(());
+        };
+        let count = i64::try_from(rows).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL INTO row count exceeds bigint"
+            )
+        })?;
+        let mark = arena.mark();
+        let saved = (|| {
+            let count = encode_projected_pub(&[Datum::Int8(count)], arena)?;
+            let first = first
+                .map(|values| encode_projected_pub(values, arena))
+                .transpose()?;
+            transition_rows::SavedTransitionRows::capture(
+                TransitionRows {
+                    old: first.as_slice(),
+                    new: core::slice::from_ref(&count),
+                },
+                pool,
+            )
+        })();
+        // SAFETY: the encoded rows were copied into the saved owner.
+        unsafe { arena.rewind_to(mark) };
+        resume.into_rows = Some(saved?);
+        Ok(())
+    }
+
+    /// The returned-row count and first row a PL/pgSQL `INTO` destination
+    /// kept with the interrupted row this attempt continues, decoded in
+    /// `arena`.
+    pub(super) fn resumed_into_rows<'out>(
+        &self,
+        arena: &'out Arena,
+    ) -> Result<Option<ResumedIntoRows<'out>>, SqlError> {
+        let Some(saved) = self
+            .resume
+            .as_ref()
+            .and_then(|resume| resume.into_rows.as_ref())
+        else {
+            return Ok(None);
+        };
+        let lost = || {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed write lost its INTO rows"
+            )
+        };
+        let rows = saved.restore(arena)?;
+        let count = match rows.new.first() {
+            Some(row) => match decode_projected_col_record(row, 0, arena)? {
+                Datum::Int8(count) => u64::try_from(count).map_err(|_| lost())?,
+                _ => return Err(lost()),
+            },
+            None => return Err(lost()),
+        };
+        let first = match rows.old.first() {
+            Some(row) => {
+                let row = arena
+                    .alloc_slice_copy(row)
+                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                let width = projected::decode_projected_row_into(row, arena, &mut values)?;
+                Some(
+                    &*arena
+                        .alloc_slice_copy(&values[..width])
+                        .map_err(|_| crate::sql::query::arena_full_pub())?,
+                )
+            }
+            None => None,
+        };
+        Ok(Some(ResumedIntoRows { rows: count, first }))
+    }
+
     /// The row state an interrupted attempt kept, decoded in `arena`.
     pub(super) fn resumed_state<'out>(
         &'out self,
@@ -1278,6 +1375,7 @@ impl RowProgress {
             transitions,
             returning,
             state: self.state.take(),
+            into_rows: None,
             selection: kept_selection,
         });
         Ok(())

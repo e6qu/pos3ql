@@ -136,7 +136,7 @@ they add no callable functions.
 
 | Workflow | File | Gates |
 |---|---|---|
-| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 12 library shards (`tools/test-lib-shard.sh N-of-12`); native build, test (call contracts and boundaries in separate jobs) and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `sql-exec`, `storage`, `storage-definitions`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
+| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, fixture-number, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 12 library shards (`tools/test-lib-shard.sh N-of-12`); native build, test (call contracts and boundaries in separate jobs) and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `sql-exec`, `storage`, `storage-definitions`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
 | Differential | `differential.yml` | One release binary, then sharded PostgreSQL comparisons, vendored SQLLogicTest and regression slices, generated queries and external execution paths (`tests/external/ci_diff.sh`) |
 | Drivers | `drivers.yml` | pgJDBC, pgx, node-postgres, psycopg2, and SQLAlchemy/Alembic with both psycopg2 and psycopg 3, against PostgreSQL and pos3ql (`tests/external/ci_drivers.sh`) |
 | coverage | `coverage.yml` | Instrumented library and external shards (`tools/coverage.sh`), crash torture, merged 70% line floor (`tools/coverage-merge.py 70`) |

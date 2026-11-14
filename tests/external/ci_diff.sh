@@ -683,6 +683,31 @@ if diff -u <(grep -Ev '^LOCATION:' "$WORK/foreign_cache_reference.out") \
 else
   bad "postgres_fdw connection cache, cursors, INSERT text and batches"
 fi
+# postgres_fdw's pushed-down scans, direct and row-by-row UPDATE/DELETE,
+# their EXPLAIN VERBOSE plans and COMMIT PREPARED invalidation, against
+# PostgreSQL's own loopback. The script's second client (`\!`) reaches the
+# side under test through PGHOST/PGPORT.
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -f "$EXT/foreign-pushdown-remote.sql" > "$WORK/foreign_pushdown_setup_$side.out" 2>&1 \
+    || echo "remote setup failed" >> "$WORK/foreign_pushdown_$side.out"
+  PGHOST=$host PGPORT=$port psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X \
+    -v VERBOSITY=verbose -v fdw_host="$PGHOST" -v fdw_port="$PGPORT" -v fdw_user="$PGUSER" \
+    -f "$EXT/foreign-pushdown.sql" >> "$WORK/foreign_pushdown_$side.out" 2>&1
+done
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q \
+  -c 'DROP SCHEMA fdw_push_remote CASCADE' > /dev/null 2>&1
+if diff -u <(grep -Ev '^LOCATION:' "$WORK/foreign_pushdown_reference.out") \
+           <(grep -Ev '^LOCATION:' "$WORK/foreign_pushdown_pos3ql.out") \
+  && grep -q 'Remote SQL: UPDATE fdw_push_remote.t SET q = (q + 1) WHERE ((id = 3))' \
+       "$WORK/foreign_pushdown_pos3ql.out" \
+  && grep -q '^ fdw_prepared$' "$WORK/foreign_pushdown_pos3ql.out" \
+  && ! grep -q 'remote setup failed' "$WORK/foreign_pushdown_reference.out"; then
+  ok "postgres_fdw pushdown, direct modification and EXPLAIN VERBOSE match PostgreSQL"
+else
+  bad "postgres_fdw pushdown, direct modification and EXPLAIN VERBOSE"
+fi
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
   -v ON_ERROR_STOP=1 -f "$EXT/foreign-procedural-subtransactions.sql" \
   > "$WORK/foreign_subtransaction_reference.out" 2>&1

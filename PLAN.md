@@ -831,30 +831,28 @@ marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
 postgres_fdw's connection cache, `postgres_fdw_get_connections`,
 `postgres_fdw_disconnect(_all)`, `keep_connections`, invalidation on server and
-user-mapping changes, cursor scans (`DECLARE cN CURSOR FOR`, `FETCH fetch_size
-FROM cN`, `CLOSE cN`), its INSERT text (only the `RETURNING` columns a local
-`RETURNING` list, `AFTER ROW` trigger or `WITH CHECK OPTION` reads, counted by
-the command tag) and `batch_size` INSERTs match PostgreSQL's loopback in
-`tests/external/foreign-connection-cache.sql`. Remaining differences: a scan
-reads every column and ships no `WHERE`, `ORDER BY`, `LIMIT`, join or
-aggregate (postgres_fdw sends `SELECT id, q FROM s.t ORDER BY id ASC NULLS
-LAST` for an ordered scan), and materializes the rows before the plan reads
-them. UPDATE and DELETE are never sent as one remote statement, and their
-per-row commands differ (`WHERE ctid = $N::tid RETURNING` every column, where
-postgres_fdw writes `WHERE ctid = $1` and returns only needed columns). COPY
-FROM into a foreign table sends one row at a time, ignoring `batch_size`. A
-batched INSERT also sends its queued rows when the statement pauses for a
-PL/pgSQL call or a full output buffer, which PostgreSQL does not. A server
-or user-mapping change committed by `COMMIT PREPARED` does not invalidate
-other clients' cached connections; a plain `COMMIT` does. libpq options
-beyond host, hostaddr, port, dbname, user, password, connect_timeout,
-application_name and sslmode fail with `HV00D`. EXPLAIN shows a foreign
-table's scan as `Seq Scan` without postgres_fdw's `Foreign Scan`, `Foreign
-Update`/`Foreign Delete`, `Remote SQL:` and `Batch Size:` lines; matching them
-needs postgres_fdw's deparser (`deparse.c`: shippable built-in expressions
-per `is_foreign_expr`, `ORDER BY ... NULLS FIRST/LAST`, `LIMIT n::bigint`)
-in the planner, which also enables pushing quals, order and limits and
-direct modification. `CREATE
+user-mapping changes (committed by `COMMIT` or `COMMIT PREPARED`), cursor scans
+(`DECLARE cN CURSOR FOR`, `FETCH fetch_size FROM cN`, `CLOSE cN`), its INSERT
+text and `batch_size` INSERTs match PostgreSQL's loopback in
+`tests/external/foreign-connection-cache.sql`. A query of one foreign table
+ships its needed columns, the conditions `is_foreign_expr` accepts (built-in
+immutable operators and functions over modeled built-in types, constants and
+`IN` lists, ordered as `order_qual_clauses` orders them), its `ORDER BY` when
+every key is a table column, and `LIMIT`/`OFFSET` when nothing stays local;
+direct `UPDATE`/`DELETE` and the row-by-row `WHERE ctid = $1` commands match,
+with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
+and `differential_exact/504`. Remaining differences: joins, aggregates,
+`DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
+`COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
+with `RETURNING` runs row by row; an `UPDATE` sends no stored generated column
+values; a select list or `ORDER BY` with a subquery reads every column. A scan
+still reads all its rows before the plan consumes them (the cursor's `FETCH`
+batches are not streamed). COPY FROM into a foreign table sends one row at a
+time, ignoring `batch_size`. A batched INSERT also sends its queued rows when
+the statement pauses for a PL/pgSQL call or a full output buffer, which
+PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,
+password, connect_timeout, application_name and sslmode fail with `HV00D`.
+`CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per
@@ -862,8 +860,8 @@ referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
 detached and dropped; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
-clones (`54000`). `CREATE TABLE ... PARTITION OF parent (...)` with column
-options or table constraints fails with `42601`. A btree index may use
+clones (`54000`). `pg_get_partition_constraintdef(oid)`, which psql's `\d+`
+calls for a partition, fails with `0A000`. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

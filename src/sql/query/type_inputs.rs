@@ -281,13 +281,37 @@ fn discover_defaults(
         _ => None,
     };
     if let Some(table) = table {
+        // A partition's column options keep the parent column's type.
+        let parent = match table.partition {
+            ast::PartitionClause::Of { parent, .. } => {
+                match storage.resolve_relation(parent.schema, parent.name, txid) {
+                    Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         for column in table.columns {
             let Some(source) = column.default_text else {
                 continue;
             };
-            let target = crate::sql::exec::resolve_routine_type(storage, txid, column.type_name)?;
+            let (ctype, user_type, type_mod) = if column.type_name.is_empty() {
+                // An unknown parent or column fails when the table is made.
+                let Some(parent) = parent.map(|slot| storage.table_def(slot, txid)) else {
+                    continue;
+                };
+                let Some(index) = parent.column_index(column.name) else {
+                    continue;
+                };
+                let meta = &parent.columns()[index];
+                (meta.ctype, meta.user_type, meta.type_mod)
+            } else {
+                let target =
+                    crate::sql::exec::resolve_routine_type(storage, txid, column.type_name)?;
+                (target.ctype, target.user_type, column.type_mod)
+            };
             let target = storage
-                .routine_type_oid(target.ctype, target.user_type, txid)
+                .routine_type_oid(ctype, user_type, txid)
                 .ok_or_else(|| {
                     sql_err!(
                         super::sqlstate::UNDEFINED_OBJECT,
@@ -295,14 +319,7 @@ fn discover_defaults(
                     )
                 })?;
             discover_default_source(
-                parser,
-                source,
-                target,
-                column.type_mod,
-                storage,
-                txid,
-                arena,
-                visit,
+                parser, source, target, type_mod, storage, txid, arena, visit,
             )?;
         }
         return Ok(());

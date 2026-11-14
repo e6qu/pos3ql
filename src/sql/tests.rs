@@ -93680,6 +93680,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
             },
             None,
             crate::sql::exec::DmlSelection::Qualified,
+            None,
         )
     })
     .unwrap();

@@ -9145,6 +9145,7 @@ fn scan_source_mode<'a>(
                             txid,
                             arena,
                             hooks.sequences,
+                            None,
                         )?;
                         for bytes in rows {
                             let mut values = [Datum::Null; MAX_COLUMNS];

@@ -12906,10 +12906,27 @@ pub(crate) fn select_query_resumable<'a>(
             );
         }
     }
+    // A query of one foreign table sends its shippable conditions, order and
+    // limit to the server; the rest runs here over the rows it returns.
+    let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {
+        Ok(pushed) => pushed,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = match &pushed {
+        Some(plan) => match plan.local_statement(statement, arena) {
+            Ok(local) => local,
+            Err(error) => return sql_fail(error),
+        },
+        None => statement,
+    };
+    let from = statement
+        .from
+        .as_ref()
+        .expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec(
+    let scope = match QueryScope::resolve_exec_pushed(
         storage,
         from,
         statement.where_clause,
@@ -12917,6 +12934,8 @@ pub(crate) fn select_query_resumable<'a>(
         arena,
         params,
         seq,
+        None,
+        pushed.as_ref(),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),

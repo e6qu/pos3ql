@@ -1300,7 +1300,21 @@ of open connections across all clients is fixed by `max_foreign_sessions`
 full`. Scans read through a cursor `fetch_size` rows (default 100) at a time,
 and an INSERT on a table with `batch_size` sends its rows in multi-row remote
 INSERTs, each batch's values limited to `foreign_send_bytes` (`54000` beyond
-it). A `LANGUAGE C` function
+it).
+
+A query that reads one foreign table sends the server the work postgres_fdw
+would: only the columns it needs, the `WHERE` conditions built from built-in
+immutable operators and functions over the table's columns and constants, and
+the `ORDER BY` and `LIMIT`/`OFFSET` when they can apply there. For example,
+`SELECT id FROM remote_orders WHERE total > 50 AND random() < 0.5 ORDER BY id`
+sends `SELECT id, total FROM sales.orders WHERE ((total > 50)) ORDER BY id ASC
+NULLS LAST` and checks `random() < 0.5` locally; `EXPLAIN VERBOSE` shows it as
+a `Foreign Scan` with that `Remote SQL`. An `UPDATE` or `DELETE` whose
+conditions and new values all ship, on a table without triggers, runs as one
+remote statement (`Foreign Update`/`Foreign Delete`); otherwise its rows are
+read `FOR UPDATE` and each is changed with `... WHERE ctid = $1`. Joins and
+aggregates are not sent to the server, and an `UPDATE` or `DELETE` with
+`RETURNING` is always changed row by row. A `LANGUAGE C` function
 of any other library fails with `0A000`; an unknown symbol of
 `$libdir/postgres_fdw` fails with `42883`. Other packages in PostgreSQL's
 `$system` directory are not available.

@@ -629,7 +629,11 @@ clones (`54000`). Attaching a partition that already has an equivalent
 foreign key under another name adds the parent's copy beside it, where
 PostgreSQL adopts the existing key (`tryAttachPartitionForeignKey`), and a
 key's insert and update check triggers take OIDs before its clones' action
-triggers, where PostgreSQL creates them after. `ALTER COLUMN ... TYPE` on a partitioned table keeps
+triggers, where PostgreSQL creates them after: a key's four trigger OIDs
+derive from its one constraint identity, so the check triggers need their own
+identity, allocated after the clones, which changes the stored key layout.
+Adopting a key needs a durable link from a partition's key to its parent's
+in place of matching by name. `ALTER COLUMN ... TYPE` on a partitioned table keeps
 each partition's index name where PostgreSQL rebuilds them under new
 generated names (`pr_1_label_idx` after a rename). A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which

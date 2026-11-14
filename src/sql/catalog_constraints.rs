@@ -952,6 +952,27 @@ pub(super) fn dependencies<'a>(
                     b'n',
                 )?;
             }
+            // A partition's clone goes with the parent's key or with the
+            // partition (`ConstraintSetParentConstraint`).
+            let parent = integer(values[parent_constraint])?;
+            if parent != 0 {
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CONSTRAINT_OID,
+                    parent,
+                    0,
+                    b'P',
+                )?;
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CLASS_OID,
+                    table,
+                    0,
+                    b'S',
+                )?;
+            }
         }
     }
     for index in indexes {

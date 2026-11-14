@@ -2170,11 +2170,35 @@ impl CheckConstraint {
     };
 }
 
+/// The unique index of the referenced table a foreign key depends on
+/// (PostgreSQL's `conindid`), chosen when the key is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferencedIndex {
+    /// The table's own primary key, created by the same statement: chosen
+    /// once the statement's new keys have their identities.
+    PendingPrimaryKey,
+    /// The oldest immediate unique key over the referenced columns among
+    /// those the same statement creates on the table, chosen likewise.
+    PendingKey,
+    /// The index's relation identity.
+    Index(RelationIdentity),
+}
+
+impl ReferencedIndex {
+    pub(crate) const fn identity(self) -> Option<RelationIdentity> {
+        match self {
+            Self::Index(identity) => Some(identity),
+            Self::PendingPrimaryKey | Self::PendingKey => None,
+        }
+    }
+}
+
 /// A FOREIGN KEY constraint on a child table's column tuple referencing a
 /// parent table's column tuple.
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
     pub(crate) identity: Option<ConstraintIdentity>,
+    pub(crate) referenced_index: ReferencedIndex,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -2201,6 +2225,7 @@ pub struct ForeignKey {
 impl ForeignKey {
     pub const EMPTY: Self = ForeignKey {
         identity: None,
+        referenced_index: ReferencedIndex::PendingKey,
         name: SqlName::EMPTY,
         parent_schema: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],

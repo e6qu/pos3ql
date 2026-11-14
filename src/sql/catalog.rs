@@ -15612,6 +15612,8 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, parent.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(")");
+        // ruleutils.c spells ON UPDATE before ON DELETE and its column list.
+        let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
         if !fk.delete_set_cols().is_empty() {
             let _ = s.write_str(" (");
@@ -15623,7 +15625,6 @@ pub fn constraint_def_text<'a>(
             }
             let _ = s.write_char(')');
         }
-        let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
             &s,
@@ -20723,23 +20724,12 @@ fn pg_constraint_values<'a>(
         let fk = storage.table_def(info.child_slot, txid).fkeys()[info.fk_index];
         let constraint_parent_oid =
             inherited_foreign_key_parent_oid(storage, txid, info.child_slot, &fk);
-        // conindid points at the parent's unique/PK index backing the referenced
-        // columns, which JDBC joins to for foreign-key metadata.
-        let conindid = indexes
-            .iter()
-            .find(|ix| {
-                ix.table_oid == info.confrelid
-                    && ix.is_unique
-                    && ix.predicate.is_none()
-                    && !ix.expression_keys[..ix.n_cols]
-                        .iter()
-                        .any(|expression| *expression)
-                    && ix.n_cols == fk.n_parent_cols
-                    && fk.parent_cols[..fk.n_parent_cols]
-                        .iter()
-                        .all(|column| ix.columns[..ix.n_cols].contains(column))
-            })
-            .map_or(0, |ix| ix.oid);
+        // conindid is the referenced table's unique index the key depends on.
+        let conindid = fk
+            .referenced_index
+            .identity()
+            .expect("admitted foreign key has a referenced index")
+            .oid();
         out[n] = row(
             &[
                 Datum::Int4(info.oid),

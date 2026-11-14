@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v41` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v42` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -121,7 +121,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 21: version byte, ten-byte catalog
+- **Table definition payload** is version 22: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
   column carries a generation-kind byte after its NOT NULL inheritance byte
   (0, or the `attgenerated` code `s` or `v`), which must agree with the
@@ -130,8 +130,10 @@ Other payload rules:
   update-action, insert-check and update-check RI triggers, then a one-byte
   count and the two-byte column positions its `ON DELETE SET NULL (...)` or
   `SET DEFAULT (...)` list changes (PostgreSQL's `confdelsetcols`; zero means
-  every key column). The manifest's `fkey` line carries the same four codes,
-  count and positions after the validation code. Each exclusion constraint
+  every key column), then the four-byte creation stamp of the referenced
+  table's unique index the key depends on (PostgreSQL's `conindid`; zero is
+  rejected). The manifest's `fkey` line carries the same four codes, count,
+  positions and stamp after the validation code. Each exclusion constraint
   element is a tag byte, `0` with a two-byte column position or `1` with a
   two-byte length and that many bytes of canonical UTF-8 expression text,
   then the four-byte operator OID. An unknown tag, invalid UTF-8, a span past

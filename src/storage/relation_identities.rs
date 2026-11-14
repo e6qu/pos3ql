@@ -65,6 +65,33 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
             .chain(self.has_toast.then_some(self.toast_index_identity))
     }
 
+    /// Visits each primary key and unique constraint's index: its identity
+    /// (none until reserved), key columns, whether it is checked
+    /// immediately, and whether it is the primary key.
+    pub(crate) fn for_each_key_index(
+        &self,
+        mut visit: impl FnMut(Option<RelationIdentity>, &[u16], bool, bool),
+    ) {
+        for (column, metadata) in self.columns().iter().enumerate() {
+            if metadata.primary || metadata.unique {
+                visit(
+                    self.column_index_identity(column),
+                    &[column as u16],
+                    true,
+                    metadata.primary,
+                );
+            }
+        }
+        for key in self.uniques() {
+            visit(
+                key.index_identity,
+                key.columns(),
+                !key.timing.is_deferrable(),
+                key.kind.is_primary(),
+            );
+        }
+    }
+
     pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
         self.columns()
             .iter()
@@ -205,6 +232,7 @@ impl Storage {
                 );
             }
         }
+        Self::resolve_pending_referenced_indexes(definition)?;
         // A dropped or recreated key takes its CLUSTER and replica identity
         // marks with it, as dropping an index clears them in PostgreSQL.
         let mut marks = definition.key_index_marks;
@@ -218,6 +246,58 @@ impl Storage {
             }
         }
         definition.key_index_marks = marks;
+        Ok(())
+    }
+
+    /// A foreign key referencing a key its own statement creates on the
+    /// same table depends on that key's index, now that it has an identity:
+    /// the primary key, or the oldest immediate unique key over exactly the
+    /// referenced columns (PostgreSQL's `transformFkeyCheckAttrs`).
+    fn resolve_pending_referenced_indexes(
+        definition: &mut super::TableDefBuilder,
+    ) -> Result<(), SqlError> {
+        for position in 0..definition.n_fkeys {
+            let foreign_key = definition.fkeys[position];
+            let primary = match foreign_key.referenced_index {
+                super::ReferencedIndex::Index(_) => continue,
+                super::ReferencedIndex::PendingPrimaryKey => true,
+                super::ReferencedIndex::PendingKey => false,
+            };
+            if foreign_key.parent_schema != definition.schema
+                || foreign_key.parent != definition.name
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign key \"{}\" has no referenced index",
+                    foreign_key.name.as_str()
+                ));
+            }
+            let referenced = foreign_key.parent_cols();
+            let mut chosen: Option<RelationIdentity> = None;
+            definition.for_each_key_index(|identity, columns, immediate, is_primary| {
+                let matches = if primary {
+                    is_primary
+                } else {
+                    immediate
+                        && columns.len() == referenced.len()
+                        && referenced.iter().all(|column| columns.contains(column))
+                };
+                if matches
+                    && let Some(identity) = identity
+                    && chosen.is_none_or(|best| identity.created_at() < best.created_at())
+                {
+                    chosen = Some(identity);
+                }
+            });
+            let chosen = chosen.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign key \"{}\" has no referenced index",
+                    foreign_key.name.as_str()
+                )
+            })?;
+            definition.fkeys[position].referenced_index = super::ReferencedIndex::Index(chosen);
+        }
         Ok(())
     }
 
@@ -251,6 +331,17 @@ impl Storage {
                     "saved implicit index creation identity is duplicated"
                 ));
             }
+        }
+        if let Some(foreign_key) = definition
+            .fkeys()
+            .iter()
+            .find(|foreign_key| foreign_key.referenced_index.identity().is_none())
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "saved foreign key \"{}\" has no referenced index",
+                foreign_key.name.as_str()
+            ));
         }
         for identity in definition.table_index_identities().flatten() {
             self.catalog_sequence.observe(identity.created_at());

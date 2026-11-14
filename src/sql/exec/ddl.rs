@@ -2451,9 +2451,13 @@ fn attach_fkey(
             n_delete_set += 1;
         }
     }
-    // Referenced columns default to the parent's primary key.
+    // Referenced columns default to the parent's primary key; otherwise a
+    // unique index over exactly the named columns must back them. Both are
+    // settled before privileges and the column counts are checked, as in
+    // PostgreSQL's `ATAddForeignKeyConstraint`.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
     let n_parent;
+    let mut primary_index = crate::storage::ReferencedIndex::PendingPrimaryKey;
     if parent_cols.is_empty() {
         let (pk, pk_n) = primary_key_cols(&parent_def);
         if pk_n == 0 {
@@ -2474,17 +2478,48 @@ fn attach_fkey(
         for (i, &column_index) in pk[..pk_n].iter().enumerate() {
             pcol_names[i] = parent_def.columns()[column_index as usize].name.as_str();
         }
+        let mut primary = None;
+        parent_def.for_each_key_index(|identity, _, _, is_primary| {
+            if is_primary {
+                primary = Some(identity);
+            }
+        });
+        if let Some(identity) = primary.flatten() {
+            primary_index = crate::storage::ReferencedIndex::Index(identity);
+        }
     } else {
         n_parent = parent_cols.len();
         pcol_names[..n_parent].copy_from_slice(parent_cols);
     }
-    if n_parent != n_child {
-        return Err(sql_err!(
-            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
-            "number of referencing and referenced columns for foreign key disagree"
-        ));
-    }
     let (parent_idxs, _) = resolve_foreign_key_cols(&parent_def, &pcol_names[..n_parent])?;
+    let referenced_index = if parent_cols.is_empty() {
+        primary_index
+    } else {
+        let referenced = &parent_idxs[..n_parent];
+        if (1..n_parent).any(|i| referenced[..i].contains(&referenced[i])) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
+                "foreign key referenced-columns list must not contain duplicates"
+            ));
+        }
+        match referenced_key(storage, txid, &parent_def, referenced) {
+            ReferencedKey::Usable(index) => index,
+            ReferencedKey::Deferrable => {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot use a deferrable unique constraint for referenced table \"{}\"",
+                    parent.name
+                ));
+            }
+            ReferencedKey::Missing => {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
+                    "there is no unique constraint matching given keys for referenced table \"{}\"",
+                    parent.name
+                ));
+            }
+        }
+    };
     if !self_ref {
         let parent_slot = resolved.expect("non-self foreign key resolved above");
         storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
@@ -2518,25 +2553,11 @@ fn attach_fkey(
             ));
         }
     }
-
-    // The referenced columns must be a unique key of the parent (PG 42830)
-    // that is checked immediately.
-    match referenced_key(&parent_def, &parent_idxs[..n_parent]) {
-        ReferencedKey::Usable => {}
-        ReferencedKey::Deferrable => {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "cannot use a deferrable unique constraint for referenced table \"{}\"",
-                parent.name
-            ));
-        }
-        ReferencedKey::Missing => {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
-                "there is no unique constraint matching given keys for referenced table \"{}\"",
-                parent.name
-            ));
-        }
+    if n_parent != n_child {
+        return Err(sql_err!(
+            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
+            "number of referencing and referenced columns for foreign key disagree"
+        ));
     }
     let fname = match name {
         Some(n) => SqlName::parse(n)?,
@@ -2576,6 +2597,7 @@ fn attach_fkey(
     fk.on_update = fk_action_of(on_update);
     fk.timing = storage_timing(timing);
     fk.validation = storage_validation(validation);
+    fk.referenced_index = referenced_index;
     def.fkeys[def.n_fkeys] = fk;
     def.n_fkeys += 1;
     Ok(())
@@ -2727,66 +2749,68 @@ pub(super) fn primary_key_cols<Definition0: crate::storage::DefinitionBacking>(
     (out, n)
 }
 
-/// Whether `columns` (as a set) exactly matches some unique key of the table: a
-/// single UNIQUE/PRIMARY column flag, or a multi-column key constraint.
-pub(super) fn references_named_key<Definition0: crate::storage::DefinitionBacking>(
-    def: &crate::storage::TableDefinition<Definition0>,
-    name: &str,
-    columns: &[u16],
-) -> bool {
-    if columns.len() == 1 {
-        let column = usize::from(columns[0]);
-        let metadata = &def.columns()[column];
-        if metadata.primary || metadata.unique {
-            return def
-                .column_key_name(column)
-                .is_some_and(|stored| stored.as_str() == name);
-        }
-    }
-    def.uniques()
-        .iter()
-        .find(|uk| {
-            !uk.timing.is_deferrable() && uk.n_cols == columns.len() && {
-                let key_columns = uk.columns();
-                columns.iter().all(|c| key_columns.contains(c))
-                    && key_columns.iter().all(|c| columns.contains(c))
-            }
-        })
-        .is_some_and(|key| key.name.as_str() == name)
-}
-
 /// Whether a set of columns is a unique key a foreign key can reference.
 enum ReferencedKey {
-    Usable,
+    Usable(crate::storage::ReferencedIndex),
     /// Only a deferrable unique key matches; PostgreSQL rejects it.
     Deferrable,
     Missing,
 }
 
+/// PostgreSQL's `transformFkeyCheckAttrs`: the oldest valid, immediate,
+/// unique, non-partial index without expressions whose key columns are
+/// exactly `columns` in any order, whether it backs a constraint or not. A
+/// key the statement itself adds (to the table it creates or alters) is
+/// newer than every existing index and is chosen once it has an identity.
 fn referenced_key<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     def: &crate::storage::TableDefinition<Definition0>,
     columns: &[u16],
 ) -> ReferencedKey {
-    if columns.len() == 1 {
-        let c = &def.columns()[columns[0] as usize];
-        if c.unique || c.primary {
-            return ReferencedKey::Usable;
-        }
-    }
-    let mut found = ReferencedKey::Missing;
-    for key in def.uniques() {
-        let keyed = key.columns();
-        if key.n_cols == columns.len()
-            && columns.iter().all(|c| keyed.contains(c))
-            && keyed.iter().all(|c| columns.contains(c))
-        {
-            if !key.timing.is_deferrable() {
-                return ReferencedKey::Usable;
+    let same = |key: &[u16]| key.len() == columns.len() && columns.iter().all(|c| key.contains(c));
+    let mut oldest: Option<crate::storage::RelationIdentity> = None;
+    let mut pending = false;
+    let mut deferrable = false;
+    let mut consider = |identity: Option<crate::storage::RelationIdentity>, immediate: bool| {
+        if !immediate {
+            deferrable = true;
+        } else if let Some(identity) = identity {
+            if oldest.is_none_or(|best| identity.created_at() < best.created_at()) {
+                oldest = Some(identity);
             }
-            found = ReferencedKey::Deferrable;
+        } else {
+            pending = true;
+        }
+    };
+    def.for_each_key_index(|identity, key, immediate, _| {
+        if same(key) {
+            consider(identity, immediate);
+        }
+    });
+    for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        let index = index.definition_for(txid);
+        let mutable = index.mutable_for(txid);
+        if index.unique
+            && mutable.kind.valid()
+            && index.predicate.is_none()
+            && index.expressions[..index.n_cols]
+                .iter()
+                .all(Option::is_none)
+            && same(&index.columns[..index.n_cols])
+        {
+            consider(
+                crate::storage::RelationIdentity::parse(index.created_at),
+                mutable.immediate,
+            );
         }
     }
-    found
+    match oldest {
+        Some(identity) => ReferencedKey::Usable(crate::storage::ReferencedIndex::Index(identity)),
+        None if pending => ReferencedKey::Usable(crate::storage::ReferencedIndex::PendingKey),
+        None if deferrable => ReferencedKey::Deferrable,
+        None => ReferencedKey::Missing,
+    }
 }
 
 fn primary_key_is_deferrable<Definition0: crate::storage::DefinitionBacking>(

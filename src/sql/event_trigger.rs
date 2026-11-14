@@ -129,7 +129,7 @@ pub(crate) fn capture_before<'a>(
                         .column_index(name)
                         .is_some_and(|column| foreign_key.parent_cols().contains(&(column as u16))),
                     crate::sql::ast::AlterAction::DropConstraint { name, .. } => {
-                        foreign_key_references_named_key(&parent, name, foreign_key.parent_cols())
+                        foreign_key_depends_on_named_key(&parent, name, foreign_key)
                     }
                     _ => false,
                 })
@@ -1653,28 +1653,17 @@ fn index_object<Definition0: crate::storage::DefinitionBacking>(
     ))
 }
 
-fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacking>(
+/// Whether `foreign_key` depends on the index of `table`'s key `name`.
+fn foreign_key_depends_on_named_key<Definition0: crate::storage::DefinitionBacking>(
     table: &crate::storage::TableDefinition<Definition0>,
     name: &str,
-    parent_columns: &[u16],
+    foreign_key: &crate::storage::ForeignKey,
 ) -> bool {
-    if let Some(key) = table.uniques().iter().find(|key| key.name.as_str() == name) {
-        return key.columns() == parent_columns;
-    }
-    for (index, column) in table.columns().iter().enumerate() {
-        let generated = (column.primary || column.unique).then(|| {
-            table
-                .column_key_name(index)
-                .expect("admitted inline key has a name")
-        });
-        if generated
-            .as_ref()
-            .is_some_and(|generated| generated.as_str() == name)
-        {
-            return parent_columns == [index as u16];
-        }
-    }
-    false
+    table
+        .backing_index_names()
+        .find(|(key, _)| key.as_str() == name)
+        .and_then(|(_, index)| index)
+        .is_some_and(|index| foreign_key.referenced_index.identity() == Some(index))
 }
 
 fn not_null_name<Definition0: crate::storage::DefinitionBacking>(

@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 21;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 22;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1225,7 +1225,8 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + fk.n_parent_cols * 2
             + 8
             + 1
-            + fk.n_delete_set_cols * 2;
+            + fk.n_delete_set_cols * 2
+            + 4;
     }
     // exclusion constraints
     n += 1;
@@ -1554,6 +1555,11 @@ fn append_table_payload<B: DefinitionBacking>(
         for &c in fk.delete_set_cols() {
             ok &= buffer.append(&c.to_le_bytes());
         }
+        // Only a chosen referenced index is durable.
+        ok &= fk.referenced_index.identity().is_some_and(|identity| {
+            u32::try_from(identity.created_at())
+                .is_ok_and(|created_at| buffer.append(&created_at.to_le_bytes()))
+        });
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -8742,6 +8748,11 @@ fn decode_op_inner<'a>(
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
+                let referenced = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                fk.referenced_index = crate::storage::ReferencedIndex::Index(
+                    crate::storage::RelationIdentity::parse(u64::from(referenced))?,
+                );
                 *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
@@ -15709,6 +15720,9 @@ mod tests {
         fk.on_delete = FkAction::Restrict;
         fk.timing = crate::storage::ConstraintTiming::DeferrableImmediate;
         fk.validation = crate::storage::ConstraintValidation::EnforcedNotValid;
+        fk.referenced_index = crate::storage::ReferencedIndex::Index(
+            crate::storage::RelationIdentity::parse(7).unwrap(),
+        );
         def.fkeys[0] = fk;
         def.n_fkeys = 1;
         let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
@@ -16102,6 +16116,53 @@ mod tests {
     }
 
     #[test]
+    fn table_payload_requires_the_foreign_key_referenced_index() {
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "foreign key payload", 4096).unwrap();
+        let mut pending = sample_def();
+        pending.fkeys[0].referenced_index = crate::storage::ReferencedIndex::PendingKey;
+        let mut marked = sample_def();
+        let stamp = 0x0089_c3e1u32;
+        marked.fkeys[0].referenced_index = crate::storage::ReferencedIndex::Index(
+            crate::storage::RelationIdentity::parse(u64::from(stamp)).unwrap(),
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            let identity = crate::storage::CatalogPosition::new(0, 1).unwrap();
+            assert!(!append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity,
+                    definition: (&pending).into(),
+                }
+            ));
+            payload.clear();
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity,
+                    definition: (&marked).into(),
+                }
+            ));
+            let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                decoded.fkeys[0].referenced_index.identity(),
+                crate::storage::RelationIdentity::parse(u64::from(stamp))
+            );
+            // A zero stamp names no index and is rejected.
+            let bytes = payload.readable();
+            let at = bytes
+                .windows(4)
+                .position(|window| window == stamp.to_le_bytes())
+                .unwrap();
+            let mut zeroed = [0u8; 4096];
+            let zeroed = &mut zeroed[..bytes.len()];
+            zeroed.copy_from_slice(bytes);
+            zeroed[at..at + 4].fill(0);
+            assert!(decode_table_payload(zeroed).is_none());
+        });
+    }
+
+    #[test]
     fn table_payload_rejects_versions_with_the_removed_increment_cache() {
         let definition = sample_def();
         let mut budget = Budget::new(8192);
@@ -16289,10 +16350,17 @@ mod tests {
             crate::storage::ConstraintValidation::NotEnforced
         );
         assert_eq!(
-            (restored.fkeys[0].timing, restored.fkeys[0].validation,),
+            (
+                restored.fkeys[0].timing,
+                restored.fkeys[0].validation,
+                restored.fkeys[0].referenced_index,
+            ),
             (
                 crate::storage::ConstraintTiming::DeferrableImmediate,
                 crate::storage::ConstraintValidation::EnforcedNotValid,
+                crate::storage::ReferencedIndex::Index(
+                    crate::storage::RelationIdentity::parse(7).unwrap()
+                ),
             )
         );
         assert!(matches!(

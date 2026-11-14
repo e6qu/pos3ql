@@ -73039,6 +73039,11 @@ pub fn drop_index(
             "DROP INDEX CONCURRENTLY does not support CASCADE"
         ));
     }
+    let selected = match arena.alloc_slice_with(names.len(), |_| 0usize) {
+        Ok(selected) => selected,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    let mut n_selected = 0usize;
     for name in names {
         if let Some(schema) = name.schema
             && storage.find_schema_visible(schema, txn.txid).is_none()
@@ -73116,6 +73121,66 @@ pub fn drop_index(
                     name.name
                 ));
             }
+            if selected[..n_selected].contains(&slot) {
+                continue;
+            }
+            selected[n_selected] = slot;
+            n_selected += 1;
+        } else if let Some(table) = constraint_index_table(storage, *name, txn.txid) {
+            if let Some((index, parent, _)) =
+                crate::sql::catalog::inherited_constraint_index(storage, txn.txid, table, name.name)
+            {
+                use crate::sql::catalog::dependencies::ObjectAddress;
+                return sql_fail(dependency_report::required_by(
+                    storage,
+                    txn.txid,
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
+                    arena,
+                ));
+            }
+            return sql_fail(constraint_requires_index(
+                name.name,
+                storage.table_def(table, txn.txid).name.as_str(),
+            ));
+        } else if if_exists {
+            responder.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "index \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+        } else {
+            // An index is an object, not a relation, to PostgreSQL's error
+            // codes: a missing one is 42704, where a missing table is 42P01.
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "index \"{}\" does not exist",
+                name.name
+            ));
+        }
+    }
+    let selected = &selected[..n_selected];
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(selected.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        for (original, &slot) in originals.iter_mut().zip(selected) {
+            let definition = storage
+                .index_visible_to(slot, txn.txid)
+                .expect("selected index is visible");
+            *original = ObjectAddress::new(
+                crate::sql::catalog::PG_CLASS_OID,
+                crate::sql::catalog::explicit_index_oid(&definition),
+                0,
+            );
+        }
+        dependency_report::report_drop(storage, txn.txid, originals, cascade, arena, responder)
+    })();
+    let mut deferred = false;
+    let outcome = run_reported_drop(report, responder, |responder| {
+        for &slot in selected {
+            let definition = storage
+                .index_visible_to(slot, txn.txid)
+                .expect("selected index is visible");
             if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
                 && let Err(error) = storage.lock_table(
                     txn.txid,
@@ -73155,10 +73220,17 @@ pub fn drop_index(
                 {
                     return sql_fail(error);
                 }
+                // The concurrent drop completes in its own transactions.
+                deferred = true;
                 return sql_ok();
             }
             if let Err(error) =
-                drop_attached_key_constraints(storage, wal, txn, slot, cascade, responder)
+                drop_attached_key_constraints(storage, wal, txn, slot, cascade, arena, responder)
+            {
+                return sql_fail(error);
+            }
+            if let Err(error) =
+                drop_index_foreign_keys(storage, wal, txn, slot, cascade, arena, responder)
             {
                 return sql_fail(error);
             }
@@ -73172,37 +73244,11 @@ pub fn drop_index(
             if let Err(error) = stage_index_drop(storage, wal, txn, slot) {
                 return sql_fail(error);
             }
-        } else if let Some(table) = constraint_index_table(storage, *name, txn.txid) {
-            if let Some((index, parent, _)) =
-                crate::sql::catalog::inherited_constraint_index(storage, txn.txid, table, name.name)
-            {
-                use crate::sql::catalog::dependencies::ObjectAddress;
-                return sql_fail(dependency_report::required_by(
-                    storage,
-                    txn.txid,
-                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
-                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
-                    arena,
-                ));
-            }
-            return sql_fail(constraint_requires_index(
-                name.name,
-                storage.table_def(table, txn.txid).name.as_str(),
-            ));
-        } else if if_exists {
-            responder.notice(
-                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(128, "index \"{}\" does not exist, skipping", name.name).as_str(),
-            )?;
-        } else {
-            // An index is an object, not a relation, to PostgreSQL's error
-            // codes: a missing one is 42704, where a missing table is 42P01.
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "index \"{}\" does not exist",
-                name.name
-            ));
         }
+        sql_ok()
+    });
+    if deferred || !matches!(outcome, Ok(Ok(()))) {
+        return outcome;
     }
     if build == crate::sql::ast::IndexBuildMode::Concurrent {
         txn.immediate_index_utility = Some(super::UtilityCommand::DropIndexWithoutRestart);
@@ -73537,6 +73583,28 @@ pub(super) fn register_next_reindex_table<'a>(
     Ok(result)
 }
 
+/// Points `definition`'s foreign keys on the index `old` of the table
+/// `schema.name` at its replacement `new`; whether any changed.
+fn repoint_foreign_keys(
+    definition: &mut TableDefBuilder,
+    schema: SqlName,
+    name: SqlName,
+    old: crate::storage::RelationIdentity,
+    new: crate::storage::RelationIdentity,
+) -> bool {
+    let mut changed = false;
+    for foreign_key in &mut definition.fkeys[..definition.n_fkeys] {
+        if foreign_key.parent_schema == schema
+            && foreign_key.parent == name
+            && foreign_key.referenced_index.identity() == Some(old)
+        {
+            foreign_key.referenced_index = crate::storage::ReferencedIndex::Index(new);
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub(super) fn swap_reindex_definitions(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -73643,8 +73711,34 @@ pub(super) fn swap_reindex_definitions(
                 changed = true;
             }
         }
+        // Foreign keys follow the replacement of the index they depend on.
+        let (old_index, new_index) = match (
+            crate::storage::RelationIdentity::parse(replacement.old_created_at),
+            crate::storage::RelationIdentity::parse(replacement.new_created_at),
+        ) {
+            (Some(old_index), Some(new_index)) => (old_index, new_index),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "REINDEX replacement has no relation identity"
+                ));
+            }
+        };
+        let (parent_schema, parent_name) = (next.schema, next.name);
+        changed |=
+            repoint_foreign_keys(&mut next, parent_schema, parent_name, old_index, new_index);
         if changed {
             stage_table_definition(storage, wal, txn, target, current, next)?;
+        }
+        for table in 0..storage.table_count() {
+            if table == replacement.table || !storage.table_slot_visible_to(table, txn.txid) {
+                continue;
+            }
+            let (target, current) = storage.select_table_definition(table, txn.txid);
+            let mut next = TableDefBuilder::from_definition(&current);
+            if repoint_foreign_keys(&mut next, parent_schema, parent_name, old_index, new_index) {
+                stage_table_definition(storage, wal, txn, target, current, next)?;
+            }
         }
         stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
         for (name, text) in [(retired_name, None), (original_name, comment)] {
@@ -90036,6 +90130,17 @@ fn drop_named_constraint(def: &mut TableDefBuilder, name: &str) -> bool {
     false
 }
 
+/// The index of `def`'s primary key or unique constraint `name`.
+fn key_index_identity<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+) -> Option<crate::storage::RelationIdentity> {
+    named_key_columns(def, name)?;
+    def.backing_index_names()
+        .find(|(key, _)| key.as_str() == name)
+        .and_then(|(_, index)| index)
+}
+
 fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     name: &str,
@@ -90069,6 +90174,7 @@ fn drop_attached_key_constraints(
     txn: &mut TxnState,
     slot: usize,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
@@ -90106,20 +90212,36 @@ fn drop_attached_key_constraints(
             let _ = write!(detail, "{separator}{}", line.as_str());
             continue;
         }
-        responder
-            .notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(
-                    160,
-                    "drop cascades to constraint {} on table {}",
-                    name.as_str(),
-                    current.name.as_str()
-                )
-                .as_str(),
+        dependency_report::send_cascade_lines(
+            responder,
+            stack_format!(
+                160,
+                "drop cascades to constraint {} on table {}",
+                name.as_str(),
+                current.name.as_str()
             )
-            .map_err(wire_to_sql)?;
+            .as_str(),
+            1,
+        )?;
         let mut next = TableDefBuilder::from_definition(&current);
-        drop_dependent_foreign_keys(storage, wal, txn, table, &mut next, name.as_str(), true)?;
+        if let Some(key_index) = key_index_identity(&next, name.as_str()) {
+            drop_dependent_foreign_keys(
+                storage,
+                wal,
+                txn,
+                table,
+                &mut next,
+                ForeignKeyDependency::Index(key_index),
+                crate::sql::catalog::dependencies::ObjectAddress::new(
+                    crate::sql::catalog::PG_CLASS_OID,
+                    key_index.oid(),
+                    0,
+                ),
+                true,
+                arena,
+                responder,
+            )?;
+        }
         drop_named_constraint(&mut next, name.as_str());
         txn.drop_constraint(table as u32, name)?;
         stage_table_definition(storage, wal, txn, target, current, next)?;
@@ -90143,6 +90265,50 @@ fn drop_attached_key_constraints(
         "cannot drop index {} because other objects depend on it",
         name.as_str()
     ))
+}
+
+/// Removes the foreign keys that depend on the index in `slot` (and so
+/// reference its table), as `DROP INDEX` must before dropping it.
+fn drop_index_foreign_keys(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let Some(table) = storage.index_table_slot_to(slot, txn.txid) else {
+        return Ok(());
+    };
+    let index = storage
+        .index_visible_to(slot, txn.txid)
+        .expect("a dropped index is visible");
+    let identity = crate::storage::RelationIdentity::parse(index.created_at)
+        .expect("admitted index has a durable identity");
+    let (target, current) = storage.select_table_definition(table, txn.txid);
+    let mut next = TableDefBuilder::from_definition(&current);
+    let keys = next.n_fkeys;
+    drop_dependent_foreign_keys(
+        storage,
+        wal,
+        txn,
+        table,
+        &mut next,
+        ForeignKeyDependency::Index(identity),
+        crate::sql::catalog::dependencies::ObjectAddress::new(
+            crate::sql::catalog::PG_CLASS_OID,
+            identity.oid(),
+            0,
+        ),
+        cascade,
+        arena,
+        responder,
+    )?;
+    if next.n_fkeys != keys {
+        stage_table_definition(storage, wal, txn, target, current, next)?;
+    }
+    Ok(())
 }
 
 /// PostgreSQL's refusal to drop the index a constraint owns.
@@ -90526,17 +90692,212 @@ fn rename_attached_index_constraint(
     Ok(())
 }
 
+/// Removes the foreign keys that depend on the dropped column `stored`
+/// (`current` in `target`): those referencing it, and those whose index
+/// covers it as an INCLUDE column and so goes with it.
+#[allow(clippy::too_many_arguments)]
+fn drop_column_foreign_keys(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    target: &mut TableDefBuilder,
+    (stored, current): (usize, usize),
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let original = crate::sql::catalog::dependencies::ObjectAddress::new(
+        crate::sql::catalog::PG_CLASS_OID,
+        crate::sql::catalog::user_table_oid(storage, table),
+        i32::from(storage.table_def(table, txn.txid).attribute_number(stored)),
+    );
+    drop_dependent_foreign_keys(
+        storage,
+        wal,
+        txn,
+        table,
+        target,
+        ForeignKeyDependency::Column {
+            stored: stored as u16,
+            current: current as u16,
+        },
+        original,
+        cascade,
+        arena,
+        responder,
+    )?;
+    let definition = storage.table_def(table, txn.txid).clone();
+    for slot in 0..storage.index_count() {
+        let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        if index.schema != definition.schema
+            || index.table != definition.name
+            || !index.include_columns[..index.n_include_cols].contains(&(stored as u16))
+        {
+            continue;
+        }
+        let Some(identity) = crate::storage::RelationIdentity::parse(index.created_at) else {
+            continue;
+        };
+        drop_dependent_foreign_keys(
+            storage,
+            wal,
+            txn,
+            table,
+            target,
+            ForeignKeyDependency::Index(identity),
+            original,
+            cascade,
+            arena,
+            responder,
+        )?;
+    }
+    Ok(())
+}
+
+/// What a foreign key depends on in the table it references: the unique
+/// index it was created against, and each referenced column.
+#[derive(Clone, Copy)]
+pub(super) enum ForeignKeyDependency {
+    Index(crate::storage::RelationIdentity),
+    /// A column by its position in the stored table and in the statement's
+    /// new definition of it.
+    Column {
+        stored: u16,
+        current: u16,
+    },
+}
+
+/// Removes the foreign keys that depend on part of `target` a statement
+/// drops, as PostgreSQL's dependency walk does: `RESTRICT` fails with the
+/// report of `original` (the dropped object) and `CASCADE` names each key.
+#[allow(clippy::too_many_arguments)]
 fn drop_dependent_foreign_keys(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     target_table: usize,
     target: &mut TableDefBuilder,
-    key_name: &str,
+    dependency: ForeignKeyDependency,
+    original: crate::sql::catalog::dependencies::ObjectAddress,
     cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
 ) -> Result<(), SqlError> {
+    use crate::sql::catalog::dependencies::ObjectAddress;
     let target_schema = target.schema;
     let target_name = target.name;
+    let depends = |table_slot: usize, foreign_key: &crate::storage::ForeignKey| {
+        foreign_key.parent_schema == target_schema
+            && foreign_key.parent == target_name
+            && match dependency {
+                ForeignKeyDependency::Index(index) => {
+                    foreign_key.referenced_index.identity() == Some(index)
+                }
+                // A key over the dropped column itself goes with the column.
+                ForeignKeyDependency::Column { stored, current } => {
+                    if table_slot == target_table {
+                        foreign_key.parent_cols().contains(&current)
+                            && !foreign_key.columns().contains(&current)
+                    } else {
+                        foreign_key.parent_cols().contains(&stored)
+                    }
+                }
+            }
+    };
+    let mut count = 0usize;
+    for table_slot in 0..storage.table_count() {
+        if !storage.table(table_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.table_def(table_slot, txn.txid);
+        let foreign_keys = if table_slot == target_table {
+            target.fkeys()
+        } else {
+            definition.fkeys()
+        };
+        count += foreign_keys
+            .iter()
+            .filter(|foreign_key| depends(table_slot, foreign_key))
+            .count();
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    if !cascade {
+        dependency_report::report_drop(storage, txn.txid, &[original], false, arena, responder)?;
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "dependency report missed a dependent foreign key"
+        ));
+    }
+    // PostgreSQL reports the keys oldest first.
+    let dependents = arena
+        .alloc_slice_with(count, |_| 0i32)
+        .map_err(|_| arena_full())?;
+    let mut next = 0usize;
+    for table_slot in 0..storage.table_count() {
+        if !storage.table(table_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.table_def(table_slot, txn.txid);
+        let foreign_keys = if table_slot == target_table {
+            target.fkeys()
+        } else {
+            definition.fkeys()
+        };
+        // A partition's clone goes silently with its parent's key.
+        let clone_of_parent = |foreign_key: &crate::storage::ForeignKey| {
+            definition.partition.attachment.is_some_and(|attachment| {
+                storage
+                    .table_def(usize::from(attachment.parent), txn.txid)
+                    .fkeys()
+                    .iter()
+                    .any(|parent| {
+                        parent.name == foreign_key.name
+                            && parent.parent_schema == foreign_key.parent_schema
+                            && parent.parent == foreign_key.parent
+                            && parent.parent_cols() == foreign_key.parent_cols()
+                    })
+            })
+        };
+        for foreign_key in foreign_keys {
+            if depends(table_slot, foreign_key) {
+                dependents[next] = if clone_of_parent(foreign_key) {
+                    0
+                } else {
+                    foreign_key.oid()
+                };
+                next += 1;
+            }
+        }
+    }
+    dependents.sort_unstable();
+    let reported = dependents.iter().filter(|oid| **oid != 0).count();
+    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    for oid in dependents.iter().filter(|oid| **oid != 0) {
+        use core::fmt::Write;
+        let mark = arena.mark();
+        let description = dependency_report::describe(
+            storage,
+            txn.txid,
+            ObjectAddress::new(crate::sql::catalog::PG_CONSTRAINT_OID, *oid, 0),
+            arena,
+        )?;
+        let separator = if detail.as_str().is_empty() { "" } else { "\n" };
+        let _ = write!(detail, "{separator}drop cascades to {description}");
+        // SAFETY: the line was copied into the report.
+        unsafe { arena.rewind_to(mark) };
+    }
+    if detail.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "dependency report exceeds its fixed buffer"
+        ));
+    }
+    dependency_report::send_cascade_lines(responder, detail.as_str(), reported)?;
     for table_slot in 0..storage.table_count() {
         if !storage.table(table_slot).visible_to(txn.txid) {
             continue;
@@ -90547,24 +90908,17 @@ fn drop_dependent_foreign_keys(
         } else {
             TableDefBuilder::from_definition(&live_definition)
         };
-        let depends = |foreign_key: &crate::storage::ForeignKey| {
-            foreign_key.parent_schema == target_schema
-                && foreign_key.parent == target_name
-                && ddl::references_named_key(target, key_name, foreign_key.parent_cols())
-        };
-        if !current.fkeys().iter().any(depends) {
+        if !current
+            .fkeys()
+            .iter()
+            .any(|foreign_key| depends(table_slot, foreign_key))
+        {
             continue;
-        }
-        if !cascade {
-            return Err(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop constraint because foreign key constraints depend on it"
-            ));
         }
         let mut altered = TableDefBuilder::from_definition(&current);
         let mut write = 0usize;
         for read in 0..altered.n_fkeys {
-            if depends(&altered.fkeys[read]) {
+            if depends(table_slot, &altered.fkeys[read]) {
                 txn.drop_constraint(table_slot as u32, altered.fkeys[read].name)?;
             } else {
                 altered.fkeys[write] = altered.fkeys[read];
@@ -94737,6 +95091,21 @@ fn alter_table_relation(
                     return sql_fail(error);
                 }
                 if let Some(original_index) = original_index
+                    && let Err(error) = drop_column_foreign_keys(
+                        storage,
+                        wal,
+                        txn,
+                        table_index,
+                        &mut new_def,
+                        (original_index, i),
+                        *cascade,
+                        arena,
+                        responder,
+                    )
+                {
+                    return sql_fail(error);
+                }
+                if let Some(original_index) = original_index
                     && let Err(error) = apply_column_drop_dependencies(
                         storage,
                         wal,
@@ -94752,38 +95121,6 @@ fn alter_table_relation(
                     )
                 {
                     return sql_fail(error);
-                }
-                let mut referenced_keys = [StackStr::<128>::new(); crate::storage::MAX_UNIQUES + 1];
-                let mut referenced_key_count = 0usize;
-                if new_def.columns[i].primary || new_def.columns[i].unique {
-                    let Some(name) = new_def.column_key_name(i) else {
-                        return sql_fail(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "dropped inline key has no admitted name"
-                        ));
-                    };
-                    referenced_keys[referenced_key_count] = StackStr::from_str(name.as_str());
-                    referenced_key_count += 1;
-                }
-                for key in new_def.uniques() {
-                    if key.columns().contains(&(i as u16)) {
-                        referenced_keys[referenced_key_count] =
-                            StackStr::from_str(key.name.as_str());
-                        referenced_key_count += 1;
-                    }
-                }
-                for key_name in &referenced_keys[..referenced_key_count] {
-                    if let Err(error) = drop_dependent_foreign_keys(
-                        storage,
-                        wal,
-                        txn,
-                        table_index,
-                        &mut new_def,
-                        key_name.as_str(),
-                        *cascade,
-                    ) {
-                        return sql_fail(error);
-                    }
                 }
                 let mut removed_constraints = [SqlName::EMPTY;
                     crate::storage::MAX_CHECKS
@@ -95737,18 +96074,38 @@ fn alter_table_relation(
                         def.name.as_str()
                     ));
                 }
-                if named_key_columns(&new_def, name).is_some()
-                    && let Err(error) = drop_dependent_foreign_keys(
+                if let Some(key_index) = key_index_identity(&new_def, name) {
+                    use crate::sql::catalog::dependencies::ObjectAddress;
+                    let original = crate::sql::catalog::table_constraint_oid(
+                        storage,
+                        txn.txid,
+                        table_index,
+                        name,
+                    )
+                    .map_or(
+                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, key_index.oid(), 0),
+                        |constraint| {
+                            ObjectAddress::new(
+                                crate::sql::catalog::PG_CONSTRAINT_OID,
+                                constraint,
+                                0,
+                            )
+                        },
+                    );
+                    if let Err(error) = drop_dependent_foreign_keys(
                         storage,
                         wal,
                         txn,
                         table_index,
                         &mut new_def,
-                        name,
+                        ForeignKeyDependency::Index(key_index),
+                        original,
                         *cascade,
-                    )
-                {
-                    return sql_fail(error);
+                        arena,
+                        responder,
+                    ) {
+                        return sql_fail(error);
+                    }
                 }
                 if drop_named_constraint(&mut new_def, name) {
                     let name = match SqlName::parse(name) {

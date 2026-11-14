@@ -794,3 +794,64 @@ fn text_search_drops_report_like_postgresql() {
         ),
     ]);
 }
+
+/// A foreign key depends on the one unique index it was created against
+/// (`conindid`): the oldest immediate one over its referenced columns,
+/// whether a constraint owns it or not.
+#[test]
+fn foreign_keys_depend_on_their_referenced_index() {
+    check_statements(&[
+        ("CREATE TABLE p (a int, b int)", ""),
+        ("CREATE UNIQUE INDEX p_idx ON p (a)", ""),
+        ("ALTER TABLE p ADD CONSTRAINT p_uq UNIQUE (a)", ""),
+        ("CREATE TABLE c (a int REFERENCES p (a))", ""),
+        ("CREATE TABLE d (a int REFERENCES p (a))", ""),
+        ("ALTER TABLE p DROP CONSTRAINT p_uq", ""),
+        (
+            "DROP INDEX p_idx",
+            "ERROR:  cannot drop index p_idx because other objects depend on it\n\
+             DETAIL:  constraint c_a_fkey on table c depends on index p_idx\n\
+             constraint d_a_fkey on table d depends on index p_idx\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "ALTER TABLE p DROP COLUMN a",
+            "ERROR:  cannot drop column a of table p because other objects depend on it\n\
+             DETAIL:  constraint c_a_fkey on table c depends on column a of table p\n\
+             constraint d_a_fkey on table d depends on column a of table p\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "DROP INDEX p_idx CASCADE",
+            "NOTICE:  drop cascades to 2 other objects\n\
+             DETAIL:  drop cascades to constraint c_a_fkey on table c\n\
+             drop cascades to constraint d_a_fkey on table d",
+        ),
+        ("ALTER TABLE p ADD CONSTRAINT p_uq UNIQUE (a)", ""),
+        ("CREATE UNIQUE INDEX p_idx ON p (a)", ""),
+        ("ALTER TABLE c ADD FOREIGN KEY (a) REFERENCES p (a)", ""),
+        ("DROP INDEX p_idx", ""),
+        (
+            "ALTER TABLE p DROP CONSTRAINT p_uq",
+            "ERROR:  cannot drop constraint p_uq on table p because other objects depend on it\n\
+             DETAIL:  constraint c_a_fkey on table c depends on index p_uq\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "ALTER TABLE p DROP CONSTRAINT p_uq CASCADE",
+            "NOTICE:  drop cascades to constraint c_a_fkey on table c",
+        ),
+        ("CREATE UNIQUE INDEX p_cover ON p (a) INCLUDE (b)", ""),
+        ("ALTER TABLE c ADD FOREIGN KEY (a) REFERENCES p (a)", ""),
+        (
+            "ALTER TABLE p DROP COLUMN b",
+            "ERROR:  cannot drop column b of table p because other objects depend on it\n\
+             DETAIL:  constraint c_a_fkey on table c depends on index p_cover\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+        ),
+        (
+            "ALTER TABLE p DROP COLUMN b CASCADE",
+            "NOTICE:  drop cascades to constraint c_a_fkey on table c",
+        ),
+    ]);
+}

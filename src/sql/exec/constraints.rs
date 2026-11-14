@@ -89,17 +89,24 @@ pub(crate) enum RowDescription {
         table: usize,
         written: crate::storage::ColumnSet,
     },
-    /// A row a maintenance command rewrites or a subscription applies,
-    /// described in full.
+    /// A row the current user's statement writes through the INSTEAD OF
+    /// trigger of the view in view slot `view`, giving values to the
+    /// `written` columns; the view's privileges decide what it shows.
+    ViewWrite {
+        view: u16,
+        written: crate::storage::ColumnSet,
+    },
+    /// A row a maintenance command rewrites, described in full.
     Maintenance,
 }
 
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
 /// violates a NOT NULL or CHECK constraint (`ExecBuildSlotValueDescription`).
 /// A write's row shows nothing while row security applies to the user;
-/// without `SELECT` on the table it shows only the columns the user may read
-/// or the statement wrote, named (`(a, c) = (1, 3)`), and nothing when there
-/// are none. A virtual generated column, which the row does not hold in
+/// without `SELECT` on the written table or view it shows only the columns
+/// the user may read or the statement wrote, named (`(a, c) = (1, 3)`), and
+/// nothing when there are none. A subscription's applied row names no
+/// written columns. A virtual generated column, which the row does not hold in
 /// PostgreSQL, reads `virtual`.
 pub(crate) fn failing_row_detail(
     storage: &Storage,
@@ -111,27 +118,49 @@ pub(crate) fn failing_row_detail(
     use core::fmt::Write;
     let mut shown = crate::storage::ColumnSet::all(values.len());
     let mut named = false;
-    if let RowDescription::Write { table, written } = description {
+    let (object, target, written) = match description {
+        RowDescription::Maintenance => (None, None, crate::storage::ColumnSet::EMPTY),
+        RowDescription::Write { table, written } => {
+            let Some(role) = storage.current_role_slot(txid) else {
+                return Ok(None);
+            };
+            if storage.row_security_applies(table, role, txid) {
+                return Ok(None);
+            }
+            (
+                Some(storage.table_access_object(table, txid)),
+                Some(storage.table_def(table, txid)),
+                written,
+            )
+        }
+        RowDescription::ViewWrite { view, written } => (
+            Some(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view,
+            }),
+            None,
+            written,
+        ),
+    };
+    if let Some(object) = object {
         let Some(role) = storage.current_role_slot(txid) else {
             return Ok(None);
         };
-        if storage.row_security_applies(table, role, txid) {
-            return Ok(None);
-        }
-        let object = storage.table_access_object(table, txid);
         let select = crate::storage::PrivilegeSet::SELECT;
         if !storage.has_object_privilege(object, role, select, txid) {
             named = true;
             shown = crate::storage::ColumnSet::EMPTY;
-            // The row may be a partition's, whose columns match the written
-            // table's by name.
-            let target = storage.table_def(table, txid);
             for (column, meta) in columns.iter().enumerate().take(values.len()) {
-                let Some(logical) = target
-                    .columns()
-                    .iter()
-                    .position(|candidate| candidate.name == meta.name)
-                else {
+                // A table's row may be a partition's, whose columns match the
+                // written table's by name; a view's row is the view's own.
+                let logical = match &target {
+                    Some(target) => target
+                        .columns()
+                        .iter()
+                        .position(|candidate| candidate.name == meta.name),
+                    None => Some(column),
+                };
+                let Some(logical) = logical else {
                     continue;
                 };
                 let readable = written.contains(logical)

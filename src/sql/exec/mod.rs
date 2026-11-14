@@ -78637,13 +78637,15 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let logical_table = logical_target.table();
-    let description = if txn.replication_apply {
-        constraints::RowDescription::Maintenance
-    } else {
-        constraints::RowDescription::Write {
-            table: logical_table,
-            written,
-        }
+    // A subscription's table synchronization names no columns, as
+    // PostgreSQL's apply worker writes without a column list.
+    let description = constraints::RowDescription::Write {
+        table: logical_table,
+        written: if txn.replication_apply {
+            ColumnSet::EMPTY
+        } else {
+            written
+        },
     };
     partition_insert::with_partition_insert_row(
         storage,
@@ -78957,7 +78959,10 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 txn.txid,
                 definition,
                 values,
-                constraints::RowDescription::Maintenance,
+                constraints::RowDescription::Write {
+                    table: target_table,
+                    written: ColumnSet::EMPTY,
+                },
             )?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             definition.schema(&mut schema);
@@ -78975,7 +78980,10 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 arena,
                 &[],
                 None,
-                constraints::RowDescription::Maintenance,
+                constraints::RowDescription::Write {
+                    table: target_table,
+                    written: ColumnSet::EMPTY,
+                },
             )?;
             store_row(
                 storage,
@@ -79568,7 +79576,10 @@ pub(crate) fn apply_replication_update(
         txn.txid,
         definition,
         &new_values,
-        constraints::RowDescription::Maintenance,
+        constraints::RowDescription::Write {
+            table: row_table,
+            written: ColumnSet::EMPTY,
+        },
     )?;
     enforce_row_constraints(
         storage,
@@ -79583,7 +79594,10 @@ pub(crate) fn apply_replication_update(
         arena,
         &[],
         None,
-        constraints::RowDescription::Maintenance,
+        constraints::RowDescription::Write {
+            table: row_table,
+            written: ColumnSet::EMPTY,
+        },
     )?;
     row.available(storage, txn, "updated")?;
     store_row(
@@ -85672,6 +85686,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     mut progress: Option<&mut RowProgress>,
     position: (usize, u64),
     batches: &mut crate::sql::foreign::ForeignInsertBatches<'a>,
+    written_columns: ColumnSet,
 ) -> Result<Result<bool, SqlError>, WireFull>
 where
     'snapshot: 'a,
@@ -85815,7 +85830,7 @@ where
             };
             let description = constraints::RowDescription::Write {
                 table: logical_table_index,
-                written: inserted_columns(statement, logical_definition),
+                written: written_columns,
             };
             if let Err(error) = enforce_view_check(
                 view_check,
@@ -85850,7 +85865,7 @@ where
                     &schema[..definition.n_columns],
                     &values[..definition.n_columns],
                     &statement.on_conflict,
-                    inserted_columns(statement, logical_definition),
+                    written_columns,
                     statement.alias,
                     arbiter,
                     checks,
@@ -86743,6 +86758,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                 };
             }
             let targets = &targets[..target_count];
+            let view_description =
+                match inserted_columns(insert, &def, storage, txn.txid, arena, None) {
+                    Ok(written) => constraints::RowDescription::ViewWrite {
+                        view: view_slot as u16,
+                        written,
+                    },
+                    Err(error) => return sql_fail(error),
+                };
             // A column the statement leaves out or writes as DEFAULT takes the
             // view column's default, as PostgreSQL's rewriter supplies it.
             let defaults = match instead_of_view_defaults(
@@ -86928,6 +86951,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 transitions: no_transitions,
                             },
                             checks,
+                            view_description,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -87073,6 +87097,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 transitions: no_transitions,
                             },
                             checks,
+                            view_description,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -87322,8 +87347,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                             arena,
                             params,
                             seq_session,
-                            // A view a trigger writes describes its whole row.
-                            description: constraints::RowDescription::Maintenance,
+                            description: constraints::RowDescription::ViewWrite {
+                                view: view_slot as u16,
+                                written: assigned_columns(update.assignments, &def),
+                            },
                         },
                     ) {
                         return sql_fail(error);
@@ -87778,6 +87805,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     progress: Option<&mut RowProgress>,
     position: ChangedRow,
     checks: Option<ViewCheck<'a>>,
+    description: constraints::RowDescription,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let seq_session = services.seq_session;
     let fired = match fire_view_row_trigger(
@@ -87808,8 +87836,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             arena,
             params,
             seq_session,
-            // A view a trigger writes describes its whole row.
-            description: constraints::RowDescription::Maintenance,
+            description,
         },
     ) {
         return Ok(Err(error));
@@ -88129,6 +88156,18 @@ where
             },
             None => None,
         },
+    };
+    // A violation describes the columns the statement gives values to.
+    let written_columns = match inserted_columns(
+        statement,
+        def,
+        storage,
+        txn.txid,
+        arena,
+        transition.map(|transition| transition as &dyn ColumnLookup<'_>),
+    ) {
+        Ok(columns) => columns,
+        Err(error) => return sql_fail(error),
     };
     let insert_columns = targets[..n_targets]
         .iter()
@@ -88942,6 +88981,7 @@ where
                     progress.as_deref_mut(),
                     (index, *inserted),
                     &mut batches,
+                    written_columns,
                 )? {
                     Ok(true) => *inserted += 1,
                     Ok(false) => {}
@@ -89424,6 +89464,7 @@ where
                 progress.as_deref_mut(),
                 (index, inserted),
                 &mut batches,
+                written_columns,
             )? {
                 Ok(true) => inserted += 1,
                 Ok(false) => {}
@@ -105762,11 +105803,16 @@ fn apply_numeric_typmod<'a>(
 }
 
 /// The columns of `definition` an INSERT gives values to, PostgreSQL's
-/// `insertedCols`: those it names, or the leading ones its source fills.
+/// `insertedCols`: those it names, or the leading ones its source fills, a
+/// query's `*` counting each column it expands to.
 fn inserted_columns<Definition0: crate::storage::DefinitionBacking>(
     statement: &Insert<'_>,
     definition: &crate::storage::TableDefinition<Definition0>,
-) -> ColumnSet {
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn ColumnLookup<'_>>,
+) -> Result<ColumnSet, SqlError> {
     let mut columns = ColumnSet::EMPTY;
     if !statement.columns.is_empty() {
         for name in statement.columns {
@@ -105774,27 +105820,31 @@ fn inserted_columns<Definition0: crate::storage::DefinitionBacking>(
                 columns.insert(column);
             }
         }
-        return columns;
+        return Ok(columns);
     }
     let width = match (statement.rows.first(), statement.select) {
         (Some(row), _) => row.len(),
-        // A `*` expands to columns this does not count; every column is
-        // then taken as written.
-        (None, Some(select))
-            if select.set_body.is_none()
-                && select
-                    .items
-                    .iter()
-                    .all(|item| matches!(item, super::ast::SelectItem::Expr { .. })) =>
-        {
-            select.items.len()
+        (None, Some(select)) => {
+            let mut width = 0usize;
+            super::query::visit_projection_types(
+                select,
+                storage,
+                txid,
+                arena,
+                outer,
+                &mut |_, _| {
+                    width += 1;
+                    Ok(())
+                },
+            )?;
+            width
         }
-        _ => definition.n_columns,
+        (None, None) => definition.n_columns,
     };
     for column in 0..width.min(definition.n_columns) {
         columns.insert(column);
     }
-    columns
+    Ok(columns)
 }
 
 /// The columns `assignments` set in `definition`, PostgreSQL's

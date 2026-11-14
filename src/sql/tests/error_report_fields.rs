@@ -1226,6 +1226,49 @@ fn key_details_need_select_on_the_key_and_no_row_security() {
     });
 }
 
+/// An `INSERT ... SELECT *` writes the columns its query's `*` expands to,
+/// and a view written through its INSTEAD OF trigger describes the row by the
+/// view's privileges and the columns the statement wrote, as PostgreSQL's
+/// `ExecBuildSlotValueDescription` does for its result relation.
+#[test]
+fn failing_rows_count_star_sources_and_trigger_view_columns() {
+    with_engine("failing-row-sources", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE sw; \
+             CREATE TABLE sr (a int, b int NOT NULL, c int, d text); \
+             CREATE TABLE ss (a int, b int); INSERT INTO ss VALUES (5, NULL); \
+             GRANT INSERT ON sr TO sw; GRANT SELECT ON ss TO sw; \
+             CREATE VIEW stv AS SELECT a, b, c FROM sr; \
+             CREATE FUNCTION stf() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RETURN NEW; END $$; \
+             CREATE TRIGGER stt INSTEAD OF INSERT OR UPDATE ON stv \
+             FOR EACH ROW EXECUTE FUNCTION stf(); \
+             CREATE VIEW scv AS SELECT a, b, c FROM stv WHERE a > 0 WITH CHECK OPTION; \
+             GRANT INSERT, UPDATE ON scv TO sw; GRANT SELECT ON scv TO sw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SET ROLE sw; INSERT INTO sr SELECT * FROM ss",
+                    &[
+                        "E|C=23502|M=null value in column \"b\" of relation \"sr\" violates not-null constraint|D=Failing row contains (a, b) = (5, null).|s=public|t=sr|c=b",
+                    ],
+                ),
+                (
+                    "SET ROLE sw; INSERT INTO scv (a, c) VALUES (-1, 1)",
+                    &[
+                        "E|C=44000|M=new row violates check option for view \"scv\"|D=Failing row contains (a, c) = (-1, 1).",
+                    ],
+                ),
+            ],
+        );
+    });
+}
+
 #[test]
 fn failing_rows_show_readable_or_written_columns() {
     with_engine("failing-row-columns", |engine, budget| {

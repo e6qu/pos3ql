@@ -2093,14 +2093,14 @@ pub(crate) fn rule_transition_source<'a>(
     let source = transition_table_ref(source_select);
     let (from, where_clause) = template;
     let template = TransitionTemplate {
-            old: arena
-                .alloc_slice_copy(&old_images[..columns.len()])
-                .map_err(|_| arena_full())?,
-            new: arena
-                .alloc_slice_copy(&new_images[..columns.len()])
-                .map_err(|_| arena_full())?,
-            from,
-            where_clause,
+        old: arena
+            .alloc_slice_copy(&old_images[..columns.len()])
+            .map_err(|_| arena_full())?,
+        new: arena
+            .alloc_slice_copy(&new_images[..columns.len()])
+            .map_err(|_| arena_full())?,
+        from,
+        where_clause,
         returning_sources: arena
             .alloc_slice_copy(&source_items[..source_count])
             .map_err(|_| arena_full())?,
@@ -5395,7 +5395,11 @@ impl<'a> RuleTransition<'_, 'a> {
     fn image(self, old: bool, index: usize) -> Result<&'a Expr<'a>, SqlError> {
         match self.references {
             Some(references) => references.reference(old, index),
-            None => Ok(if old { self.old[index] } else { self.new[index] }),
+            None => Ok(if old {
+                self.old[index]
+            } else {
+                self.new[index]
+            }),
         }
     }
 }

@@ -8343,6 +8343,79 @@ impl<'a> Parser<'a> {
         Ok((names.as_slice(), if_exists))
     }
 
+    /// PostgreSQL's `OptTypedTableElementList` of a partition, after its
+    /// `(`: column options, which keep an empty type name, and table
+    /// constraints.
+    #[expect(clippy::type_complexity, reason = "the two element lists")]
+    fn partition_elements(
+        &mut self,
+        table: &'a str,
+        foreign: bool,
+    ) -> Result<(&'a [ColumnDef<'a>], &'a [TableConstraint<'a>]), ParseError> {
+        let mut columns = ArenaList::new(self.arena);
+        let mut cons = ArenaList::new(self.arena);
+        loop {
+            let at = self.peek_at;
+            let constraint_name = if self.eat_ident("constraint")? {
+                Some(self.col_ident("constraint name")?)
+            } else {
+                None
+            };
+            if matches!(
+                self.peeked,
+                Tok::Ident("primary" | "unique" | "check" | "foreign" | "exclude")
+            ) {
+                let constraint = self.table_constraint(
+                    constraint_name,
+                    SourcePosition::new(Some(at)),
+                    if foreign {
+                        ConstraintSite::CreateForeignTable
+                    } else {
+                        ConstraintSite::CreateTable
+                    },
+                )?;
+                self.push(&mut cons, constraint)?;
+            } else {
+                if constraint_name.is_some() {
+                    return Err(self.syntax_error_here());
+                }
+                let column = self.col_ident("column name")?;
+                if self.eat_ident("with")? {
+                    self.expect_ident("options")?;
+                }
+                let clauses = self.column_clauses(column, table, !foreign, &mut cons)?;
+                self.push(
+                    &mut columns,
+                    ColumnDef {
+                        source_position: SourcePosition::new(Some(at)),
+                        name: column,
+                        type_name: "",
+                        type_mod: -1,
+                        collation: crate::sql::ast::ParsedCollation::DEFAULT,
+                        foreign_options: &[],
+                        storage: None,
+                        compression: crate::sql::ast::ColumnCompression::Default,
+                        not_null: clauses.not_null,
+                        not_null_name: clauses.not_null_name,
+                        not_null_inheritable: clauses.not_null_inheritable,
+                        unique: clauses.unique,
+                        primary: clauses.primary,
+                        default: clauses.default,
+                        default_text: clauses.default_text,
+                        generated_text: clauses.generated_text,
+                        generated_kind: clauses.generated_kind,
+                        identity: clauses.identity,
+                    },
+                )?;
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok((columns.as_slice(), cons.as_slice()))
+    }
+
     fn create_table(
         &mut self,
         foreign: bool,
@@ -8367,6 +8440,14 @@ impl<'a> Parser<'a> {
         if self.eat_ident("partition")? {
             self.expect_ident("of")?;
             let parent = self.qual_name("partitioned table name")?;
+            // `( column [WITH OPTIONS] constraints | table_constraint, ... )`:
+            // options of the parent's columns, whose types it keeps, as an
+            // empty type name.
+            let (columns, constraints) = if self.eat_op("(")? {
+                self.partition_elements(name.name, foreign)?
+            } else {
+                (&[][..], &[][..])
+            };
             let bound = self.partition_bound()?;
             let subpartition = if self.eat_ident("partition")? {
                 Some(self.partition_by_clause()?)
@@ -8390,8 +8471,8 @@ impl<'a> Parser<'a> {
             };
             let relation = CreateTable {
                 name,
-                columns: &[],
-                constraints: &[],
+                columns,
+                constraints,
                 likes: &[],
                 partition: PartitionClause::Of {
                     parent,

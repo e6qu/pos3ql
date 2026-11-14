@@ -4787,13 +4787,10 @@ fn build_partitioned_table_def(
                     parent.name
                 ));
             };
-            if !statement.columns.is_empty()
-                || !statement.constraints.is_empty()
-                || !statement.likes.is_empty()
-            {
+            if !statement.likes.is_empty() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
-                    "a partition cannot declare columns or table constraints"
+                    "a partition cannot declare LIKE clauses"
                 ));
             }
             for check in parent_def.checks() {
@@ -4831,6 +4828,7 @@ fn build_partitioned_table_def(
                     *name = None;
                 }
             }
+            partition_column_options(storage, &mut def, statement.columns, txid, arena)?;
             for index in 0..def.n_uniques {
                 let constraint = def.uniques[index];
                 def.uniques[index].name = auto_key_name(
@@ -4881,6 +4879,68 @@ fn build_partitioned_table_def(
             Ok(def)
         }
     }
+}
+
+/// A partition's options of its parent's columns (`b WITH OPTIONS NOT NULL
+/// DEFAULT 'x'`), as PostgreSQL's `MergeAttributes` applies them: each names
+/// a parent column once and adds a local NOT NULL, a default or a key.
+fn partition_column_options(
+    storage: &Storage,
+    def: &mut TableDefBuilder,
+    options: &[crate::sql::ast::ColumnDef],
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for (position, option) in options.iter().enumerate() {
+        let Some(column) = def.column_index(option.name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                option.name
+            ));
+        };
+        if options[..position]
+            .iter()
+            .any(|earlier| earlier.name == option.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column \"{}\" specified more than once",
+                option.name
+            ));
+        }
+        if option.generated_text.is_some() || option.identity.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a partition column option cannot add a generation expression or identity"
+            ));
+        }
+        let meta = &mut def.columns[column];
+        if option.default.is_some() {
+            meta.default = ddl::resolve_default(
+                option.name,
+                option.default,
+                option.default_text,
+                meta.ctype,
+                meta.type_mod,
+                storage,
+                txid,
+                arena,
+            )?;
+        }
+        meta.unique |= option.unique;
+        meta.primary |= option.primary;
+        if option.not_null || option.primary {
+            meta.not_null = match meta.not_null {
+                crate::storage::NotNullOrigin::Nullable => crate::storage::NotNullOrigin::Local,
+                inherited => inherited,
+            };
+            if let Some(name) = option.not_null_name {
+                def.set_not_null_constraint_name(column, SqlName::parse(name)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// PostgreSQL's notices for a column that several parents, or a parent and

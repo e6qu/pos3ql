@@ -1590,8 +1590,9 @@ pub(crate) struct ForeignSelectPlan<'a> {
     pub table_slot: usize,
     /// The columns the remote query returns, in table order.
     pub fetched: ColumnSet,
-    /// The `ORDER BY` columns the remote query sorts by.
-    pub ordered: ColumnSet,
+    /// The table columns `ORDER BY` keys name, in key order, which the scan
+    /// returns for the sort whether or not the remote query applies it.
+    pub sort_columns: &'a [usize],
     /// The conditions evaluated locally after the rows arrive.
     pub local_where: Option<&'a Expr<'a>>,
     pub order_pushed: bool,
@@ -1830,10 +1831,20 @@ fn plan_with<'a>(
         || !statement.distinct_on.is_empty();
     // ORDER BY ships when every key is a column of the table.
     let mut ordered = ColumnSet::from_low_word(0);
+    let sort_columns = arena
+        .alloc_slice_with(statement.order_by.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut sort_count = 0;
     let mut order_text = RemoteText::new();
     let mut order_pushed = !statement.order_by.is_empty() && !grouped && simple_items;
     for (index, key) in statement.order_by.iter().enumerate() {
         let column = order_column(deparser, statement, key);
+        if let Some(column) = column
+            && !sort_columns[..sort_count].contains(&column)
+        {
+            sort_columns[sort_count] = column;
+            sort_count += 1;
+        }
         match column {
             Some(column) if order_pushed && deparser.column_type(column).is_ok() => {
                 ordered.insert(column);
@@ -1911,7 +1922,7 @@ fn plan_with<'a>(
     Ok(ForeignSelectPlan {
         table_slot: slot,
         fetched,
-        ordered,
+        sort_columns: &sort_columns[..sort_count],
         local_where: conjoin(kept, arena)?,
         order_pushed,
         limit_pushed,

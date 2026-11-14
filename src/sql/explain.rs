@@ -3410,6 +3410,15 @@ pub(super) fn plan_select<'a>(
                 foreign_scan_node(
                     &mut scan, pushed, statement, scope, storage, txid, arena, aggregate,
                 )?;
+                // A local limit over the remote order passes the scan's
+                // sort columns up.
+                if pushed.order_pushed {
+                    for node in plan.nodes[..plan.count].iter_mut() {
+                        if node.name.as_str() == "Limit" {
+                            node.output = scan.output;
+                        }
+                    }
+                }
             }
             push_scan(&mut plan, scan)?;
         }
@@ -3465,6 +3474,69 @@ pub(super) fn plan_select<'a>(
     }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// A one-row INSERT's `Result` target list: each column's value as the
+/// planner coerced it, when the row names every column without `DEFAULT`.
+fn inserted_row_output(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    insert: &crate::sql::ast::Insert<'_>,
+    arena: &Arena,
+) -> Result<StackStr<256>, SqlError> {
+    let mut output = StackStr::new();
+    let table = storage.table_def(slot, txid);
+    let [row] = insert.rows else {
+        return Ok(output);
+    };
+    if row.len() != table.n_columns
+        || !insert.columns.is_empty()
+            && insert
+                .columns
+                .iter()
+                .zip(table.columns())
+                .any(|(named, column)| *named != column.name.as_str())
+        || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+    {
+        return Ok(output);
+    }
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined: &[],
+        pretty: false,
+        qualify: false,
+        domain_value: None,
+        folded: true,
+        bare: None,
+    };
+    for (value, column) in row.iter().zip(table.columns()) {
+        let Some(text) = crate::sql::catalog::deparse::deparse_expression(
+            &context,
+            value,
+            crate::sql::catalog::deparse::Destination::Assignment(column.ctype.oid()),
+            arena,
+        )?
+        else {
+            return Ok(StackStr::new());
+        };
+        if !output.is_empty() {
+            let _ = output.write_str(", ");
+        }
+        let _ = output.write_str(text);
+    }
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN output column list exceeds 256 bytes"
+        ));
+    }
+    Ok(output)
 }
 
 /// The plan of a foreign UPDATE or DELETE, as postgres_fdw's: one `Foreign
@@ -3711,7 +3783,7 @@ fn foreign_scan_node(
         }
     }
     scan.output = output;
-    for column in (0..table.n_columns).filter(|&column| pushed.ordered.contains(column)) {
+    for &column in pushed.sort_columns {
         let name = table.columns()[column].name.as_str();
         let projected = statement.items.iter().any(|item| match item {
             SelectItem::Wildcard(_) => true,
@@ -5113,6 +5185,11 @@ pub(super) fn plan_modification<'a>(
                 name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
                 alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
                 key: Some(NodeKey::new(block, Role::Values)),
+                output: if several {
+                    StackStr::new()
+                } else {
+                    inserted_row_output(storage, txid, slot, insert, arena)?
+                },
                 depth: 1,
                 rows: match statement {
                     Stmt::Insert(insert) => insert.rows.len() as u64,
@@ -5980,6 +6057,11 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
         "Insert" | "Update" | "Delete" | "Merge" => {
             kind.node_type = "ModifyTable";
             kind.operation = Some(name);
+        }
+        "Foreign Scan" => kind.operation = Some("Select"),
+        "Foreign Update" | "Foreign Delete" => {
+            kind.node_type = "Foreign Scan";
+            kind.operation = Some(&name["Foreign ".len()..]);
         }
         "Aggregate" => kind.strategy = Some("Plain"),
         "HashAggregate" => {

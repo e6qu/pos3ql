@@ -1,9 +1,9 @@
 //! Table expressions bound to the catalog objects they named when written.
 //!
-//! A CHECK constraint or a column default or generation expression keeps its
-//! SQL text and, in the table definition, the dependencies captured under the
-//! creator's search path. Before running or printing one, its text is bound to
-//! those identities under their current names, as PostgreSQL's stored trees
+//! A CHECK or exclusion constraint or a column default or generation
+//! expression keeps its SQL text and, in the table definition, the
+//! dependencies captured under the creator's search path. Before running or
+//! printing one, its text is bound to those identities under their current names, as PostgreSQL's stored trees
 //! name objects by OID: a later `search_path` or a rename changes nothing.
 
 use super::{Arena, Expr, SqlError, Storage};
@@ -76,24 +76,36 @@ impl CapturedDependencies {
     }
 }
 
-/// Refuses `text`, an exclusion constraint element or predicate, when it
-/// names a user-defined routine, operator or type. Exclusion constraints keep
-/// these expressions as plain text with no captured binding, so such an
-/// object could be dropped or replaced under the constraint.
-pub(crate) fn reject_unbound_exclusion_names<B: crate::storage::DefinitionBacking>(
+/// Captures what the expression elements and predicate of `exclusion`, a
+/// new constraint of `def`, name under the current search path.
+pub(crate) fn capture_exclusion_expression_dependencies(
     storage: &Storage,
-    def: &crate::storage::TableDefinition<B>,
-    text: &str,
+    def: &mut TableDefBuilder,
+    exclusion: &crate::storage::ExclusionConstraint,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let captured = collect_expression_dependencies(storage, def, text, txid, arena)?;
-    if let Some(dependency) = captured.entries().first() {
-        return Err(crate::sql_err!(
-            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
-            "exclusion constraint expressions cannot name user-defined objects such as \"{}\"",
-            dependency.name.as_str()
-        ));
+    for (position, element) in exclusion.elements().enumerate() {
+        if let crate::storage::ExclusionElement::Expression(text) = element {
+            capture_expression_dependencies(
+                storage,
+                def,
+                ExpressionOwner::ExclusionKey(exclusion.name, position as u8),
+                text,
+                txid,
+                arena,
+            )?;
+        }
+    }
+    if let Some(predicate) = &exclusion.predicate {
+        capture_expression_dependencies(
+            storage,
+            def,
+            ExpressionOwner::ExclusionPredicate(exclusion.name),
+            predicate.as_str(),
+            txid,
+            arena,
+        )?;
     }
     Ok(())
 }

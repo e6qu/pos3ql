@@ -357,13 +357,11 @@ pub(crate) fn sql_json_cast<'a>(
     if value.is_null() {
         return Ok(Datum::Null);
     }
+    // The type's input applies its modifier: a value too long for it fails
+    // rather than being cut as an explicit cast would.
     if let Some(target) = crate::sql::types::ColType::from_sql_name(type_name) {
         let value = crate::sql::eval::cast_to(value, target, arena)?;
-        return if type_mod == -1 {
-            Ok(value)
-        } else {
-            crate::sql::exec::apply_cast_typmod(value, target, type_mod, arena)
-        };
+        return crate::sql::exec::apply_typmod(value, target, type_mod, arena);
     }
     if let Some(catalog) = hooks.catalog {
         if let Datum::Json { text, .. } = value
@@ -389,11 +387,14 @@ pub(crate) fn sql_json_cast<'a>(
             return Ok(value);
         }
     }
-    Err(sql_err!(
-        sqlstate::UNDEFINED_OBJECT,
-        "type \"{}\" does not exist",
-        type_name
-    ))
+    Err(
+        crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
+            hooks
+                .catalog
+                .is_none_or(|catalog| catalog.type_schema_exists(schema))
+        })
+        .error(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +431,15 @@ fn sql_json_query_type(name: &str) -> &'static str {
         "bytea"
     } else {
         "text"
+    }
+}
+
+/// The ON ERROR behavior marker of a JSON_QUERY call whose options start at
+/// `tail`.
+fn error_code_of<'a>(args: &[&'a Expr<'a>], tail: usize) -> &'a str {
+    match *args[tail + 3] {
+        Expr::Str(value) => value,
+        _ => unreachable!("parser supplies SQL/JSON option markers"),
     }
 }
 
@@ -905,6 +915,7 @@ pub(crate) fn dispatch<'a>(
         && !name.starts_with("__json_array_")
         && !name.starts_with("__json_object_")
         && !name.starts_with("__json_serialize_")
+        && !name.starts_with("__json_fit_")
         && !name.starts_with("__json_exists_")
         && name != "__json_value"
         && !name.starts_with("__json_query_")
@@ -1344,10 +1355,86 @@ pub(crate) fn dispatch<'a>(
                 })
             }
             constructor if constructor.starts_with("__json_query_") => {
-                if args.len() < 8 || !(args.len() - 8).is_multiple_of(2) || star {
+                // A text-family call also names its RETURNING type and modifier.
+                let typed = constructor == "__json_query_text";
+                let options = if typed { 8 } else { 6 };
+                if args.len() < options + 2 || !(args.len() - options - 2).is_multiple_of(2) || star
+                {
                     return Err(arity_err("json_query", args.len()));
                 }
-                let tail = args.len() - 6;
+                let tail = args.len() - options;
+                let returning = typed.then(|| {
+                    let type_name = match *args[tail + 6] {
+                        Expr::Str(value) => value,
+                        _ => unreachable!("parser supplies the RETURNING type"),
+                    };
+                    let type_mod = match *args[tail + 7] {
+                        Expr::Int(value) => i32::try_from(value).unwrap_or(-1),
+                        _ => unreachable!("parser supplies the RETURNING modifier"),
+                    };
+                    (type_name, type_mod)
+                });
+                // The result converts as the RETURNING type's input does: a
+                // value it rejects takes the ON ERROR behavior.
+                let convert = |value: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+                    let Some((type_name, type_mod)) = returning else {
+                        return Ok(value);
+                    };
+                    // An array or row type is populated from the JSON, as
+                    // PostgreSQL's `json_populate_type` does; any other type
+                    // takes the text through its input.
+                    let converted =
+                        match (crate::sql::types::ColType::from_sql_name(type_name), value) {
+                            (
+                                Some(target @ crate::sql::types::ColType::Array(_)),
+                                Datum::Text(text),
+                            ) => json::parse(text, arena).and_then(|parsed| {
+                                json_value_to_type(
+                                    parsed,
+                                    target.oid(),
+                                    type_mod,
+                                    Datum::Null,
+                                    arena,
+                                    hooks,
+                                )
+                            }),
+                            (None, Datum::Text(text))
+                                if hooks.catalog.is_some_and(|catalog| {
+                                    catalog.user_type_oid(type_name).is_some_and(|oid| {
+                                        matches!(
+                                            crate::sql::types::ColType::from_oid(oid),
+                                            Some(
+                                                crate::sql::types::ColType::Composite(_)
+                                                    | crate::sql::types::ColType::Array(_)
+                                            )
+                                        )
+                                    })
+                                }) =>
+                            {
+                                sql_json_cast(
+                                    Datum::Json { text, jsonb: true },
+                                    type_name,
+                                    type_mod,
+                                    arena,
+                                    hooks,
+                                )
+                            }
+                            _ => sql_json_cast(value, type_name, type_mod, arena, hooks),
+                        };
+                    match converted {
+                        Ok(value) => Ok(value),
+                        Err(error) => sql_json_query_behavior(
+                            error_code_of(args, tail),
+                            args[tail + 1],
+                            error,
+                            constructor,
+                            arena,
+                            params,
+                            row,
+                            hooks,
+                        ),
+                    }
+                };
                 let (empty_default, error_default) = (args[tail], args[tail + 1]);
                 let marker = |index: usize| match *args[index] {
                     Expr::Str(value) => value,
@@ -1436,7 +1523,7 @@ pub(crate) fn dispatch<'a>(
                         unreachable!()
                     };
                     return if constructor.ends_with("_text") {
-                        Ok(Datum::Text(text))
+                        convert(Datum::Text(text))
                     } else if constructor.ends_with("_bytea") {
                         Ok(Datum::Bytea(text.as_bytes()))
                     } else {
@@ -1468,7 +1555,7 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     values[0].write(&mut buffer).map_err(|_| arena_full())?;
                 }
-                sql_json_result(buffer.as_str(), constructor, arena)
+                convert(sql_json_result(buffer.as_str(), constructor, arena)?)
             }
             "__json_value" => {
                 if args.len() < 8 || !(args.len() - 8).is_multiple_of(2) || star {
@@ -1623,6 +1710,48 @@ pub(crate) fn dispatch<'a>(
                     Err(_) if predicate.ends_with("_false") => Ok(Datum::Bool(false)),
                     Err(error) => Err(error),
                 }
+            }
+            "__json_fit_varchar" | "__json_fit_bpchar" => {
+                arity(2)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let length = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int4(length) => usize::try_from(length).ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "SQL/JSON length modifier is not a length"
+                    )
+                })?;
+                let text = match value {
+                    Datum::Text(text) | Datum::Json { text, .. } => text,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SQL/JSON character result is not text"
+                        ));
+                    }
+                };
+                // Excess made only of spaces is cut, as assignment allows.
+                let end = text
+                    .char_indices()
+                    .nth(length)
+                    .map_or(text.len(), |(at, _)| at);
+                if text[end..].chars().any(|c| c != ' ') {
+                    return Err(sql_err!(
+                        sqlstate::STRING_DATA_RIGHT_TRUNCATION,
+                        "value too long for type {}({})",
+                        if name == "__json_fit_varchar" {
+                            "character varying"
+                        } else {
+                            "character"
+                        },
+                        length
+                    ));
+                }
+                Ok(Datum::Text(&text[..end]))
             }
             "__json_serialize_text" | "__json_serialize_bytea" => {
                 arity(1)?;

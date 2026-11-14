@@ -344,6 +344,7 @@ pub struct Responder<'b> {
 pub(crate) struct AttemptMark {
     output: OutputMark,
     eval_messages: usize,
+    folded_notices: usize,
 }
 
 impl AttemptMark {
@@ -466,7 +467,8 @@ fn write_wire_text(
     }
     match value {
         Datum::Char(0) => {}
-        Datum::Char(byte @ 0x20..=0x7e) => out(&[*byte]),
+        // PostgreSQL's `charout` escapes only bytes with the high bit set.
+        Datum::Char(byte @ 0x01..=0x7f) => out(&[*byte]),
         Datum::Char(byte) => out(&[
             b'\\',
             b'0' + (byte >> 6),
@@ -984,6 +986,7 @@ impl<'b> Responder<'b> {
         AttemptMark {
             output: self.mark(),
             eval_messages: crate::sql::eval::eval_message_mark(),
+            folded_notices: crate::sql::eval::folded_notice_mark(),
         }
     }
 
@@ -992,6 +995,7 @@ impl<'b> Responder<'b> {
     pub(crate) fn restart_attempt(&mut self, mark: AttemptMark) -> Result<(), SqlError> {
         self.truncate_to(mark.output)?;
         crate::sql::eval::truncate_eval_messages(mark.eval_messages);
+        crate::sql::eval::truncate_folded_notices(mark.folded_notices);
         Ok(())
     }
 

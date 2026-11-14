@@ -891,6 +891,60 @@ pub(crate) fn for_each_dependency(
             },
         )?;
     }
+    // A publication's explicitly listed table goes with its publication
+    // and its table, and depends on each column of its column list.
+    crate::sql::catalog::visit_publication_relations(storage, txid, &mut |relation| {
+        let table_oid = user_table_oid(storage, relation.table);
+        push!(
+            crate::sql::catalog::PG_PUBLICATION_REL_OID,
+            relation.oid,
+            crate::sql::catalog::PG_PUBLICATION_OID,
+            relation.publication_oid,
+            0,
+            "a",
+        )?;
+        push!(
+            crate::sql::catalog::PG_PUBLICATION_REL_OID,
+            relation.oid,
+            PG_CLASS_OID,
+            table_oid,
+            0,
+            "a",
+        )?;
+        let definition = storage.table_def(relation.table, txid);
+        for column in 0..definition.n_columns {
+            if relation.columns.contains(column) {
+                push!(
+                    crate::sql::catalog::PG_PUBLICATION_REL_OID,
+                    relation.oid,
+                    PG_CLASS_OID,
+                    table_oid,
+                    i32::from(definition.attribute_number(column)),
+                    "n",
+                )?;
+            }
+        }
+        Ok(())
+    })?;
+    // A table records its access method unless the method is pinned
+    // (`heap`).
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        if let crate::storage::TableAccessMethod::Catalog(method) =
+            storage.table_def(table, txid).access_method
+        {
+            push!(
+                PG_CLASS_OID,
+                user_table_oid(storage, table),
+                crate::sql::catalog::PG_AM_OID,
+                method.get(),
+                0,
+                "n",
+            )?;
+        }
+    }
     type_dependencies(storage, txid, arena, visit)
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare psql data verbatim and diagnostics with their SQL source positions."""
+"""Compare psql data verbatim and diagnostics of every severity with their SQL source positions."""
 
 import argparse
 import json
@@ -43,7 +43,7 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
     in_context = False
 
     def finish():
-        if current is None or current["severity"] in ("NOTICE", "WARNING"):
+        if current is None:
             return
         record = {key: value for key, value in current.items()
                   if key not in ("message", "context")}
@@ -64,23 +64,22 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
         if start and (start[1] is not None or current is None or current["source"] is None):
             finish()
             source, number, severity, body = start.groups()
-            if severity in ("NOTICE", "WARNING"):
-                state = None
-                message = []
-            elif input_diagnostics == "sqlstate":
+            # Notices and warnings carry an SQLSTATE like errors do, so every
+            # severity is compared with the same rules.
+            if input_diagnostics == "sqlstate":
                 state = re.fullmatch(r"([0-9A-Z]{5})", body)
                 message = []
             else:
                 state = re.fullmatch(r"([0-9A-Z]{5}): (.*)", body)
                 message = [state[2]] if state else []
-            if state is None and severity not in ("NOTICE", "WARNING"):
+            if state is None:
                 raise ValueError(f"malformed {input_diagnostics} diagnostic: {line}")
             current = {
                 "source": source,
                 "line": (copy_positions.get((source, int(number)), int(number))
                          if number is not None else None),
                 "severity": severity,
-                "sqlstate": None if state is None else state[1],
+                "sqlstate": state[1],
                 "message": message,
                 "context": [],
             }

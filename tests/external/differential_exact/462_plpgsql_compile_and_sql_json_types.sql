@@ -1,0 +1,137 @@
+-- PL/pgSQL compile errors, analysis positions, SQL/JSON RETURNING catalog
+-- types, polymorphic casts and UNNEST column definition lists.
+CREATE TABLE t (a int, b text);
+CREATE FUNCTION f1() RETURNS int LANGUAGE plpgsql AS $$ DECLARE v t.nope%TYPE; BEGIN RETURN 1; END $$;
+CREATE FUNCTION f2() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  w int;
+  v nope%ROWTYPE;
+BEGIN RETURN 1; END $$;
+CREATE FUNCTION f3() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  IF 1 + THEN RETURN 1; END IF;
+  RETURN 2;
+END $$;
+CREATE FUNCTION f4() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  SELEC 1;
+  RETURN 2;
+END $$;
+CREATE FUNCTION f5() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  x := 1;
+  RETURN 2;
+END $$;
+CREATE FUNCTION f6() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  IF THEN RETURN 1; END IF;
+  RETURN 2;
+END $$;
+CREATE FUNCTION f7() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE v int := (1 +);
+BEGIN
+  RETURN v;
+END $$;
+CREATE FUNCTION f8() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 +;
+  RETURN 2;
+END $$;
+CREATE FUNCTION f9() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  w int NOT NULL;
+BEGIN RETURN 1; END $$;
+CREATE FUNCTION f10() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  w int;
+BEGIN
+  w.x := 1; RETURN 1; END $$;
+CREATE FUNCTION f11() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'zzzzz'; END $$;
+SELECT f11();
+CREATE FUNCTION f12() RETURNS int LANGUAGE plpgsql AS $$ DECLARE v anyelement; BEGIN RETURN 1; END $$;
+CREATE FUNCTION h1() RETURNS int LANGUAGE plpgsql AS $$ BEGIN SELECT 1 INTO y; RETURN 1; END $$;
+CREATE FUNCTION h2() RETURNS int LANGUAGE plpgsql AS $$ DECLARE n int; BEGIN GET DIAGNOSTICS y = ROW_COUNT; RETURN 1; END $$;
+CREATE FUNCTION h3() RETURNS int LANGUAGE plpgsql AS $$ BEGIN found := true; RETURN 1; END $$;
+CREATE FUNCTION h4() RETURNS int LANGUAGE plpgsql AS $$ BEGIN BEGIN NULL; EXCEPTION WHEN others THEN sqlstate := 'x'; END; RETURN 1; END $$;
+CREATE FUNCTION h5(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN h5.a := 2; $1 := 3; RETURN a; END $$;
+CREATE FUNCTION h6() RETURNS int LANGUAGE plpgsql AS $$ BEGIN FOR i IN 1..2 LOOP i := 3; END LOOP; RETURN 1; END $$;
+CREATE FUNCTION h7() RETURNS int LANGUAGE plpgsql AS $$ BEGIN x[1] := 3; RETURN 1; END $$;
+CREATE FUNCTION h9() RETURNS TABLE (o int) LANGUAGE plpgsql AS $$ BEGIN o := 3; RETURN NEXT; END $$;
+CREATE FUNCTION h10() RETURNS int LANGUAGE plpgsql AS $$ BEGIN $1 := 3; RETURN 1; END $$;
+CREATE FUNCTION h12() RETURNS int LANGUAGE plpgsql AS $$ BEGIN X := 3; RETURN 1; END $$;
+CREATE FUNCTION h13() RETURNS int LANGUAGE plpgsql AS $$ BEGIN "X" := 3; RETURN 1; END $$;
+CREATE FUNCTION h14() RETURNS int LANGUAGE plpgsql AS $$ BEGIN FOR r IN SELECT 1 AS q LOOP r.q := 3; END LOOP; RETURN 1; END $$;
+CREATE FUNCTION h15() RETURNS int LANGUAGE plpgsql AS $$ BEGIN x = 3; RETURN 1; END $$;
+CREATE FUNCTION h16() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN tg_name := 'x'; new.a := 1; RETURN NEW; END $$;
+DO $$ DECLARE v t.nope%TYPE; BEGIN END $$;
+DO $$ BEGIN y := 3; END $$;
+DO $$ BEGIN RAISE EXCEPTION SQLSTATE 'zzzzz'; END $$;
+DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'zzz'; END $$;
+DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'division_by_zero'; END $$;
+DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'ZZZZZ'; END $$;
+DO $$ DECLARE c text; BEGIN RAISE EXCEPTION USING ERRCODE = c; END $$;
+DO $$ BEGIN RAISE EXCEPTION SQLSTATE '0000'; END $$;
+CREATE TABLE d1 (a int DEFAULT 1::nope);
+CREATE TABLE d2 (a int DEFAULT nope_fn());
+CREATE TABLE d3 (a int DEFAULT abs(1::nope.t));
+CREATE TABLE d4 (a int CHECK (a + 1));
+CREATE TABLE d5 (a int CHECK (nope_fn(a)));
+CREATE TABLE d6 (a int CHECK ('x'::nope = a));
+CREATE TABLE d7 (a int CHECK (a::nope IS NULL));
+CREATE TABLE d8 (a int);
+ALTER TABLE d8 ADD CHECK (a::nope > 0);
+ALTER TABLE d8 ADD CHECK (a + 1);
+ALTER TABLE d8 ALTER COLUMN a SET DEFAULT 1::nope;
+SELECT * FROM json_to_record('{"a":1}') AS x(a nope);
+SELECT * FROM json_populate_record(NULL::nope, '{}');
+SELECT * FROM json_populate_record(NULL::nope.t, '{}');
+SELECT * FROM generate_series(1::nope, 2);
+SELECT pg_typeof(NULL::nope.t);
+SELECT pg_typeof(1::nope.t);
+CREATE DOMAIN dt AS text CHECK (length(VALUE) < 5);
+CREATE DOMAIN dt2 AS text CHECK (length(VALUE) < 50);
+CREATE DOMAIN di AS int;
+CREATE DOMAIN dj AS jsonb;
+CREATE TYPE en AS ENUM ('a', 'b');
+SELECT JSON_VALUE('"abc"', '$' RETURNING dt);
+SELECT JSON_VALUE('"abcdefg"', '$' RETURNING dt);
+SELECT JSON_VALUE('"z"', '$' RETURNING en ERROR ON ERROR);
+SELECT JSON_QUERY('"abc"', '$' RETURNING dt);
+SELECT JSON_QUERY('"a"', '$' RETURNING en OMIT QUOTES);
+SELECT JSON_QUERY('7', '$' RETURNING di);
+SELECT JSON_QUERY('7', '$' RETURNING int);
+SELECT JSON_QUERY('"7"', '$' RETURNING int);
+SELECT JSON_QUERY('"7"', '$' RETURNING int ERROR ON ERROR);
+SELECT JSON_QUERY('{"a":1}', '$' RETURNING dj);
+SELECT JSON_QUERY('true', '$' RETURNING bool);
+SELECT JSON_QUERY('[1,2]', '$' RETURNING int[]);
+SELECT JSON_QUERY('"abcdef"', '$' RETURNING varchar(3));
+SELECT JSON_QUERY('"abcdef"', '$' RETURNING varchar(3) ERROR ON ERROR);
+SELECT JSON_QUERY('"abcdef"', '$' RETURNING varchar(3) OMIT QUOTES);
+SELECT JSON_QUERY('"abc  "', '$' RETURNING varchar(3) OMIT QUOTES);
+SELECT JSON_QUERY('"abcdef"', '$' RETURNING varchar(3) DEFAULT 'zz' ON ERROR);
+SELECT JSON_QUERY('"abcdef"', '$' RETURNING char(3) ERROR ON ERROR);
+SELECT JSON_VALUE('"abcdef"', '$' RETURNING varchar(3));
+SELECT JSON_VALUE('"abcdef"', '$' RETURNING varchar(3) ERROR ON ERROR);
+SELECT JSON_VALUE('1', '$' RETURNING nope);
+SELECT JSON_OBJECT('a': 1 RETURNING dt2);
+SELECT JSON_OBJECT('a': 1 RETURNING dt);
+SELECT JSON_OBJECT('a': 1 RETURNING di);
+SELECT JSON_OBJECT('a': 1 RETURNING dj);
+SELECT JSON_OBJECT('a': 1 RETURNING en);
+SELECT JSON_OBJECT('a': 1 RETURNING nope);
+SELECT JSON_ARRAY(1 RETURNING dt2);
+SELECT JSON_SERIALIZE('1' RETURNING dt2);
+SELECT JSON_ARRAYAGG(1 RETURNING dt2);
+SELECT JSON_OBJECTAGG('k': 1 RETURNING dt2);
+SELECT pg_typeof(JSON_OBJECT('a': 1 RETURNING dt2)), pg_typeof(JSON_QUERY('7', '$' RETURNING di));
+SELECT * FROM JSON_TABLE('{"a":"abcdef"}', '$' COLUMNS (a varchar(3) PATH '$.a', b dt PATH '$.a', c en PATH '$.a'));
+SELECT 1::anyelement, NULL::anyelement, '1'::anycompatible;
+SELECT 1::anyarray;
+SELECT ARRAY[1]::anynonarray;
+SELECT ARRAY[1]::anyelement;
+SELECT 'x'::anynonarray, pg_typeof(2.5::anycompatible);
+SELECT x::anyelement FROM (VALUES (1), (2)) v(x) ORDER BY 1;
+SELECT * FROM unnest(ARRAY[1,2]) AS u(x int);
+SELECT * FROM unnest(ARRAY[1,2], ARRAY['a']) AS u(x int, y text);
+SELECT * FROM ROWS FROM (unnest(ARRAY[1,2]) AS (x int));

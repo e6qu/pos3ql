@@ -334,6 +334,20 @@ mod window;
 
 mod ddl;
 
+/// One part of a composed type name: double-quoted when it holds a `.`, so
+/// the type catalog's split (`split_type_name`) finds the qualifying dot.
+struct ComposedTypePart<'a>(&'a str);
+
+impl core::fmt::Display for ComposedTypePart<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.contains('.') {
+            write!(formatter, "\"{}\"", self.0)
+        } else {
+            formatter.write_str(self.0)
+        }
+    }
+}
+
 struct TypeInputSources<'a> {
     strings: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
     candidates: ArenaList<'a, super::type_inputs::Candidate<'a>>,
@@ -832,6 +846,44 @@ pub(crate) fn parse_query_with_string_parameters<'a>(
             sqlstate: super::eval::SqlState::known(super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED),
             message: crate::stack_format!(192, "query too large for SQL arena"),
         })
+}
+
+/// Parses a PL/pgSQL expression, keeping the grammar error and its cursor
+/// so the routine can position it in its body.
+pub(crate) fn parse_procedural_expression<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    let expression = parser.expression(0)?;
+    if parser.peeked != Tok::Eof {
+        return Err(parser.syntax_error_here());
+    }
+    Ok(expression)
+}
+
+/// Checks that a PL/pgSQL statement parses as SQL, keeping the grammar
+/// error and its cursor.
+pub(crate) fn parse_procedural_statement(sql: &str, arena: &Arena) -> Result<(), ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    while parser.next_stmt()?.is_some() {}
+    Ok(())
+}
+
+/// Parses a PL/pgSQL query, keeping the grammar error and its cursor.
+pub(crate) fn parse_procedural_query<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, ParseError> {
+    let mut parser = Parser::new(sql, arena)?;
+    let select = parser.query_select()?;
+    if parser.peeked != Tok::Eof {
+        return Err(parser.syntax_error_here());
+    }
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| parser.arena_full("query too large for SQL arena"))
 }
 
 /// Cursor plans contain exactly one command. Parse the complete input before
@@ -1707,6 +1759,50 @@ impl<'a> Parser<'a> {
             ))?;
         }
         Ok((second, third))
+    }
+
+    /// The rest of a type name after `first.second` when another `.` follows,
+    /// as PostgreSQL's `DeconstructQualifiedName`: `database.schema.type` must
+    /// name the session's database, and a longer name is improper. Both are
+    /// analysis errors without a cursor. Returns the schema, the type name and
+    /// whether the type name was quoted.
+    fn catalog_qualified_type_name(
+        &mut self,
+        first: &'a str,
+        second: &'a str,
+    ) -> Result<(&'a str, &'a str, bool), ParseError> {
+        let at = self.peek_at;
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{first}.{second}");
+        let mut parts = 2;
+        let (mut schema, mut base, mut base_quoted) = (first, second, false);
+        while self.eat_op(".")? {
+            let quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+            let part = self.any_ident("type name")?;
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            parts += 1;
+            (schema, base, base_quoted) = (base, part, quoted);
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 3 {
+            self.analysis_error(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ))?;
+        } else if !crate::sql::eval::funcs::system::is_current_database(first) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: {written}"),
+            ))?;
+        }
+        Ok((schema, base, base_quoted))
     }
 
     /// PostgreSQL's `any_name`: a `ColId` optionally followed by dotted
@@ -4332,13 +4428,38 @@ impl<'a> Parser<'a> {
         };
         // PostgreSQL expands only an unqualified FROM UNNEST with multiple
         // positional inputs into independent catalog calls in lockstep.
+        // A column definition list follows the arrays as a last argument.
+        let definitions_at = match source.func_args.and_then(|arguments| arguments.last()) {
+            Some(Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name: "__json_record_columns",
+                source_position,
+                ..
+            }) => Some(source_position.get()),
+            _ => None,
+        };
         if source.schema.is_none()
             && source.table == "unnest"
             && !source.func_variadic
             && source.func_argument_names.is_empty()
             && let Some(arguments) = source.func_args
-            && arguments.len() > 1
+            && arguments.len() - usize::from(definitions_at.is_some()) > 1
         {
+            if let Some(at) = definitions_at {
+                return Err(ParseError {
+                    at: at.unwrap_or(self.peek_at),
+                    message: StackStr::from_str(
+                        "UNNEST() with multiple arguments cannot have a column definition list",
+                    ),
+                    near: None,
+                    sqlstate: sqlstate::SYNTAX_ERROR,
+                    cursor: at,
+                    hint: Some(
+                        "Use separate UNNEST() calls inside ROWS FROM(), and attach a column definition list to each one.",
+                    ),
+                    detail: None,
+                });
+            }
             let mut functions = ArenaList::new(self.arena);
             for argument in arguments {
                 let input = self.arena_slice(&[*argument])?;
@@ -9055,6 +9176,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("conflict")?;
         let mut target = ArenaList::new(self.arena);
         let mut constraint = None;
+        let mut target_where = None;
         if self.eat_op("(")? {
             loop {
                 let start = self.peek_at;
@@ -9079,6 +9201,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            if self.eat_ident("where")? {
+                target_where = Some(self.expression(0)?);
+            }
         } else if self.eat_ident("on")? {
             // `ON CONFLICT ON CONSTRAINT name`.
             self.expect_ident("constraint")?;
@@ -9101,6 +9226,7 @@ impl<'a> Parser<'a> {
         Ok(Some(OnConflict {
             target: target.as_slice(),
             constraint,
+            target_where,
             update,
             update_where,
         }))
@@ -9804,6 +9930,9 @@ impl<'a> Parser<'a> {
             name,
             array: false,
         };
+        if name.contains('"') && name.contains('.') {
+            return Err(self.err_here("type name parts cannot hold both '.' and '\"'"));
+        }
         // PostgreSQL's grammar turns these unquoted keywords into
         // `pg_catalog`-qualified internal names.
         let keyword = !quoted
@@ -9836,27 +9965,56 @@ impl<'a> Parser<'a> {
         // it aliases same-named domains/enums in different schemas.
         if self.peeked == Tok::Op(".") {
             self.record_namespace(source)?;
-            let schema = name;
+            let mut schema = name;
             self.advance()?;
-            let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
-            let base = self.any_ident("type name")?;
+            let mut base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+            let mut base = self.any_ident("type name")?;
+            if base.contains('"') && base.contains('.') {
+                return Err(self.err_here("type name parts cannot hold both '.' and '\"'"));
+            }
+            if self.peeked == Tok::Op(".") {
+                (schema, base, base_quoted) = self.catalog_qualified_type_name(schema, base)?;
+            }
             written = WrittenTypeName {
                 schema: Some(schema),
                 name: base,
                 array: false,
             };
-            name = if schema == "pg_catalog" {
+            // `pg_catalog.name` names a built-in only by its `pg_type` name
+            // (`pg_catalog.integer` is no type); any other keeps its schema so
+            // the miss names it as written.
+            name = if schema == "pg_catalog"
+                && crate::sql::catalog::builtin_type_rows()
+                    .iter()
+                    .any(|row| row.name == base)
+            {
                 quoted = base_quoted;
                 base
             } else {
                 quoted = false;
                 let composed = self
                     .arena
-                    .alloc_str(stack_format!(128, "{}.{}", schema, base).as_str())
+                    .alloc_str(
+                        stack_format!(
+                            136,
+                            "{}.{}",
+                            ComposedTypePart(schema),
+                            ComposedTypePart(base)
+                        )
+                        .as_str(),
+                    )
                     .map_err(|_| self.err_here("type name too long"))?;
                 self.note_composed_source(composed, source.start)?;
                 composed
             };
+        } else if name.contains('.') {
+            // A quoted unqualified name holding a `.` stays one name.
+            let composed = self
+                .arena
+                .alloc_str(stack_format!(136, "{}", ComposedTypePart(name)).as_str())
+                .map_err(|_| self.err_here("type name too long"))?;
+            self.note_composed_source(composed, source.start)?;
+            name = composed;
         }
         // SQL `char` is the blank-padded character type. Only the quoted
         // catalog spelling names PostgreSQL's distinct one-byte OID 18 type.
@@ -12835,7 +12993,11 @@ mod tests {
             let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
                 panic!("empty password did not parse")
             };
-            assert_eq!(options.password, Some(None));
+            // Execution clears it with PostgreSQL's notice.
+            assert!(matches!(
+                options.password,
+                Some(Some(crate::sql::ast::RolePasswordSpec::Plaintext("")))
+            ));
         });
     }
 

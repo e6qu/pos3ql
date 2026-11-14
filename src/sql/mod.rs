@@ -91,6 +91,7 @@ pub mod txn;
 pub(crate) mod type_input_plans;
 pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
+pub(crate) mod type_name_miss;
 pub mod types;
 pub mod tzif;
 pub(crate) mod unicode;
@@ -203,8 +204,40 @@ type StatementWith<'a> = (
     &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
 );
 
-type ReturningCapture<'a> = dyn for<'row> FnMut(&Storage, u32, &dyn SequenceAccess, &[Datum<'row>]) -> Result<(), SqlError>
-    + 'a;
+/// Where a nested data change's RETURNING rows go instead of the client.
+pub(crate) trait ReturningSink {
+    fn row(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        sequences: &dyn SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError>;
+
+    /// How many rows the sink asks for, as an executor run with a row
+    /// count: once the data change has returned that many rows it
+    /// processes no further rows and completes normally for the rows it has.
+    fn row_limit(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<F> ReturningSink for F
+where
+    F: for<'row> FnMut(&Storage, u32, &dyn SequenceAccess, &[Datum<'row>]) -> Result<(), SqlError>,
+{
+    fn row(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        sequences: &dyn SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError> {
+        self(storage, txid, sequences, values)
+    }
+}
+
+type ReturningCapture<'a> = dyn ReturningSink + 'a;
 
 fn intrinsic_uuid_parameter_oids(
     written_name: &str,
@@ -6861,19 +6894,6 @@ impl Engine {
             return Err(error);
         }
         self.work.reset();
-        if let Err(error) =
-            exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
-        {
-            // A foreign key check waiting for its parent row's lock keeps
-            // the admission, the completed checks and their locks, and
-            // continues when the commit runs again.
-            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
-                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
-            {
-                self.rollback_txn(txn, guc);
-            }
-            return Err(error);
-        }
         if txn.isolation == TransactionIsolation::Serializable
             && (!txn.touched().is_empty() || !txn.ddl().is_empty())
             && let Err(error) = self.storage.validate_serializable(txn.txid)
@@ -8938,7 +8958,7 @@ impl Engine {
                         owner: entry.ownership.owner_to(txn.txid),
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Server => {
@@ -8949,7 +8969,7 @@ impl Engine {
                         owner: entry.ownership.owner_to(txn.txid),
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Mapping => {
@@ -8959,14 +8979,14 @@ impl Engine {
                         created_at: entry.created_at,
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Table => {
                     let entry = self.storage.foreign_table_entry(slot as usize);
                     foreign_table_definition = entry
                         .visible_to(txn.txid)
-                        .then(|| entry.definition_for(txn.txid));
+                        .then(|| *entry.definition_for(txn.txid));
                     WalOp::SetForeignTable {
                         slot: slot as u16,
                         created_at: entry.created_at,
@@ -9708,8 +9728,6 @@ impl Engine {
         txn.rewind_statistics(mark.statistics);
         txn.rewind_subscription_advances(mark.subscription_advances);
         txn.rewind_constraints(
-            mark.constraint_obligations,
-            mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
             (
@@ -10941,35 +10959,6 @@ impl Engine {
         }
         if mode == ast::ConstraintMode::Immediate {
             if matches!(targets, ast::ConstraintTargets::All) {
-                if let Err(error) = exec::constraints::validate_deferred_constraints(
-                    &self.storage,
-                    txn,
-                    false,
-                    arena,
-                ) {
-                    return Ok(Err(error));
-                }
-            } else {
-                for identity in identities[..count].iter().copied() {
-                    while let Some((index, obligation)) = txn.deferred_constraint_for(identity) {
-                        if let Err(error) = exec::constraints::validate_constraint_obligation(
-                            &self.storage,
-                            identity,
-                            obligation.rowid,
-                            txn.txid,
-                            txn.isolation,
-                            self.storage.validation_read(),
-                            arena,
-                        ) {
-                            return Ok(Err(error));
-                        }
-                        if let Err(error) = txn.complete_deferred_constraint(index) {
-                            return Ok(Err(error));
-                        }
-                    }
-                }
-            }
-            if matches!(targets, ast::ConstraintTargets::All) {
                 if let Err(error) = self.fire_constraint_trigger_boundary(
                     txn,
                     guc,
@@ -11028,7 +11017,7 @@ impl Engine {
             .alloc_slice_with(count, |_| types::oid::TEXT)
             .map_err(|_| eval::arena_full())?;
         for (target, name) in types.iter_mut().zip(names) {
-            let resolved = exec::resolve_routine_type(&self.storage, txid, name)?;
+            let resolved = exec::resolve_routine_type_at(&self.storage, txid, name)?;
             if resolved.polymorphic_type().is_some() {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -11040,11 +11029,7 @@ impl Engine {
                 .storage
                 .routine_type_oid(resolved.ctype, resolved.user_type, txid)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        name
-                    )
+                    type_name_miss::TypeNameMiss::in_storage(&self.storage, txid, name).error()
                 })?;
         }
         Ok(types)
@@ -12199,7 +12184,6 @@ impl Engine {
             responder,
             inserted,
         )?;
-        exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -12208,7 +12192,7 @@ impl Engine {
             responder,
             boundary,
         )?;
-        txn.compact_completed_constraints();
+        txn.compact_trigger_events();
         Ok(())
     }
 
@@ -13221,14 +13205,6 @@ impl Engine {
                 };
                 let outcome = outcome
                     .and_then(|()| {
-                        exec::constraints::validate_deferred_constraints(
-                            &self.storage,
-                            txn,
-                            true,
-                            arena,
-                        )
-                    })
-                    .and_then(|()| {
                         self.fire_constraint_trigger_boundary(
                             txn,
                             guc,
@@ -13306,9 +13282,13 @@ impl Engine {
                             } else {
                                 sequence_scope.discard(guc.seq_session());
                             }
+                            // The resumed commit only finishes the staged
+                            // transaction: the notices and warnings its
+                            // deferred triggers or index phases already sent
+                            // stay, as PostgreSQL sends them once.
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
-                                output_mark,
+                                output_mark: responder.mark(),
                                 wait: if txn.staged_commit().is_some()
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {
@@ -13419,7 +13399,7 @@ impl Engine {
                         wait: crate::sql::StatementWait::Lock,
                     });
                 }
-                txn.compact_completed_constraints();
+                txn.compact_trigger_events();
                 // Only the last statement's tag waits for the commit.
                 txn.held_command_complete = responder
                     .take_held_command_complete()
@@ -13961,14 +13941,6 @@ impl Engine {
                                 Err(error) => Err(error),
                             }
                             .and_then(|()| {
-                                exec::constraints::validate_deferred_constraints(
-                                    &self.storage,
-                                    txn,
-                                    true,
-                                    arena,
-                                )
-                            })
-                            .and_then(|()| {
                                 self.fire_constraint_trigger_boundary(
                                     txn,
                                     guc,
@@ -14035,7 +14007,7 @@ impl Engine {
                                         wait: crate::sql::StatementWait::Lock,
                                     });
                                 }
-                                txn.compact_completed_constraints();
+                                txn.compact_trigger_events();
                                 if immediate.is_none()
                                     && index_completion.is_none()
                                     && !matches!(
@@ -14335,7 +14307,7 @@ impl Engine {
                     return Ok(ExtendedExecutionStatus::Complete(false));
                 }
             };
-            txn.compact_completed_constraints();
+            txn.compact_trigger_events();
             let response_mark = responder.mark();
             responder.function_call_response(&value, binary_result)?;
             if txn.is_implicit()
@@ -17481,6 +17453,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let capturing = capture.is_some();
+        let row_limit = capture.as_deref().and_then(ReturningSink::row_limit);
         let outcome = responder.without_command_complete(|responder| {
             Self::execute_data_modification_inner(
                 storage,
@@ -17504,16 +17477,20 @@ impl Engine {
         if outcome.is_err() {
             return Ok(outcome);
         }
-        if let Err(error) = exec::fire_view_statement_triggers(
-            storage,
-            txn,
-            arena,
-            &mut exec::TriggerServices::new(guc.seq_session(), cursors, row_buffers),
-            responder,
-            view,
-            statement,
-            false,
-        ) {
+        // A write its RETURNING destination stopped never reaches the end of
+        // its rows, so its AFTER STATEMENT triggers do not fire.
+        if row_limit.is_none_or(|limit| affected < limit)
+            && let Err(error) = exec::fire_view_statement_triggers(
+                storage,
+                txn,
+                arena,
+                &mut exec::TriggerServices::new(guc.seq_session(), cursors, row_buffers),
+                responder,
+                view,
+                statement,
+                false,
+            )
+        {
             return Ok(Err(error));
         }
         if capturing {
@@ -19859,6 +19836,16 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let routine = &match exec::resolve_routine_type_references(
+            &self.storage,
+            txn.txid,
+            routine,
+            arena,
+            responder,
+        )? {
+            Ok(routine) => routine,
+            Err(error) => return Ok(Err(error)),
+        };
         let declaration = match exec::resolve_routine_declaration(&self.storage, txn, routine, guc)
         {
             Ok(declaration) => declaration,
@@ -22892,6 +22879,7 @@ impl Engine {
         let _ = eval::take_diagnostic();
         if reset_workspace {
             eval::clear_eval_messages();
+            eval::clear_folded_notices();
             event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();
@@ -23586,9 +23574,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateExtension {
@@ -27131,6 +27122,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let required_package = match self
                     .storage
                     .extension_package_for_version(required.as_str(), None)
@@ -27235,6 +27235,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let namespace = self
                     .storage
                     .extension(plan.extension)
@@ -29040,13 +29049,8 @@ impl Engine {
         }
         if let Some(type_name) = type_name
             && let Err(error) = exec::resolve_routine_type(&self.storage, txid, type_name)
-            && error.sqlstate == eval::sqlstate::UNDEFINED_OBJECT
+            && type_name_miss::is_type_name_miss(&error)
         {
-            let error = sql_err!(
-                eval::sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                type_name
-            );
             if let Some(deferred_at) = deferred_at {
                 error_position::restore_position(&error, deferred_at);
             }

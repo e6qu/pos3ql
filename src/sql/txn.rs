@@ -44,8 +44,6 @@ pub struct Savepoint {
     pub notify_payload_mark: usize,
     pub listen_mark: usize,
     pub subscription_advance_mark: usize,
-    pub constraint_obligation_mark: usize,
-    pub constraint_completion_mark: usize,
     pub constraint_mode_mark: usize,
     pub constraint_rename_mark: usize,
     pub trigger_event_mark: crate::sql::trigger_events::TriggerEventMark,
@@ -70,8 +68,6 @@ pub(crate) struct StatementMark {
     pub notification_payload: usize,
     pub listen_ops: usize,
     pub subscription_advances: usize,
-    pub constraint_obligations: usize,
-    pub constraint_completions: usize,
     pub constraint_modes: usize,
     pub constraint_renames: usize,
     pub trigger_events: crate::sql::trigger_events::TriggerEventMark,
@@ -80,7 +76,7 @@ pub(crate) struct StatementMark {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TransactionEffectMark([u64; 15]);
+pub(crate) struct TransactionEffectMark([u64; 13]);
 
 #[derive(Clone, Copy)]
 pub(super) struct WriteCompletionBoundary {
@@ -522,8 +518,6 @@ pub struct TxnState {
     /// Publisher positions staged with the local transaction that applied
     /// them.  They are journaled immediately before the transaction marker.
     subscription_advances: FixedVec<crate::storage::SubscriptionAdvance>,
-    deferred_constraints: FixedVec<ConstraintObligation>,
-    completed_constraints: FixedVec<usize>,
     constraint_modes: FixedVec<ConstraintModeChange>,
     constraint_renames: FixedVec<ConstraintLifecycle>,
     trigger_events: crate::sql::trigger_events::TriggerEventQueue,
@@ -873,14 +867,6 @@ pub(crate) enum ConstraintIdentity {
     },
 }
 
-/// One row whose transaction-visible state must satisfy a deferred
-/// constraint at the next applicable boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConstraintObligation {
-    pub(crate) constraint: ConstraintIdentity,
-    pub(crate) rowid: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConstraintModeChange {
     /// `None` represents `SET CONSTRAINTS ALL` without expanding catalog state
@@ -895,9 +881,10 @@ pub(crate) struct DeferredTriggerTuple {
     pub(crate) length: u32,
 }
 
-/// Which side of a foreign key a queued check protects.
+/// What a queued key check protects: a side of a foreign key, or a
+/// deferrable unique or exclusion key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForeignKeyCheck {
+pub(crate) enum KeyCheck {
     /// An inserted or updated referencing row's key must have a referenced
     /// row (PostgreSQL's `RI_FKey_check_ins` and `RI_FKey_check_upd`).
     Referencing,
@@ -908,6 +895,10 @@ pub(crate) enum ForeignKeyCheck {
     /// or rewritten (`RI_FKey_cascade_*`, `RI_FKey_setnull_*`,
     /// `RI_FKey_setdefault_*`), never deferred.
     Action(ReferentialAction),
+    /// A written row that met a possible conflict of a deferrable unique or
+    /// exclusion key is checked again (PostgreSQL's `unique_key_recheck`,
+    /// fired by `PK_ConstraintTrigger_*` or `Unique_ConstraintTrigger_*`).
+    Unique,
 }
 
 /// The rewriting referential actions.
@@ -918,7 +909,7 @@ pub(crate) enum ReferentialAction {
     SetDefault,
 }
 
-impl ForeignKeyCheck {
+impl KeyCheck {
     pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Referencing => 1,
@@ -927,6 +918,7 @@ impl ForeignKeyCheck {
             Self::Action(ReferentialAction::Cascade) => 4,
             Self::Action(ReferentialAction::SetNull) => 5,
             Self::Action(ReferentialAction::SetDefault) => 6,
+            Self::Unique => 7,
         }
     }
 
@@ -938,16 +930,17 @@ impl ForeignKeyCheck {
             4 => Some(Self::Action(ReferentialAction::Cascade)),
             5 => Some(Self::Action(ReferentialAction::SetNull)),
             6 => Some(Self::Action(ReferentialAction::SetDefault)),
+            7 => Some(Self::Unique),
             _ => None,
         }
     }
 
     /// PostgreSQL creates only the NO ACTION trigger with the constraint's
-    /// deferrability.
+    /// deferrability; a unique recheck exists only for a deferrable key.
     pub(crate) const fn deferrable(self) -> bool {
         matches!(
             self,
-            Self::Referencing | Self::Referenced { restrict: false }
+            Self::Referencing | Self::Referenced { restrict: false } | Self::Unique
         )
     }
 }
@@ -978,12 +971,12 @@ pub(crate) enum DeferredTriggerKind {
         trigger_depth: u16,
         command: u32,
     },
-    /// A foreign key check queued among the row's AFTER triggers. `rowid`
-    /// names the written referencing row; a referenced-side check carries the
+    /// A key check queued among the row's AFTER triggers. `rowid` names the
+    /// written referencing or keyed row; a referenced-side check carries the
     /// old key as its OLD image of `effective_table`.
-    ForeignKey {
+    KeyCheck {
         identity: ConstraintIdentity,
-        check: ForeignKeyCheck,
+        check: KeyCheck,
         effective_table: u16,
         trigger_depth: u16,
         command: u32,
@@ -1342,16 +1335,6 @@ impl TxnState {
             .saturating_add(
                 capacity
                     .deferred_constraints
-                    .saturating_mul(core::mem::size_of::<ConstraintObligation>()),
-            )
-            .saturating_add(
-                capacity
-                    .deferred_constraints
-                    .saturating_mul(core::mem::size_of::<usize>()),
-            )
-            .saturating_add(
-                capacity
-                    .deferred_constraints
                     .saturating_mul(core::mem::size_of::<ConstraintModeChange>()),
             )
             .saturating_add(
@@ -1510,16 +1493,6 @@ impl TxnState {
                 budget,
                 "txn_subscription_advances",
                 SUBSCRIPTION_ADVANCES_PER_TXN,
-            )?,
-            deferred_constraints: FixedVec::new(
-                budget,
-                "txn_deferred_constraints",
-                capacity.deferred_constraints,
-            )?,
-            completed_constraints: FixedVec::new(
-                budget,
-                "txn_completed_constraints",
-                capacity.deferred_constraints,
             )?,
             constraint_modes: FixedVec::new(
                 budget,
@@ -2430,7 +2403,7 @@ impl TxnState {
     }
 
     pub(crate) fn constraint_capacity(&self) -> usize {
-        self.deferred_constraints.capacity()
+        self.constraint_modes.capacity()
     }
 
     pub(crate) fn truncate_wal_tables<'a>(
@@ -2591,66 +2564,6 @@ impl TxnState {
             .len()
             .checked_add(additional)
             .is_some_and(|needed| needed <= self.constraint_modes.capacity())
-    }
-
-    pub(crate) fn defer_constraint(
-        &mut self,
-        constraint: ConstraintIdentity,
-        rowid: u64,
-    ) -> Result<(), SqlError> {
-        let obligation = ConstraintObligation { constraint, rowid };
-        if self
-            .deferred_constraints
-            .iter()
-            .enumerate()
-            .any(|(index, item)| {
-                *item == obligation && !self.completed_constraints.contains(&index)
-            })
-        {
-            return Ok(());
-        }
-        self.deferred_constraints.push(obligation).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "transaction defers more than {} constraints",
-                self.constraint_capacity()
-            )
-        })
-    }
-
-    pub(crate) fn deferred_constraints(&self) -> &[ConstraintObligation] {
-        &self.deferred_constraints
-    }
-
-    pub(crate) fn deferred_constraint_is_complete(&self, index: usize) -> bool {
-        self.completed_constraints.contains(&index)
-    }
-
-    pub(crate) fn deferred_constraint_for(
-        &self,
-        current: ConstraintIdentity,
-    ) -> Option<(usize, ConstraintObligation)> {
-        self.deferred_constraints
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !self.completed_constraints.contains(index))
-            .map(|(index, obligation)| (index, *obligation))
-            .find(|(_, obligation)| {
-                self.current_constraint_identity(obligation.constraint) == current
-            })
-    }
-
-    pub(crate) fn complete_deferred_constraint(&mut self, index: usize) -> Result<(), SqlError> {
-        if self.completed_constraints.contains(&index) {
-            return Ok(());
-        }
-        self.completed_constraints.push(index).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "transaction completes more than {} deferred constraints",
-                self.constraint_capacity()
-            )
-        })
     }
 
     pub(crate) fn rename_constraint(
@@ -2821,8 +2734,6 @@ impl TxnState {
 
     pub(crate) fn rewind_constraints(
         &mut self,
-        obligation_mark: usize,
-        completion_mark: usize,
         mode_mark: usize,
         rename_mark: usize,
         (trigger_events, pending_row_events, statement_tables): (
@@ -2831,14 +2742,8 @@ impl TxnState {
             u64,
         ),
     ) {
-        while self.deferred_constraints.len() > obligation_mark {
-            self.deferred_constraints.pop();
-        }
         while self.constraint_modes.len() > mode_mark {
             self.constraint_modes.pop();
-        }
-        while self.completed_constraints.len() > completion_mark {
-            self.completed_constraints.pop();
         }
         while self.constraint_renames.len() > rename_mark {
             self.constraint_renames.pop();
@@ -2937,19 +2842,19 @@ impl TxnState {
         clippy::too_many_arguments,
         reason = "a pending check carries its complete queued identity"
     )]
-    pub(crate) fn pend_foreign_key_event(
+    pub(crate) fn pend_key_check_event(
         &mut self,
         table: u16,
         trigger_name: crate::storage::SqlName,
         identity: ConstraintIdentity,
-        check: ForeignKeyCheck,
+        check: KeyCheck,
         effective_table: u16,
         event: u8,
         rowid: u64,
         old: Option<&[u8]>,
     ) -> Result<(), SqlError> {
         let (trigger_depth, command) = self.after_event_owner();
-        let kind = DeferredTriggerKind::ForeignKey {
+        let kind = DeferredTriggerKind::KeyCheck {
             identity,
             check,
             effective_table,
@@ -3265,23 +3170,10 @@ impl TxnState {
     /// Empties the event queue once every event fired and no SQL savepoint
     /// can make one live again. Fired events otherwise form the undo state
     /// for `ROLLBACK TO SAVEPOINT`.
-    pub(crate) fn compact_completed_constraints(&mut self) {
+    pub(crate) fn compact_trigger_events(&mut self) {
         if !self.savepoints.is_empty() {
             return;
         }
-
-        let mut write = 0usize;
-        for read in 0..self.deferred_constraints.len() {
-            if self.completed_constraints.contains(&read) {
-                continue;
-            }
-            self.deferred_constraints[write] = self.deferred_constraints[read];
-            write += 1;
-        }
-        while self.deferred_constraints.len() > write {
-            self.deferred_constraints.pop();
-        }
-        self.completed_constraints.clear();
         if self.pending_row_events.entries.is_empty()
             && matches!(self.trigger_events.has_waiting(), Ok(false))
         {
@@ -3341,8 +3233,6 @@ impl TxnState {
             notify_payload_mark: self.notify_payloads.mark(),
             listen_mark: self.pending_listen_ops.len(),
             subscription_advance_mark: self.subscription_advances.len(),
-            constraint_obligation_mark: self.deferred_constraints.len(),
-            constraint_completion_mark: self.completed_constraints.len(),
             constraint_mode_mark: self.constraint_modes.len(),
             constraint_rename_mark: self.constraint_renames.len(),
             trigger_event_mark: self.trigger_events.mark(),
@@ -3372,8 +3262,6 @@ impl TxnState {
             notification_payload: self.notify_payloads.mark(),
             listen_ops: self.pending_listen_ops.len(),
             subscription_advances: self.subscription_advances.len(),
-            constraint_obligations: self.deferred_constraints.len(),
-            constraint_completions: self.completed_constraints.len(),
             constraint_modes: self.constraint_modes.len(),
             constraint_renames: self.constraint_renames.len(),
             trigger_events: self.trigger_events.mark(),
@@ -3392,8 +3280,6 @@ impl TxnState {
             self.notify_payloads.mark() as u64,
             self.pending_listen_ops.len() as u64,
             self.subscription_advances.len() as u64,
-            self.deferred_constraints.len() as u64,
-            self.completed_constraints.len() as u64,
             self.constraint_modes.len() as u64,
             self.constraint_renames.len() as u64,
             self.trigger_events.end(),
@@ -3447,8 +3333,6 @@ impl TxnState {
         self.rewind_statistics(boundary.statistics_mark);
         self.rewind_subscription_advances(boundary.subscription_advance_mark);
         self.rewind_constraints(
-            boundary.constraint_obligation_mark,
-            boundary.constraint_completion_mark,
             boundary.constraint_mode_mark,
             boundary.constraint_rename_mark,
             (
@@ -4031,8 +3915,6 @@ impl TxnState {
         self.notify_payloads.clear();
         self.pending_listen_ops.clear();
         self.subscription_advances.clear();
-        self.deferred_constraints.clear();
-        self.completed_constraints.clear();
         self.constraint_modes.clear();
         self.constraint_renames.clear();
         self.trigger_events.clear();

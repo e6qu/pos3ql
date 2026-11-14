@@ -5906,7 +5906,7 @@ pub(super) fn select_contains_function(
             .any(|cte| select_contains_function(cte.query, matches))
 }
 
-fn from_contains_function(
+pub(super) fn from_contains_function(
     from: &crate::sql::ast::FromClause<'_>,
     matches: &impl Fn(&str, usize) -> bool,
 ) -> bool {
@@ -7980,6 +7980,7 @@ fn subst_insert<'a>(
         Some(conflict) => Some(OnConflict {
             target: subst_on_conflict_targets(conflict.target, context, arena)?,
             constraint: conflict.constraint,
+            target_where: opt_subst(conflict.target_where, context, arena)?,
             update: match conflict.update {
                 Some(assignments) => Some(subst_assignments(assignments, context, arena)?),
                 None => None,

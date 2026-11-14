@@ -264,6 +264,16 @@ pub(crate) fn plan_row_security<'a>(
     }))
 }
 
+impl<'a> RowSecurityPlan<'a> {
+    /// Whether any policy condition of the plan satisfies `test`.
+    pub(crate) fn any_predicate(self, test: impl Fn(&Expr<'a>) -> bool) -> bool {
+        self.predicates[..usize::from(self.groups)]
+            .iter()
+            .flat_map(|group| group.iter())
+            .any(|predicate| test(predicate.expression))
+    }
+}
+
 pub(crate) fn conjoin_row_security<'a>(
     first: Option<RowSecurityPlan<'a>>,
     second: Option<RowSecurityPlan<'a>>,
@@ -348,29 +358,57 @@ pub(crate) fn row_security_passes<'a>(
             sequences: base_hooks.sequences,
             merge_action: base_hooks.merge_action,
         };
-        let mut permissive = plan.permissive_always;
-        for (group, predicates) in plan.predicates.iter().enumerate() {
-            for predicate in *predicates {
-                let passes = match eval_full(predicate.expression, arena, params, row, &hooks)? {
-                    Datum::Bool(value) => value,
-                    Datum::Null => false,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "row-level security policy expression must be type boolean"
-                        ));
-                    }
-                };
-                if predicate.permissive {
-                    permissive[group] |= passes;
-                } else if !passes {
+        let passes = |predicate: &PolicyPredicate<'a>| -> Result<bool, SqlError> {
+            match eval_full(predicate.expression, arena, params, row, &hooks)? {
+                Datum::Bool(value) => Ok(value),
+                Datum::Null => Ok(false),
+                _ => Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "row-level security policy expression must be type boolean"
+                )),
+            }
+        };
+        // PostgreSQL's security quals, in order: each group's restrictive
+        // conditions, then the OR of its permissive ones; a later group (the
+        // SELECT policies of a write that reads its target) skips a qual an
+        // earlier group already holds (`list_append_unique`).
+        let groups = &plan.predicates[..usize::from(plan.groups)];
+        for (group, predicates) in groups.iter().enumerate() {
+            let earlier = &groups[..group];
+            let permissive = || predicates.iter().filter(|predicate| predicate.permissive);
+            if permissive().next().is_none() && !plan.permissive_always[group] {
+                return Ok(false);
+            }
+            for predicate in predicates.iter().filter(|predicate| !predicate.permissive) {
+                let repeated = earlier
+                    .iter()
+                    .flat_map(|group| group.iter())
+                    .any(|held| !held.permissive && held.expression == predicate.expression);
+                if !repeated && !passes(predicate)? {
                     return Ok(false);
                 }
             }
+            let repeated = earlier.iter().any(|held| {
+                held.iter()
+                    .filter(|predicate| predicate.permissive)
+                    .map(|predicate| predicate.expression)
+                    .eq(permissive().map(|predicate| predicate.expression))
+            });
+            if permissive().next().is_none() || repeated {
+                continue;
+            }
+            let mut any = plan.permissive_always[group];
+            for predicate in permissive() {
+                if passes(predicate)? {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
+                return Ok(false);
+            }
         }
-        Ok(permissive[..usize::from(plan.groups)]
-            .iter()
-            .all(|value| *value))
+        Ok(true)
     })();
     // SAFETY: policy subquery values and evaluator scratch do not escape this
     // boolean gate; the parsed policy expressions were allocated before mark.
@@ -1652,6 +1690,15 @@ fn spgist_supports_operator(
     }
 }
 
+/// Whether `operator` is one of the byte-wise `~<~` family that only the
+/// pattern operator classes index.
+fn is_pattern_operator(operator: BinaryOp) -> bool {
+    matches!(
+        operator,
+        BinaryOp::PatternLt | BinaryOp::PatternLtEq | BinaryOp::PatternGt | BinaryOp::PatternGtEq
+    )
+}
+
 fn operator_class_supports_knn(class: Option<crate::storage::IndexOperatorClass>) -> bool {
     use crate::sql::types::{GistOperatorClass, SpGistOperatorClass};
     matches!(
@@ -1844,6 +1891,15 @@ where
 {
     if stored == candidate {
         return true;
+    }
+    // A key the planner folded matches the stored key written the same way.
+    if let Expr::BoundLiteral {
+        value: crate::sql::ast::BoundLiteralValue::Folded(_),
+        source,
+        ..
+    } = candidate
+    {
+        return index_expression_matches(stored, source, definition, resolve_candidate);
     }
     match (stored, candidate) {
         (Expr::WholeRow(_), candidate) => resolve_candidate(candidate) == Some(WHOLE_ROW_KEY),
@@ -2107,7 +2163,7 @@ where
     }
 }
 
-fn predicate_is_implied<'a, Resolve>(
+pub(crate) fn predicate_is_implied<'a, Resolve>(
     required: &Expr<'_>,
     queries: &[Option<&'a Expr<'a>>],
     definition: &TableDef,
@@ -2363,7 +2419,14 @@ where
                     Some(crate::storage::IndexOperatorClass::SpGist(class)) => {
                         spgist_supports_operator(class, constraint.operator)
                     }
-                    _ => !gist && !gin && !spgist,
+                    // A btree family holds either the collation-aware
+                    // comparisons or the byte-wise pattern ones; `=` is in
+                    // both.
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                        constraint.operator == BinaryOp::Eq
+                            || class.is_pattern() == is_pattern_operator(constraint.operator)
+                    }
+                    _ => !gist && !gin && !spgist && !is_pattern_operator(constraint.operator),
                 };
             if let Some(equality) = set.equality.filter(|constraint| gist_supports(*constraint)) {
                 constraints[position] = Some(equality);
@@ -3133,6 +3196,172 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
     }
 }
 
+/// The target column a data change's condition names in `expression`, or
+/// `WHOLE_ROW_KEY` for its whole row.
+fn dml_target_column(
+    definition: &TableDef,
+    alias: Option<&str>,
+    expression: &Expr<'_>,
+) -> Option<usize> {
+    let answers = |qualifier: &str| {
+        crate::sql::eval::qualifier_answers_target(
+            crate::storage::RelationDefinition::from_definition(definition),
+            alias,
+            qualifier,
+        )
+    };
+    match expression {
+        Expr::WholeRow(name) if answers(name) => return Some(WHOLE_ROW_KEY),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if definition.column_index(name).is_none() && answers(name) => {
+            return Some(WHOLE_ROW_KEY);
+        }
+        _ => {}
+    }
+    let Expr::Column { qualifier, name } = expression else {
+        return None;
+    };
+    if qualifier.is_some_and(|qualifier| !answers(qualifier)) {
+        return None;
+    }
+    definition.column_index(name)
+}
+
+/// Whether a data change's condition constrains the leading key column of
+/// one of the table's indexes, so PostgreSQL reaches its rows through index
+/// entries rather than a sequential scan: a comparison, an `IN` list, or an
+/// `OR` whose every branch does.
+pub(crate) fn dml_condition_reaches_index(
+    storage: &Storage,
+    definition: &TableDef,
+    alias: Option<&str>,
+    txid: u32,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    let Some(predicate) = where_clause else {
+        return false;
+    };
+    let leading = index_leading_columns(storage, definition, txid);
+    !leading.is_empty()
+        && condition_reaches_columns(
+            predicate,
+            &|column| dml_target_column(definition, alias, column),
+            leading,
+        )
+}
+
+/// [`dml_condition_reaches_index`] for a query reading one table: PostgreSQL
+/// returns such a query's rows in the order its index or bitmap scan reaches
+/// them, an updated row at its first position.
+pub(crate) fn select_condition_reaches_index(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
+    txid: u32,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    let Some(predicate) = where_clause else {
+        return false;
+    };
+    if scope.n != 1 || scope.derived[0].is_some() || scope.lateral[0] {
+        return false;
+    }
+    let Some(definition) = scope.defs.stored(0) else {
+        return false;
+    };
+    let leading = index_leading_columns(storage, definition, txid);
+    !leading.is_empty()
+        && condition_reaches_columns(
+            predicate,
+            &|column| {
+                if let Some(key) = scope_whole_row(scope, 0, column) {
+                    return Some(key);
+                }
+                let Expr::Column { qualifier, name } = column else {
+                    return None;
+                };
+                match crate::sql::error_position::preserving_pending(|| {
+                    scope.find_column(*qualifier, name)
+                }) {
+                    Ok(ResolvedColumn::Table(0, index)) => Some(index),
+                    _ => None,
+                }
+            },
+            leading,
+        )
+}
+
+/// The columns that lead one of the table's B-tree keys.
+fn index_leading_columns(storage: &Storage, definition: &TableDef, txid: u32) -> ColumnSet {
+    let mut leading = ColumnSet::EMPTY;
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if metadata.primary || metadata.unique {
+            leading.insert(column);
+        }
+    }
+    for key in definition.uniques() {
+        if let Some(&column) = key.columns().first() {
+            leading.insert(usize::from(column));
+        }
+    }
+    for index in storage.indexes_for(definition.schema.as_str(), definition.name.as_str(), txid) {
+        if index.n_cols > 0 && index.expressions[0].is_none() {
+            leading.insert(usize::from(index.columns[0]));
+        }
+    }
+    leading
+}
+
+fn condition_reaches_columns(
+    expression: &Expr<'_>,
+    resolve: &dyn Fn(&Expr<'_>) -> Option<usize>,
+    leading: ColumnSet,
+) -> bool {
+    match expression {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            condition_reaches_columns(left, resolve, leading)
+                || condition_reaches_columns(right, resolve, leading)
+        }
+        Expr::Binary {
+            operator: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            condition_reaches_columns(left, resolve, leading)
+                && condition_reaches_columns(right, resolve, leading)
+        }
+        Expr::InList {
+            operand,
+            list,
+            negated: false,
+            ..
+        } => {
+            resolve(operand).is_some_and(|column| column < MAX_COLUMNS && leading.contains(column))
+                && list.iter().all(|item| dml_index_operand_is_invariant(item))
+        }
+        _ => {
+            let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
+            collect_index_constraints(
+                expression,
+                &mut |column: &Expr<'_>| resolve(column),
+                &dml_index_operand_is_invariant,
+                &mut by_column,
+            );
+            by_column.iter().enumerate().any(|(column, set)| {
+                leading.contains(column)
+                    && (set.equality.is_some() || set.lower.is_some() || set.upper.is_some())
+            })
+        }
+    }
+}
+
 pub(crate) fn dml_index_access_plan<'a>(
     storage: &Storage,
     slot: usize,
@@ -3146,38 +3375,8 @@ pub(crate) fn dml_index_access_plan<'a>(
         return Ok(None);
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
-    let mut resolve_column = |expression: &Expr<'a>| {
-        let answers = |qualifier: &str| {
-            crate::sql::eval::qualifier_answers_target(
-                crate::storage::RelationDefinition::from_definition(definition),
-                alias,
-                qualifier,
-            )
-        };
-        match expression {
-            Expr::WholeRow(name) if answers(name) => return Some(WHOLE_ROW_KEY),
-            Expr::Column {
-                qualifier: None,
-                name,
-            } if definition.column_index(name).is_none() && answers(name) => {
-                return Some(WHOLE_ROW_KEY);
-            }
-            _ => {}
-        }
-        let Expr::Column { qualifier, name } = expression else {
-            return None;
-        };
-        if qualifier.is_some_and(|qualifier| {
-            !crate::sql::eval::qualifier_answers_target(
-                crate::storage::RelationDefinition::from_definition(definition),
-                alias,
-                qualifier,
-            )
-        }) {
-            return None;
-        }
-        definition.column_index(name)
-    };
+    let mut resolve_column =
+        |expression: &Expr<'a>| dml_target_column(definition, alias, expression);
     let Some(predicate) = where_clause else {
         return Ok(None);
     };
@@ -8750,6 +8949,9 @@ fn scan_source_mode<'a>(
                 .then_some(scope.target_hash_candidates)
                 .flatten();
             let candidates = access.map(|access| access.rowids).or(hashed);
+            let index_order = depth == 0
+                && hashed.is_none()
+                && select_condition_reaches_index(storage, scope, txid, where_clause);
             if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
                 visit_sequential_physical_rows!(slot);
                 return Ok(true);
@@ -8892,10 +9094,19 @@ fn scan_source_mode<'a>(
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group. A hash
             // chain's order is the hash join's output order.
+            // A condition an index answers reaches rows through their index
+            // entries, which keep an updated row's first position: rows go in
+            // row identity order, as data changes take them.
             if hashed.is_none() && access.is_none_or(|access| !access.preserves_order) {
-                ordered[..fill].sort_unstable_by_key(|row| {
-                    row.expect("row snapshots are initialized").sort_key()
-                });
+                if index_order {
+                    ordered[..fill].sort_unstable_by_key(|row| {
+                        row.expect("row snapshots are initialized").rowid()
+                    });
+                } else {
+                    ordered[..fill].sort_unstable_by_key(|row| {
+                        row.expect("row snapshots are initialized").sort_key()
+                    });
+                }
             }
             for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
                 let rowid = row.rowid();

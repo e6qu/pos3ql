@@ -128,6 +128,11 @@ STATEMENT` triggers follow its row events. A referencing check reads the
 row's current version, so a row deleted before the check is not checked; a
 referenced check carries the old key, and NO ACTION passes when another row
 provides that key again. Checks see every change of their transaction.
+A row that meets a possible conflict of a deferrable unique or exclusion key
+queues that key's recheck the same way, by the name of PostgreSQL's
+`PK_ConstraintTrigger_<oid>` or `Unique_ConstraintTrigger_<oid>` trigger
+(here the constraint's OID), so a deferred trigger named after it does not
+run for a row whose recheck fails.
 
 A `CASCADE`, `SET NULL` or `SET DEFAULT` action runs PostgreSQL's
 `ri_triggers.c` query (`DELETE FROM ONLY child WHERE $1 OPERATOR(pg_catalog.=)
@@ -889,8 +894,9 @@ children. Exhaustion returns `54000` naming the function timing stack.
 
 ### Stored expressions
 
-PostgreSQL stores a CHECK constraint, a column default or generation
-expression, and an index key expression or predicate as an analyzed tree that
+PostgreSQL stores a CHECK constraint, an exclusion constraint's elements and
+predicate, a column default or generation expression, and an index key
+expression or predicate as an analyzed tree that
 names functions, operators, types and collations by OID. pos3ql stores the
 SQL text and, beside it, the dependency list captured when the expression was
 written: each entry pairs the spelling used with the object it resolved to
@@ -903,7 +909,7 @@ rank` (printed as `app.rank(a)`), and after `ALTER SCHEMA app RENAME TO core`.
 
 | Owner | Where the list lives | Limit |
 |---|---|---|
-| CHECK constraints, defaults, generated columns | The table definition, frozen into `table_metadata_bytes` | 64 entries per table |
+| CHECK and exclusion constraints, defaults, generated columns | The table definition, frozen into `table_metadata_bytes` | 64 entries per table |
 | Index keys and predicate | The index definition | 16 entries per index |
 
 Each single expression also respects `max_stored_query_dependencies_per_object`.
@@ -914,14 +920,15 @@ maintain.
 The lists produce `pg_depend` rows as PostgreSQL's do: a constraint, default
 or index depends normally on what it names, and a generation expression
 internally on its column. `DROP ... RESTRICT` of a named object therefore
-fails listing them, and `CASCADE` drops the CHECK constraints, clears the
-defaults, drops the generated columns and drops the indexes (after the drop
-that removed the object, in one statement). Exclusion constraint elements
-and predicates, statistics expressions, trigger conditions and domain
-constraints still store plain text; an exclusion element or predicate that
-names a user-defined function, operator or type is refused with `0A000`,
-renaming or moving a routine or type one of the others names is refused with
-`0A000`, and so is renaming an enum label any stored expression spells.
+fails listing them, and `CASCADE` drops the CHECK and exclusion constraints,
+clears the defaults, drops the generated columns and drops the indexes (after
+the drop that removed the object, in one statement). An exclusion
+constraint's index likewise depends on a user-defined operator class it uses
+and the constraint on a user-defined operator it compares with. A partition's
+or `LIKE` copy's constraint keeps its source's list. Statistics expressions,
+trigger conditions and domain constraints still store plain text; renaming
+or moving a routine or type one of them names is refused with `0A000`, and so
+is renaming an enum label any stored expression spells.
 
 ### Catalog reads within a statement
 

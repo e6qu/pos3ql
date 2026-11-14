@@ -77,6 +77,23 @@ fn argument_oid(storage: &Storage, txid: u32, argument: &RoutineArgumentDef) -> 
         .unwrap_or(0)
 }
 
+/// Why a routine signature's argument type resolved to nothing; its
+/// display is the type as written.
+fn argument_miss<'a>(
+    storage: &Storage,
+    txid: u32,
+    argument: crate::sql::ast::RoutineArgumentType<'a>,
+) -> crate::sql::type_name_miss::TypeNameMiss<'a> {
+    use crate::sql::type_name_miss::TypeNameMiss;
+    match TypeNameMiss::qualified_in_storage(storage, txid, argument.schema, argument.written) {
+        TypeNameMiss::Type { .. } => TypeNameMiss::Type {
+            schema: None,
+            name: argument.written,
+        },
+        schema => schema,
+    }
+}
+
 fn schema_missing(storage: &Storage, schema: Option<&str>, txid: u32) -> bool {
     schema.is_some_and(|schema| !storage.namespace_exists(schema, txid))
 }
@@ -337,7 +354,7 @@ fn resolve_arguments<'a>(
                 arguments[slot].ctype = resolved.ctype;
                 arguments[slot].user_type = resolved.user_type;
             }
-            Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
+            Err(error) if crate::sql::type_name_miss::is_type_name_miss(&error) => {
                 return Ok(Err(*argument));
             }
             Err(error) => return Err(error),
@@ -356,18 +373,7 @@ impl RoutineLookupMiss<'_> {
         identity: &RoutineIdentity<'_>,
     ) -> SqlError {
         match self {
-            Self::Type { argument, .. } => match argument.schema {
-                Some(schema) if schema_missing(storage, Some(schema), txid) => sql_err!(
-                    sqlstate::INVALID_SCHEMA_NAME,
-                    "schema \"{}\" does not exist",
-                    schema
-                ),
-                _ => sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    argument.written
-                ),
-            },
+            Self::Type { argument, .. } => argument_miss(storage, txid, argument).error(),
             Self::Schema => sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "schema \"{}\" does not exist",
@@ -428,16 +434,11 @@ impl RoutineLookupMiss<'_> {
                 "schema \"{}\" does not exist, skipping",
                 identity.name.schema.unwrap_or_default()
             ),
-            Self::Type { argument, .. } => match argument.schema {
-                Some(schema) if schema_missing(storage, Some(schema), txid) => {
-                    write!(notice, "schema \"{}\" does not exist, skipping", schema)
-                }
-                _ => write!(
-                    notice,
-                    "type \"{}\" does not exist, skipping",
-                    argument.written
-                ),
-            },
+            Self::Type { argument, .. } => notice.write_str(
+                argument_miss(storage, txid, argument)
+                    .skip_notice()
+                    .as_str(),
+            ),
             Self::Routine => {
                 let _ = write!(notice, "{} {}(", kind.noun(), QualifiedName(identity.name));
                 for (index, argument) in identity.argument_types.iter().enumerate() {

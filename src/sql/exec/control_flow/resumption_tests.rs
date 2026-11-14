@@ -72,6 +72,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             nested_command = command.command_id();
             assert_eq!(command.trigger_depth(), 1);
             let (program, code) = compile_plpgsql_execution(
+                "inline_code_block",
                 SOURCE,
                 PlpgsqlProgramKind::Anonymous,
                 0,

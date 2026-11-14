@@ -308,6 +308,15 @@ wait_p3() {
 wait_up "$PGHOST" "$PGPORT" || { echo "PostgreSQL not reachable on $PGHOST:$PGPORT"; exit 1; }
 wait_p3 || { echo "pos3ql not reachable on 127.0.0.1:$P3_PORT"; exit 1; }
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+# pos3ql publishes logical changes from every write. A reference below
+# `wal_level = logical` warns on CREATE PUBLICATION, and the corpora compare
+# warnings, so the oracle must run at pos3ql's level.
+reference_wal_level=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW wal_level' 2>&1)
+if [[ "$reference_wal_level" != logical ]]; then
+  printf 'FAIL: the PostgreSQL reference must run with wal_level = logical (found %s)\n' \
+    "$reference_wal_level"
+  exit 1
+fi
 
 restart_p3() {
   kill "$P3_PID" 2>/dev/null
@@ -597,6 +606,60 @@ if [[ "$foreign_mutation" == $'4|(40,four)|quote \' is data\n4|quote \' is data 
 else
   bad "foreign mutation transaction behavior"
   printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_mutation" "$foreign_mutation_reference"
+fi
+# A remote error keeps its DETAIL, HINT and CONTEXT. The reference runs the
+# same statements through its own postgres_fdw loopback server.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  > "$WORK/foreign_errors_setup.out" 2>&1 <<SQL
+DROP SCHEMA IF EXISTS pos3ql_fdw_loop CASCADE;
+DROP SERVER IF EXISTS pos3ql_fdw_loopback CASCADE;
+DROP TABLE IF EXISTS public.pos3ql_fdw_checked, public.pos3ql_fdw_raising;
+DROP FUNCTION IF EXISTS public.pos3ql_fdw_raise();
+CREATE TABLE public.pos3ql_fdw_checked (id integer PRIMARY KEY, note text CHECK (note <> 'bad'));
+INSERT INTO public.pos3ql_fdw_checked VALUES (1, 'one');
+CREATE FUNCTION public.pos3ql_fdw_raise() RETURNS trigger LANGUAGE plpgsql AS
+  \$\$ BEGIN RAISE EXCEPTION 'refused' USING DETAIL = 'remote detail', HINT = 'remote hint'; END \$\$;
+CREATE TABLE public.pos3ql_fdw_raising (id integer);
+CREATE TRIGGER refuse BEFORE INSERT ON public.pos3ql_fdw_raising
+  FOR EACH ROW EXECUTE FUNCTION public.pos3ql_fdw_raise();
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE SERVER pos3ql_fdw_loopback FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pos3ql_fdw_loopback OPTIONS (user '$PGUSER');
+CREATE SCHEMA pos3ql_fdw_loop;
+IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_checked, pos3ql_fdw_raising)
+  FROM SERVER pos3ql_fdw_loopback INTO pos3ql_fdw_loop;
+SQL
+foreign_errors_setup_status=$?
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  >> "$WORK/foreign_errors_setup.out" 2>&1 <<'SQL'
+CREATE SCHEMA pos3ql_fdw_loop;
+IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_checked, pos3ql_fdw_raising)
+  FROM SERVER reference_server INTO pos3ql_fdw_loop;
+SQL
+foreign_errors_setup_status=$((foreign_errors_setup_status + $?))
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -q -v VERBOSITY=verbose \
+    > "$WORK/foreign_errors_$side.out" 2>&1 <<'SQL'
+INSERT INTO pos3ql_fdw_loop.pos3ql_fdw_checked VALUES (1, 'duplicate');
+INSERT INTO pos3ql_fdw_loop.pos3ql_fdw_checked VALUES (2, 'bad');
+INSERT INTO pos3ql_fdw_loop.pos3ql_fdw_raising VALUES (1);
+SELECT id, note FROM pos3ql_fdw_loop.pos3ql_fdw_checked ORDER BY id;
+SQL
+done
+# The remote command's own spelling differs (pos3ql reads back each written
+# row), so its CONTEXT line is left out; every other line must match.
+if [[ $foreign_errors_setup_status -eq 0 ]] \
+  && diff -u <(grep -Ev '^(LOCATION|CONTEXT|remote SQL command):' "$WORK/foreign_errors_reference.out") \
+             <(grep -Ev '^(LOCATION|CONTEXT|remote SQL command):' "$WORK/foreign_errors_pos3ql.out") \
+  && grep -q '^DETAIL:  remote detail' "$WORK/foreign_errors_pos3ql.out" \
+  && grep -q '^CONTEXT:  PL/pgSQL function public.pos3ql_fdw_raise() line 1 at RAISE' \
+       "$WORK/foreign_errors_pos3ql.out"; then
+  ok "foreign server errors keep their DETAIL, HINT and CONTEXT"
+else
+  bad "foreign server error fields"
+  cat "$WORK/foreign_errors_setup.out" "$WORK/foreign_errors_reference.out" "$WORK/foreign_errors_pos3ql.out"
 fi
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
   -v ON_ERROR_STOP=1 -f "$EXT/foreign-procedural-subtransactions.sql" \
@@ -1625,15 +1688,15 @@ reset_user_relations() { # host port
       -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
-# Schemas, standalone types, foreign-data wrappers and roles a fixture leaves
-# behind would otherwise collide with a later fixture's (or a later run's on a
-# reused reference cluster) objects of the same name. Only roles created after
-# the run's first reset (OIDs above its baseline) are dropped, so roles that
-# predate the run on a shared reference server survive; pos3ql servers are
-# disposable, so every role it did not bootstrap is dropped.
+# Schemas, standalone types, public collations, foreign-data wrappers and
+# roles a fixture leaves behind would otherwise collide with a later fixture's
+# (or a later run's on a reused reference cluster) objects of the same name.
+# Only roles created after the run's first reset (OIDs above its baseline) are
+# dropped, so roles that predate the run on a shared reference server survive;
+# pos3ql servers are disposable, so every role it did not bootstrap is dropped.
 reset_user_objects() { # host port role-baseline
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
+    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP COLLATION ' || quote_ident(n.nspname) || '.' || quote_ident(c.collname) || ' CASCADE' FROM pg_collation AS c JOIN pg_namespace AS n ON n.oid = c.collnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
   while IFS= read -r statement; do
     [[ -z "$statement" ]] && continue
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q -c "$statement" >/dev/null 2>&1

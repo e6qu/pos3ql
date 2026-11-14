@@ -92,6 +92,76 @@ SELECT * FROM items ORDER BY id;
 SELECT label, seen FROM calls ORDER BY label, seen;
 TRUNCATE calls;
 
+-- INTO asks the executor for two rows: every data change stops after its
+-- second returned row (an INSERT stops reading its source), its AFTER
+-- triggers fire for those rows, and then the second row is the error.
+CREATE TABLE many(id int, a bigint);
+INSERT INTO many VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+UPDATE many SET a = 1 WHERE id = 1;
+CREATE FUNCTION many_after() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE '% % row %', TG_WHEN, TG_OP, coalesce(NEW.id, OLD.id);
+  RETURN NULL;
+END$$;
+CREATE FUNCTION many_statement() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE 'statement %', TG_OP;
+  RETURN NULL;
+END$$;
+CREATE TRIGGER many_rows AFTER INSERT OR UPDATE OR DELETE ON many
+  FOR EACH ROW EXECUTE FUNCTION many_after();
+CREATE TRIGGER many_statements AFTER INSERT OR UPDATE OR DELETE ON many
+  FOR EACH STATEMENT EXECUTE FUNCTION many_statement();
+CREATE TABLE merged(id int, a bigint);
+INSERT INTO merged VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+CREATE TRIGGER merged_rows AFTER UPDATE ON merged
+  FOR EACH ROW EXECUTE FUNCTION many_after();
+CREATE TRIGGER merged_statements AFTER UPDATE ON merged
+  FOR EACH STATEMENT EXECUTE FUNCTION many_statement();
+DO $$DECLARE x bigint;
+BEGIN
+  UPDATE many SET a = seen('update ' || id) RETURNING id INTO x;
+END$$;
+DO $$DECLARE x bigint;
+BEGIN
+  DELETE FROM many WHERE id > 0 RETURNING seen('delete ' || id) INTO STRICT x;
+END$$;
+DO $$DECLARE x bigint;
+BEGIN
+  INSERT INTO many SELECT g, seen('insert ' || g) FROM generate_series(5, 8) g
+    RETURNING id INTO x;
+END$$;
+DO $$DECLARE x bigint;
+BEGIN
+  INSERT INTO many VALUES (5, seen('value 5')), (6, seen('value 6')), (7, seen('value 7'))
+    RETURNING id INTO x;
+END$$;
+DO $$DECLARE x bigint;
+BEGIN
+  MERGE INTO merged t USING generate_series(1, 4) s(id) ON t.id = s.id
+    WHEN MATCHED THEN UPDATE SET a = seen('merge ' || s.id)
+    RETURNING t.id INTO x;
+END$$;
+DO $$DECLARE x bigint;
+BEGIN
+  UPDATE many SET a = seen('caught ' || id) RETURNING id INTO x;
+EXCEPTION WHEN too_many_rows THEN
+  RAISE NOTICE 'caught: %', sqlerrm;
+END$$;
+-- A routine call for a later row that returns nothing keeps the row INTO
+-- already received.
+DO $$DECLARE x bigint;
+BEGIN
+  MERGE INTO merged t USING generate_series(1, 2) s(id) ON t.id = s.id
+    WHEN MATCHED AND seen('merge when ' || s.id) > 0 AND s.id = 1 THEN UPDATE SET a = 1
+    RETURNING t.id INTO x;
+  RAISE NOTICE 'merge returned % found %', x, found;
+END$$;
+SELECT * FROM many ORDER BY id;
+SELECT * FROM merged ORDER BY id;
+SELECT label, seen FROM calls ORDER BY label, seen;
+TRUNCATE calls;
+
 -- RETURNING without INTO, and INTO without RETURNING, are PL/pgSQL errors.
 DO $$BEGIN INSERT INTO items VALUES (5, 0) RETURNING id; END$$;
 DO $$DECLARE x int; BEGIN DELETE FROM items WHERE id = 1 INTO x; END$$;

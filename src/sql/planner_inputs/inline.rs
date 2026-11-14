@@ -228,22 +228,29 @@ fn constant_value_in(
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS
     };
-    super::inspect_parameters(|parameters| {
-        crate::sql::eval::eval_full(
-            expression,
-            arena,
-            parameters.unwrap_or(crate::sql::eval::NO_PARAMS),
-            &crate::sql::eval::NoColumns,
-            &hooks,
-        )
-        .map(|value| {
-            Some(match value {
-                Datum::Null => ConstantValue::Null,
-                Datum::Bool(value) => ConstantValue::Boolean(value),
-                _ => ConstantValue::NonNull,
+    // Planning folds the constant only to classify it; the statement's own
+    // evaluation raises its notices.
+    let mut folded = None;
+    crate::sql::eval::probe_constants(|| {
+        folded = super::inspect_parameters(|parameters| {
+            crate::sql::eval::eval_full(
+                expression,
+                arena,
+                parameters.unwrap_or(crate::sql::eval::NO_PARAMS),
+                &crate::sql::eval::NoColumns,
+                &hooks,
+            )
+            .map(|value| {
+                Some(match value {
+                    Datum::Null => ConstantValue::Null,
+                    Datum::Bool(value) => ConstantValue::Boolean(value),
+                    _ => ConstantValue::NonNull,
+                })
             })
-        })
-    })
+        })?;
+        Ok(())
+    })?;
+    Ok(folded)
 }
 
 /// Whether PostgreSQL's planner folds `expression`, which names no column

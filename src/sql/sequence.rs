@@ -1582,14 +1582,7 @@ impl<'a> SeqEval<'a> {
                 ));
             }
             crate::sql::identifiers::ObjectReference::Name(parsed) => {
-                if parsed.database.is_some_and(|database| {
-                    database != self.storage.current_database_name(self.txid)
-                }) {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cross-database sequence references are not supported"
-                    ));
-                }
+                parsed.require_database(self.storage.current_database_name(self.txid))?;
                 let qualifier = parsed.schema.as_ref().map(crate::storage::SqlName::as_str);
                 if let Some(schema) = qualifier
                     && self

@@ -263,6 +263,41 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
             .for_each_saved_home(&RowScanIds::Captured(self.rows), each)
     }
 
+    /// Visits the scan's rows in a sequential scan's physical order: the
+    /// saved rows no resident version shadows, by row identity, then the
+    /// resident rows by heap position. The resident order is sorted in
+    /// `arena`, one record per resident row.
+    pub(crate) fn for_each_home_physically(
+        &self,
+        arena: &Arena,
+        each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,
+    ) -> Result<ControlFlow<()>, SqlError> {
+        crate::sql::query::check_timeout()?;
+        if self
+            .source
+            .for_each_saved_home(&RowScanIds::Captured(self.rows), each)?
+            .is_break()
+        {
+            return Ok(ControlFlow::Break(()));
+        }
+        let resident = arena.alloc_slice_copy(self.rows).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "captured resident rows exceed the statement arena"
+            )
+        })?;
+        resident.sort_unstable_by_key(CapturedRowRecord::physical_order);
+        for &record in resident.iter() {
+            crate::sql::query::check_timeout()?;
+            if let Some(home) = self.source.read_record(record)?
+                && each(record.rowid, home)?.is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
     pub(crate) fn for_each_overlay(
         &self,
         each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,

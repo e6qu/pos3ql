@@ -5733,11 +5733,11 @@ pub(crate) fn collect_routine_signature_row_types(
             continue;
         };
         let relation = storage.row_type_relation(creation, txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                identity.name.as_str()
-            )
+            crate::sql::type_name_miss::TypeNameMiss::Type {
+                schema: None,
+                name: identity.name.as_str(),
+            }
+            .error()
         })?;
         record_relation_row_type(
             relation,
@@ -6205,15 +6205,7 @@ fn resolve_sequence_reference(
                 )
             }
             crate::sql::identifiers::ObjectReference::Name(parsed) => {
-                if parsed
-                    .database
-                    .is_some_and(|database| database != storage.current_database_name(txid))
-                {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cross-database sequence references are not supported"
-                    ));
-                }
+                parsed.require_database(storage.current_database_name(txid))?;
                 let name = parsed.name.as_str();
                 let slot = if let Some(schema) = parsed.schema {
                     if schema.as_str() == "pg_temp" {

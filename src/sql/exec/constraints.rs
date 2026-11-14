@@ -136,6 +136,36 @@ fn write_key_description(
     let _ = detail.write_char(')');
 }
 
+/// `Partition key of the failing row contains (a, b) = (1, 2).`,
+/// PostgreSQL's detail for a row no partition accepts
+/// (`ExecBuildSlotPartitionKeyDescription`).
+pub(crate) fn partition_key_detail<'v>(
+    columns: &mut dyn Iterator<Item = &str>,
+    values: &mut dyn Iterator<Item = Datum<'v>>,
+) -> Result<DetailText, SqlError> {
+    use core::fmt::Write;
+    let mut detail = DetailText::new();
+    let _ = detail.write_str("Partition key of the failing row contains (");
+    for (index, column) in columns.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        let _ = detail.write_str(column);
+    }
+    let _ = detail.write_str(") = (");
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        write_described_value(&mut detail, value);
+    }
+    let _ = detail.write_str(").");
+    if detail.is_truncated() {
+        return Err(detail_full());
+    }
+    Ok(detail)
+}
+
 /// A key description followed by `suffix`, such as ` already exists.`.
 pub(crate) fn key_detail<'v>(
     columns: &mut dyn Iterator<Item = &str>,
@@ -577,10 +607,39 @@ pub(crate) struct ExclusionScan<'e, 'a> {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
     sources: [Option<&'a str>; crate::storage::MAX_INDEX_COLS],
+    /// Each element's collation: the one written, else the key's own.
+    collations: [crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS],
+    /// The function each user-defined operator runs.
+    functions: [i32; crate::storage::MAX_INDEX_COLS],
 }
 
 /// One row's element values under an exclusion constraint.
 pub(crate) type ExclusionKeys<'a> = [Datum<'a>; crate::storage::MAX_INDEX_COLS];
+
+/// The stored predicate of `exclusion`, a constraint of `def`, parsed and
+/// bound to the objects it was written against.
+pub(crate) fn exclusion_predicate<'a>(
+    storage: &Storage,
+    txid: u32,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(predicate) = &exclusion.predicate else {
+        return Ok(None);
+    };
+    let source = arena
+        .alloc_str(predicate.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    Ok(Some(super::expression_bindings::bind_table_expression(
+        crate::sql::parser::parse_expr(source, arena)?,
+        storage,
+        def,
+        crate::storage::ExpressionOwner::ExclusionPredicate(exclusion.name),
+        txid,
+        arena,
+    )?))
+}
 
 impl<'e, 'a> ExclusionScan<'e, 'a> {
     /// A placeholder with no elements, for filling fixed storage.
@@ -589,17 +648,23 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expressions: [None; crate::storage::MAX_INDEX_COLS],
         sources: [None; crate::storage::MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+        functions: [0; crate::storage::MAX_INDEX_COLS],
     };
 
+    /// Binds each expression element of `exclusion`, a constraint of `def`,
+    /// to the objects it was written against and resolves what each
+    /// element compares with.
     pub(crate) fn new(
         exclusion: &'e crate::storage::ExclusionConstraint,
+        storage: &Storage,
+        txid: u32,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut scan = Self {
             exclusion,
-            columns: [0; crate::storage::MAX_INDEX_COLS],
-            expressions: [None; crate::storage::MAX_INDEX_COLS],
-            sources: [None; crate::storage::MAX_INDEX_COLS],
+            ..Self::EMPTY
         };
         for (position, element) in exclusion.elements().enumerate() {
             match element {
@@ -610,8 +675,45 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
                         .map_err(|_| crate::sql::eval::arena_full())?;
                     scan.sources[position] = Some(source);
                     scan.expressions[position] =
-                        Some(crate::sql::parser::parse_expr(source, arena)?);
+                        Some(super::expression_bindings::bind_table_expression(
+                            crate::sql::parser::parse_expr(source, arena)?,
+                            storage,
+                            def,
+                            crate::storage::ExpressionOwner::ExclusionKey(
+                                exclusion.name,
+                                position as u8,
+                            ),
+                            txid,
+                            arena,
+                        )?);
                 }
+            }
+        }
+        for (position, options) in exclusion.options().iter().enumerate() {
+            scan.collations[position] = options.collation;
+        }
+        for (position, operator) in exclusion.operators().iter().enumerate() {
+            if operator.binary().is_none() {
+                let slot = storage
+                    .operator_slot_by_oid(operator.oid(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "exclusion operator {} does not exist",
+                            operator.oid()
+                        )
+                    })?;
+                scan.functions[position] = storage
+                    .operator_for(slot, txid)
+                    .implementation
+                    .routine()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "exclusion operator {} has no function",
+                            operator.oid()
+                        )
+                    })?;
             }
         }
         Ok(scan)
@@ -641,20 +743,52 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
     /// Whether two rows' elements all conflict; a NULL element never does.
     pub(crate) fn conflicts(
         &self,
-        left: &ExclusionKeys<'_>,
-        right: &ExclusionKeys<'_>,
-        arena: &Arena,
+        storage: &Storage,
+        txid: u32,
+        left: &ExclusionKeys<'a>,
+        right: &ExclusionKeys<'a>,
+        arena: &'a Arena,
     ) -> Result<bool, SqlError> {
         for (position, operator) in self.exclusion.operators().iter().enumerate() {
-            if left[position].is_null() || right[position].is_null() {
+            let (left, right) = (left[position], right[position]);
+            if left.is_null() || right.is_null() {
                 return Ok(false);
             }
-            if !crate::sql::eval::exclusion_operator(
-                operator.binary(),
-                left[position],
-                right[position],
-                arena,
-            )? {
+            let conflict = match operator.binary() {
+                // A catalog collation may be nondeterministic, so equality
+                // asks the collation.
+                Some(
+                    binary @ (crate::sql::ast::BinaryOp::Eq | crate::sql::ast::BinaryOp::NotEq),
+                ) if matches!(
+                    self.collations[position],
+                    crate::sql::ast::Collation::Catalog(_)
+                ) =>
+                {
+                    let equal = crate::sql::eval::compare_datums_collated(
+                        storage,
+                        txid,
+                        self.collations[position],
+                        &left,
+                        &right,
+                    )?
+                    .is_eq();
+                    equal == (binary == crate::sql::ast::BinaryOp::Eq)
+                }
+                Some(binary) => crate::sql::eval::exclusion_operator(binary, left, right, arena)?,
+                None => matches!(
+                    crate::sql::query::execute_operator_function(
+                        storage,
+                        txid,
+                        self.functions[position],
+                        left,
+                        right,
+                        self.collations[position],
+                        arena,
+                    )?,
+                    Datum::Bool(true)
+                ),
+            };
+            if !conflict {
                 return Ok(false);
             }
         }
@@ -937,6 +1071,18 @@ fn index_key_values_equal(
             return Ok(false);
         }
         let equal = match equality.operator_classes[index] {
+            // A pattern class compares strings byte by byte, whatever the
+            // key's collation.
+            crate::storage::IndexOperatorClass::Btree(class) if class.is_pattern() => {
+                compare_datums_collated(
+                    equality.storage,
+                    equality.txid,
+                    crate::sql::ast::Collation::C,
+                    value,
+                    other_value,
+                )?
+                .is_eq()
+            }
             crate::storage::IndexOperatorClass::Btree(_)
             | crate::storage::IndexOperatorClass::Hash(_)
             | crate::storage::IndexOperatorClass::Brin(_)
@@ -1753,7 +1899,20 @@ fn check_row_keys(
             {
                 crate::sql::eval::take_diagnostic();
                 let identity = transaction.constraint_identity(constraint_table as u32, name);
-                return transaction.defer_constraint(identity, rowid);
+                return transaction.pend_key_check_event(
+                    table_index as u16,
+                    key_recheck_trigger_name(def, name)?,
+                    identity,
+                    crate::sql::txn::KeyCheck::Unique,
+                    constraint_table as u16,
+                    if row.excluded().is_some() {
+                        crate::sql::ast::TriggerEvents::UPDATE
+                    } else {
+                        crate::sql::ast::TriggerEvents::INSERT
+                    },
+                    rowid,
+                    None,
+                );
             }
             Err(error)
         };
@@ -2382,13 +2541,8 @@ pub(crate) fn parse_checks<'a>(
         )?);
     }
     for (index, exclusion) in def.exclusions().iter().enumerate() {
-        if let Some(predicate) = &exclusion.predicate {
-            let source = arena
-                .alloc_str(predicate.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            out[crate::storage::MAX_CHECKS + index] =
-                Some(crate::sql::parser::parse_expr(source, arena)?);
-        }
+        out[crate::storage::MAX_CHECKS + index] =
+            exclusion_predicate(storage, txid, def, exclusion, arena)?;
     }
     Ok(out)
 }
@@ -2922,7 +3076,7 @@ fn enforce_exclusion_constraint_in<'a>(
     if !predicate_holds(values)? {
         return Ok(());
     }
-    let scan = ExclusionScan::new(exclusion, arena)?;
+    let scan = ExclusionScan::new(exclusion, storage, txid, def, arena)?;
     let keys = scan.keys(storage, txid, def, values, arena)?;
     // A NULL element conflicts with nothing.
     if keys[..exclusion.len()].iter().any(Datum::is_null) {
@@ -2949,7 +3103,7 @@ fn enforce_exclusion_constraint_in<'a>(
                 return Ok(false);
             }
             let other_keys = scan.keys(storage, txid, def, other, arena)?;
-            if !scan.conflicts(&keys, &other_keys, arena)? {
+            if !scan.conflicts(storage, txid, &keys, &other_keys, arena)? {
                 return Ok(false);
             }
             scan.stash_conflict(
@@ -3033,11 +3187,11 @@ fn check_or_defer_fk_child(
                     crate::sql::ast::TriggerEvents::INSERT,
                 )
             };
-            transaction.pend_foreign_key_event(
+            transaction.pend_key_check_event(
                 table_index as u16,
                 foreign_key_trigger_name(fk, trigger)?,
                 identity,
-                crate::sql::txn::ForeignKeyCheck::Referencing,
+                crate::sql::txn::KeyCheck::Referencing,
                 constraint_table as u16,
                 event,
                 rowid,
@@ -3269,6 +3423,43 @@ fn missing_parent_key(
     )
 }
 
+/// The name of the trigger PostgreSQL creates for the deferrable unique or
+/// exclusion key `name`, which orders the key's recheck among the row's AFTER
+/// triggers. Its number is the constraint's OID, which keeps creation order.
+fn key_recheck_trigger_name<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: SqlName,
+) -> Result<SqlName, SqlError> {
+    let (primary, identity) = def
+        .uniques()
+        .iter()
+        .find(|key| key.name == name)
+        .map(|key| (key.kind.is_primary(), key.identity))
+        .or_else(|| {
+            def.exclusions()
+                .iter()
+                .find(|constraint| constraint.name == name)
+                .map(|constraint| (false, constraint.identity))
+        })
+        .and_then(|(primary, identity)| Some((primary, identity?)))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "deferrable key \"{}\" has no constraint identity",
+                name.as_str()
+            )
+        })?;
+    SqlName::parse(
+        crate::stack_format!(
+            64,
+            "{}_ConstraintTrigger_{}",
+            if primary { "PK" } else { "Unique" },
+            identity.oid()
+        )
+        .as_str(),
+    )
+}
+
 /// The name of a foreign key's RI trigger, which orders its queued check
 /// among the row's AFTER triggers.
 pub(super) fn foreign_key_trigger_name(
@@ -3295,11 +3486,11 @@ pub(super) fn foreign_key_trigger_name(
 /// When a queued foreign key check fires: `None` once its constraint is gone.
 /// A `RESTRICT` check and the rewriting actions are never deferred, as
 /// PostgreSQL creates their triggers not deferrable.
-pub(crate) fn foreign_key_event_mode(
+pub(crate) fn key_check_event_mode(
     storage: &Storage,
     txn: &TxnState,
     identity: crate::sql::txn::ConstraintIdentity,
-    check: crate::sql::txn::ForeignKeyCheck,
+    check: crate::sql::txn::KeyCheck,
 ) -> Option<crate::sql::ast::ConstraintMode> {
     if !txn.constraint_identity_is_current(identity) {
         return None;
@@ -3312,24 +3503,24 @@ pub(crate) fn foreign_key_event_mode(
 }
 
 /// Runs the queued foreign key event `index`: a referential action or a
-/// check (see [`fire_foreign_key_event`]).
-pub(super) fn fire_queued_foreign_key_event(
+/// check (see [`fire_key_check_event`]).
+pub(super) fn fire_queued_key_check_event(
     context: &mut super::TriggerExecContext<'_, '_, '_>,
     index: u64,
 ) -> Result<(), SqlError> {
     let (event, _, _) = context.txn.trigger_event(index)?;
     match event.kind {
-        crate::sql::txn::DeferredTriggerKind::ForeignKey {
-            check: crate::sql::txn::ForeignKeyCheck::Action(_),
+        crate::sql::txn::DeferredTriggerKind::KeyCheck {
+            check: crate::sql::txn::KeyCheck::Action(_),
             ..
         } => fire_foreign_key_action(context, index),
-        _ => fire_foreign_key_event(context.host.storage(), context.txn, index, context.arena),
+        _ => fire_key_check_event(context.host.storage(), context.txn, index, context.arena),
     }
 }
 
 /// Runs the queued foreign key check `index` and marks it fired. A check
 /// that waits for a row lock runs again under the snapshot it started with.
-fn fire_foreign_key_event(
+fn fire_key_check_event(
     storage: &Storage,
     txn: &mut TxnState,
     index: u64,
@@ -3339,7 +3530,7 @@ fn fire_foreign_key_event(
     if fired {
         return Ok(());
     }
-    let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+    let crate::sql::txn::DeferredTriggerKind::KeyCheck {
         identity,
         check,
         effective_table,
@@ -3362,21 +3553,23 @@ fn fire_foreign_key_event(
     // A data-modifying `WITH` reads below its own command; its checks do not.
     let _own_changes = storage.own_changes_snapshot();
     let result = match check {
-        crate::sql::txn::ForeignKeyCheck::Referencing => validate_constraint_obligation(
-            storage,
-            current,
-            rowid,
-            txn.txid,
-            txn.isolation,
-            read,
-            arena,
-        )
-        .map(|_| ()),
-        crate::sql::txn::ForeignKeyCheck::Action(_) => Err(sql_err!(
+        crate::sql::txn::KeyCheck::Referencing | crate::sql::txn::KeyCheck::Unique => {
+            validate_constraint_obligation(
+                storage,
+                current,
+                rowid,
+                txn.txid,
+                txn.isolation,
+                read,
+                arena,
+            )
+            .map(|_| ())
+        }
+        crate::sql::txn::KeyCheck::Action(_) => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "a referential action was run as a check"
         )),
-        crate::sql::txn::ForeignKeyCheck::Referenced { restrict } => {
+        crate::sql::txn::KeyCheck::Referenced { restrict } => {
             let old = event
                 .old
                 .map(|tuple| txn.trigger_event_tuple(tuple, arena))
@@ -3454,13 +3647,8 @@ pub(crate) fn validate_constraint_obligation(
     let Some(timing) = timing else {
         return Ok(None);
     };
-    let predicate = match exclusion.and_then(|constraint| constraint.predicate) {
-        Some(source) => {
-            let source = arena
-                .alloc_str(source.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            Some(crate::sql::parser::parse_expr(source, arena)?)
-        }
+    let predicate = match &exclusion {
+        Some(exclusion) => exclusion_predicate(storage, txid, &definition, exclusion, arena)?,
         None => None,
     };
     constraint_row_tables(storage, table_index, txid, |row_table| {
@@ -3658,64 +3846,6 @@ pub(crate) fn validate_check_constraint(
             )
         }
     })
-}
-
-/// Checks and removes obligations whose current mode requires this boundary.
-/// `immediate_only` is the statement boundary; `false` is transaction commit.
-pub(crate) fn validate_deferred_constraints(
-    storage: &Storage,
-    txn: &mut TxnState,
-    immediate_only: bool,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let mut index = 0;
-    while index < txn.deferred_constraints().len() {
-        if txn.deferred_constraint_is_complete(index) {
-            index += 1;
-            continue;
-        }
-        let obligation = txn.deferred_constraints()[index];
-        let current = txn.current_constraint_identity(obligation.constraint);
-        if !txn.constraint_identity_is_current(obligation.constraint) {
-            txn.complete_deferred_constraint(index)?;
-            index += 1;
-            continue;
-        }
-        let Some(timing) = constraint_timing(storage, current, txn.txid) else {
-            txn.complete_deferred_constraint(index)?;
-            index += 1;
-            continue;
-        };
-        if immediate_only
-            && txn.constraint_mode(obligation.constraint, timing)
-                == crate::sql::ast::ConstraintMode::Deferred
-        {
-            index += 1;
-            continue;
-        }
-        // A check that waited for its parent row's lock runs again under
-        // the snapshot it started with, as in-row checks do.
-        let read = txn
-            .take_awaited_parent_read(current)
-            .unwrap_or_else(|| storage.validation_read());
-        if let Err(error) = validate_constraint_obligation(
-            storage,
-            current,
-            obligation.rowid,
-            txn.txid,
-            txn.isolation,
-            read,
-            arena,
-        ) {
-            if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
-                txn.await_parent_read(current, read);
-            }
-            return Err(error);
-        }
-        txn.complete_deferred_constraint(index)?;
-        index += 1;
-    }
-    Ok(())
 }
 
 pub(crate) fn constraint_timing(
@@ -4294,25 +4424,25 @@ pub(crate) fn apply_fk_parent_actions(
             };
             let check = match action {
                 StorageFkAction::NoAction => {
-                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: false }
+                    crate::sql::txn::KeyCheck::Referenced { restrict: false }
                 }
                 StorageFkAction::Restrict => {
-                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: true }
+                    crate::sql::txn::KeyCheck::Referenced { restrict: true }
                 }
-                StorageFkAction::Cascade => crate::sql::txn::ForeignKeyCheck::Action(
-                    crate::sql::txn::ReferentialAction::Cascade,
-                ),
-                StorageFkAction::SetNull => crate::sql::txn::ForeignKeyCheck::Action(
-                    crate::sql::txn::ReferentialAction::SetNull,
-                ),
-                StorageFkAction::SetDefault => crate::sql::txn::ForeignKeyCheck::Action(
+                StorageFkAction::Cascade => {
+                    crate::sql::txn::KeyCheck::Action(crate::sql::txn::ReferentialAction::Cascade)
+                }
+                StorageFkAction::SetNull => {
+                    crate::sql::txn::KeyCheck::Action(crate::sql::txn::ReferentialAction::SetNull)
+                }
+                StorageFkAction::SetDefault => crate::sql::txn::KeyCheck::Action(
                     crate::sql::txn::ReferentialAction::SetDefault,
                 ),
             };
             // A check keeps the old key alone; a cascaded update also the new
             // key (see [`decode_action_keys`]).
             let encoded = match check {
-                crate::sql::txn::ForeignKeyCheck::Action(_) => encode_action_keys(
+                crate::sql::txn::KeyCheck::Action(_) => encode_action_keys(
                     old_parent,
                     new_parent,
                     parent_columns,
@@ -4327,7 +4457,7 @@ pub(crate) fn apply_fk_parent_actions(
                 )?,
             };
             let identity = txn.constraint_identity(child_index as u32, fk.name);
-            txn.pend_foreign_key_event(
+            txn.pend_key_check_event(
                 parent_index as u16,
                 foreign_key_trigger_name(&fk, trigger)?,
                 identity,
@@ -4360,9 +4490,9 @@ fn fire_foreign_key_action(
     if fired {
         return Ok(());
     }
-    let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+    let crate::sql::txn::DeferredTriggerKind::KeyCheck {
         identity,
-        check: crate::sql::txn::ForeignKeyCheck::Action(referential),
+        check: crate::sql::txn::KeyCheck::Action(referential),
         effective_table,
         ..
     } = event.kind

@@ -717,6 +717,27 @@ pub(crate) fn describe_object_text<'a>(
         };
         return described(stack_format!(1024, "database {}", name.as_str()), arena).map(Some);
     }
+    if class_id == crate::sql::catalog::PG_PUBLICATION_REL_OID {
+        let Some((relation, publication)) = catalog
+            .publication_relation(object_id)?
+            .filter(|_| sub_id == 0)
+        else {
+            return Ok(None);
+        };
+        let Some(relation) = describe_object_text(catalog, 1259, relation, 0, arena)? else {
+            return Ok(None);
+        };
+        return described(
+            stack_format!(
+                1024,
+                "publication of {} in publication {}",
+                relation,
+                publication.as_str()
+            ),
+            arena,
+        )
+        .map(Some);
+    }
     if class_id == 2604 {
         let Some((relation, column)) = catalog.attribute_default_column(object_id) else {
             return Ok(None);
@@ -3146,16 +3167,11 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
-                if matches!(name, "to_regtype" | "to_regtypemod")
-                    && let Some(identity) =
-                        super::super::cross_database_catalog_reference(written, false)
-                {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cross-database references are not implemented: {}",
-                        identity
-                    ));
-                }
+                let written = if matches!(name, "to_regtype" | "to_regtypemod") {
+                    super::super::without_catalog_qualifier(written, false)?
+                } else {
+                    written
+                };
                 if name == "to_regtypemod" {
                     let (type_name, type_mod) =
                         crate::sql::parser::parse_type_name(written, arena)?;

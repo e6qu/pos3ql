@@ -57,3 +57,55 @@ fn foreign_key_checks_probe_the_parent_key() {
         );
     }
 }
+
+/// A parent key backed only by `CREATE UNIQUE INDEX` is a referenced key like
+/// a constraint's, chosen as PostgreSQL's `transformFkeyCheckAttrs` does, and
+/// its checks still probe the parent instead of scanning it.
+#[test]
+fn foreign_keys_reference_plain_unique_indexes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut run = |sql: &str| run_with(&mut engine, &mut budget, sql);
+    for sql in [
+        "CREATE TABLE p (a int, b int, c int)",
+        "CREATE UNIQUE INDEX p_partial ON p (a) WHERE a > 0",
+        "CREATE UNIQUE INDEX p_expression ON p ((a + 1))",
+        "CREATE INDEX p_plain ON p (a)",
+        "CREATE TABLE c (a int REFERENCES p (a))",
+        "ALTER TABLE p ADD CONSTRAINT p_deferred UNIQUE (b) DEFERRABLE",
+        "CREATE TABLE c (b int REFERENCES p (b))",
+        "CREATE TABLE c (a int, FOREIGN KEY (a, a) REFERENCES p (a, a))",
+    ] {
+        let output = run(sql);
+        let expected: &[&str] = match sql {
+            "CREATE TABLE c (b int REFERENCES p (b))" => &["55000"],
+            sql if sql.starts_with("CREATE TABLE c") => &["42830"],
+            _ => &[],
+        };
+        assert_eq!(error_sqlstates(&output), expected, "{sql}");
+    }
+    for sql in [
+        "CREATE UNIQUE INDEX p_ba ON p (b, a) NULLS NOT DISTINCT",
+        "CREATE UNIQUE INDEX p_a ON p (a) INCLUDE (c)",
+        "ALTER TABLE p ADD CONSTRAINT p_ab UNIQUE (a, b)",
+        "CREATE TABLE c (a int REFERENCES p (a), b int, FOREIGN KEY (a, b) REFERENCES p (a, b))",
+        "INSERT INTO p SELECT g, g, g FROM generate_series(1, 400) g",
+    ] {
+        assert_eq!(error_sqlstates(&run(sql)), [] as [&str; 0], "{sql}");
+    }
+    assert_eq!(
+        data_rows(&run(
+            "SELECT conname, conindid::regclass FROM pg_constraint \
+             WHERE conrelid = 'c'::regclass ORDER BY conname"
+        )),
+        ["c_a_b_fkey|p_ba", "c_a_fkey|p_a"]
+    );
+    let before = visited();
+    let output = run("INSERT INTO c SELECT g, g FROM generate_series(1, 100) g");
+    assert_eq!(error_sqlstates(&output), [] as [&str; 0]);
+    let probed = visited() - before;
+    assert!(probed <= 4 * 100, "{probed} parent rows");
+    assert_eq!(
+        error_sqlstates(&run("INSERT INTO c VALUES (401, 1)")),
+        ["23503"]
+    );
+}

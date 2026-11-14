@@ -178,6 +178,8 @@ pub(super) fn sql_constructor(name: &str) -> Option<SqlConstructor> {
         | "__json_format"
         | "__json_serialize_text"
         | "__json_serialize_bytea"
+        | "__json_fit_varchar"
+        | "__json_fit_bpchar"
         | "__jsonb_subscript_set"
         | "__array_subscript_set"
         | "__assign_path"

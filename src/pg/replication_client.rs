@@ -566,6 +566,10 @@ pub enum FrameError {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a remote error's fields stay inline so reporting it cannot allocate"
+)]
 pub enum ClientError {
     Budget(BudgetError),
     Io(std::io::Error),
@@ -625,13 +629,21 @@ impl core::fmt::Display for ClientError {
     }
 }
 
-/// A PostgreSQL ErrorResponse reduced to the stable fields needed for
-/// diagnostics and typed recovery decisions. Unknown fields remain protocol
-/// compatible without entering runtime state.
+/// The longest remote `DETAIL`, `HINT` or `CONTEXT` a publisher or foreign
+/// server error carries; a longer field is a protocol error.
+pub const PUBLISHER_DIAGNOSTIC_FIELD_BYTES: usize = 2048;
+
+/// A PostgreSQL ErrorResponse reduced to the fields a local error repeats:
+/// SQLSTATE, message, and the `DETAIL`, `HINT` and `CONTEXT` PostgreSQL's
+/// `pgfdw_report_error` re-raises. Other fields remain protocol compatible
+/// without entering runtime state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublisherDiagnostic {
     pub sqlstate: crate::sql::eval::SqlState,
     pub message: StackStr<192>,
+    pub detail: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,
+    pub hint: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,
+    pub context: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,
 }
 
 impl std::error::Error for ClientError {}
@@ -1803,6 +1815,7 @@ fn publisher_diagnostic(fields: &[u8]) -> Result<PublisherDiagnostic, FrameError
     let mut at = 0;
     let mut sqlstate = None;
     let mut message = None;
+    let [mut detail, mut hint, mut context] = [None; 3];
     loop {
         let kind = *fields.get(at).ok_or(FrameError::Malformed)?;
         at += 1;
@@ -1833,12 +1846,27 @@ fn publisher_diagnostic(fields: &[u8]) -> Result<PublisherDiagnostic, FrameError
                 }
                 message = Some(value);
             }
+            b'D' | b'H' | b'W' => {
+                let field = match kind {
+                    b'D' => &mut detail,
+                    b'H' => &mut hint,
+                    _ => &mut context,
+                };
+                let value = StackStr::from_str(value);
+                if field.is_some() || value.is_truncated() {
+                    return Err(FrameError::Malformed);
+                }
+                *field = Some(value);
+            }
             _ => {}
         }
     }
     Ok(PublisherDiagnostic {
         sqlstate: sqlstate.ok_or(FrameError::Malformed)?,
         message: message.ok_or(FrameError::Malformed)?,
+        detail,
+        hint,
+        context,
     })
 }
 

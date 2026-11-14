@@ -103,6 +103,9 @@ pub struct Config {
     /// must free a slot for the next delta checkpoint.
     pub max_spill_generations_per_table: usize,
     pub max_savepoints_per_transaction: usize,
+    /// `SET CONSTRAINTS` mode changes and constraint renames or drops a
+    /// transaction retains. Deferred key checks are queued trigger events,
+    /// bounded by `deferred_trigger_bytes`.
     pub max_deferred_constraints_per_transaction: usize,
     pub deferred_trigger_bytes: usize,
     pub max_analyze_per_transaction: usize,

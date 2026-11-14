@@ -61,6 +61,7 @@ pub(crate) use plan::plan_time_bool;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
+pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, PaxReadDemand, pax_column_demand,
@@ -3575,6 +3576,43 @@ pub(super) fn storage_catalog<'storage, 'workspace>(
     }
 }
 
+/// Runs `function_oid`, a user-defined operator's function, on two values
+/// under `collation`.
+pub(crate) fn execute_operator_function<'a>(
+    storage: &Storage,
+    txid: u32,
+    function_oid: i32,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collation: super::ast::Collation,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let slot = storage
+        .routine_slot_by_oid(function_oid, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator function does not exist"
+            )
+        })?;
+    storage_catalog(storage, arena, txid)
+        .execute_routine(
+            slot,
+            &storage.routine_for(slot, txid),
+            &[left, right],
+            collation,
+            super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "operator function produced no scalar result"
+            )
+        })
+}
+
 pub(crate) fn execute_index_comparison<'a>(
     storage: &Storage,
     txid: u32,
@@ -6927,6 +6965,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
+    fn type_schema_exists(&self, schema: &str) -> bool {
+        super::type_name_miss::type_schema_exists(self.storage, self.txid, schema)
+    }
+
     fn schema_oid(&self, name: &str) -> Option<i32> {
         super::catalog::schema_oid_by_name(self.storage, self.txid, name)
     }
@@ -8002,7 +8044,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 super::eval::NO_PARAMS,
                 sequences,
             )
-            .map(Some);
+            .map(Some)
+            .map_err(|error| {
+                // PostgreSQL names the domain, not its base type, when no
+                // cast reaches it.
+                let message = error.message.as_str();
+                match message.rfind(" to ") {
+                    Some(at)
+                        if error.sqlstate.as_str() == sqlstate::CANNOT_COERCE
+                            && message.starts_with("cannot cast type ") =>
+                    {
+                        sql_err!(
+                            sqlstate::CANNOT_COERCE,
+                            "{} to {}",
+                            &message[..at],
+                            crate::sql::type_name_miss::split_type_name(type_name).1
+                        )
+                    }
+                    _ => error,
+                }
+            });
         }
         if let Some(slot) = self.storage.resolve_composite_slot(type_name, self.txid) {
             return match value {
@@ -8118,15 +8179,7 @@ fn privilege_relation_oid(
         PrivilegeRelation::Oid(oid) => return Ok(oid),
     };
     let parsed = super::identifiers::QualifiedObjectName::parse(written)?;
-    if parsed
-        .database
-        .is_some_and(|database| database != storage.current_database_name(transaction))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cross-database relation references are not supported"
-        ));
-    }
+    parsed.require_database(storage.current_database_name(transaction))?;
     if let Some(schema) = parsed.schema.as_ref() {
         let schema_exists = if schema.as_str() == "pg_temp" {
             super::catalog::current_temporary_namespace_oid(storage, transaction) != 0

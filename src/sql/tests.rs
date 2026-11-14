@@ -50,7 +50,10 @@ pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod partition_column_recursion;
 mod partition_index_propagation;
+mod pattern_index_families;
+mod plpgsql_compile_diagnostics;
 mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;
 mod polymorphic_resolution;
@@ -94,6 +97,7 @@ mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
+mod unknown_type_schema;
 mod view_reloptions;
 mod virtual_search_path;
 mod write_producers;
@@ -19400,12 +19404,13 @@ fn configured_catalog_version_pools_do_not_allocate_while_serving() {
 fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
     for (label, metadata, row_bytes, failing_insert) in [
         (
-            // Only a row that meets a possible duplicate is queued for the
-            // deferred recheck: three duplicates exceed two obligations.
-            "deferred-metadata",
-            2,
+            // A row that meets a possible duplicate queues its recheck in
+            // the event log beside its trigger events, so many duplicates
+            // fill the one in-memory page.
+            "deferred-rechecks",
+            8,
             crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
-            "INSERT INTO bounded_deferred VALUES(1, 'x'), (1, 'x'), (1, 'x'), (1, 'x')",
+            "INSERT INTO bounded_deferred SELECT 1, 'x' FROM generate_series(1, 20000)",
         ),
         (
             // One in-memory page and no spill file: an event larger than the

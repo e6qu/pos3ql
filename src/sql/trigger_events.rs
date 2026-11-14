@@ -23,8 +23,7 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::mem::mutex::Mutex;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::txn::{
-    ConstraintIdentity, DeferredTriggerEvent, DeferredTriggerKind, DeferredTriggerTuple,
-    ForeignKeyCheck,
+    ConstraintIdentity, DeferredTriggerEvent, DeferredTriggerKind, DeferredTriggerTuple, KeyCheck,
 };
 use crate::sql_err;
 use crate::storage::{ColumnSet, SqlName};
@@ -673,7 +672,7 @@ fn encode_header(
             command,
             ..
         } => (KIND_CONSTRAINT, 0, trigger_depth, effective_table, command),
-        DeferredTriggerKind::ForeignKey {
+        DeferredTriggerKind::KeyCheck {
             check,
             effective_table,
             trigger_depth,
@@ -722,7 +721,7 @@ fn encode_header(
         DeferredTriggerKind::Constraint { identity, .. } => {
             encode_identity(identity, header, &mut at)?;
         }
-        DeferredTriggerKind::ForeignKey {
+        DeferredTriggerKind::KeyCheck {
             identity, rowid, ..
         } => {
             encode_identity(identity, header, &mut at)?;
@@ -777,9 +776,9 @@ fn decode_header(id: u64, header: &[u8]) -> Result<(DeferredTriggerEvent, u32, b
         KIND_FOREIGN_KEY => {
             let identity = decode_identity(header, &mut at)?;
             let rowid = u64::from_le_bytes(take(header, &mut at, 8)?.try_into().expect("eight"));
-            DeferredTriggerKind::ForeignKey {
+            DeferredTriggerKind::KeyCheck {
                 identity,
-                check: ForeignKeyCheck::from_code(check).ok_or_else(corrupt)?,
+                check: KeyCheck::from_code(check).ok_or_else(corrupt)?,
                 effective_table,
                 trigger_depth,
                 command,

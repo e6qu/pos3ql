@@ -63,6 +63,9 @@ fn copied_errors_preserve_private_provenance_but_wire_codes_remain_public() {
 struct InputCatalog(SqlState);
 
 impl super::CatalogAccess for InputCatalog {
+    fn type_schema_exists(&self, _: &str) -> bool {
+        unreachable!("input validation does not inspect schemas")
+    }
     fn relation_is_visible(&self, _: i32) -> Option<bool> {
         unreachable!("input validation does not inspect relation visibility")
     }

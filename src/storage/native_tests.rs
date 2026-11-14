@@ -5520,6 +5520,12 @@ fn relation_identity_recovery_accepts_only_matching_inline_backing_relations() {
         .push(
             super::ExclusionElement::Column(1),
             super::ExclusionOperator::from_oid(3882).unwrap(),
+            super::ExclusionKeyOptions {
+                resolved_class: Some(super::IndexOperatorClass::Btree(
+                    crate::sql::types::BtreeOperatorClass::Range,
+                )),
+                ..super::ExclusionKeyOptions::DEFAULT
+            },
         )
         .unwrap();
     let table = storage.create_table(definition).unwrap();

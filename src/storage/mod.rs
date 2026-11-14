@@ -1541,6 +1541,9 @@ pub struct ColumnMeta {
     /// PostgreSQL's `attoptions` overrides for the local and inherited
     /// `ANALYZE` paths. This is a typed catalog value, never an option string.
     pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
+    /// PostgreSQL's `attislocal`: the table itself declares the column, as
+    /// opposed to receiving it only from an inheritance or partition parent.
+    pub local: bool,
 }
 
 // Recovery and copied execution schemas reserve at most 512 bytes per column.
@@ -1741,6 +1744,7 @@ impl ColumnMeta {
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     };
 }
 
@@ -1939,12 +1943,13 @@ impl UniqueKey {
     }
 }
 
-/// The built-in commutative binary operator, by `pg_operator` OID, that an
-/// exclusion constraint compares one element with.
+/// The commutative binary operator, by `pg_operator` OID, that an exclusion
+/// constraint compares one element with: a built-in the evaluator runs
+/// directly, or a user-defined operator run through its function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExclusionOperator {
     oid: i32,
-    binary: crate::sql::ast::BinaryOp,
+    binary: Option<crate::sql::ast::BinaryOp>,
 }
 
 impl ExclusionOperator {
@@ -1953,28 +1958,64 @@ impl ExclusionOperator {
         let (name, ..) = crate::sql::catalog::builtin_binary_operator_row(oid)?;
         Some(Self {
             oid,
-            binary: crate::sql::ast::BinaryOp::from_operator_name(name)?,
+            binary: Some(crate::sql::ast::BinaryOp::from_operator_name(name)?),
         })
+    }
+
+    /// A user-defined operator, by its catalog OID.
+    pub(crate) fn user(oid: i32) -> Option<Self> {
+        (oid >= OPERATOR_OID_BASE).then_some(Self { oid, binary: None })
+    }
+
+    /// A stored operator OID: a runnable built-in or a user-defined operator.
+    pub(crate) fn from_stored(oid: i32) -> Option<Self> {
+        Self::from_oid(oid).or_else(|| Self::user(oid))
     }
 
     pub(crate) const fn oid(self) -> i32 {
         self.oid
     }
 
-    pub(crate) const fn binary(self) -> crate::sql::ast::BinaryOp {
+    /// The built-in operator's evaluator form; `None` for a user operator.
+    pub(crate) const fn binary(self) -> Option<crate::sql::ast::BinaryOp> {
         self.binary
     }
 
-    pub(crate) fn sql(self) -> &'static str {
-        crate::sql::catalog::builtin_binary_operator_row(self.oid)
-            .expect("an exclusion operator is a built-in binary operator")
-            .0
+    /// The built-in operator's name; `None` for a user operator, which the
+    /// catalog names.
+    pub(crate) fn builtin_sql(self) -> Option<&'static str> {
+        crate::sql::catalog::builtin_binary_operator_row(self.oid).map(|row| row.0)
     }
 
     /// Range equality, the operator of `EMPTY`'s unused positions.
     const RANGE_EQUAL: Self = Self {
         oid: 3882,
-        binary: crate::sql::ast::BinaryOp::Eq,
+        binary: Some(crate::sql::ast::BinaryOp::Eq),
+    };
+}
+
+/// How one exclusion element is indexed: the operator class as written
+/// (`None` when omitted, so the definition prints back as written) and the
+/// class it resolved to, the key's collation (`explicit_collation` when a
+/// written one differs from the key's own) and the btree ordering options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExclusionKeyOptions {
+    pub(crate) class: Option<IndexOperatorClass>,
+    pub(crate) resolved_class: Option<IndexOperatorClass>,
+    pub(crate) collation: crate::sql::ast::Collation,
+    pub(crate) explicit_collation: bool,
+    pub(crate) descending: bool,
+    pub(crate) nulls_first: bool,
+}
+
+impl ExclusionKeyOptions {
+    pub(crate) const DEFAULT: Self = Self {
+        class: None,
+        resolved_class: None,
+        collation: crate::sql::ast::Collation::None,
+        explicit_collation: false,
+        descending: false,
+        nulls_first: false,
     };
 }
 
@@ -2013,6 +2054,7 @@ pub struct ExclusionConstraint {
     /// outside `expression_text`.
     keys: [ExclusionKey; MAX_INDEX_COLS],
     operators: [ExclusionOperator; MAX_INDEX_COLS],
+    options: [ExclusionKeyOptions; MAX_INDEX_COLS],
     n_cols: usize,
     expression_text: StackStr<EXCLUSION_EXPRESSIONS_MAX>,
     pub predicate: Option<StackStr<EXCLUSION_PREDICATE_MAX>>,
@@ -2027,6 +2069,7 @@ impl ExclusionConstraint {
         method: crate::sql::ast::IndexAccessMethod::Gist,
         keys: [ExclusionKey::Column(0); MAX_INDEX_COLS],
         operators: [ExclusionOperator::RANGE_EQUAL; MAX_INDEX_COLS],
+        options: [ExclusionKeyOptions::DEFAULT; MAX_INDEX_COLS],
         n_cols: 0,
         expression_text: StackStr::new(),
         predicate: None,
@@ -2059,6 +2102,11 @@ impl ExclusionConstraint {
         &self.operators[..self.n_cols]
     }
 
+    /// Each element's operator class and collation as written.
+    pub(crate) fn options(&self) -> &[ExclusionKeyOptions] {
+        &self.options[..self.n_cols]
+    }
+
     /// The table columns that are elements themselves (`conkey` entries
     /// other than 0).
     pub fn element_columns(&self) -> impl Iterator<Item = u16> + Clone + '_ {
@@ -2069,9 +2117,11 @@ impl ExclusionConstraint {
     }
 
     /// Whether both constraints compare the same elements with the same
-    /// operators.
+    /// operators, operator classes and collations.
     pub fn same_elements(&self, other: &Self) -> bool {
-        self.operators() == other.operators() && self.elements().eq(other.elements())
+        self.operators() == other.operators()
+            && self.options() == other.options()
+            && self.elements().eq(other.elements())
     }
 
     /// Appends one element. Exhaustion of the element or expression-text
@@ -2080,6 +2130,7 @@ impl ExclusionConstraint {
         &mut self,
         element: ExclusionElement<'_>,
         operator: ExclusionOperator,
+        options: ExclusionKeyOptions,
     ) -> Result<(), SqlError> {
         if self.n_cols == MAX_INDEX_COLS {
             return Err(sql_err!(
@@ -2107,6 +2158,7 @@ impl ExclusionConstraint {
             }
         };
         self.operators[self.n_cols] = operator;
+        self.options[self.n_cols] = options;
         self.n_cols += 1;
         Ok(())
     }
@@ -2142,7 +2194,11 @@ impl ExclusionConstraint {
     ) -> Result<Self, SqlError> {
         let mut mapped = self.without_elements();
         for position in 0..self.n_cols {
-            mapped.push(map(self.element(position))?, self.operators[position])?;
+            mapped.push(
+                map(self.element(position))?,
+                self.operators[position],
+                self.options[position],
+            )?;
         }
         Ok(mapped)
     }
@@ -2170,11 +2226,35 @@ impl CheckConstraint {
     };
 }
 
+/// The unique index of the referenced table a foreign key depends on
+/// (PostgreSQL's `conindid`), chosen when the key is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferencedIndex {
+    /// The table's own primary key, created by the same statement: chosen
+    /// once the statement's new keys have their identities.
+    PendingPrimaryKey,
+    /// The oldest immediate unique key over the referenced columns among
+    /// those the same statement creates on the table, chosen likewise.
+    PendingKey,
+    /// The index's relation identity.
+    Index(RelationIdentity),
+}
+
+impl ReferencedIndex {
+    pub(crate) const fn identity(self) -> Option<RelationIdentity> {
+        match self {
+            Self::Index(identity) => Some(identity),
+            Self::PendingPrimaryKey | Self::PendingKey => None,
+        }
+    }
+}
+
 /// A FOREIGN KEY constraint on a child table's column tuple referencing a
 /// parent table's column tuple.
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
     pub(crate) identity: Option<ConstraintIdentity>,
+    pub(crate) referenced_index: ReferencedIndex,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -2201,6 +2281,7 @@ pub struct ForeignKey {
 impl ForeignKey {
     pub const EMPTY: Self = ForeignKey {
         identity: None,
+        referenced_index: ReferencedIndex::PendingKey,
         name: SqlName::EMPTY,
         parent_schema: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
@@ -13148,6 +13229,56 @@ pub(crate) enum IndexOperatorClass {
 }
 
 impl IndexOperatorClass {
+    /// The five-byte durable form of an optional class: a tag, then a
+    /// built-in class code padded with zeros or a user class OID.
+    pub(crate) fn encode(class: Option<Self>) -> [u8; 5] {
+        let builtin = |tag: u8, code: u8| [tag, code, 0, 0, 0];
+        match class {
+            None => [0; 5],
+            Some(Self::Btree(class)) => builtin(1, class.code()),
+            Some(Self::Catalog(oid)) => {
+                let [a, b, c, d] = oid.get().to_le_bytes();
+                [2, a, b, c, d]
+            }
+            Some(Self::Hash(class)) => builtin(3, class.code()),
+            Some(Self::Brin(class)) => builtin(4, class.code()),
+            Some(Self::Gist(class)) => builtin(5, class.code()),
+            Some(Self::Gin(class)) => builtin(6, class.code()),
+            Some(Self::SpGist(class)) => builtin(7, class.code()),
+        }
+    }
+
+    /// Reads [`Self::encode`]'s form: `None` for malformed bytes.
+    pub(crate) fn decode(bytes: [u8; 5]) -> Option<Option<Self>> {
+        let [tag, value @ ..] = bytes;
+        let code = (value[1..] == [0, 0, 0]).then_some(value[0]);
+        Some(match tag {
+            0 if value == [0, 0, 0, 0] => None,
+            1 => Some(Self::Btree(
+                crate::sql::types::BtreeOperatorClass::from_code(code?)?,
+            )),
+            2 => Some(Self::Catalog(OperatorClassOid::parse(i32::from_le_bytes(
+                value,
+            ))?)),
+            3 => Some(Self::Hash(crate::sql::types::HashOperatorClass::from_code(
+                code?,
+            )?)),
+            4 => Some(Self::Brin(crate::sql::types::BrinOperatorClass::from_code(
+                code?,
+            )?)),
+            5 => Some(Self::Gist(crate::sql::types::GistOperatorClass::from_code(
+                code?,
+            )?)),
+            6 => Some(Self::Gin(crate::sql::types::GinOperatorClass::from_code(
+                code?,
+            )?)),
+            7 => Some(Self::SpGist(
+                crate::sql::types::SpGistOperatorClass::from_code(code?)?,
+            )),
+            _ => return None,
+        })
+    }
+
     pub(crate) const fn oid(self) -> i32 {
         match self {
             Self::Btree(class) => class.oid(),
@@ -13773,6 +13904,15 @@ pub struct IndexDef {
 }
 
 impl IndexDef {
+    /// The collation key `position` is ordered and compared under: its own,
+    /// or `C` under a pattern operator class, which compares byte by byte.
+    pub(crate) fn comparison_collation(&self, position: usize) -> Collation {
+        match self.resolved_operator_classes[position] {
+            Some(IndexOperatorClass::Btree(class)) if class.is_pattern() => Collation::C,
+            _ => self.collations[position],
+        }
+    }
+
     pub(crate) const EMPTY: Self = Self {
         relation: IndexRelationSource::Table,
         database: DatabaseOid::POSTGRES,
@@ -31557,12 +31697,11 @@ impl Storage {
                     })
             })
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}.{}\" does not exist",
-                    schema,
-                    name
-                )
+                crate::sql::type_name_miss::TypeNameMiss::Type {
+                    schema: Some(schema),
+                    name,
+                }
+                .error()
             })?;
         let role = self.current_role_slot(txid).ok_or_else(|| {
             sql_err!(
@@ -41848,7 +41987,7 @@ impl Storage {
                     .iter()
                     .any(Option::is_some)
                 || columns.iter().enumerate().any(|(position, column)| {
-                    index.collations[position]
+                    index.comparison_collation(position)
                         != table_definition.columns[*column as usize].collation
                 });
             let mut key_mask = ColumnSet::EMPTY;
@@ -41887,8 +42026,12 @@ impl Storage {
                     | crate::sql::ast::IndexAccessMethod::Gin
                     | crate::sql::ast::IndexAccessMethod::SpGist
             );
-            want[n_want].collations[..columns.len()]
-                .copy_from_slice(&index.collations[..columns.len()]);
+            for (position, collation) in want[n_want].collations[..columns.len()]
+                .iter_mut()
+                .enumerate()
+            {
+                *collation = index.comparison_collation(position);
+            }
             want[n_want].dependency_mask = key_mask | include_mask;
             let arena = self
                 .index_arena
@@ -45791,10 +45934,7 @@ impl Storage {
     /// definition, visible to `txid`, searching the current path when
     /// unqualified.
     pub fn find_domain(&self, type_name: &str, txid: u32) -> Option<DomainDef> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_domain_slot(qualifier, name, txid)
             .map(|slot| self.domain_for(slot, txid))
     }
@@ -45839,10 +45979,7 @@ impl Storage {
     /// Resolves a (possibly qualified) domain type name to its slot on the
     /// current path, visible to `txid`.
     pub fn resolve_domain_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_domain_slot(qualifier, name, txid)
     }
 
@@ -46675,10 +46812,7 @@ impl Storage {
     /// Resolves a (possibly qualified) enum type name to its slot on the current
     /// path, visible to `txid`.
     pub fn resolve_enum_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = match type_name.split_once('.') {
-            Some((q, n)) => (Some(q), n),
-            None => (None, type_name),
-        };
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_enum_slot(qualifier, name, txid)
     }
 
@@ -47440,9 +47574,7 @@ impl Storage {
     // --- Named composite types (CREATE TYPE ... AS (...)) ---
 
     pub fn resolve_composite_slot(&self, type_name: &str, txid: u32) -> Option<usize> {
-        let (qualifier, name) = type_name
-            .split_once('.')
-            .map_or((None, type_name), |(s, n)| (Some(s), n));
+        let (qualifier, name) = crate::sql::type_name_miss::split_type_name(type_name);
         self.find_composite_slot(qualifier, name, txid)
     }
 
@@ -60131,6 +60263,7 @@ pub(crate) mod tests {
                 user_type: None,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
         }
         def

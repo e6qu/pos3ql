@@ -4303,7 +4303,7 @@ fn relation_row_types_in_routine_signatures_resolve_like_postgresql() {
         (
             "CREATE FUNCTION takes_missing(signature_missing) RETURNS integer LANGUAGE sql \
              AS 'SELECT 1'",
-            &[('E', "42704", "type \"signature_missing\" does not exist")],
+            &[('E', "42704", "type signature_missing does not exist")],
         ),
     ]);
 }

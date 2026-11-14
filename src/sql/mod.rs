@@ -91,6 +91,7 @@ pub mod txn;
 pub(crate) mod type_input_plans;
 pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
+pub(crate) mod type_name_miss;
 pub mod types;
 pub mod tzif;
 pub(crate) mod unicode;
@@ -6861,19 +6862,6 @@ impl Engine {
             return Err(error);
         }
         self.work.reset();
-        if let Err(error) =
-            exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
-        {
-            // A foreign key check waiting for its parent row's lock keeps
-            // the admission, the completed checks and their locks, and
-            // continues when the commit runs again.
-            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
-                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
-            {
-                self.rollback_txn(txn, guc);
-            }
-            return Err(error);
-        }
         if txn.isolation == TransactionIsolation::Serializable
             && (!txn.touched().is_empty() || !txn.ddl().is_empty())
             && let Err(error) = self.storage.validate_serializable(txn.txid)
@@ -9708,8 +9696,6 @@ impl Engine {
         txn.rewind_statistics(mark.statistics);
         txn.rewind_subscription_advances(mark.subscription_advances);
         txn.rewind_constraints(
-            mark.constraint_obligations,
-            mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
             (
@@ -10941,35 +10927,6 @@ impl Engine {
         }
         if mode == ast::ConstraintMode::Immediate {
             if matches!(targets, ast::ConstraintTargets::All) {
-                if let Err(error) = exec::constraints::validate_deferred_constraints(
-                    &self.storage,
-                    txn,
-                    false,
-                    arena,
-                ) {
-                    return Ok(Err(error));
-                }
-            } else {
-                for identity in identities[..count].iter().copied() {
-                    while let Some((index, obligation)) = txn.deferred_constraint_for(identity) {
-                        if let Err(error) = exec::constraints::validate_constraint_obligation(
-                            &self.storage,
-                            identity,
-                            obligation.rowid,
-                            txn.txid,
-                            txn.isolation,
-                            self.storage.validation_read(),
-                            arena,
-                        ) {
-                            return Ok(Err(error));
-                        }
-                        if let Err(error) = txn.complete_deferred_constraint(index) {
-                            return Ok(Err(error));
-                        }
-                    }
-                }
-            }
-            if matches!(targets, ast::ConstraintTargets::All) {
                 if let Err(error) = self.fire_constraint_trigger_boundary(
                     txn,
                     guc,
@@ -11028,7 +10985,7 @@ impl Engine {
             .alloc_slice_with(count, |_| types::oid::TEXT)
             .map_err(|_| eval::arena_full())?;
         for (target, name) in types.iter_mut().zip(names) {
-            let resolved = exec::resolve_routine_type(&self.storage, txid, name)?;
+            let resolved = exec::resolve_routine_type_at(&self.storage, txid, name)?;
             if resolved.polymorphic_type().is_some() {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -11040,11 +10997,7 @@ impl Engine {
                 .storage
                 .routine_type_oid(resolved.ctype, resolved.user_type, txid)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        name
-                    )
+                    type_name_miss::TypeNameMiss::in_storage(&self.storage, txid, name).error()
                 })?;
         }
         Ok(types)
@@ -12199,7 +12152,6 @@ impl Engine {
             responder,
             inserted,
         )?;
-        exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -12208,7 +12160,7 @@ impl Engine {
             responder,
             boundary,
         )?;
-        txn.compact_completed_constraints();
+        txn.compact_trigger_events();
         Ok(())
     }
 
@@ -13221,14 +13173,6 @@ impl Engine {
                 };
                 let outcome = outcome
                     .and_then(|()| {
-                        exec::constraints::validate_deferred_constraints(
-                            &self.storage,
-                            txn,
-                            true,
-                            arena,
-                        )
-                    })
-                    .and_then(|()| {
                         self.fire_constraint_trigger_boundary(
                             txn,
                             guc,
@@ -13419,7 +13363,7 @@ impl Engine {
                         wait: crate::sql::StatementWait::Lock,
                     });
                 }
-                txn.compact_completed_constraints();
+                txn.compact_trigger_events();
                 // Only the last statement's tag waits for the commit.
                 txn.held_command_complete = responder
                     .take_held_command_complete()
@@ -13961,14 +13905,6 @@ impl Engine {
                                 Err(error) => Err(error),
                             }
                             .and_then(|()| {
-                                exec::constraints::validate_deferred_constraints(
-                                    &self.storage,
-                                    txn,
-                                    true,
-                                    arena,
-                                )
-                            })
-                            .and_then(|()| {
                                 self.fire_constraint_trigger_boundary(
                                     txn,
                                     guc,
@@ -14035,7 +13971,7 @@ impl Engine {
                                         wait: crate::sql::StatementWait::Lock,
                                     });
                                 }
-                                txn.compact_completed_constraints();
+                                txn.compact_trigger_events();
                                 if immediate.is_none()
                                     && index_completion.is_none()
                                     && !matches!(
@@ -14335,7 +14271,7 @@ impl Engine {
                     return Ok(ExtendedExecutionStatus::Complete(false));
                 }
             };
-            txn.compact_completed_constraints();
+            txn.compact_trigger_events();
             let response_mark = responder.mark();
             responder.function_call_response(&value, binary_result)?;
             if txn.is_implicit()
@@ -19859,6 +19795,16 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let routine = &match exec::resolve_routine_type_references(
+            &self.storage,
+            txn.txid,
+            routine,
+            arena,
+            responder,
+        )? {
+            Ok(routine) => routine,
+            Err(error) => return Ok(Err(error)),
+        };
         let declaration = match exec::resolve_routine_declaration(&self.storage, txn, routine, guc)
         {
             Ok(declaration) => declaration,
@@ -23586,9 +23532,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateExtension {
@@ -29040,13 +28989,8 @@ impl Engine {
         }
         if let Some(type_name) = type_name
             && let Err(error) = exec::resolve_routine_type(&self.storage, txid, type_name)
-            && error.sqlstate == eval::sqlstate::UNDEFINED_OBJECT
+            && type_name_miss::is_type_name_miss(&error)
         {
-            let error = sql_err!(
-                eval::sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                type_name
-            );
             if let Some(deferred_at) = deferred_at {
                 error_position::restore_position(&error, deferred_at);
             }

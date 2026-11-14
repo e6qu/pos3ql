@@ -874,6 +874,12 @@ mod tests {
                 .push(
                     super::super::ExclusionElement::Column(1),
                     super::super::ExclusionOperator::from_oid(3882).unwrap(),
+                    super::super::ExclusionKeyOptions {
+                        resolved_class: Some(super::super::IndexOperatorClass::Btree(
+                            crate::sql::types::BtreeOperatorClass::Range,
+                        )),
+                        ..super::super::ExclusionKeyOptions::DEFAULT
+                    },
                 )
                 .unwrap();
             let slot = storage.create_table(definition).unwrap();

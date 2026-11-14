@@ -1,11 +1,10 @@
 //! Stored expressions that keep routine and type names as SQL text without a
-//! captured binding (exclusion elements and predicates, statistics
-//! expressions, trigger conditions and domain constraints) would be left
-//! unresolvable by renaming or moving a routine or type they name, so the
-//! rename is refused. CHECK
-//! constraints, column defaults and generation expressions, and index keys
-//! and predicates are bound to what they name and refuse only enum label
-//! renames, whose spellings stay text.
+//! captured binding (statistics expressions, trigger conditions and domain
+//! constraints) would be left unresolvable by renaming or moving a routine or
+//! type they name, so the rename is refused. CHECK and exclusion constraints,
+//! column defaults and generation expressions, and index keys and predicates
+//! are bound to what they name and refuse only enum label renames, whose
+//! spellings stay text.
 
 use super::{CatalogDdlState, ExtendedStatisticsKey, SqlName, Storage, current_database};
 use crate::sql::eval::{SqlError, sqlstate};
@@ -145,10 +144,10 @@ impl Storage {
                 continue;
             }
             let definition = self.table_def(slot, txid);
-            // CHECK constraints and column expressions are bound to the
-            // routines and types they name, so only their enum labels, which
-            // stay text, block a rename here.
-            let bound = definition
+            // CHECK and exclusion constraints and column expressions are
+            // bound to the routines and types they name, so only their enum
+            // labels, which stay text, block a rename here.
+            let named = definition
                 .columns()
                 .iter()
                 .filter_map(|column| column.default.expression().map(|text| text.as_str()))
@@ -158,8 +157,6 @@ impl Storage {
                         .iter()
                         .map(|check| check.expression.as_str()),
                 )
-                .filter(|_| matches!(target, StoredTextName::EnumLabels { .. }));
-            let named = bound
                 .chain(definition.exclusions().iter().flat_map(|exclusion| {
                     exclusion
                         .elements()
@@ -169,6 +166,7 @@ impl Storage {
                         })
                         .chain(exclusion.predicate.as_ref().map(|text| text.as_str()))
                 }))
+                .filter(|_| matches!(target, StoredTextName::EnumLabels { .. }))
                 .try_fold(false, |found, text| {
                     Ok::<_, SqlError>(found || target.named_by(text, arena)?)
                 })?;

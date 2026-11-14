@@ -1324,6 +1324,16 @@ pub(crate) fn expression_type_identity<'a>(
         operand, type_name, ..
     } = expression
     {
+        if let Some(nonarray) = super::types::unchanged_polymorphic_cast(type_name) {
+            if matches!(operand, Expr::Str(_)) {
+                return Ok(ExpressionTypeIdentity::Known(super::types::oid::UNKNOWN));
+            }
+            let identity = expression_type_identity(operand, row, hooks)?;
+            if nonarray {
+                reject_polymorphic_array(identity.routine_argument_oid(), type_name)?;
+            }
+            return Ok(identity);
+        }
         if let Some(ctype) = super::types::ColType::from_sql_name(type_name) {
             if ctype == super::types::ColType::Pseudo(super::types::PseudoType::Any) {
                 // An untyped literal stays `unknown`.
@@ -1344,11 +1354,10 @@ pub(crate) fn expression_type_identity<'a>(
             .user_type_oid(type_name)
             .map(ExpressionTypeIdentity::Known)
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    type_name
-                )
+                crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
+                    catalog.type_schema_exists(schema)
+                })
+                .error()
             });
     }
     // An element of an `information_schema` domain array keeps the domain,
@@ -2291,6 +2300,8 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "__json_object_bytea"
             | "__json_serialize_bytea"
             | "__json_serialize_text"
+            | "__json_fit_varchar"
+            | "__json_fit_bpchar"
             | "__json_exists_true"
             | "__json_exists_unknown"
             | "__json_exists_error"
@@ -3186,6 +3197,10 @@ pub trait CatalogAccess {
     fn schema_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    /// Whether the schema written before a type name exists, as
+    /// PostgreSQL's `LookupExplicitNamespace` decides (`pg_temp` names the
+    /// session's temporary schema once it has one).
+    fn type_schema_exists(&self, schema: &str) -> bool;
     /// Resolve a namespace name to its catalog OID.
     fn schema_oid(&self, _name: &str) -> Option<i32> {
         None
@@ -4464,6 +4479,20 @@ fn catalog_evaluation(
         let target = ColType::from_sql_name(type_name)
             .map(ColType::oid)
             .or_else(|| catalog.user_type_oid(type_name));
+        // PostgreSQL resolves an array constructor's target type before
+        // the constructor.
+        if target.is_none()
+            && matches!(operand, Expr::Array(_))
+            && super::types::unchanged_polymorphic_cast(type_name).is_none()
+        {
+            return Err(crate::sql::error_position::at_subject(
+                crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
+                    catalog.type_schema_exists(schema)
+                })
+                .error(),
+                type_name,
+            ));
+        }
         let source = if let Expr::Array(items) = operand
             && let Some(ColType::Array(element)) = target.and_then(|oid| {
                 constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid))
@@ -4603,6 +4632,7 @@ fn fold_check<'a>(
             Err(e)
                 if (evaluation != Some(ExpressionEvaluation::Immutable)
                     && (e.sqlstate == sqlstate::UNDEFINED_OBJECT
+                        || crate::sql::type_name_miss::is_type_name_miss(&e)
                         || e.sqlstate == sqlstate::UNDEFINED_FUNCTION))
                     || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED =>
             {
@@ -7417,9 +7447,26 @@ fn eval_full_inner<'a>(
                 Some(element) => Ok(ExpressionTypeIdentity::Known(element.array_oid())),
                 None => expression_type_identity(operand, row, hooks),
             };
+            if let Some(nonarray) = super::types::unchanged_polymorphic_cast(type_name) {
+                if nonarray {
+                    reject_polymorphic_array(source_identity()?.routine_argument_oid(), type_name)?;
+                }
+                return Ok(v);
+            }
             let target_type = ColType::from_sql_name(type_name);
             if let Some(ColType::Pseudo(kind)) = target_type {
-                return pseudo_type_cast(kind, v, source_identity()?.routine_argument_oid(), arena);
+                let source_oid = source_identity()?.routine_argument_oid();
+                // An input-function refusal of an untyped literal points at
+                // the literal.
+                return pseudo_type_cast(kind, v, source_oid, arena).map_err(|error| {
+                    if source_oid == super::types::oid::UNKNOWN
+                        && error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED
+                    {
+                        crate::sql::error_position::at_expression(error, operand)
+                    } else {
+                        error
+                    }
+                });
             }
             // `cstring` converts only to the string types, element by element
             // for arrays; an array constructor converts each `cstring` item.
@@ -7595,11 +7642,21 @@ fn eval_full_inner<'a>(
             // any other type spelling through the one catalog-aware cast hook:
             // domains, enums, and their automatically-created array types all
             // resolve and validate there.
-            if ColType::from_sql_name(type_name).is_none()
-                && let Some(cat) = hooks.catalog
-                && let Some(value) = cat.cast_user_type(type_name, v, arena, hooks.sequences)?
-            {
-                return Ok(value);
+            if ColType::from_sql_name(type_name).is_none() {
+                if let Some(cat) = hooks.catalog
+                    && let Some(value) = cat.cast_user_type(type_name, v, arena, hooks.sequences)?
+                {
+                    return Ok(value);
+                }
+                return Err(crate::sql::type_name_miss::TypeNameMiss::of_written(
+                    type_name,
+                    |schema| {
+                        hooks
+                            .catalog
+                            .is_none_or(|catalog| catalog.type_schema_exists(schema))
+                    },
+                )
+                .error());
             }
             let v = cast(v, type_name, arena)?;
             let v = if let Some(target) = ColType::from_sql_name(type_name)
@@ -13335,11 +13392,20 @@ pub(crate) fn input_error<'a>(
         None
     };
     let Some(parsed) = parsed else {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "type \"{}\" does not exist",
-            type_name
-        ));
+        use crate::sql::type_name_miss::TypeNameMiss;
+        let miss = TypeNameMiss::of_written(base_name, |schema| {
+            hooks
+                .catalog
+                .is_none_or(|catalog| catalog.type_schema_exists(schema))
+        });
+        return Err(match miss {
+            TypeNameMiss::Schema(_) => miss,
+            TypeNameMiss::Type { .. } => TypeNameMiss::Type {
+                schema: None,
+                name: type_name,
+            },
+        }
+        .error());
     };
     parsed
         .err()
@@ -13562,13 +13628,7 @@ pub(crate) fn regtype_cast<'a>(
             if let Ok(oid) = name.parse::<u32>() {
                 return regtype_of_oid_with_catalog(i64::from(oid), catalog, arena);
             }
-            if let Some(identity) = cross_database_catalog_reference(name, false) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cross-database references are not implemented: {}",
-                    identity
-                ));
-            }
+            let name = without_catalog_qualifier(name, false)?;
             let (normalized, display) = written_type_name(name)?;
             if let Some(catalog) = catalog {
                 if let Some(referenced_oid) = catalog.user_type_oid(normalized.as_str()) {
@@ -13601,10 +13661,15 @@ pub(crate) fn regtype_cast<'a>(
     }
 }
 
-pub(crate) fn cross_database_catalog_reference(
+/// PostgreSQL's `DeconstructQualifiedName` for the name a catalog-reference
+/// input reads: `database.schema.name` must name the session's database, whose
+/// part is dropped, and four or more names are improper. A signature after the
+/// name (`f(int)`) is kept; text this cannot split is returned unchanged for
+/// the input function's own diagnostics.
+pub(crate) fn without_catalog_qualifier(
     written: &str,
     signature_required: bool,
-) -> Option<&str> {
+) -> Result<&str, SqlError> {
     let written = written.trim();
     let bytes = written.as_bytes();
     let mut quoted = false;
@@ -13625,28 +13690,66 @@ pub(crate) fn cross_database_catalog_reference(
         }
     }
     if quoted || (signature_required && signature.is_none()) {
-        return None;
+        return Ok(written);
     }
-    let identity = written[..signature.unwrap_or(written.len())].trim();
+    let identity = written[..signature.unwrap_or(written.len())].trim_end();
     let mut quoted = false;
-    let mut separators = 0u8;
-    let mut input = identity.as_bytes().iter().copied().peekable();
-    while let Some(byte) = input.next() {
-        match byte {
-            b'"' if quoted && input.peek() == Some(&b'"') => {
-                input.next();
-            }
+    let mut separators = 0usize;
+    let mut first_separator = 0;
+    let mut index = 0;
+    let identity_bytes = identity.as_bytes();
+    while index < identity_bytes.len() {
+        match identity_bytes[index] {
+            b'"' if quoted && identity_bytes.get(index + 1) == Some(&b'"') => index += 1,
             b'"' => quoted = !quoted,
             b'.' if !quoted => {
-                separators += 1;
-                if separators == 2 {
-                    return Some(identity);
+                if separators == 0 {
+                    first_separator = index;
                 }
+                separators += 1;
             }
             _ => {}
         }
+        index += 1;
     }
-    None
+    match separators {
+        0 | 1 => Ok(written),
+        2 => {
+            use core::fmt::Write as _;
+            let database = identity[..first_separator].trim();
+            let mut decoded = crate::util::StackStr::<256>::new();
+            if let Some(inner) = database
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+            {
+                let mut rest = inner;
+                while let Some((before, after)) = rest.split_once("\"\"") {
+                    let _ = decoded.write_str(before);
+                    let _ = decoded.write_char('"');
+                    rest = after;
+                }
+                let _ = decoded.write_str(rest);
+            } else {
+                for character in database.chars() {
+                    let _ = decoded.write_char(character.to_ascii_lowercase());
+                }
+            }
+            if funcs::system::is_current_database(decoded.as_str()) {
+                Ok(written[first_separator + 1..].trim_start())
+            } else {
+                Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cross-database references are not implemented: {}",
+                    identity
+                ))
+            }
+        }
+        _ => Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "improper qualified name (too many dotted names): {}",
+            identity
+        )),
+    }
 }
 
 /// PostgreSQL's `parseNameAndArgTypes` for `regprocedure` and `regoperator`
@@ -13766,22 +13869,18 @@ pub(crate) fn regobject_cast<'a>(
             } else {
                 let signature_required =
                     matches!(target, ColType::Regprocedure | ColType::Regoperator);
-                if matches!(
+                let name = if matches!(
                     target,
                     ColType::Regproc
                         | ColType::Regprocedure
                         | ColType::Regoper
                         | ColType::Regoperator
                         | ColType::Regcollation
-                ) && let Some(identity) =
-                    cross_database_catalog_reference(name, signature_required)
-                {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cross-database references are not implemented: {}",
-                        identity
-                    ));
-                }
+                ) {
+                    without_catalog_qualifier(name, signature_required)?
+                } else {
+                    name
+                };
                 let catalog = catalog.ok_or_else(|| {
                     sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -14314,10 +14413,25 @@ pub(crate) fn regtype_of_normalized_name<'a>(
     regtype_of_oid(i64::from(referenced_oid), arena)
 }
 
+/// PostgreSQL's `can_coerce_type` refusal of an array cast to `anynonarray`
+/// or `anycompatiblenonarray`.
+fn reject_polymorphic_array(source_oid: i32, type_name: &str) -> Result<(), SqlError> {
+    match crate::sql::exec::coltype_of_oid(source_oid) {
+        Some(source @ ColType::Array(_)) => Err(sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type {} to {}",
+            source.name(),
+            type_name
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// A cast to `cstring`, `unknown` or `"any"`. PostgreSQL converts a string
 /// value or an untyped literal to `cstring` through its output, keeps an
 /// untyped literal as `unknown`, and treats `"any"` as no conversion; other
-/// sources fail with `42846`, and the remaining pseudo-types accept no value.
+/// sources fail with `42846`, and the remaining pseudo-types refuse an
+/// untyped literal (`NULL` included) in their input function.
 fn pseudo_type_cast<'a>(
     kind: super::types::PseudoType,
     value: Datum<'a>,
@@ -14332,7 +14446,17 @@ fn pseudo_type_cast<'a>(
             oid::UNKNOWN | oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CSTRING
         ),
         PseudoType::Unknown => source_oid == oid::UNKNOWN,
-        _ => return Err(cast::pseudo_type_value(kind)),
+        // An untyped literal or a string, converted through I/O, reaches the
+        // input function, which refuses every value; another source has no
+        // coercion path.
+        _ if matches!(
+            source_oid,
+            oid::UNKNOWN | oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME
+        ) =>
+        {
+            return Err(cast::pseudo_type_value(kind));
+        }
+        _ => false,
     };
     if !accepted {
         return Err(sql_err!(
@@ -14782,6 +14906,9 @@ mod tests {
         use crate::sql::ast::Collation;
         struct Operator(core::cell::Cell<Collation>, core::cell::Cell<usize>);
         impl CatalogAccess for Operator {
+            fn type_schema_exists(&self, _: &str) -> bool {
+                panic!("unexpected schema lookup in conversion metadata test")
+            }
             fn relation_is_visible(&self, _: i32) -> Option<bool> {
                 panic!("unexpected relation lookup in conversion metadata test")
             }
@@ -14884,6 +15011,9 @@ mod tests {
         use crate::sql::ast::Collation;
         struct Cast(core::cell::Cell<Collation>);
         impl CatalogAccess for Cast {
+            fn type_schema_exists(&self, _: &str) -> bool {
+                panic!("unexpected schema lookup in conversion metadata test")
+            }
             fn relation_is_visible(&self, _: i32) -> Option<bool> {
                 panic!("unexpected relation lookup in conversion metadata test")
             }

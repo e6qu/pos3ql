@@ -1416,6 +1416,9 @@ pub(crate) fn dml_parameter_scope_query<'a>(
 
 /// The derived relation rule actions read the triggering statement through.
 const TRANSITION_SOURCE_ALIAS: &str = "__pos3ql_rule_transition";
+/// An `INSERT` statement's query or `VALUES` rows, as a rule's transition
+/// relation reads them.
+const RULE_INPUT_ALIAS: &str = "__pos3ql_rule_input";
 
 #[derive(Clone, Copy)]
 pub(crate) struct RuleTransitionSource<'a> {
@@ -1993,9 +1996,7 @@ pub(crate) fn rule_transition_source<'a>(
                     .map(|select| &*select)
                     .map_err(|_| arena_full())?
             };
-            let input_alias = arena
-                .alloc_str("__pos3ql_rule_input")
-                .map_err(|_| arena_full())?;
+            let input_alias = RULE_INPUT_ALIAS;
             let input_ref = TableRef {
                 schema: None,
                 table: "",
@@ -2702,6 +2703,8 @@ pub(crate) fn attach_rule_source<'a>(
     source: TableRef<'a>,
     condition: Option<&'a Expr<'a>>,
     target: impl FnOnce() -> Result<RuleInsertTarget<'a>, SqlError>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let rewritten = match statement {
@@ -2746,16 +2749,23 @@ pub(crate) fn attach_rule_source<'a>(
                     ..*select
                 }
             } else {
+                let rewritten = rule_insert_values(insert, source, condition, target, arena)?;
+                let rewritten = match rewritten.select {
+                    Some(select) => Insert {
+                        select: Some(pull_up_rule_source(select, storage, txid, arena)?),
+                        ..rewritten
+                    },
+                    None => rewritten,
+                };
                 return arena
-                    .alloc(Stmt::Insert(rule_insert_values(
-                        insert, source, condition, target, arena,
-                    )?))
+                    .alloc(Stmt::Insert(rewritten))
                     .map(|statement| &*statement)
                     .map_err(|_| arena_full());
             };
+            let select = arena.alloc(select).map_err(|_| arena_full())?;
             Stmt::Insert(Insert {
                 rows: &[],
-                select: Some(&*arena.alloc(select).map_err(|_| arena_full())?),
+                select: Some(pull_up_rule_source(select, storage, txid, arena)?),
                 ..*insert
             })
         }
@@ -2770,6 +2780,197 @@ pub(crate) fn attach_rule_source<'a>(
     arena
         .alloc(rewritten)
         .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+/// `select`, an action's query over the rule's transition relation alone,
+/// with that relation pulled up: each reference replaced with the
+/// statement's expression it reads and the relation's own `FROM` and `WHERE`
+/// in its place, as PostgreSQL's rewriter substitutes them. An `INSERT ...
+/// SELECT` statement's query, which the relation reads, is pulled up the
+/// same way when it has no volatile output, as PostgreSQL's planner pulls up
+/// a simple subquery. The action
+/// then evaluates the statement's expressions row by row, interleaved with
+/// its own, rather than reading them from a relation evaluated first. A
+/// query joining other relations or holding subqueries keeps the relation.
+fn pull_up_rule_source<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let pulled = pull_up_derived(select, TRANSITION_SOURCE_ALIAS, storage, txid, arena)?;
+    if core::ptr::eq(pulled, select) {
+        return Ok(select);
+    }
+    // The statement's query is a subquery the planner pulls up only without
+    // volatile output, which would otherwise run once per reference.
+    if let Some(FromClause {
+        base: TableRef {
+            subquery: Some(input),
+            ..
+        },
+        ..
+    }) = pulled.from.as_ref()
+        && input.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if super::expression_contains_volatile(expression, storage, txid, false))
+        })
+    {
+        return Ok(pulled);
+    }
+    pull_up_derived(pulled, RULE_INPUT_ALIAS, storage, txid, arena)
+}
+
+/// Whether `expression` calls an aggregate, a window function or a
+/// set-returning function, which keep a subquery from being pulled up
+/// (PostgreSQL's `is_simple_subquery`). A stored routine of that kind
+/// counts under any of its overloads.
+fn calls_grouping_or_set_routine(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call { name, over, .. } = expression {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        if over.is_some()
+            || expression.is_aggregate()
+            || super::is_builtin_set_routine(name)
+            || (0..storage.routine_count()).any(|slot| {
+                storage
+                    .routine_identity_for(slot, txid)
+                    .is_some_and(|identity| identity.name.as_str() == bare)
+                    && {
+                        let kind = storage.routine_for(slot, txid).kind;
+                        matches!(kind, crate::storage::RoutineKind::Aggregate(_))
+                            || kind.is_set_returning()
+                    }
+            })
+        {
+            return true;
+        }
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found = found || calls_grouping_or_set_routine(child, storage, txid);
+        Ok(())
+    });
+    found
+}
+
+/// [`pull_up_rule_source`] of the derived relation `alias`, `select`'s only
+/// `FROM` item, or `select` itself when it cannot be pulled up.
+fn pull_up_derived<'a>(
+    select: &'a Select<'a>,
+    alias: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let Some(from) = select.from.as_ref() else {
+        return Ok(select);
+    };
+    let Some(source) = from.base.subquery else {
+        return Ok(select);
+    };
+    let simple = |query: &Select<'_>| {
+        !query.distinct
+            && query.distinct_on.is_empty()
+            && query.windows.is_empty()
+            && query.group_by.is_empty()
+            && query.grouping_sets.is_empty()
+            && query.having.is_none()
+            && query.order_by.is_empty()
+            && query.limit.is_none()
+            && query.offset.is_none()
+            && query.with.is_empty()
+            && query.set_body.is_none()
+            && query.locking.is_empty()
+    };
+    let plain_items = |query: &Select<'_>| {
+        query.items.iter().all(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if !expression.contains_subquery()
+                    && !calls_grouping_or_set_routine(expression, storage, txid))
+        })
+    };
+    if from.base.alias != Some(alias)
+        || !from.joins.is_empty()
+        || from.base.lateral
+        || !simple(select)
+        || !simple(source)
+        || !plain_items(select)
+        || !plain_items(source)
+        || select
+            .where_clause
+            .is_some_and(|condition| condition.contains_subquery())
+        || source
+            .where_clause
+            .is_some_and(|condition| condition.contains_subquery())
+    {
+        return Ok(select);
+    }
+    let names = from.base.col_alias;
+    struct Failure(SqlError);
+    impl From<crate::mem::arena::ArenaFull> for Failure {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self(arena_full())
+        }
+    }
+    let mut unresolved = false;
+    let mut substitute = |node: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, Failure> {
+        let Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } = node
+        else {
+            return Ok(None);
+        };
+        if *qualifier != alias {
+            return Ok(None);
+        }
+        let found = match names {
+            Some(names) => names
+                .iter()
+                .position(|candidate| candidate == name)
+                .and_then(|position| source.items.get(position)),
+            None => source.items.iter().find(|item| {
+                matches!(item, SelectItem::Expr { alias: Some(written), .. } if written == name)
+            }),
+        };
+        let found = match found {
+            Some(SelectItem::Expr { expression, .. }) => Some(*expression),
+            _ => None,
+        };
+        if found.is_none() {
+            unresolved = true;
+        }
+        Ok(found)
+    };
+    let items = arena
+        .alloc_slice_copy(select.items)
+        .map_err(|_| arena_full())?;
+    for item in items.iter_mut() {
+        if let SelectItem::Expr { expression, .. } = item {
+            *expression = crate::sql::ast::rewrite_expression(expression, arena, &mut substitute)
+                .map_err(|Failure(error)| error)?;
+        }
+    }
+    let condition = match select.where_clause {
+        Some(condition) => Some(
+            crate::sql::ast::rewrite_expression(condition, arena, &mut substitute)
+                .map_err(|Failure(error)| error)?,
+        ),
+        None => None,
+    };
+    if unresolved {
+        return Ok(select);
+    }
+    let items = &*items;
+    arena
+        .alloc(Select {
+            items,
+            from: source.from,
+            where_clause: and_where(source.where_clause, condition, arena)?,
+            ..*select
+        })
+        .map(|select| &*select)
         .map_err(|_| arena_full())
 }
 

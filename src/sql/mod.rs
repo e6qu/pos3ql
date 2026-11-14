@@ -17184,6 +17184,8 @@ impl Engine {
                         source,
                         condition,
                         || rule_insert_target(storage, action, txn.txid, arena),
+                        storage,
+                        txn.txid,
                         arena,
                     ) {
                         Ok(action) => action,

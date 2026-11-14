@@ -790,3 +790,42 @@ fn leakproof_conditions_run_at_the_first_security_level() {
         );
     });
 }
+
+#[test]
+fn rule_actions_read_statement_expressions_row_by_row() {
+    with_engine("notice-rule-interleaving", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ri (id int, a int)",
+            "CREATE TABLE ri_log (x int, y int)",
+            "INSERT INTO ri VALUES (1, 10), (2, 20)",
+            "CREATE FUNCTION ri_f(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ri_also AS ON UPDATE TO ri \
+             DO ALSO INSERT INTO ri_log VALUES (new.a, ri_f('own', old.id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let output = messages(
+            engine,
+            budget,
+            "UPDATE ri SET a = ri_f('set', a) WHERE id < 3",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        // The action's rows interleave the SET expression with the action's
+        // own call; the UPDATE itself then evaluates its SET expressions.
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 own 1",
+                "NOTICE 00000 set 20",
+                "NOTICE 00000 own 2",
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 set 20",
+            ]
+        );
+    });
+}

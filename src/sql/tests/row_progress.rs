@@ -630,6 +630,9 @@ const QUALIFY_SETUP: &str = "CREATE TABLE items(id int PRIMARY KEY, a bigint); \
     INSERT INTO calls VALUES (x, total, nextval('call_numbers')); \
     RAISE NOTICE 'seen % %', x, total; RETURN total; END$$";
 
+/// A statement with its expected rows, calls and notices.
+type QualifyCase<'c> = (&'c str, &'c [&'c str], &'c [&'c str], &'c [&'c str]);
+
 /// `UPDATE` and `DELETE` qualify each row just before changing it, as
 /// PostgreSQL does: a condition's call sees the rows already changed, and
 /// its notices interleave with the change's own calls. Each call runs once
@@ -646,7 +649,7 @@ fn conditions_qualify_each_row_as_it_changes() {
         "seen 3 13",
         "seen -3 13",
     ];
-    let cases: &[(&str, &[&str], &[&str], &[&str])] = &[
+    let cases: &[QualifyCase] = &[
         (
             "UPDATE items SET a = a + 10 + seen(-id) * 0 WHERE seen(id) + id > 4",
             &["1|1", "2|11", "3|11"],

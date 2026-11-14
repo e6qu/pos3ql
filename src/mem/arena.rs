@@ -1134,8 +1134,8 @@ pub fn try_stable_top_n_via<T, E>(
     }
     perm[..bound].copy_from_slice(heap);
     let mut next = bound;
-    for position in 0..n {
-        if !visited[position] {
+    for (position, &kept) in visited.iter().enumerate() {
+        if !kept {
             perm[next] = position as u32;
             next += 1;
         }

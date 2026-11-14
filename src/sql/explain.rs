@@ -4325,7 +4325,7 @@ fn window_definition(
 /// first, and the keys the last window leaves its rows sorted by. Each
 /// window clause sorts its input unless the rows already follow its keys,
 /// incrementally when they follow a prefix of them, as PostgreSQL plans.
-fn window_stages<'a, 'e>(
+fn window_stages<'e>(
     storage: &Storage,
     txid: u32,
     scope: Option<&QueryScope<'_>>,

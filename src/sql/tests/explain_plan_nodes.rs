@@ -30,15 +30,13 @@ fn plan(
 fn without_memory(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
-        .map(
-            |line| match line.find("Memory: ").or(line.find("Storage: ")) {
-                Some(at) if line.ends_with("kB") => {
-                    let label_end = line[at..].find(": ").map_or(line.len(), |end| at + end + 2);
-                    format!("{}NkB", &line[..label_end])
-                }
-                _ => line,
-            },
-        )
+        .map(|line| match line.strip_suffix("kB") {
+            Some(figure) => {
+                let digits = figure.trim_end_matches(|c: char| c.is_ascii_digit());
+                format!("{digits}NkB")
+            }
+            None => line,
+        })
         .collect()
 }
 

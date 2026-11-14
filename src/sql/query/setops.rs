@@ -2339,6 +2339,10 @@ pub(crate) fn set_rows_tie(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sort keys and their limit's bound"
+)]
 pub(crate) fn sort_set_rows(
     storage: &Storage,
     txid: u32,

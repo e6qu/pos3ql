@@ -122,8 +122,16 @@ is owned.
   in the statement arena to capture the changed rows. `pg_proc` history
   includes only the built-in routines that have a per-database entry, so
   `CREATE FUNCTION` is bounded by the stored and altered routines, not the
-  3,000-row built-in catalog. Capturing only the rows the transaction's
-  changes name would bound every relation by the change.
+  3,000-row built-in catalog. The synthesis walks each table's indexes by
+  its slot, and collects indexes and foreign keys in one walk, so a commit
+  no longer looks every table up by name for each table; checkpoint
+  maintenance reads a value index binding's fields in place instead of
+  copying it. A commit's cost still grows with the catalog: each table's
+  index lookup scans every index and each foreign key finds its parent by
+  name. Capturing only the rows the transaction's changes name would bound
+  every relation by the change (`configured_transaction_capacity_covers_
+  truncate_fanout_and_prepared_cold_recovery`, which commits 300 tables'
+  DDL, took 175 s in a local debug build before and 108 s after).
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the
@@ -529,7 +537,13 @@ top-level conjuncts run in PostgreSQL's `order_qual_clauses` order: by
 per-row cost, stably, where a routine or a user-defined operator's function
 costs its declared `COST` (100 by default) times an operator, so
 `f(id) AND id < 4` runs `id < 4` first, in queries, `UPDATE`, `DELETE` and
-their `EXPLAIN` filters. Under row security each policy condition runs
+their `EXPLAIN` filters. An uncorrelated scalar, `EXISTS` or `ARRAY`
+subquery is an initPlan that costs nothing per row, and an uncorrelated
+`IN` or `ANY` below the top level a hashed subPlan that costs its
+comparison; a top-level `IN (SELECT ...)` becomes a semi-join that runs
+after the relation's own conditions, except that a write runs it first
+when an index leads with its column, as PostgreSQL's plan then reads the
+subquery's rows and probes the index. Under row security each policy condition runs
 before the statement's conditions, except that a leakproof conjunct of a
 single-relation query or write cheaper than ten operators and than the first
 policy condition runs before the policies. A foreign table's candidate

@@ -9726,7 +9726,6 @@ fn visit_indexes(
         if schema.is_some_and(|schema| def.schema.as_str() != schema) {
             continue;
         }
-        let table_name = def.name.as_str();
         let toid = user_table_oid(storage, slot);
         let mk = |oid: i32,
                   columns: &[u16],
@@ -9816,12 +9815,10 @@ fn visit_indexes(
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
             if (col.primary || col.unique)
-                && storage
-                    .indexes_for(def.schema.as_str(), table_name, txid)
-                    .any(|index| {
-                        def.column_index_identity(ci)
-                            .is_some_and(|identity| identity.created_at() == index.created_at)
-                    })
+                && storage.indexes_for_slot(slot, txid).any(|index| {
+                    def.column_index_identity(ci)
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
+                })
             {
                 continue;
             }
@@ -9885,13 +9882,10 @@ fn visit_indexes(
         for uk in def.uniques() {
             // A transferred or rebuilt backing relation keeps the constraint's
             // identity. Its relation identity prevents a duplicate index row.
-            if storage
-                .indexes_for(def.schema.as_str(), table_name, txid)
-                .any(|index| {
-                    uk.index_identity
-                        .is_some_and(|identity| identity.created_at() == index.created_at)
-                })
-            {
+            if storage.indexes_for_slot(slot, txid).any(|index| {
+                uk.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            }) {
                 continue;
             }
             visit(mk(
@@ -9917,14 +9911,11 @@ fn visit_indexes(
             ));
         }
         for exclusion in def.exclusions() {
-            if storage
-                .indexes_for(def.schema.as_str(), table_name, txid)
-                .any(|index| {
-                    exclusion
-                        .index_identity
-                        .is_some_and(|identity| identity.created_at() == index.created_at)
-                })
-            {
+            if storage.indexes_for_slot(slot, txid).any(|index| {
+                exclusion
+                    .index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            }) {
                 continue;
             }
             // An expression element is attribute 0 of the key, its source
@@ -9979,7 +9970,7 @@ fn visit_indexes(
             visit(info);
         }
         // Explicit CREATE INDEX on this table.
-        for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+        for index in storage.indexes_for_slot(slot, txid) {
             let inline = def
                 .columns()
                 .iter()
@@ -10254,43 +10245,6 @@ pub(crate) fn replica_identity_index_oid(
     selected
 }
 
-fn empty_index() -> IdxInfo {
-    IdxInfo {
-        oid: 0,
-        table_oid: 0,
-        table_slot: 0,
-        table_database: crate::storage::DatabaseOid::POSTGRES,
-        table_created_at: 0,
-        name: StackStr::new(),
-        kind: crate::storage::IndexKind::Ordinary,
-        owner: 0,
-        method: crate::sql::ast::IndexAccessMethod::Btree,
-        columns: [0; crate::storage::MAX_INDEX_COLS],
-        expression_keys: [false; crate::storage::MAX_INDEX_COLS],
-        include_columns: [0; crate::storage::MAX_INDEX_COLS],
-        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
-        explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
-        operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-        resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-        operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
-            crate::storage::MAX_INDEX_COLS],
-        descending: [false; crate::storage::MAX_INDEX_COLS],
-        nulls_first: [false; crate::storage::MAX_INDEX_COLS],
-        n_cols: 0,
-        n_include_cols: 0,
-        nulls_not_distinct: false,
-        predicate: None,
-        is_primary: false,
-        is_unique: false,
-        constraint_identity: None,
-        is_exclusion: false,
-        timing: crate::storage::ConstraintTiming::NotDeferrable,
-        constraint_parent: None,
-        index_parent_oid: None,
-        explicit_definition: None,
-    }
-}
-
 fn index_expression_source(
     storage: &Storage,
     info: &IdxInfo,
@@ -10321,9 +10275,8 @@ fn index_expression_source(
 }
 
 fn info_index(storage: &Storage, info: &IdxInfo, txid: u32) -> Option<crate::storage::IndexDef> {
-    let table = storage.table_def(info.table_slot, txid);
     storage
-        .indexes_for(table.schema.as_str(), table.name.as_str(), txid)
+        .indexes_for_slot(info.table_slot, txid)
         .find(|index| index.name_for(txid).as_str() == info.name.as_str())
 }
 
@@ -10372,17 +10325,16 @@ fn collect_indexes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [IdxInfo], SqlError> {
-    let mut count = 0usize;
-    visit_indexes(storage, txid, None, |_| count += 1);
-    let indexes = arena
-        .alloc_slice_with(count, |_| empty_index())
-        .map_err(|_| arena_full())?;
-    let mut next = 0usize;
+    // One walk: each table's index lookup scans the whole index catalog.
+    let mut indexes = crate::mem::arena::ArenaList::new(arena);
+    let mut full = false;
     visit_indexes(storage, txid, None, |index| {
-        indexes[next] = index;
-        next += 1;
+        full |= indexes.push(index).is_err();
     });
-    Ok(indexes)
+    if full {
+        return Err(arena_full());
+    }
+    Ok(indexes.as_slice())
 }
 
 fn index_oid_by_name(
@@ -15431,34 +15383,21 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
     }
 }
 
-fn empty_foreign_key() -> FkInfo {
-    FkInfo {
-        oid: 0,
-        conrelid: 0,
-        confrelid: 0,
-        child_slot: 0,
-        parent_slot: 0,
-        fk_index: 0,
-        name: StackStr::new(),
-    }
-}
-
 fn collect_fkeys<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [FkInfo], SqlError> {
-    let mut count = 0usize;
-    visit_fkeys(storage, txid, |_| count += 1);
-    let foreign_keys = arena
-        .alloc_slice_with(count, |_| empty_foreign_key())
-        .map_err(|_| arena_full())?;
-    let mut next = 0usize;
+    // One walk: each key's parent is looked up by name.
+    let mut foreign_keys = crate::mem::arena::ArenaList::new(arena);
+    let mut full = false;
     visit_fkeys(storage, txid, |foreign_key| {
-        foreign_keys[next] = foreign_key;
-        next += 1;
+        full |= foreign_keys.push(foreign_key).is_err();
     });
-    Ok(foreign_keys)
+    if full {
+        return Err(arena_full());
+    }
+    Ok(foreign_keys.as_slice())
 }
 
 fn inherited_foreign_key_parent_oid(

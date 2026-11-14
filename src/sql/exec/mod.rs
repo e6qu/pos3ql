@@ -97943,9 +97943,9 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
 
 /// Visits a table's visible rows in the order a sequential `SELECT` reads
 /// them, as PostgreSQL's data changes read their target: routines they call
-/// observe earlier rows' changes in that order. A table with saved row
-/// files streams its resident rows by row identity, then its saved rows;
-/// otherwise its heap rows go in heap position order.
+/// observe earlier rows' changes in that order: saved rows by row identity,
+/// then heap rows by heap position. Only a table without saved row files
+/// keeps an order record for every row.
 fn for_each_physical_row(
     storage: &Storage,
     table: usize,
@@ -97956,7 +97956,7 @@ fn for_each_physical_row(
     if storage.spill_generation_count(table) != 0 {
         let scan = storage.captured_row_scan_in(table, txid, arena)?;
         // The visitor never stops the scan early.
-        let _ = scan.for_each_home(&mut |rowid, home| {
+        let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
             visit(rowid, home)?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;

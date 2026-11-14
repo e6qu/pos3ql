@@ -12603,7 +12603,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_table_trigger_is_typed_and_illegal_forms_fail_at_parse_boundary() {
+    fn transition_table_trigger_is_typed_and_equal_names_fail_at_parse_boundary() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "transition trigger parser", 1 << 18).unwrap();
         let mut parser = Parser::new(
@@ -12625,17 +12625,31 @@ mod tests {
                 }
             );
         });
-        for source in [
-            "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+        // Timing, event and column-list checks run with the relation, in
+        // PostgreSQL's CreateTrigger order; equal names fail here.
+        for (source, parses) in [
+            (
+                "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                false,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
         ] {
             let mut budget = Budget::new(1 << 20);
             let arena =
                 Arena::new(&mut budget, "invalid transition trigger parser", 1 << 18).unwrap();
             let mut parser = Parser::new(source, &arena).unwrap();
-            assert!(parser.next_stmt().is_err(), "{source}");
+            assert_eq!(parser.next_stmt().is_ok(), parses, "{source}");
         }
     }
 

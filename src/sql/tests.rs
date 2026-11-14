@@ -64047,6 +64047,100 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
 }
 
 #[test]
+fn limited_lock_scan_stops_at_its_limit_and_resumes_after_a_wait() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE TABLE limited_lock (id int, value int); \
+         INSERT INTO limited_lock SELECT g, g * 10 FROM generate_series(1, 6) g",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    let locked = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "SELECT id FROM limited_lock WHERE id >= 2 LIMIT 2 FOR UPDATE",
+    );
+    assert!(locked.contains("SELECT 2"), "{locked}");
+    // The scan stopped at its limit: later rows stay unlocked.
+    let free = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM limited_lock WHERE id IN (1, 4, 5, 6) FOR UPDATE NOWAIT",
+    );
+    assert!(free.contains("SELECT 4"), "{free}");
+    let skipped = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut waiter,
+        "SELECT id FROM limited_lock OFFSET 1 LIMIT 2 FOR UPDATE SKIP LOCKED",
+    );
+    assert!(skipped.contains("SELECT 2"), "{skipped}");
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "lock wait send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "lock wait sql", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let mut resume_waiter = TxnState::new(&mut budget, 256).unwrap();
+    if let Some(owner) = resume_waiter.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
+    let sql = "SELECT id, value FROM limited_lock LIMIT 3 FOR UPDATE";
+    let parked = engine
+        .execute_simple(
+            sql,
+            &arena,
+            &mut resume_waiter,
+            &mut pool,
+            &mut cursors,
+            &guc,
+            &mut Responder::new(&mut send),
+            3,
+        )
+        .unwrap();
+    assert!(matches!(parked, ExecutionStatus::Blocked { .. }));
+    // Only the row description precedes the wait: no row was sent.
+    assert!(
+        !send.readable().contains(&b'D'),
+        "a parked locking scan emits no rows: {:?}",
+        String::from_utf8_lossy(send.readable())
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "UPDATE limited_lock SET value = 25 WHERE id = 2",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    let resumed = engine
+        .execute_simple_from(
+            sql,
+            0,
+            &arena,
+            &mut resume_waiter,
+            &mut pool,
+            &mut cursors,
+            &guc,
+            &mut Responder::new(&mut send),
+            3,
+            false,
+        )
+        .unwrap();
+    assert_eq!(resumed, ExecutionStatus::Complete);
+    let output = String::from_utf8_lossy(send.readable()).into_owned();
+    assert!(output.contains("SELECT 3"), "{output}");
+    // The row replaced while the statement waited returns its new value.
+    assert!(output.contains("25"), "{output}");
+    assert!(!output.contains("20"), "{output}");
+}
+
+#[test]
 fn table_lock_modes_nowait_and_wait_match_postgresql_matrix() {
     let (mut engine, mut budget) = test_engine();
     let mut owner = TxnState::new(&mut budget, 256).unwrap();

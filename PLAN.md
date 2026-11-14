@@ -745,7 +745,8 @@ the constants the planner folds them into (`'2'::double precision`). Times are m
 per loop, to the first row and to the end; in pos3ql's push-based executor a
 node's time also includes the work of the nodes reading its rows. A locking
 clause plans a `LockRows` node below the `Limit`, which counts the rows it
-locked. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
+locked; rows read in scan order are locked as the scan returns them, and the
+scan stops once the limit has its rows, as the `Limit` pulls them. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
 `top-N heapsort` when a limit directly above bounds it and it read more than
 twice the bound, which pos3ql then also keeps to a heap of the bounded rows;
 `external merge` when its rows spilled to disk) and the space of the rows it
@@ -843,8 +844,7 @@ the executor does not count (a data-modifying `WITH`, a joined `UPDATE` or
 the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
 joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`
 early leaves its `Sort` without figures, as pos3ql deduplicates before
-sorting; a `LIMIT` over a locking query without `ORDER BY` reads every row
-where PostgreSQL's `LockRows` stops early. Where pos3ql's plan differs from
+sorting. Where pos3ql's plan differs from
 PostgreSQL's cost-based one the figures are those of the plan it shows and
 runs: it hashes the second of two joined relations where PostgreSQL may hash
 the smaller filtered one, joins three or more relations in nested loops where

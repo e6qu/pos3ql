@@ -15233,6 +15233,7 @@ fn select_into_rows_mode<'a>(
                 && !statement.with_ties
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            materialize::locked_scan_window(statement, limit, offset),
             &stages,
         )?;
         materialize::materialized_rows_into(

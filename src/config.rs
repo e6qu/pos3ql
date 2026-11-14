@@ -251,7 +251,8 @@ pub struct Config {
     /// Fixed receive buffer for postgres_fdw queries.
     pub foreign_receive_bytes: usize,
     /// Fixed send buffer for postgres_fdw queries; it also bounds the values
-    /// one `batch_size` INSERT batch queues.
+    /// one `batch_size` INSERT batch queues, and sizes each connection's COPY
+    /// FROM queue for foreign tables.
     pub foreign_send_bytes: usize,
     /// Additional roots for postgres_fdw TLS.
     pub foreign_tls_ca_file: String,

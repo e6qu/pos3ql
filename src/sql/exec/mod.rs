@@ -78471,7 +78471,7 @@ pub(crate) fn copy_statement_end(
     services: &mut TriggerServices<'_>,
     arena: &Arena,
     responder: &mut Responder,
-    inserted: &CopyTransitionRows,
+    inserted: &mut CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let _files = setup.restore_snapshot(storage)?;
     let definition = setup
@@ -78481,6 +78481,7 @@ pub(crate) fn copy_statement_end(
     if let Err(failure) = flushed {
         return Err(failure.raise(definition.name.as_str(), setup.fmt.binary));
     }
+    send_copy_foreign_rows(storage, setup.table_index, txn.txid, inserted, arena)?;
     let replication_role = crate::sql::guc::active_session_replication_role()?;
     let mut transition_capture = if transition_capture_required(
         storage,
@@ -78637,7 +78638,9 @@ pub(crate) fn copy_row<'a>(
     });
     // PostgreSQL counts the line without its end-of-line.
     let line_bytes = line.len() - usize::from(line.last() == Some(&b'\r'));
-    finish_copy_row_window(storage, setup, txn.txid, outcome, line_bytes)
+    finish_copy_row_window(
+        storage, setup, txn.txid, outcome, line_bytes, inserted, arena,
+    )
 }
 
 /// Accounts a COPY row in the buffering window, reporting the index error of
@@ -78648,8 +78651,11 @@ fn finish_copy_row_window(
     txid: u32,
     outcome: Result<CopyRowOutcome, SqlError>,
     line_bytes: usize,
+    inserted: &mut CopyTransitionRows,
+    arena: &Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
     let mut batch = setup.batch.lock().unwrap();
+    let before = batch.flushes();
     let flushed = match batch.take_failure() {
         Some(failure) => Err(failure),
         None => {
@@ -78657,13 +78663,93 @@ fn finish_copy_row_window(
             batch.finish_row(line_bytes).map(|()| outcome)
         }
     };
+    let wrote = batch.flushes() != before;
     drop(batch);
-    flushed.map_err(|failure| {
+    let outcome = flushed.map_err(|failure| {
         failure.raise(
             storage.table_def(setup.table_index, txid).name.as_str(),
             setup.fmt.binary,
         )
-    })
+    })?;
+    if wrote {
+        send_copy_foreign_rows(storage, setup.table_index, txid, inserted, arena)?;
+    }
+    Ok(outcome)
+}
+
+/// Sends the foreign rows a COPY window flush wrote out, as
+/// `CopyMultiInsertBufferFlush` does: each table's rows in `batch_size`
+/// remote INSERTs, tables in the order their first row was buffered. An
+/// error names only the relation (`COPY ft`), the row's line having passed.
+fn send_copy_foreign_rows(
+    storage: &Storage,
+    copy_table: usize,
+    txid: u32,
+    inserted: &mut CopyTransitionRows,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let queue = &inserted.foreign;
+    if queue.is_empty() {
+        return Ok(());
+    }
+    let relation = storage.table_def(copy_table, txid).name;
+    let frame = crate::sql::error_context::CopyRelationFrame {
+        relation: relation.as_str(),
+    };
+    let result = crate::sql::error_context::within(&frame, || {
+        let rows = queue.rows();
+        for (first, row) in rows.iter().enumerate() {
+            if rows[..first]
+                .iter()
+                .any(|earlier| earlier.table == row.table)
+            {
+                continue;
+            }
+            let row_triggers =
+                insert_has_row_trigger(storage, row.table, txid, TriggerTiming::After)
+                    || insert_has_row_trigger(storage, row.table, txid, TriggerTiming::Before);
+            let batch_size =
+                crate::sql::foreign::copy_batch_size(storage, row.table, txid, row_triggers)?;
+            let mut chunk_rows = 0usize;
+            let mut chunk = crate::mem::arena::ArenaList::<u8>::new(arena);
+            for queued in rows[first..]
+                .iter()
+                .filter(|queued| queued.table == row.table)
+            {
+                for &byte in queue.fields(*queued) {
+                    chunk.push(byte).map_err(|_| arena_full())?;
+                }
+                chunk_rows += 1;
+                if chunk_rows == batch_size {
+                    crate::sql::foreign::send_insert_batch(
+                        storage,
+                        txid,
+                        row.table,
+                        chunk.as_slice(),
+                        chunk_rows,
+                        false,
+                        arena,
+                    )?;
+                    chunk = crate::mem::arena::ArenaList::new(arena);
+                    chunk_rows = 0;
+                }
+            }
+            if chunk_rows != 0 {
+                crate::sql::foreign::send_insert_batch(
+                    storage,
+                    txid,
+                    row.table,
+                    chunk.as_slice(),
+                    chunk_rows,
+                    false,
+                    arena,
+                )?;
+            }
+        }
+        Ok(())
+    });
+    inserted.foreign.clear();
+    result
 }
 
 fn name_copy_frame(
@@ -78859,7 +78945,7 @@ pub(crate) fn copy_row_binary<'a>(
         )
     });
     // Binary input has no line buffer, so only the row count fills a window.
-    finish_copy_row_window(storage, setup, txn.txid, outcome, 0)
+    finish_copy_row_window(storage, setup, txn.txid, outcome, 0, inserted, arena)
 }
 
 #[expect(
@@ -79005,7 +79091,8 @@ fn copy_insert_method<Definition0: crate::storage::DefinitionBacking>(
     use copy_batch::CopyInsertMethod;
     let table = setup.table_index;
     let partitioned = definition.partition.is_partitioned();
-    if definition.kind == crate::storage::TableKind::Foreign
+    if (definition.kind == crate::storage::TableKind::Foreign
+        && !foreign_copy_batches(storage, table, txn.txid)?)
         || !copy_buffers_rows(storage, table, txn.txid)
         || (partitioned
             && transition_capture_required(
@@ -79038,6 +79125,14 @@ fn copy_insert_method<Definition0: crate::storage::DefinitionBacking>(
     } else {
         CopyInsertMethod::Multi
     })
+}
+
+/// Whether COPY FROM batches a foreign table's rows: postgres_fdw's batch
+/// size for it is above one (`CIM_SINGLE` otherwise).
+fn foreign_copy_batches(storage: &Storage, table: usize, txid: u32) -> Result<bool, SqlError> {
+    let row_triggers = insert_has_row_trigger(storage, table, txid, TriggerTiming::After)
+        || insert_has_row_trigger(storage, table, txid, TriggerTiming::Before);
+    Ok(crate::sql::foreign::copy_batch_size(storage, table, txid, row_triggers)? > 1)
 }
 
 /// Whether PostgreSQL's COPY FROM buffers rows for `table` (`CIM_MULTI`):
@@ -79113,12 +79208,21 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             if txn.replication_apply {
                 storage.require_subscription_target(target, txn.txid)?;
             }
-            let leaf_batches = physical.kind != crate::storage::TableKind::Foreign
-                && copy_buffers_rows(storage, target, txn.txid);
-            let Some(buffered) = batch.lock().unwrap().route(target, leaf_batches) else {
+            let foreign = physical.kind == crate::storage::TableKind::Foreign;
+            let leaf_batches = copy_buffers_rows(storage, target, txn.txid)
+                && (!foreign || foreign_copy_batches(storage, target, txn.txid)?);
+            let mut window = batch.lock().unwrap();
+            let before = window.flushes();
+            let routed = window.route(target, leaf_batches);
+            let wrote = window.flushes() != before;
+            drop(window);
+            let Some(buffered) = routed else {
                 // The flush before this row failed; `copy_row` reports it.
                 return Ok(CopyRowOutcome::Filtered);
             };
+            if wrote {
+                send_copy_foreign_rows(storage, logical_table, txn.txid, inserted, arena)?;
+            }
             let leaf_checks;
             let checks = if target == logical_table {
                 checks
@@ -79204,7 +79308,17 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 }
                 return Err(error);
             }
-            if physical.kind == crate::storage::TableKind::Foreign {
+            if foreign && buffered {
+                let fields = crate::sql::foreign::insert_fields(
+                    storage,
+                    target,
+                    txn.txid,
+                    &values[..physical.n_columns],
+                    responder.render_context(),
+                    arena,
+                )?;
+                inserted.foreign.push(target, fields)?;
+            } else if foreign {
                 let retrieved = if foreign_insert_has_after_row_trigger(storage, target, txn.txid) {
                     ColumnSet::all(physical.n_columns)
                 } else {

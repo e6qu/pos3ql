@@ -2295,85 +2295,171 @@ impl<'a> ForeignInsertBatches<'a> {
             .expect("a flushed batch target exists");
         let rows = core::mem::take(&mut pending.rows);
         let used = core::mem::take(&mut pending.used);
-        let remote = RemoteTable::open(storage, pending.table, txid)?;
-        let per_row = remote
-            .table
-            .columns()
-            .iter()
-            .filter(|column| !column.default.is_generated())
-            .count();
-        let count = rows * per_row;
-        let parameters = arena
-            .alloc_slice_with(count, |_| None::<&[u8]>)
-            .map_err(|_| super::eval::arena_full())?;
-        let mut at = 0;
-        for parameter in parameters.iter_mut() {
-            let length = i32::from_be_bytes(
-                pending.buffer[at..at + 4]
-                    .try_into()
-                    .expect("a queued value has its length"),
-            );
-            at += 4;
-            if length >= 0 {
-                let end = at + length as usize;
-                *parameter = Some(&pending.buffer[at..end]);
-                at = end;
-            }
-        }
-        debug_assert_eq!(at, used);
-        let mut single = StackStr::<16_384>::new();
-        write_insert(
-            &mut single,
-            &remote,
-            1,
-            pending.on_conflict_do_nothing,
-            ColumnSet::EMPTY,
-        );
-        checked(&single, "INSERT query")?;
-        let capacity =
-            single.as_str().len() + rows * (per_row * 9 + remote.table.n_columns * 9 + 4);
-        let mut query = FixedText {
-            buffer: arena
-                .alloc_slice_with(capacity, |_| 0u8)
-                .map_err(|_| super::eval::arena_full())?,
-            len: 0,
-            truncated: false,
-        };
-        write_insert(
-            &mut query,
-            &remote,
+        let inserted = send_insert_batch(
+            storage,
+            txid,
+            pending.table,
+            &pending.buffer[..used],
             rows,
             pending.on_conflict_do_nothing,
-            ColumnSet::EMPTY,
-        );
-        if query.truncated {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "foreign batched INSERT query exceeds its buffer"
-            ));
-        }
-        let query = core::str::from_utf8(&query.buffer[..query.len])
-            .expect("the INSERT text is written from strings");
-        let lease = enter_session(storage, txid, &remote.server)?;
-        let mut inserted = None;
-        exchange(
-            storage,
-            lease,
-            query,
-            Some(&*parameters),
-            query,
-            &mut |event| match event {
-                SqlEvent::CommandComplete { tag } if tag.starts_with("INSERT ") => {
-                    inserted = Some(tag_rows(tag)?);
-                    Ok(())
-                }
-                _ => Err(unexpected_response("INSERT")),
-            },
+            arena,
         )?;
-        let inserted = inserted.ok_or_else(|| unexpected_response("INSERT"))?;
         self.skipped += (rows as u64).saturating_sub(inserted);
         Ok(())
     }
+}
+
+/// The rows postgres_fdw sends in one remote INSERT of a COPY FROM into
+/// `table_slot` (`GetForeignModifyBatchSize`): 1 when a BEFORE or AFTER row
+/// INSERT trigger is on it, else its `batch_size`, at most as many rows as
+/// fit 65535 parameters.
+pub(crate) fn copy_batch_size(
+    storage: &Storage,
+    table_slot: usize,
+    txid: u32,
+    row_triggers: bool,
+) -> Result<usize, SqlError> {
+    let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let parameters = remote
+        .table
+        .columns()
+        .iter()
+        .filter(|column| !column.default.is_generated())
+        .count();
+    if row_triggers || parameters == 0 {
+        return Ok(1);
+    }
+    Ok(usize::try_from(remote.batch_size())
+        .unwrap_or(1)
+        .min(MAX_QUERY_PARAMETERS / parameters))
+}
+
+/// One row's INSERT values as Bind fields: a big-endian length (-1 for
+/// NULL), then the text, for every column but the generated ones.
+pub(crate) fn insert_fields<'a>(
+    storage: &Storage,
+    table_slot: usize,
+    txid: u32,
+    values: &[Datum<'_>],
+    render: crate::sql::guc::RenderContext,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let definition = storage.table_def(table_slot, txid);
+    let mut texts = [None::<&[u8]>; crate::storage::MAX_COLUMNS];
+    let mut length = 0usize;
+    let mut count = 0usize;
+    for (value, column) in values.iter().zip(definition.columns()) {
+        if column.default.is_generated() {
+            continue;
+        }
+        let text = Responder::datum_wire_text(value, render, arena)?;
+        length += 4 + text.map_or(0, <[u8]>::len);
+        texts[count] = text;
+        count += 1;
+    }
+    let fields = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut at = 0usize;
+    for text in &texts[..count] {
+        let field_length = text.map_or(-1, |text| text.len() as i32);
+        fields[at..at + 4].copy_from_slice(&field_length.to_be_bytes());
+        at += 4;
+        if let Some(text) = text {
+            fields[at..at + text.len()].copy_from_slice(text);
+            at += text.len();
+        }
+    }
+    Ok(fields)
+}
+
+/// postgres_fdw's `execute_foreign_modify` for a batch: one INSERT with a
+/// VALUES row per queued row, whose Bind fields `fields` holds in row order;
+/// returns the rows its command tag counts.
+pub(crate) fn send_insert_batch(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    fields: &[u8],
+    rows: usize,
+    on_conflict_do_nothing: bool,
+    arena: &Arena,
+) -> Result<u64, SqlError> {
+    let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let per_row = remote
+        .table
+        .columns()
+        .iter()
+        .filter(|column| !column.default.is_generated())
+        .count();
+    let count = rows * per_row;
+    let parameters = arena
+        .alloc_slice_with(count, |_| None::<&[u8]>)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut at = 0;
+    for parameter in parameters.iter_mut() {
+        let length = i32::from_be_bytes(
+            fields[at..at + 4]
+                .try_into()
+                .expect("a queued value has its length"),
+        );
+        at += 4;
+        if length >= 0 {
+            let end = at + length as usize;
+            *parameter = Some(&fields[at..end]);
+            at = end;
+        }
+    }
+    debug_assert_eq!(at, fields.len());
+    let mut single = StackStr::<16_384>::new();
+    write_insert(
+        &mut single,
+        &remote,
+        1,
+        on_conflict_do_nothing,
+        ColumnSet::EMPTY,
+    );
+    checked(&single, "INSERT query")?;
+    let capacity = single.as_str().len() + rows * (per_row * 9 + remote.table.n_columns * 9 + 4);
+    let mut query = FixedText {
+        buffer: arena
+            .alloc_slice_with(capacity, |_| 0u8)
+            .map_err(|_| super::eval::arena_full())?,
+        len: 0,
+        truncated: false,
+    };
+    write_insert(
+        &mut query,
+        &remote,
+        rows,
+        on_conflict_do_nothing,
+        ColumnSet::EMPTY,
+    );
+    if query.truncated {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "foreign batched INSERT query exceeds its buffer"
+        ));
+    }
+    let query = core::str::from_utf8(&query.buffer[..query.len])
+        .expect("the INSERT text is written from strings");
+    let lease = enter_session(storage, txid, &remote.server)?;
+    let mut inserted = None;
+    exchange(
+        storage,
+        lease,
+        query,
+        Some(&*parameters),
+        query,
+        &mut |event| match event {
+            SqlEvent::CommandComplete { tag } if tag.starts_with("INSERT ") => {
+                inserted = Some(tag_rows(tag)?);
+                Ok(())
+            }
+            _ => Err(unexpected_response("INSERT")),
+        },
+    )?;
+    inserted.ok_or_else(|| unexpected_response("INSERT"))
 }
 
 /// Runs one row's remote `UPDATE` or `DELETE` and merges the columns its

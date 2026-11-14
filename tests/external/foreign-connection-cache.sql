@@ -97,6 +97,24 @@ INSERT INTO fdw_cache_local.b SELECT i, 'b' || i FROM generate_series(1, 7) i;
 SELECT count(*) FROM fdw_cache_local.calls;
 INSERT INTO fdw_cache_local.b VALUES (1, 'x'), (2, 'y') RETURNING id;
 SELECT count(*) FROM fdw_cache_local.calls;
+-- COPY FROM queues its rows until the buffering window flushes, then sends
+-- them in batch_size INSERTs; a bad row stops the COPY before any is sent.
+COPY fdw_cache_local.b FROM STDIN;
+11	c1
+12	c2
+13	c3
+14	c4
+15	c5
+16	c6
+17	c7
+\.
+SELECT count(*) FROM fdw_cache_local.calls;
+COPY fdw_cache_local.b FROM STDIN;
+21	d1
+x	d2
+\.
+SELECT count(*) FROM fdw_cache_local.calls;
+SELECT count(*) FROM fdw_cache_local.b WHERE id > 10;
 ALTER FOREIGN TABLE fdw_cache_local.t OPTIONS (ADD batch_size '0x10');
 INSERT INTO fdw_cache_local.t (id, note) VALUES (200, 'f'), (1, 'skipped'), (201, 'g')
   ON CONFLICT DO NOTHING;

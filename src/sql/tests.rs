@@ -18543,7 +18543,7 @@ fn finish_copy(
 }
 
 fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::CopyTransitionRows {
-    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10).unwrap()
+    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10, 64 << 10).unwrap()
 }
 
 fn run_with_arena_bytes(
@@ -98173,7 +98173,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                             arena: &reader.arena,
                         },
                         &mut Responder::new(&mut send),
-                        &transition,
+                        &mut transition,
                         CopyFinishMode::ImplicitTransaction,
                     )
                     .unwrap();

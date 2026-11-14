@@ -356,6 +356,18 @@ impl Frame for CopyFrame<'_> {
     }
 }
 
+/// A COPY FROM's relation alone (`relname_only`), as PostgreSQL reports an
+/// error of a buffered rows' flush: the input line has moved on.
+pub(crate) struct CopyRelationFrame<'a> {
+    pub(crate) relation: &'a str,
+}
+
+impl Frame for CopyRelationFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
+        write!(out, "COPY {}", self.relation)
+    }
+}
+
 /// A PL/pgSQL function being compiled, as PostgreSQL's
 /// `plpgsql_compile_error_callback` reports an error raised meanwhile: an
 /// error with a cursor position is positioned in the body and gets no line.

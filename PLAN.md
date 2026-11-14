@@ -877,8 +877,11 @@ attempts fetched and continues the same cursor. Remaining: a foreign table
 joined with other FROM items is read whole before the join, and a SQL
 cursor or a PL/pgSQL `FOR` loop over a query runs the query to completion
 before the first row is returned, so both fetch every remote batch where
-PostgreSQL fetches only what the reads need. COPY FROM into a foreign table sends one row at a
-time, ignoring `batch_size`. A batched INSERT also sends its queued rows when
+PostgreSQL fetches only what the reads need. COPY FROM into a foreign table queues its rows
+until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
+partition that cannot batch, the end of the data) and sends them in
+`batch_size` remote INSERTs; the queue is reserved per connection at startup
+and holds at most `foreign_send_bytes` (`54000` beyond). A batched INSERT also sends its queued rows when
 the statement pauses for a PL/pgSQL call or a full output buffer, which
 PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,
 password, connect_timeout, application_name and sslmode fail with `HV00D`.

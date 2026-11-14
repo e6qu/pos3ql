@@ -489,6 +489,348 @@ fn index_answered_queries_return_rows_at_their_first_position() {
     });
 }
 
+#[test]
+fn rule_actions_substitute_each_new_reference() {
+    with_engine("notice-rule-new-references", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ruled (id serial, a int, b int)",
+            "CREATE TABLE ruled_log (x int, y int)",
+            "INSERT INTO ruled (a, b) VALUES (10, 20)",
+            "CREATE FUNCTION seen(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ruled_also AS ON UPDATE TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.a, new.a + 1)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The action reads NEW.a twice and NEW.b never; the original
+        // statement then evaluates both of its SET expressions.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE ruled SET a = seen('a', a), b = seen('b', b)",
+            ),
+            [
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 b 20",
+                "UPDATE 1",
+            ]
+        );
+        run_with(engine, budget, "DROP RULE ruled_also ON ruled");
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_instead AS ON UPDATE TO ruled \
+             DO INSTEAD INSERT INTO ruled_log VALUES (new.a, old.b)",
+        );
+        // An unread SET expression never runs, so its division never fails.
+        assert_eq!(
+            messages(engine, budget, "UPDATE ruled SET a = 1, b = b / 0"),
+            ["UPDATE 0"]
+        );
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_insert AS ON INSERT TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.id, new.id)",
+        );
+        run_with(engine, budget, "DELETE FROM ruled_log");
+        // Each NEW.id reference evaluates the column default again.
+        run_with(engine, budget, "INSERT INTO ruled (a, b) VALUES (1, 2)");
+        run_with(engine, budget, "INSERT INTO ruled (a, b) SELECT 3, 4");
+        let rows = run_with(engine, budget, "SELECT x, y FROM ruled_log ORDER BY x");
+        assert_eq!(data_rows(&rows), ["3|4", "6|7"]);
+    });
+}
+
+#[test]
+fn conditions_run_cheapest_first_under_row_security() {
+    with_engine("notice-qual-cost-order", |engine, budget| {
+        for sql in [
+            "CREATE TABLE costed (id int, a int)",
+            "INSERT INTO costed SELECT g, g FROM generate_series(1, 4) g",
+            "CREATE FUNCTION seen(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'seen %', v; RETURN true; END $$",
+            "CREATE FUNCTION policy(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'policy %', v; RETURN true; END $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // A routine costs 100 operators, so the comparison runs first.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SELECT id FROM costed WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "SELECT 1"]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE costed SET a = a WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "UPDATE 1"]
+        );
+        for sql in [
+            "CREATE ROLE costed_reader",
+            "GRANT ALL ON costed TO costed_reader",
+            "ALTER TABLE costed ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY costed_policy ON costed USING (policy(id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The leakproof comparison runs before the policy; the routine after.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; SELECT id FROM costed WHERE seen(id) AND id < 2",
+            ),
+            [
+                "SET",
+                "NOTICE 00000 policy 1",
+                "NOTICE 00000 seen 1",
+                "SELECT 1"
+            ]
+        );
+        // Addition can fail, so it is not leakproof and waits for the policy.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; DELETE FROM costed WHERE id + 0 < 2",
+            ),
+            [
+                "SET",
+                // The UPDATE above moved row 1 to the end.
+                "NOTICE 00000 policy 2",
+                "NOTICE 00000 policy 3",
+                "NOTICE 00000 policy 4",
+                "NOTICE 00000 policy 1",
+                "DELETE 1",
+            ]
+        );
+    });
+}
+
+#[test]
+fn join_conflict_and_merge_constants_fold_once() {
+    with_engine("notice-fold-join-merge", |engine, budget| {
+        for sql in [
+            "CREATE TABLE folded (id int PRIMARY KEY, q tsquery)",
+            "INSERT INTO folded VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TABLE folded_source (id int)",
+            "INSERT INTO folded_source VALUES (1), (2), (3), (4)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        for (sql, tag) in [
+            (
+                "SELECT f.id FROM folded f JOIN folded_source s \
+                 ON f.id = s.id + numnode(''::tsquery)",
+                "SELECT 3",
+            ),
+            (
+                "SELECT g FROM folded f, \
+                 LATERAL generate_series(1, numnode(''::tsquery) + f.id) g",
+                "SELECT 6",
+            ),
+            (
+                "INSERT INTO folded SELECT id, 'z' FROM folded_source WHERE id < 3 \
+                 ON CONFLICT (id) DO UPDATE SET q = ''::tsquery",
+                "INSERT 0 2",
+            ),
+            (
+                "MERGE INTO folded f USING folded_source s ON f.id = s.id \
+                 WHEN MATCHED AND numnode(''::tsquery) = 0 THEN DELETE",
+                "MERGE 3",
+            ),
+        ] {
+            assert_eq!(messages(engine, budget, sql), [empty, tag], "{sql}");
+        }
+    });
+}
+
+#[test]
+fn prepare_converts_each_literal_once() {
+    with_engine("notice-prepare-literals", |engine, budget| {
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        run_with(engine, budget, "CREATE TABLE pl (q tsquery, n int)");
+        // Parse analysis converts the cast, the inserted value and the
+        // compared literal at PREPARE; EXECUTE reads the converted values.
+        for (sql, tag) in [
+            ("SELECT ''::tsquery, int4 '7' + 1", "SELECT 1"),
+            ("INSERT INTO pl VALUES ('', 1)", "INSERT 0 1"),
+            ("SELECT q = '' FROM pl", "SELECT 2"),
+        ] {
+            assert_eq!(
+                messages(
+                    engine,
+                    budget,
+                    &format!("PREPARE p AS {sql}; EXECUTE p; EXECUTE p"),
+                ),
+                [empty, "PREPARE", tag, tag],
+                "{sql}"
+            );
+        }
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT * FROM pl WHERE n = 'q'",
+        );
+        assert!(
+            output[0].starts_with("ERROR 22P02 invalid input syntax for type integer: \"q\""),
+            "{output:?}"
+        );
+        // A length coercion and constant folding run when the statement is
+        // planned, at each EXECUTE.
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT '123.45'::numeric(3,1); EXECUTE p",
+        );
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22003 numeric field overflow"),
+            "{output:?}"
+        );
+        let output = messages(engine, budget, "PREPARE p AS SELECT 1/0; EXECUTE p");
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22012 division by zero"),
+            "{output:?}"
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "PREPARE p AS SELECT 'abcd'::varchar(2); EXECUTE p",
+        );
+        assert_eq!(data_rows(&output), ["ab"]);
+    });
+}
+
+#[test]
+fn leakproof_conditions_run_at_the_first_security_level() {
+    with_engine("notice-row-security-levels", |engine, budget| {
+        for sql in [
+            "CREATE ROLE lsr",
+            "CREATE TABLE ls (a int, b int)",
+            "INSERT INTO ls VALUES (1, 1)",
+            "GRANT SELECT, UPDATE ON ls TO lsr",
+            "ALTER TABLE ls ENABLE ROW LEVEL SECURITY",
+            "CREATE FUNCTION ls_rp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'restrictive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_pp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'permissive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lp(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'leakproof %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lq(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 0.5 AS \
+             $$ BEGIN RAISE NOTICE 'cheap %', $1; RETURN true; END $$",
+            "CREATE POLICY ls_r ON ls AS RESTRICTIVE USING (ls_rp(a))",
+            "CREATE POLICY ls_p ON ls USING (ls_pp(a))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The cheaper leakproof condition runs first, the other right after
+        // the first security qual; each runs once.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 cheap 1",
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+            ]
+        );
+        // A write's WITH CHECK options test the permissive policies first.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; UPDATE ls SET a = a WHERE ls_lp(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 restrictive 1",
+            ]
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "SET ROLE lsr; EXPLAIN (COSTS OFF) SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "Seq Scan on ls",
+                "  Filter: (ls_lq(b) AND ls_rp(a) AND ls_lp(b) AND ls_pp(a))",
+            ]
+        );
+    });
+}
+
+#[test]
+fn rule_actions_read_statement_expressions_row_by_row() {
+    with_engine("notice-rule-interleaving", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ri (id int, a int)",
+            "CREATE TABLE ri_log (x int, y int)",
+            "INSERT INTO ri VALUES (1, 10), (2, 20)",
+            "CREATE FUNCTION ri_f(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ri_also AS ON UPDATE TO ri \
+             DO ALSO INSERT INTO ri_log VALUES (new.a, ri_f('own', old.id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let output = messages(
+            engine,
+            budget,
+            "UPDATE ri SET a = ri_f('set', a) WHERE id < 3",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        // The action's rows interleave the SET expression with the action's
+        // own call; the UPDATE itself then evaluates its SET expressions.
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 own 1",
+                "NOTICE 00000 set 20",
+                "NOTICE 00000 own 2",
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 set 20",
+            ]
+        );
+    });
+}
+
 /// PostgreSQL's planner folds a statement's constants in order: a constant
 /// that fails is the statement's error, sent after the warnings the
 /// constants folded before it raised. EXPLAIN plans the folded statement,

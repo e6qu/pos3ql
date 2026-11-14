@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod aggregate_levels;
+mod alter_type_rebuild;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
 mod bound_definition_renames;
@@ -32,6 +33,9 @@ mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
 mod explain_plan_nodes;
+mod foreign_connection_cache;
+mod foreign_key_attach;
+mod foreign_key_clones;
 mod foreign_key_lookups;
 mod foreign_parent_admission;
 mod function_progress;
@@ -96,6 +100,7 @@ mod streamed_insert_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod trigger_row_subfields;
 mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
@@ -12144,8 +12149,16 @@ fn prepare_transaction_is_strictly_configured_and_eligible() {
     config.max_prepared_transactions = 1;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
+    // Outside a transaction block PostgreSQL warns and reports ROLLBACK.
+    let outside = run_with(&mut engine, &mut budget, "PREPARE TRANSACTION 'outside'");
+    let outside = String::from_utf8_lossy(&outside);
+    assert!(
+        outside.contains("there is no transaction in progress")
+            && outside.contains("ROLLBACK")
+            && !outside.contains("ERROR"),
+        "{outside}"
+    );
     for statement in [
-        "PREPARE TRANSACTION 'outside'",
         "BEGIN; NOTIFY prepared_channel; PREPARE TRANSACTION 'notify'",
         "BEGIN; LISTEN prepared_channel; PREPARE TRANSACTION 'listen'",
         "BEGIN; DECLARE prepared_cursor CURSOR WITH HOLD FOR SELECT 1; \
@@ -86480,6 +86493,85 @@ fn external_recursive_runs_use_object_storage() {
     external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Recursive);
 }
 
+/// A spill-attached engine streams only index-evaluable set functions through
+/// external `LATERAL` runs; table functions with their own materialization
+/// (psql's `\d` uses `pg_partition_ancestors`) keep that path.
+#[test]
+fn spilled_lateral_table_functions_keep_their_materialization() {
+    let name = "spilled-lateral-table-functions";
+    let mut config = test_config(name);
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(engine.storage.spill_attached());
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE lat_pk (id int PRIMARY KEY); \
+         CREATE TABLE lat_fp (id int, ref int REFERENCES lat_pk) PARTITION BY LIST (id); \
+         CREATE TABLE lat_fp_1 PARTITION OF lat_fp FOR VALUES IN (1)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    for (sql, expected) in [
+        (
+            "SELECT conname, relid::regclass::text FROM pg_constraint r, \
+             pg_partition_ancestors('lat_fp_1') WHERE conrelid = relid AND contype = 'f' \
+             ORDER BY 1, 2",
+            &["lat_fp_ref_fkey|lat_fp", "lat_fp_ref_fkey|lat_fp_1"][..],
+        ),
+        (
+            "SELECT t.relid::regclass::text, t.level FROM pg_class c, \
+             pg_partition_tree(c.oid) t WHERE c.relname = 'lat_fp' ORDER BY 2, 1",
+            &["lat_fp|0", "lat_fp_1|1"][..],
+        ),
+        (
+            "SELECT count(*) FROM pg_class c, ts_token_type('default') \
+             WHERE c.relname = 'lat_pk'",
+            &["23"][..],
+        ),
+        (
+            "SELECT count(*) FROM pg_class c, \
+             pg_snapshot_xip('10:20:10,14,15'::pg_snapshot) WHERE c.relname = 'lat_pk'",
+            &["3"][..],
+        ),
+        (
+            "SELECT c.relname::text, g FROM pg_class c, generate_series(1, 2) g \
+             WHERE c.relname = 'lat_pk' ORDER BY 2",
+            &["lat_pk|1", "lat_pk|2"][..],
+        ),
+        // In a select list the text search parser functions use the same
+        // materialization and return records.
+        (
+            "SELECT ts_parse('default', 'a b')",
+            &["(1,a)", "(12,\" \")", "(1,b)"][..],
+        ),
+        (
+            "SELECT count(*) FROM (SELECT ts_token_type('default')) s",
+            &["23"][..],
+        ),
+        (
+            "SELECT ts_debug('simple', 'Hi')",
+            &["(asciiword,\"Word, all ASCII\",Hi,{simple},simple,{hi})"][..],
+        ),
+    ] {
+        let out = run_with(&mut engine, &mut budget, sql);
+        assert_eq!(
+            data_rows(&out),
+            expected,
+            "{sql}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
+
 #[test]
 fn external_lateral_runs_use_object_storage() {
     external_runs_use_object_storage_after_cold_cache(ExternalRunPhase::Lateral);
@@ -93590,6 +93682,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
             },
             None,
             crate::sql::exec::DmlSelection::Qualified,
+            None,
         )
     })
     .unwrap();

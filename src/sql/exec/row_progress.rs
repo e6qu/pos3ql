@@ -129,7 +129,8 @@ impl<'p> KeptSelection<'p> {
             .transpose()
     }
 
-    /// The local rows' stored images, in selection order, decoded in `arena`.
+    /// The rows' stored images (local rows that need one, every foreign row),
+    /// in selection order, decoded in `arena`.
     pub(super) fn images<'out>(self, arena: &'out Arena) -> Result<&'out [&'out [u8]], SqlError>
     where
         'p: 'out,

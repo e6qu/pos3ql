@@ -57,7 +57,7 @@ pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
-pub(crate) use plan::plan_time_bool;
+pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
@@ -71,12 +71,13 @@ use scan::{
 };
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index, dml_index_access_plan,
-    dml_indexed_candidates, index_access_plan, ordered_index_access_plan,
+    dml_indexed_candidates, index_access_plan, index_leading_columns, ordered_index_access_plan,
     parameterized_index_access_plan, rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{
-    RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
-    row_security_off_error, row_security_passes,
+    RowSecurityExpression, RowSecurityPlan, conjoin_row_security, lead_row_security,
+    leakproof_at_first_security_level, plan_row_security, row_security_off_error,
+    row_security_passes,
 };
 
 mod scope;
@@ -130,12 +131,12 @@ use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleInsertTarget, RuleReturningRelation, RuleReturningSource, RuleTransitionType,
-    attach_rule_source, check_rule_condition_aggregates, check_rule_insert_values,
-    describe_stored_set_query, dml_parameter_scope_query, expand_set_tree, expand_stored_query,
-    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
-    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
-    rule_relation_ref, rule_returning_entries, rule_returning_items, rule_select,
-    rule_transition_source,
+    TransitionReferences, attach_rule_source, check_rule_condition_aggregates,
+    check_rule_insert_values, describe_stored_set_query, dml_parameter_scope_query,
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
+    rule_original_transition, rule_relation_ref, rule_returning_entries, rule_returning_items,
+    rule_select, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -4796,6 +4797,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        if let crate::storage::RoutineLanguage::Native(native) = routine.language {
+            return super::foreign::call_native(self.storage, self.txid, native, arguments)
+                .map(Some);
+        }
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
@@ -9075,6 +9080,7 @@ pub(crate) fn analyse_routine_statement<'a>(
 /// operation branches, derived tables and subqueries resolve before it ever
 /// runs. `select` has its views and `WITH` queries expanded. `LATERAL`
 /// derived tables and `FROM`-less subqueries are analysed when they run.
+/// Constant folding errors wait for planning, as in PostgreSQL.
 pub(crate) fn analyse_select<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
@@ -9099,7 +9105,6 @@ pub(crate) fn analyse_select<'a>(
     check_select_types(select, &scope, storage, txid, arena, outer)?;
     // Unknown literals convert during analysis, before constants fold.
     check_key_types(select, &scope, arena, storage, txid)?;
-    check_select_constants(select, arena, storage, txid)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -9748,6 +9753,9 @@ pub(super) fn convert_literal<'a>(
     target: Option<ColType>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
+    if let Some(target) = target.filter(|target| super::type_inputs::builtin_input_type(*target)) {
+        super::type_inputs::note_literal_target(literal, target.oid());
+    }
     let Some(target) = target.filter(|target| {
         matches!(
             target,
@@ -11995,6 +12003,70 @@ fn fold_select_constants_in<'a>(
     let group_by = fold_list(statement.group_by)?;
     let distinct_on = fold_list(statement.distinct_on)?;
     let fold_optional = |expression: Option<&'a Expr<'a>>| expression.map(fold).transpose();
+    // The join tree's conditions, each join's after those of the joins it
+    // contains, fold before WHERE (`preprocess_qual_conditions`). A function
+    // the scan calls for each row to its left (any but the first FROM item,
+    // outside the right of a RIGHT or FULL join) folds its arguments here
+    // too; the others ran when the scope materialized them.
+    // `JSON_TABLE` and `XMLTABLE` carry their clauses as arguments, which
+    // their scans read as written.
+    let lateral_call = |join: &crate::sql::ast::Join<'a>| {
+        !join.kind.is_right_or_full()
+            && (join.table.func_args.is_some() || join.table.rows_from.is_some())
+            && !(join.table.schema.is_none()
+                && matches!(join.table.table, "json_table" | "xmltable"))
+    };
+    if let Some(from) = statement.from
+        && from
+            .joins
+            .iter()
+            .any(|join| join.on.is_some() || lateral_call(join))
+    {
+        let joins = arena
+            .alloc_slice_copy(from.joins)
+            .map_err(|_| arena_full())?;
+        let folded_arguments = core::cell::Cell::new(false);
+        let fold_arguments =
+            |arguments: &'a [&'a Expr<'a>]| -> Result<&'a [&'a Expr<'a>], SqlError> {
+                let copy = arena
+                    .alloc_slice_copy(arguments)
+                    .map_err(|_| arena_full())?;
+                let mut folded_here = false;
+                for argument in copy.iter_mut() {
+                    let folded = fold(argument)?;
+                    folded_here |= !core::ptr::eq(folded, *argument);
+                    *argument = folded;
+                }
+                folded_arguments.set(folded_arguments.get() | folded_here);
+                Ok(if folded_here { copy } else { arguments })
+            };
+        let mut folded_any = false;
+        for join in joins.iter_mut() {
+            if lateral_call(join) {
+                if let Some(arguments) = join.table.func_args {
+                    join.table.func_args = Some(fold_arguments(arguments)?);
+                }
+                if let Some(members) = join.table.rows_from {
+                    let members = arena.alloc_slice_copy(members).map_err(|_| arena_full())?;
+                    for member in members.iter_mut() {
+                        if let Some(arguments) = member.func_args {
+                            member.func_args = Some(fold_arguments(arguments)?);
+                        }
+                    }
+                    join.table.rows_from = Some(members);
+                }
+            }
+            if let Some(on) = join.on {
+                let folded = fold(on)?;
+                folded_any |= !core::ptr::eq(folded, on);
+                join.on = Some(folded);
+            }
+        }
+        if folded_any || folded_arguments.get() {
+            rebuilt.from = Some(crate::sql::ast::FromClause { joins, ..from });
+            changed = true;
+        }
+    }
     rebuilt.where_clause = fold_optional(statement.where_clause)?;
     rebuilt.having = fold_optional(statement.having)?;
     rebuilt.offset = fold_optional(statement.offset)?;
@@ -12199,14 +12271,135 @@ fn fold_insert_constants_in<'a>(
             items
         })
     };
+    // `ON CONFLICT DO UPDATE`'s assignments and condition fold after
+    // `RETURNING`, before a `VALUES` list of several rows.
+    let fold_conflict = || -> Result<Option<crate::sql::ast::OnConflict<'a>>, SqlError> {
+        let Some(conflict) = statement.on_conflict else {
+            return Ok(None);
+        };
+        let Some(update) = conflict.update else {
+            return Ok(Some(conflict));
+        };
+        let assignments = arena.alloc_slice_copy(update).map_err(|_| arena_full())?;
+        let mut changed = false;
+        for (_, expression) in assignments.iter_mut() {
+            if !matches!(expression, Expr::DefaultMarker)
+                && !assigns_through_indirection(expression)
+            {
+                let folded = fold(expression)?;
+                changed |= !core::ptr::eq(folded, *expression);
+                *expression = folded;
+            }
+        }
+        Ok(Some(crate::sql::ast::OnConflict {
+            update: Some(if changed { assignments } else { update }),
+            update_where: conflict.update_where.map(fold).transpose()?,
+            ..conflict
+        }))
+    };
     if statement.rows.len() <= 1 {
         folded.rows = fold_rows()?;
         folded.returning.items = fold_returning()?;
+        folded.on_conflict = fold_conflict()?;
     } else {
         folded.returning.items = fold_returning()?;
+        folded.on_conflict = fold_conflict()?;
         folded.rows = fold_rows()?;
     }
     Ok(folded)
+}
+
+/// [`fold_update_constants`] for a `MERGE`: `RETURNING`, then each action's
+/// assignments or values and its condition, then the join condition, the
+/// order PostgreSQL's planner preprocesses them.
+pub(crate) fn fold_merge_constants<'a>(
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a crate::sql::ast::Merge<'a>, SqlError> {
+    use crate::sql::ast::{MergeSourceAction, MergeTargetAction, MergeWhen};
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+    let fold_assignments = |assignments: &'a [(&'a str, &'a Expr<'a>)]| {
+        let copy = arena
+            .alloc_slice_copy(assignments)
+            .map_err(|_| arena_full())?;
+        for (_, expression) in copy.iter_mut() {
+            if !matches!(expression, Expr::DefaultMarker)
+                && !assigns_through_indirection(expression)
+            {
+                *expression = fold(expression)?;
+            }
+        }
+        Ok::<_, SqlError>(&*copy)
+    };
+    let fold_target_action = |action: MergeTargetAction<'a>| match action {
+        MergeTargetAction::Update(assignments) => {
+            fold_assignments(assignments).map(MergeTargetAction::Update)
+        }
+        other => Ok(other),
+    };
+    let whens = arena
+        .alloc_slice_copy(statement.whens)
+        .map_err(|_| arena_full())?;
+    for when in whens.iter_mut() {
+        *when = match *when {
+            MergeWhen::Matched { cond, action } => {
+                let action = fold_target_action(action)?;
+                MergeWhen::Matched {
+                    cond: cond.map(fold).transpose()?,
+                    action,
+                }
+            }
+            MergeWhen::NotMatchedBySource { cond, action } => {
+                let action = fold_target_action(action)?;
+                MergeWhen::NotMatchedBySource {
+                    cond: cond.map(fold).transpose()?,
+                    action,
+                }
+            }
+            MergeWhen::NotMatchedByTarget { cond, action } => {
+                let action = match action {
+                    MergeSourceAction::Insert {
+                        columns,
+                        values,
+                        default_values,
+                        overriding,
+                    } => {
+                        let copy = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+                        for value in copy.iter_mut() {
+                            if !matches!(value, Expr::DefaultMarker)
+                                && !assigns_through_indirection(value)
+                            {
+                                *value = fold(value)?;
+                            }
+                        }
+                        MergeSourceAction::Insert {
+                            columns,
+                            values: copy,
+                            default_values,
+                            overriding,
+                        }
+                    }
+                    MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                };
+                MergeWhen::NotMatchedByTarget {
+                    cond: cond.map(fold).transpose()?,
+                    action,
+                }
+            }
+        };
+    }
+    folded.whens = whens;
+    folded.on = fold(statement.on)?;
+    arena
+        .alloc(folded)
+        .map(|merge| &*merge)
+        .map_err(|_| arena_full())
 }
 
 /// [`fold_update_constants`] for a `DELETE`: `RETURNING`, then `WHERE`.
@@ -12764,10 +12957,27 @@ pub(crate) fn select_query_resumable<'a>(
             );
         }
     }
+    // A query of one foreign table sends its shippable conditions, order and
+    // limit to the server; the rest runs here over the rows it returns.
+    let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {
+        Ok(pushed) => pushed,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = match &pushed {
+        Some(plan) => match plan.local_statement(statement, arena) {
+            Ok(local) => local,
+            Err(error) => return sql_fail(error),
+        },
+        None => statement,
+    };
+    let from = statement
+        .from
+        .as_ref()
+        .expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec(
+    let scope = match QueryScope::resolve_exec_pushed(
         storage,
         from,
         statement.where_clause,
@@ -12775,6 +12985,8 @@ pub(crate) fn select_query_resumable<'a>(
         arena,
         params,
         seq,
+        None,
+        pushed.as_ref(),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -12899,6 +13111,11 @@ pub(crate) fn select_query_resumable<'a>(
         Ok(statement) => statement,
         Err(e) => return sql_fail(e),
     };
+    // The scans read the folded join conditions.
+    let from = statement
+        .from
+        .as_ref()
+        .expect("FROM-less handled by caller");
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -13359,7 +13576,8 @@ pub(crate) fn first_aggregate<'a>(
 }
 
 /// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
-/// type and its constant inputs, as `PREPARE` checks them.
+/// type and its keys, as `PREPARE` checks them. Constant folding errors
+/// (`1/0`) wait for the planning of each execution.
 pub(crate) fn analyse_fromless_select<'a>(
     statement: &'a Select<'a>,
     storage: &'a Storage,
@@ -13380,8 +13598,7 @@ pub(crate) fn analyse_fromless_select<'a>(
     if let Some(condition) = statement.where_clause {
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
-    check_fromless_keys(statement, &columns, storage, txid, arena)?;
-    check_select_constants(statement, arena, storage, txid)
+    check_fromless_keys(statement, &columns, storage, txid, arena)
 }
 
 /// The ORDER BY and DISTINCT ON keys of a query without FROM: output

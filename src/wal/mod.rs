@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 32;
+pub(crate) const RECORD_VERSION: u8 = 33;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 24;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 26;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1226,7 +1226,8 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + 8
             + 1
             + fk.n_delete_set_cols * 2
-            + 4;
+            + 4
+            + 3 * crate::storage::ConstraintIdentity::ENCODED_BYTES;
     }
     // exclusion constraints
     n += 1;
@@ -1268,6 +1269,16 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         .inline_key_names()
         .iter()
         .map(|key| 2 + 1 + key.name.as_str().len())
+        .sum::<usize>();
+    n += 2 + def
+        .fkey_clones()
+        .iter()
+        .map(|clone| {
+            crate::storage::ConstraintIdentity::ENCODED_BYTES
+                + crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + clone.name.as_str().len()
+        })
         .sum::<usize>();
     n += def.table_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
@@ -1621,6 +1632,11 @@ fn append_table_payload<B: DefinitionBacking>(
             u32::try_from(identity.created_at())
                 .is_ok_and(|created_at| buffer.append(&created_at.to_le_bytes()))
         });
+        // The parent key it is attached to and its trigger stamps.
+        ok &= fk.trigger_stamps_consistent();
+        for stamp in [fk.inherited_from, fk.action_triggers, fk.check_triggers] {
+            ok &= buffer.append(&stamp.map_or([0; 4], |stamp| stamp.to_le_bytes()));
+        }
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -1688,6 +1704,12 @@ fn append_table_payload<B: DefinitionBacking>(
     }
     for key in def.inline_key_names() {
         ok &= buffer.append(&key.attribute.to_le_bytes()) && name_bytes(buffer, key.name.as_str());
+    }
+    ok &= buffer.append(&(def.n_fkey_clones as u16).to_le_bytes());
+    for clone in def.fkey_clones() {
+        ok &= buffer.append(&clone.foreign_key.to_le_bytes())
+            && buffer.append(&clone.partition.encode())
+            && name_bytes(buffer, clone.name.as_str());
     }
     for identity in def.table_index_identities() {
         ok &= identity.is_some()
@@ -2135,7 +2157,11 @@ pub(crate) enum WalOp<'a> {
         /// source persisted alongside the physical key columns.
         predicate: Option<&'a str>,
         unique: bool,
+        /// Journaled without its parent slot, which replay does not reproduce.
         definition: crate::storage::IndexMutableDefinition,
+        /// The creation stamp of the partitioned index this index is attached
+        /// to.
+        parent: Option<u64>,
         /// What the key expressions and predicate were bound to.
         expression_dependencies: ExpressionDependencyList<'a>,
     },
@@ -2152,7 +2178,11 @@ pub(crate) enum WalOp<'a> {
     AlterIndexDefinition {
         schema: &'a str,
         name: &'a str,
+        /// Journaled without its parent slot, which replay does not reproduce.
         definition: crate::storage::IndexMutableDefinition,
+        /// The creation stamp of the partitioned index this index is attached
+        /// to.
+        parent: Option<u64>,
         /// The complete key expressions and predicate after the change.
         expressions: [Option<&'a str>; MAX_INDEX_COLS],
         predicate: Option<&'a str>,
@@ -4245,7 +4275,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + MAX_INDEX_COLS * 2
-                + 2
+                + 4
                 + 1
                 + 1
                 + 1
@@ -4270,7 +4300,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + MAX_INDEX_COLS * 2
-                + 2
+                + 4
                 + 4
                 + 8
                 + 6
@@ -5156,7 +5186,17 @@ fn append_subscription_behavior(
 fn append_index_definition(
     buffer: &mut FixedBuf,
     definition: crate::storage::IndexMutableDefinition,
+    parent: Option<u64>,
 ) -> bool {
+    // A parent is named by its creation stamp; zero means none.
+    let Some(parent) = parent.map_or(Some(0), |parent| {
+        u32::try_from(parent).ok().filter(|parent| *parent != 0)
+    }) else {
+        return false;
+    };
+    if definition.parent.is_some() != (parent != 0) {
+        return false;
+    }
     let fillfactor = definition.options.fillfactor.unwrap_or(0);
     let deduplicate = match definition.options.deduplicate_items {
         None => 0,
@@ -5169,7 +5209,7 @@ fn append_index_definition(
     for statistic in definition.statistics {
         ok &= buffer.append(&statistic.to_le_bytes());
     }
-    ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
+    ok &= buffer.append(&parent.to_le_bytes());
     ok &= buffer.append(&[
         kind,
         u8::from(definition.clustered),
@@ -5995,6 +6035,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             predicate,
             unique,
             definition,
+            parent,
             expression_dependencies,
         } => {
             let mut ok = buffer.append(&created_at.to_le_bytes())
@@ -6074,7 +6115,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
-            ok && append_index_definition(buffer, *definition)
+            ok && append_index_definition(buffer, *definition, *parent)
                 && buffer.append(&[0xa7])
                 && expression_dependencies.append(buffer)
         }
@@ -6102,6 +6143,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             definition,
+            parent,
             expressions,
             predicate,
         } => {
@@ -6113,7 +6155,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 });
             name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
-                && append_index_definition(buffer, *definition)
+                && append_index_definition(buffer, *definition, *parent)
                 && buffer.append(&mask.to_le_bytes())
                 && expressions.iter().flatten().all(|text| {
                     text.len() <= u16::MAX as usize
@@ -7738,10 +7780,12 @@ fn decode_subscription_behavior(
     Some(behavior)
 }
 
+/// An index's journaled definition, without a parent slot, and its parent
+/// index's creation stamp.
 fn decode_index_definition(
     payload: &[u8],
     at: &mut usize,
-) -> Option<crate::storage::IndexMutableDefinition> {
+) -> Option<(crate::storage::IndexMutableDefinition, Option<u64>)> {
     let tablespace = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
     let fillfactor = match *payload.get(*at)? {
@@ -7765,8 +7809,8 @@ fn decode_index_definition(
             return None;
         }
     }
-    let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
-    *at += 2;
+    let parent = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
     let kind = crate::storage::IndexKind::from_code(*payload.get(*at)?)?;
     *at += 1;
     let clustered = match *payload.get(*at)? {
@@ -7837,24 +7881,27 @@ fn decode_index_definition(
     if (clustered || replica_identity) && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
-    Some(crate::storage::IndexMutableDefinition {
-        tablespace,
-        options: crate::storage::IndexStorageOptions {
-            fillfactor,
-            deduplicate_items,
-            pages_per_range,
-            autosummarize,
-            buffering,
-            fastupdate,
-            gin_pending_list_limit,
+    Some((
+        crate::storage::IndexMutableDefinition {
+            tablespace,
+            options: crate::storage::IndexStorageOptions {
+                fillfactor,
+                deduplicate_items,
+                pages_per_range,
+                autosummarize,
+                buffering,
+                fastupdate,
+                gin_pending_list_limit,
+            },
+            statistics,
+            parent: None,
+            kind,
+            clustered,
+            replica_identity,
+            immediate,
         },
-        statistics,
-        parent: (parent != u16::MAX).then_some(parent),
-        kind,
-        clustered,
-        replica_identity,
-        immediate,
-    })
+        (parent != 0).then_some(u64::from(parent)),
+    ))
 }
 
 fn decode_tablespace_options(
@@ -8777,6 +8824,18 @@ fn decode_op_inner<'a>(
                 fk.referenced_index = crate::storage::ReferencedIndex::Index(
                     crate::storage::RelationIdentity::parse(u64::from(referenced))?,
                 );
+                let mut stamps = [None; 3];
+                for stamp in &mut stamps {
+                    let bytes: [u8; 4] = payload.get(at..at + 4)?.try_into().ok()?;
+                    at += 4;
+                    if bytes != [0; 4] {
+                        *stamp = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes)?);
+                    }
+                }
+                [fk.inherited_from, fk.action_triggers, fk.check_triggers] = stamps;
+                if !fk.trigger_stamps_consistent() {
+                    return None;
+                }
                 *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
@@ -8918,6 +8977,26 @@ fn decode_op_inner<'a>(
                 def.n_inline_key_names += 1;
             }
             crate::storage::Storage::validate_inline_key_names(&def).ok()?;
+            let clones = usize::from(u16::from_le_bytes(
+                payload.get(at..at + 2)?.try_into().ok()?,
+            ));
+            at += 2;
+            if clones > crate::storage::MAX_FKEY_CLONES {
+                return None;
+            }
+            for clone in &mut def.fkey_clones[..clones] {
+                let bytes =
+                    payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+                clone.foreign_key =
+                    crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?;
+                clone.partition = crate::storage::CatalogPosition::decode(
+                    payload.get(at..at + crate::storage::CatalogPosition::ENCODED_BYTES)?,
+                )?;
+                at += crate::storage::CatalogPosition::ENCODED_BYTES;
+                clone.name = SqlName::parse(take_name(&mut at)?).ok()?;
+            }
+            def.n_fkey_clones = clones;
             // Stored names are authoritative during later column remapping.
             def.not_null_name_edits = crate::storage::ColumnSet::all(n_cols);
             for identity in def.table_index_identities_mut() {
@@ -8938,6 +9017,9 @@ fn decode_op_inner<'a>(
                 identity.created_at(),
             )
             .ok()?;
+            if !def.fkey_clones_are_valid() {
+                return None;
+            }
             let dependencies = usize::from(*payload.get(at)?);
             at += 1;
             if dependencies > crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES {
@@ -10379,7 +10461,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             at += 1;
-            let definition = decode_index_definition(payload, &mut at)?;
+            let (definition, parent) = decode_index_definition(payload, &mut at)?;
             if *payload.get(at)? != 0xa7 {
                 return None;
             }
@@ -10408,6 +10490,7 @@ fn decode_op_inner<'a>(
                 predicate,
                 unique,
                 definition,
+                parent,
                 expression_dependencies,
             })
         }),
@@ -10444,7 +10527,7 @@ fn decode_op_inner<'a>(
         KIND_ALTER_INDEX_DEFINITION_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
-            let definition = decode_index_definition(payload, &mut at)?;
+            let (definition, parent) = decode_index_definition(payload, &mut at)?;
             let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let mut expressions = [None; MAX_INDEX_COLS];
@@ -10479,6 +10562,7 @@ fn decode_op_inner<'a>(
                 schema,
                 name,
                 definition,
+                parent,
                 expressions,
                 predicate,
             })
@@ -15706,6 +15790,8 @@ mod tests {
         fk.referenced_index = crate::storage::ReferencedIndex::Index(
             crate::storage::RelationIdentity::parse(7).unwrap(),
         );
+        fk.action_triggers = crate::storage::ConstraintIdentity::parse(91);
+        fk.check_triggers = crate::storage::ConstraintIdentity::parse(92);
         def.fkeys[0] = fk;
         def.n_fkeys = 1;
         let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
@@ -16141,6 +16227,63 @@ mod tests {
                 }
             ));
             let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                (
+                    decoded.fkeys[0].inherited_from,
+                    decoded.fkeys[0].action_triggers,
+                    decoded.fkeys[0].check_triggers
+                ),
+                (
+                    None,
+                    crate::storage::ConstraintIdentity::parse(91),
+                    crate::storage::ConstraintIdentity::parse(92)
+                )
+            );
+            // Trigger stamps must fit the key: action triggers exactly when
+            // it is not attached, and none for a NOT ENFORCED key.
+            for (inherited_from, action, check, validation) in [
+                (
+                    None,
+                    None,
+                    Some(92),
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    Some(90),
+                    Some(91),
+                    Some(92),
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    None,
+                    Some(91),
+                    None,
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    None,
+                    Some(91),
+                    Some(92),
+                    crate::storage::ConstraintValidation::NotEnforced,
+                ),
+            ] {
+                let mut inconsistent = marked.clone();
+                inconsistent.fkeys[0].inherited_from =
+                    inherited_from.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].action_triggers =
+                    action.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].check_triggers =
+                    check.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].validation = validation;
+                payload.clear();
+                assert!(!append_payload(
+                    &mut payload,
+                    &WalOp::CreateTable {
+                        identity,
+                        definition: (&inconsistent).into(),
+                    }
+                ));
+            }
             assert_eq!(
                 decoded.fkeys[0].referenced_index.identity(),
                 crate::storage::RelationIdentity::parse(u64::from(stamp))
@@ -17624,6 +17767,7 @@ mod tests {
                     predicate: None,
                     unique: true,
                     definition: crate::storage::IndexMutableDefinition::DEFAULT,
+                    parent: None,
                     expression_dependencies: ExpressionDependencyList::Entries(&[]),
                 };
                 let result = append_record(&mut buffer, 2, &operation);
@@ -17684,6 +17828,7 @@ mod tests {
             predicate: None,
             unique: true,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let length = encoded_payload_len(&operation);
@@ -17739,6 +17884,7 @@ mod tests {
                 clustered: true,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut budget = Budget::new(4096);
@@ -17844,6 +17990,7 @@ mod tests {
             predicate: None,
             unique: false,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
@@ -17899,6 +18046,7 @@ mod tests {
                 },
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
@@ -17977,6 +18125,7 @@ mod tests {
                     options,
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 },
+                parent: None,
                 expression_dependencies: ExpressionDependencyList::Entries(&[]),
             };
             let mut bytes = [0; 4096];
@@ -18053,11 +18202,13 @@ mod tests {
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 };
                 payload.clear();
-                assert!(append_index_definition(&mut payload, definition));
+                assert!(append_index_definition(&mut payload, definition, None));
                 let mut at = 0;
-                let decoded = decode_index_definition(payload.readable(), &mut at).unwrap();
+                let (decoded, parent) =
+                    decode_index_definition(payload.readable(), &mut at).unwrap();
                 assert_eq!(at, payload.len());
                 assert_eq!(decoded, definition);
+                assert_eq!(parent, None);
                 assert_eq!(
                     (
                         decoded.kind.valid(),
@@ -18088,10 +18239,29 @@ mod tests {
                             clustered,
                             replica_identity,
                             ..crate::storage::IndexMutableDefinition::DEFAULT
-                        }
+                        },
+                        None,
                     ));
                     assert!(decode_index_definition(payload.readable(), &mut 0).is_none());
                 }
+            }
+            // A parent is journaled by its creation stamp, never its slot.
+            let attached = crate::storage::IndexMutableDefinition {
+                parent: Some(3),
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            };
+            payload.clear();
+            assert!(append_index_definition(&mut payload, attached, Some(42)));
+            let (decoded, parent) = decode_index_definition(payload.readable(), &mut 0).unwrap();
+            assert_eq!((decoded.parent, parent), (None, Some(42)));
+            for (definition, parent) in [
+                (attached, None),
+                (crate::storage::IndexMutableDefinition::DEFAULT, Some(42)),
+                (attached, Some(0)),
+                (attached, Some(u64::from(u32::MAX) + 1)),
+            ] {
+                payload.clear();
+                assert!(!append_index_definition(&mut payload, definition, parent));
             }
             assert_eq!(IndexKind::from_code(6), None);
             assert_eq!(IndexKind::from_code(u8::MAX), None);
@@ -18108,6 +18278,7 @@ mod tests {
                 immediate: false,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expressions: {
                 let mut expressions = [None; MAX_INDEX_COLS];
                 expressions[1] = Some("lower(renamed)");
@@ -18128,6 +18299,7 @@ mod tests {
             schema,
             name,
             definition,
+            parent: None,
             expressions,
             predicate,
         }) = decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable())

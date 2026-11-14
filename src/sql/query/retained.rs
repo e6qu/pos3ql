@@ -3299,11 +3299,9 @@ impl<'a> RetainedSelect<'a> {
                         ..super::super::eval::NO_HOOKS
                     },
                 )?;
-                // A grouping filters its input as the general executor's
-                // scan does, with the same planning-time folding.
-                if mode == RetainedMode::Statement && aggregates.is_none() {
-                    return Ok(predicate);
-                }
+                // Every stream filters its input as the general executor's
+                // scan does, with the same planning-time folding and
+                // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
                 reorder_qual(predicate, &scope, arena)
@@ -3612,6 +3610,8 @@ impl<'a> RetainedSelect<'a> {
             Err(error) if error.requires_routine_engine() => return Ok(None),
             Err(error) => return Err(error),
         };
+        // The join reads its folded conditions.
+        let from = statement.from.as_ref().unwrap_or(from);
         let demand = match aggregates {
             Some(_) => grouping::input_demand(&scope, from, statement, arena)?,
             None => streaming_pax_columns_ordered(
@@ -3669,11 +3669,9 @@ impl<'a> RetainedSelect<'a> {
                         ..super::super::eval::NO_HOOKS
                     },
                 )?;
-                // A grouping filters its input as the general executor's
-                // scan does, with the same planning-time folding.
-                if mode == RetainedMode::Statement && aggregates.is_none() {
-                    return Ok(predicate);
-                }
+                // Every stream filters its input as the general executor's
+                // scan does, with the same planning-time folding and
+                // PostgreSQL's cost order of the conjuncts.
                 let predicate = simplify_qual(predicate, arena)?;
                 let predicate = plan::fold_null(predicate, &scope, arena)?;
                 reorder_qual(predicate, &scope, arena)

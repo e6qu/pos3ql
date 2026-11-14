@@ -25,8 +25,8 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v44` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v46` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Journal record | Version `33` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -87,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`32`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`33`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -121,7 +121,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 24: version byte, ten-byte catalog
+- **Table definition payload** is version 26: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
   column's NOT NULL inheritance byte carries inheritability in bit 0 and
   PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
@@ -135,8 +135,21 @@ Other payload rules:
   `SET DEFAULT (...)` list changes (PostgreSQL's `confdelsetcols`; zero means
   every key column), then the four-byte creation stamp of the referenced
   table's unique index the key depends on (PostgreSQL's `conindid`; zero is
-  rejected). The manifest's `fkey` line carries the same four codes, count,
-  positions and stamp after the validation code. Each exclusion constraint
+  rejected), then three four-byte stamps (zero for none): the partition
+  parent's key it is attached to (PostgreSQL's `conparentid`), its action
+  triggers' and its check triggers' stamps, from which their OIDs derive. A
+  NOT ENFORCED key has no triggers; an enforced key has check triggers, and
+  action triggers exactly when it is not attached; anything else is rejected. The manifest's `fkey` line carries the
+  same four codes, count, positions and four stamps after the validation code. After the inline key names
+  come the foreign keys' partition clones (PostgreSQL's `pg_constraint` row
+  per partition of a referenced partitioned table): a two-byte count of at
+  most 256, then for each the four-byte creation stamp of the key it belongs
+  to, the referenced partition's ten-byte catalog position and the clone's
+  name. Each clone's own creation stamp follows the table's other constraint
+  stamps, last. A duplicate (key, partition) pair or an empty name is
+  rejected. The manifest writes each clone as an `fkclone <key stamp>
+  <partition slot> <partition stamp> <hex name>` line after the `fkey`
+  lines. Each exclusion constraint
   element is a tag byte, `0` with a two-byte column position or `1` with a
   two-byte length and that many bytes of canonical UTF-8 expression text,
   then the four-byte operator OID (a runnable built-in or a user-defined
@@ -435,7 +448,10 @@ Index lifecycle codes retain PostgreSQL's `indisvalid`, `indisready`,
 | 5 | Dead | false, false, false |
 
 Invalid indexes cannot serve reads; ready indexes participate in writes and
-uniqueness. TOAST index sources are encoded in 11 journal bytes: one tag plus a
+uniqueness. An index create or definition change journals the partitioned
+index it is attached to as that index's four-byte creation stamp (zero for
+none), never its catalog slot, which replay does not reproduce; recovery
+resolves the stamp and rejects one that names no index. TOAST index sources are encoded in 11 journal bytes: one tag plus a
 ten-byte owner identity (the ordinary-table tag requires ten zero bytes). They
 distinguish real columns from virtual `chunk_id`/`chunk_seq` keys. Unknown tags,
 stale owners and contradictory keys are rejected.

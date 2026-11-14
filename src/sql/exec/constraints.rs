@@ -24,7 +24,8 @@ use super::{RowCtx, check_not_null};
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
 const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
 
-type DetailText = crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
+pub(crate) type DetailText =
+    crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
 
 fn detail_full() -> SqlError {
     sql_err!(
@@ -75,20 +76,105 @@ fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
     }
 }
 
+/// Whose row a NOT NULL, CHECK or view check option violation describes.
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a fixed column set passed by value to each row check"
+)]
+pub(crate) enum RowDescription {
+    /// A row the current user's statement writes to the table in slot
+    /// `table`, giving values to the `written` columns.
+    Write {
+        table: usize,
+        written: crate::storage::ColumnSet,
+    },
+    /// A row a maintenance command rewrites or a subscription applies,
+    /// described in full.
+    Maintenance,
+}
+
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
-/// violates a NOT NULL or CHECK constraint. A virtual generated column,
-/// which the row does not hold in PostgreSQL, reads `virtual`.
+/// violates a NOT NULL or CHECK constraint (`ExecBuildSlotValueDescription`).
+/// A write's row shows nothing while row security applies to the user;
+/// without `SELECT` on the table it shows only the columns the user may read
+/// or the statement wrote, named (`(a, c) = (1, 3)`), and nothing when there
+/// are none. A virtual generated column, which the row does not hold in
+/// PostgreSQL, reads `virtual`.
 pub(crate) fn failing_row_detail(
+    storage: &Storage,
+    txid: u32,
+    description: RowDescription,
     columns: &[crate::storage::ColumnMeta],
     values: &[Datum<'_>],
-) -> Result<DetailText, SqlError> {
+) -> Result<Option<DetailText>, SqlError> {
     use core::fmt::Write;
+    let mut shown = crate::storage::ColumnSet::all(values.len());
+    let mut named = false;
+    if let RowDescription::Write { table, written } = description {
+        let Some(role) = storage.current_role_slot(txid) else {
+            return Ok(None);
+        };
+        if storage.row_security_applies(table, role, txid) {
+            return Ok(None);
+        }
+        let object = storage.table_access_object(table, txid);
+        let select = crate::storage::PrivilegeSet::SELECT;
+        if !storage.has_object_privilege(object, role, select, txid) {
+            named = true;
+            shown = crate::storage::ColumnSet::EMPTY;
+            // The row may be a partition's, whose columns match the written
+            // table's by name.
+            let target = storage.table_def(table, txid);
+            for (column, meta) in columns.iter().enumerate().take(values.len()) {
+                let Some(logical) = target
+                    .columns()
+                    .iter()
+                    .position(|candidate| candidate.name == meta.name)
+                else {
+                    continue;
+                };
+                let readable = written.contains(logical)
+                    || u16::try_from(logical).is_ok_and(|logical| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, logical).is_ok_and(
+                            |target| storage.has_column_privilege(target, role, select, txid),
+                        )
+                    });
+                if readable {
+                    shown.insert(column);
+                }
+            }
+            if !(0..values.len()).any(|column| shown.contains(column)) {
+                return Ok(None);
+            }
+        }
+    }
     let mut detail = DetailText::new();
-    let _ = detail.write_str("Failing row contains (");
+    let _ = detail.write_str("Failing row contains ");
+    if named {
+        let _ = detail.write_char('(');
+        let mut first = true;
+        for (index, column) in columns.iter().enumerate().take(values.len()) {
+            if shown.contains(index) {
+                if !first {
+                    let _ = detail.write_str(", ");
+                }
+                first = false;
+                let _ = detail.write_str(column.name.as_str());
+            }
+        }
+        let _ = detail.write_str(") = ");
+    }
+    let _ = detail.write_char('(');
+    let mut first = true;
     for (index, value) in values.iter().enumerate() {
-        if index > 0 {
+        if !shown.contains(index) {
+            continue;
+        }
+        if !first {
             let _ = detail.write_str(", ");
         }
+        first = false;
         if columns
             .get(index)
             .is_some_and(|column| column.default.is_virtual())
@@ -102,7 +188,7 @@ pub(crate) fn failing_row_detail(
     if detail.is_truncated() {
         return Err(detail_full());
     }
-    Ok(detail)
+    Ok(Some(detail))
 }
 
 /// `Key (a, b)=(1, 2)`, PostgreSQL's description of an index key
@@ -164,6 +250,41 @@ pub(crate) fn partition_key_detail<'v>(
         return Err(detail_full());
     }
     Ok(detail)
+}
+
+/// Whether the current user may read a row's key values in an error
+/// detail, as PostgreSQL's `BuildIndexValueDescription`,
+/// `ExecBuildSlotPartitionKeyDescription` and `ri_ReportViolation` decide:
+/// never while row security applies to the user, else with `SELECT` on the
+/// table or on every key column. A `None` key is an expression, which only
+/// table-level `SELECT` reveals.
+pub(crate) fn key_values_visible(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    columns: &mut dyn Iterator<Item = Option<u16>>,
+) -> bool {
+    let Some(role) = storage.current_role_slot(txid) else {
+        return false;
+    };
+    if storage.row_security_applies(table, role, txid) {
+        return false;
+    }
+    let object = storage.table_access_object(table, txid);
+    let select = crate::storage::PrivilegeSet::SELECT;
+    if storage.has_object_privilege(object, role, select, txid) {
+        return true;
+    }
+    for column in columns {
+        let readable = column.is_some_and(|column| {
+            crate::storage::ColumnPrivilegeTarget::new(object, column)
+                .is_ok_and(|target| storage.has_column_privilege(target, role, select, txid))
+        });
+        if !readable {
+            return false;
+        }
+    }
+    true
 }
 
 /// A key description followed by `suffix`, such as ` already exists.`.
@@ -541,18 +662,23 @@ pub(crate) fn check_domain_constraints(
 
 /// 23505 for the key `columns` of `values`, with PostgreSQL's detail and
 /// the constraint's table.
+#[allow(clippy::too_many_arguments)]
 fn unique_violation(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
     duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     values: &[Datum],
 ) -> SqlError {
+    let visible = key_values_visible(storage, table, txid, &mut columns.iter().map(|c| Some(*c)));
     let names = columns
         .iter()
         .map(|column| def.columns()[*column as usize].name.as_str());
     let keys = columns.iter().map(|column| values[*column as usize]);
-    duplicate_key_error(duplicate, name, def, &mut { names }, &mut { keys })
+    duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut { keys })
 }
 
 /// Whether a duplicate key meets a written row or an index being built.
@@ -562,10 +688,14 @@ pub(crate) enum DuplicateKey {
     IndexBuild,
 }
 
+/// `visible` is [`key_values_visible`]'s verdict: without it a write's
+/// violation has no detail and an index build's says only that duplicates
+/// exist.
 fn duplicate_key_error<'v>(
     duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    visible: bool,
     names: &mut dyn Iterator<Item = &str>,
     keys: &mut dyn Iterator<Item = Datum<'v>>,
 ) -> SqlError {
@@ -573,12 +703,21 @@ fn duplicate_key_error<'v>(
         DuplicateKey::Write => format_args!(" already exists."),
         DuplicateKey::IndexBuild => format_args!(" is duplicated."),
     };
-    let detail = match key_detail(names, keys, suffix) {
-        Ok(detail) => detail,
-        Err(error) => return error,
+    let detail = if visible {
+        match key_detail(names, keys, suffix) {
+            Ok(detail) => Some(detail),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    let detail = match (&detail, duplicate) {
+        (Some(detail), _) => Some(detail.as_str()),
+        (None, DuplicateKey::Write) => None,
+        (None, DuplicateKey::IndexBuild) => Some("Duplicate keys exist."),
     };
     crate::sql::eval::stash_object_diagnostic(
-        Some(detail.as_str()),
+        detail,
         crate::sql::eval::ErrorObjects::table_constraint(
             def.schema.as_str(),
             def.name.as_str(),
@@ -811,6 +950,28 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
         let n = self.exclusion.len();
+        let objects = crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            self.exclusion.name.as_str(),
+        );
+        if !key_values_visible(
+            storage,
+            table_index,
+            txid,
+            &mut (0..n).map(|position| {
+                self.expressions[position]
+                    .is_none()
+                    .then_some(self.columns[position])
+            }),
+        ) {
+            let detail = match duplicate {
+                DuplicateKey::Write => "Key conflicts with existing key.",
+                DuplicateKey::IndexBuild => "Key conflicts exist.",
+            };
+            crate::sql::eval::stash_object_diagnostic(Some(detail), objects);
+            return Ok(());
+        }
         let mut names = [""; crate::storage::MAX_INDEX_COLS];
         for (position, name) in names.iter_mut().enumerate().take(n) {
             *name = match (self.expressions[position], self.sources[position]) {
@@ -843,14 +1004,7 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
             &mut values[..n].iter().copied(),
             format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
         )?;
-        crate::sql::eval::stash_object_diagnostic(
-            Some(detail.as_str()),
-            crate::sql::eval::ErrorObjects::table_constraint(
-                def.schema.as_str(),
-                def.name.as_str(),
-                self.exclusion.name.as_str(),
-            ),
-        );
+        crate::sql::eval::stash_object_diagnostic(Some(detail.as_str()), objects);
         Ok(())
     }
 }
@@ -900,12 +1054,24 @@ pub(crate) fn index_build_exclusion_violation<'a>(
 
 /// The index-build unique violation for `values`' key `columns`.
 pub(crate) fn index_build_unique_violation(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     values: &[Datum],
 ) -> SqlError {
-    unique_violation(DuplicateKey::IndexBuild, name, def, columns, values)
+    unique_violation(
+        storage,
+        table,
+        txid,
+        DuplicateKey::IndexBuild,
+        name,
+        def,
+        columns,
+        values,
+    )
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -1283,7 +1449,18 @@ fn enforce_expression_index_uniqueness<'a>(
             displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
-        duplicate_key_error(duplicate, name, def, &mut { names }, &mut { values })
+        let visible = key_values_visible(
+            storage,
+            table_index,
+            txid,
+            &mut columns
+                .iter()
+                .enumerate()
+                .map(|(position, column)| expressions[position].is_none().then_some(*column)),
+        );
+        duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut {
+            values
+        })
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -1496,7 +1673,16 @@ fn enforce_key_uniqueness(
                 };
                 match matched {
                     Ok(true) => {
-                        result = Err(unique_violation(duplicate, name, def, columns, values))
+                        result = Err(unique_violation(
+                            storage,
+                            table_index,
+                            txid,
+                            duplicate,
+                            name,
+                            def,
+                            columns,
+                            values,
+                        ))
                     }
                     Ok(false) => {}
                     Err(e) => result = Err(e),
@@ -1584,7 +1770,16 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(duplicate, name, def, columns, values));
+                return Err(unique_violation(
+                    storage,
+                    table_index,
+                    txid,
+                    duplicate,
+                    name,
+                    def,
+                    columns,
+                    values,
+                ));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1641,7 +1836,16 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(duplicate, name, def, columns, values));
+            return Err(unique_violation(
+                storage,
+                table_index,
+                txid,
+                duplicate,
+                name,
+                def,
+                columns,
+                values,
+            ));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1709,7 +1913,16 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(duplicate, name, def, columns, values));
+                return Err(unique_violation(
+                    storage,
+                    table_index,
+                    txid,
+                    duplicate,
+                    name,
+                    def,
+                    columns,
+                    values,
+                ));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1736,7 +1949,16 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(duplicate, name, def, columns, values))
+        Err(unique_violation(
+            storage,
+            table_index,
+            txid,
+            duplicate,
+            name,
+            def,
+            columns,
+            values,
+        ))
     })?;
     Ok(())
 }
@@ -2754,8 +2976,19 @@ pub(crate) fn enforce_row_constraints(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
-    enforce_row_checks(storage, def, values, txid, checks, arena, params, sequences)?;
+    enforce_row_checks(
+        storage,
+        def,
+        values,
+        txid,
+        checks,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     enforce_row_keys(
         storage,
         table_index,
@@ -2782,9 +3015,20 @@ pub(crate) fn enforce_row_checks(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_row_checks(
+        storage,
+        def,
+        checks,
+        values,
+        txid,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     check_domain_constraints(storage, def, values, txid, arena, params, sequences)
 }
 
@@ -2879,11 +3123,22 @@ pub(crate) fn check_row_content(
     txid: u32,
     read: ValidationRead,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
-    check_not_null(def, values)?;
+    check_not_null(storage, txid, def, values, description)?;
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_row_checks(
+        storage,
+        def,
+        checks,
+        values,
+        txid,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_fk_child(storage, def, values, txid, read, arena)?;
     Ok(())
@@ -2926,6 +3181,7 @@ fn check_row_checks(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
     let context = RowCtx {
         table_oid: None,
@@ -2950,9 +3206,15 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
-            let detail = failing_row_detail(def.columns(), &values[..def.columns().len()])?;
+            let detail = failing_row_detail(
+                storage,
+                txid,
+                description,
+                def.columns(),
+                &values[..def.columns().len()],
+            )?;
             crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
+                detail.as_ref().map(DetailText::as_str),
                 crate::sql::eval::ErrorObjects::table_constraint(
                     def.schema.as_str(),
                     def.name.as_str(),
@@ -3269,7 +3531,7 @@ fn check_fk_child_one_at(
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
     else {
-        return Err(missing_parent_key(def, fk, values));
+        return Err(missing_parent_key(storage, txid, def, fk, values));
     };
     let parent_definition = storage.table_def(parent_index, txid).clone();
     let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
@@ -3302,7 +3564,7 @@ fn check_fk_child_one_at(
         arena,
     ) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(missing_parent_key(def, fk, values)),
+        Ok(false) => Err(missing_parent_key(storage, txid, def, fk, values)),
         Err(error) if error.sqlstate.internal_control().is_some() => Err(error),
         // An error inside the lookup names PostgreSQL's check query.
         Err(error) => {
@@ -3391,18 +3653,43 @@ fn write_quoted(out: &mut dyn core::fmt::Write, name: &str) -> core::fmt::Result
 
 /// 23503 for a referencing row whose key `values` has no parent row.
 fn missing_parent_key(
+    storage: &Storage,
+    txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     fk: &crate::storage::ForeignKey,
     values: &[Datum],
 ) -> SqlError {
-    let detail = key_detail(
-        &mut fk
-            .columns()
-            .iter()
-            .map(|column| def.columns()[*column as usize].name.as_str()),
-        &mut fk.columns().iter().map(|column| values[*column as usize]),
-        format_args!(" is not present in table \"{}\".", fk.parent.as_str()),
-    );
+    let visible = storage
+        .find_visible(def.schema.as_str(), def.name.as_str(), txid)
+        .is_some_and(|table| {
+            key_values_visible(
+                storage,
+                table,
+                txid,
+                &mut fk.columns().iter().map(|column| Some(*column)),
+            )
+        });
+    let detail = if visible {
+        key_detail(
+            &mut fk
+                .columns()
+                .iter()
+                .map(|column| def.columns()[*column as usize].name.as_str()),
+            &mut fk.columns().iter().map(|column| values[*column as usize]),
+            format_args!(" is not present in table \"{}\".", fk.parent.as_str()),
+        )
+    } else {
+        let mut detail = DetailText::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut detail,
+            format_args!("Key is not present in table \"{}\".", fk.parent.as_str()),
+        );
+        if detail.is_truncated() {
+            Err(detail_full())
+        } else {
+            Ok(detail)
+        }
+    };
     let detail = match detail {
         Ok(detail) => detail,
         Err(error) => return error,
@@ -3460,6 +3747,43 @@ fn key_recheck_trigger_name<Definition0: crate::storage::DefinitionBacking>(
     )
 }
 
+/// The key `foreign_key` of `table` is attached to at the top of its
+/// partition tree, or the key itself.
+fn attached_root(
+    storage: &Storage,
+    txid: u32,
+    mut table: usize,
+    mut foreign_key: crate::storage::ForeignKey,
+) -> Result<crate::storage::ForeignKey, SqlError> {
+    while let Some(link) = foreign_key.inherited_from {
+        let parent = storage
+            .table_def(table, txid)
+            .partition
+            .attachment
+            .map(|attachment| usize::from(attachment.parent))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "attached foreign key's table is not a partition"
+                )
+            })?;
+        foreign_key = storage
+            .table_def(parent, txid)
+            .fkeys()
+            .iter()
+            .find(|key| key.identity == Some(link))
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "attached foreign key's parent key is absent"
+                )
+            })?;
+        table = parent;
+    }
+    Ok(foreign_key)
+}
+
 /// The name of a foreign key's RI trigger, which orders its queued check
 /// among the row's AFTER triggers.
 pub(super) fn foreign_key_trigger_name(
@@ -3477,7 +3801,10 @@ pub(super) fn foreign_key_trigger_name(
             64,
             "RI_ConstraintTrigger_{}_{}",
             side,
-            foreign_key.trigger_oid(trigger)
+            foreign_key.trigger_oid(trigger).ok_or_else(|| sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign key attached to its partition parent's has no action trigger"
+            ))?
         )
         .as_str(),
     )
@@ -4367,7 +4694,10 @@ pub(crate) fn apply_fk_parent_actions(
             } else {
                 crate::storage::ForeignKeyTrigger::ActionUpdate
             };
-            if !fk.trigger_enabled(action_trigger).fires_in(role) {
+            // A key attached to its partition parent's acts through the
+            // topmost key's action trigger and its firing mode.
+            let acting = attached_root(storage, txn.txid, child_index, fk)?;
+            if !acting.trigger_enabled(action_trigger).fires_in(role) {
                 continue;
             }
             let declared_parent = storage
@@ -4459,7 +4789,7 @@ pub(crate) fn apply_fk_parent_actions(
             let identity = txn.constraint_identity(child_index as u32, fk.name);
             txn.pend_key_check_event(
                 parent_index as u16,
-                foreign_key_trigger_name(&fk, trigger)?,
+                foreign_key_trigger_name(&acting, trigger)?,
                 identity,
                 check,
                 parent_index as u16,
@@ -5290,26 +5620,59 @@ fn check_referenced_key(
     if !referenced {
         return Ok(());
     }
-    let detail = key_detail(
-        &mut parent_columns
-            .iter()
-            .map(|column| physical_parent.columns()[*column as usize].name.as_str()),
-        &mut parent_columns
-            .iter()
-            .map(|column| old_parent[*column as usize]),
-        // PostgreSQL 18 words a RESTRICT violation without "still".
-        format_args!(
-            " is {}referenced from table \"{}\".",
-            if restrict { "" } else { "still " },
-            child.name.as_str()
-        ),
-    )?;
+    // The partition's own clone of the key fires for a row of a referenced
+    // partition, and the report names it.
+    let reported = if parent_index == declared_index {
+        fk.name
+    } else {
+        fk.identity
+            .and_then(|identity| {
+                child
+                    .fkey_clone(identity, storage.table_position(parent_index))
+                    .map(|clone| clone.name)
+            })
+            .unwrap_or(fk.name)
+    };
+    // PostgreSQL 18 words a RESTRICT violation without "still".
+    let still = if restrict { "" } else { "still " };
+    let detail = if key_values_visible(
+        storage,
+        parent_index,
+        txid,
+        &mut parent_columns.iter().map(|column| Some(*column)),
+    ) {
+        key_detail(
+            &mut parent_columns
+                .iter()
+                .map(|column| physical_parent.columns()[*column as usize].name.as_str()),
+            &mut parent_columns
+                .iter()
+                .map(|column| old_parent[*column as usize]),
+            format_args!(
+                " is {still}referenced from table \"{}\".",
+                child.name.as_str()
+            ),
+        )?
+    } else {
+        let mut detail = DetailText::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut detail,
+            format_args!(
+                "Key is {still}referenced from table \"{}\".",
+                child.name.as_str()
+            ),
+        );
+        if detail.is_truncated() {
+            return Err(detail_full());
+        }
+        detail
+    };
     crate::sql::eval::stash_object_diagnostic(
         Some(detail.as_str()),
         crate::sql::eval::ErrorObjects::table_constraint(
             child.schema.as_str(),
             child.name.as_str(),
-            fk.name.as_str(),
+            reported.as_str(),
         ),
     );
     // PostgreSQL names the RESTRICT setting (ri_ReportViolation).
@@ -5323,7 +5686,7 @@ fn check_referenced_key(
         "update or delete on table \"{}\" violates {}foreign key constraint \"{}\" on table \"{}\"",
         physical_parent.name.as_str(),
         setting,
-        fk.name.as_str(),
+        reported.as_str(),
         child.name.as_str()
     ))
 }
@@ -5464,4 +5827,113 @@ mod tests {
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
         assert!(error.message.as_str().contains("outside row width 1"));
     }
+}
+
+/// PostgreSQL's `ATDetachCheckNoForeignKeyRefs`: detaching `partition` from
+/// a referenced partitioned table fails while a row of a referencing table
+/// still points at one of its keys, naming the partition's clone of the key.
+pub(crate) fn check_partition_removal(
+    storage: &Storage,
+    partition: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let position = storage.table_position(partition);
+    let partition_definition = storage.table_def(partition, txid).clone();
+    for table in 0..storage.table_count() {
+        if !storage.relation_visible_to_current_session(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid).clone();
+        for key in definition.fkeys() {
+            let Some(clone) = key
+                .identity
+                .and_then(|identity| definition.fkey_clone(identity, position))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(referenced) =
+                storage.find_visible(key.parent_schema.as_str(), key.parent.as_str(), txid)
+            else {
+                continue;
+            };
+            let referenced_definition = storage.table_def(referenced, txid).clone();
+            let mapped = super::remap_columns(
+                &partition_definition,
+                &referenced_definition,
+                key.parent_cols(),
+            )?;
+            let partition_columns = &mapped[..key.parent_cols().len()];
+            let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+            for (target, &column) in key_types.iter_mut().zip(partition_columns) {
+                *target = partition_definition.columns()[usize::from(column)].ctype;
+            }
+            let key_types = &key_types[..partition_columns.len()];
+            let read = storage.validation_read();
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            constraint_row_tables(storage, table, txid, |row_table| {
+                // SAFETY: the callback returns only an owned result.
+                unsafe {
+                    for_each_validation_row(
+                        storage,
+                        row_table,
+                        txid,
+                        read,
+                        &schema[..definition.n_columns],
+                        arena,
+                        &mut |_, values| {
+                            let mut row_key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+                            for (target, &column) in row_key.iter_mut().zip(key.columns()) {
+                                *target = values[usize::from(column)];
+                            }
+                            let row_key = &row_key[..key.columns().len()];
+                            if row_key.iter().any(Datum::is_null)
+                                || !parent_has_key(
+                                    storage,
+                                    partition,
+                                    partition_columns,
+                                    row_key,
+                                    key_types,
+                                    txid,
+                                    ParentRead::Validation(read),
+                                    arena,
+                                )?
+                            {
+                                return Ok(());
+                            }
+                            let detail = key_detail(
+                                &mut partition_columns.iter().map(|&column| {
+                                    partition_definition.columns()[usize::from(column)]
+                                        .name
+                                        .as_str()
+                                }),
+                                &mut row_key.iter().copied(),
+                                format_args!(
+                                    " is still referenced from table \"{}\".",
+                                    definition.name.as_str()
+                                ),
+                            )?;
+                            crate::sql::eval::stash_object_diagnostic(
+                                Some(detail.as_str()),
+                                crate::sql::eval::ErrorObjects::table_constraint(
+                                    definition.schema.as_str(),
+                                    definition.name.as_str(),
+                                    clone.name.as_str(),
+                                ),
+                            );
+                            Err(sql_err!(
+                                sqlstate::FOREIGN_KEY_VIOLATION,
+                                "removing partition \"{}\" violates foreign key constraint \"{}\"",
+                                partition_definition.name.as_str(),
+                                clone.name.as_str()
+                            ))
+                        },
+                    )
+                }
+            })?;
+        }
+    }
+    Ok(())
 }

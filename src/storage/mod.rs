@@ -1762,6 +1762,9 @@ pub(crate) const MAX_CHECKS: usize = MAX_TABLE_CONSTRAINTS;
 pub(crate) const CHECK_SQL_MAX: usize = 512;
 /// Maximum number of FOREIGN KEY constraints per table.
 pub(crate) const MAX_FKEYS: usize = MAX_TABLE_CONSTRAINTS;
+/// Maximum number of partition clones of a table's foreign keys: one per
+/// partition, at any depth, of each partitioned table a key references.
+pub(crate) const MAX_FKEY_CLONES: usize = 256;
 /// Maximum number of exclusion constraints per table.
 pub(crate) const MAX_EXCLUSIONS: usize = MAX_TABLE_CONSTRAINTS;
 /// Exclusion predicates share the bounded table-definition footprint with
@@ -2249,6 +2252,41 @@ impl ReferencedIndex {
     }
 }
 
+/// The `pg_constraint` row PostgreSQL's `addFkRecurseReferenced` adds for a
+/// foreign key on each partition of the partitioned table it references. Its
+/// name is chosen against the namespace when the clone is made and kept, and
+/// it owns the partition's two RI action triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForeignKeyClone {
+    pub(crate) identity: Option<ConstraintIdentity>,
+    /// The foreign key, on this table, the clone belongs to.
+    pub(crate) foreign_key: ConstraintIdentity,
+    /// The referenced partition.
+    pub(crate) partition: CatalogPosition,
+    pub(crate) name: SqlName,
+}
+
+impl ForeignKeyClone {
+    pub(crate) const EMPTY: Self = Self {
+        identity: None,
+        foreign_key: ConstraintIdentity::PLACEHOLDER,
+        partition: CatalogPosition::PLACEHOLDER,
+        name: SqlName::EMPTY,
+    };
+
+    pub(crate) fn oid(&self) -> i32 {
+        self.identity
+            .expect("admitted foreign key clone has a creation identity")
+            .oid()
+    }
+
+    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> i32 {
+        self.identity
+            .expect("admitted foreign key clone has a creation identity")
+            .foreign_key_trigger_oid(trigger)
+    }
+}
+
 /// A FOREIGN KEY constraint on a child table's column tuple referencing a
 /// parent table's column tuple.
 #[derive(Debug, Clone, Copy)]
@@ -2276,6 +2314,16 @@ pub struct ForeignKey {
     /// TABLE ... ENABLE/DISABLE TRIGGER` on the referencing or referenced
     /// table changes them.
     pub(crate) trigger_enabled: [TriggerEnabled; 4],
+    /// The partition parent's foreign key this key is attached to
+    /// (PostgreSQL's `conparentid`): a copy made for the partition or an
+    /// equivalent key adopted when the partition was attached.
+    pub(crate) inherited_from: Option<ConstraintIdentity>,
+    /// The stamp of the key's two action triggers on the referenced table.
+    /// A key attached to a parent's has none: the parent's reach it.
+    pub(crate) action_triggers: Option<ConstraintIdentity>,
+    /// The stamp of the key's two check triggers on this table, taken after
+    /// the key's partition clones as PostgreSQL creates them.
+    pub(crate) check_triggers: Option<ConstraintIdentity>,
 }
 
 impl ForeignKey {
@@ -2296,6 +2344,9 @@ impl ForeignKey {
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
         trigger_enabled: [TriggerEnabled::Origin; 4],
+        inherited_from: None,
+        action_triggers: None,
+        check_triggers: None,
     };
 
     pub(crate) const fn trigger_enabled(&self, trigger: ForeignKeyTrigger) -> TriggerEnabled {
@@ -2385,6 +2436,8 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_checks: usize,
     pub fkeys: B::Slice<ForeignKey, MAX_FKEYS>,
     pub n_fkeys: usize,
+    pub(crate) fkey_clones: B::Slice<ForeignKeyClone, MAX_FKEY_CLONES>,
+    pub(crate) n_fkey_clones: usize,
     pub exclusions: B::Slice<ExclusionConstraint, MAX_EXCLUSIONS>,
     pub n_exclusions: usize,
     /// What the CHECK constraints and column expressions were bound to.
@@ -2898,6 +2951,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
+            n_fkey_clones: self.n_fkey_clones,
             n_exclusions: self.n_exclusions,
             n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
@@ -2921,6 +2975,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             uniques: &self.uniques.as_ref()[..self.n_uniques],
             checks: &self.checks.as_ref()[..self.n_checks],
             fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
+            fkey_clones: &self.fkey_clones.as_ref()[..self.n_fkey_clones],
             exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
             expression_dependencies: &self.expression_dependencies.as_ref()
                 [..self.n_expression_dependencies],
@@ -2994,6 +3049,42 @@ impl<B: DefinitionBacking> TableDefinition<B> {
 
     pub fn exclusions(&self) -> &[ExclusionConstraint] {
         &self.exclusions.as_ref()[..self.n_exclusions]
+    }
+
+    pub(crate) fn fkey_clones(&self) -> &[ForeignKeyClone] {
+        &self.fkey_clones.as_ref()[..self.n_fkey_clones]
+    }
+
+    /// Whether every stored clone is named and names a distinct (key,
+    /// partition) pair. A clone whose key a statement dropped is dead until
+    /// the statement's end reconciles it away.
+    pub(crate) fn fkey_clones_are_valid(&self) -> bool {
+        self.fkey_clones().iter().enumerate().all(|(at, clone)| {
+            clone.name != SqlName::EMPTY
+                && !self.fkey_clones()[..at].iter().any(|earlier| {
+                    earlier.foreign_key == clone.foreign_key && earlier.partition == clone.partition
+                })
+        })
+    }
+
+    /// The clone of `foreign_key` for the referenced `partition`.
+    pub(crate) fn fkey_clone(
+        &self,
+        foreign_key: ConstraintIdentity,
+        partition: CatalogPosition,
+    ) -> Option<&ForeignKeyClone> {
+        self.fkey_clones()
+            .iter()
+            .find(|clone| clone.foreign_key == foreign_key && clone.partition == partition)
+    }
+
+    /// The clones whose foreign key is still on this table.
+    pub(crate) fn keyed_fkey_clones(&self) -> impl Iterator<Item = &ForeignKeyClone> {
+        self.fkey_clones().iter().filter(|clone| {
+            self.fkeys()
+                .iter()
+                .any(|key| key.identity == Some(clone.foreign_key))
+        })
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -3100,6 +3191,7 @@ impl TableDefBuilder {
         result.n_uniques = source.n_uniques;
         result.n_checks = source.n_checks;
         result.n_fkeys = source.n_fkeys;
+        result.n_fkey_clones = source.n_fkey_clones;
         result.n_exclusions = source.n_exclusions;
         result.has_toast = source.has_toast;
         result.toast_index_identity = source.toast_index_identity;
@@ -3127,6 +3219,7 @@ impl TableDefBuilder {
         result.checks[..source.n_checks]
             .copy_from_slice(&source.checks.as_ref()[..source.n_checks]);
         result.fkeys[..source.n_fkeys].copy_from_slice(&source.fkeys.as_ref()[..source.n_fkeys]);
+        result.fkey_clones[..source.n_fkey_clones].copy_from_slice(source.fkey_clones());
         result.exclusions[..source.n_exclusions]
             .copy_from_slice(&source.exclusions.as_ref()[..source.n_exclusions]);
         result.n_expression_dependencies = source.n_expression_dependencies;
@@ -3149,6 +3242,7 @@ impl TableDefBuilder {
             || self.n_uniques > MAX_UNIQUES
             || self.n_checks > MAX_CHECKS
             || self.n_fkeys > MAX_FKEYS
+            || self.n_fkey_clones > MAX_FKEY_CLONES
             || self.n_exclusions > MAX_EXCLUSIONS
             || self.n_expression_dependencies > MAX_TABLE_EXPRESSION_DEPENDENCIES
         {
@@ -3176,6 +3270,7 @@ impl TableDefBuilder {
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
+            n_fkey_clones: self.n_fkey_clones,
             n_exclusions: self.n_exclusions,
             n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
@@ -3213,6 +3308,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             fkeys: pool
                 .copy_slice(&self.fkeys[..self.n_fkeys])
+                .map_err(exhausted)?,
+            fkey_clones: pool
+                .copy_slice(&self.fkey_clones[..self.n_fkey_clones])
                 .map_err(exhausted)?,
             exclusions: pool
                 .copy_slice(&self.exclusions[..self.n_exclusions])
@@ -3258,6 +3356,8 @@ impl TableDefBuilder {
             n_checks: 0,
             fkeys: [ForeignKey::EMPTY; MAX_FKEYS],
             n_fkeys: 0,
+            fkey_clones: [ForeignKeyClone::EMPTY; MAX_FKEY_CLONES],
+            n_fkey_clones: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
             expression_dependencies: [ExpressionDependency::EMPTY;
@@ -3305,6 +3405,8 @@ impl TableDef {
             n_checks: 0,
             fkeys: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_fkeys: 0,
+            fkey_clones: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_fkey_clones: 0,
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_exclusions: 0,
             expression_dependencies: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -3350,6 +3452,8 @@ impl TableDefView<'_> {
             n_checks: 0,
             fkeys: &[],
             n_fkeys: 0,
+            fkey_clones: &[],
+            n_fkey_clones: 0,
             exclusions: &[],
             n_exclusions: 0,
             expression_dependencies: &[],
@@ -5516,6 +5620,21 @@ impl Table {
     }
     pub(crate) fn enforcer_count(&self) -> usize {
         self.publication().enforcers.len()
+    }
+
+    /// Reads one published binding in place; [`Self::enforcer`] copies it.
+    fn read_enforcer<R>(
+        &self,
+        binding: usize,
+        read: impl FnOnce(&Enforcer, EnforcerPublicationState, u32) -> R,
+    ) -> Option<R> {
+        let publication = self.publication();
+        let selected = publication.enforcers.get(binding)?.as_ref()?;
+        Some(read(
+            selected,
+            publication.enforcer_state[binding],
+            publication.enforcer_transaction,
+        ))
     }
 
     fn enforcer(&self, binding: usize) -> Option<EnforcerSnapshot> {
@@ -16822,15 +16941,50 @@ impl PreparedTransactionCatalog {
     }
 }
 
-/// One transaction-owned PostgreSQL foreign session. This identity prevents a
-/// remote transaction from being reused by another local transaction or
-/// endpoint.
+/// The identity postgres_fdw caches a connection under: one per local backend
+/// and user mapping. The server and mapping are named by slot and creation
+/// stamp, so a dropped and recreated object never reuses the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignConnectionKey {
+    pub owner: i32,
+    pub server: u16,
+    pub server_created_at: u64,
+    pub mapping: u16,
+    pub mapping_created_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForeignSessionPhase {
+    /// The socket is opening and the session is being configured.
+    Opening,
+    /// Configured; a remote transaction is open while `transaction_id` is set.
+    Connected,
+    /// The transport failed inside a remote transaction. The slot stays
+    /// reserved so the transaction cannot commit without its remote work.
+    Broken,
+}
+
+/// One cached postgres_fdw connection. It outlives the local transactions
+/// that use it, as PostgreSQL's connection cache does, until its backend
+/// ends, it is invalidated or `keep_connections` is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ForeignSession {
-    transaction_id: u32,
+    key: ForeignConnectionKey,
     endpoint: crate::pg::replication_client::ConnectionInfo,
     timeout: std::time::Duration,
-    active: bool,
+    keep_connections: bool,
+    /// The local transaction whose remote transaction is open.
+    transaction_id: Option<u32>,
+    phase: ForeignSessionPhase,
+    /// A server or user-mapping change; the connection closes once no
+    /// transaction uses it.
+    invalidated: bool,
+    /// postgres_fdw's per-transaction cursor numbering (`c1`, `c2`, ...).
+    cursor_number: u32,
+    /// postgres_fdw's `xact_depth`: the local nesting level the remote
+    /// transaction has reached (1 for the transaction, `n` after its
+    /// `SAVEPOINT sn`), or 0 outside a transaction.
+    remote_depth: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16847,7 +17001,7 @@ impl ForeignSessionId {
 pub(crate) struct ForeignSessionLease {
     session_id: ForeignSessionId,
     transaction_id: u32,
-    endpoint: crate::pg::replication_client::ConnectionInfo,
+    key: ForeignConnectionKey,
 }
 
 impl ForeignSessionLease {
@@ -16856,13 +17010,53 @@ impl ForeignSessionLease {
     }
 }
 
+/// Whose cached connections a foreign server or user-mapping change reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignInvalidation {
+    /// The changing client's, while its transaction runs.
+    Owner(i32),
+    /// Every client's, once the change commits.
+    Everyone,
+}
+
+/// What a transaction must do before using a reserved connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignSessionStart {
+    /// Its remote transaction is already open.
+    Active,
+    /// A cached connection needs its remote transaction started.
+    Begin,
+    /// A new connection must be opened, configured and begun.
+    Connect,
+}
+
+/// One cached connection as `postgres_fdw_get_connections` reports it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForeignConnectionStatus {
+    pub server: u16,
+    pub server_created_at: u64,
+    pub mapping: u16,
+    pub mapping_created_at: u64,
+    pub valid: bool,
+    pub used_in_transaction: bool,
+    pub remote_backend_pid: i32,
+    pub raw_fd: Option<std::os::fd::RawFd>,
+}
+
 struct ForeignSessionSlot {
     client: crate::pg::replication_client::ReplicationClient,
     session: Option<ForeignSession>,
 }
 
+impl ForeignSessionSlot {
+    fn close(&mut self) {
+        self.client.unbind();
+        self.session = None;
+    }
+}
+
 struct ForeignSessionPool {
-    /// Serializes slot assignment so a transaction and endpoint cannot be
+    /// Serializes slot assignment so one backend and user mapping cannot be
     /// installed in two slots while another slot is being released.
     assignment: Mutex<()>,
     slots: FixedVec<Mutex<ForeignSessionSlot>>,
@@ -16887,19 +17081,86 @@ impl core::ops::DerefMut for ForeignClientGuard<'_> {
 }
 
 impl ForeignClientGuard<'_> {
-    pub(crate) fn activate(&mut self) {
-        let session = self
-            .slot
+    fn session_mut(&mut self) -> &mut ForeignSession {
+        self.slot
             .session
             .as_mut()
-            .expect("foreign session was reserved before activation");
-        assert!(!session.active);
-        session.active = true;
+            .expect("a foreign client guard holds a reserved session")
+    }
+
+    /// Marks a newly opened or reopened connection configured.
+    pub(crate) fn activate(&mut self) {
+        self.session_mut().phase = ForeignSessionPhase::Connected;
+    }
+
+    /// The server's `connect_timeout`, which bounds each exchange.
+    pub(crate) fn timeout(&self) -> std::time::Duration {
+        self.slot
+            .session
+            .expect("a foreign client guard holds a reserved session")
+            .timeout
+    }
+
+    /// Closes the socket and marks the transaction's remote work lost: the
+    /// transaction can only roll back.
+    pub(crate) fn break_session(&mut self) {
+        self.slot.client.unbind();
+        self.session_mut().phase = ForeignSessionPhase::Broken;
+    }
+
+    /// Discards the connection and frees its slot.
+    pub(crate) fn close(mut self) {
+        self.slot.close();
+    }
+
+    /// Ends the remote transaction. The connection stays cached unless it was
+    /// invalidated, its server sets `keep_connections` off or no backend owns
+    /// it.
+    pub(crate) fn finish_transaction(mut self) {
+        let session = self.session_mut();
+        session.transaction_id = None;
+        session.cursor_number = 0;
+        session.remote_depth = 0;
+        if session.invalidated || !session.keep_connections || session.key.owner <= 0 {
+            self.slot.close();
+        }
+    }
+
+    /// The nesting level the remote transaction has reached.
+    pub(crate) fn remote_depth(&self) -> u32 {
+        self.slot
+            .session
+            .expect("a foreign client guard holds a reserved session")
+            .remote_depth
+    }
+
+    pub(crate) fn set_remote_depth(&mut self, depth: u32) {
+        self.session_mut().remote_depth = depth;
+    }
+
+    /// postgres_fdw's `GetCursorNumber`.
+    pub(crate) fn next_cursor_number(&mut self) -> u32 {
+        let session = self.session_mut();
+        session.cursor_number = session.cursor_number.wrapping_add(1);
+        session.cursor_number
+    }
+
+    pub(crate) fn is_broken(&self) -> bool {
+        self.slot
+            .session
+            .is_some_and(|session| session.phase == ForeignSessionPhase::Broken)
     }
 }
 
 pub(crate) const fn foreign_session_slot_bytes() -> usize {
     size_of::<Mutex<ForeignSessionSlot>>()
+}
+
+/// The catalog object whose change invalidates cached foreign connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignConnectionTarget {
+    Server(u16),
+    Mapping(u16),
 }
 
 struct ForeignStatementContext {
@@ -21568,6 +21829,16 @@ impl Storage {
             .server_by_slot(current_database(), slot, txid)
     }
 
+    pub(crate) fn foreign_mapping_by_slot(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<foreign::UserMappingDefinition> {
+        let entry = self.foreign_mapping_entry(slot);
+        (entry.database == current_database() && entry.visible_to(txid))
+            .then(|| *entry.definition_for(txid))
+    }
+
     pub(crate) fn foreign_user_mapping(
         &self,
         server: u16,
@@ -24315,15 +24586,30 @@ impl Storage {
             .expect("foreign clients match max_foreign_sessions");
     }
 
+    /// `foreign_send_bytes`: every foreign client's fixed send buffer.
+    pub(crate) fn foreign_send_capacity(&self) -> usize {
+        self.foreign_sessions.slots.first().map_or(0, |slot| {
+            slot.lock()
+                .expect("foreign session lock poisoned")
+                .client
+                .send_capacity()
+        })
+    }
+
+    fn foreign_slot(&self, index: usize) -> MutexGuard<'_, ForeignSessionSlot> {
+        self.foreign_sessions.slots[index]
+            .lock()
+            .expect("foreign session lock poisoned")
+    }
+
+    /// The client of a session the lease's transaction holds open.
     pub(crate) fn foreign_client(
         &self,
         lease: ForeignSessionLease,
     ) -> Result<ForeignClientGuard<'_>, SqlError> {
-        let slot = self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned");
+        let slot = self.foreign_slot(lease.session_id.index());
         if !slot.session.is_some_and(|session| {
-            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+            session.transaction_id == Some(lease.transaction_id) && session.key == lease.key
         }) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -24333,95 +24619,108 @@ impl Storage {
         Ok(ForeignClientGuard { slot })
     }
 
-    /// Reserves or finds the session for one local transaction and endpoint.
-    /// Each free slot already owns its complete wire buffers.
+    /// Finds or reserves the cached connection for `key` and enters it into
+    /// `transaction_id`. Each free slot already owns its complete wire
+    /// buffers; a full cache is the named `53300` error.
     pub(crate) fn reserve_foreign_session(
         &self,
         transaction_id: u32,
+        key: ForeignConnectionKey,
         endpoint: crate::pg::replication_client::ConnectionInfo,
         timeout: std::time::Duration,
-    ) -> Result<(ForeignSessionLease, bool), SqlError> {
+        keep_connections: bool,
+    ) -> Result<(ForeignSessionLease, ForeignSessionStart), SqlError> {
         let _assignment = self
             .foreign_sessions
             .assignment
             .lock()
             .expect("foreign session assignment lock poisoned");
+        let lease = |index| ForeignSessionLease {
+            session_id: ForeignSessionId(index),
+            transaction_id,
+            key,
+        };
+        let fresh = ForeignSession {
+            key,
+            endpoint,
+            timeout,
+            keep_connections,
+            transaction_id: Some(transaction_id),
+            phase: ForeignSessionPhase::Opening,
+            invalidated: false,
+            cursor_number: 0,
+            remote_depth: 0,
+        };
         let mut vacant = None;
         for (index, slot) in self.foreign_sessions.slots.iter().enumerate() {
-            let session = slot.lock().expect("foreign session lock poisoned").session;
-            match session {
-                Some(session)
-                    if session.transaction_id == transaction_id && session.endpoint == endpoint =>
-                {
-                    if !session.active {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session.as_mut() else {
+                vacant = vacant.or(Some(index));
+                continue;
+            };
+            if session.key != key {
+                continue;
+            }
+            return match (session.transaction_id, session.phase) {
+                (Some(owner), _) if owner != transaction_id => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "foreign PostgreSQL connection is in use by another transaction"
+                )),
+                (Some(_), ForeignSessionPhase::Connected) => {
+                    if session.invalidated && session.endpoint != endpoint {
                         return Err(sql_err!(
-                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                            "foreign PostgreSQL session is still opening"
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "foreign server connection options changed while its connection \
+                             is in use in this transaction"
                         ));
                     }
-                    return Ok((
-                        ForeignSessionLease {
-                            session_id: ForeignSessionId(index),
-                            transaction_id,
-                            endpoint,
-                        },
-                        true,
-                    ));
+                    Ok((lease(index), ForeignSessionStart::Active))
                 }
-                None if vacant.is_none() => vacant = Some(index),
-                _ => {}
-            }
+                (Some(_), ForeignSessionPhase::Opening) => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "foreign PostgreSQL session is still opening"
+                )),
+                (Some(_), ForeignSessionPhase::Broken) => Err(sql_err!(
+                    sqlstate::CONNECTION_FAILURE,
+                    "connection to the foreign server was lost in this transaction"
+                )),
+                (None, _) if session.invalidated || session.endpoint != endpoint => {
+                    // PostgreSQL closes an invalidated connection once it is
+                    // out of every transaction and opens a new one.
+                    slot.client.unbind();
+                    slot.session = Some(fresh);
+                    Ok((lease(index), ForeignSessionStart::Connect))
+                }
+                (None, _) => {
+                    session.transaction_id = Some(transaction_id);
+                    session.timeout = timeout;
+                    Ok((lease(index), ForeignSessionStart::Begin))
+                }
+            };
         }
         let index = vacant.ok_or_else(|| {
             sql_err!(
                 sqlstate::TOO_MANY_CONNECTIONS,
-                "configured foreign PostgreSQL session capacity is exhausted"
+                "foreign connection cache is full: max_foreign_sessions = {}",
+                self.foreign_sessions.slots.len()
             )
         })?;
-        self.foreign_sessions.slots[index]
-            .lock()
-            .expect("foreign session lock poisoned")
-            .session = Some(ForeignSession {
-            transaction_id,
-            endpoint,
-            timeout,
-            active: false,
-        });
-        Ok((
-            ForeignSessionLease {
-                session_id: ForeignSessionId(index),
-                transaction_id,
-                endpoint,
-            },
-            false,
-        ))
+        self.foreign_slot(index).session = Some(fresh);
+        Ok((lease(index), ForeignSessionStart::Connect))
     }
 
+    /// Whether `transaction_id` holds a remote transaction open.
     pub(crate) fn has_foreign_session(&self, transaction_id: u32) -> bool {
         self.foreign_sessions.slots.iter().any(|slot| {
             slot.lock()
                 .expect("foreign session lock poisoned")
                 .session
-                .is_some_and(|session| session.transaction_id == transaction_id && session.active)
+                .is_some_and(|session| session.transaction_id == Some(transaction_id))
         })
     }
 
-    pub(crate) fn foreign_session_timeout(
-        &self,
-        lease: ForeignSessionLease,
-    ) -> Option<std::time::Duration> {
-        self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned")
-            .session
-            .filter(|session| {
-                session.transaction_id == lease.transaction_id
-                    && session.endpoint == lease.endpoint
-                    && session.active
-            })
-            .map(|session| session.timeout)
-    }
-
+    /// The sessions whose remote transaction `transaction_id` holds open,
+    /// including broken ones.
     pub(crate) fn foreign_sessions(
         &self,
         transaction_id: u32,
@@ -24435,13 +24734,13 @@ impl Storage {
                     .lock()
                     .expect("foreign session lock poisoned")
                     .session?;
-                (session.transaction_id == transaction_id && session.active).then_some(
-                    ForeignSessionLease {
+                (session.transaction_id == Some(transaction_id)
+                    && session.phase != ForeignSessionPhase::Opening)
+                    .then_some(ForeignSessionLease {
                         session_id: ForeignSessionId(index),
                         transaction_id,
-                        endpoint: session.endpoint,
-                    },
-                )
+                        key: session.key,
+                    })
             })
     }
 
@@ -24458,19 +24757,148 @@ impl Storage {
             .count()
     }
 
+    /// Frees a session that failed while opening.
     pub(crate) fn clear_foreign_session(&self, lease: ForeignSessionLease) {
         let _assignment = self
             .foreign_sessions
             .assignment
             .lock()
             .expect("foreign session assignment lock poisoned");
-        let mut slot = self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned");
+        let mut slot = self.foreign_slot(lease.session_id.index());
         if slot.session.is_some_and(|session| {
-            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+            session.key == lease.key && session.transaction_id == Some(lease.transaction_id)
         }) {
-            slot.session = None;
+            slot.close();
+        }
+    }
+
+    /// The connections `owner` has cached, for `postgres_fdw_get_connections`.
+    pub(crate) fn foreign_connections(
+        &self,
+        owner: i32,
+        output: &mut [ForeignConnectionStatus],
+    ) -> usize {
+        let mut count = 0;
+        for slot in self.foreign_sessions.slots.iter() {
+            let slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session else {
+                continue;
+            };
+            if session.key.owner != owner
+                || session.phase != ForeignSessionPhase::Connected
+                || count == output.len()
+            {
+                continue;
+            }
+            output[count] = ForeignConnectionStatus {
+                server: session.key.server,
+                server_created_at: session.key.server_created_at,
+                mapping: session.key.mapping,
+                mapping_created_at: session.key.mapping_created_at,
+                valid: !session.invalidated,
+                used_in_transaction: session.transaction_id.is_some(),
+                remote_backend_pid: slot.client.backend_pid(),
+                raw_fd: slot.client.is_bound().then(|| slot.client.raw_fd()),
+            };
+            count += 1;
+        }
+        count
+    }
+
+    /// `postgres_fdw_disconnect`: closes `owner`'s idle cached connections to
+    /// `server` (every server when `None`). Returns whether one closed and
+    /// the servers whose connections stay open because a transaction uses
+    /// them.
+    pub(crate) fn disconnect_foreign_connections(
+        &self,
+        owner: i32,
+        server: Option<(u16, u64)>,
+        busy: &mut [(u16, u64)],
+    ) -> (bool, usize) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        let mut closed = false;
+        let mut busy_count = 0;
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session else {
+                continue;
+            };
+            if session.key.owner != owner
+                || session.phase != ForeignSessionPhase::Connected
+                || server.is_some_and(|server| {
+                    server != (session.key.server, session.key.server_created_at)
+                })
+            {
+                continue;
+            }
+            if session.transaction_id.is_some() {
+                if busy_count < busy.len() {
+                    busy[busy_count] = (session.key.server, session.key.server_created_at);
+                    busy_count += 1;
+                }
+            } else {
+                slot.close();
+                closed = true;
+            }
+        }
+        (closed, busy_count)
+    }
+
+    /// PostgreSQL's `pgfdw_inval_callback`: a change to a foreign server or
+    /// user mapping closes the connections built from it that no transaction
+    /// uses, and marks the others to close when their transaction ends.
+    pub(crate) fn invalidate_foreign_connections(
+        &self,
+        target: ForeignConnectionTarget,
+        scope: ForeignInvalidation,
+    ) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session.as_mut() else {
+                continue;
+            };
+            let matches = match target {
+                ForeignConnectionTarget::Server(server) => session.key.server == server,
+                ForeignConnectionTarget::Mapping(mapping) => session.key.mapping == mapping,
+            };
+            if !matches
+                || session.phase == ForeignSessionPhase::Opening
+                || matches!(scope, ForeignInvalidation::Owner(owner) if session.key.owner != owner)
+            {
+                continue;
+            }
+            if session.transaction_id.is_some() {
+                session.invalidated = true;
+            } else {
+                slot.close();
+            }
+        }
+    }
+
+    /// Closes a backend's cached connections as it disconnects.
+    pub(crate) fn drop_foreign_connections(&self, owner: i32) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            if slot
+                .session
+                .is_some_and(|session| session.key.owner == owner)
+            {
+                slot.close();
+            }
         }
     }
 
@@ -38631,17 +39059,33 @@ impl Storage {
                 "no partition of relation \"{}\" found for row",
                 parent.name.as_str()
             );
-            let Some(scheme) = parent.partition.scheme else {
+            // `errtable`: the relation the row was routed through.
+            let objects =
+                crate::sql::eval::ErrorObjects::table(parent.schema.as_str(), parent.name.as_str());
+            let scheme = parent.partition.scheme;
+            let keys = scheme
+                .as_ref()
+                .map_or(&[][..], |scheme| &scheme.keys[..usize::from(scheme.n_keys)]);
+            if keys.is_empty()
+                || !crate::sql::exec::key_values_visible(
+                    self,
+                    parent_slot,
+                    txid,
+                    &mut keys.iter().map(|key| Some(*key)),
+                )
+            {
+                crate::sql::eval::stash_object_diagnostic(None, objects);
                 return error;
-            };
-            let names = scheme.keys[..usize::from(scheme.n_keys)]
+            }
+            let names = keys
                 .iter()
                 .map(|key| parent.columns()[usize::from(*key)].name.as_str());
+            // `ExecFindPartition`: the key values.
             match crate::sql::exec::partition_key_detail(&mut { names }, &mut row.key_values()) {
-                Ok(detail) => crate::sql::error_position::with_detail(
-                    error,
-                    format_args!("{}", detail.as_str()),
-                ),
+                Ok(detail) => {
+                    crate::sql::eval::stash_object_diagnostic(Some(detail.as_str()), objects);
+                    error
+                }
                 Err(error) => error,
             }
         })
@@ -40383,9 +40827,8 @@ impl Storage {
         binding: usize,
     ) -> Option<u64> {
         self.tables[table_index]
-            .enforcer(binding)
+            .read_enforcer(binding, |enforcer, _, _| enforcer.index_created_at)
             .expect("binding")
-            .index_created_at
     }
 
     /// Walks a manifest-published key generation and the resident changes
@@ -40912,8 +41355,11 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([u16; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        (enforcer.columns, enforcer.n_cols)
+        self.tables[table_index]
+            .read_enforcer(binding, |enforcer, _, _| {
+                (enforcer.columns, enforcer.n_cols)
+            })
+            .expect("binding")
     }
 
     pub(crate) fn value_binding_include_mask(
@@ -40922,9 +41368,8 @@ impl Storage {
         binding: usize,
     ) -> ColumnSet {
         self.tables[table_index]
-            .enforcer(binding)
+            .read_enforcer(binding, |enforcer, _, _| enforcer.include_mask)
             .expect("binding")
-            .include_mask
     }
 
     pub(crate) fn value_binding_handle(
@@ -40952,11 +41397,11 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        enforcer
-            .state
-            .durable_dirty
-            .then_some(enforcer.state.durable_dirty_lsn)
+        self.tables[table_index]
+            .read_enforcer(binding, |_, state, _| {
+                state.durable_dirty.then_some(state.durable_dirty_lsn)
+            })
+            .expect("binding")
     }
 
     pub(crate) fn value_binding_requires_rebuild(
@@ -40996,30 +41441,37 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
+        let (evaluation_txid, index_created_at, key, n_cols) = self.tables[table_index]
+            .read_enforcer(binding, |enforcer, _, evaluation_txid| {
+                (
+                    evaluation_txid,
+                    enforcer.index_created_at,
+                    enforcer.columns,
+                    enforcer.n_cols,
+                )
+            })
+            .expect("binding");
         // A committed index identity can still belong to a private rewritten
         // shape. Maintenance must not decode committed rows with that shape.
-        if enforcer.evaluation_txid != 0 {
+        if evaluation_txid != 0 {
             return false;
         }
-        if let Some(created_at) = enforcer.index_created_at {
-            let table = &self.tables[table_index];
+        let table = &self.tables[table_index];
+        if let Some(created_at) = index_created_at {
+            let (schema, name) = {
+                let definition = table.definition();
+                (definition.schema, definition.name)
+            };
+            let database = table.database();
             return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
-                    && index.database == table.database()
-                    && index.schema == {
-                        let definition = table.definition();
-                        definition.schema
-                    }
-                    && index.table == {
-                        let definition = table.definition();
-                        definition.name
-                    }
+                    && index.database == database
+                    && index.schema == schema
+                    && index.table == name
                     && index.created_at == created_at
             });
         }
-        let columns = enforcer.columns();
-        let table = &self.tables[table_index];
+        let columns = &key[..n_cols];
         let definition = &*table.definition();
         definition
             .columns()
@@ -52993,7 +53445,25 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let selected = self.find_visible(schema, table, txid).map(|slot| {
+        self.indexes_for_selected(self.find_visible(schema, table, txid), txid)
+    }
+
+    /// [`Self::indexes_for`] for the table in `slot`, which a catalog walk
+    /// already selected, without looking its name up again.
+    pub(crate) fn indexes_for_slot(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = IndexDef> + '_ {
+        self.indexes_for_selected(Some(slot), txid)
+    }
+
+    fn indexes_for_selected(
+        &self,
+        slot: Option<usize>,
+        txid: u32,
+    ) -> impl Iterator<Item = IndexDef> + '_ {
+        let selected = slot.map(|slot| {
             let identity = self.tables[slot].identity();
             self.catalog_object_identity(
                 catalog_sources::CatalogObjectSlot::Table(slot),
@@ -53200,6 +53670,45 @@ impl Storage {
                 }
                 index
             })
+    }
+
+    /// The creation stamp of the partitioned index `definition` is attached
+    /// to, which the journal records in place of its slot.
+    pub(crate) fn index_parent_identity(
+        &self,
+        definition: IndexMutableDefinition,
+        txid: u32,
+    ) -> Option<u64> {
+        definition
+            .parent
+            .and_then(|slot| self.index_visible_to(usize::from(slot), txid))
+            .map(|parent| parent.created_at)
+    }
+
+    /// The slot of the journaled parent index created at `parent`.
+    pub(crate) fn resolve_index_parent(
+        &self,
+        parent: Option<u64>,
+        txid: u32,
+    ) -> Result<Option<u16>, SqlError> {
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        let slot = (0..self.index_count())
+            .find(|&slot| {
+                self.index_visible_to(slot, txid)
+                    .is_some_and(|index| index.created_at == parent)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journaled index parent {} does not exist",
+                    parent
+                )
+            })?;
+        u16::try_from(slot)
+            .map(Some)
+            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many indexes"))
     }
 
     /// Recovery check of the current database's partitioned indexes, in the

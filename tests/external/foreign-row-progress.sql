@@ -77,3 +77,15 @@ INSERT INTO fdw_toid_part VALUES (1001, 'r'), (2001, 'l') RETURNING tableoid::re
 SELECT tableoid::regclass, count(*) FROM fdw_toid_part GROUP BY 1 ORDER BY 1;
 DELETE FROM fdw_toid_part RETURNING tableoid::regclass, id;
 ROLLBACK;
+-- Conditions calling routines qualify each foreign row just before its
+-- change: their notices interleave with the row's SET and RETURNING calls.
+BEGIN;
+CREATE FUNCTION fdw_qualify_note(label text, i integer) RETURNS integer LANGUAGE plpgsql
+  AS $$BEGIN RAISE NOTICE '% %', label, i; RETURN i; END$$;
+INSERT INTO pos3ql_fdw_source(id, note) SELECT g, 'q' FROM generate_series(2201, 2204) g;
+UPDATE pos3ql_fdw_source SET note = note || fdw_qualify_note('set', id)
+  WHERE id > 2200 AND fdw_qualify_note('where', id) % 2 = 0 RETURNING id, note;
+DELETE FROM pos3ql_fdw_source WHERE id > 2200 AND fdw_qualify_note('delete where', id) > 2202
+  RETURNING id, fdw_qualify_note('returning', id);
+SELECT id, note FROM pos3ql_fdw_source WHERE id > 2200 ORDER BY id;
+ROLLBACK;

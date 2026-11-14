@@ -1090,6 +1090,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
     new: &'a [&'a Expr<'a>],
     old_available: bool,
     new_available: bool,
+    references: Option<&TransitionReferences<'a>>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     expand_stored_statement_with_transition(
         statement,
@@ -1107,6 +1108,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
             new,
             old_available,
             new_available,
+            references,
         }),
     )
 }
@@ -1130,6 +1132,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
     new: &'a [&'a Expr<'a>],
     old_available: bool,
     new_available: bool,
+    references: Option<&TransitionReferences<'a>>,
 ) -> Result<&'a Expr<'a>, SqlError> {
     with_exec_context(
         &[],
@@ -1157,6 +1160,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
                         new,
                         old_available,
                         new_available,
+                        references,
                     }),
                     ..context
                 },
@@ -1412,6 +1416,9 @@ pub(crate) fn dml_parameter_scope_query<'a>(
 
 /// The derived relation rule actions read the triggering statement through.
 const TRANSITION_SOURCE_ALIAS: &str = "__pos3ql_rule_transition";
+/// An `INSERT` statement's query or `VALUES` rows, as a rule's transition
+/// relation reads them.
+const RULE_INPUT_ALIAS: &str = "__pos3ql_rule_input";
 
 #[derive(Clone, Copy)]
 pub(crate) struct RuleTransitionSource<'a> {
@@ -1423,6 +1430,155 @@ pub(crate) struct RuleTransitionSource<'a> {
     /// the rule's relation, which the triggering statement's RETURNING list
     /// can read.
     pub sources: &'a [RuleReturningSource<'a>],
+    /// The statement's expression for each OLD and NEW column, which
+    /// PostgreSQL's rewriter substitutes for every reference an action
+    /// makes; `referenced_source` builds an action's relation from them.
+    /// An `INSERT` reading a query or several `VALUES` rows keeps those
+    /// rows as its input, whose columns are evaluated once per row.
+    template: TransitionTemplate<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct TransitionTemplate<'a> {
+    old: &'a [&'a Expr<'a>],
+    new: &'a [&'a Expr<'a>],
+    from: Option<FromClause<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+    returning_sources: &'a [SelectItem<'a>],
+}
+
+#[derive(Clone, Copy)]
+struct TransitionReference<'a> {
+    old: bool,
+    column: usize,
+    alias: &'a str,
+}
+
+/// The OLD and NEW references of one rule action query (with its rule's
+/// condition), in substitution order. PostgreSQL's rewriter replaces each
+/// reference with the triggering statement's expression for that column
+/// (`ReplaceVarsFromTargetList`), so an action evaluates only the `SET`
+/// expressions it reads, once for each reference.
+pub(crate) struct TransitionReferences<'a> {
+    arena: &'a Arena,
+    entries: core::cell::RefCell<ArenaList<'a, TransitionReference<'a>>>,
+}
+
+impl<'a> TransitionReferences<'a> {
+    pub(crate) fn new(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            entries: core::cell::RefCell::new(ArenaList::new(arena)),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    /// Forgets the references after the first `len`, those of the previous
+    /// action, keeping the rule condition's.
+    pub(crate) fn truncate(&self, len: usize) {
+        self.entries.borrow_mut().truncate(len);
+    }
+
+    fn reference(&self, old: bool, column: usize) -> Result<&'a Expr<'a>, SqlError> {
+        let mut entries = self.entries.borrow_mut();
+        if entries.len() >= MAX_PROJ {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most {} entries",
+                MAX_PROJ
+            ));
+        }
+        let alias = crate::stack_format!(
+            63,
+            "__pos3ql_{}_{}_{}",
+            if old { "old" } else { "new" },
+            column,
+            entries.len()
+        );
+        let alias = self
+            .arena
+            .alloc_str(alias.as_str())
+            .map_err(|_| arena_full())?;
+        entries
+            .push(TransitionReference { old, column, alias })
+            .map_err(|_| arena_full())?;
+        self.arena
+            .alloc(Expr::Column {
+                qualifier: Some(TRANSITION_SOURCE_ALIAS),
+                name: alias,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full())
+    }
+}
+
+impl<'a> RuleTransitionSource<'a> {
+    /// The transition relation one action reads: a column for each of its
+    /// recorded references, then the RETURNING sources' rows.
+    pub(crate) fn referenced_source(
+        &self,
+        references: Option<&TransitionReferences<'a>>,
+        arena: &'a Arena,
+    ) -> Result<TableRef<'a>, SqlError> {
+        let Some(references) = references else {
+            return Ok(self.source);
+        };
+        let template = self.template;
+        let entries = references.entries.borrow();
+        let entries = entries.borrowed_slice();
+        let width = entries.len() + template.returning_sources.len();
+        if width > MAX_PROJ {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most {} entries",
+                MAX_PROJ
+            ));
+        }
+        let items = arena
+            .alloc_slice_with(width, |index| match entries.get(index) {
+                Some(entry) => SelectItem::Expr {
+                    expression: if entry.old {
+                        template.old[entry.column]
+                    } else {
+                        template.new[entry.column]
+                    },
+                    alias: Some(entry.alias),
+                },
+                None => template.returning_sources[index - entries.len()],
+            })
+            .map_err(|_| arena_full())?;
+        let select = arena
+            .alloc(rule_select(items, template.from, template.where_clause))
+            .map_err(|_| arena_full())?;
+        Ok(transition_table_ref(select))
+    }
+}
+
+fn transition_table_ref<'a>(select: &'a Select<'a>) -> TableRef<'a> {
+    TableRef {
+        schema: None,
+        table: "",
+        alias: Some(TRANSITION_SOURCE_ALIAS),
+        subquery: Some(select),
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        rows_from: None,
+        col_alias: None,
+        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+        bound_table: None,
+        view_access: None,
+        join_members: None,
+    }
 }
 
 /// One `FROM` or `USING` item of the triggering statement, as a rule's
@@ -1623,6 +1779,11 @@ pub(crate) fn rule_transition_source<'a>(
     let source_alias = TRANSITION_SOURCE_ALIAS;
     let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    // The statement's own expression for each column, which substituting
+    // shapes evaluate per reference.
+    let mut old_images = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    let mut new_images = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    let template;
     let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut item_count = 0usize;
     let mut add_output = |prefix: &str,
@@ -1687,18 +1848,16 @@ pub(crate) fn rule_transition_source<'a>(
                     .map(|expression| &*expression)
                     .map_err(|_| arena_full())?;
                 add_output("old", column, old_expression, &mut old)?;
+                old_images[column] = old_expression;
                 let new_expression = update
                     .assignments
                     .iter()
                     .find_map(|(written, expression)| (*written == name).then_some(*expression))
                     .unwrap_or(old_expression);
-                add_output(
-                    "new",
-                    column,
-                    coerce_rule_transition(new_expression, types[column], arena)?,
-                    &mut new,
-                )?;
+                new_images[column] = coerce_rule_transition(new_expression, types[column], arena)?;
+                add_output("new", column, new_images[column], &mut new)?;
             }
+            template = (Some(from), update.where_clause);
             if !update.returning.is_empty() {
                 for item in rule_returning_items_of(update.from) {
                     let row = add_source(item, source_count)?;
@@ -1739,7 +1898,9 @@ pub(crate) fn rule_transition_source<'a>(
                     .map(|expression| &*expression)
                     .map_err(|_| arena_full())?;
                 add_output("old", column, old_expression, &mut old)?;
+                old_images[column] = old_expression;
             }
+            template = (Some(from), delete.where_clause);
             if !delete.returning.is_empty() {
                 for item in rule_returning_items_of(delete.using) {
                     let row = add_source(item, source_count)?;
@@ -1835,9 +1996,7 @@ pub(crate) fn rule_transition_source<'a>(
                     .map(|select| &*select)
                     .map_err(|_| arena_full())?
             };
-            let input_alias = arena
-                .alloc_str("__pos3ql_rule_input")
-                .map_err(|_| arena_full())?;
+            let input_alias = RULE_INPUT_ALIAS;
             let input_ref = TableRef {
                 schema: None,
                 table: "",
@@ -1881,13 +2040,38 @@ pub(crate) fn rule_transition_source<'a>(
                             .flatten()
                             .unwrap_or(&Expr::Null)
                     });
-                add_output(
-                    "new",
-                    column,
-                    coerce_rule_transition(expression, types[column], arena)?,
-                    &mut new,
-                )?;
+                new_images[column] = coerce_rule_transition(expression, types[column], arena)?;
+                add_output("new", column, new_images[column], &mut new)?;
+                if let [row] = insert.rows
+                    && insert.select.is_none()
+                {
+                    let image = input_columns
+                        .iter()
+                        .position(|candidate| *candidate == name)
+                        .filter(|_| !force_defaults.get(column).copied().unwrap_or(false))
+                        .and_then(|position| row.get(position).copied())
+                        .filter(|value| !matches!(value, Expr::DefaultMarker))
+                        .unwrap_or_else(|| {
+                            defaults
+                                .get(column)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(&Expr::Null)
+                        });
+                    new_images[column] = coerce_rule_transition(image, types[column], arena)?;
+                }
             }
+            // A query's or several VALUES rows' columns are read from the
+            // input, which evaluates each once per row; defaults filling
+            // the other columns, and one VALUES row's expressions, are
+            // evaluated per reference.
+            template = (
+                (insert.rows.len() != 1 || insert.select.is_some()).then_some(FromClause {
+                    base: input_ref,
+                    joins: &[],
+                }),
+                None,
+            );
             rule_select(
                 arena
                     .alloc_slice_copy(&items[..item_count])
@@ -1907,26 +2091,20 @@ pub(crate) fn rule_transition_source<'a>(
         }
     };
     let source_select = arena.alloc(select).map_err(|_| arena_full())?;
-    let source = TableRef {
-        schema: None,
-        table: "",
-        alias: Some(source_alias),
-        subquery: Some(&*source_select),
-        func_args: None,
-        func_argument_names: &[],
-        func_variadic: false,
-        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        rows_from: None,
-        col_alias: None,
-        inheritance: crate::sql::ast::RelationInheritance::Descendants,
-        sample: None,
-        cte: None,
-        with_ordinality: false,
-        lateral: false,
-        authorization_role: None,
-        bound_table: None,
-        view_access: None,
-        join_members: None,
+    let source = transition_table_ref(source_select);
+    let (from, where_clause) = template;
+    let template = TransitionTemplate {
+        old: arena
+            .alloc_slice_copy(&old_images[..columns.len()])
+            .map_err(|_| arena_full())?,
+        new: arena
+            .alloc_slice_copy(&new_images[..columns.len()])
+            .map_err(|_| arena_full())?,
+        from,
+        where_clause,
+        returning_sources: arena
+            .alloc_slice_copy(&source_items[..source_count])
+            .map_err(|_| arena_full())?,
     };
     let mut collected = ArenaList::new(arena);
     for source in sources[..source_count].iter().flatten() {
@@ -1942,6 +2120,7 @@ pub(crate) fn rule_transition_source<'a>(
             .alloc_slice_copy(&new[..columns.len()])
             .map_err(|_| arena_full())?,
         sources: collected.as_slice(),
+        template,
     })
 }
 
@@ -2524,6 +2703,8 @@ pub(crate) fn attach_rule_source<'a>(
     source: TableRef<'a>,
     condition: Option<&'a Expr<'a>>,
     target: impl FnOnce() -> Result<RuleInsertTarget<'a>, SqlError>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let rewritten = match statement {
@@ -2568,16 +2749,23 @@ pub(crate) fn attach_rule_source<'a>(
                     ..*select
                 }
             } else {
+                let rewritten = rule_insert_values(insert, source, condition, target, arena)?;
+                let rewritten = match rewritten.select {
+                    Some(select) => Insert {
+                        select: Some(pull_up_rule_source(select, storage, txid, arena)?),
+                        ..rewritten
+                    },
+                    None => rewritten,
+                };
                 return arena
-                    .alloc(Stmt::Insert(rule_insert_values(
-                        insert, source, condition, target, arena,
-                    )?))
+                    .alloc(Stmt::Insert(rewritten))
                     .map(|statement| &*statement)
                     .map_err(|_| arena_full());
             };
+            let select = arena.alloc(select).map_err(|_| arena_full())?;
             Stmt::Insert(Insert {
                 rows: &[],
-                select: Some(&*arena.alloc(select).map_err(|_| arena_full())?),
+                select: Some(pull_up_rule_source(select, storage, txid, arena)?),
                 ..*insert
             })
         }
@@ -2592,6 +2780,200 @@ pub(crate) fn attach_rule_source<'a>(
     arena
         .alloc(rewritten)
         .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+/// `select`, an action's query over the rule's transition relation alone,
+/// with that relation pulled up: each reference replaced with the
+/// statement's expression it reads and the relation's own `FROM` and `WHERE`
+/// in its place, as PostgreSQL's rewriter substitutes them. An `INSERT ...
+/// SELECT` statement's query, which the relation reads, is pulled up the
+/// same way when it has no volatile output, as PostgreSQL's planner pulls up
+/// a simple subquery. The action
+/// then evaluates the statement's expressions row by row, interleaved with
+/// its own, rather than reading them from a relation evaluated first. A
+/// query joining other relations or holding subqueries keeps the relation.
+fn pull_up_rule_source<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let pulled = pull_up_derived(select, TRANSITION_SOURCE_ALIAS, storage, txid, arena)?;
+    if core::ptr::eq(pulled, select) {
+        return Ok(select);
+    }
+    // The statement's query is a subquery the planner pulls up only without
+    // volatile output, which would otherwise run once per reference.
+    if let Some(FromClause {
+        base: TableRef {
+            subquery: Some(input),
+            ..
+        },
+        ..
+    }) = pulled.from.as_ref()
+        && input.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if super::expression_contains_volatile(expression, storage, txid, false))
+        })
+    {
+        return Ok(pulled);
+    }
+    pull_up_derived(pulled, RULE_INPUT_ALIAS, storage, txid, arena)
+}
+
+/// Whether `expression` calls an aggregate, a window function or a
+/// set-returning function, which keep a subquery from being pulled up
+/// (PostgreSQL's `is_simple_subquery`). A stored routine of that kind
+/// counts under any of its overloads.
+fn calls_grouping_or_set_routine(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call { name, over, .. } = expression {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        if over.is_some()
+            || expression.is_aggregate()
+            || super::is_builtin_set_routine(name)
+            || (0..storage.routine_count()).any(|slot| {
+                storage
+                    .routine_identity_for(slot, txid)
+                    .is_some_and(|identity| identity.name.as_str() == bare)
+                    && {
+                        let kind = storage.routine_for(slot, txid).kind;
+                        matches!(kind, crate::storage::RoutineKind::Aggregate(_))
+                            || kind.is_set_returning()
+                    }
+            })
+        {
+            return true;
+        }
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found = found || calls_grouping_or_set_routine(child, storage, txid);
+        Ok(())
+    });
+    found
+}
+
+/// [`pull_up_rule_source`] of the derived relation `alias`, `select`'s only
+/// `FROM` item, or `select` itself when it cannot be pulled up.
+fn pull_up_derived<'a>(
+    select: &'a Select<'a>,
+    alias: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let Some(from) = select.from.as_ref() else {
+        return Ok(select);
+    };
+    let Some(source) = from.base.subquery else {
+        return Ok(select);
+    };
+    let simple = |query: &Select<'_>| {
+        !query.distinct
+            && query.distinct_on.is_empty()
+            && query.windows.is_empty()
+            && query.group_by.is_empty()
+            && query.grouping_sets.is_empty()
+            && query.having.is_none()
+            && query.order_by.is_empty()
+            && query.limit.is_none()
+            && query.offset.is_none()
+            && query.with.is_empty()
+            && query.set_body.is_none()
+            && query.locking.is_empty()
+    };
+    let plain_items = |query: &Select<'_>| {
+        query.items.iter().all(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if !expression.contains_subquery()
+                    && !calls_grouping_or_set_routine(expression, storage, txid))
+        })
+    };
+    // A source without FROM (one `VALUES` row) has one row, which its
+    // relation evaluates before the action's own expressions.
+    if from.base.alias != Some(alias)
+        || source.from.is_none()
+        || !from.joins.is_empty()
+        || from.base.lateral
+        || !simple(select)
+        || !simple(source)
+        || !plain_items(select)
+        || !plain_items(source)
+        || select
+            .where_clause
+            .is_some_and(|condition| condition.contains_subquery())
+        || source
+            .where_clause
+            .is_some_and(|condition| condition.contains_subquery())
+    {
+        return Ok(select);
+    }
+    let names = from.base.col_alias;
+    struct Failure(SqlError);
+    impl From<crate::mem::arena::ArenaFull> for Failure {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self(arena_full())
+        }
+    }
+    let mut unresolved = false;
+    let mut substitute = |node: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, Failure> {
+        let Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } = node
+        else {
+            return Ok(None);
+        };
+        if *qualifier != alias {
+            return Ok(None);
+        }
+        let found = match names {
+            Some(names) => names
+                .iter()
+                .position(|candidate| candidate == name)
+                .and_then(|position| source.items.get(position)),
+            None => source.items.iter().find(|item| {
+                matches!(item, SelectItem::Expr { alias: Some(written), .. } if written == name)
+            }),
+        };
+        let found = match found {
+            Some(SelectItem::Expr { expression, .. }) => Some(*expression),
+            _ => None,
+        };
+        if found.is_none() {
+            unresolved = true;
+        }
+        Ok(found)
+    };
+    let items = arena
+        .alloc_slice_copy(select.items)
+        .map_err(|_| arena_full())?;
+    for item in items.iter_mut() {
+        if let SelectItem::Expr { expression, .. } = item {
+            *expression = crate::sql::ast::rewrite_expression(expression, arena, &mut substitute)
+                .map_err(|Failure(error)| error)?;
+        }
+    }
+    let condition = match select.where_clause {
+        Some(condition) => Some(
+            crate::sql::ast::rewrite_expression(condition, arena, &mut substitute)
+                .map_err(|Failure(error)| error)?,
+        ),
+        None => None,
+    };
+    if unresolved {
+        return Ok(select);
+    }
+    let items = &*items;
+    arena
+        .alloc(Select {
+            items,
+            from: source.from,
+            where_clause: and_where(source.where_clause, condition, arena)?,
+            ..*select
+        })
+        .map(|select| &*select)
         .map_err(|_| arena_full())
 }
 
@@ -2978,7 +3360,7 @@ fn expand_stored_statement_with_transition<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
     authorization_role: ViewReader,
-    transition: Option<RuleTransition<'a>>,
+    transition: Option<RuleTransition<'_, 'a>>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let (outer_with, body) = match statement {
         Stmt::With { ctes, statement } => (*ctes, *statement),
@@ -4904,7 +5286,7 @@ struct Subst<'c, 'a, 's, 'e> {
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
-    rule_transition: Option<RuleTransition<'a>>,
+    rule_transition: Option<RuleTransition<'e, 'a>>,
     recursive_state: Option<RecursiveStateSubst<'a>>,
     execution: Option<ExecutionSubst<'e, 'a>>,
     /// Leave subqueries as they are, for a caller that binds each query
@@ -5202,12 +5584,28 @@ fn from_item_columns<'a>(
 }
 
 #[derive(Clone, Copy)]
-struct RuleTransition<'a> {
+struct RuleTransition<'e, 'a> {
     names: &'a [&'a str],
     old: &'a [&'a Expr<'a>],
     new: &'a [&'a Expr<'a>],
     old_available: bool,
     new_available: bool,
+    /// When set, each OLD or NEW reference becomes its own column of the
+    /// transition relation instead of the column's shared image.
+    references: Option<&'e TransitionReferences<'a>>,
+}
+
+impl<'a> RuleTransition<'_, 'a> {
+    fn image(self, old: bool, index: usize) -> Result<&'a Expr<'a>, SqlError> {
+        match self.references {
+            Some(references) => references.reference(old, index),
+            None => Ok(if old {
+                self.old[index]
+            } else {
+                self.new[index]
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7858,11 +8256,7 @@ fn subst_select_items<'a>(
                     )
                 })?;
                 *slot = SelectItem::Expr {
-                    expression: if old {
-                        transition.old[index]
-                    } else {
-                        transition.new[index]
-                    },
+                    expression: transition.image(old, index)?,
                     alias: Some(name),
                 };
                 count += 1;
@@ -9534,11 +9928,7 @@ fn subst_expr<'a>(
                             name
                         )
                     })?;
-                return Ok(if old {
-                    transition.old[index]
-                } else {
-                    transition.new[index]
-                });
+                return transition.image(old, index);
             }
             if let Some(state) = context.recursive_state
                 && qualifier.is_none_or(|written| written == state.qualifier)

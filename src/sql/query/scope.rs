@@ -1379,6 +1379,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
+    /// The catalog the scope's names resolve against.
+    pub(super) const fn catalog(&self) -> (&'d Storage, u32) {
+        (self.storage, self.txid)
+    }
+
     pub(super) fn set_target_aliases(
         &mut self,
         names: &[&'d str],
@@ -2042,6 +2047,28 @@ impl<'d> QueryScope<'d> {
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
+        Self::resolve_exec_pushed(
+            storage, from, predicate, txid, arena, params, sequences, outer, None,
+        )
+    }
+
+    /// Execution scope whose single foreign FROM item reads the remote query
+    /// `pushed` planned.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "scope construction carries explicit query restrictions and execution context"
+    )]
+    pub(crate) fn resolve_exec_pushed<'a>(
+        storage: &'a Storage,
+        from: &'a FromClause<'a>,
+        predicate: Option<&'a Expr<'a>>,
+        txid: u32,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
+    ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_exec(
             storage,
@@ -2052,6 +2079,7 @@ impl<'d> QueryScope<'d> {
             sequences,
             outer,
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
+            pushed,
         )?;
         for (index, j) in from.joins.iter().enumerate() {
             scope.merge_left_of(from, index, arena)?;
@@ -2065,6 +2093,7 @@ impl<'d> QueryScope<'d> {
                 sequences,
                 outer,
                 catalog_scan(&j.table, predicate, false),
+                None,
             )?;
         }
         scope.right_of_outer_join = false;
@@ -2325,6 +2354,7 @@ impl<'d> QueryScope<'d> {
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
         catalog_scan: crate::sql::catalog_snapshot::CatalogScan,
+        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -2388,7 +2418,10 @@ impl<'d> QueryScope<'d> {
                 }
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
-                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena, sequences)?;
+                let pushed = pushed.filter(|plan| plan.table_slot == slot);
+                let rows = crate::sql::foreign::materialize(
+                    storage, slot, txid, arena, sequences, pushed,
+                )?;
                 self.derived[source] = Some(rows);
                 return Ok(());
             }

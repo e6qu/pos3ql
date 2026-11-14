@@ -1152,3 +1152,144 @@ fn case_comparisons_and_prepared_analysis_are_positioned() {
         }
     });
 }
+
+#[test]
+fn key_details_need_select_on_the_key_and_no_row_security() {
+    with_engine("withheld-key-details", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE kw; \
+             CREATE TABLE ku (id int PRIMARY KEY, b int UNIQUE); \
+             INSERT INTO ku VALUES (1, 1); \
+             GRANT INSERT ON ku TO kw; GRANT SELECT (id) ON ku TO kw; \
+             CREATE TABLE kp (id int) PARTITION BY RANGE (id); \
+             CREATE TABLE kp1 PARTITION OF kp FOR VALUES FROM (0) TO (10); \
+             GRANT INSERT ON kp TO kw; \
+             CREATE TABLE kparent (id int PRIMARY KEY); \
+             CREATE TABLE kchild (pid int REFERENCES kparent); \
+             GRANT INSERT ON kchild TO kw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SET ROLE kw; INSERT INTO ku VALUES (1, 2)",
+                    &[
+                        "E|C=23505|M=duplicate key value violates unique constraint \"ku_pkey\"|D=Key (id)=(1) already exists.|s=public|t=ku|n=ku_pkey",
+                    ],
+                ),
+                // No SELECT on b: the violation has no detail.
+                (
+                    "SET ROLE kw; INSERT INTO ku VALUES (2, 1)",
+                    &[
+                        "E|C=23505|M=duplicate key value violates unique constraint \"ku_b_key\"|s=public|t=ku|n=ku_b_key",
+                    ],
+                ),
+                (
+                    "SET ROLE kw; INSERT INTO kp VALUES (20)",
+                    &["E|C=23514|M=no partition of relation \"kp\" found for row|s=public|t=kp"],
+                ),
+                (
+                    "INSERT INTO kp VALUES (20)",
+                    &[
+                        "E|C=23514|M=no partition of relation \"kp\" found for row|D=Partition key of the failing row contains (id) = (20).|s=public|t=kp",
+                    ],
+                ),
+                (
+                    "SET ROLE kw; INSERT INTO kchild VALUES (5)",
+                    &[
+                        "E|C=23503|M=insert or update on table \"kchild\" violates foreign key constraint \"kchild_pid_fkey\"|D=Key is not present in table \"kparent\".|s=public|t=kchild|n=kchild_pid_fkey",
+                    ],
+                ),
+            ],
+        );
+        // Row security hides the key even from a reader of the table.
+        run_with(
+            engine,
+            budget,
+            "ALTER TABLE ku ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY everything ON ku USING (true) WITH CHECK (true); \
+             GRANT SELECT ON ku TO kw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE kw; INSERT INTO ku VALUES (1, 5)",
+                &[
+                    "E|C=23505|M=duplicate key value violates unique constraint \"ku_pkey\"|s=public|t=ku|n=ku_pkey",
+                ],
+            )],
+        );
+    });
+}
+
+#[test]
+fn failing_rows_show_readable_or_written_columns() {
+    with_engine("failing-row-columns", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE fw; \
+             CREATE TABLE fr (a int, b int NOT NULL, c int CHECK (c > 0)); \
+             INSERT INTO fr VALUES (1, 1, 1); \
+             GRANT INSERT, UPDATE ON fr TO fw; GRANT SELECT (a) ON fr TO fw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SET ROLE fw; INSERT INTO fr (c) VALUES (1)",
+                    &[
+                        "E|C=23502|M=null value in column \"b\" of relation \"fr\" violates not-null constraint|D=Failing row contains (a, c) = (null, 1).|s=public|t=fr|c=b",
+                    ],
+                ),
+                (
+                    "SET ROLE fw; UPDATE fr SET c = 0",
+                    &[
+                        "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (a, c) = (1, 0).|s=public|t=fr|n=fr_c_check",
+                    ],
+                ),
+                (
+                    "UPDATE fr SET c = 0",
+                    &[
+                        "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (1, 1, 0).|s=public|t=fr|n=fr_c_check",
+                    ],
+                ),
+            ],
+        );
+        // Revoking the table's SELECT revokes the column's too.
+        run_with(engine, budget, "REVOKE SELECT ON fr FROM fw");
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE fw; UPDATE fr SET c = 0",
+                &[
+                    "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (c) = (0).|s=public|t=fr|n=fr_c_check",
+                ],
+            )],
+        );
+        // Nothing shows while row security applies to the user.
+        run_with(
+            engine,
+            budget,
+            "ALTER TABLE fr ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY fr_all ON fr USING (true) WITH CHECK (true); \
+             GRANT SELECT ON fr TO fw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE fw; UPDATE fr SET c = 0",
+                &[
+                    "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|s=public|t=fr|n=fr_c_check",
+                ],
+            )],
+        );
+    });
+}

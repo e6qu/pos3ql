@@ -430,6 +430,19 @@ impl Context<'_> {
             true,
             output,
         )?;
+        // The planner folds an array of constants into one array constant.
+        if self.folded
+            && let Some(text) = self.constant_array_text(items, element, output.arena)?
+            && let Some(array_type) = super::array_of(element)
+        {
+            output.push(if negated { " <> ALL (" } else { " = ANY (" })?;
+            self.constant(text, array_type, output)?;
+            output.push(")")?;
+            if !self.pretty {
+                output.push(")")?;
+            }
+            return Ok(());
+        }
         output.push(if negated {
             " <> ALL (ARRAY["
         } else {
@@ -448,6 +461,75 @@ impl Context<'_> {
             output.push(")")?;
         }
         Ok(())
+    }
+
+    /// The `array_out` text of the array the planner folds the non-column
+    /// `items` of an `IN` list into, each converted to `element`; `None` when
+    /// an item is not a constant.
+    fn constant_array_text<'o>(
+        &self,
+        items: &[&Expr<'_>],
+        element: i32,
+        arena: &'o crate::mem::arena::Arena,
+    ) -> Result<Option<&'o str>, SqlError> {
+        use crate::sql::types::Datum;
+        let Some(ctype) = crate::sql::types::ColType::from_oid(element) else {
+            return Ok(None);
+        };
+        let mut text = crate::mem::arena::ArenaString::new(arena);
+        core::fmt::Write::write_str(&mut text, "{").map_err(|_| super::arena_full())?;
+        for (index, item) in items.iter().filter(|item| !in_list_var(item)).enumerate() {
+            let value = match item {
+                Expr::Null => Datum::Null,
+                Expr::Int(value) => Datum::Int8(*value),
+                Expr::Bool(value) => Datum::Bool(*value),
+                Expr::Str(written) | Expr::NumericLit(written) => Datum::Text(written),
+                Expr::BoundLiteral {
+                    value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                    ..
+                } => {
+                    let mut values = [Datum::Null];
+                    crate::sql::exec::decode_projected_row_into(encoded, arena, &mut values)?;
+                    values[0]
+                }
+                _ => return Ok(None),
+            };
+            if index != 0 {
+                core::fmt::Write::write_str(&mut text, ",").map_err(|_| super::arena_full())?;
+            }
+            if matches!(value, Datum::Null) {
+                core::fmt::Write::write_str(&mut text, "NULL").map_err(|_| super::arena_full())?;
+                continue;
+            }
+            let Ok(converted) = crate::sql::eval::cast_to(value, ctype, arena) else {
+                return Ok(None);
+            };
+            let shown = crate::sql::eval::datum_to_text(converted, arena)?;
+            // `array_out` quotes an element that is empty, reads as NULL or
+            // holds a delimiter, brace, quote, backslash or white space.
+            let quoted = shown.is_empty()
+                || shown.eq_ignore_ascii_case("NULL")
+                || shown
+                    .bytes()
+                    .any(|byte| b"{},\"\\".contains(&byte) || byte.is_ascii_whitespace());
+            if quoted {
+                core::fmt::Write::write_str(&mut text, "\"").map_err(|_| super::arena_full())?;
+                for character in shown.chars() {
+                    if matches!(character, '"' | '\\') {
+                        core::fmt::Write::write_str(&mut text, "\\")
+                            .map_err(|_| super::arena_full())?;
+                    }
+                    let mut buffer = [0u8; 4];
+                    core::fmt::Write::write_str(&mut text, character.encode_utf8(&mut buffer))
+                        .map_err(|_| super::arena_full())?;
+                }
+                core::fmt::Write::write_str(&mut text, "\"").map_err(|_| super::arena_full())?;
+            } else {
+                core::fmt::Write::write_str(&mut text, shown).map_err(|_| super::arena_full())?;
+            }
+        }
+        core::fmt::Write::write_str(&mut text, "}").map_err(|_| super::arena_full())?;
+        Ok(Some(text.as_str()))
     }
 
     /// A comparison of two row constructors: pairwise `=` joined by `AND`,

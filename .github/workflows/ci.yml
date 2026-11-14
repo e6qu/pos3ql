@@ -325,6 +325,9 @@ jobs:
       - name: Vendored corpus integrity guard
         run: bash tools/check-vendor.sh
 
+      - name: Exact fixture number guard
+        run: bash tools/check-fixture-numbers.sh
+
       - name: External harness liveness guard
         run: sh tests/external/liveness_test.sh
 

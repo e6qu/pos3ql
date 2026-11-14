@@ -54956,10 +54956,11 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (ANALYZE, TIMING OFF) INSERT INTO ep VALUES (5, 'e') RETURNING id",
     ));
+    // ModifyTable returns its RETURNING rows (PostgreSQL 18.6).
     assert!(
         returning_insert
             .iter()
-            .any(|row| row.starts_with("Insert on ep") && row.contains("actual rows=0.00")),
+            .any(|row| row.starts_with("Insert on ep") && row.contains("actual rows=1.00")),
         "{returning_insert:?}"
     );
     assert_eq!(

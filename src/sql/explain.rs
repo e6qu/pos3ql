@@ -80,6 +80,9 @@ struct PlanNode {
     /// The subplans this node is nested in: PostgreSQL indents each
     /// subplan two columns past its parent's children.
     shift: u8,
+    /// A `Subquery Scan` that returns every row of its child unchanged,
+    /// reported with its child's figures.
+    passthrough: bool,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -265,6 +268,7 @@ impl PlanNode {
         schema: StackStr::new(),
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
 }
 
@@ -407,6 +411,7 @@ impl<'a> Plan<'a> {
         let counters = arena
             .alloc_slice_with(self.count, |index| slots[index].counters())
             .map_err(|_| query::arena_full_pub())?;
+        mirror_passthrough(nodes, counters);
         self.measured = Some(counters);
         Ok(result)
     }
@@ -420,7 +425,7 @@ impl<'a> Plan<'a> {
         let node = &self.nodes[index];
         let counters = self
             .measured
-            .filter(|_| node.key.is_some())
+            .filter(|_| node.key.is_some() || node.passthrough)
             .map(|measured| measured[index])
             .map(|mut counters| {
                 // Execution filters a `VALUES` list's rows as it builds them:
@@ -604,9 +609,12 @@ fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'
     });
 }
 
-/// `condition` split into its conjuncts that read no column and only
-/// subplans run once, which PostgreSQL checks once, and the rest.
+/// `condition` split into its pseudoconstant conjuncts, which read no
+/// column, call no volatile function and read only subplans run once, and
+/// which PostgreSQL checks once, and the rest.
 fn split_gating<'e>(
+    storage: &Storage,
+    txid: u32,
     condition: Option<&'e Expr<'e>>,
     arena: &'e Arena,
 ) -> Result<(Option<&'e Expr<'e>>, Option<&'e Expr<'e>>), SqlError> {
@@ -615,20 +623,45 @@ fn split_gating<'e>(
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none() {
         return Ok((None, Some(condition)));
     }
     let (mut gating, mut rest) = (None, None);
     for conjunct in &conjuncts[..count] {
         let mut columns = false;
         conjunct.for_each_column_reference(&mut |_, _| columns = true);
-        if !columns && conjunct.contains_subquery() && sublinks_registered(conjunct, false) {
+        let pseudoconstant = if conjunct.contains_subquery() {
+            sublinks_registered(conjunct, false)
+        } else {
+            !query::expression_contains_volatile(conjunct, storage, txid, false)
+        };
+        if !columns && pseudoconstant {
             gating = query::and_where(gating, Some(conjunct), arena)?;
         } else {
             rest = query::and_where(rest, Some(conjunct), arena)?;
         }
     }
     Ok((gating, rest))
+}
+
+/// Whether the planner folds the qualification `condition` to false or
+/// NULL, which returns no rows.
+fn qual_false(condition: &Expr<'_>, arena: &Arena) -> bool {
+    if query::plan_time_bool(condition, arena) == Some(false) {
+        return true;
+    }
+    match condition {
+        Expr::Null => true,
+        Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+            ..
+        } => {
+            let mut values = [crate::sql::types::Datum::Null];
+            crate::sql::exec::decode_projected_row_into(encoded, arena, &mut values).is_ok()
+                && matches!(values[0], crate::sql::types::Datum::Null)
+        }
+        _ => false,
+    }
 }
 
 /// The most conjuncts a condition's EXPLAIN qualification is split into.
@@ -640,6 +673,7 @@ fn split_conjuncts<'e>(
     condition: &'e Expr<'e>,
     out: &mut [&'e Expr<'e>; MAX_CONJUNCTS],
     count: &mut usize,
+    arena: &Arena,
 ) -> Option<()> {
     match condition {
         Expr::Binary {
@@ -648,8 +682,13 @@ fn split_conjuncts<'e>(
             right,
             ..
         } => {
-            split_conjuncts(left, out, count)?;
-            split_conjuncts(right, out, count)
+            split_conjuncts(left, out, count, arena)?;
+            split_conjuncts(right, out, count, arena)
+        }
+        // The planner drops a conjunct it folded to true.
+        Expr::Bool(true) => Some(()),
+        Expr::BoundLiteral { .. } if query::plan_time_bool(condition, arena) == Some(true) => {
+            Some(())
         }
         _ => {
             *out.get_mut(*count)? = condition;
@@ -694,6 +733,13 @@ fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
                 | Expr::Float(_)
                 | Expr::NumericLit(_)
                 | Expr::Bool(_)
+                // A constant the planner folded.
+                | Expr::BoundLiteral { .. }
+                | Expr::Unary {
+                    operator: crate::sql::ast::UnaryOp::Neg,
+                    operand: Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_),
+                    ..
+                }
         )
     };
     matches!(conjunct, Expr::Binary { operator: BinaryOp::Eq, left, right, .. }
@@ -845,7 +891,7 @@ fn join_quals<'a>(
     }
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none() {
         return Ok(None);
     }
     // Each conjunct's relation (a scan filter) or join depth, in order.
@@ -1123,7 +1169,7 @@ fn outer_hash_quals<'a>(
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none() {
         return Ok(None);
     }
     let mut hash_conds = [&Expr::Null; MAX_CONJUNCTS];
@@ -1147,7 +1193,7 @@ fn outer_hash_quals<'a>(
     if let Some(where_clause) = where_clause {
         let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
         let mut count = 0;
-        if split_conjuncts(where_clause, &mut conjuncts, &mut count).is_none() {
+        if split_conjuncts(where_clause, &mut conjuncts, &mut count, arena).is_none() {
             return Ok(None);
         }
         for &conjunct in &conjuncts[..count] {
@@ -1239,7 +1285,7 @@ fn one_time_filter(
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none() {
         return Ok(None);
     }
     // The planner folds a constant conjunct; one that holds disappears.
@@ -1467,7 +1513,7 @@ fn outer_join_quals<'a>(
         };
         let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
         let mut conjunct_count = 0;
-        if split_conjuncts(source, &mut conjuncts, &mut conjunct_count).is_none() {
+        if split_conjuncts(source, &mut conjuncts, &mut conjunct_count, arena).is_none() {
             return Ok(None);
         }
         for &conjunct in &conjuncts[..conjunct_count] {
@@ -1694,7 +1740,7 @@ fn having_filter<'a>(
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(having, &mut conjuncts, &mut count).is_none() {
+    if split_conjuncts(having, &mut conjuncts, &mut count, arena).is_none() {
         return Ok(None);
     }
     deparse_qual(&context, &conjuncts[..count], arena)
@@ -1752,7 +1798,7 @@ fn derived_relation_filter<'a>(
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none()
         || conjuncts[..count]
             .iter()
             .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
@@ -1835,7 +1881,7 @@ fn single_relation_quals<'a>(
         });
         columns && sublinks_registered(conjunct, true)
     };
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
+    if split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none()
         || !conjuncts[..count]
             .iter()
             .all(|conjunct| placeable(conjunct))
@@ -2742,6 +2788,7 @@ fn scan_node<'a>(
         schema,
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -2873,17 +2920,18 @@ fn plan_sublinks<'a>(
                 true
             });
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        let inner = plan_select(storage, txid, select, block.child(Segment::Sublink), arena);
+        let inner = plan_select(
+            storage,
+            txid,
+            select,
+            block.child(Segment::Sublink(core::ptr::from_ref(select) as usize as u64)),
+            arena,
+        );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
         if pushed {
             OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
         }
         let Plan { nodes, count, .. } = inner?;
-        // Execution does not count a subquery's operators per subplan yet,
-        // so `EXPLAIN ANALYZE` prints no figures for them.
-        for node in &mut nodes[..count] {
-            node.key = None;
-        }
         let nodes: &'a [PlanNode] = &nodes[..count];
         let number = match register_subplan(select, correlated)? {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
@@ -2939,7 +2987,8 @@ fn attach_subplans<'a>(
         let at = match (sublink.kind, sublink.origin) {
             (SubplanKind::InitPlan, _) => None,
             (SubplanKind::SubPlan, SublinkOrigin::Having) => find(Role::Aggregate),
-            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::Aggregate)
+            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::SortedProjection)
+                .or_else(|| find(Role::Aggregate))
                 .or_else(|| find(Role::Result))
                 .or_else(scan),
             (SubplanKind::SubPlan, SublinkOrigin::Where) => scan(),
@@ -3166,8 +3215,7 @@ fn plan_pulled_select<'a>(
     // no rows.
     let constant_false = statement
         .where_clause
-        .and_then(|predicate| query::plan_time_bool(predicate, arena))
-        == Some(false);
+        .is_some_and(|predicate| qual_false(predicate, arena));
 
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
@@ -3527,6 +3575,23 @@ fn plan_pulled_select<'a>(
                 .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
         }
         add_stage(&mut stages, &mut stage_count, node)?;
+        if postpones_select_list(storage, txid, statement) {
+            add_stage(
+                &mut stages,
+                &mut stage_count,
+                PlanNode {
+                    name: StackStr::from_str("Result"),
+                    key: key(Role::SortedProjection),
+                    total_cost,
+                    rows: estimated_rows,
+                    width,
+                    object_requests,
+                    cache_blocks,
+                    passthrough: true,
+                    ..PlanNode::EMPTY
+                },
+            )?;
+        }
     }
     let distinct_items = || -> Result<bool, SqlError> {
         if !statement.distinct_on.is_empty() {
@@ -3691,8 +3756,9 @@ fn plan_pulled_select<'a>(
             // Conjuncts that read only subplans run once gate the scan
             // from a `Result` above it, as PostgreSQL's pseudoconstant
             // quals do.
-            let (gating, scanned) = split_gating(statement.where_clause, arena)?;
-            if let Some(gating) = gating {
+            let (gating, scanned) = split_gating(storage, txid, statement.where_clause, arena)?;
+            // A condition folded to false or NULL leaves only its `Result`.
+            if let Some(gating) = gating.filter(|_| !constant_false) {
                 let filter = one_time_filter(storage, txid, Some(gating), arena)?;
                 if stage_count == stages.len() {
                     return Err(sql_err!(
@@ -3707,6 +3773,7 @@ fn plan_pulled_select<'a>(
                     rows: estimated_rows,
                     width,
                     total_cost,
+                    passthrough: true,
                     ..PlanNode::EMPTY
                 }
                 .with_qual(QualLabel::OneTimeFilter, filter);
@@ -4093,6 +4160,41 @@ fn presorted_text(keys: &PlanKeys, verbose: bool) -> Option<StackStr<512>> {
 
 /// The expression an `ORDER BY` key sorts by: an output position or name
 /// stands for its select-list expression.
+/// PostgreSQL's `make_sort_input_target`: whether the query evaluates its
+/// select list after its sort, from a `Result` above it, because a column
+/// that is not a sort key calls a volatile function, or, under a `LIMIT`,
+/// is expensive (a user routine or a correlated subplan).
+fn postpones_select_list(storage: &Storage, txid: u32, statement: &Select<'_>) -> bool {
+    if statement.distinct || !statement.distinct_on.is_empty() {
+        return false;
+    }
+    statement.items.iter().any(|item| {
+        let SelectItem::Expr { expression, .. } = item else {
+            return false;
+        };
+        let sorted = statement
+            .order_by
+            .iter()
+            .any(|key| order_key_expression(statement, key.expression) == *expression);
+        if sorted {
+            return false;
+        }
+        if query::expression_contains_volatile(expression, storage, txid, false) {
+            return true;
+        }
+        let mut subplan = false;
+        visit_sublinks(expression, &mut |node| {
+            subplan |= sublink_query(node)
+                .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
+                .is_some_and(|plan| {
+                    matches!(plan, crate::sql::catalog::deparse::SublinkPlan::SubPlan(_))
+                });
+        });
+        statement.limit.is_some()
+            && (subplan || query::expression_calls_user_routine(expression, storage, txid))
+    })
+}
+
 fn order_key_expression<'e>(statement: &Select<'e>, key: &'e Expr<'e>) -> &'e Expr<'e> {
     let item = match key {
         Expr::Int(position) => usize::try_from(*position)
@@ -4956,6 +5058,7 @@ fn physical_scan_node(
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
         subplan: None,
         shift: 0,
+        passthrough: false,
     }
 }
 
@@ -5111,6 +5214,7 @@ fn push_set_tree(
                 schema: StackStr::new(),
                 subplan: None,
                 shift: 0,
+                passthrough: false,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -5555,6 +5659,7 @@ pub(super) fn plan_modification<'a>(
             .unwrap_or_default(),
         subplan: None,
         shift: 0,
+        passthrough: false,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -5882,6 +5987,21 @@ pub(super) fn plan_modification<'a>(
                     .average_row_width
                     .max(1),
                 total_cost: 0.01,
+                ..PlanNode::EMPTY
+            }
+        } else if !joined && predicate.is_some_and(|predicate| qual_false(predicate, arena)) {
+            // A condition the planner folds to false leaves no row to
+            // change: the write reads a `Result` that returns none.
+            PlanNode {
+                name: StackStr::from_str("Result"),
+                depth: 1,
+                rows: 0,
+                width: storage
+                    .table_statistics(slot, txid)
+                    .average_row_width
+                    .max(1),
+                total_cost: 0.0,
+                constant_false: true,
                 ..PlanNode::EMPTY
             }
         } else {
@@ -6313,13 +6433,16 @@ pub(super) fn visit_text_rows<E>(
 pub(super) fn plan_statement<'a>(
     storage: &Storage,
     txid: u32,
-    statement: &Stmt<'_>,
+    statement: &'a Stmt<'a>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     if block == BlockId::ROOT {
         reset_subplans();
     }
+    // The planner plans the statement its constant folding produced, and
+    // raises the folding's notices and errors (`eval_const_expressions`).
+    let statement = fold_statement(storage, txid, statement, arena)?;
     match statement {
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
@@ -6373,6 +6496,39 @@ pub(super) fn plan_statement<'a>(
             "EXPLAIN does not support this statement type"
         )),
     }
+}
+
+/// `statement` with its constants folded, as execution folds them before it
+/// reads a row. A data-modifying `WITH` and `MERGE` fold where they run.
+fn fold_statement<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let folded = match statement {
+        Stmt::Select(select) if select.with.iter().all(|cte| cte.dml.is_none()) => {
+            let folded = query::fold_select_constants(select, arena, storage, txid)?;
+            if core::ptr::eq(folded, select) {
+                return Ok(statement);
+            }
+            Stmt::Select(*folded)
+        }
+        Stmt::Update(update) => {
+            Stmt::Update(query::fold_update_constants(update, arena, storage, txid)?)
+        }
+        Stmt::Delete(delete) => {
+            Stmt::Delete(query::fold_delete_constants(delete, arena, storage, txid)?)
+        }
+        Stmt::Insert(insert) => {
+            Stmt::Insert(query::fold_insert_constants(insert, arena, storage, txid)?)
+        }
+        _ => return Ok(statement),
+    };
+    arena
+        .alloc(folded)
+        .map(|folded| &*folded)
+        .map_err(|_| arena_full())
 }
 
 /// A data-modifying CTE's result relation exists only while the statement is
@@ -7208,11 +7364,28 @@ pub(super) fn analyze_rewritten<'a, R>(
             let counters = arena
                 .alloc_slice_with(plan.count, |index| slots[start + index].counters())
                 .map_err(|_| query::arena_full_pub())?;
+            mirror_passthrough(&plan.nodes[..plan.count], counters);
             plan.measured = Some(counters);
             start += plan.count;
         }
     }
     Ok(result)
+}
+
+/// Gives each passthrough `Subquery Scan` the figures of its child, the
+/// node after it, from the last such scan up.
+fn mirror_passthrough(nodes: &[PlanNode], counters: &mut [NodeCounters]) {
+    for index in (0..nodes.len().saturating_sub(1)).rev() {
+        if nodes[index].passthrough {
+            let child = counters[index + 1];
+            counters[index] = NodeCounters {
+                hash: None,
+                sort: None,
+                stored: None,
+                ..child
+            };
+        }
+    }
 }
 
 /// EXPLAIN of a statement a rewrite rule changes: each query the rule

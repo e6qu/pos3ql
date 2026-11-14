@@ -974,7 +974,7 @@ pub(crate) struct BodyScope {
     assignment: Option<crate::sql::type_inputs::AssignmentSite>,
     in_body: bool,
     /// A body's statements are not part of an explained plan.
-    _instrument: super::instrument::Suspended,
+    _instrument: Option<super::instrument::Suspended>,
 }
 impl Drop for BodyScope {
     fn drop(&mut self) {
@@ -987,6 +987,16 @@ impl Drop for BodyScope {
     }
 }
 pub(crate) fn enter_body() -> BodyScope {
+    body_scope(Some(super::instrument::suspend()))
+}
+
+/// [`enter_body`] for a subquery an expression runs: its operators are part
+/// of the analyzed plan, so their counters stay visible.
+pub(crate) fn enter_subquery_body() -> BodyScope {
+    body_scope(None)
+}
+
+fn body_scope(instrument: Option<super::instrument::Suspended>) -> BodyScope {
     BodyScope {
         active: ACTIVE_INPUT.with(|active| active.replace(None)),
         available: AVAILABLE_INPUT.with(|active| active.replace(None)),
@@ -994,7 +1004,7 @@ pub(crate) fn enter_body() -> BodyScope {
         source_position: CURRENT_SOURCE_POSITION.with(|current| current.replace(None)),
         assignment: CURRENT_ASSIGNMENT_SITE.with(|current| current.replace(None)),
         in_body: IN_BODY.with(|current| current.replace(true)),
-        _instrument: super::instrument::suspend(),
+        _instrument: instrument,
     }
 }
 

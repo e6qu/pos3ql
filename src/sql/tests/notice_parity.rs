@@ -1,7 +1,8 @@
 //! Notices and warnings PostgreSQL 18.6 sends, in the order it sends them:
 //! a PL/pgSQL `INTO` data change stops at its second row, a dropped column's
 //! cascade is one report, analysis passes do not repeat input notices, the
-//! planner folds a constant once, and an index answers in its rows' order.
+//! planner folds a constant once (also for EXPLAIN), a folding error follows
+//! the warnings folded before it, and an index answers in its rows' order.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -484,6 +485,48 @@ fn index_answered_queries_return_rows_at_their_first_position() {
                 "SELECT id FROM keyed WHERE v <> ''"
             )),
             ["2", "3", "1"]
+        );
+    });
+}
+
+/// PostgreSQL's planner folds a statement's constants in order: a constant
+/// that fails is the statement's error, sent after the warnings the
+/// constants folded before it raised. EXPLAIN plans the folded statement,
+/// so plain EXPLAIN raises those warnings and EXPLAIN ANALYZE raises them
+/// once.
+#[test]
+fn folding_errors_follow_earlier_warnings_and_explain_folds() {
+    with_engine("notice-folding-order", |engine, budget| {
+        run_with(engine, budget, "CREATE TABLE folded (a int)");
+        run_with(engine, budget, "INSERT INTO folded VALUES (1)");
+        let reduced = "WARNING 22023 TIMESTAMP(7) precision reduced to maximum allowed, 6";
+        let division = "ERROR 22012 division by zero";
+        for sql in [
+            "SELECT timestamptypmodin('{7}'), 1/0",
+            "SELECT timestamptypmodin('{7}'), 1/0 FROM folded",
+            "UPDATE folded SET a = timestamptypmodin('{7}') + 1/0",
+        ] {
+            assert_eq!(messages(engine, budget, sql), [reduced, division], "{sql}");
+        }
+        assert_eq!(
+            messages(engine, budget, "SELECT 1/0, timestamptypmodin('{7}')"),
+            [division]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
+            ),
+            [reduced, "EXPLAIN"]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "EXPLAIN (ANALYZE, COSTS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
+            ),
+            [reduced, "EXPLAIN"]
         );
     });
 }

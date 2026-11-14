@@ -34,9 +34,9 @@ pub(crate) enum Segment {
     Branch(u16),
     /// The query a write reads its rows from (`INSERT ... SELECT`).
     Source,
-    /// A subquery in an expression. EXPLAIN does not show these yet; the
-    /// segment keeps their operators apart from the enclosing block's.
-    Sublink,
+    /// The subquery whose query is at this address, run as a subplan: its
+    /// operators count apart from the enclosing block's.
+    Sublink(u64),
     /// A `WITH` query run once. EXPLAIN does not show these yet; the
     /// segment keeps their operators apart.
     Cte,
@@ -51,7 +51,7 @@ impl Segment {
             Self::Derived(position) => (1 << 32) | position as u64,
             Self::Branch(position) => (2 << 32) | position as u64,
             Self::Source => 3 << 32,
-            Self::Sublink => 4 << 32,
+            Self::Sublink(query) => (4 << 56) ^ query,
             Self::Cte => 5 << 32,
             Self::Query(position) => (6 << 32) | position as u64,
         }
@@ -106,6 +106,10 @@ pub(crate) enum Role {
     LockRows,
     /// A block without relations: one computed row.
     Result,
+    /// The projection PostgreSQL runs above a block's sort to evaluate its
+    /// volatile or expensive select-list expressions on sorted rows. It
+    /// reports its sort's figures.
+    SortedProjection,
     /// The set operation at this pre-order position of its tree.
     SetOperation(u16),
     /// The `Append` of a hashed set operation's inputs.
@@ -225,6 +229,9 @@ pub(crate) struct Slot {
     open: u32,
     started: Option<std::time::Instant>,
     first_row: Option<u64>,
+    /// Rows a write's change loop finished qualifying or removing, which a
+    /// later attempt does not see again: [`restart`] keeps them.
+    carried: Option<(u64, u64)>,
 }
 
 impl Slot {
@@ -245,6 +252,7 @@ impl Slot {
             open: 0,
             started: None,
             first_row: None,
+            carried: None,
         }
     }
 
@@ -327,6 +335,32 @@ pub(crate) fn next_query() {
     }
 }
 
+/// Starts another attempt of the analyzed statement, which runs it again
+/// from its first row after an earlier attempt stopped for a routine call:
+/// the counters restart, so they report the attempt that completes.
+pub(crate) fn restart() {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; no `Node` of the statement is open between
+    // attempts, and nothing else borrows the registry here.
+    let registry = unsafe { registry.as_mut() };
+    let slots = unsafe { &mut *registry.slots.as_ptr() };
+    for slot in slots.iter_mut() {
+        let carried = slot.carried;
+        *slot = Slot::new(slot.key);
+        if let Some((rows, filtered)) = carried {
+            slot.carried = carried;
+            slot.counters.rows = rows;
+            slot.counters.filtered = filtered;
+        }
+    }
+    if registry.next_query.is_some() {
+        registry.next_query = Some(0);
+    }
+    BLOCK.with(|block| block.set(BlockId::ROOT));
+}
+
 /// Hides the counters from statements a routine or trigger body runs, until
 /// the returned scope ends.
 #[must_use]
@@ -348,6 +382,35 @@ pub(crate) fn active() -> bool {
 #[cfg(test)]
 fn current_block() -> BlockId {
     BLOCK.with(Cell::get)
+}
+
+thread_local! {
+    /// The query of the subquery the executor is running, which a nested
+    /// runner of the same subquery does not enter again.
+    static SUBLINK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Runs the subquery whose query is `query` in its own block, nested in the
+/// current one, until the returned scope ends. A subquery's runners nest
+/// (a row subquery runs its set): only the outermost enters.
+#[must_use]
+pub(crate) fn enter_sublink<T>(query: *const T) -> SublinkEntered {
+    let query = query as usize as u64;
+    if SUBLINK.with(Cell::get) == query {
+        return SublinkEntered(None);
+    }
+    let prior = SUBLINK.with(|current| current.replace(query));
+    SublinkEntered(Some((enter(Segment::Sublink(query)), prior)))
+}
+
+pub(crate) struct SublinkEntered(Option<(Entered, u64)>);
+
+impl Drop for SublinkEntered {
+    fn drop(&mut self) {
+        if let Some((_, prior)) = &self.0 {
+            SUBLINK.with(|current| current.set(*prior));
+        }
+    }
 }
 
 /// Runs nested blocks at `segment` of the current one until the returned
@@ -487,6 +550,16 @@ impl Node {
     pub(crate) fn stored(self, bytes: usize) {
         self.with(|slot, _| {
             slot.counters.stored = Some(slot.counters.stored.map_or(bytes, |held| held.max(bytes)));
+        });
+    }
+
+    /// Marks the start of a candidate row in a write's change loop: the
+    /// rows qualified or removed before it are final. An attempt that
+    /// resumes the write starts at the row it left unfinished, so
+    /// [`restart`] keeps the counts up to that row's start.
+    pub(crate) fn checkpoint(self) {
+        self.with(|slot, _| {
+            slot.carried = Some((slot.counters.rows, slot.counters.filtered));
         });
     }
 

@@ -691,11 +691,15 @@ node (referenced as `(InitPlan n).col1`, and gating the scan from a `Result`
 when a condition reads only such subplans), a correlated one in the select
 list or `WHERE` of a one-relation query as `SubPlan n` after the inputs of the
 node evaluating it, numbered as PostgreSQL plans them, with the subplan's
-relations named uniquely (`u_1`). Not yet shown: `IN`/`ANY`/`ALL`/row
-subqueries as subplans, a correlated subquery of a join, the `Result` that
-PostgreSQL adds above a sorted, limited query to run select-list subplans
-after the sort, a subplan's figures under `ANALYZE` (its nodes print none:
-execution counts every subquery's operators in one block), `CTE` InitPlans
+relations named uniquely (`u_1`). Under `ANALYZE` each subplan's nodes
+report their own figures, once per run. A sorted query whose select list
+calls a volatile function, or under `LIMIT` a user routine or a correlated
+subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
+list (`make_sort_input_target`), which hosts the list's subplans; execution
+still evaluates the list before sorting, so such a subplan runs, and a
+routine is called, once per input row where PostgreSQL runs it only for the
+rows the sort and limit return. Not yet shown: `IN`/`ANY`/`ALL`/row
+subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
 clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
@@ -720,19 +724,24 @@ condition is false with `HashAggregate` where PostgreSQL may sort, and does
 not flatten a distinct union of more than two inputs into one `Append`. A
 `top-N heapsort` of input that spills before the sort ends is reported as
 `external merge`. Notices carry
-no position (`''::tsquery` points at the literal in PostgreSQL). A constant
-error that folding reaches after a notice or warning (`SELECT
-timestamptypmodin('{7}'), 1/0` or `SELECT ''::tsquery, 1/0`) is reported
-without the earlier message, which PostgreSQL sends first. `EXPLAIN` plans
-the statement as written, without the planner's constant folding: a
-condition prints its constants unfolded (`Filter: (a > (1 + 1))` where
-PostgreSQL prints `(a > 2)`, and an `UPDATE` or `DELETE` whose condition
-is `WHERE 1 = 2` keeps its scan where PostgreSQL plans a `Result` with a
-false `One-Time Filter`), and a plain
-`EXPLAIN` raises none of the folding's notices or errors. Folding while
-planning needs the resumable executor that PL/pgSQL calls run in, which the
-planner does not have; an `EXPLAIN ANALYZE` of a statement that calls a
-PL/pgSQL function fails with `0A000`. Errors in a client's query report
+no position (`''::tsquery` points at the literal in PostgreSQL), and a
+literal conversion's notice is raised where the statement folds rather than
+during parse analysis, so `UPDATE t SET a = 1/0 WHERE ''::tsquery IS NOT
+NULL` reports the division without the notice PostgreSQL sends first.
+`EXPLAIN` plans the statement the planner's constant folding produced:
+conditions print folded values (`Filter: (a > 2)`), a comparison with a NULL
+constant folds to NULL, a condition folded to false or NULL leaves a `Result`
+with a false `One-Time Filter` (also under `UPDATE` and `DELETE`), a
+conjunct folded to true is dropped, an `IN` list of constants prints as one
+array constant, and a condition that reads no column and calls no volatile
+function gates a single relation's scan from a `Result`. Plain `EXPLAIN`
+raises the folding's notices and errors; `EXPLAIN ANALYZE` raises them once.
+Set operation leaves, derived tables and subqueries print their constants
+as written. `EXPLAIN ANALYZE` runs its statement on the resumable executor,
+so statements calling PL/pgSQL functions are analyzed; a write that
+qualifies its rows in its change loop counts its scan's kept and removed
+rows across the attempts its calls restart. A write's top node returns its
+`RETURNING` rows. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a

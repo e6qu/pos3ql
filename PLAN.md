@@ -691,11 +691,15 @@ node (referenced as `(InitPlan n).col1`, and gating the scan from a `Result`
 when a condition reads only such subplans), a correlated one in the select
 list or `WHERE` of a one-relation query as `SubPlan n` after the inputs of the
 node evaluating it, numbered as PostgreSQL plans them, with the subplan's
-relations named uniquely (`u_1`). Not yet shown: `IN`/`ANY`/`ALL`/row
-subqueries as subplans, a correlated subquery of a join, the `Result` that
-PostgreSQL adds above a sorted, limited query to run select-list subplans
-after the sort, a subplan's figures under `ANALYZE` (its nodes print none:
-execution counts every subquery's operators in one block), `CTE` InitPlans
+relations named uniquely (`u_1`). Under `ANALYZE` each subplan's nodes
+report their own figures, once per run. A sorted query whose select list
+calls a volatile function, or under `LIMIT` a user routine or a correlated
+subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
+list (`make_sort_input_target`), which hosts the list's subplans; execution
+still evaluates the list before sorting, so such a subplan runs, and a
+routine is called, once per input row where PostgreSQL runs it only for the
+rows the sort and limit return. Not yet shown: `IN`/`ANY`/`ALL`/row
+subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
 clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs

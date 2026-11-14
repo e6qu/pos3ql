@@ -596,20 +596,28 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
-The built-in `postgres_fdw` extension's routines cannot be called directly
-(`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need
-connections cached past their transaction, which pos3ql closes at transaction
-end, and `postgres_fdw_validator` is run only by wrapper DDL. A foreign
-server's error keeps its SQLSTATE, message, `DETAIL`, `HINT` and `CONTEXT`
-and adds `remote SQL command: ...`, as postgres_fdw reports it; the remote
-command differs from postgres_fdw's own (an `INSERT` reads back
-`RETURNING ctid::text` and every column, and a scan reads the whole table
-with one plain `SELECT` where postgres_fdw declares a cursor and fetches
-`fetch_size` rows at a time), and `batch_size` is not honored. The read-back
-only tells an inserted row from one `ON CONFLICT DO NOTHING` skipped and
-feeds the local `RETURNING` list and row triggers; postgres_fdw's text needs
-the caller to name the columns those read and to take the row count from the
-command tag. `CREATE
+postgres_fdw's connection cache, `postgres_fdw_get_connections`,
+`postgres_fdw_disconnect(_all)`, `keep_connections`, invalidation on server and
+user-mapping changes, cursor scans (`DECLARE cN CURSOR FOR`, `FETCH fetch_size
+FROM cN`, `CLOSE cN`), its INSERT text (only the `RETURNING` columns a local
+`RETURNING` list, `AFTER ROW` trigger or `WITH CHECK OPTION` reads, counted by
+the command tag) and `batch_size` INSERTs match PostgreSQL's loopback in
+`tests/external/foreign-connection-cache.sql`. Remaining differences: a scan
+reads every column and ships no `WHERE`, `ORDER BY`, `LIMIT`, join or
+aggregate (postgres_fdw sends `SELECT id, q FROM s.t ORDER BY id ASC NULLS
+LAST` for an ordered scan), and materializes the rows before the plan reads
+them. UPDATE and DELETE are never sent as one remote statement, and their
+per-row commands differ (`WHERE ctid = $N::tid RETURNING` every column, where
+postgres_fdw writes `WHERE ctid = $1` and returns only needed columns). COPY
+FROM into a foreign table sends one row at a time, ignoring `batch_size`. A
+batched INSERT also sends its queued rows when the statement pauses for a
+PL/pgSQL call or a full output buffer, which PostgreSQL does not. Remote
+savepoints take the local savepoint's name where postgres_fdw numbers them
+`s1`, `s2`. A server or user-mapping change marks another client's cached
+connection invalid when it runs, where PostgreSQL waits for that change to
+commit. An unknown option fails without PostgreSQL's `Perhaps you meant`
+hint, and libpq options beyond host, hostaddr, port, dbname, user, password,
+connect_timeout, application_name and sslmode fail with `HV00D`. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per

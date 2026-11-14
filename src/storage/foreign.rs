@@ -129,7 +129,7 @@ impl ForeignOptions {
                     if self.get(option.name).is_some() {
                         return Err(sql_err!(
                             sqlstate::DUPLICATE_OBJECT,
-                            "option \"{}\" already exists",
+                            "option \"{}\" provided more than once",
                             option.name
                         ));
                     }

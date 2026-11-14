@@ -6212,6 +6212,17 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let input_collation = routine_params.input_collation;
             let routine_params = routine_params.values;
             composite = routine_composite_result(routine, storage, txid)?;
+            if let crate::storage::RoutineLanguage::Native(native) = routine.language
+                && routine.kind.is_set_returning()
+            {
+                return crate::sql::foreign::native_rows(
+                    storage,
+                    txid,
+                    native,
+                    &routine_params[..routine.argument_count],
+                    arena,
+                );
+            }
             if !routine.kind.is_set_returning() {
                 let value = catalog
                     .execute_routine(

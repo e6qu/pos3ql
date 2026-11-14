@@ -16913,15 +16913,46 @@ impl PreparedTransactionCatalog {
     }
 }
 
-/// One transaction-owned PostgreSQL foreign session. This identity prevents a
-/// remote transaction from being reused by another local transaction or
-/// endpoint.
+/// The identity postgres_fdw caches a connection under: one per local backend
+/// and user mapping. The server and mapping are named by slot and creation
+/// stamp, so a dropped and recreated object never reuses the connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignConnectionKey {
+    pub owner: i32,
+    pub server: u16,
+    pub server_created_at: u64,
+    pub mapping: u16,
+    pub mapping_created_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForeignSessionPhase {
+    /// The socket is opening and the session is being configured.
+    Opening,
+    /// Configured; a remote transaction is open while `transaction_id` is set.
+    Connected,
+    /// The transport failed inside a remote transaction. The slot stays
+    /// reserved so the transaction cannot commit without its remote work.
+    Broken,
+}
+
+/// One cached postgres_fdw connection. It outlives the local transactions
+/// that use it, as PostgreSQL's connection cache does, until its backend
+/// ends, it is invalidated or `keep_connections` is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ForeignSession {
-    transaction_id: u32,
+    key: ForeignConnectionKey,
     endpoint: crate::pg::replication_client::ConnectionInfo,
     timeout: std::time::Duration,
-    active: bool,
+    keep_connections: bool,
+    /// The local transaction whose remote transaction is open.
+    transaction_id: Option<u32>,
+    phase: ForeignSessionPhase,
+    /// A server or user-mapping change; the connection closes once no
+    /// transaction uses it.
+    invalidated: bool,
+    /// postgres_fdw's per-transaction cursor numbering (`c1`, `c2`, ...).
+    cursor_number: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16938,7 +16969,7 @@ impl ForeignSessionId {
 pub(crate) struct ForeignSessionLease {
     session_id: ForeignSessionId,
     transaction_id: u32,
-    endpoint: crate::pg::replication_client::ConnectionInfo,
+    key: ForeignConnectionKey,
 }
 
 impl ForeignSessionLease {
@@ -16947,13 +16978,44 @@ impl ForeignSessionLease {
     }
 }
 
+/// What a transaction must do before using a reserved connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignSessionStart {
+    /// Its remote transaction is already open.
+    Active,
+    /// A cached connection needs its remote transaction started.
+    Begin,
+    /// A new connection must be opened, configured and begun.
+    Connect,
+}
+
+/// One cached connection as `postgres_fdw_get_connections` reports it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForeignConnectionStatus {
+    pub server: u16,
+    pub server_created_at: u64,
+    pub mapping: u16,
+    pub mapping_created_at: u64,
+    pub valid: bool,
+    pub used_in_transaction: bool,
+    pub remote_backend_pid: i32,
+    pub raw_fd: Option<std::os::fd::RawFd>,
+}
+
 struct ForeignSessionSlot {
     client: crate::pg::replication_client::ReplicationClient,
     session: Option<ForeignSession>,
 }
 
+impl ForeignSessionSlot {
+    fn close(&mut self) {
+        self.client.unbind();
+        self.session = None;
+    }
+}
+
 struct ForeignSessionPool {
-    /// Serializes slot assignment so a transaction and endpoint cannot be
+    /// Serializes slot assignment so one backend and user mapping cannot be
     /// installed in two slots while another slot is being released.
     assignment: Mutex<()>,
     slots: FixedVec<Mutex<ForeignSessionSlot>>,
@@ -16978,19 +17040,73 @@ impl core::ops::DerefMut for ForeignClientGuard<'_> {
 }
 
 impl ForeignClientGuard<'_> {
-    pub(crate) fn activate(&mut self) {
-        let session = self
-            .slot
+    fn session_mut(&mut self) -> &mut ForeignSession {
+        self.slot
             .session
             .as_mut()
-            .expect("foreign session was reserved before activation");
-        assert!(!session.active);
-        session.active = true;
+            .expect("a foreign client guard holds a reserved session")
+    }
+
+    /// Marks a newly opened or reopened connection configured.
+    pub(crate) fn activate(&mut self) {
+        self.session_mut().phase = ForeignSessionPhase::Connected;
+    }
+
+    /// The server's `connect_timeout`, which bounds each exchange.
+    pub(crate) fn timeout(&self) -> std::time::Duration {
+        self.slot
+            .session
+            .expect("a foreign client guard holds a reserved session")
+            .timeout
+    }
+
+    /// Closes the socket and marks the transaction's remote work lost: the
+    /// transaction can only roll back.
+    pub(crate) fn break_session(&mut self) {
+        self.slot.client.unbind();
+        self.session_mut().phase = ForeignSessionPhase::Broken;
+    }
+
+    /// Discards the connection and frees its slot.
+    pub(crate) fn close(mut self) {
+        self.slot.close();
+    }
+
+    /// Ends the remote transaction. The connection stays cached unless it was
+    /// invalidated, its server sets `keep_connections` off or no backend owns
+    /// it.
+    pub(crate) fn finish_transaction(mut self) {
+        let session = self.session_mut();
+        session.transaction_id = None;
+        session.cursor_number = 0;
+        if session.invalidated || !session.keep_connections || session.key.owner <= 0 {
+            self.slot.close();
+        }
+    }
+
+    /// postgres_fdw's `GetCursorNumber`.
+    pub(crate) fn next_cursor_number(&mut self) -> u32 {
+        let session = self.session_mut();
+        session.cursor_number = session.cursor_number.wrapping_add(1);
+        session.cursor_number
+    }
+
+    pub(crate) fn is_broken(&self) -> bool {
+        self.slot
+            .session
+            .is_some_and(|session| session.phase == ForeignSessionPhase::Broken)
     }
 }
 
 pub(crate) const fn foreign_session_slot_bytes() -> usize {
     size_of::<Mutex<ForeignSessionSlot>>()
+}
+
+/// The catalog object whose change invalidates cached foreign connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignConnectionTarget {
+    Server(u16),
+    Mapping(u16),
 }
 
 struct ForeignStatementContext {
@@ -21659,6 +21775,16 @@ impl Storage {
             .server_by_slot(current_database(), slot, txid)
     }
 
+    pub(crate) fn foreign_mapping_by_slot(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<foreign::UserMappingDefinition> {
+        let entry = self.foreign_mapping_entry(slot);
+        (entry.database == current_database() && entry.visible_to(txid))
+            .then(|| entry.definition_for(txid))
+    }
+
     pub(crate) fn foreign_user_mapping(
         &self,
         server: u16,
@@ -24406,15 +24532,30 @@ impl Storage {
             .expect("foreign clients match max_foreign_sessions");
     }
 
+    /// `foreign_send_bytes`: every foreign client's fixed send buffer.
+    pub(crate) fn foreign_send_capacity(&self) -> usize {
+        self.foreign_sessions.slots.first().map_or(0, |slot| {
+            slot.lock()
+                .expect("foreign session lock poisoned")
+                .client
+                .send_capacity()
+        })
+    }
+
+    fn foreign_slot(&self, index: usize) -> MutexGuard<'_, ForeignSessionSlot> {
+        self.foreign_sessions.slots[index]
+            .lock()
+            .expect("foreign session lock poisoned")
+    }
+
+    /// The client of a session the lease's transaction holds open.
     pub(crate) fn foreign_client(
         &self,
         lease: ForeignSessionLease,
     ) -> Result<ForeignClientGuard<'_>, SqlError> {
-        let slot = self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned");
+        let slot = self.foreign_slot(lease.session_id.index());
         if !slot.session.is_some_and(|session| {
-            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+            session.transaction_id == Some(lease.transaction_id) && session.key == lease.key
         }) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -24424,95 +24565,107 @@ impl Storage {
         Ok(ForeignClientGuard { slot })
     }
 
-    /// Reserves or finds the session for one local transaction and endpoint.
-    /// Each free slot already owns its complete wire buffers.
+    /// Finds or reserves the cached connection for `key` and enters it into
+    /// `transaction_id`. Each free slot already owns its complete wire
+    /// buffers; a full cache is the named `53300` error.
     pub(crate) fn reserve_foreign_session(
         &self,
         transaction_id: u32,
+        key: ForeignConnectionKey,
         endpoint: crate::pg::replication_client::ConnectionInfo,
         timeout: std::time::Duration,
-    ) -> Result<(ForeignSessionLease, bool), SqlError> {
+        keep_connections: bool,
+    ) -> Result<(ForeignSessionLease, ForeignSessionStart), SqlError> {
         let _assignment = self
             .foreign_sessions
             .assignment
             .lock()
             .expect("foreign session assignment lock poisoned");
+        let lease = |index| ForeignSessionLease {
+            session_id: ForeignSessionId(index),
+            transaction_id,
+            key,
+        };
+        let fresh = ForeignSession {
+            key,
+            endpoint,
+            timeout,
+            keep_connections,
+            transaction_id: Some(transaction_id),
+            phase: ForeignSessionPhase::Opening,
+            invalidated: false,
+            cursor_number: 0,
+        };
         let mut vacant = None;
         for (index, slot) in self.foreign_sessions.slots.iter().enumerate() {
-            let session = slot.lock().expect("foreign session lock poisoned").session;
-            match session {
-                Some(session)
-                    if session.transaction_id == transaction_id && session.endpoint == endpoint =>
-                {
-                    if !session.active {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session.as_mut() else {
+                vacant = vacant.or(Some(index));
+                continue;
+            };
+            if session.key != key {
+                continue;
+            }
+            return match (session.transaction_id, session.phase) {
+                (Some(owner), _) if owner != transaction_id => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "foreign PostgreSQL connection is in use by another transaction"
+                )),
+                (Some(_), ForeignSessionPhase::Connected) => {
+                    if session.invalidated && session.endpoint != endpoint {
                         return Err(sql_err!(
-                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                            "foreign PostgreSQL session is still opening"
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "foreign server connection options changed while its connection \
+                             is in use in this transaction"
                         ));
                     }
-                    return Ok((
-                        ForeignSessionLease {
-                            session_id: ForeignSessionId(index),
-                            transaction_id,
-                            endpoint,
-                        },
-                        true,
-                    ));
+                    Ok((lease(index), ForeignSessionStart::Active))
                 }
-                None if vacant.is_none() => vacant = Some(index),
-                _ => {}
-            }
+                (Some(_), ForeignSessionPhase::Opening) => Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "foreign PostgreSQL session is still opening"
+                )),
+                (Some(_), ForeignSessionPhase::Broken) => Err(sql_err!(
+                    sqlstate::CONNECTION_FAILURE,
+                    "connection to the foreign server was lost in this transaction"
+                )),
+                (None, _) if session.invalidated || session.endpoint != endpoint => {
+                    // PostgreSQL closes an invalidated connection once it is
+                    // out of every transaction and opens a new one.
+                    slot.client.unbind();
+                    slot.session = Some(fresh);
+                    Ok((lease(index), ForeignSessionStart::Connect))
+                }
+                (None, _) => {
+                    session.transaction_id = Some(transaction_id);
+                    session.timeout = timeout;
+                    Ok((lease(index), ForeignSessionStart::Begin))
+                }
+            };
         }
         let index = vacant.ok_or_else(|| {
             sql_err!(
                 sqlstate::TOO_MANY_CONNECTIONS,
-                "configured foreign PostgreSQL session capacity is exhausted"
+                "foreign connection cache is full: max_foreign_sessions = {}",
+                self.foreign_sessions.slots.len()
             )
         })?;
-        self.foreign_sessions.slots[index]
-            .lock()
-            .expect("foreign session lock poisoned")
-            .session = Some(ForeignSession {
-            transaction_id,
-            endpoint,
-            timeout,
-            active: false,
-        });
-        Ok((
-            ForeignSessionLease {
-                session_id: ForeignSessionId(index),
-                transaction_id,
-                endpoint,
-            },
-            false,
-        ))
+        self.foreign_slot(index).session = Some(fresh);
+        Ok((lease(index), ForeignSessionStart::Connect))
     }
 
+    /// Whether `transaction_id` holds a remote transaction open.
     pub(crate) fn has_foreign_session(&self, transaction_id: u32) -> bool {
         self.foreign_sessions.slots.iter().any(|slot| {
             slot.lock()
                 .expect("foreign session lock poisoned")
                 .session
-                .is_some_and(|session| session.transaction_id == transaction_id && session.active)
+                .is_some_and(|session| session.transaction_id == Some(transaction_id))
         })
     }
 
-    pub(crate) fn foreign_session_timeout(
-        &self,
-        lease: ForeignSessionLease,
-    ) -> Option<std::time::Duration> {
-        self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned")
-            .session
-            .filter(|session| {
-                session.transaction_id == lease.transaction_id
-                    && session.endpoint == lease.endpoint
-                    && session.active
-            })
-            .map(|session| session.timeout)
-    }
-
+    /// The sessions whose remote transaction `transaction_id` holds open,
+    /// including broken ones.
     pub(crate) fn foreign_sessions(
         &self,
         transaction_id: u32,
@@ -24526,13 +24679,13 @@ impl Storage {
                     .lock()
                     .expect("foreign session lock poisoned")
                     .session?;
-                (session.transaction_id == transaction_id && session.active).then_some(
-                    ForeignSessionLease {
+                (session.transaction_id == Some(transaction_id)
+                    && session.phase != ForeignSessionPhase::Opening)
+                    .then_some(ForeignSessionLease {
                         session_id: ForeignSessionId(index),
                         transaction_id,
-                        endpoint: session.endpoint,
-                    },
-                )
+                        key: session.key,
+                    })
             })
     }
 
@@ -24549,19 +24702,141 @@ impl Storage {
             .count()
     }
 
+    /// Frees a session that failed while opening.
     pub(crate) fn clear_foreign_session(&self, lease: ForeignSessionLease) {
         let _assignment = self
             .foreign_sessions
             .assignment
             .lock()
             .expect("foreign session assignment lock poisoned");
-        let mut slot = self.foreign_sessions.slots[lease.session_id.index()]
-            .lock()
-            .expect("foreign session lock poisoned");
+        let mut slot = self.foreign_slot(lease.session_id.index());
         if slot.session.is_some_and(|session| {
-            session.transaction_id == lease.transaction_id && session.endpoint == lease.endpoint
+            session.key == lease.key && session.transaction_id == Some(lease.transaction_id)
         }) {
-            slot.session = None;
+            slot.close();
+        }
+    }
+
+    /// The connections `owner` has cached, for `postgres_fdw_get_connections`.
+    pub(crate) fn foreign_connections(
+        &self,
+        owner: i32,
+        output: &mut [ForeignConnectionStatus],
+    ) -> usize {
+        let mut count = 0;
+        for slot in self.foreign_sessions.slots.iter() {
+            let slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session else {
+                continue;
+            };
+            if session.key.owner != owner
+                || session.phase != ForeignSessionPhase::Connected
+                || count == output.len()
+            {
+                continue;
+            }
+            output[count] = ForeignConnectionStatus {
+                server: session.key.server,
+                server_created_at: session.key.server_created_at,
+                mapping: session.key.mapping,
+                mapping_created_at: session.key.mapping_created_at,
+                valid: !session.invalidated,
+                used_in_transaction: session.transaction_id.is_some(),
+                remote_backend_pid: slot.client.backend_pid(),
+                raw_fd: slot.client.is_bound().then(|| slot.client.raw_fd()),
+            };
+            count += 1;
+        }
+        count
+    }
+
+    /// `postgres_fdw_disconnect`: closes `owner`'s idle cached connections to
+    /// `server` (every server when `None`). Returns whether one closed and
+    /// the servers whose connections stay open because a transaction uses
+    /// them.
+    pub(crate) fn disconnect_foreign_connections(
+        &self,
+        owner: i32,
+        server: Option<(u16, u64)>,
+        busy: &mut [(u16, u64)],
+    ) -> (bool, usize) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        let mut closed = false;
+        let mut busy_count = 0;
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session else {
+                continue;
+            };
+            if session.key.owner != owner
+                || session.phase != ForeignSessionPhase::Connected
+                || server.is_some_and(|server| {
+                    server != (session.key.server, session.key.server_created_at)
+                })
+            {
+                continue;
+            }
+            if session.transaction_id.is_some() {
+                if busy_count < busy.len() {
+                    busy[busy_count] = (session.key.server, session.key.server_created_at);
+                    busy_count += 1;
+                }
+            } else {
+                slot.close();
+                closed = true;
+            }
+        }
+        (closed, busy_count)
+    }
+
+    /// PostgreSQL's `pgfdw_inval_callback`: a change to a foreign server or
+    /// user mapping closes the connections built from it that no transaction
+    /// uses, and marks the others to close when their transaction ends.
+    pub(crate) fn invalidate_foreign_connections(&self, target: ForeignConnectionTarget) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            let Some(session) = slot.session.as_mut() else {
+                continue;
+            };
+            let matches = match target {
+                ForeignConnectionTarget::Server(server) => session.key.server == server,
+                ForeignConnectionTarget::Mapping(mapping) => session.key.mapping == mapping,
+            };
+            if !matches || session.phase == ForeignSessionPhase::Opening {
+                continue;
+            }
+            if session.transaction_id.is_some() {
+                session.invalidated = true;
+            } else {
+                slot.close();
+            }
+        }
+    }
+
+    /// Closes a backend's cached connections as it disconnects.
+    pub(crate) fn drop_foreign_connections(&self, owner: i32) {
+        let _assignment = self
+            .foreign_sessions
+            .assignment
+            .lock()
+            .expect("foreign session assignment lock poisoned");
+        for slot in self.foreign_sessions.slots.iter() {
+            let mut slot = slot.lock().expect("foreign session lock poisoned");
+            if slot
+                .session
+                .is_some_and(|session| session.key.owner == owner)
+            {
+                slot.close();
+            }
         }
     }
 

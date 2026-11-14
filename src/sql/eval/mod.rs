@@ -567,6 +567,7 @@ pub mod sqlstate {
     pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const TRANSACTION_RESOLUTION_UNKNOWN: &str = "08007";
+    pub const CONNECTION_FAILURE: &str = "08006";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const UNDEFINED_FUNCTION: &str = "42883";

@@ -245,11 +245,13 @@ pub struct Config {
     pub max_foreign_servers: usize,
     /// Database-local foreign user-mapping catalog slots.
     pub max_user_mappings: usize,
-    /// Concurrent transaction-owned postgres_fdw sessions.
+    /// postgres_fdw connections open at once across all clients, cached
+    /// past their transactions as PostgreSQL's connection cache keeps them.
     pub max_foreign_sessions: usize,
     /// Fixed receive buffer for postgres_fdw queries.
     pub foreign_receive_bytes: usize,
-    /// Fixed send buffer for postgres_fdw queries.
+    /// Fixed send buffer for postgres_fdw queries; it also bounds the values
+    /// one `batch_size` INSERT batch queues.
     pub foreign_send_bytes: usize,
     /// Additional roots for postgres_fdw TLS.
     pub foreign_tls_ca_file: String,

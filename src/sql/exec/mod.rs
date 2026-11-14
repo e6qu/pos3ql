@@ -2412,6 +2412,24 @@ fn validate_positive_foreign_integer(value: &str, name: &str) -> Result<(), SqlE
     }
 }
 
+/// postgres_fdw's validation of `fetch_size` and `batch_size`.
+fn validate_postgres_fdw_count(name: &str, value: &str) -> Result<(), SqlError> {
+    match crate::sql::guc::parse_unitless_int(value) {
+        None => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for integer option \"{}\": {}",
+            name,
+            value
+        )),
+        Some(value) if value <= 0 => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "\"{}\" must be an integer value greater than zero",
+            name
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 fn validate_postgres_foreign_option_value(name: &str, value: &str) -> Result<(), SqlError> {
     match name {
         "port" => {
@@ -2425,17 +2443,18 @@ fn validate_postgres_foreign_option_value(name: &str, value: &str) -> Result<(),
                 ))
             }
         }
-        "connect_timeout" | "fetch_size" | "batch_size" => {
-            validate_positive_foreign_integer(value, name)
-        }
+        "connect_timeout" => validate_positive_foreign_integer(value, name),
+        "fetch_size" | "batch_size" => validate_postgres_fdw_count(name, value),
         "sslmode" if matches!(value, "disable" | "prefer" | "require") => Ok(()),
         "sslmode" => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "foreign sslmode \"{}\" is not supported",
             value
         )),
-        "updatable" | "truncatable" | "import_collate" | "import_default" | "import_generated"
-        | "import_not_null" => super::eval::parse_bool(value).map(|_| ()),
+        "updatable" | "truncatable" | "keep_connections" | "import_collate" | "import_default"
+        | "import_generated" | "import_not_null" => {
+            super::foreign::option_boolean(name, value).map(|_| ())
+        }
         "host" | "hostaddr" => value.parse::<std::net::IpAddr>().map(|_| ()).map_err(|_| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2446,45 +2465,102 @@ fn validate_postgres_foreign_option_value(name: &str, value: &str) -> Result<(),
     }
 }
 
+/// Whether postgres_fdw, as pos3ql implements it, accepts option `name` on
+/// objects of `context`.
+fn postgres_foreign_option_accepted(name: &str, context: PostgresForeignOptionContext) -> bool {
+    match context {
+        PostgresForeignOptionContext::Wrapper => false,
+        PostgresForeignOptionContext::Server => matches!(
+            name,
+            "host"
+                | "hostaddr"
+                | "port"
+                | "dbname"
+                | "connect_timeout"
+                | "application_name"
+                | "sslmode"
+                | "updatable"
+                | "truncatable"
+                | "fetch_size"
+                | "batch_size"
+                | "keep_connections"
+        ),
+        PostgresForeignOptionContext::Mapping => matches!(name, "user" | "password"),
+        PostgresForeignOptionContext::Table => matches!(
+            name,
+            "schema_name"
+                | "table_name"
+                | "updatable"
+                | "truncatable"
+                | "fetch_size"
+                | "batch_size"
+        ),
+        PostgresForeignOptionContext::Column => name == "column_name",
+        PostgresForeignOptionContext::Import => matches!(
+            name,
+            "import_collate" | "import_default" | "import_generated" | "import_not_null"
+        ),
+    }
+}
+
+fn validate_postgres_foreign_option(
+    name: &str,
+    value: &str,
+    context: PostgresForeignOptionContext,
+) -> Result<(), SqlError> {
+    if !postgres_foreign_option_accepted(name, context) {
+        return Err(sql_err!(
+            sqlstate::FDW_INVALID_OPTION_NAME,
+            "invalid option \"{}\"",
+            name
+        ));
+    }
+    validate_postgres_foreign_option_value(name, value)
+}
+
 fn validate_postgres_foreign_options(
     options: &crate::storage::foreign::ForeignOptions,
     context: PostgresForeignOptionContext,
 ) -> Result<(), SqlError> {
     for option in options.entries() {
-        let name = option.name.as_str();
-        let accepted = match context {
-            PostgresForeignOptionContext::Wrapper => false,
-            PostgresForeignOptionContext::Server => matches!(
-                name,
-                "host"
-                    | "hostaddr"
-                    | "port"
-                    | "dbname"
-                    | "connect_timeout"
-                    | "application_name"
-                    | "sslmode"
-                    | "updatable"
-                    | "truncatable"
-            ),
-            PostgresForeignOptionContext::Mapping => matches!(name, "user" | "password"),
-            PostgresForeignOptionContext::Table => matches!(
-                name,
-                "schema_name" | "table_name" | "updatable" | "truncatable"
-            ),
-            PostgresForeignOptionContext::Column => name == "column_name",
-            PostgresForeignOptionContext::Import => matches!(
-                name,
-                "import_collate" | "import_default" | "import_generated" | "import_not_null"
-            ),
+        validate_postgres_foreign_option(option.name.as_str(), option.value.as_str(), context)?;
+    }
+    Ok(())
+}
+
+/// A direct call of `postgres_fdw_validator(options, catalog)`: each
+/// `name=value` element is checked as wrapper DDL on that catalog would
+/// check it.
+pub(crate) fn call_postgres_fdw_validator(
+    options: Datum<'_>,
+    catalog: Datum<'_>,
+) -> Result<(), SqlError> {
+    let context = match catalog {
+        Datum::Oid(2328) | Datum::Int4(2328) => Some(PostgresForeignOptionContext::Wrapper),
+        Datum::Oid(1417) | Datum::Int4(1417) => Some(PostgresForeignOptionContext::Server),
+        Datum::Oid(1418) | Datum::Int4(1418) => Some(PostgresForeignOptionContext::Mapping),
+        Datum::Oid(3118) | Datum::Int4(3118) => Some(PostgresForeignOptionContext::Table),
+        Datum::Oid(1249) | Datum::Int4(1249) => Some(PostgresForeignOptionContext::Column),
+        _ => None,
+    };
+    let Datum::Array { raw, element } = options else {
+        return Ok(());
+    };
+    for item in crate::sql::array::elements(raw, element) {
+        let Datum::Text(text) = crate::sql::eval::text_view(item) else {
+            continue;
         };
-        if !accepted {
-            return Err(sql_err!(
-                sqlstate::FDW_INVALID_OPTION_NAME,
-                "invalid option \"{}\"",
-                name
-            ));
+        let (name, value) = text.split_once('=').unwrap_or((text, ""));
+        match context {
+            Some(context) => validate_postgres_foreign_option(name, value, context)?,
+            None => {
+                return Err(sql_err!(
+                    sqlstate::FDW_INVALID_OPTION_NAME,
+                    "invalid option \"{}\"",
+                    name
+                ));
+            }
         }
-        validate_postgres_foreign_option_value(name, option.value.as_str())?;
     }
     Ok(())
 }
@@ -43422,6 +43498,21 @@ pub fn create_trigger(
                 return sql_fail(error);
             }
             let definition = storage.table_def(table, txn.txid);
+            if definition.kind == crate::storage::TableKind::Foreign
+                && !matches!(
+                    trigger.transition_tables,
+                    crate::sql::ast::TriggerTransitionTables::None
+                )
+            {
+                return sql_fail(crate::sql::eval::with_detail(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is a foreign table",
+                        definition.name.as_str()
+                    ),
+                    format_args!("Triggers on foreign tables cannot have transition tables."),
+                ));
+            }
             if matches!(trigger.level, TriggerLevel::Row)
                 && !matches!(
                     trigger.transition_tables,
@@ -43469,9 +43560,13 @@ pub fn create_trigger(
                 trigger.transition_tables,
                 crate::sql::ast::TriggerTransitionTables::None
             ) {
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "transition tables cannot be specified for triggers on views"
+                return sql_fail(crate::sql::eval::with_detail(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is a view",
+                        trigger.table.name
+                    ),
+                    format_args!("Triggers on views cannot have transition tables."),
                 ));
             }
             if let Err(error) = require_view_privilege(
@@ -49852,14 +49947,18 @@ fn check_routine_argument_type(
     }
 }
 
-/// A native routine backs catalog uses such as a foreign-data wrapper's
-/// handler; pos3ql runs none of them as a called function.
+/// A foreign-data wrapper's handler backs only its wrapper; pos3ql does not
+/// run it as a called function. The other native routines run in
+/// `foreign::call_native`.
 pub(crate) fn reject_native_routine_call(
     routine: &crate::storage::RoutineDef,
     txid: u32,
 ) -> Result<(), SqlError> {
     use core::fmt::Write as _;
-    if !matches!(routine.language, crate::storage::RoutineLanguage::Native(_)) {
+    if !matches!(
+        routine.language,
+        crate::storage::RoutineLanguage::Native(crate::storage::NativeRoutine::PostgresFdwHandler)
+    ) {
         return Ok(());
     }
     let mut message = StackStr::<192>::new();
@@ -76917,26 +77016,34 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 return Err(error);
             }
             if physical.kind == crate::storage::TableKind::Foreign {
-                crate::sql::foreign::insert_row(
+                let retrieved = if foreign_insert_has_after_row_trigger(storage, target, txn.txid) {
+                    ColumnSet::all(physical.n_columns)
+                } else {
+                    ColumnSet::EMPTY
+                };
+                if !crate::sql::foreign::insert_row(
                     storage,
                     target,
                     txn.txid,
-                    &mut values[..physical.n_columns],
-                    false,
-                    responder.render_context(),
+                    crate::sql::foreign::RemoteInsert {
+                        values: &mut values[..physical.n_columns],
+                        on_conflict_do_nothing: false,
+                        retrieved,
+                        render: responder.render_context(),
+                        before_row_triggers: false,
+                    },
                     arena,
                     Some(&crate::sql::sequence::SeqEval::new(
                         storage,
                         seq_session,
                         coercion_txid,
                     )),
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
+                )? {
+                    return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
-                        "foreign COPY INSERT unexpectedly returned no row"
-                    )
-                })?;
+                        "foreign COPY INSERT stored no row"
+                    ));
+                }
             } else {
                 store_row(
                     storage,
@@ -81296,7 +81403,6 @@ fn merge_target<'a>(
         Ok(selection) => selection,
         Err(error) => return sql_fail(error),
     };
-    let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
     let (update_columns, insert_columns) = match merge_written_columns(statement, def) {
         Ok(columns) => columns,
@@ -81638,9 +81744,6 @@ fn merge_target<'a>(
     };
     // Collect the target rows once (rowid + decoded values), plus an affected
     // flag per row for the cardinality check.
-    let mut target_schema = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut target_schema);
-    let target_schema = &target_schema[..def.n_columns];
     let leaves = match dml_leaf_slots_for(
         storage,
         table_index,
@@ -81651,12 +81754,11 @@ fn merge_target<'a>(
         Ok(leaves) => leaves,
         Err(error) => return sql_fail(error),
     };
-    // PostgreSQL's planner refuses a MERGE whose result relations include a
-    // foreign partition or child.
-    if !foreign_target
-        && let Some(&leaf) = leaves.iter().find(|&&leaf| {
-            storage.table_def(leaf, txn.txid).kind == crate::storage::TableKind::Foreign
-        })
+    // PostgreSQL refuses a MERGE whose result relations include a foreign
+    // table: its target, a partition or a child.
+    if let Some(&leaf) = leaves
+        .iter()
+        .find(|&&leaf| storage.table_def(leaf, txn.txid).kind == crate::storage::TableKind::Foreign)
     {
         return sql_fail(crate::sql::eval::with_detail(
             sql_err!(
@@ -81668,109 +81770,19 @@ fn merge_target<'a>(
         ));
     }
     let mut n_target = 0usize;
-    let mut foreign_rows: *mut Option<(crate::sql::foreign::RemoteTupleId, &'a [Datum<'a>])> =
-        core::ptr::null_mut();
-    let mut foreign_capacity = 0usize;
-    if foreign_target {
-        if let Err(error) = crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txn.txid,
-            arena,
-            &mut |tuple_id, bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, target_schema, &mut values)?;
-                if let Some(plan) = select_security {
-                    let context = RowCtx {
-                        table_oid: None,
-                        def: crate::storage::RelationDefinition::from_definition(def),
-                        values: &values[..def.n_columns],
-                        alias: None,
-                    };
-                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                    let sequences =
-                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(&sequences),
-                        ..NO_HOOKS
-                    };
-                    if !super::query::row_security_passes(
-                        plan, &context, storage, txn.txid, arena, params, &hooks,
-                    )? {
-                        return Ok(());
-                    }
-                }
-                if !merge_view_row_visible(
-                    view_target,
-                    def,
-                    &values[..def.n_columns],
-                    storage,
-                    txn.txid,
-                    seq_session,
-                    arena,
-                    params,
-                )? {
-                    return Ok(());
-                }
-                let owned = arena
-                    .alloc_slice_copy(&values[..def.n_columns])
-                    .map_err(|_| super::query::arena_full_pub())?;
-                if n_target == foreign_capacity {
-                    let next_capacity = if foreign_capacity == 0 {
-                        8
-                    } else {
-                        foreign_capacity
-                            .checked_mul(2)
-                            .ok_or_else(super::query::arena_full_pub)?
-                    };
-                    let fresh = arena
-                        .alloc_slice_with(next_capacity, |_| None)
-                        .map_err(|_| super::query::arena_full_pub())?;
-                    if n_target != 0 {
-                        let previous =
-                            unsafe { core::slice::from_raw_parts(foreign_rows, n_target) };
-                        fresh[..n_target].copy_from_slice(previous);
-                    }
-                    foreign_rows = fresh.as_mut_ptr();
-                    foreign_capacity = next_capacity;
-                }
-                unsafe { foreign_rows.add(n_target).write(Some((tuple_id, owned))) };
-                n_target += 1;
-                Ok(())
+    for &leaf in leaves {
+        n_target = match storage.visible_row_count(leaf, txn.txid) {
+            Ok(n) => match n_target.checked_add(n) {
+                Some(total) => total,
+                None => return sql_fail(super::query::arena_full_pub()),
             },
-            Some(&crate::sql::sequence::SeqEval::new(
-                storage,
-                seq_session,
-                coercion_txid,
-            )),
-        ) {
-            return sql_fail(error);
-        }
-    } else {
-        for &leaf in leaves {
-            n_target = match storage.visible_row_count(leaf, txn.txid) {
-                Ok(n) => match n_target.checked_add(n) {
-                    Some(total) => total,
-                    None => return sql_fail(super::query::arena_full_pub()),
-                },
-                Err(error) => return sql_fail(error),
-            };
-        }
+            Err(error) => return sql_fail(error),
+        };
     }
     let target_ids: &mut [u64] = match arena.alloc_slice_with(n_target, |_| 0u64) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut target_remote_ids: Option<&mut [Option<crate::sql::foreign::RemoteTupleId>]> =
-        if foreign_target {
-            match arena.alloc_slice_with(n_target, |_| None) {
-                Ok(ids) => Some(ids),
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            }
-        } else {
-            None
-        };
     let target_tables: &mut [usize] = match arena.alloc_slice_with(n_target, |_| usize::MAX) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -81819,134 +81831,115 @@ fn merge_target<'a>(
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    if foreign_target {
-        let rows = if n_target == 0 {
-            &[][..]
-        } else {
-            unsafe { core::slice::from_raw_parts(foreign_rows, n_target) }
-        };
-        for (index, row) in rows.iter().enumerate() {
-            let (tuple_id, values) = row.expect("foreign MERGE rows are initialized");
-            target_tables[index] = table_index;
-            target_remote_ids
-                .as_deref_mut()
-                .expect("foreign targets allocate remote tuple identities")[index] = Some(tuple_id);
-            target_vals[index] = values;
-            target_physical[index] = values;
+    use core::ops::ControlFlow;
+    // Copy selected bytes before policy evaluation or target writes can
+    // change their version chains. These copies use the existing arena.
+    let ids: &mut [u64] = target_ids;
+    let tables: &mut [usize] = target_tables;
+    let target_bytes: &mut [&[u8]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let mut k = 0usize;
+    for &leaf in leaves {
+        if let Err(error) = storage.record_relation_scan(
+            txn.txid,
+            leaf,
+            None,
+            0,
+            crate::sql::datetime::now_micros(),
+        ) {
+            return sql_fail(error);
         }
-    } else {
-        use core::ops::ControlFlow;
-        // Copy selected bytes before policy evaluation or target writes can
-        // change their version chains. These copies use the existing arena.
-        let ids: &mut [u64] = target_ids;
-        let tables: &mut [usize] = target_tables;
-        let target_bytes: &mut [&[u8]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
-            Ok(s) => s,
-            Err(_) => return sql_fail(super::query::arena_full_pub()),
-        };
-        let mut k = 0usize;
-        for &leaf in leaves {
-            if let Err(error) = storage.record_relation_scan(
-                txn.txid,
-                leaf,
-                None,
-                0,
-                crate::sql::datetime::now_micros(),
-            ) {
-                return sql_fail(error);
-            }
-            if let Err(e) = storage.for_each_row_state(leaf, &mut |rowid, state| {
-                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txn.txid)?
-                    && k < ids.len()
-                {
-                    storage.record_relation_tuple_read(txn.txid, leaf, None)?;
-                    ids[k] = rowid;
-                    tables[k] = leaf;
-                    selected_rows[k] = Some(PhysicalRow::local(leaf, rowid, home.snapshot()));
-                    target_bytes[k] = storage.row_bytes(leaf, rowid, home, arena)?;
-                    k += 1;
-                }
-                Ok(ControlFlow::Continue(()))
-            }) {
-                return sql_fail(e);
-            }
-        }
-        let mut accepted = 0usize;
-        for j in 0..k {
-            let row_table = tables[j];
-            let row_id = ids[j];
-            let bytes = target_bytes[j];
-            let row_definition = match definitions.definition(storage, row_table, txn.txid) {
-                Ok(definition) => definition,
-                Err(error) => return sql_fail(error),
-            };
-            let mut row_schema = [ColType::Bool; MAX_COLUMNS];
-            row_definition.schema(&mut row_schema);
-            let mut vals = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) =
-                rowenc::decode(bytes, &row_schema[..row_definition.n_columns], &mut vals)
+        if let Err(e) = storage.for_each_row_state(leaf, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(leaf, rowid, state, txn.txid)?
+                && k < ids.len()
             {
-                return sql_fail(e);
+                storage.record_relation_tuple_read(txn.txid, leaf, None)?;
+                ids[k] = rowid;
+                tables[k] = leaf;
+                selected_rows[k] = Some(PhysicalRow::local(leaf, rowid, home.snapshot()));
+                target_bytes[k] = storage.row_bytes(leaf, rowid, home, arena)?;
+                k += 1;
             }
-            let layout = match retained_rows.layout(row_table) {
-                Ok(layout) => layout,
-                Err(error) => return sql_fail(error),
+            Ok(ControlFlow::Continue(()))
+        }) {
+            return sql_fail(e);
+        }
+    }
+    let mut accepted = 0usize;
+    for j in 0..k {
+        let row_table = tables[j];
+        let row_id = ids[j];
+        let bytes = target_bytes[j];
+        let row_definition = match definitions.definition(storage, row_table, txn.txid) {
+            Ok(definition) => definition,
+            Err(error) => return sql_fail(error),
+        };
+        let mut row_schema = [ColType::Bool; MAX_COLUMNS];
+        row_definition.schema(&mut row_schema);
+        let mut vals = [Datum::Null; MAX_COLUMNS];
+        if let Err(e) = rowenc::decode(bytes, &row_schema[..row_definition.n_columns], &mut vals) {
+            return sql_fail(e);
+        }
+        let layout = match retained_rows.layout(row_table) {
+            Ok(layout) => layout,
+            Err(error) => return sql_fail(error),
+        };
+        let mut logical = [Datum::Null; MAX_COLUMNS];
+        layout.project(&vals, &mut logical);
+        if let Some(plan) = select_security {
+            let context = RowCtx {
+                table_oid: None,
+                def: crate::storage::RelationDefinition::from_definition(def),
+                values: &logical[..def.n_columns],
+                alias: None,
             };
-            let mut logical = [Datum::Null; MAX_COLUMNS];
-            layout.project(&vals, &mut logical);
-            if let Some(plan) = select_security {
-                let context = RowCtx {
-                    table_oid: None,
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: &logical[..def.n_columns],
-                    alias: None,
-                };
-                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let hooks = EvalHooks {
-                    catalog: Some(&catalog),
-                    sequences: Some(&sequences),
-                    ..NO_HOOKS
-                };
-                match super::query::row_security_passes(
-                    plan, &context, storage, txn.txid, arena, params, &hooks,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            match merge_view_row_visible(
-                view_target,
-                def,
-                &logical[..def.n_columns],
-                storage,
-                txn.txid,
-                seq_session,
-                arena,
-                params,
+            let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+            let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                sequences: Some(&sequences),
+                ..NO_HOOKS
+            };
+            match super::query::row_security_passes(
+                plan, &context, storage, txn.txid, arena, params, &hooks,
             ) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => return sql_fail(error),
             }
-            let owned = match arena.alloc_slice_copy(&vals[..row_definition.n_columns]) {
-                Ok(v) => &*v,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
-            let logical = match arena.alloc_slice_copy(&logical[..def.n_columns]) {
-                Ok(values) => &*values,
-                Err(_) => return sql_fail(arena_full()),
-            };
-            ids[accepted] = row_id;
-            tables[accepted] = row_table;
-            selected_rows[accepted] = selected_rows[j];
-            target_vals[accepted] = logical;
-            target_physical[accepted] = owned;
-            accepted += 1;
         }
-        n_target = accepted;
+        match merge_view_row_visible(
+            view_target,
+            def,
+            &logical[..def.n_columns],
+            storage,
+            txn.txid,
+            seq_session,
+            arena,
+            params,
+        ) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => return sql_fail(error),
+        }
+        let owned = match arena.alloc_slice_copy(&vals[..row_definition.n_columns]) {
+            Ok(v) => &*v,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
+        let logical = match arena.alloc_slice_copy(&logical[..def.n_columns]) {
+            Ok(values) => &*values,
+            Err(_) => return sql_fail(arena_full()),
+        };
+        ids[accepted] = row_id;
+        tables[accepted] = row_table;
+        selected_rows[accepted] = selected_rows[j];
+        target_vals[accepted] = logical;
+        target_physical[accepted] = owned;
+        accepted += 1;
     }
+    n_target = accepted;
     // A matched target row can be acted on at most once by MERGE's cardinality
     // rule, so target cardinality is the exact bounded capture capacity for
     // UPDATE and DELETE transition relations.
@@ -82535,18 +82528,16 @@ fn merge_target<'a>(
                                 if affected[j] {
                                     return sql_fail(merge_cardinality());
                                 }
-                                if !foreign_target {
-                                    let lock = lock_merge_row(
-                                        storage,
-                                        txn,
-                                        pair_row.expect("local MERGE retains selected row"),
-                                        crate::sql::ast::LockStrength::Update,
-                                        row_layout,
-                                        def.n_columns,
-                                        arena,
-                                    );
-                                    merge_lock_outcome!(lock);
-                                }
+                                let lock = lock_merge_row(
+                                    storage,
+                                    txn,
+                                    pair_row.expect("local MERGE retains selected row"),
+                                    crate::sql::ast::LockStrength::Update,
+                                    row_layout,
+                                    def.n_columns,
+                                    arena,
+                                );
+                                merge_lock_outcome!(lock);
                                 if !match fire_partition_row_triggers(
                                     storage,
                                     txn,
@@ -82570,76 +82561,42 @@ fn merge_target<'a>(
                                 let mut deleted_values = [Datum::Null; MAX_COLUMNS];
                                 deleted_values[..row_definition.n_columns]
                                     .copy_from_slice(pair_physical);
-                                if let Some(tuple_id) = target_remote_ids
-                                    .as_deref()
-                                    .and_then(|identities| identities[j])
-                                {
-                                    let deleted = match crate::sql::foreign::delete_row(
-                                        storage,
-                                        target_tables[j],
-                                        txn.txid,
-                                        tuple_id,
-                                        arena,
-                                        Some(&crate::sql::sequence::SeqEval::new(
-                                            storage,
-                                            seq_session,
-                                            coercion_txid,
-                                        )),
-                                    ) {
-                                        Ok(Some(deleted)) => deleted,
-                                        Ok(None) => {
-                                            return sql_fail(sql_err!(
-                                                sqlstate::SERIALIZATION_FAILURE,
-                                                "foreign row changed before MERGE could delete it"
-                                            ));
-                                        }
-                                        Err(error) => return sql_fail(error),
-                                    };
-                                    if let Err(error) = rowenc::decode(
-                                        deleted,
-                                        row_layout.schema,
-                                        &mut deleted_values,
-                                    ) {
-                                        return sql_fail(error);
-                                    }
-                                } else {
-                                    match dml_row_available(
-                                        storage,
-                                        txn,
-                                        pair_row.expect("local MERGE retains selected row"),
-                                        "deleted",
-                                    ) {
-                                        Ok(true) => {}
-                                        Ok(false) => break,
-                                        Err(error) => return sql_fail(error),
-                                    }
-                                    if table_is_referenced(
-                                        storage,
-                                        row_definition.schema.as_str(),
-                                        row_definition.name.as_str(),
-                                        txn.txid,
-                                    ) && let Err(error) = apply_fk_parent_actions(
-                                        storage,
-                                        txn,
-                                        row_definition.schema.as_str(),
-                                        row_definition.name.as_str(),
-                                        &deleted_values[..row_definition.n_columns],
-                                        None,
-                                        arena,
-                                    ) {
-                                        return sql_fail(error);
-                                    }
-                                    match txn.write_row(
-                                        storage,
-                                        row_target,
-                                        target_ids[j],
-                                        txn.command_id(),
-                                        None,
-                                        crate::storage::RowWriteStatistics::Tracked,
-                                    ) {
-                                        Ok(_) => {}
-                                        Err(e) => return sql_fail(e),
-                                    }
+                                match dml_row_available(
+                                    storage,
+                                    txn,
+                                    pair_row.expect("local MERGE retains selected row"),
+                                    "deleted",
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(error) => return sql_fail(error),
+                                }
+                                if table_is_referenced(
+                                    storage,
+                                    row_definition.schema.as_str(),
+                                    row_definition.name.as_str(),
+                                    txn.txid,
+                                ) && let Err(error) = apply_fk_parent_actions(
+                                    storage,
+                                    txn,
+                                    row_definition.schema.as_str(),
+                                    row_definition.name.as_str(),
+                                    &deleted_values[..row_definition.n_columns],
+                                    None,
+                                    arena,
+                                ) {
+                                    return sql_fail(error);
+                                }
+                                match txn.write_row(
+                                    storage,
+                                    row_target,
+                                    target_ids[j],
+                                    txn.command_id(),
+                                    None,
+                                    crate::storage::RowWriteStatistics::Tracked,
+                                ) {
+                                    Ok(_) => {}
+                                    Err(e) => return sql_fail(e),
                                 }
                                 affected[j] = true;
                                 let physical_deleted = &deleted_values[..row_definition.n_columns];
@@ -82719,20 +82676,18 @@ fn merge_target<'a>(
                                         def.column_index(name).expect("MERGE assignment analyzed");
                                     action_update_columns.insert(column);
                                 }
-                                if !foreign_target {
-                                    // `lock_key_change` raises the strength
-                                    // once the new version is known.
-                                    let lock = lock_merge_row(
-                                        storage,
-                                        txn,
-                                        pair_row.expect("local MERGE retains selected row"),
-                                        crate::sql::ast::LockStrength::NoKeyUpdate,
-                                        row_layout,
-                                        def.n_columns,
-                                        arena,
-                                    );
-                                    merge_lock_outcome!(lock);
-                                }
+                                // `lock_key_change` raises the strength
+                                // once the new version is known.
+                                let lock = lock_merge_row(
+                                    storage,
+                                    txn,
+                                    pair_row.expect("local MERGE retains selected row"),
+                                    crate::sql::ast::LockStrength::NoKeyUpdate,
+                                    row_layout,
+                                    def.n_columns,
+                                    arena,
+                                );
+                                merge_lock_outcome!(lock);
                                 for (assignment, (name, expression)) in
                                     assignments.iter().enumerate()
                                 {
@@ -82853,9 +82808,7 @@ fn merge_target<'a>(
                                     return sql_fail(e);
                                 }
                                 row_layout.project(&physical_new, &mut new_values);
-                                let updated_table = if foreign_target {
-                                    target_tables[j]
-                                } else if def.partition.scheme.is_some() {
+                                let updated_table = if def.partition.scheme.is_some() {
                                     match storage.partition_target(
                                         table_index,
                                         def,
@@ -82960,15 +82913,14 @@ fn merge_target<'a>(
                                 if let Err(error) = check_not_null(new_definition, &persisted) {
                                     return sql_fail(error);
                                 }
-                                let stored_rowid =
-                                    if foreign_target || updated_table == target_tables[j] {
-                                        target_ids[j]
-                                    } else {
-                                        match storage.next_rowid() {
-                                            Ok(rowid) => rowid,
-                                            Err(error) => return sql_fail(error),
-                                        }
-                                    };
+                                let stored_rowid = if updated_table == target_tables[j] {
+                                    target_ids[j]
+                                } else {
+                                    match storage.next_rowid() {
+                                        Ok(rowid) => rowid,
+                                        Err(error) => return sql_fail(error),
+                                    }
+                                };
                                 if let Err(error) = constraints::enforce_row_checks(
                                     storage,
                                     new_definition,
@@ -82988,17 +82940,15 @@ fn merge_target<'a>(
                                 // PostgreSQL's `heap_update` takes its tuple
                                 // lock after the row's own constraints and
                                 // before its index keys.
-                                if !foreign_target
-                                    && let Err(error) = lock_key_change(
-                                        storage,
-                                        txn,
-                                        pair_row.expect("local MERGE retains selected row"),
-                                        row_definition,
-                                        pair_physical,
-                                        (updated_table == target_tables[j])
-                                            .then_some(&persisted[..row_definition.n_columns]),
-                                    )
-                                {
+                                if let Err(error) = lock_key_change(
+                                    storage,
+                                    txn,
+                                    pair_row.expect("local MERGE retains selected row"),
+                                    row_definition,
+                                    pair_physical,
+                                    (updated_table == target_tables[j])
+                                        .then_some(&persisted[..row_definition.n_columns]),
+                                ) {
                                     return sql_fail(error);
                                 }
                                 if let Err(e) = constraints::enforce_row_keys(
@@ -83007,14 +82957,10 @@ fn merge_target<'a>(
                                     new_definition,
                                     new_layout.schema,
                                     &persisted[..new_definition.n_columns],
-                                    if foreign_target {
-                                        ConstraintRow::Validation { excluded: None }
-                                    } else {
-                                        ConstraintRow::Stored {
-                                            excluded: (updated_table == target_tables[j])
-                                                .then_some(target_ids[j]),
-                                            rowid: stored_rowid,
-                                        }
+                                    ConstraintRow::Stored {
+                                        excluded: (updated_table == target_tables[j])
+                                            .then_some(target_ids[j]),
+                                        rowid: stored_rowid,
                                     },
                                     txn.txid,
                                     Some(txn),
@@ -83037,118 +82983,83 @@ fn merge_target<'a>(
                                 ) {
                                     return sql_fail(error);
                                 }
-                                if let Some(tuple_id) = target_remote_ids
-                                    .as_deref()
-                                    .and_then(|identities| identities[j])
-                                {
-                                    let changed = match crate::sql::foreign::update_row(
+                                if updated_table == target_tables[j] {
+                                    match dml_row_available(
                                         storage,
-                                        target_tables[j],
-                                        txn.txid,
-                                        crate::sql::foreign::RemoteUpdate {
-                                            tuple_id,
-                                            target_columns: &action_targets[..assignments.len()],
-                                            values: &mut new_values[..def.n_columns],
-                                            render: responder.render_context(),
-                                        },
-                                        arena,
-                                        Some(&crate::sql::sequence::SeqEval::new(
-                                            storage,
-                                            seq_session,
-                                            coercion_txid,
-                                        )),
+                                        txn,
+                                        pair_row.expect("local MERGE retains selected row"),
+                                        "updated",
                                     ) {
-                                        Ok(changed) => changed,
+                                        Ok(true) => {}
+                                        Ok(false) => break,
                                         Err(error) => return sql_fail(error),
-                                    };
-                                    if !changed {
-                                        return sql_fail(sql_err!(
-                                            sqlstate::SERIALIZATION_FAILURE,
-                                            "foreign row changed before MERGE could update it"
-                                        ));
-                                    }
-                                    new_layout.overlay(&new_values, &mut persisted);
-                                } else {
-                                    if updated_table == target_tables[j] {
-                                        match dml_row_available(
-                                            storage,
-                                            txn,
-                                            pair_row.expect("local MERGE retains selected row"),
-                                            "updated",
-                                        ) {
-                                            Ok(true) => {}
-                                            Ok(false) => break,
-                                            Err(error) => return sql_fail(error),
-                                        }
-                                    }
-                                    let len =
-                                        rowenc::encoded_len(&persisted[..new_definition.n_columns]);
-                                    let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                                        Ok(out) => out,
-                                        Err(_) => return sql_fail(arena_full()),
-                                    };
-                                    rowenc::encode(&persisted[..new_definition.n_columns], out);
-                                    let image = match storage.heap.append_image(out) {
-                                        Ok(x) => x,
-                                        Err(e) => return sql_fail(e),
-                                    };
-                                    if updated_table == target_tables[j] {
-                                        match txn.write_row(
-                                            storage,
-                                            new_target,
-                                            target_ids[j],
-                                            txn.command_id(),
-                                            Some(image),
-                                            crate::storage::RowWriteStatistics::Tracked,
-                                        ) {
-                                            Ok(_) => {}
-                                            Err(e) => return sql_fail(e),
-                                        }
-                                    } else {
-                                        let inserted_rowid = stored_rowid;
-                                        match txn.write_row(
-                                            storage,
-                                            new_target,
-                                            inserted_rowid,
-                                            txn.command_id(),
-                                            Some(image),
-                                            crate::storage::RowWriteStatistics::Tracked,
-                                        ) {
-                                            Ok(_) => {}
-                                            Err(error) => return sql_fail(error),
-                                        };
                                     }
                                 }
-                                if !foreign_target {
-                                    let mut source_new = [Datum::Null; MAX_COLUMNS];
-                                    source_new[..row_definition.n_columns]
-                                        .copy_from_slice(pair_physical);
-                                    new_layout.project(&persisted, &mut new_values);
-                                    row_layout.overlay(&new_values, &mut source_new);
-                                    let changed = match referenced_key_changed(
+                                let len =
+                                    rowenc::encoded_len(&persisted[..new_definition.n_columns]);
+                                let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                                    Ok(out) => out,
+                                    Err(_) => return sql_fail(arena_full()),
+                                };
+                                rowenc::encode(&persisted[..new_definition.n_columns], out);
+                                let image = match storage.heap.append_image(out) {
+                                    Ok(x) => x,
+                                    Err(e) => return sql_fail(e),
+                                };
+                                if updated_table == target_tables[j] {
+                                    match txn.write_row(
                                         storage,
+                                        new_target,
+                                        target_ids[j],
+                                        txn.command_id(),
+                                        Some(image),
+                                        crate::storage::RowWriteStatistics::Tracked,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(e) => return sql_fail(e),
+                                    }
+                                } else {
+                                    let inserted_rowid = stored_rowid;
+                                    match txn.write_row(
+                                        storage,
+                                        new_target,
+                                        inserted_rowid,
+                                        txn.command_id(),
+                                        Some(image),
+                                        crate::storage::RowWriteStatistics::Tracked,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(error) => return sql_fail(error),
+                                    };
+                                }
+                                let mut source_new = [Datum::Null; MAX_COLUMNS];
+                                source_new[..row_definition.n_columns]
+                                    .copy_from_slice(pair_physical);
+                                new_layout.project(&persisted, &mut new_values);
+                                row_layout.overlay(&new_values, &mut source_new);
+                                let changed = match referenced_key_changed(
+                                    storage,
+                                    row_definition.schema.as_str(),
+                                    row_definition.name.as_str(),
+                                    pair_physical,
+                                    &source_new[..row_definition.n_columns],
+                                    txn.txid,
+                                ) {
+                                    Ok(changed) => changed,
+                                    Err(error) => return sql_fail(error),
+                                };
+                                if changed
+                                    && let Err(error) = apply_fk_parent_actions(
+                                        storage,
+                                        txn,
                                         row_definition.schema.as_str(),
                                         row_definition.name.as_str(),
                                         pair_physical,
-                                        &source_new[..row_definition.n_columns],
-                                        txn.txid,
-                                    ) {
-                                        Ok(changed) => changed,
-                                        Err(error) => return sql_fail(error),
-                                    };
-                                    if changed
-                                        && let Err(error) = apply_fk_parent_actions(
-                                            storage,
-                                            txn,
-                                            row_definition.schema.as_str(),
-                                            row_definition.name.as_str(),
-                                            pair_physical,
-                                            Some(&source_new[..row_definition.n_columns]),
-                                            arena,
-                                        )
-                                    {
-                                        return sql_fail(error);
-                                    }
+                                        Some(&source_new[..row_definition.n_columns]),
+                                        arena,
+                                    )
+                                {
+                                    return sql_fail(error);
                                 }
                                 let after = if updated_table != target_tables[j] {
                                     partition_update::fire_after_move(
@@ -83836,11 +83747,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
             check_not_null(def, row_arr)?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut schema);
-            let row = if def.kind == crate::storage::TableKind::Foreign {
-                ConstraintRow::Validation { excluded: None }
-            } else {
-                ConstraintRow::insert(storage.next_rowid()?)
-            };
+            let row = ConstraintRow::insert(storage.next_rowid()?);
             enforce_row_constraints(
                 storage,
                 target_table,
@@ -83859,37 +83766,13 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     coercion_txid,
                 )),
             )?;
-            if def.kind == crate::storage::TableKind::Foreign {
-                if crate::sql::foreign::insert_row(
-                    storage,
-                    target_table,
-                    txn.txid,
-                    &mut row_arr[..def.n_columns],
-                    false,
-                    responder.render_context(),
-                    arena,
-                    Some(&crate::sql::sequence::SeqEval::new(
-                        storage,
-                        seq_session,
-                        coercion_txid,
-                    )),
-                )?
-                .is_none()
-                {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "foreign MERGE INSERT returned no row"
-                    ));
-                }
-            } else {
-                store_row(
-                    storage,
-                    txn,
-                    row_target,
-                    row.stored(),
-                    &row_arr[..def.n_columns],
-                )?;
-            }
+            store_row(
+                storage,
+                txn,
+                row_target,
+                row.stored(),
+                &row_arr[..def.n_columns],
+            )?;
             if view.is_some() {
                 let logical_values = partition_insert::logical_insert_values(
                     mapping,
@@ -83968,6 +83851,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
     mut progress: Option<&mut RowProgress>,
     position: (usize, u64),
+    batches: &mut crate::sql::foreign::ForeignInsertBatches<'a>,
 ) -> Result<Result<bool, SqlError>, WireFull>
 where
     'snapshot: 'a,
@@ -84016,6 +83900,16 @@ where
             } else {
                 arbiter
             };
+            let before_row_triggers =
+                insert_has_row_trigger(storage, table_index, txn.txid, TriggerTiming::Before);
+            // Batched foreign rows are stored before a BEFORE ROW trigger
+            // runs, so it sees them, as PostgreSQL's ExecPendingInserts does.
+            if before_row_triggers
+                && batches.has_pending()
+                && let Err(error) = batches.flush_all(storage, txn.txid, arena)
+            {
+                return Ok(Err(error));
+            }
             if !match fire_partition_row_triggers(
                 storage,
                 txn,
@@ -84245,13 +84139,30 @@ where
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
                 }
-                match crate::sql::foreign::insert_row(
+                let retrieved = match foreign_insert_retrieved(
+                    storage,
+                    txn.txid,
+                    table_index,
+                    logical_definition,
+                    mapping,
+                    statement,
+                    view_check,
+                    arena,
+                ) {
+                    Ok(retrieved) => retrieved,
+                    Err(error) => return Ok(Err(error)),
+                };
+                match batches.insert_row(
                     storage,
                     table_index,
                     txn.txid,
-                    &mut values[..definition.n_columns],
-                    statement.on_conflict.is_some(),
-                    responder.render_context(),
+                    crate::sql::foreign::RemoteInsert {
+                        values: &mut values[..definition.n_columns],
+                        on_conflict_do_nothing: statement.on_conflict.is_some(),
+                        retrieved,
+                        render: responder.render_context(),
+                        before_row_triggers,
+                    },
                     arena,
                     Some(&crate::sql::sequence::SeqEval::new(
                         storage,
@@ -84259,8 +84170,8 @@ where
                         coercion_txid,
                     )),
                 ) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(Ok(false)),
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(false)),
                     Err(error) => return Ok(Err(error)),
                 }
             } else if let Err(error) = store_row(
@@ -86625,6 +86536,7 @@ where
             None
         };
         let mut inserted = resumed.changed;
+        let mut batches = crate::sql::foreign::ForeignInsertBatches::new();
         let first_row = resumed.first;
         let mut write_row = |storage: &mut Storage,
                              txn: &mut TxnState,
@@ -86836,6 +86748,7 @@ where
                     conflict_outer,
                     progress.as_deref_mut(),
                     (index, inserted),
+                    &mut batches,
                 )? {
                     Ok(true) => inserted += 1,
                     Ok(false) => {}
@@ -86907,6 +86820,14 @@ where
                 sql_ok()
             })(),
         };
+        let rows_outcome = finish_foreign_batches(
+            rows_outcome,
+            &mut batches,
+            &mut inserted,
+            storage,
+            txn.txid,
+            arena,
+        );
         if let Err(error) = row_progress::settle_rows(
             progress,
             &rows_outcome,
@@ -87043,6 +86964,7 @@ where
         return sql_fail(error);
     }
     let mut inserted = resumed.changed;
+    let mut batches = crate::sql::foreign::ForeignInsertBatches::new();
     let first_row = resumed.first;
     let rows_outcome = (|| -> Outcome {
         for (index, row_exprs) in statement.rows.iter().enumerate().skip(first_row) {
@@ -87231,6 +87153,7 @@ where
                 conflict_outer,
                 progress.as_deref_mut(),
                 (index, inserted),
+                &mut batches,
             )? {
                 Ok(true) => inserted += 1,
                 Ok(false) => {}
@@ -87239,6 +87162,14 @@ where
         }
         sql_ok()
     })();
+    let rows_outcome = finish_foreign_batches(
+        rows_outcome,
+        &mut batches,
+        &mut inserted,
+        storage,
+        txn.txid,
+        arena,
+    );
     if let Err(error) = row_progress::settle_rows(
         progress,
         &rows_outcome,
@@ -87904,6 +87835,96 @@ fn expression_dml_target_columns_with_output_aliases<
         columns |= all_columns_mask(definition);
     }
     Ok(columns)
+}
+
+/// Sends the INSERT's queued foreign rows once its row loop ends, however
+/// it ends, and takes the rows the remote servers skipped off its count.
+fn finish_foreign_batches(
+    outcome: Outcome,
+    batches: &mut crate::sql::foreign::ForeignInsertBatches<'_>,
+    inserted: &mut u64,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Outcome {
+    if !batches.has_pending() {
+        return outcome;
+    }
+    let flushed = batches.flush_all(storage, txid, arena);
+    *inserted = inserted.saturating_sub(batches.take_skipped());
+    match (outcome, flushed) {
+        (Ok(Ok(())), Err(error)) => sql_fail(error),
+        (outcome, _) => outcome,
+    }
+}
+
+/// Whether a row trigger of `timing` on INSERT applies to `leaf`'s rows,
+/// declared on it or an ancestor, enabled or not, as the partition's
+/// trigger descriptor in PostgreSQL holds them.
+fn insert_has_row_trigger(
+    storage: &Storage,
+    leaf: usize,
+    txid: u32,
+    timing: TriggerTiming,
+) -> bool {
+    let mut table = leaf;
+    loop {
+        if storage.triggers_for_table(table, txid).any(|(_, trigger)| {
+            matches!(trigger.level, TriggerLevel::Row)
+                && trigger.timing == timing
+                && trigger
+                    .events
+                    .contains(crate::sql::ast::TriggerEvents::INSERT)
+        }) {
+            return true;
+        }
+        let Some(attachment) = storage.table_def(table, txid).partition.attachment else {
+            return false;
+        };
+        table = usize::from(attachment.parent);
+    }
+}
+
+/// Whether an `AFTER ROW INSERT` trigger of a foreign table or one of its
+/// ancestors applies to its rows, enabled or not, as postgres_fdw's
+/// `trig_insert_after_row` test sees the partition's triggers.
+fn foreign_insert_has_after_row_trigger(storage: &Storage, leaf: usize, txid: u32) -> bool {
+    insert_has_row_trigger(storage, leaf, txid, TriggerTiming::After)
+}
+
+/// The columns a foreign INSERT reads back, as postgres_fdw's
+/// `deparseReturningList` chooses them: every column for an `AFTER ROW`
+/// trigger, else those the local `RETURNING` list and `WITH CHECK OPTION`
+/// filters read, mapped onto the foreign partition's columns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the INSERT's target, statement and view check each contribute columns"
+)]
+fn foreign_insert_retrieved<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
+    leaf: usize,
+    logical: &crate::storage::TableDefinition<Definition0>,
+    mapping: Option<crate::storage::RelationColumnMap<'_>>,
+    statement: &Insert<'_>,
+    view_check: Option<ViewCheck<'_>>,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    if foreign_insert_has_after_row_trigger(storage, leaf, txid) {
+        return Ok(ColumnSet::all(storage.table_def(leaf, txid).n_columns));
+    }
+    let mut columns = returning_dml_target_columns(
+        statement.returning,
+        logical,
+        statement.alias,
+        storage,
+        txid,
+        arena,
+    )?;
+    for (_, filter) in view_check.map_or(&[][..], |check| check.checks) {
+        columns |= expression_dml_target_columns(filter, logical, None, storage, txid, arena)?;
+    }
+    Ok(mapping.map_or(columns, |mapping| mapping.column_set(columns)))
 }
 
 fn returning_dml_target_columns<Definition0: crate::storage::DefinitionBacking>(

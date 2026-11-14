@@ -4245,6 +4245,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        if let crate::storage::RoutineLanguage::Native(native) = routine.language {
+            return super::foreign::call_native(self.storage, self.txid, native, arguments)
+                .map(Some);
+        }
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage

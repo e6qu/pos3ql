@@ -31,6 +31,7 @@ mod dependency_rows;
 mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
+mod foreign_connection_cache;
 mod foreign_key_clones;
 mod foreign_key_lookups;
 mod foreign_parent_admission;
@@ -12141,8 +12142,16 @@ fn prepare_transaction_is_strictly_configured_and_eligible() {
     config.max_prepared_transactions = 1;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
+    // Outside a transaction block PostgreSQL warns and reports ROLLBACK.
+    let outside = run_with(&mut engine, &mut budget, "PREPARE TRANSACTION 'outside'");
+    let outside = String::from_utf8_lossy(&outside);
+    assert!(
+        outside.contains("there is no transaction in progress")
+            && outside.contains("ROLLBACK")
+            && !outside.contains("ERROR"),
+        "{outside}"
+    );
     for statement in [
-        "PREPARE TRANSACTION 'outside'",
         "BEGIN; NOTIFY prepared_channel; PREPARE TRANSACTION 'notify'",
         "BEGIN; LISTEN prepared_channel; PREPARE TRANSACTION 'listen'",
         "BEGIN; DECLARE prepared_cursor CURSOR WITH HOLD FOR SELECT 1; \

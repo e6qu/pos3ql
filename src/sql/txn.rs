@@ -3677,6 +3677,9 @@ impl TxnState {
         }
         let event =
             super::plan_invalidations::PlanInvalidationEvent::capture(storage, &undo, self.txid)?;
+        if let Some(target) = foreign_connection_target(&undo) {
+            storage.invalidate_foreign_connections(target);
+        }
         self.ddl
             .push(undo)
             .expect("DDL capacity was checked before capturing its event");
@@ -4082,5 +4085,37 @@ mod tests {
             txn.begin_command().unwrap();
             assert_eq!(txn.command_id(), 1);
         });
+    }
+}
+
+/// The foreign server or user mapping whose change invalidates cached
+/// postgres_fdw connections, as its syscache invalidation does in PostgreSQL:
+/// any update of its catalog row, including its owner and privileges.
+fn foreign_connection_target(undo: &DdlUndo) -> Option<crate::storage::ForeignConnectionTarget> {
+    use crate::storage::ForeignConnectionTarget::{Mapping, Server};
+    use crate::storage::foreign::ForeignObjectClass;
+    match undo {
+        DdlUndo::ForeignServerAltered { slot, .. } | DdlUndo::ForeignServerDropped(slot) => {
+            Some(Server(*slot as u16))
+        }
+        DdlUndo::UserMappingAltered { slot, .. } | DdlUndo::UserMappingDropped(slot) => {
+            Some(Mapping(*slot as u16))
+        }
+        DdlUndo::ForeignOwnerChanged {
+            class: ForeignObjectClass::Server,
+            slot,
+            ..
+        } => Some(Server(*slot as u16)),
+        DdlUndo::ObjectOwnerChanged { object, .. }
+            if object.class == crate::storage::AccessClass::ForeignServer =>
+        {
+            Some(Server(object.slot))
+        }
+        DdlUndo::ObjectAclChanged { prior, .. }
+            if prior.object().class == crate::storage::AccessClass::ForeignServer =>
+        {
+            Some(Server(prior.object().slot))
+        }
+        _ => None,
     }
 }

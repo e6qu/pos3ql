@@ -4188,6 +4188,40 @@ impl SettingUnit {
     }
 }
 
+/// PostgreSQL's `parse_int` with no unit, which postgres_fdw applies to
+/// `fetch_size` and `batch_size`: decimal, octal or hexadecimal, a
+/// fractional or exponent value rounded, `None` for anything else.
+pub(crate) fn parse_unitless_int(value: &str) -> Option<i32> {
+    let bytes = value.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let (integer, integer_end) = parse_c_long(value, start);
+    let reparse = integer_end.is_none_or(|end| matches!(bytes.get(end), Some(b'.' | b'e' | b'E')));
+    let (number, mut end) = if reparse {
+        parse_c_double(value, start)?
+    } else {
+        (
+            integer as f64,
+            integer_end.expect("integer parse consumed digits"),
+        )
+    };
+    if number.is_nan() {
+        return None;
+    }
+    while bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
+        end += 1;
+    }
+    if end < bytes.len() {
+        return None;
+    }
+    let number = number.round_ties_even();
+    (f64::from(i32::MIN)..=f64::from(i32::MAX))
+        .contains(&number)
+        .then_some(number as i32)
+}
+
 /// Parses an integer setting as PostgreSQL's `parse_int` and
 /// `parse_and_validate_value` do: decimal, octal or hexadecimal integers,
 /// fractional or exponent values rounded to the nearest integer, and an

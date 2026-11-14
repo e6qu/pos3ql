@@ -9219,7 +9219,7 @@ impl Engine {
                 cursors,
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot PREPARE a transaction that has operated on a foreign table"
+                    "cannot PREPARE a transaction that has operated on postgres_fdw foreign tables"
                 ),
             ));
         }
@@ -11869,6 +11869,7 @@ impl Engine {
 
     /// Drops a closing connection's LISTEN registrations.
     pub fn drop_connection(&mut self, conn_id: i32) {
+        foreign::drop_backend_connections(&self.storage, conn_id);
         self.storage.unregister_backend(conn_id);
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
@@ -22134,6 +22135,60 @@ impl Engine {
         result
     }
 
+    /// `COMMIT`, and `PREPARE TRANSACTION` outside a transaction block,
+    /// which commits the same way but reports `ROLLBACK`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a commit settles the statement's cursors, plans and output"
+    )]
+    fn commit_statement(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        cursors: &mut cursor::CursorPool,
+        sqlprep: &mut SqlPreparedPool,
+        arena: &Arena,
+        responder: &mut Responder,
+        prepare: bool,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if !txn.is_explicit() && txn.staged_commit().is_none() && txn.commit_admission().is_none() {
+            responder.warning("25P01", "there is no transaction in progress")?;
+        }
+        let tag = if txn.failed || prepare {
+            "ROLLBACK"
+        } else {
+            "COMMIT"
+        };
+        if txn.failed {
+            self.rollback_txn(txn, guc);
+            cursors.on_rollback();
+        } else {
+            if let Err(e) = self.commit_txn_with_triggers(
+                txn,
+                guc,
+                crate::sql::txn::CommitTarget::Ordinary,
+                CursorCommitContext {
+                    cursors,
+                    plans: Some(sqlprep),
+                    arena,
+                },
+                arena,
+                responder,
+            ) {
+                return Ok(Err(e));
+            }
+        }
+        responder.command_complete(tag)?;
+        // Later statements in this message get a fresh implicit txn.
+        // Freeze this statement's clock before anything anchors a
+        // transaction to it.
+        datetime::begin_statement();
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            return Ok(Err(error));
+        }
+        Ok(Ok(()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt_with_snapshot<'capture>(
         &mut self,
@@ -24330,43 +24385,21 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Commit => {
-                if !txn.is_explicit()
-                    && txn.staged_commit().is_none()
-                    && txn.commit_admission().is_none()
-                {
-                    responder.warning("25P01", "there is no transaction in progress")?;
-                }
-                let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
-                if txn.failed {
-                    self.rollback_txn(txn, guc);
-                    cursors.on_rollback();
-                } else {
-                    if let Err(e) = self.commit_txn_with_triggers(
-                        txn,
-                        guc,
-                        crate::sql::txn::CommitTarget::Ordinary,
-                        CursorCommitContext {
-                            cursors,
-                            plans: Some(sqlprep),
-                            arena,
-                        },
-                        arena,
-                        responder,
-                    ) {
-                        return Ok(Err(e));
-                    }
-                }
-                responder.command_complete(tag)?;
-                // Later statements in this message get a fresh implicit txn.
-                // Freeze this statement's clock before anything anchors a
-                // transaction to it.
-                datetime::begin_statement();
-                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
-                    return Ok(Err(error));
-                }
-                Ok(Ok(()))
+                self.commit_statement(txn, guc, cursors, sqlprep, arena, responder, false)
             }
             Stmt::PrepareTransaction(gid) => {
+                // Outside a transaction block PostgreSQL's PREPARE TRANSACTION
+                // commits like COMMIT, warns and reports ROLLBACK.
+                let ordinary = |target| matches!(target, crate::sql::txn::CommitTarget::Ordinary);
+                let implicit = match (txn.commit_admission(), txn.staged_commit()) {
+                    (Some(target), _) => ordinary(target),
+                    (None, Some(staged)) => ordinary(staged.target),
+                    (None, None) => !txn.is_explicit(),
+                };
+                if implicit {
+                    return self
+                        .commit_statement(txn, guc, cursors, sqlprep, arena, responder, true);
+                }
                 if let Err(error) =
                     self.prepare_transaction(*gid, txn, guc, cursors, arena, responder)
                 {

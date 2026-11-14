@@ -9553,7 +9553,7 @@ fn cumulative_statistics_are_synchronized_and_startup_bounded() {
 }
 
 #[test]
-fn foreign_session_pool_is_endpoint_keyed_and_startup_bounded() {
+fn foreign_connection_cache_is_mapping_keyed_and_startup_bounded() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ForeignSessionPool>();
 
@@ -9574,33 +9574,33 @@ fn foreign_session_pool_is_endpoint_keyed_and_startup_bounded() {
         .unwrap();
         storage.install_foreign_client(client);
     }
-    let first = crate::pg::replication_client::ConnectionInfo::parse(
+    assert_eq!(storage.foreign_send_capacity(), 128);
+    let endpoint = crate::pg::replication_client::ConnectionInfo::parse(
         "host=127.0.0.1 port=5432 user=postgres dbname=postgres sslmode=disable",
     )
     .unwrap();
-    let second = crate::pg::replication_client::ConnectionInfo::parse(
-        "host=127.0.0.2 port=5432 user=postgres dbname=postgres sslmode=disable",
-    )
-    .unwrap();
-    let third = crate::pg::replication_client::ConnectionInfo::parse(
-        "host=127.0.0.3 port=5432 user=postgres dbname=postgres sslmode=disable",
-    )
-    .unwrap();
+    let key = |owner, server, mapping| ForeignConnectionKey {
+        owner,
+        server,
+        server_created_at: 10,
+        mapping,
+        mapping_created_at: 20,
+    };
+    let timeout = std::time::Duration::from_secs(1);
+    let reserve = |storage: &Storage, txid, key| {
+        storage.reserve_foreign_session(txid, key, endpoint, timeout, true)
+    };
 
-    let (first_id, active) = storage
-        .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
-        .unwrap();
-    assert!(!active);
-    storage.foreign_client(first_id).unwrap().activate();
+    let (first, start) = reserve(&storage, 41, key(1, 0, 0)).unwrap();
+    assert_eq!(start, ForeignSessionStart::Connect);
+    storage.foreign_client(first).unwrap().activate();
     assert_eq!(
-        storage
-            .reserve_foreign_session(41, first, std::time::Duration::from_secs(1))
-            .unwrap(),
-        (first_id, true)
+        reserve(&storage, 41, key(1, 0, 0)).unwrap(),
+        (first, ForeignSessionStart::Active)
     );
-    let client = storage.foreign_client(first_id).unwrap();
+    let client = storage.foreign_client(first).unwrap();
     std::thread::scope(|scope| {
-        let slot = &storage.foreign_sessions.slots[first_id.session_id.index()];
+        let slot = &storage.foreign_sessions.slots[first.session_id.index()];
         scope
             .spawn(move || {
                 assert!(matches!(
@@ -9611,57 +9611,63 @@ fn foreign_session_pool_is_endpoint_keyed_and_startup_bounded() {
             .join()
             .unwrap();
     });
-    drop(client);
+    // The connection outlives its transaction and serves the next one.
+    client.finish_transaction();
+    assert!(!storage.has_foreign_session(41));
+    let (next, start) = reserve(&storage, 42, key(1, 0, 0)).unwrap();
+    assert_eq!(start, ForeignSessionStart::Begin);
+    assert_eq!(next.session_id, first.session_id);
+    assert_eq!(
+        storage.foreign_client(first).err().unwrap().sqlstate,
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+    );
 
-    let (second_id, active) = storage
-        .reserve_foreign_session(41, second, std::time::Duration::from_secs(2))
-        .unwrap();
-    assert!(!active);
-    storage.foreign_client(second_id).unwrap().activate();
-    assert_ne!(first_id, second_id);
-    assert_eq!(storage.foreign_sessions(41).count(), 2);
+    // Another backend's mapping takes the second slot; a third is refused.
+    let (other, _) = reserve(&storage, 43, key(2, 0, 0)).unwrap();
+    storage.foreign_client(other).unwrap().activate();
     assert_eq!(storage.foreign_sessions_used(), 2);
     assert_eq!(
-        storage
-            .reserve_foreign_session(73, first, std::time::Duration::from_secs(1))
-            .unwrap_err()
-            .sqlstate,
+        reserve(&storage, 44, key(3, 0, 0)).unwrap_err().sqlstate,
         sqlstate::TOO_MANY_CONNECTIONS
     );
-    let wrong_owner = ForeignSessionLease {
-        session_id: first_id.session_id,
-        transaction_id: 73,
-        endpoint: first,
-    };
-    assert_eq!(
-        storage.foreign_client(wrong_owner).err().unwrap().sqlstate,
-        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
-    );
+    let mut statuses = [ForeignConnectionStatus {
+        server: 0,
+        server_created_at: 0,
+        mapping: 0,
+        mapping_created_at: 0,
+        valid: false,
+        used_in_transaction: false,
+        remote_backend_pid: 0,
+        raw_fd: None,
+    }; 4];
+    assert_eq!(storage.foreign_connections(1, &mut statuses), 1);
+    assert!(statuses[0].valid && statuses[0].used_in_transaction);
 
-    storage.clear_foreign_session(first_id);
-    let (replacement, active) = storage
-        .reserve_foreign_session(41, third, std::time::Duration::from_secs(3))
-        .unwrap();
-    assert_eq!(replacement.session_id, first_id.session_id);
-    assert!(!active);
+    // A server change marks a connection in use and closes an idle one.
+    storage.foreign_client(other).unwrap().finish_transaction();
+    storage.invalidate_foreign_connections(ForeignConnectionTarget::Server(0));
+    assert_eq!(storage.foreign_connections(2, &mut statuses), 0);
+    assert_eq!(storage.foreign_connections(1, &mut statuses), 1);
+    assert!(!statuses[0].valid);
+    let mut busy = [(0u16, 0u64); 2];
     assert_eq!(
-        storage.foreign_client(first_id).err().unwrap().sqlstate,
-        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+        storage.disconnect_foreign_connections(1, None, &mut busy),
+        (false, 1)
     );
-    storage.foreign_client(replacement).unwrap().activate();
-
-    for session_id in storage.foreign_sessions(41) {
-        storage.clear_foreign_session(session_id);
-    }
-    assert_eq!(storage.foreign_sessions(41).count(), 0);
+    storage.foreign_client(next).unwrap().finish_transaction();
     assert_eq!(storage.foreign_sessions_used(), 0);
-    let (reused, active) = storage
-        .reserve_foreign_session(73, first, std::time::Duration::from_secs(1))
-        .unwrap();
-    assert_eq!(reused.session_id, first_id.session_id);
-    assert_eq!(reused.transaction_id(), 73);
-    assert!(!active);
-    assert_eq!(storage.foreign_sessions_used(), 1);
+
+    let (kept, _) = reserve(&storage, 45, key(1, 1, 1)).unwrap();
+    storage.foreign_client(kept).unwrap().activate();
+    storage.foreign_client(kept).unwrap().finish_transaction();
+    assert_eq!(
+        storage.disconnect_foreign_connections(1, Some((1, 10)), &mut busy),
+        (true, 0)
+    );
+    let (dropped, _) = reserve(&storage, 46, key(1, 1, 1)).unwrap();
+    storage.foreign_client(dropped).unwrap().activate();
+    storage.drop_foreign_connections(1);
+    assert_eq!(storage.foreign_sessions_used(), 0);
 }
 
 #[test]

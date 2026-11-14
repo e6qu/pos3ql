@@ -639,11 +639,11 @@ INSERT INTO pos3ql_fdw_loop.pos3ql_fdw_raising VALUES (1);
 SELECT id, note FROM pos3ql_fdw_loop.pos3ql_fdw_checked ORDER BY id;
 SQL
 done
-# The remote command's own spelling differs (pos3ql reads back each written
-# row), so its CONTEXT line is left out; every other line must match.
+# Every line but the source location must match, the remote command
+# postgres_fdw reports included.
 if [[ $foreign_errors_setup_status -eq 0 ]] \
-  && diff -u <(grep -Ev '^(LOCATION|CONTEXT|remote SQL command):' "$WORK/foreign_errors_reference.out") \
-             <(grep -Ev '^(LOCATION|CONTEXT|remote SQL command):' "$WORK/foreign_errors_pos3ql.out") \
+  && diff -u <(grep -Ev '^LOCATION:' "$WORK/foreign_errors_reference.out") \
+             <(grep -Ev '^LOCATION:' "$WORK/foreign_errors_pos3ql.out") \
   && grep -q '^DETAIL:  remote detail' "$WORK/foreign_errors_pos3ql.out" \
   && grep -q '^CONTEXT:  PL/pgSQL function public.pos3ql_fdw_raise() line 1 at RAISE' \
        "$WORK/foreign_errors_pos3ql.out"; then
@@ -651,6 +651,28 @@ if [[ $foreign_errors_setup_status -eq 0 ]] \
 else
   bad "foreign server error fields"
   cat "$WORK/foreign_errors_setup.out" "$WORK/foreign_errors_reference.out" "$WORK/foreign_errors_pos3ql.out"
+fi
+# postgres_fdw's connection cache, cursor scans, INSERT text and batches:
+# PostgreSQL's own postgres_fdw loopback and pos3ql reach the same remote
+# tables on the reference server, each run after a fresh remote setup.
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+    -f "$EXT/foreign-connection-cache-remote.sql" > "$WORK/foreign_cache_setup_$side.out" 2>&1 \
+    || echo "remote setup failed" >> "$WORK/foreign_cache_$side.out"
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -v VERBOSITY=verbose \
+    -v fdw_host="$PGHOST" -v fdw_port="$PGPORT" -v fdw_user="$PGUSER" \
+    -f "$EXT/foreign-connection-cache.sql" >> "$WORK/foreign_cache_$side.out" 2>&1
+done
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q \
+  -c 'DROP SCHEMA fdw_cache_remote CASCADE' > /dev/null 2>&1
+if diff -u <(grep -Ev '^LOCATION:' "$WORK/foreign_cache_reference.out") \
+           <(grep -Ev '^LOCATION:' "$WORK/foreign_cache_pos3ql.out") \
+  && grep -q 'remote SQL command: COMMIT TRANSACTION' "$WORK/foreign_cache_pos3ql.out" \
+  && ! grep -q 'remote setup failed' "$WORK/foreign_cache_reference.out"; then
+  ok "postgres_fdw connection cache, cursors, INSERT text and batches match PostgreSQL"
+else
+  bad "postgres_fdw connection cache, cursors, INSERT text and batches"
 fi
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
   -v ON_ERROR_STOP=1 -f "$EXT/foreign-procedural-subtransactions.sql" \
@@ -706,57 +728,29 @@ else
   bad "MERGE over a foreign partition"
   printf '%s\n' "$foreign_mixed_merge"
 fi
-cat > "$WORK/foreign_merge.sql" <<'SQL'
-BEGIN;
-SAVEPOINT outer_foreign_merge;
-SAVEPOINT before_foreign_merge;
-WITH changed AS (
-  MERGE INTO pos3ql_fdw_source AS target
-  USING (VALUES (1, 'merged'), (2, 'delete'), (9, 'inserted')) AS source(id, note)
-  ON target.id = source.id
-  WHEN MATCHED AND source.note = 'delete' THEN DELETE
-  WHEN MATCHED THEN UPDATE SET note = source.note
-  WHEN NOT MATCHED THEN INSERT (id, scores, pair, note)
-    VALUES (source.id, ARRAY[9,NULL], ROW(90,'nine')::public.pos3ql_fdw_pair, source.note)
-  WHEN NOT MATCHED BY SOURCE AND target.id = 3 THEN UPDATE SET note = 'target only'
-  RETURNING merge_action() AS action, source.id AS source_id, target.id, target.note
-)
-SELECT action, source_id, id, note FROM changed ORDER BY source_id;
-SELECT id, note FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
-ROLLBACK TO SAVEPOINT before_foreign_merge;
-SELECT id, note FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
-RELEASE SAVEPOINT before_foreign_merge;
-ROLLBACK TO SAVEPOINT outer_foreign_merge;
-ROLLBACK;
+# PostgreSQL refuses MERGE into a foreign table and a transition table on
+# a foreign table's trigger. Both sides run them on a foreign table.
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -q -v VERBOSITY=verbose \
+    > "$WORK/foreign_refusals_$side.out" 2>&1 <<'SQL'
+MERGE INTO pos3ql_fdw_loop.pos3ql_fdw_checked AS target
+USING (VALUES (1, 'merged')) AS source(id, note) ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET note = source.note;
+CREATE FUNCTION pos3ql_fdw_refused_audit() RETURNS trigger LANGUAGE plpgsql
+  AS $$ BEGIN RETURN NULL; END $$;
+CREATE TRIGGER refused_audit AFTER INSERT ON pos3ql_fdw_loop.pos3ql_fdw_checked
+  REFERENCING NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION pos3ql_fdw_refused_audit();
+DROP FUNCTION pos3ql_fdw_refused_audit();
 SQL
-psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
-  -v ON_ERROR_STOP=1 -f "$WORK/foreign_merge.sql" > "$WORK/foreign_merge_reference.out" 2>&1
-foreign_merge_reference_status=$?
-psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
-  -v ON_ERROR_STOP=1 -f "$WORK/foreign_merge.sql" > "$WORK/foreign_merge_pos3ql.out" 2>&1
-foreign_merge_pos3ql_status=$?
-foreign_merge_commit=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  -X -Atq -F '|' -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
-MERGE INTO pos3ql_fdw_source AS target
-USING (VALUES (1, 'merged'), (2, 'delete'), (9, 'inserted')) AS source(id, note)
-ON target.id = source.id
-WHEN MATCHED AND source.note = 'delete' THEN DELETE
-WHEN MATCHED THEN UPDATE SET note = source.note
-WHEN NOT MATCHED THEN INSERT (id, scores, pair, note)
-  VALUES (source.id, ARRAY[9,NULL], ROW(90,'nine')::public.pos3ql_fdw_pair, source.note)
-WHEN NOT MATCHED BY SOURCE AND target.id = 3 THEN UPDATE SET note = 'target only';
-SELECT id, scores::text, pair::text, note
-  FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
-SQL
-)
-if [[ $foreign_merge_reference_status -eq 0 && $foreign_merge_pos3ql_status -eq 0 ]] \
-  && cmp -s "$WORK/foreign_merge_reference.out" "$WORK/foreign_merge_pos3ql.out" \
-  && [[ "$foreign_merge_commit" == $'1|{1,2}|(10,one)|merged\n3|{5,NULL}|(30,)|target only\n9|{9,NULL}|(90,nine)|inserted' ]]; then
-  ok "foreign MERGE actions, RETURNING, commit and savepoint rollback match PostgreSQL"
+done
+if diff -u <(grep -Ev '^LOCATION:' "$WORK/foreign_refusals_reference.out") \
+           <(grep -Ev '^LOCATION:' "$WORK/foreign_refusals_pos3ql.out") \
+  && grep -q 'cannot execute MERGE on relation' "$WORK/foreign_refusals_pos3ql.out"; then
+  ok "foreign MERGE and transition tables are refused as in PostgreSQL"
 else
-  bad "foreign MERGE transaction behavior"
-  diff -u "$WORK/foreign_merge_reference.out" "$WORK/foreign_merge_pos3ql.out" || true
-  printf 'committed rows:\n%s\n' "$foreign_merge_commit"
+  bad "foreign MERGE and transition table refusals"
 fi
 if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) FROM STDIN' \
@@ -774,33 +768,6 @@ if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER"
 else
   bad "foreign COPY FROM"
   cat "$WORK/foreign_copy_in.out"
-fi
-foreign_copy_transition=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  -X -Atq -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
-CREATE TABLE pos3ql_foreign_copy_audit (n integer);
-CREATE FUNCTION pos3ql_foreign_copy_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-  INSERT INTO pos3ql_foreign_copy_audit SELECT count(*) FROM new_rows;
-  RETURN NULL;
-END;
-$$;
-CREATE TRIGGER pos3ql_foreign_copy_audit_trigger
-  AFTER INSERT ON pos3ql_fdw_source
-  REFERENCING NEW TABLE AS new_rows
-  FOR EACH STATEMENT EXECUTE FUNCTION pos3ql_foreign_copy_audit_fn();
-COPY pos3ql_fdw_source (id, note) FROM STDIN;
-8	COPY transition
-\.
-SELECT n FROM pos3ql_foreign_copy_audit;
-SQL
-)
-foreign_copy_transition_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
-  -X -Atq -v ON_ERROR_STOP=1 -c "SELECT note FROM public.pos3ql_fdw_source WHERE id = 8" 2>/dev/null)
-if [[ "$foreign_copy_transition" == 1 && "$foreign_copy_transition_reference" == 'COPY transition' ]]; then
-  ok "foreign COPY retains statement transition rows without local shadows"
-else
-  bad "foreign COPY transition rows"
-  printf 'transition:\n%s\nreference:\n%s\n' "$foreign_copy_transition" "$foreign_copy_transition_reference"
 fi
 if P3_PORT="$P3_PORT" PGHOST="$PGHOST" PGPORT="$PGPORT" PGUSER="$PGUSER" "$PY" - <<'PY' \
   > "$WORK/foreign_copy_binary.out" 2>&1

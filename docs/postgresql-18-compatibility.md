@@ -1282,9 +1282,25 @@ scripts, which create `postgres_fdw_handler`, `postgres_fdw_validator` and
 the `postgres_fdw` wrapper in the target schema. Before that, no handler
 exists. Their `LANGUAGE C` functions (`AS '$libdir/postgres_fdw', 'symbol'`)
 bind to pos3ql's implementation: a wrapper uses them as its handler and
-validator, but calling one directly (`SELECT postgres_fdw_validator(...)`,
-`postgres_fdw_get_connections()`, `postgres_fdw_disconnect(...)`,
-`postgres_fdw_disconnect_all()`) fails with `0A000`. A `LANGUAGE C` function
+validator. `postgres_fdw_validator(options, catalog)`,
+`postgres_fdw_get_connections()`, `postgres_fdw_disconnect(server)` and
+`postgres_fdw_disconnect_all()` work when called; calling the handler fails
+with `0A000`.
+
+Like PostgreSQL, pos3ql keeps a postgres_fdw connection open after the
+transaction that opened it, one per client connection and user mapping, and
+reuses it in later transactions. For example, after `SELECT count(*) FROM
+remote_orders`, `SELECT server_name, valid FROM postgres_fdw_get_connections()`
+lists the server until `postgres_fdw_disconnect('orders_server')` closes it or
+the client disconnects. A server with `keep_connections 'off'` closes its
+connection at transaction end, and changing a server or user mapping closes
+its connections once no transaction uses them. Unlike PostgreSQL, the number
+of open connections across all clients is fixed by `max_foreign_sessions`
+(default 16); opening one more fails with `53300 foreign connection cache is
+full`. Scans read through a cursor `fetch_size` rows (default 100) at a time,
+and an INSERT on a table with `batch_size` sends its rows in multi-row remote
+INSERTs, each batch's values limited to `foreign_send_bytes` (`54000` beyond
+it). A `LANGUAGE C` function
 of any other library fails with `0A000`; an unknown symbol of
 `$libdir/postgres_fdw` fails with `42883`. Other packages in PostgreSQL's
 `$system` directory are not available.

@@ -9561,6 +9561,16 @@ impl Engine {
         txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
         let result = txn.with_detached_plan_owner(|txn| {
             if commit {
+                // Every client sees a server or user-mapping change the
+                // prepared transaction made, as a plain COMMIT's does.
+                for undo in txn.ddl() {
+                    if let Some(target) = txn::foreign_connection_target(undo) {
+                        self.storage.invalidate_foreign_connections(
+                            target,
+                            crate::storage::ForeignInvalidation::Everyone,
+                        );
+                    }
+                }
                 self.storage
                     .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
                 self.promote_transaction_state(txn, resolution_lsn, None)

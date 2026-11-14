@@ -51,8 +51,34 @@ fn id_row(value: i32) -> Vec<u8> {
     frame(b'D', &row)
 }
 
-/// The reply to one command against a remote table of `rows` integers.
-fn respond(command: &str, rows: &mut std::ops::Range<i32>, status: &mut u8) -> Vec<u8> {
+/// A RowDescription of one `tid` column named `ctid`.
+fn ctid_description() -> Vec<u8> {
+    let mut description = 1i16.to_be_bytes().to_vec();
+    description.extend_from_slice(b"ctid\0");
+    description.extend_from_slice(&[0; 6]);
+    description.extend_from_slice(&27i32.to_be_bytes());
+    description.extend_from_slice(&6i16.to_be_bytes());
+    description.extend_from_slice(&(-1i32).to_be_bytes());
+    description.extend_from_slice(&0i16.to_be_bytes());
+    frame(b'T', &description)
+}
+
+fn ctid_row(value: i32) -> Vec<u8> {
+    let text = format!("(0,{value})");
+    let mut row = 1i16.to_be_bytes().to_vec();
+    row.extend_from_slice(&(text.len() as i32).to_be_bytes());
+    row.extend_from_slice(text.as_bytes());
+    frame(b'D', &row)
+}
+
+/// The reply to one command against a remote table of `rows` integers. A
+/// cursor declared over `SELECT ctid` reads row identities instead.
+fn respond_to(
+    command: &str,
+    rows: &mut std::ops::Range<i32>,
+    status: &mut u8,
+    identities: &mut bool,
+) -> Vec<u8> {
     let mut out = Vec::new();
     if command.starts_with("SET ") {
         out.extend(complete("SET"));
@@ -67,14 +93,23 @@ fn respond(command: &str, rows: &mut std::ops::Range<i32>, status: &mut u8) -> V
         out.extend(complete("ROLLBACK"));
     } else if command.starts_with("DECLARE ") {
         *rows = 0..5;
+        *identities = command.contains("\nSELECT ctid ");
         out.extend(complete("DECLARE CURSOR"));
     } else if let Some(rest) = command.strip_prefix("FETCH ") {
         let size: i32 = rest.split(' ').next().unwrap().parse().unwrap();
-        out.extend(id_description());
+        out.extend(if *identities {
+            ctid_description()
+        } else {
+            id_description()
+        });
         let mut fetched = 0;
         while fetched < size {
             let Some(value) = rows.next() else { break };
-            out.extend(id_row(value));
+            out.extend(if *identities {
+                ctid_row(value + 1)
+            } else {
+                id_row(value)
+            });
             fetched += 1;
         }
         out.extend(complete(&format!("FETCH {fetched}")));
@@ -87,6 +122,14 @@ fn respond(command: &str, rows: &mut std::ops::Range<i32>, status: &mut u8) -> V
             out.extend(id_row(7));
         }
         out.extend(complete(&format!("INSERT 0 {values}")));
+    } else if command.starts_with("UPDATE ") {
+        out.extend(complete("UPDATE 2"));
+    } else if command.starts_with("DELETE ") {
+        out.extend(complete(if command.ends_with("ctid = $1") {
+            "DELETE 1"
+        } else {
+            "DELETE 3"
+        }));
     } else {
         panic!("unscripted remote command {command:?}");
     }
@@ -121,6 +164,7 @@ fn scripted_server() -> (u16, Log) {
                 stream.write_all(&greeting).unwrap();
                 let mut status = b'I';
                 let mut rows = 0..0;
+                let mut identities = false;
                 let mut parsed = String::new();
                 loop {
                     let mut head = [0u8; 5];
@@ -134,7 +178,8 @@ fn scripted_server() -> (u16, Log) {
                         b'Q' => {
                             let command = cstr(&body);
                             log.lock().unwrap()[index].push(command.clone());
-                            let mut reply = respond(&command, &mut rows, &mut status);
+                            let mut reply =
+                                respond_to(&command, &mut rows, &mut status, &mut identities);
                             reply.extend(ready(status));
                             reply
                         }
@@ -144,7 +189,7 @@ fn scripted_server() -> (u16, Log) {
                             frame(b'1', &[])
                         }
                         b'B' => frame(b'2', &[]),
-                        b'E' => respond(&parsed, &mut rows, &mut status),
+                        b'E' => respond_to(&parsed, &mut rows, &mut status, &mut identities),
                         b'S' => ready(status),
                         b'X' => return,
                         other => panic!("unscripted frontend message {other}"),
@@ -221,9 +266,9 @@ fn postgres_fdw_caches_connections_and_spells_its_remote_commands() {
         ]
     };
     let mut expected: Vec<String> = configure.iter().map(|text| text.to_string()).collect();
-    for _ in 0..2 {
+    for query in ["SELECT id FROM public.ft", "SELECT NULL FROM public.ft"] {
         expected.push("START TRANSACTION ISOLATION LEVEL REPEATABLE READ".into());
-        expected.extend(scan(1));
+        expected.extend(scan(1).map(|command| command.replace("SELECT id FROM public.ft", query)));
         expected.push("COMMIT TRANSACTION".into());
     }
     expected.push("START TRANSACTION ISOLATION LEVEL REPEATABLE READ".into());
@@ -292,4 +337,169 @@ fn foreign_tables_refuse_merge_and_transition_tables() {
         let rendered = String::from_utf8_lossy(&output);
         assert!(rendered.contains(expected), "{statement}: {rendered}");
     }
+}
+
+/// The scripted server and an engine with a foreign table `ft (id integer)`
+/// on it.
+fn scripted_table() -> (Log, Engine, Budget) {
+    let (port, log) = scripted_server();
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "CREATE EXTENSION postgres_fdw; \
+             CREATE SERVER scripted FOREIGN DATA WRAPPER postgres_fdw \
+               OPTIONS (host '127.0.0.1', port '{port}', dbname 'remote', sslmode 'disable'); \
+             CREATE USER MAPPING FOR CURRENT_USER SERVER scripted OPTIONS (user 'remote'); \
+             CREATE FOREIGN TABLE ft (id integer, note text) SERVER scripted \
+               OPTIONS (schema_name 'public', table_name 'ft')"
+        ),
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    (log, engine, budget)
+}
+
+/// The statements after the session setup and transaction start.
+fn remote_statements(log: &Log) -> Vec<String> {
+    commands(log)
+        .concat()
+        .into_iter()
+        .filter(|command| {
+            !command.starts_with("SET ")
+                && !command.starts_with("START TRANSACTION")
+                && !command.starts_with("FETCH ")
+                && !command.starts_with("CLOSE ")
+                && command != "COMMIT TRANSACTION"
+        })
+        .collect()
+}
+
+#[test]
+fn postgres_fdw_pushes_conditions_order_and_limit_and_modifies_directly() {
+    let (log, mut engine, mut budget) = scripted_table();
+    // Shipped conditions, order and limit are the server's work: the
+    // scripted server applies none of them, so every row it sends arrives.
+    let pushed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM ft WHERE id > 2 AND note <> 'x' ORDER BY id DESC LIMIT 2 OFFSET 1",
+    );
+    assert_eq!(data_rows(&pushed), ["0", "1", "2", "3", "4"]);
+    // A volatile condition stays local and keeps the limit here.
+    let local = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM ft WHERE random() < 2 AND id = 3 LIMIT 2",
+    );
+    assert_eq!(data_rows(&local), ["0", "1"]);
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE ft SET id = id + 1 WHERE id = 3",
+    );
+    assert!(String::from_utf8_lossy(&updated).contains("UPDATE 2"));
+    let deleted = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM ft WHERE note IS NULL",
+    );
+    assert!(String::from_utf8_lossy(&deleted).contains("DELETE 3"));
+    let by_row = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM ft WHERE id = 4 AND random() < 2",
+    );
+    assert!(
+        String::from_utf8_lossy(&by_row).contains("DELETE 5"),
+        "{}",
+        String::from_utf8_lossy(&by_row)
+    );
+    let mut expected = vec![
+        "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft WHERE ((id > 2)) AND ((note <> 'x')) \
+         ORDER BY id DESC NULLS FIRST LIMIT 2::bigint OFFSET 1::bigint"
+            .to_string(),
+        "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft WHERE ((id = 3))".to_string(),
+        "UPDATE public.ft SET id = (id + 1) WHERE ((id = 3))".to_string(),
+        "DELETE FROM public.ft WHERE ((note IS NULL))".to_string(),
+        "DECLARE c1 CURSOR FOR\nSELECT ctid FROM public.ft WHERE ((id = 4)) FOR UPDATE".to_string(),
+    ];
+    expected.extend((0..5).map(|_| "DELETE FROM public.ft WHERE ctid = $1".to_string()));
+    assert_eq!(remote_statements(&log), expected);
+}
+
+#[test]
+fn explain_verbose_shows_postgres_fdw_remote_sql() {
+    let (_log, mut engine, mut budget) = scripted_table();
+    let plan = |engine: &mut Engine, budget: &mut Budget, sql: &str| {
+        data_rows(&run_with(
+            engine,
+            budget,
+            &format!("EXPLAIN (VERBOSE, COSTS OFF) {sql}"),
+        ))
+    };
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "SELECT note FROM ft WHERE id < 3 AND random() > 0.5"
+        ),
+        [
+            "Foreign Scan on public.ft",
+            "  Output: note",
+            "  Filter: (random() > '0.5'::double precision)",
+            "  Remote SQL: SELECT note FROM public.ft WHERE ((id < 3))",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM ft ORDER BY note LIMIT 3"
+        ),
+        [
+            "Foreign Scan on public.ft",
+            "  Output: id, note",
+            "  Remote SQL: SELECT id, note FROM public.ft ORDER BY note ASC NULLS LAST LIMIT 3::bigint",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "UPDATE ft SET note = 'y' WHERE id = 1"
+        ),
+        [
+            "Update on public.ft",
+            "  ->  Foreign Update on public.ft",
+            "        Remote SQL: UPDATE public.ft SET note = 'y'::text WHERE ((id = 1))",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM ft WHERE id = 1 RETURNING note"
+        ),
+        [
+            "Delete on public.ft",
+            "  Remote SQL: DELETE FROM public.ft WHERE ctid = $1 RETURNING note",
+            "  ->  Foreign Scan on public.ft",
+            "        Output: ctid",
+            "        Remote SQL: SELECT ctid FROM public.ft WHERE ((id = 1)) FOR UPDATE",
+        ]
+    );
+    assert_eq!(
+        plan(&mut engine, &mut budget, "INSERT INTO ft VALUES (1, 'a')"),
+        [
+            "Insert on public.ft",
+            "  Remote SQL: INSERT INTO public.ft(id, note) VALUES ($1, $2)",
+            "  Batch Size: 1",
+            "  ->  Result",
+        ]
+    );
 }

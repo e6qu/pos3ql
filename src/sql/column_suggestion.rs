@@ -220,7 +220,7 @@ pub(crate) fn offer_set_branches(suggestion: &mut ColumnSuggestion<'_>) {
 
 /// Levenshtein distance in characters with unit costs, as PostgreSQL's
 /// `varstr_levenshtein`. Names beyond the identifier limit never match.
-fn levenshtein(source: &str, target: &str) -> usize {
+pub(crate) fn levenshtein(source: &str, target: &str) -> usize {
     let target_len = target.chars().count();
     if source.chars().count() > MAX_NAME_CHARS || target_len > MAX_NAME_CHARS {
         return usize::MAX / 2;

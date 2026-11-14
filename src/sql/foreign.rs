@@ -468,22 +468,38 @@ fn begin(
     if command(storage, lease, begin, "START TRANSACTION")? != b'T' {
         return Err(unexpected_response(begin));
     }
-    // The remote transaction opens at first use. Recreate the savepoints
-    // made before it so later RELEASE and ROLLBACK TO have the same shape
-    // locally and remotely.
-    for name in statement_context.savepoints() {
-        let mut savepoint = StackStr::<256>::new();
-        let _ = savepoint.write_str("SAVEPOINT ");
-        quote_identifier(&mut savepoint, name.as_str());
-        if savepoint.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "foreign savepoint command exceeds its fixed buffer"
-            ));
-        }
-        command(storage, lease, savepoint.as_str(), "SAVEPOINT")?;
-    }
+    storage.foreign_client(lease)?.set_remote_depth(1);
     Ok(())
+}
+
+/// postgres_fdw's `begin_remote_xact`: the remote transaction reaches the
+/// local nesting level through savepoints named for each level (`s2` for
+/// the first local savepoint), made only when the connection is used.
+fn reach_local_level(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let level = local_level(storage, txid);
+    loop {
+        let depth = storage.foreign_client(lease)?.remote_depth();
+        if depth >= level {
+            return Ok(());
+        }
+        let mut text = StackStr::<32>::new();
+        let _ = write!(text, "SAVEPOINT s{}", depth + 1);
+        command(storage, lease, text.as_str(), "SAVEPOINT")?;
+        storage.foreign_client(lease)?.set_remote_depth(depth + 1);
+    }
+}
+
+/// The local transaction's nesting level: 1, plus one per open savepoint.
+fn local_level(storage: &Storage, txid: u32) -> u32 {
+    let savepoints = storage
+        .foreign_statement_context_for(txid)
+        .savepoints()
+        .len();
+    u32::try_from(savepoints).map_or(u32::MAX, |savepoints| savepoints + 1)
 }
 
 /// Enters the remote transaction of `txid` on `server`'s cached connection,
@@ -510,7 +526,9 @@ fn enter_session(
         begin(storage, lease, txid, true)
     };
     let result = match start {
-        ForeignSessionStart::Active => return Ok(lease),
+        ForeignSessionStart::Active => {
+            return reach_local_level(storage, lease, txid).map(|()| lease);
+        }
         ForeignSessionStart::Connect => open(storage),
         ForeignSessionStart::Begin => match begin(storage, lease, txid, false) {
             // A cached connection found broken outside every transaction
@@ -519,7 +537,7 @@ fn enter_session(
             result => result,
         },
     };
-    match result {
+    match result.and_then(|()| reach_local_level(storage, lease, txid)) {
         Ok(()) => {
             storage.foreign_client(lease)?.activate();
             Ok(lease)
@@ -589,47 +607,79 @@ pub(crate) fn abort_session(storage: &Storage, txid: u32) {
     }
 }
 
-fn savepoint_command(
+/// The local nesting level of the savepoint `name`, the innermost one so
+/// named.
+fn savepoint_level(storage: &Storage, txid: u32, name: &str) -> Option<u32> {
+    let context = storage.foreign_statement_context_for(txid);
+    let position = context
+        .savepoints()
+        .iter()
+        .rposition(|savepoint| savepoint.as_str() == name)?;
+    u32::try_from(position).ok().map(|position| position + 2)
+}
+
+/// Ends the local subtransactions from the innermost down to `name`'s level
+/// on every connection that reached them, as postgres_fdw's subtransaction
+/// callback does: `RELEASE SAVEPOINT sn` when they commit, `ROLLBACK TO
+/// SAVEPOINT sn; RELEASE SAVEPOINT sn` when they abort.
+fn end_subtransactions(
     storage: &Storage,
     txid: u32,
-    prefix: &str,
     name: &str,
+    commit: bool,
 ) -> Result<(), SqlError> {
-    let mut text = StackStr::<256>::new();
-    let _ = text.write_str(prefix);
-    quote_identifier(&mut text, name);
-    if text.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "foreign savepoint command exceeds its fixed buffer"
-        ));
-    }
-    let tag = match prefix {
-        "SAVEPOINT " => "SAVEPOINT",
-        "RELEASE SAVEPOINT " => "RELEASE",
-        "ROLLBACK TO SAVEPOINT " => "ROLLBACK",
-        _ => unreachable!("foreign savepoint command has a fixed prefix"),
+    let Some(target) = savepoint_level(storage, txid, name) else {
+        return Ok(());
     };
-    for lease in storage.foreign_sessions(txid) {
-        let broken = storage.foreign_client(lease)?.is_broken();
-        // A lost connection stays broken until the transaction ends; its
-        // rollback to a savepoint has nothing left to undo remotely.
-        if broken && tag == "ROLLBACK" {
-            continue;
-        }
-        if command(storage, lease, text.as_str(), tag)? != b'T' {
-            return Err(unexpected_response(text.as_str()));
+    let innermost = local_level(storage, txid);
+    for level in (target..=innermost).rev() {
+        for lease in storage.foreign_sessions(txid) {
+            let client = storage.foreign_client(lease)?;
+            if client.remote_depth() != level {
+                continue;
+            }
+            // A lost connection stays broken until the transaction ends.
+            if client.is_broken() {
+                drop(client);
+                if commit {
+                    return Err(lost_connection());
+                }
+                continue;
+            }
+            drop(client);
+            let mut text = StackStr::<64>::new();
+            if commit {
+                let _ = write!(text, "RELEASE SAVEPOINT s{level}");
+            } else {
+                let _ = write!(
+                    text,
+                    "ROLLBACK TO SAVEPOINT s{level}; RELEASE SAVEPOINT s{level}"
+                );
+            }
+            let status = exchange(
+                storage,
+                lease,
+                text.as_str(),
+                None,
+                text.as_str(),
+                &mut |event| match event {
+                    SqlEvent::CommandComplete {
+                        tag: "RELEASE" | "ROLLBACK",
+                    } => Ok(()),
+                    _ => Err(unexpected_response(text.as_str())),
+                },
+            )?;
+            if status != b'T' {
+                return Err(unexpected_response(text.as_str()));
+            }
+            storage.foreign_client(lease)?.set_remote_depth(level - 1);
         }
     }
     Ok(())
 }
 
-pub(crate) fn savepoint(storage: &Storage, txid: u32, name: &str) -> Result<(), SqlError> {
-    savepoint_command(storage, txid, "SAVEPOINT ", name)
-}
-
 pub(crate) fn release_savepoint(storage: &Storage, txid: u32, name: &str) -> Result<(), SqlError> {
-    savepoint_command(storage, txid, "RELEASE SAVEPOINT ", name)
+    end_subtransactions(storage, txid, name, true)
 }
 
 pub(crate) fn rollback_to_savepoint(
@@ -637,7 +687,7 @@ pub(crate) fn rollback_to_savepoint(
     txid: u32,
     name: &str,
 ) -> Result<(), SqlError> {
-    savepoint_command(storage, txid, "ROLLBACK TO SAVEPOINT ", name)
+    end_subtransactions(storage, txid, name, false)
 }
 
 /// Closes a disconnecting backend's cached connections.

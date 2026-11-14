@@ -2549,7 +2549,7 @@ pub fn create_foreign_table(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PostgresForeignOptionContext {
     Wrapper,
     Server,
@@ -2663,17 +2663,133 @@ fn postgres_foreign_option_accepted(name: &str, context: PostgresForeignOptionCo
     }
 }
 
+/// The options postgres_fdw's validator knows for `context`, in its own
+/// order: libpq's connection options (debug ones, `fallback_application_name`,
+/// `client_encoding` and OAuth ones hidden; `user` and secrets on user
+/// mappings), then its own.
+fn postgres_fdw_option_candidates(
+    context: PostgresForeignOptionContext,
+) -> &'static [&'static str] {
+    match context {
+        PostgresForeignOptionContext::Server => &[
+            "service",
+            "passfile",
+            "channel_binding",
+            "connect_timeout",
+            "dbname",
+            "host",
+            "hostaddr",
+            "port",
+            "options",
+            "application_name",
+            "keepalives",
+            "keepalives_idle",
+            "keepalives_interval",
+            "keepalives_count",
+            "tcp_user_timeout",
+            "sslmode",
+            "sslnegotiation",
+            "sslcompression",
+            "sslcert",
+            "sslkey",
+            "sslcertmode",
+            "sslrootcert",
+            "sslcrl",
+            "sslcrldir",
+            "sslsni",
+            "requirepeer",
+            "require_auth",
+            "min_protocol_version",
+            "max_protocol_version",
+            "ssl_min_protocol_version",
+            "ssl_max_protocol_version",
+            "gssencmode",
+            "krbsrvname",
+            "gsslib",
+            "gssdelegation",
+            "target_session_attrs",
+            "load_balance_hosts",
+            "use_remote_estimate",
+            "fdw_startup_cost",
+            "fdw_tuple_cost",
+            "extensions",
+            "updatable",
+            "truncatable",
+            "fetch_size",
+            "batch_size",
+            "async_capable",
+            "parallel_commit",
+            "parallel_abort",
+            "keep_connections",
+            "analyze_sampling",
+            "use_scram_passthrough",
+        ],
+        PostgresForeignOptionContext::Mapping => &[
+            "user",
+            "password",
+            "sslpassword",
+            "password_required",
+            "use_scram_passthrough",
+            "sslcert",
+            "sslkey",
+            "gssdelegation",
+        ],
+        PostgresForeignOptionContext::Table => &[
+            "schema_name",
+            "table_name",
+            "use_remote_estimate",
+            "updatable",
+            "truncatable",
+            "fetch_size",
+            "batch_size",
+            "async_capable",
+            "analyze_sampling",
+        ],
+        PostgresForeignOptionContext::Column => &["column_name"],
+        PostgresForeignOptionContext::Wrapper | PostgresForeignOptionContext::Import => &[],
+    }
+}
+
 fn validate_postgres_foreign_option(
     name: &str,
     value: &str,
     context: PostgresForeignOptionContext,
 ) -> Result<(), SqlError> {
     if !postgres_foreign_option_accepted(name, context) {
-        return Err(sql_err!(
+        let error = sql_err!(
             sqlstate::FDW_INVALID_OPTION_NAME,
             "invalid option \"{}\"",
             name
-        ));
+        );
+        let candidates = postgres_fdw_option_candidates(context);
+        if context == PostgresForeignOptionContext::Import || candidates.contains(&name) {
+            return Err(error);
+        }
+        if candidates.is_empty() {
+            return Err(crate::sql::error_position::with_computed_hint(
+                error,
+                format_args!("There are no valid options in this context."),
+            ));
+        }
+        // `getClosestMatch`: the first candidate at the least distance, at
+        // most 4 edits and half the written name's length.
+        let mut closest: Option<(usize, &str)> = None;
+        for &candidate in candidates {
+            let distance = crate::sql::column_suggestion::levenshtein(name, candidate);
+            if distance <= 4
+                && distance <= name.len() / 2
+                && closest.is_none_or(|(best, _)| distance < best)
+            {
+                closest = Some((distance, candidate));
+            }
+        }
+        return Err(match closest {
+            Some((_, candidate)) => crate::sql::error_position::with_computed_hint(
+                error,
+                format_args!("Perhaps you meant the option \"{candidate}\"."),
+            ),
+            None => error,
+        });
     }
     validate_postgres_foreign_option_value(name, value)
 }
@@ -2711,16 +2827,12 @@ pub(crate) fn call_postgres_fdw_validator(
             continue;
         };
         let (name, value) = text.split_once('=').unwrap_or((text, ""));
-        match context {
-            Some(context) => validate_postgres_foreign_option(name, value, context)?,
-            None => {
-                return Err(sql_err!(
-                    sqlstate::FDW_INVALID_OPTION_NAME,
-                    "invalid option \"{}\"",
-                    name
-                ));
-            }
-        }
+        // A catalog postgres_fdw has no options for checks as the wrapper's.
+        validate_postgres_foreign_option(
+            name,
+            value,
+            context.unwrap_or(PostgresForeignOptionContext::Wrapper),
+        )?;
     }
     Ok(())
 }

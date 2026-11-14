@@ -115,10 +115,6 @@ pub(crate) fn establish_savepoint(
 ) -> Result<usize, SqlError> {
     txn.savepoint(name, wal_mark, storage.lock_mark(), cursor_mark)?;
     let index = txn.savepoint_index(name).expect("new savepoint is present");
-    if let Err(error) = super::foreign::savepoint(storage, txn.txid, name) {
-        txn.release_savepoints_from(index);
-        return Err(error);
-    }
     storage.set_cumulative_transaction_nest_level(txn.txid, index + 2);
     guc.savepoint();
     txn.publish_foreign_statement_context(storage)?;

@@ -16966,6 +16966,10 @@ struct ForeignSession {
     invalidated: bool,
     /// postgres_fdw's per-transaction cursor numbering (`c1`, `c2`, ...).
     cursor_number: u32,
+    /// postgres_fdw's `xact_depth`: the local nesting level the remote
+    /// transaction has reached (1 for the transaction, `n` after its
+    /// `SAVEPOINT sn`), or 0 outside a transaction.
+    remote_depth: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17092,9 +17096,22 @@ impl ForeignClientGuard<'_> {
         let session = self.session_mut();
         session.transaction_id = None;
         session.cursor_number = 0;
+        session.remote_depth = 0;
         if session.invalidated || !session.keep_connections || session.key.owner <= 0 {
             self.slot.close();
         }
+    }
+
+    /// The nesting level the remote transaction has reached.
+    pub(crate) fn remote_depth(&self) -> u32 {
+        self.slot
+            .session
+            .expect("a foreign client guard holds a reserved session")
+            .remote_depth
+    }
+
+    pub(crate) fn set_remote_depth(&mut self, depth: u32) {
+        self.session_mut().remote_depth = depth;
     }
 
     /// postgres_fdw's `GetCursorNumber`.
@@ -24608,6 +24625,7 @@ impl Storage {
             phase: ForeignSessionPhase::Opening,
             invalidated: false,
             cursor_number: 0,
+            remote_depth: 0,
         };
         let mut vacant = None;
         for (index, slot) in self.foreign_sessions.slots.iter().enumerate() {

@@ -53,6 +53,8 @@ impl ForeignKeyTrigger {
 
 impl ConstraintIdentity {
     pub(crate) const ENCODED_BYTES: usize = core::mem::size_of::<u32>();
+    /// Fills unused fixed-capacity slots; never an admitted identity.
+    pub(crate) const PLACEHOLDER: Self = Self(NonZeroU32::MAX);
 
     pub(crate) fn parse(created_at: u64) -> Option<Self> {
         if created_at > MAX_CONSTRAINT_CREATION {
@@ -109,10 +111,31 @@ impl ForeignKey {
             .oid()
     }
 
-    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> i32 {
-        self.identity
-            .expect("admitted foreign key has a creation identity")
-            .foreign_key_trigger_oid(trigger)
+    /// The OID of one of the key's RI triggers; `None` when the key has no
+    /// such trigger: a NOT ENFORCED key has none, and a key attached to its
+    /// partition parent's has no action triggers.
+    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> Option<i32> {
+        match trigger {
+            ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => {
+                self.action_triggers
+            }
+            ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => self.check_triggers,
+        }
+        .map(|stamp| stamp.foreign_key_trigger_oid(trigger))
+    }
+}
+
+impl ForeignKey {
+    /// Whether the key's trigger stamps fit it: a NOT ENFORCED key has no
+    /// triggers; an enforced one has check triggers, and action triggers
+    /// exactly when it is not attached to its partition parent's key.
+    pub(crate) fn trigger_stamps_consistent(&self) -> bool {
+        if self.validation == super::ConstraintValidation::NotEnforced {
+            self.action_triggers.is_none() && self.check_triggers.is_none()
+        } else {
+            self.check_triggers.is_some()
+                && self.action_triggers.is_some() != self.inherited_from.is_some()
+        }
     }
 }
 
@@ -205,6 +228,7 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
                         _ => None,
                     }),
             )
+            .chain(self.fkey_clones().iter().map(|clone| clone.identity))
     }
 }
 
@@ -283,6 +307,11 @@ impl super::TableDefBuilder {
                         }
                         _ => None,
                     }),
+            )
+            .chain(
+                self.fkey_clones[..self.n_fkey_clones]
+                    .iter_mut()
+                    .map(|clone| &mut clone.identity),
             )
     }
 }
@@ -526,10 +555,17 @@ pub(super) fn for_each_key_in_creation_order(
 }
 
 impl Storage {
+    /// A new constraint stamp, for a constraint PostgreSQL drops and creates
+    /// again under a new OID.
+    pub(crate) fn reserve_constraint_identity(&self) -> Result<ConstraintIdentity, SqlError> {
+        ConstraintIdentity::reserve(self)
+    }
+
     pub(super) fn reserve_constraint_identities(
         &self,
         definition: &mut super::TableDefBuilder,
         declared: Option<&ConstraintDeclarationOrder>,
+        creating: bool,
     ) -> Result<(), SqlError> {
         for (identity, slot) in definition
             .attribute_identities
@@ -565,7 +601,7 @@ impl Storage {
                 *identity = None;
             }
         }
-        self.reserve_table_constraints_in_creation_order(definition, declared)?;
+        self.reserve_table_constraints_in_creation_order(definition, declared, creating)?;
         validate_constraint_identities(definition.constraint_identities())
     }
 
@@ -573,11 +609,15 @@ impl Storage {
     /// assigns their OIDs: column defaults, CHECK constraints, NOT NULL
     /// constraints (a table primary key's undeclared columns last, in key
     /// order), the primary key, the other keys and exclusion constraints as
-    /// `declared`, then foreign keys.
+    /// `declared`, then foreign keys. A table being created
+    /// (`DefineRelation`) adds its local NOT NULL constraints before those it
+    /// inherits; a new partition clones its parent's keys and foreign keys
+    /// before it adds any NOT NULL constraint.
     fn reserve_table_constraints_in_creation_order(
         &self,
         definition: &mut super::TableDefBuilder,
         declared: Option<&ConstraintDeclarationOrder>,
+        creating: bool,
     ) -> Result<(), SqlError> {
         let reserve = |identity: &mut Option<ConstraintIdentity>| -> Result<(), SqlError> {
             if identity.is_none() {
@@ -629,11 +669,30 @@ impl Storage {
         let declared_not_null = |column: usize| {
             declared.is_some_and(|declared| declared.declared_not_null.contains(column))
         };
-        for attribute in 0..attributes {
-            if not_null(definition, attribute).is_some_and(|column| {
-                !primary.contains(&(column as u16)) || declared_not_null(column)
-            }) {
-                reserve(&mut definition.attribute_identities[attribute].not_null)?;
+        let partition = creating && definition.partition.attachment.is_some();
+        if partition {
+            for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
+            for key in &mut definition.fkeys[..definition.n_fkeys] {
+                // Trigger stamps belong to the identity they were taken with.
+                if key.identity.is_none() {
+                    key.action_triggers = None;
+                    key.check_triggers = None;
+                }
+                reserve(&mut key.identity)?;
+            }
+        }
+        // Local NOT NULL constraints, then (for a new table) inherited ones.
+        for local_pass in [true, false] {
+            for attribute in 0..attributes {
+                if not_null(definition, attribute).is_some_and(|column| {
+                    (!creating || definition.columns[column].not_null.is_local() == local_pass)
+                        && (!primary.contains(&(column as u16)) || declared_not_null(column))
+                }) {
+                    reserve(&mut definition.attribute_identities[attribute].not_null)?;
+                }
+            }
+            if !creating {
+                break;
             }
         }
         for &column in primary {
@@ -643,14 +702,51 @@ impl Storage {
                 reserve(&mut definition.attribute_identities[attribute].not_null)?;
             }
         }
-        for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
-        for key in &mut definition.fkeys[..definition.n_fkeys] {
-            reserve(&mut key.identity)?;
+        if !partition {
+            for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
+            for key in &mut definition.fkeys[..definition.n_fkeys] {
+                // Trigger stamps belong to the identity they were taken with.
+                if key.identity.is_none() {
+                    key.action_triggers = None;
+                    key.check_triggers = None;
+                }
+                reserve(&mut key.identity)?;
+            }
         }
         // Anything the creation order above does not name keeps the
         // definition's own order.
         for identity in definition.constraint_identities_mut() {
             reserve(identity)?;
+        }
+        // A key's check triggers follow its partition clones' action
+        // triggers (`addFkRecurseReferenced`, then
+        // `addFkRecurseReferencing`); a key attached to its partition
+        // parent's has no action triggers.
+        for position in 0..definition.n_fkeys {
+            let key = definition.fkeys[position];
+            let identity = key.identity.expect("reserved above");
+            let mut stamped = key;
+            if key.validation == super::ConstraintValidation::NotEnforced {
+                stamped.action_triggers = None;
+                stamped.check_triggers = None;
+                definition.fkeys[position] = stamped;
+                continue;
+            }
+            stamped.action_triggers = match key.inherited_from {
+                Some(_) => None,
+                None => key.action_triggers.or(Some(identity)),
+            };
+            if key.check_triggers.is_none() {
+                let cloned = definition.fkey_clones[..definition.n_fkey_clones]
+                    .iter()
+                    .any(|clone| clone.foreign_key == identity);
+                stamped.check_triggers = Some(if cloned {
+                    ConstraintIdentity::reserve(self)?
+                } else {
+                    identity
+                });
+            }
+            definition.fkeys[position] = stamped;
         }
         Ok(())
     }

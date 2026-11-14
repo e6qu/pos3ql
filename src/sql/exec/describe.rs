@@ -1807,6 +1807,8 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
 /// followed by the mandated per-node default ("case" for CASE, otherwise
 /// "?column?").
 pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
+    // A constant the planner folded is named as written.
+    let expression = expression.written();
     if let Some(n) = name_of(expression) {
         return n;
     }

@@ -29,6 +29,9 @@ fn constraint_named<B: DefinitionBacking>(definition: &TableDefinition<B>, name:
         || definition.uniques().iter().any(|key| key.name == name)
         || definition.checks().iter().any(|key| key.name == name)
         || definition.fkeys().iter().any(|key| key.name == name)
+        || definition
+            .keyed_fkey_clones()
+            .any(|clone| clone.name == name)
         || definition.exclusions().iter().any(|key| key.name == name)
         || definition.not_null_names.as_ref()[..definition.n_columns].contains(&Some(name))
         || definition

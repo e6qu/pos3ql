@@ -159,10 +159,12 @@ pub(crate) fn capture_before<'a>(
                 .push((reference, true))
                 .map_err(|_| graph_full())?;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
-                let reference = foreign_key_trigger_reference(child, foreign_key, trigger);
-                dependent_drops
-                    .push((reference, false))
-                    .map_err(|_| graph_full())?;
+                if let Some(reference) = foreign_key_trigger_reference(child, foreign_key, trigger)
+                {
+                    dependent_drops
+                        .push((reference, false))
+                        .map_err(|_| graph_full())?;
+                }
             }
         }
     }
@@ -541,6 +543,12 @@ enum EventObjectRef {
     ViewArrayType(u16),
     ViewRule(u16),
     MatviewRule(u16),
+    /// A foreign key's internal RI trigger on `table`.
+    ForeignKeyTrigger {
+        table: u16,
+        oid: i32,
+        action: bool,
+    },
     /// A row trigger's clone on a partition of its table.
     PartitionTrigger {
         trigger: u16,
@@ -734,6 +742,37 @@ impl EventObjectRef {
                 rule.address_names[2] = StackStr::from_str("_RETURN");
                 rule.address_name_count = 3;
                 rule
+            }
+            Self::ForeignKeyTrigger { table, oid, action } => {
+                let name = crate::stack_format!(
+                    64,
+                    "RI_ConstraintTrigger_{}_{}",
+                    if action { "a" } else { "c" },
+                    oid
+                );
+                let table = storage.table_def(usize::from(table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "{} on {}",
+                    identifier(name.as_str()).as_str(),
+                    qualified(table.schema.as_str(), table.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut object = base_object(
+                    catalog::PG_TRIGGER_OID,
+                    oid,
+                    "trigger",
+                    Some(table.schema.as_str()),
+                    Some(name.as_str()),
+                    identity,
+                    false,
+                );
+                object.address_names[0] = StackStr::from_str(table.schema.as_str());
+                object.address_names[1] = StackStr::from_str(table.name.as_str());
+                object.address_names[2] = StackStr::from_str(name.as_str());
+                object.address_name_count = 3;
+                object
             }
             Self::PartitionTrigger {
                 trigger,
@@ -3243,8 +3282,11 @@ fn existing_catalog_object(
                     (crate::storage::trigger_oid(&trigger) == object_id).then_some(slot)
                 }) {
                 Some(slot) => EventObjectRef::Primary(ObjectRef::Trigger(slot)),
-                None => partition_trigger_object(storage, txid, object_id)?
-                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                None => match partition_trigger_object(storage, txid, object_id)? {
+                    Some(object) => object,
+                    None => foreign_key_trigger_object(storage, txid, object_id)?
+                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                },
             }
         }
         catalog::PG_REWRITE_OID => {
@@ -3785,11 +3827,11 @@ fn foreign_key_trigger_reference<Definition0: crate::storage::DefinitionBacking>
     child: &crate::storage::TableDefinition<Definition0>,
     foreign_key: &crate::storage::ForeignKey,
     trigger: crate::storage::ForeignKeyTrigger,
-) -> EventObjectRef {
-    let oid = foreign_key.trigger_oid(trigger);
+) -> Option<EventObjectRef> {
+    let oid = foreign_key.trigger_oid(trigger)?;
     let ordinal = trigger.ordinal();
     let side = if ordinal < 2 { "a" } else { "c" };
-    EventObjectRef::DetachedTrigger {
+    Some(EventObjectRef::DetachedTrigger {
         oid,
         schema: if ordinal < 2 {
             foreign_key.parent_schema
@@ -3802,7 +3844,7 @@ fn foreign_key_trigger_reference<Definition0: crate::storage::DefinitionBacking>
             child.name
         },
         name: crate::stack_format!(128, "RI_ConstraintTrigger_{}_{}", side, oid),
-    }
+    })
 }
 
 fn push_foreign_key_trigger_drops<Definition0: crate::storage::DefinitionBacking>(
@@ -3812,13 +3854,9 @@ fn push_foreign_key_trigger_drops<Definition0: crate::storage::DefinitionBacking
     count: &mut usize,
 ) -> Result<(), SqlError> {
     for trigger in crate::storage::ForeignKeyTrigger::ALL {
-        push_drop_once(
-            output,
-            count,
-            foreign_key_trigger_reference(child, foreign_key, trigger),
-            false,
-            false,
-        )?;
+        if let Some(reference) = foreign_key_trigger_reference(child, foreign_key, trigger) {
+            push_drop_once(output, count, reference, false, false)?;
+        }
     }
     Ok(())
 }
@@ -4875,6 +4913,60 @@ pub(crate) fn collect<'a>(
 }
 
 /// The partition clone of a row trigger whose OID is `oid`, if any.
+/// The RI trigger with `oid`: a foreign key's action triggers sit on the
+/// referenced table (or, for a partition clone, the partition), its check
+/// triggers on the referencing table.
+fn foreign_key_trigger_object(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<EventObjectRef>, SqlError> {
+    let slot = |table: usize| u16::try_from(table).map_err(|_| graph_full());
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for key in definition.fkeys() {
+            let Some(referenced) =
+                storage.find_visible(key.parent_schema.as_str(), key.parent.as_str(), txid)
+            else {
+                continue;
+            };
+            for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                let action = trigger.ordinal() < 2;
+                if key.trigger_oid(trigger) != Some(oid) {
+                    continue;
+                }
+                return Ok(Some(EventObjectRef::ForeignKeyTrigger {
+                    table: slot(if action { referenced } else { table })?,
+                    oid,
+                    action,
+                }));
+            }
+            for clone in definition.keyed_fkey_clones() {
+                if clone.foreign_key == key.identity.expect("admitted foreign key has an identity")
+                    && [
+                        crate::storage::ForeignKeyTrigger::ActionDelete,
+                        crate::storage::ForeignKeyTrigger::ActionUpdate,
+                    ]
+                    .into_iter()
+                    .any(|trigger| clone.trigger_oid(trigger) == oid)
+                    && clone.partition.slot() < storage.table_count()
+                    && storage.table_position(clone.partition.slot()) == clone.partition
+                {
+                    return Ok(Some(EventObjectRef::ForeignKeyTrigger {
+                        table: slot(clone.partition.slot())?,
+                        oid,
+                        action: true,
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn partition_trigger_object(
     storage: &Storage,
     txid: u32,

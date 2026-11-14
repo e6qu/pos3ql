@@ -71,11 +71,15 @@ pub(crate) struct Context<'s> {
 
 /// How EXPLAIN refers to a subquery its plan runs separately.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[expect(clippy::enum_variant_names, reason = "PostgreSQL's EXPLAIN plan names")]
 pub(crate) enum SublinkPlan {
     /// Run once before the query's first row: `(InitPlan 1).col1`.
     InitPlan(u16),
     /// Run for each row that reads it: `(SubPlan 1)`.
     SubPlan(u16),
+    /// An uncorrelated `IN` or `= ANY` subquery whose rows are hashed once
+    /// and probed per row: `(hashed SubPlan 1).col1`.
+    HashedSubPlan(u16),
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -625,6 +629,11 @@ impl Context<'_> {
     /// The types this module derives itself, as PostgreSQL's parser does.
     fn modeled_type(&self, expression: &Expr<'_>) -> Result<Option<i32>, SqlError> {
         Ok(match expression {
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(_),
+                type_oid,
+                ..
+            } if self.folded => Some(*type_oid),
             Expr::Int(value) => Some(if i32::try_from(*value).is_ok() {
                 oid::INT4
             } else {
@@ -1117,6 +1126,21 @@ impl Context<'_> {
                 },
                 output,
             ),
+            // A planned expression prints the value the planner folded.
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                type_oid,
+                ..
+            } if self.folded => {
+                let mut values = [crate::sql::types::Datum::Null];
+                crate::sql::exec::decode_projected_row_into(encoded, output.arena, &mut values)?;
+                if matches!(values[0], crate::sql::types::Datum::Null) {
+                    output.push("NULL::")?;
+                    return self.type_name(*type_oid, output);
+                }
+                let text = crate::sql::eval::datum_to_text(values[0], output.arena)?;
+                self.constant(text, *type_oid, output)
+            }
             Expr::BoundLiteral { source, .. } => self.bare(source, output),
             Expr::BoundDefault { expression, .. } => self.bare(expression, output),
             Expr::OuterAggregate { call, .. } => self.bare(call, output),
@@ -1888,10 +1912,45 @@ impl Context<'_> {
                     (Expr::ArraySubquery(_), SublinkPlan::SubPlan(number)) => {
                         output.push_display(format_args!("ARRAY(SubPlan {number})"))
                     }
-                    (_, SublinkPlan::SubPlan(number)) => {
+                    (_, SublinkPlan::SubPlan(number) | SublinkPlan::HashedSubPlan(number)) => {
                         output.push_display(format_args!("(SubPlan {number})"))
                     }
                 }
+            }
+            // A compared subquery the plan runs separately prints as its
+            // comparison with the subplan's column (`get_rule_expr`'s
+            // SubPlan of an ANY or ALL sublink).
+            Expr::InSubquery {
+                operand,
+                select,
+                negated,
+            } if let Some(plan) = self
+                .sublinks
+                .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
+            {
+                if *negated {
+                    self.open(output)?;
+                    output.push("NOT ")?;
+                }
+                self.quantified_subplan(operand, "=", false, plan, output)?;
+                if *negated {
+                    self.close(output)?;
+                }
+                Ok(())
+            }
+            Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            } if let Some(plan) = self
+                .sublinks
+                .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
+            {
+                let Some(symbol) = operator_symbol(*operator) else {
+                    return output.unsupported();
+                };
+                self.quantified_subplan(operand, symbol, *all, plan, output)
             }
             // `get_sublink_expr`: a sublink parenthesizes itself.
             Expr::Exists(select) => {
@@ -1947,6 +2006,29 @@ impl Context<'_> {
                 output.push("))")
             }
             _ => output.unsupported(),
+        }
+    }
+
+    /// `(ANY (operand op (SubPlan n).col1))`, or `ALL`, as PostgreSQL prints
+    /// the subplan of a compared subquery.
+    fn quantified_subplan(
+        &self,
+        operand: &Expr<'_>,
+        symbol: &str,
+        all: bool,
+        plan: SublinkPlan,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        output.push(if all { "(ALL (" } else { "(ANY (" })?;
+        self.write(operand, None, output)?;
+        output.push_display(format_args!(" {symbol} "))?;
+        match plan {
+            SublinkPlan::InitPlan(number) | SublinkPlan::SubPlan(number) => {
+                output.push_display(format_args!("(SubPlan {number}).col1))"))
+            }
+            SublinkPlan::HashedSubPlan(number) => {
+                output.push_display(format_args!("(hashed SubPlan {number}).col1))"))
+            }
         }
     }
 

@@ -126,12 +126,18 @@ is owned.
   its slot, and collects indexes and foreign keys in one walk, so a commit
   no longer looks every table up by name for each table; checkpoint
   maintenance reads a value index binding's fields in place instead of
-  copying it. A commit's cost still grows with the catalog: each table's
-  index lookup scans every index and each foreign key finds its parent by
-  name. Capturing only the rows the transaction's changes name would bound
-  every relation by the change (`configured_transaction_capacity_covers_
-  truncate_fanout_and_prepared_cold_recovery`, which commits 300 tables'
-  DDL, took 175 s in a local debug build before and 108 s after).
+  copying it. `pg_attribute` looks up a foreign table's binding only for a
+  foreign table, and keying a catalog's rows reuses one row-wide buffer
+  (`configured_transaction_capacity_covers_truncate_fanout_and_prepared_
+  cold_recovery`, which commits 300 tables' DDL, took 122 s in a local
+  debug build before and 95 s after). A commit's cost still grows with the
+  catalog: about four fifths of it is synthesizing each changed catalog
+  relation (`pg_depend`, `pg_attribute` and `pg_constraint` most), so
+  capturing only the rows the transaction's changes name, with each
+  synthesizer filtered to the touched relations and their key and
+  inheritance neighbours, would bound it by the change. Each table's index
+  lookup still scans every index, and each foreign key finds its parent by
+  name; in that commit profile they cost under five percent.
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the
@@ -256,6 +262,12 @@ is owned.
     function arguments that are not constants, user-defined and other builtin
     set-returning functions, and column definition lists such as
     `jsonb_to_recordset(...) AS t(a int)`.
+    In object-store mode a `LATERAL` builtin call streams its rows through
+    an external run only for the functions evaluated one row at a time (the
+    generator, regex and `json`/`jsonb` families, `aclexplode`,
+    `pg_listening_channels`, `pg_available_extensions`); the others, such as
+    the `pg_partition_ancestors` call psql's `\d` makes, materialize in the
+    work arena as they do without object storage.
     A cursor over those shapes runs its query whole at its first read, with
     the snapshot taken when it opened: a scrollable cursor ordered by an
     expression that is not a source column returns saved values where
@@ -510,14 +522,21 @@ folds `RETURNING`, each action's assignments or values and condition, then
 its join condition, before its statement triggers fire. Folding gaps
 remain: aggregate arguments, window specifications, `FROM` subqueries and a
 `MERGE` into a view are evaluated where they run; join conditions inside a
-parenthesized join are not folded; a parameter of a custom plan does not fold; a literal conversion
-in a prepared statement raises its notice at each `EXECUTE` where
-PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
-prepared statement to keep every converted literal, not only the typed
-inputs it keeps today; a statement a routine runs folds at each run where
+parenthesized join are not folded; a parameter of a custom plan does not fold; a statement a routine runs folds at each run where
 PostgreSQL folds its cached plan once per session; and PostgreSQL's
 selectivity estimate, which evaluates a stable call compared with an indexed
 column once more while planning, is not modeled.
+`PREPARE` converts each literal as PostgreSQL's parse analysis does: a
+literal cast to a built-in type (`''::tsquery`, `int4 '7'`, `'{1}'::int[]`)
+and an untyped literal the analysis converts (an inserted or assigned value,
+a comparison operand, a built-in routine's argument) run their input
+function once there, raising its notice or error, and the prepared
+statement keeps the converted values (with its text, in its
+`prepared_bytes` slot; more fails with `54000`), which each `EXECUTE` reads.
+A cast's length coercion (`'123.45'::numeric(3,1)`) and constant folding
+(`1/0`) run when the statement is planned, at each `EXECUTE`. Remaining: a
+statement prepared through the extended protocol's Parse still converts its
+literals at each Execute, and an input notice carries no cursor position.
 `UPDATE` and `DELETE` whose conditions (`WHERE`, `FROM` or `USING` items, or
 row-security policies) call a user routine or a volatile built-in qualify
 each candidate row in their change loop, just before changing it, as
@@ -545,15 +564,17 @@ after the relation's own conditions, except that a write runs it first
 when an index leads with its column, as PostgreSQL's plan then reads the
 subquery's rows and probes the index. Under row security each policy condition runs
 before the statement's conditions, except that a leakproof conjunct of a
-single-relation query or write cheaper than ten operators and than the first
-policy condition runs before the policies. A foreign table's candidate
+single-relation query or write cheaper than ten operators runs before the
+first policy condition when it costs less, and right after it otherwise,
+as PostgreSQL's `order_qual_clauses` sorts by security level and cost; a
+write's WITH CHECK options test the OR of the permissive policies before
+each restrictive one. `EXPLAIN` of a single-relation query prints the
+policy conditions in its scan's `Filter` in that order. A foreign table's candidate
 rows are read again by their remote row identity and qualified in the
 change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
 ... USING` whose target reaches a foreign table's rows qualifies them
-before any change; such a leakproof conjunct that costs at
-least as much as the first policy condition runs after every policy
-condition, where PostgreSQL runs it right after the first; `EXPLAIN` prints
-a scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
+before any change; `EXPLAIN` of `UPDATE` and `DELETE` prints the target
+scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
 `DELETE ... USING` cost a routine reading a joined item's column as one
 operator; a data-modifying `WITH` sub-statement runs ahead of the main
 statement (above). A rule action reads the triggering statement's
@@ -561,10 +582,18 @@ expression for each `OLD` or `NEW` reference it (or its rule's condition)
 makes, as PostgreSQL's rewriter substitutes them: it evaluates only the
 `SET` expressions, single `VALUES` row expressions and column defaults it
 reads, once per reference, while an `INSERT` reading a query or several
-`VALUES` rows evaluates each input column once per row. Those expressions
-form a derived relation the action reads, which is evaluated for every row
-before the action's own expressions run, where PostgreSQL interleaves them
-row by row. A policy that a write's `UPDATE` (or `DELETE`)
+`VALUES` rows evaluates each input column once per row. An action reading
+only those expressions evaluates them row by row, interleaved with its own
+expressions, and an `INSERT ... SELECT` statement's query without volatile
+output is pulled up into it the same way. Remaining: an action that also
+reads other relations (its own `FROM`, an `UPDATE` or `DELETE` action, or
+several `VALUES` rows), and an `INSERT` statement whose query has volatile
+output, read a derived relation evaluated for every row first (one
+`VALUES` row's expressions run before an action expression written ahead
+of the reference), where
+PostgreSQL's subquery scan streams it; an `INSERT ... SELECT` whose
+condition and output both call routines evaluates every row's condition
+before the outputs. A policy that a write's `UPDATE` (or `DELETE`)
 and `SELECT` commands share runs once per row, as PostgreSQL's
 `list_append_unique` keeps it; each command's restrictive policies run
 before the OR of its permissive ones, which stops at the first that passes.
@@ -576,9 +605,16 @@ row security applies to the user, as PostgreSQL decides; otherwise a unique
 violation has no detail and the others say `Key conflicts with existing
 key.`, `Key is not present in table "p".` or `Key is still referenced from
 table "c".`. A NOT NULL, CHECK or view check option violation's `Failing row
-contains (...)` still lists every column, where PostgreSQL lists only the
-columns the user may read or the statement wrote, as `(a, c) = (1, 3)`, and
-none under row security; that needs the written columns at each check.
+contains (...)` follows `ExecBuildSlotValueDescription`: a user without
+`SELECT` on the table sees only the columns they may read or the statement
+wrote, named (`(a, c) = (1, 3)`), no detail when there are none, and none
+while row security applies. The written columns are an `INSERT`'s (or
+`COPY`'s) target columns, an `UPDATE`'s `SET` columns, those of every
+`MERGE` action and, under `ON CONFLICT DO UPDATE`, both. Remaining: an
+`INSERT ... SELECT *` without a column list counts every column as written,
+and a view written through `INSTEAD OF` triggers and a subscription's
+applied rows list every column. Revoking a table privilege revokes it on
+each column too.
 Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
 its cost-based plan: a query or data change on one table whose condition
@@ -594,10 +630,7 @@ access method that accepts its type, built-in (`text_pattern_ops`) or a
 user-defined btree class, a `COLLATE`, and, under btree, `DESC` and `NULLS
 FIRST/LAST`; its operator may be user-defined when the class's family holds
 it, and runs through the operator's function. Operator class options on an
-element fail with `0A000`. `ALTER COLUMN ... TYPE` keeps the
-OIDs of the key and exclusion indexes over the column, where PostgreSQL
-rebuilds them with new OIDs, so after it a row that violates two
-constraints can report the other one first. `DROP COLUMN` of a column an
+element fail with `0A000`. `DROP COLUMN` of a column an
 exclusion expression or predicate reads lists those constraints in their own
 `2BP01` report, separately from views, policies and routines that also depend
 on the column, and reports `cannot drop column ...` where PostgreSQL, when
@@ -732,15 +765,30 @@ node (referenced as `(InitPlan n).col1`, and gating the scan from a `Result`
 when a condition reads only such subplans), a correlated one in the select
 list or `WHERE` of a one-relation query as `SubPlan n` after the inputs of the
 node evaluating it, numbered as PostgreSQL plans them, with the subplan's
-relations named uniquely (`u_1`). Not yet shown: `IN`/`ANY`/`ALL`/row
-subqueries as subplans, a correlated subquery of a join, the `Result` that
-PostgreSQL adds above a sorted, limited query to run select-list subplans
-after the sort, a subplan's figures under `ANALYZE` (its nodes print none:
-execution counts every subquery's operators in one block), `CTE` InitPlans
+relations named uniquely (`u_1`). Under `ANALYZE` each subplan's nodes
+report their own figures, once per run. A sorted query whose select list
+calls a volatile function, or under `LIMIT` a user routine or a correlated
+subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
+list (`make_sort_input_target`), which hosts the list's subplans; execution
+still evaluates the list before sorting, so such a subplan runs, and a
+routine is called, once per input row where PostgreSQL runs it only for the
+rows the sort and limit return. An `IN`, `NOT IN`, `ANY` or `ALL`
+subquery run as a subplan prints its comparison in the condition
+(`Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))`): hashed when it is
+uncorrelated `IN` or `= ANY`, and scanned through the `Materialize`
+PostgreSQL adds over another uncorrelated one; that `Materialize` reports no
+`ANALYZE` figures yet, `VERBOSE` does not qualify the statement's columns
+when it has subplans, and an uncorrelated `< ANY` in `WHERE`, which
+PostgreSQL pulls up into a semi join, is shown as a subplan. Not yet shown:
+row subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
 clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
-them as per-row subqueries), an incremental sort's `ANALYZE` group lines,
+them as per-row subqueries; a pull-up into semi and anti joins that run as
+hash or nested-loop joins matches PostgreSQL's plans and figures in the
+common shapes, but its join is not yet read by the retained executor, so a
+cold statement with such a subquery would no longer wait for its blocks),
+an incremental sort's `ANALYZE` group lines,
 `VERBOSE` output lists of windows and expressions (the output columns' names
 are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
@@ -761,19 +809,24 @@ condition is false with `HashAggregate` where PostgreSQL may sort, and does
 not flatten a distinct union of more than two inputs into one `Append`. A
 `top-N heapsort` of input that spills before the sort ends is reported as
 `external merge`. Notices carry
-no position (`''::tsquery` points at the literal in PostgreSQL). A constant
-error that folding reaches after a notice or warning (`SELECT
-timestamptypmodin('{7}'), 1/0` or `SELECT ''::tsquery, 1/0`) is reported
-without the earlier message, which PostgreSQL sends first. `EXPLAIN` plans
-the statement as written, without the planner's constant folding: a
-condition prints its constants unfolded (`Filter: (a > (1 + 1))` where
-PostgreSQL prints `(a > 2)`, and an `UPDATE` or `DELETE` whose condition
-is `WHERE 1 = 2` keeps its scan where PostgreSQL plans a `Result` with a
-false `One-Time Filter`), and a plain
-`EXPLAIN` raises none of the folding's notices or errors. Folding while
-planning needs the resumable executor that PL/pgSQL calls run in, which the
-planner does not have; an `EXPLAIN ANALYZE` of a statement that calls a
-PL/pgSQL function fails with `0A000`. Errors in a client's query report
+no position (`''::tsquery` points at the literal in PostgreSQL), and a
+literal conversion's notice is raised where the statement folds rather than
+during parse analysis, so `UPDATE t SET a = 1/0 WHERE ''::tsquery IS NOT
+NULL` reports the division without the notice PostgreSQL sends first.
+`EXPLAIN` plans the statement the planner's constant folding produced:
+conditions print folded values (`Filter: (a > 2)`), a comparison with a NULL
+constant folds to NULL, a condition folded to false or NULL leaves a `Result`
+with a false `One-Time Filter` (also under `UPDATE` and `DELETE`), a
+conjunct folded to true is dropped, an `IN` list of constants prints as one
+array constant, and a condition that reads no column and calls no volatile
+function gates a single relation's scan from a `Result`. Plain `EXPLAIN`
+raises the folding's notices and errors; `EXPLAIN ANALYZE` raises them once.
+Set operation leaves, derived tables and subqueries print their constants
+as written. `EXPLAIN ANALYZE` runs its statement on the resumable executor,
+so statements calling PL/pgSQL functions are analyzed; a write that
+qualifies its rows in its change loop counts its scan's kept and removed
+rows across the attempts its calls restart. A write's top node returns its
+`RETURNING` rows. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
@@ -796,23 +849,41 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
-The built-in `postgres_fdw` extension's routines cannot be called directly
-(`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need
-connections cached past their transaction, which pos3ql closes at transaction
-end, and `postgres_fdw_validator` is run only by wrapper DDL. A foreign
-server's error keeps its SQLSTATE, message, `DETAIL`, `HINT` and `CONTEXT`
-and adds `remote SQL command: ...`, as postgres_fdw reports it; the remote
-command differs from postgres_fdw's own (an `INSERT` reads back
-`RETURNING ctid::text` and every column, and a scan reads the whole table
-with one plain `SELECT` where postgres_fdw declares a cursor and fetches
-`fetch_size` rows at a time), and `batch_size` is not honored. `CREATE
+postgres_fdw's connection cache, `postgres_fdw_get_connections`,
+`postgres_fdw_disconnect(_all)`, `keep_connections`, invalidation on server and
+user-mapping changes (committed by `COMMIT` or `COMMIT PREPARED`), cursor scans
+(`DECLARE cN CURSOR FOR`, `FETCH fetch_size FROM cN`, `CLOSE cN`), its INSERT
+text and `batch_size` INSERTs match PostgreSQL's loopback in
+`tests/external/foreign-connection-cache.sql`. A query of one foreign table
+ships its needed columns, the conditions `is_foreign_expr` accepts (built-in
+immutable operators and functions over modeled built-in types, constants and
+`IN` lists, ordered as `order_qual_clauses` orders them), its `ORDER BY` when
+every key is a table column, and `LIMIT`/`OFFSET` when nothing stays local;
+direct `UPDATE`/`DELETE` and the row-by-row `WHERE ctid = $1` commands match,
+with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
+and `differential_exact/504`. Remaining differences: joins, aggregates,
+`DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
+`COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
+with `RETURNING` runs row by row, as does one of a table with any trigger
+(PostgreSQL disqualifies only row triggers for the statement's event, so
+statement triggers must fire around the direct command first); an `UPDATE` sends no stored generated column
+values; a select list or `ORDER BY` with a subquery reads every column. A scan
+still reads all its rows before the plan consumes them (the cursor's `FETCH`
+batches are not streamed). COPY FROM into a foreign table sends one row at a
+time, ignoring `batch_size`. A batched INSERT also sends its queued rows when
+the statement pauses for a PL/pgSQL call or a full output buffer, which
+PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,
+password, connect_timeout, application_name and sslmode fail with `HV00D`.
+`CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
-has only its own `pg_constraint` row: PostgreSQL also lists one clone per
-partition of the referenced table (`pc_a_fkey_1`, whose `conindid` is that
-partition's index). `ALTER COLUMN ... TYPE` on a partitioned table keeps
-each partition's index name where PostgreSQL rebuilds them under new
-generated names (`pr_1_label_idx` after a rename). A btree index may use
+has one `pg_constraint` clone, with its two RI action triggers, per
+referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
+when made and kept), added and removed as partitions are created, attached,
+detached and dropped; a referenced partition's violations, `DETACH` and
+`DROP` report it as PostgreSQL does. A table can hold at most 256 such
+clones (`54000`). `pg_get_partition_constraintdef(oid)`, which psql's `\d+`
+calls for a partition, fails with `0A000`. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family
@@ -821,12 +892,15 @@ operator, as PostgreSQL's operator families do. It does not yet turn a
 `C`, `>=`/`<`) index range with the pattern kept as a filter, nor scan a
 pattern-class key for an explicit `~<~`-family range: those keys get their
 own physical binding, whose range plans need PostgreSQL's prefix and
-histogram selectivity to choose its bitmap scan; `=` on a pattern-class key
-shows `Index Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
-table column but not a view column (`0A000`). A PL/pgSQL assignment to a
-three-part name (`x.y.z := 1`, a labelled row variable's field) fails with
-`0A000`, where PostgreSQL assigns `label.row.field` or reports `"x.y.z" is
-not a known variable`. A literal passed to a function's `regclass`
+histogram selectivity to choose its bitmap scan. Any B-tree range (`id >= 5
+AND id < 9`, also under `enable_seqscan = off`) is planned as a sequential
+scan until its value binding is durably complete, so a range derived from a
+prefix would show only on spilled tables. `=` on a B-tree key whose columns
+cover the query shows `Index Scan` where PostgreSQL shows `Index Only Scan`;
+EXPLAIN names an index-only scan only for an ordered plan. A routine parameter or result written with `%TYPE` may name a
+table column but not a view column (`0A000`). When a block label and a row variable share the
+first word, the variable wins only when it is declared at least as deep as
+the labelled block's variable, where PostgreSQL compares block by block. A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
@@ -958,3 +1032,9 @@ limits do not count as evidence.
 [AGENTS.md](AGENTS.md) holds the engineering and change rules and
 [CONTRIBUTING.md](CONTRIBUTING.md) holds the verification gates. The roadmap is
 finished only when every milestone's "done when" is demonstrated.
+
+The macOS arm64 native test build is memory-bound: compiling the library test
+executable peaks near 7 GB, all of the hosted runner, and takes about 7 minutes
+there against under 2 minutes on a larger machine. Lower that compiler peak,
+for example by moving large test fixtures out of the library crate, before the
+library grows enough to approach the 15-minute job limit again.

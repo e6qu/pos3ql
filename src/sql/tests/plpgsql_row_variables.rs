@@ -210,3 +210,74 @@ fn trigger_records_are_assignable_record_variables() {
         );
     });
 }
+
+#[test]
+fn block_qualified_record_fields_are_assignable() {
+    with_engine("plpgsql-block-record-fields", |engine, budget| {
+        run_with(engine, budget, "CREATE TYPE three_part AS (a int, b int)");
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ <<b1>> DECLARE r three_part; BEGIN <<b2>> DECLARE r int := 3; \
+                 BEGIN b1.r.a := r; b1.r.b := b2.r * 2; END; RAISE NOTICE '%', r; END $$",
+            ),
+            ["NOTICE 00000 (3,6)", "DO"]
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ <<b>> DECLARE r three_part; BEGIN b.r.c := 1; END $$",
+            )[0],
+            "ERROR 42703 record \"r\" has no field \"c\""
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ <<b>> DECLARE c CONSTANT three_part := ROW(1, 2); BEGIN b.c.a := 1; END $$",
+            )[0],
+            "ERROR 22005 variable \"c\" is declared CONSTANT @63"
+        );
+    });
+}
+
+#[test]
+fn composite_sub_fields_are_assignable_through_row_variables() {
+    with_engine("plpgsql-sub-fields", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE TYPE sub_inner AS (x int, y text); \
+             CREATE TYPE sub_outer AS (a sub_inner, n int)",
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ <<blk>> DECLARE r sub_outer; BEGIN r.a.x := 1; blk.r.a.y := 'q'; \
+                 RAISE NOTICE '%', r; END $$",
+            ),
+            ["NOTICE 00000 (\"(1,q)\",)", "DO"]
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ DECLARE r sub_outer; BEGIN r.n.x := 1; END $$",
+            )[0],
+            "ERROR 42804 cannot assign to field \"x\" of column \"r\" because its type integer \
+             is not a composite type"
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "DO $$ DECLARE r sub_outer; BEGIN r.a.x.w := 1; END $$",
+            )[0],
+            "ERROR 42804 cannot assign to field \"w\" of column \"x\" because its type integer \
+             is not a composite type"
+        );
+    });
+}

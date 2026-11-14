@@ -1216,10 +1216,9 @@ impl<'a> Parser<'a> {
             return Ok(&[]);
         }
         loop {
+            // A repeated name fails as PostgreSQL's transformGenericOptions
+            // reports it, once the statement runs.
             let name = self.any_ident("foreign option name")?;
-            if options.as_slice().iter().any(|option| option.name == name) {
-                return Err(self.err_here("foreign option specified more than once"));
-            }
             let value = self.str_literal("foreign option value")?;
             self.push(&mut options, ForeignOption { name, value })?;
             if self.eat_op(")")? {
@@ -1235,7 +1234,6 @@ impl<'a> Parser<'a> {
     ) -> Result<&'a [ForeignOptionAction<'a>], ParseError> {
         self.expect_op("(")?;
         let mut options = ArenaList::new(self.arena);
-        let mut names = ArenaList::new(self.arena);
         if self.eat_op(")")? {
             return Ok(&[]);
         }
@@ -1248,11 +1246,9 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("add")?;
                 0u8
             };
+            // Actions apply in order: a repeated ADD fails as a duplicate and a
+            // repeated DROP as a missing option, as in PostgreSQL.
             let name = self.any_ident("foreign option name")?;
-            if names.as_slice().contains(&name) {
-                return Err(self.err_here("foreign option specified more than once"));
-            }
-            self.push(&mut names, name)?;
             let action = if operation == 2 {
                 ForeignOptionAction::Drop(name)
             } else {
@@ -3686,38 +3682,8 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("INSTEAD OF triggers cannot have column lists"));
             }
         }
-        if !matches!(transition_tables, TriggerTransitionTables::None) {
-            if event_count != 1 {
-                return Err(self.err_here(
-                    "transition tables cannot be specified for triggers with more than one event",
-                ));
-            }
-            if !matches!(timing, TriggerTiming::After) {
-                return Err(self.err_here("transition tables are only valid for AFTER triggers"));
-            }
-            if events[..event_count].contains(&TriggerEvent::Truncate) {
-                return Err(self.err_here("TRUNCATE triggers cannot have transition tables"));
-            }
-            if transition_tables.old().is_some()
-                && !events[..event_count]
-                    .iter()
-                    .any(|event| matches!(event, TriggerEvent::Update | TriggerEvent::Delete))
-            {
-                return Err(self.err_here("OLD TABLE requires UPDATE or DELETE"));
-            }
-            if transition_tables.new_table().is_some()
-                && !events[..event_count]
-                    .iter()
-                    .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
-            {
-                return Err(self.err_here("NEW TABLE requires INSERT or UPDATE"));
-            }
-            if !update_columns.is_empty() {
-                return Err(
-                    self.err_here("UPDATE OF column lists cannot be used with transition tables")
-                );
-            }
-        }
+        // Transition tables are checked once the relation is known, in
+        // PostgreSQL's CreateTrigger order.
         // The condition stays a slice of the statement, so its analysis
         // errors carry their position.
         let when = self
@@ -8377,6 +8343,78 @@ impl<'a> Parser<'a> {
         Ok((names.as_slice(), if_exists))
     }
 
+    /// PostgreSQL's `OptTypedTableElementList` of a partition, after its
+    /// `(`: column options, which keep an empty type name, and table
+    /// constraints.
+    fn partition_elements(
+        &mut self,
+        table: &'a str,
+        foreign: bool,
+    ) -> Result<(&'a [ColumnDef<'a>], &'a [TableConstraint<'a>]), ParseError> {
+        let mut columns = ArenaList::new(self.arena);
+        let mut cons = ArenaList::new(self.arena);
+        loop {
+            let at = self.peek_at;
+            let constraint_name = if self.eat_ident("constraint")? {
+                Some(self.col_ident("constraint name")?)
+            } else {
+                None
+            };
+            if matches!(
+                self.peeked,
+                Tok::Ident("primary" | "unique" | "check" | "foreign" | "exclude")
+            ) {
+                let constraint = self.table_constraint(
+                    constraint_name,
+                    SourcePosition::new(Some(at)),
+                    if foreign {
+                        ConstraintSite::CreateForeignTable
+                    } else {
+                        ConstraintSite::CreateTable
+                    },
+                )?;
+                self.push(&mut cons, constraint)?;
+            } else {
+                if constraint_name.is_some() {
+                    return Err(self.syntax_error_here());
+                }
+                let column = self.col_ident("column name")?;
+                if self.eat_ident("with")? {
+                    self.expect_ident("options")?;
+                }
+                let clauses = self.column_clauses(column, table, !foreign, &mut cons)?;
+                self.push(
+                    &mut columns,
+                    ColumnDef {
+                        source_position: SourcePosition::new(Some(at)),
+                        name: column,
+                        type_name: "",
+                        type_mod: -1,
+                        collation: crate::sql::ast::ParsedCollation::DEFAULT,
+                        foreign_options: &[],
+                        storage: None,
+                        compression: crate::sql::ast::ColumnCompression::Default,
+                        not_null: clauses.not_null,
+                        not_null_name: clauses.not_null_name,
+                        not_null_inheritable: clauses.not_null_inheritable,
+                        unique: clauses.unique,
+                        primary: clauses.primary,
+                        default: clauses.default,
+                        default_text: clauses.default_text,
+                        generated_text: clauses.generated_text,
+                        generated_kind: clauses.generated_kind,
+                        identity: clauses.identity,
+                    },
+                )?;
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok((columns.as_slice(), cons.as_slice()))
+    }
+
     fn create_table(
         &mut self,
         foreign: bool,
@@ -8401,6 +8439,14 @@ impl<'a> Parser<'a> {
         if self.eat_ident("partition")? {
             self.expect_ident("of")?;
             let parent = self.qual_name("partitioned table name")?;
+            // `( column [WITH OPTIONS] constraints | table_constraint, ... )`:
+            // options of the parent's columns, whose types it keeps, as an
+            // empty type name.
+            let (columns, constraints) = if self.eat_op("(")? {
+                self.partition_elements(name.name, foreign)?
+            } else {
+                (&[][..], &[][..])
+            };
             let bound = self.partition_bound()?;
             let subpartition = if self.eat_ident("partition")? {
                 Some(self.partition_by_clause()?)
@@ -8424,8 +8470,8 @@ impl<'a> Parser<'a> {
             };
             let relation = CreateTable {
                 name,
-                columns: &[],
-                constraints: &[],
+                columns,
+                constraints,
                 likes: &[],
                 partition: PartitionClause::Of {
                     parent,

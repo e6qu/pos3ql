@@ -751,6 +751,8 @@ pub struct ReplicationClient {
     tls: Option<Arc<rustls::ClientConfig>>,
     purpose: ClientPurpose,
     slot_snapshot: Option<SlotSnapshot>,
+    /// The server process from BackendKeyData, 0 until it arrives.
+    backend_pid: i32,
 }
 
 /// All immutable replication-stream parameters are parsed and selected before
@@ -823,6 +825,7 @@ impl ReplicationClient {
             tls: tls.map(|tls| tls.config.clone()),
             purpose: ClientPurpose::Unbound,
             slot_snapshot: None,
+            backend_pid: 0,
         })
     }
 
@@ -899,7 +902,28 @@ impl ReplicationClient {
         self.scram = None;
         self.purpose = ClientPurpose::Unbound;
         self.slot_snapshot = None;
+        self.backend_pid = 0;
         self.state = ClientState::Idle;
+    }
+
+    /// The most bytes one queued request may take.
+    pub(crate) fn send_capacity(&self) -> usize {
+        self.send.capacity()
+    }
+
+    /// The remote server process serving this connection, or 0.
+    pub(crate) fn backend_pid(&self) -> i32 {
+        self.backend_pid
+    }
+
+    /// Whether a SQL connection is idle between commands.
+    pub(crate) fn is_sql_ready(&self) -> bool {
+        self.state == ClientState::SqlReady
+    }
+
+    /// Whether a SQL command's response is still arriving.
+    pub(crate) fn is_awaiting_sql(&self) -> bool {
+        self.state == ClientState::AwaitingSql
     }
 
     pub(crate) fn bind_create_slot(
@@ -1209,6 +1233,10 @@ impl ReplicationClient {
             let Some((used, frame)) = parsed else {
                 break;
             };
+            if let BackendFrame::BackendKeyData { process_id } = frame {
+                self.backend_pid = process_id;
+            }
+            let publisher_error = matches!(frame, BackendFrame::Error { .. });
             let ReplicationClient {
                 endpoint,
                 slot,
@@ -1242,7 +1270,18 @@ impl ReplicationClient {
                     scram,
                 },
                 frame,
-            )?;
+            );
+            // A server error is a complete message: consume it so a caller can
+            // read on to the ReadyForQuery that ends the failed command.
+            let copied = match copied {
+                Err(error) => {
+                    if publisher_error {
+                        self.receive.consume(used);
+                    }
+                    return Err(error);
+                }
+                Ok(copied) => copied,
+            };
             if let Some(frame) = copied {
                 visit(frame)?;
             }
@@ -1470,7 +1509,8 @@ fn consume_frame<'a>(
         BackendFrame::ParseComplete | BackendFrame::BindComplete | BackendFrame::NoData
             if *state == ClientState::AwaitingSql => {}
         BackendFrame::ReadyForQuery { transaction_status }
-            if *state == ClientState::AwaitingSql && matches!(transaction_status, b'I' | b'T') =>
+            if *state == ClientState::AwaitingSql
+                && matches!(transaction_status, b'I' | b'T' | b'E') =>
         {
             *state = ClientState::SqlReady;
             return Ok(Some(ClientEvent::Sql(SqlEvent::Ready {
@@ -1486,7 +1526,7 @@ fn consume_frame<'a>(
             return Ok(Some(ClientEvent::Replication(frame)));
         }
         BackendFrame::ParameterStatus { .. }
-        | BackendFrame::BackendKeyData
+        | BackendFrame::BackendKeyData { .. }
         | BackendFrame::Notice { .. } => {}
         BackendFrame::Error { fields } => {
             return Err(ClientError::Publisher(publisher_diagnostic(fields)?));
@@ -1674,7 +1714,7 @@ pub enum Authentication<'a> {
 pub enum BackendFrame<'a> {
     Authentication(Authentication<'a>),
     ParameterStatus { name: &'a str, value: &'a str },
-    BackendKeyData,
+    BackendKeyData { process_id: i32 },
     ReadyForQuery { transaction_status: u8 },
     CopyBoth,
     CopyOut { fields: u16, binary: bool },
@@ -1930,7 +1970,9 @@ pub fn next_frame(bytes: &[u8]) -> Result<Option<(usize, BackendFrame<'_>)>, Fra
             BackendFrame::ParameterStatus { name, value }
         }
         wire::MSG_BACKEND_KEY_DATA if matches!(payload.len(), 8 | 20) => {
-            BackendFrame::BackendKeyData
+            BackendFrame::BackendKeyData {
+                process_id: i32::from_be_bytes(payload[..4].try_into().expect("checked length")),
+            }
         }
         wire::MSG_READY_FOR_QUERY if payload.len() == 1 => BackendFrame::ReadyForQuery {
             transaction_status: payload[0],

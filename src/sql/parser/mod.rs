@@ -595,6 +595,19 @@ pub(crate) struct TypeInputSyntax<'a> {
     pub expression: Option<&'a Expr<'a>>,
 }
 
+/// A bound input's value: a checked array (or null) input, or a scalar
+/// value of a built-in type converted when a prepared statement was
+/// prepared.
+fn bound_literal_value<'a>(
+    binding: super::type_inputs::Binding<'a>,
+) -> crate::sql::ast::BoundLiteralValue<'a> {
+    if super::type_inputs::checked_input_value(binding.encoded) {
+        crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded)
+    } else {
+        crate::sql::ast::BoundLiteralValue::Folded(binding.encoded)
+    }
+}
+
 pub(crate) fn type_input_sources<'a>(
     sql: &'a str,
     kind: StoredSqlKind,
@@ -1485,7 +1498,7 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
             }
             return self.arena_expr(Expr::BoundLiteral {
-                value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded),
+                value: bound_literal_value(binding),
                 type_oid: binding.type_oid,
                 type_mod: binding.type_mod,
                 collation: binding.collation,
@@ -10946,17 +10959,37 @@ impl<'a> Parser<'a> {
                                 self.arena_full("type input source map exceeds SQL arena")
                             })?;
                     }
-                    return self
+                    // PostgreSQL runs a built-in input function with the
+                    // modifier only for `interval`; the length coercion the
+                    // cast adds still runs when the statement executes.
+                    let length_coercion = super::type_inputs::is_builtin_oid(binding.type_oid)
+                        && binding.type_mod != -1
+                        && binding.type_oid != super::types::oid::INTERVAL;
+                    let bound = self
                         .arena
                         .alloc(Expr::BoundLiteral {
-                            value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(
-                                binding.encoded,
-                            ),
+                            value: bound_literal_value(binding),
                             type_oid: binding.type_oid,
-                            type_mod: binding.type_mod,
+                            type_mod: if length_coercion {
+                                -1
+                            } else {
+                                binding.type_mod
+                            },
                             collation: binding.collation,
-                            source: expression,
+                            source: if length_coercion { operand } else { expression },
                         })
+                        .map(|expression| &*expression)
+                        .map_err(|_| self.arena_full("bound type input exceeds SQL arena"))?;
+                    if !length_coercion {
+                        return Ok(bound);
+                    }
+                    let mut cast = *expression;
+                    if let Expr::Cast { operand, .. } = &mut cast {
+                        *operand = bound;
+                    }
+                    return self
+                        .arena
+                        .alloc(cast)
                         .map(|expression| &*expression)
                         .map_err(|_| self.arena_full("bound type input exceeds SQL arena"));
                 }
@@ -12612,7 +12645,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_table_trigger_is_typed_and_illegal_forms_fail_at_parse_boundary() {
+    fn transition_table_trigger_is_typed_and_equal_names_fail_at_parse_boundary() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "transition trigger parser", 1 << 18).unwrap();
         let mut parser = Parser::new(
@@ -12634,17 +12667,31 @@ mod tests {
                 }
             );
         });
-        for source in [
-            "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+        // Timing, event and column-list checks run with the relation, in
+        // PostgreSQL's CreateTrigger order; equal names fail here.
+        for (source, parses) in [
+            (
+                "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                false,
+            ),
+            (
+                "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
+                true,
+            ),
         ] {
             let mut budget = Budget::new(1 << 20);
             let arena =
                 Arena::new(&mut budget, "invalid transition trigger parser", 1 << 18).unwrap();
             let mut parser = Parser::new(source, &arena).unwrap();
-            assert!(parser.next_stmt().is_err(), "{source}");
+            assert_eq!(parser.next_stmt().is_ok(), parses, "{source}");
         }
     }
 

@@ -24,6 +24,11 @@ pub(crate) enum CatalogAllocation {
 
 impl CatalogPosition {
     pub(crate) const ENCODED_BYTES: usize = 10;
+    /// Fills unused fixed-capacity slots; never an admitted position.
+    pub(crate) const PLACEHOLDER: Self = Self {
+        slot: u16::MAX,
+        created_at: NonZeroU64::MAX,
+    };
 
     pub(crate) fn new(slot: usize, created_at: u64) -> Result<Self, SqlError> {
         let slot = u16::try_from(slot).ok();

@@ -1,7 +1,8 @@
 //! Notices and warnings PostgreSQL 18.6 sends, in the order it sends them:
 //! a PL/pgSQL `INTO` data change stops at its second row, a dropped column's
 //! cascade is one report, analysis passes do not repeat input notices, the
-//! planner folds a constant once, and an index answers in its rows' order.
+//! planner folds a constant once (also for EXPLAIN), a folding error follows
+//! the warnings folded before it, and an index answers in its rows' order.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -653,5 +654,221 @@ fn join_conflict_and_merge_constants_fold_once() {
         ] {
             assert_eq!(messages(engine, budget, sql), [empty, tag], "{sql}");
         }
+    });
+}
+
+#[test]
+fn prepare_converts_each_literal_once() {
+    with_engine("notice-prepare-literals", |engine, budget| {
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        run_with(engine, budget, "CREATE TABLE pl (q tsquery, n int)");
+        // Parse analysis converts the cast, the inserted value and the
+        // compared literal at PREPARE; EXECUTE reads the converted values.
+        for (sql, tag) in [
+            ("SELECT ''::tsquery, int4 '7' + 1", "SELECT 1"),
+            ("INSERT INTO pl VALUES ('', 1)", "INSERT 0 1"),
+            ("SELECT q = '' FROM pl", "SELECT 2"),
+        ] {
+            assert_eq!(
+                messages(
+                    engine,
+                    budget,
+                    &format!("PREPARE p AS {sql}; EXECUTE p; EXECUTE p"),
+                ),
+                [empty, "PREPARE", tag, tag],
+                "{sql}"
+            );
+        }
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT * FROM pl WHERE n = 'q'",
+        );
+        assert!(
+            output[0].starts_with("ERROR 22P02 invalid input syntax for type integer: \"q\""),
+            "{output:?}"
+        );
+        // A length coercion and constant folding run when the statement is
+        // planned, at each EXECUTE.
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT '123.45'::numeric(3,1); EXECUTE p",
+        );
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22003 numeric field overflow"),
+            "{output:?}"
+        );
+        let output = messages(engine, budget, "PREPARE p AS SELECT 1/0; EXECUTE p");
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22012 division by zero"),
+            "{output:?}"
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "PREPARE p AS SELECT 'abcd'::varchar(2); EXECUTE p",
+        );
+        assert_eq!(data_rows(&output), ["ab"]);
+    });
+}
+
+#[test]
+fn leakproof_conditions_run_at_the_first_security_level() {
+    with_engine("notice-row-security-levels", |engine, budget| {
+        for sql in [
+            "CREATE ROLE lsr",
+            "CREATE TABLE ls (a int, b int)",
+            "INSERT INTO ls VALUES (1, 1)",
+            "GRANT SELECT, UPDATE ON ls TO lsr",
+            "ALTER TABLE ls ENABLE ROW LEVEL SECURITY",
+            "CREATE FUNCTION ls_rp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'restrictive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_pp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'permissive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lp(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'leakproof %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lq(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 0.5 AS \
+             $$ BEGIN RAISE NOTICE 'cheap %', $1; RETURN true; END $$",
+            "CREATE POLICY ls_r ON ls AS RESTRICTIVE USING (ls_rp(a))",
+            "CREATE POLICY ls_p ON ls USING (ls_pp(a))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The cheaper leakproof condition runs first, the other right after
+        // the first security qual; each runs once.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 cheap 1",
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+            ]
+        );
+        // A write's WITH CHECK options test the permissive policies first.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; UPDATE ls SET a = a WHERE ls_lp(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 restrictive 1",
+            ]
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "SET ROLE lsr; EXPLAIN (COSTS OFF) SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "Seq Scan on ls",
+                "  Filter: (ls_lq(b) AND ls_rp(a) AND ls_lp(b) AND ls_pp(a))",
+            ]
+        );
+    });
+}
+
+#[test]
+fn rule_actions_read_statement_expressions_row_by_row() {
+    with_engine("notice-rule-interleaving", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ri (id int, a int)",
+            "CREATE TABLE ri_log (x int, y int)",
+            "INSERT INTO ri VALUES (1, 10), (2, 20)",
+            "CREATE FUNCTION ri_f(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ri_also AS ON UPDATE TO ri \
+             DO ALSO INSERT INTO ri_log VALUES (new.a, ri_f('own', old.id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let output = messages(
+            engine,
+            budget,
+            "UPDATE ri SET a = ri_f('set', a) WHERE id < 3",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        // The action's rows interleave the SET expression with the action's
+        // own call; the UPDATE itself then evaluates its SET expressions.
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 own 1",
+                "NOTICE 00000 set 20",
+                "NOTICE 00000 own 2",
+                "NOTICE 00000 set 10",
+                "NOTICE 00000 set 20",
+            ]
+        );
+    });
+}
+
+/// PostgreSQL's planner folds a statement's constants in order: a constant
+/// that fails is the statement's error, sent after the warnings the
+/// constants folded before it raised. EXPLAIN plans the folded statement,
+/// so plain EXPLAIN raises those warnings and EXPLAIN ANALYZE raises them
+/// once.
+#[test]
+fn folding_errors_follow_earlier_warnings_and_explain_folds() {
+    with_engine("notice-folding-order", |engine, budget| {
+        run_with(engine, budget, "CREATE TABLE folded (a int)");
+        run_with(engine, budget, "INSERT INTO folded VALUES (1)");
+        let reduced = "WARNING 22023 TIMESTAMP(7) precision reduced to maximum allowed, 6";
+        let division = "ERROR 22012 division by zero";
+        for sql in [
+            "SELECT timestamptypmodin('{7}'), 1/0",
+            "SELECT timestamptypmodin('{7}'), 1/0 FROM folded",
+            "UPDATE folded SET a = timestamptypmodin('{7}') + 1/0",
+        ] {
+            assert_eq!(messages(engine, budget, sql), [reduced, division], "{sql}");
+        }
+        assert_eq!(
+            messages(engine, budget, "SELECT 1/0, timestamptypmodin('{7}')"),
+            [division]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
+            ),
+            [reduced, "EXPLAIN"]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "EXPLAIN (ANALYZE, COSTS OFF) SELECT a FROM folded WHERE a > timestamptypmodin('{7}')"
+            ),
+            [reduced, "EXPLAIN"]
+        );
     });
 }

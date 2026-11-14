@@ -231,8 +231,11 @@ fn constant_value_in(
     // Planning folds the constant only to classify it; the statement's own
     // evaluation raises its notices.
     let mut folded = None;
-    crate::sql::eval::probe_constants(|| {
+    let mut inlined = false;
+    let messages = crate::sql::eval::eval_message_mark();
+    let probed = crate::sql::eval::probe_constants(|| {
         folded = super::inspect_parameters(|parameters| {
+            inlined = super::inspecting_inline_arguments();
             crate::sql::eval::eval_full(
                 expression,
                 arena,
@@ -249,8 +252,19 @@ fn constant_value_in(
             })
         })?;
         Ok(())
-    })?;
-    Ok(folded)
+    });
+    match probed {
+        Ok(()) => Ok(folded),
+        // The statement's own constant fails where its folding reaches it;
+        // an inlined body's, which reads the call's arguments, fails here,
+        // during inlining.
+        Err(error) if !inlined => {
+            crate::sql::eval::defer_fold_error(error)?;
+            crate::sql::eval::truncate_eval_messages(messages);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether PostgreSQL's planner folds `expression`, which names no column

@@ -850,6 +850,7 @@ pub(super) fn dependencies<'a>(
             Datum::Char(kind),
         ])
     };
+    let (oid_field, table_field) = (oid, table);
     for values in constraints {
         let constraint_kind = super::view_rows::character(values[kind])?;
         if !matches!(constraint_kind, b'c' | b'n' | b'p' | b'u' | b'x' | b'f') {
@@ -973,10 +974,26 @@ pub(super) fn dependencies<'a>(
                     b'n',
                 )?;
             }
-            // A partition's clone goes with the parent's key or with the
-            // partition (`ConstraintSetParentConstraint`).
+            // A referenced partition's clone, on the same table as its
+            // parent, is internal to it (`addFkConstraint`); a referencing
+            // partition's goes with the parent's key or with the partition
+            // (`ConstraintSetParentConstraint`).
             let parent = integer(values[parent_constraint])?;
-            if parent != 0 {
+            let parent_table = constraints
+                .iter()
+                .find(|row| integer(row[oid_field]).is_ok_and(|candidate| candidate == parent))
+                .map(|row| integer(row[table_field]))
+                .transpose()?;
+            if parent != 0 && parent_table == Some(table) {
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CONSTRAINT_OID,
+                    parent,
+                    0,
+                    b'i',
+                )?;
+            } else if parent != 0 {
                 push(
                     super::PG_CONSTRAINT_OID,
                     oid,

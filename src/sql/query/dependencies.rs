@@ -3739,17 +3739,28 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 self.txid,
             )?
         } else {
-            let crate::storage::RoutineCallSelection::Stored(slot) =
-                self.storage.select_routine_call(
-                    name,
-                    argument_names,
-                    arguments,
-                    variadic,
-                    self.txid,
-                    crate::storage::RoutineCallKind::Function,
-                )
-            else {
-                return None;
+            let slot = match self.storage.select_routine_call(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            ) {
+                crate::storage::RoutineCallSelection::Stored(slot) => slot,
+                // A built-in's result follows its catalog signature
+                // (`int4in('5')` is an integer).
+                crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                    return crate::sql::exec::catalog_builtin_call_result_metadata(
+                        self.storage,
+                        self.txid,
+                        oid,
+                        argument_names,
+                        arguments,
+                        variadic,
+                    );
+                }
+                _ => return None,
             };
             let oid = crate::storage::routine_oid(&self.storage.routine_for(slot, self.txid));
             self.storage.function_for_captured_call(

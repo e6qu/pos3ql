@@ -76,7 +76,8 @@ pub(crate) use scan::{
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, lead_row_security,
-    plan_row_security, row_security_off_error, row_security_passes,
+    leakproof_at_first_security_level, plan_row_security, row_security_off_error,
+    row_security_passes,
 };
 
 mod scope;
@@ -158,6 +159,17 @@ pub(crate) fn expression_contains_volatile(
         }
         crate::sql::ast::is_volatile_function(name)
             || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+    })
+}
+
+/// Whether `expression` calls a user-defined routine (outside subqueries).
+pub(crate) fn expression_calls_user_routine(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    cte::expression_contains_function(expression, &|name, arity| {
+        storage.has_non_aggregate_routine_candidate(name, arity, txid)
     })
 }
 
@@ -978,11 +990,13 @@ use subquery::{
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
+    enter_sublink_of, subquery_node_correlated, type_witness, walk_children,
+};
+pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
     uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
-pub(crate) use subquery::{subquery_node_correlated, type_witness, walk_children};
 
 mod window;
 use window::{
@@ -4782,6 +4796,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         super::exec::reject_native_routine_call(routine, self.txid)?;
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
+        }
+        if let crate::storage::RoutineLanguage::Native(native) = routine.language {
+            return super::foreign::call_native(self.storage, self.txid, native, arguments)
+                .map(Some);
         }
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
@@ -9062,6 +9080,7 @@ pub(crate) fn analyse_routine_statement<'a>(
 /// operation branches, derived tables and subqueries resolve before it ever
 /// runs. `select` has its views and `WITH` queries expanded. `LATERAL`
 /// derived tables and `FROM`-less subqueries are analysed when they run.
+/// Constant folding errors wait for planning, as in PostgreSQL.
 pub(crate) fn analyse_select<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
@@ -9086,7 +9105,6 @@ pub(crate) fn analyse_select<'a>(
     check_select_types(select, &scope, storage, txid, arena, outer)?;
     // Unknown literals convert during analysis, before constants fold.
     check_key_types(select, &scope, arena, storage, txid)?;
-    check_select_constants(select, arena, storage, txid)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -9735,6 +9753,9 @@ pub(super) fn convert_literal<'a>(
     target: Option<ColType>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
+    if let Some(target) = target.filter(|target| super::type_inputs::builtin_input_type(*target)) {
+        super::type_inputs::note_literal_target(literal, target.oid());
+    }
     let Some(target) = target.filter(|target| {
         matches!(
             target,
@@ -11915,6 +11936,15 @@ pub fn fold_select_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<&'a Select<'a>, SqlError> {
+    super::eval::finish_folding(fold_select_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_select_constants_in<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a Select<'a>, SqlError> {
     if statement.from.is_none() {
         super::eval::probe_constants(|| {
             check_fromless_literal_operands(statement, arena, storage, txid)
@@ -12123,6 +12153,15 @@ pub(crate) fn fold_update_constants<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<crate::sql::ast::Update<'a>, SqlError> {
+    super::eval::finish_folding(fold_update_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_update_constants_in<'a>(
+    statement: &crate::sql::ast::Update<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Update<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
     let fold =
         |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
@@ -12168,6 +12207,15 @@ fn assigns_through_indirection(expression: &Expr<'_>) -> bool {
 /// the range table after `RETURNING`. An `INSERT ... SELECT` source folds
 /// when it runs.
 pub(crate) fn fold_insert_constants<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    super::eval::finish_folding(fold_insert_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_insert_constants_in<'a>(
     statement: &crate::sql::ast::Insert<'a>,
     arena: &'a Arena,
     storage: &Storage,
@@ -12356,6 +12404,15 @@ pub(crate) fn fold_merge_constants<'a>(
 
 /// [`fold_update_constants`] for a `DELETE`: `RETURNING`, then `WHERE`.
 pub(crate) fn fold_delete_constants<'a>(
+    statement: &crate::sql::ast::Delete<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
+    super::eval::finish_folding(fold_delete_constants_in(statement, arena, storage, txid))
+}
+
+fn fold_delete_constants_in<'a>(
     statement: &crate::sql::ast::Delete<'a>,
     arena: &'a Arena,
     storage: &Storage,
@@ -12898,10 +12955,27 @@ pub(crate) fn select_query_resumable<'a>(
             );
         }
     }
+    // A query of one foreign table sends its shippable conditions, order and
+    // limit to the server; the rest runs here over the rows it returns.
+    let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {
+        Ok(pushed) => pushed,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = match &pushed {
+        Some(plan) => match plan.local_statement(statement, arena) {
+            Ok(local) => local,
+            Err(error) => return sql_fail(error),
+        },
+        None => statement,
+    };
+    let from = statement
+        .from
+        .as_ref()
+        .expect("FROM-less handled by caller");
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec(
+    let scope = match QueryScope::resolve_exec_pushed(
         storage,
         from,
         statement.where_clause,
@@ -12909,6 +12983,8 @@ pub(crate) fn select_query_resumable<'a>(
         arena,
         params,
         seq,
+        None,
+        pushed.as_ref(),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -13498,7 +13574,8 @@ pub(crate) fn first_aggregate<'a>(
 }
 
 /// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
-/// type and its constant inputs, as `PREPARE` checks them.
+/// type and its keys, as `PREPARE` checks them. Constant folding errors
+/// (`1/0`) wait for the planning of each execution.
 pub(crate) fn analyse_fromless_select<'a>(
     statement: &'a Select<'a>,
     storage: &'a Storage,
@@ -13519,8 +13596,7 @@ pub(crate) fn analyse_fromless_select<'a>(
     if let Some(condition) = statement.where_clause {
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
-    check_fromless_keys(statement, &columns, storage, txid, arena)?;
-    check_select_constants(statement, arena, storage, txid)
+    check_fromless_keys(statement, &columns, storage, txid, arena)
 }
 
 /// The ORDER BY and DISTINCT ON keys of a query without FROM: output

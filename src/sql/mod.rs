@@ -1457,10 +1457,16 @@ fn write_extension_qualified_identifier<const N: usize>(
 }
 
 pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
+    let returned = |items: &[ast::SelectItem<'_>]| {
+        if items.is_empty() { 0 } else { emitted_rows }
+    };
     match statement {
-        // PostgreSQL's ModifyTable node reports zero output rows even when its
-        // RETURNING projection sends rows to the client.
-        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => 0,
+        // PostgreSQL's ModifyTable node returns the rows of its RETURNING
+        // list, and none without one.
+        Stmt::Insert(insert) => returned(insert.returning.items),
+        Stmt::Update(update) => returned(update.returning.items),
+        Stmt::Delete(delete) => returned(delete.returning.items),
+        Stmt::Merge(merge) => returned(merge.returning.items),
         Stmt::With { statement, .. } => explained_root_rows(statement, emitted_rows),
         _ => emitted_rows,
     }
@@ -8004,6 +8010,18 @@ impl Engine {
                 return Err(error);
             }
         };
+        // Other clients see a server or user-mapping change once it
+        // commits, as PostgreSQL's invalidation messages reach them.
+        if prepared_slot.is_none() {
+            for undo in txn.ddl() {
+                if let Some(target) = txn::foreign_connection_target(undo) {
+                    self.storage.invalidate_foreign_connections(
+                        target,
+                        crate::storage::ForeignInvalidation::Everyone,
+                    );
+                }
+            }
+        }
         // A cold row needed for final WAL staging can park this COMMIT. Keep
         // transaction state and locks live until every staged image and the
         // commit boundary are complete, so the statement retry can resume the
@@ -9262,7 +9280,7 @@ impl Engine {
                 cursors,
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot PREPARE a transaction that has operated on a foreign table"
+                    "cannot PREPARE a transaction that has operated on postgres_fdw foreign tables"
                 ),
             ));
         }
@@ -9549,6 +9567,16 @@ impl Engine {
         txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
         let result = txn.with_detached_plan_owner(|txn| {
             if commit {
+                // Every client sees a server or user-mapping change the
+                // prepared transaction made, as a plain COMMIT's does.
+                for undo in txn.ddl() {
+                    if let Some(target) = txn::foreign_connection_target(undo) {
+                        self.storage.invalidate_foreign_connections(
+                            target,
+                            crate::storage::ForeignInvalidation::Everyone,
+                        );
+                    }
+                }
                 self.storage
                     .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
                 self.promote_transaction_state(txn, resolution_lsn, None)
@@ -11035,6 +11063,166 @@ impl Engine {
         Ok(types)
     }
 
+    /// Converts each literal a prepared statement casts to a built-in type,
+    /// or that its analysis converts to one, and encodes them with the
+    /// statement's array domain inputs `bound` as its session input map.
+    fn bind_prepared_literals<'a>(
+        &self,
+        sql: &str,
+        bound: &[type_inputs::Binding<'a>],
+        candidates: &[type_inputs::Candidate<'a>],
+        targets: &type_inputs::LiteralTargets<'a>,
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<&'a [u8], SqlError> {
+        let catalog = query::storage_catalog(&self.storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..NO_HOOKS
+        };
+        let empty = type_inputs::Binding {
+            kind: type_inputs::InputKind::ExplicitCast,
+            start: 0,
+            end: 0,
+            type_oid: 0,
+            type_mod: -1,
+            collation: None,
+            encoded: &[],
+        };
+        let capacity = bound
+            .len()
+            .checked_add(candidates.len())
+            .and_then(|count| count.checked_add(targets.literals.len()))
+            .ok_or_else(eval::arena_full)?;
+        let bindings = arena
+            .alloc_slice_with(capacity, |_| empty)
+            .map_err(|_| eval::arena_full())?;
+        bindings[..bound.len()].copy_from_slice(bound);
+        let mut count = bound.len();
+        let cast_operand = |literal: &ast::Expr<'_>| {
+            candidates.iter().any(|candidate| {
+                matches!(candidate.expression, ast::Expr::Cast { operand, .. }
+                    if core::ptr::eq(*operand, literal))
+            })
+        };
+        // Converted in source order, as parse analysis meets them: casts
+        // first, then the literals analysis converts.
+        let work = arena
+            .alloc_slice_with(candidates.len() + targets.literals.len(), |index| {
+                if index < candidates.len() {
+                    (candidates[index].start, false, index)
+                } else {
+                    let literal = index - candidates.len();
+                    (targets.literals[literal].1.start, true, literal)
+                }
+            })
+            .map_err(|_| eval::arena_full())?;
+        work.sort_unstable();
+        for &(_, implicit, index) in work.iter() {
+            if !implicit {
+                let candidate = candidates[index];
+                if candidate.kind != type_inputs::InputKind::ExplicitCast
+                    || bound.iter().any(|binding| {
+                        (binding.start, binding.end, binding.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                {
+                    continue;
+                }
+                let type_inputs::CandidateTarget::TypeName(name) = candidate.target else {
+                    continue;
+                };
+                let Some(type_oid) = type_inputs::prepared_target_oid(&self.storage, txid, name)
+                else {
+                    continue;
+                };
+                let ast::Expr::Cast {
+                    operand: ast::Expr::Str(text),
+                    ..
+                } = candidate.expression
+                else {
+                    continue;
+                };
+                if !type_inputs::is_builtin_oid(type_oid) {
+                    continue;
+                }
+                // PostgreSQL passes the modifier to `interval` input only;
+                // the cast's length coercion runs at execution.
+                let mut cast = *candidate.expression;
+                if type_oid != types::oid::INTERVAL
+                    && let ast::Expr::Cast { type_mod, .. } = &mut cast
+                {
+                    *type_mod = -1;
+                }
+                let value = eval::eval_full(&cast, arena, &[], &NoColumns, &hooks)
+                    .map_err(|error| error_position::at_subject(error, text))?;
+                bindings[count] = type_inputs::Binding {
+                    kind: candidate.kind,
+                    start: candidate.start,
+                    end: candidate.end,
+                    type_oid,
+                    type_mod: candidate.type_mod,
+                    collation: None,
+                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                };
+                count += 1;
+            } else {
+                let (expression, source) = targets.literals[index];
+                let type_inputs::LiteralTarget::Type(type_oid) = targets.targets[index].get()
+                else {
+                    continue;
+                };
+                let ast::Expr::Str(text) = expression else {
+                    continue;
+                };
+                if cast_operand(expression)
+                    || bound.iter().any(|binding| {
+                        binding.kind == type_inputs::InputKind::ImplicitLiteral
+                            && (binding.start, binding.end) == (source.start, source.end)
+                    })
+                {
+                    continue;
+                }
+                let Some(target) = types::ColType::from_oid(type_oid) else {
+                    continue;
+                };
+                let value =
+                    catalog::convert_literal_input(&self.storage, txid, text, target, arena)
+                        .map_err(|error| error_position::at_subject(error, text))?;
+                let Some(value) = value else {
+                    continue;
+                };
+                bindings[count] = type_inputs::Binding {
+                    kind: type_inputs::InputKind::ImplicitLiteral,
+                    start: source.start,
+                    end: source.end,
+                    type_oid,
+                    type_mod: -1,
+                    collation: None,
+                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                };
+                count += 1;
+            }
+        }
+        let bindings = &mut bindings[..count];
+        if bindings.is_empty() {
+            return Ok(&[]);
+        }
+        bindings.sort_unstable_by_key(|binding| (binding.start, binding.end, binding.kind));
+        let bytes = arena
+            .alloc_slice_with(type_inputs::session_encoded_len(bindings)?, |_| 0u8)
+            .map_err(|_| eval::arena_full())?;
+        type_inputs::encode_session_into(bindings, bytes)?;
+        // EXECUTE must restore every converted literal from this map.
+        let mut restored = Parser::new(sql, arena).map_err(|error| parse_error_to_sql(&error))?;
+        restored.set_type_inputs(bindings);
+        restored
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?;
+        type_inputs::validate_prepared(&restored, &self.storage, txid)?;
+        Ok(bytes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_prepare_statement(
         &mut self,
@@ -11160,24 +11348,16 @@ impl Engine {
             Ok(bindings) => bindings,
             Err(error) => return Ok(Err(error)),
         };
-        let bound_inputs = match (|| -> Result<&[u8], SqlError> {
-            if bindings.is_empty() {
-                return Ok(&[]);
-            }
-            let bytes = arena
-                .alloc_slice_with(type_inputs::encoded_len(bindings)?, |_| 0u8)
-                .map_err(|_| eval::arena_full())?;
-            type_inputs::encode_into(bindings, bytes)?;
-            Ok(bytes)
-        })() {
-            Ok(bytes) => bytes,
-            Err(error) => return Ok(Err(error)),
-        };
-        let (statement, source_copies) = if bindings.is_empty() {
+        let (statement, source_copies, literals, candidates) = if bindings.is_empty() {
             if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
                 return Ok(Err(error));
             }
-            (statement, parser.source_copies())
+            (
+                statement,
+                parser.source_copies(),
+                parser.string_literals(),
+                parser.type_input_candidates(),
+            )
         } else {
             let mut restored = match Parser::new(sql, arena) {
                 Ok(parser) => parser,
@@ -11194,7 +11374,12 @@ impl Engine {
                     {
                         return Ok(Err(error));
                     }
-                    (statement, restored.source_copies())
+                    (
+                        statement,
+                        restored.source_copies(),
+                        restored.string_literals(),
+                        restored.type_input_candidates(),
+                    )
                 }
                 Ok(None) => {
                     return Ok(Err(sql_err!(
@@ -11250,81 +11435,113 @@ impl Engine {
         // `pg_prepared_statements` lists result types as the query produces
         // them, keeping domains that the wire description reduces to base types.
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let literal_targets =
+            match arena.alloc_slice_with(literals.len(), |_| type_inputs::LiteralTarget::Unseen) {
+                Ok(targets) => core::cell::Cell::from_mut(targets).as_slice_of_cells(),
+                Err(_) => return Ok(Err(eval::arena_full())),
+            };
+        let literal_targets = type_inputs::LiteralTargets {
+            literals,
+            targets: literal_targets,
+        };
         // The query's analysis errors are positioned in the PREPARE text.
-        let described = exec::with_bound_parameter_types(parameter_oids, || {
-            crate::sql::error_position::with_analysis_of_parsed(sql, Some(source_copies), || {
-                type_inputs::with_source(
-                    type_inputs::Source::RootCommand { statement: 0 },
+        let described = type_inputs::record_literal_targets(&literal_targets, || {
+            exec::with_bound_parameter_types(parameter_oids, || {
+                crate::sql::error_position::with_analysis_of_parsed(
                     sql,
-                    bindings,
-                    || match statement {
-                        Stmt::Select(select) => query::expand_ctes(
-                            select,
-                            &self.storage,
-                            txn.txid,
-                            arena,
+                    Some(source_copies),
+                    || {
+                        type_inputs::with_source(
+                            type_inputs::Source::RootCommand { statement: 0 },
+                            sql,
+                            bindings,
+                            || match statement {
+                                Stmt::Select(select) => {
+                                    query::expand_ctes(select, &self.storage, txn.txid, arena)
+                                        .and_then(|select| {
+                                            let count = query::describe_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                                &mut result_columns,
+                                                crate::sql::exec::DescriptionTarget::Sql,
+                                                None,
+                                            )?;
+                                            query::analyse_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                                None,
+                                            )?;
+                                            query::analyse_fromless_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                            )?;
+                                            Ok(count)
+                                        })
+                                }
+                                Stmt::SetQuery(query) => query::describe_set_query(
+                                    &self.storage,
+                                    txn.txid,
+                                    query,
+                                    &mut result_columns,
+                                    arena,
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                )
+                                .and_then(|count| {
+                                    query::analyse_set_query(
+                                        query,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                    )?;
+                                    Ok(count)
+                                }),
+                                Stmt::With { statement, .. } => self
+                                    .describe_data_modification_columns(
+                                        statement,
+                                        arena,
+                                        txn,
+                                        &mut result_columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    ),
+                                Stmt::Insert(_)
+                                | Stmt::Update(_)
+                                | Stmt::Delete(_)
+                                | Stmt::Merge(_) => {
+                                    let count = self.describe_data_modification_columns(
+                                        statement,
+                                        arena,
+                                        txn,
+                                        &mut result_columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    )?;
+                                    query::analyse_dml_condition(
+                                        statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                        None,
+                                    )?;
+                                    query::validate_dml_assignment_casts(
+                                        statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                        None,
+                                    )?;
+                                    Ok(count)
+                                }
+                                _ => Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "utility statements cannot be prepared"
+                                )),
+                            },
                         )
-                        .and_then(|select| {
-                            let count = query::describe_select(
-                                select,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Sql,
-                                None,
-                            )?;
-                            query::analyse_select(select, &self.storage, txn.txid, arena, None)?;
-                            query::analyse_fromless_select(select, &self.storage, txn.txid, arena)?;
-                            Ok(count)
-                        }),
-                        Stmt::SetQuery(query) => query::describe_set_query(
-                            &self.storage,
-                            txn.txid,
-                            query,
-                            &mut result_columns,
-                            arena,
-                            crate::sql::exec::DescriptionTarget::Sql,
-                        )
-                        .and_then(|count| {
-                            query::analyse_set_query(query, &self.storage, txn.txid, arena)?;
-                            Ok(count)
-                        }),
-                        Stmt::With { statement, .. } => self.describe_data_modification_columns(
-                            statement,
-                            arena,
-                            txn,
-                            &mut result_columns,
-                            crate::sql::exec::DescriptionTarget::Sql,
-                        ),
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                            let count = self.describe_data_modification_columns(
-                                statement,
-                                arena,
-                                txn,
-                                &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Sql,
-                            )?;
-                            query::analyse_dml_condition(
-                                statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                None,
-                            )?;
-                            query::validate_dml_assignment_casts(
-                                statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                None,
-                            )?;
-                            Ok(count)
-                        }
-                        _ => Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "utility statements cannot be prepared"
-                        )),
                     },
                 )
             })
@@ -11333,6 +11550,23 @@ impl Engine {
             Ok(count) => count,
             Err(error) => return Ok(Err(error)),
         };
+        // PostgreSQL's parse analysis converts each literal once, raising its
+        // input function's notices and errors at PREPARE; EXECUTE reads the
+        // converted values.
+        let bound_inputs =
+            match error_position::with_analysis_of_parsed(sql, Some(source_copies), || {
+                self.bind_prepared_literals(
+                    sql,
+                    bindings,
+                    candidates,
+                    &literal_targets,
+                    arena,
+                    txn.txid,
+                )
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Ok(Err(error)),
+            };
         let mut result_types = [0i32; MAX_PROJ];
         for (target, column) in result_types.iter_mut().zip(&result_columns[..result_count]) {
             *target = column.type_oid;
@@ -11912,6 +12146,7 @@ impl Engine {
 
     /// Drops a closing connection's LISTEN registrations.
     pub fn drop_connection(&mut self, conn_id: i32) {
+        foreign::drop_backend_connections(&self.storage, conn_id);
         self.storage.unregister_backend(conn_id);
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
@@ -16978,6 +17213,8 @@ impl Engine {
                         source,
                         condition,
                         || rule_insert_target(storage, action, txn.txid, arena),
+                        storage,
+                        txn.txid,
                         arena,
                     ) {
                         Ok(action) => action,
@@ -18139,6 +18376,37 @@ impl Engine {
             // A rejected shape owns no retained reader or arena description.
             unsafe { arena.rewind_to(mark) };
         }
+        self.execute_select_attempts(
+            statement,
+            arena,
+            params,
+            source_snapshot,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )
+    }
+
+    /// Runs a read-only SELECT in attempts: an attempt that stops for a
+    /// routine call the resumable executor runs (a PL/pgSQL function)
+    /// withdraws its output, the call completes, and the next attempt
+    /// replays every completed call's result. `EXPLAIN ANALYZE` counts the
+    /// last attempt, which runs the whole statement.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_attempts(
+        &mut self,
+        statement: &ast::Select<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        source_snapshot: u32,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         let invocations = query::RoutineInvocationState::new(
             arena,
             crate::sql::query::RoutineExecution::StatementReplay,
@@ -18154,6 +18422,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
+            query::instrument::restart();
             let output_mark = responder.attempt_mark();
             let outcome = self.execute_select_once(
                 statement,
@@ -18753,6 +19022,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
+            query::instrument::restart();
             let attempt_arena_mark = arena.mark();
             let attempt_mark = responder.attempt_mark();
             let output_mark = attempt_mark.output();
@@ -19059,6 +19329,8 @@ impl Engine {
         if let Err(error) = invocations.require_replay() {
             return Ok(Err(error));
         }
+        // The routine's own statements are not part of an analyzed plan.
+        let _instrument = query::instrument::suspend();
         if let query::PendingRoutineTarget::WriteQuery(write) = pending.target {
             return type_input_plans::with_owner(pending.plan_owner, || {
                 self.complete_pending_write(
@@ -19353,6 +19625,7 @@ impl Engine {
         let Some(call) = invocations.suspended.borrow_mut().take() else {
             return Ok(Err(query::inactive_pending_call()));
         };
+        let _instrument = query::instrument::suspend();
         let query::SuspendedRoutineCall {
             mut body,
             timing,
@@ -20916,80 +21189,55 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        match statement {
-            Stmt::Select(select) => self.execute_select_once(
-                select,
-                arena,
-                params,
-                txn,
-                (sqlprep, cursors),
-                guc,
-                None,
-                responder,
-            ),
+        // The statement runs on the resumable executor, as when it is not
+        // explained, so routines that need it (PL/pgSQL) run in its attempts.
+        let select = match statement {
+            Stmt::Select(select) => Some(select),
             // A set query runs as the Select form subqueries carry, so its
             // data-modifying CTEs and routine calls run as a SELECT's do.
             Stmt::SetQuery(query) => match query::set_query_select(query, arena) {
-                Ok(select) => self.execute_select_once(
+                Ok(select) => Some(select),
+                Err(error) => return Ok(Err(error)),
+            },
+            _ => None,
+        };
+        match statement {
+            Stmt::Select(_) | Stmt::SetQuery(_)
+                if select.is_some_and(|select| select.with.iter().all(|cte| cte.dml.is_none())) =>
+            {
+                let select = select.expect("a SELECT is selected");
+                let source_snapshot = txn.command_id().saturating_add(1);
+                self.execute_select_attempts(
                     select,
                     arena,
                     params,
+                    source_snapshot,
                     txn,
-                    (sqlprep, cursors),
-                    guc,
-                    None,
-                    responder,
-                ),
-                Err(error) => Ok(Err(error)),
-            },
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                let connection_id = self.work.connection_id();
-                let (work, row_buffers) = self.work.cursor_parts();
-                Self::execute_data_modification(
-                    &mut self.storage,
-                    &mut self.dml_scratch,
-                    work,
-                    statement,
-                    exec::DmlAuthorization::Invoker,
-                    txn,
-                    params,
-                    guc,
+                    sqlprep,
                     cursors,
-                    row_buffers,
+                    guc,
                     responder,
-                    None,
-                    None,
-                    connection_id,
                 )
             }
-            Stmt::Merge(_) => {
-                let (work, row_buffers) = self.work.cursor_parts();
-                Self::execute_merge(
-                    &mut self.storage,
-                    work,
-                    statement,
-                    txn,
+            Stmt::Select(_) | Stmt::SetQuery(_) => {
+                let select = select.expect("a SELECT is selected");
+                self.execute_modification_resumable(
+                    &Stmt::Select(*select),
+                    arena,
                     params,
-                    guc,
+                    txn,
+                    sqlprep,
                     cursors,
-                    row_buffers,
+                    guc,
                     responder,
-                    None,
-                    None,
                 )
             }
-            Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes,
-                statement,
-                arena,
-                params,
-                txn,
-                (sqlprep, cursors),
-                guc,
-                responder,
-                None,
-                None,
-                None,
+            Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::Merge(_)
+            | Stmt::With { .. } => self.execute_modification_resumable(
+                statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -22313,7 +22561,7 @@ impl Engine {
             })?)
             .map_err(|_| eval::arena_full())?;
         let mut parser = Parser::new(text, arena).map_err(|error| parse_error_to_sql(&error))?;
-        parser.set_type_inputs(type_inputs::decode(inputs, arena)?);
+        parser.set_type_inputs(type_inputs::decode_session(inputs, arena)?);
         let statement = parser
             .next_stmt()
             .map_err(|error| parse_error_to_sql(&error))?
@@ -22328,7 +22576,7 @@ impl Engine {
                 "prepared statement must contain exactly one statement"
             ));
         }
-        type_inputs::validate_restored(&parser, &self.storage, txid)?;
+        type_inputs::validate_prepared(&parser, &self.storage, txid)?;
         arena
             .alloc(statement)
             .map(|statement| &*statement)
@@ -22734,6 +22982,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let event_ddl_mark = txn.ddl().len();
+        let event_catalog_stamp = self.storage.catalog_identity_sequence();
         let event_ddl_origin = txn.ddl_origin();
         let event_drop = event_tag.is_some_and(|tag| {
             event_trigger_drop_command(statement)
@@ -22779,6 +23028,19 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::reconcile_foreign_key_clones(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                event_ddl_mark,
+                event_catalog_stamp,
+                arena,
+            )
         {
             return Ok(Err(error));
         }
@@ -22891,6 +23153,7 @@ impl Engine {
         if reset_workspace {
             eval::clear_eval_messages();
             eval::clear_folded_notices();
+            eval::clear_deferred_fold_error();
             event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();
@@ -23056,6 +23319,60 @@ impl Engine {
         result
     }
 
+    /// `COMMIT`, and `PREPARE TRANSACTION` outside a transaction block,
+    /// which commits the same way but reports `ROLLBACK`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a commit settles the statement's cursors, plans and output"
+    )]
+    fn commit_statement(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        cursors: &mut cursor::CursorPool,
+        sqlprep: &mut SqlPreparedPool,
+        arena: &Arena,
+        responder: &mut Responder,
+        prepare: bool,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if !txn.is_explicit() && txn.staged_commit().is_none() && txn.commit_admission().is_none() {
+            responder.warning("25P01", "there is no transaction in progress")?;
+        }
+        let tag = if txn.failed || prepare {
+            "ROLLBACK"
+        } else {
+            "COMMIT"
+        };
+        if txn.failed {
+            self.rollback_txn(txn, guc);
+            cursors.on_rollback();
+        } else {
+            if let Err(e) = self.commit_txn_with_triggers(
+                txn,
+                guc,
+                crate::sql::txn::CommitTarget::Ordinary,
+                CursorCommitContext {
+                    cursors,
+                    plans: Some(sqlprep),
+                    arena,
+                },
+                arena,
+                responder,
+            ) {
+                return Ok(Err(e));
+            }
+        }
+        responder.command_complete(tag)?;
+        // Later statements in this message get a fresh implicit txn.
+        // Freeze this statement's clock before anything anchors a
+        // transaction to it.
+        datetime::begin_statement();
+        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            return Ok(Err(error));
+        }
+        Ok(Ok(()))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt_with_snapshot<'capture>(
         &mut self,
@@ -23153,6 +23470,7 @@ impl Engine {
         // command. DDL executed by a start trigger has already completed its
         // own nested invocation and must not leak into the outer command set.
         let event_ddl_mark = txn.ddl().len();
+        let event_catalog_stamp = self.storage.catalog_identity_sequence();
         let event_ddl_origin = txn.ddl_origin();
         let event_drop = event_tag.is_some_and(|tag| {
             event_trigger_drop_command(statement)
@@ -25276,43 +25594,21 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Commit => {
-                if !txn.is_explicit()
-                    && txn.staged_commit().is_none()
-                    && txn.commit_admission().is_none()
-                {
-                    responder.warning("25P01", "there is no transaction in progress")?;
-                }
-                let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
-                if txn.failed {
-                    self.rollback_txn(txn, guc);
-                    cursors.on_rollback();
-                } else {
-                    if let Err(e) = self.commit_txn_with_triggers(
-                        txn,
-                        guc,
-                        crate::sql::txn::CommitTarget::Ordinary,
-                        CursorCommitContext {
-                            cursors,
-                            plans: Some(sqlprep),
-                            arena,
-                        },
-                        arena,
-                        responder,
-                    ) {
-                        return Ok(Err(e));
-                    }
-                }
-                responder.command_complete(tag)?;
-                // Later statements in this message get a fresh implicit txn.
-                // Freeze this statement's clock before anything anchors a
-                // transaction to it.
-                datetime::begin_statement();
-                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
-                    return Ok(Err(error));
-                }
-                Ok(Ok(()))
+                self.commit_statement(txn, guc, cursors, sqlprep, arena, responder, false)
             }
             Stmt::PrepareTransaction(gid) => {
+                // Outside a transaction block PostgreSQL's PREPARE TRANSACTION
+                // commits like COMMIT, warns and reports ROLLBACK.
+                let ordinary = |target| matches!(target, crate::sql::txn::CommitTarget::Ordinary);
+                let implicit = match (txn.commit_admission(), txn.staged_commit()) {
+                    (Some(target), _) => ordinary(target),
+                    (None, Some(staged)) => ordinary(staged.target),
+                    (None, None) => !txn.is_explicit(),
+                };
+                if implicit {
+                    return self
+                        .commit_statement(txn, guc, cursors, sqlprep, arena, responder, true);
+                }
                 if let Err(error) =
                     self.prepare_transaction(*gid, txn, guc, cursors, arena, responder)
                 {
@@ -25712,7 +26008,7 @@ impl Engine {
                         }));
                     }
                 };
-                let source_bindings = match type_inputs::decode(bound_inputs, arena) {
+                let source_bindings = match type_inputs::decode_session(bound_inputs, arena) {
                     Ok(bindings) => bindings,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -25728,7 +26024,7 @@ impl Engine {
                         || match inner.next_stmt() {
                             Ok(Some(statement)) => {
                                 if let Err(error) =
-                                    type_inputs::validate_restored(&inner, &self.storage, txn.txid)
+                                    type_inputs::validate_prepared(&inner, &self.storage, txn.txid)
                                 {
                                     return Ok(Err(error));
                                 }
@@ -25759,6 +26055,15 @@ impl Engine {
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
+        // A folding error planning-input discovery deferred stands even when
+        // no folding reached its constant.
+        let outcome = match (
+            outcome,
+            reset_workspace.then(eval::take_deferred_fold_error),
+        ) {
+            (Ok(Ok(())), Some(Some(error))) => Ok(Err(error)),
+            (outcome, _) => outcome,
+        };
         let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
                 Ok(tag) => tag,
@@ -25772,6 +26077,19 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::reconcile_foreign_key_clones(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                event_ddl_mark,
+                event_catalog_stamp,
+                arena,
+            )
         {
             return Ok(Err(error));
         }
@@ -32811,6 +33129,7 @@ fn apply_wal_op(
             expressions,
             unique,
             definition,
+            parent,
             expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
@@ -32848,7 +33167,10 @@ fn apply_wal_op(
                     .map(crate::storage::index_predicate_stackstr)
                     .transpose()?,
                 unique,
-                mutable: definition,
+                mutable: crate::storage::IndexMutableDefinition {
+                    parent: storage.resolve_index_parent(parent, 0)?,
+                    ..definition
+                },
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Present,
                 pending_parent_drop_txid: None,
@@ -32889,6 +33211,7 @@ fn apply_wal_op(
             schema,
             name,
             definition,
+            parent,
             expressions,
             predicate,
         } => {
@@ -32901,6 +33224,10 @@ fn apply_wal_op(
             })?;
             let (expressions, predicate) =
                 crate::storage::index_expression_image(expressions, predicate)?;
+            let definition = crate::storage::IndexMutableDefinition {
+                parent: storage.resolve_index_parent(parent, 0)?,
+                ..definition
+            };
             storage.alter_index_definition(slot, definition, 0)?;
             storage.alter_index_expressions(slot, expressions, predicate, 0)?;
             storage.commit_index_definition(slot)?;

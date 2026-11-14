@@ -2039,13 +2039,15 @@ fn computes_outputs(body: &Select<'_>) -> bool {
 /// The most FROM items a query keeps after its subqueries become joins.
 const MAX_FILTER_JOIN_ITEMS: usize = 16;
 
-/// Turns each `WHERE` conjunct `EXISTS (subquery)`, `NOT EXISTS (subquery)`
-/// and `expression IN (subquery)` of a top-level query into a semi or anti
+/// Turns each `WHERE` conjunct `EXISTS (subquery)`, `NOT EXISTS (subquery)`,
+/// `expression IN (subquery)` and `expression op ANY (subquery)` of a
+/// top-level query into a semi or anti
 /// join with the subquery's relation, as PostgreSQL's `pull_up_sublinks`
 /// does, so the subquery's rows are read once rather than per row. The
 /// subquery must read one stored table and carry only a condition: no
-/// grouping, bounds, locking or volatile functions. `EXISTS` must and `IN`
-/// must not read the query's columns, and the `IN` operand must.
+/// grouping, bounds, locking or volatile functions. `EXISTS` must read the
+/// query's columns, as must an `IN` or `ANY` operand; the compared column
+/// is the subquery's own.
 ///
 /// The joined table answers to its name prefixed with a NUL byte, which no
 /// SQL identifier contains, so nothing outside its condition can name it.
@@ -2142,7 +2144,107 @@ fn pull_up_sublinks<'a>(
     if (outer_scope.n..scope.n).any(|table| scope.derived[table].is_some()) {
         return Err(Stop::Keep);
     }
-    Ok(rewritten)
+    equate_constants(rewritten, &scope, outer_scope.n, arena)
+}
+
+/// A pulled-up join's equality of its relation's column with a query
+/// column the query's `WHERE` equates to a constant becomes the same
+/// comparison of its own column, as PostgreSQL's equivalence classes
+/// derive it (`o.id = 287` and `i.id = o.id` give `i.id = 287`), which then
+/// filters the relation's scan. Only columns of one type are equated.
+fn equate_constants<'a>(
+    select: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    own: usize,
+    arena: &'a Arena,
+) -> Step<&'a Select<'a>> {
+    let from = select.from.as_ref().expect("pulled-up query has FROM");
+    let mut restrictions = crate::mem::arena::ArenaList::new(arena);
+    flatten_and(select.where_clause, &mut restrictions).map_err(|_| Stop::full())?;
+    let column = |expression: &Expr<'_>| match expression {
+        Expr::Column { qualifier, name } => scope.find_column_unsuggested(*qualifier, name).ok(),
+        _ => None,
+    };
+    // The constant a `WHERE` conjunct equates `target` to.
+    let constant = |target| {
+        restrictions.as_slice().iter().find_map(|conjunct| match conjunct {
+            Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => {
+                let literal = |side: &'a Expr<'a>| matches!(side, Expr::Int(_) | Expr::Str(_));
+                if literal(right) && column(left) == Some(target) {
+                    Some(*right)
+                } else if literal(left) && column(right) == Some(target) {
+                    Some(*left)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    };
+    let first = own - 1;
+    let joins = arena
+        .alloc_slice_copy(from.joins)
+        .map_err(|_| Stop::full())?;
+    let mut changed = false;
+    for join in &mut joins[first..] {
+        let mut conjuncts = crate::mem::arena::ArenaList::new(arena);
+        flatten_and(join.on, &mut conjuncts).map_err(|_| Stop::full())?;
+        let mut on = None;
+        for &conjunct in conjuncts.as_slice() {
+            let mut rewritten = conjunct;
+            if let Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                left,
+                right,
+                source_position,
+            } = conjunct
+                && let (Some(a), Some(b)) = (column(left), column(right))
+            {
+                let table = |entry| match entry {
+                    ResolvedColumn::Table(table, _) => Some(table),
+                    _ => None,
+                };
+                let sides = match (table(a), table(b)) {
+                    (Some(x), Some(y)) if x >= own && y < own => Some((*left, b)),
+                    (Some(x), Some(y)) if y >= own && x < own => Some((*right, a)),
+                    _ => None,
+                };
+                if let Some((inner, query_column)) = sides
+                    && scope.output_type(a) == scope.output_type(b)
+                    && let Some(value) = constant(query_column)
+                {
+                    rewritten = &*arena
+                        .alloc(Expr::Binary {
+                            source_position: *source_position,
+                            operator: crate::sql::ast::BinaryOp::Eq,
+                            left: inner,
+                            right: value,
+                        })
+                        .map_err(|_| Stop::full())?;
+                    changed = true;
+                }
+            }
+            on = super::and_where(on, Some(rewritten), arena)?;
+        }
+        join.on = on;
+    }
+    if !changed {
+        return Ok(select);
+    }
+    Ok(&*arena
+        .alloc(Select {
+            from: Some(FromClause {
+                base: from.base,
+                joins,
+            }),
+            ..*select
+        })
+        .map_err(|_| Stop::full())?)
 }
 
 /// The semi or anti join a `WHERE` conjunct becomes, if it pulls up.
@@ -2164,7 +2266,13 @@ fn sublink_join<'a>(
             operand,
             select,
             negated: false,
-        } => (*select, JoinKind::Semi, Some(*operand)),
+        } => (*select, JoinKind::Semi, Some((*operand, crate::sql::ast::BinaryOp::Eq))),
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            select,
+            all: false,
+        } => (*select, JoinKind::Semi, Some((*operand, *operator))),
         _ => return Ok(None),
     };
     let Some(sub_from) = subquery.from.as_ref() else {
@@ -2198,7 +2306,7 @@ fn sublink_join<'a>(
     if condition.is_some_and(|condition| {
         condition.contains_subquery()
             || super::expression_contains_volatile(condition, storage, txid, false)
-    }) || operand.is_some_and(|operand| {
+    }) || operand.is_some_and(|(operand, _)| {
         operand.contains_subquery()
             || super::expression_contains_volatile(operand, storage, txid, false)
     }) {
@@ -2251,7 +2359,7 @@ fn sublink_join<'a>(
     // Each column reference: the subquery's own, qualified by its hidden
     // name, or the query's, which must answer it. Anything else (an
     // enclosing query's column, a whole row) keeps the subquery in place.
-    let mut correlated = false;
+    let correlated = core::cell::Cell::new(false);
     let mut unbindable = false;
     let mut requalify = |expression: &'a Expr<'a>| -> Step<&'a Expr<'a>> {
         rewrite_expression(expression, arena, &mut |node| match node {
@@ -2280,7 +2388,7 @@ fn sublink_join<'a>(
                     .find_column_unsuggested(*qualifier, name)
                     .is_ok()
                 {
-                    correlated = true;
+                    correlated.set(true);
                 } else {
                     unbindable = true;
                 }
@@ -2299,24 +2407,24 @@ fn sublink_join<'a>(
         })
         .map_err(|_: crate::mem::arena::ArenaFull| Stop::full())
     };
-    let condition = match condition {
-        Some(condition) => Some(requalify(condition)?),
-        None => None,
-    };
+    // The compared column is the subquery's own.
     let compared = match compared {
         Some(compared) => Some(requalify(compared)?),
         None => None,
     };
-    let read_outer = correlated;
-    if unbindable {
+    let item_reads_outer = correlated.get();
+    let condition = match condition {
+        Some(condition) => Some(requalify(condition)?),
+        None => None,
+    };
+    let read_outer = correlated.get();
+    if unbindable || item_reads_outer {
         return Ok(None);
     }
     let condition = match (operand, compared) {
-        (Some(operand), Some(compared)) => {
-            // The subquery must not read the query; its operand must.
-            if read_outer {
-                return Ok(None);
-            }
+        // PostgreSQL 18 also pulls up a correlated `IN` or `ANY`; its
+        // operand must read the query.
+        (Some((operand, operator)), Some(compared)) => {
             let mut operand_columns = true;
             let mut operand_reads = false;
             operand.for_each_column_reference(&mut |qualifier, name| {
@@ -2332,7 +2440,7 @@ fn sublink_join<'a>(
             let equality = &*arena
                 .alloc(Expr::Binary {
                     source_position: SourcePosition::UNKNOWN,
-                    operator: crate::sql::ast::BinaryOp::Eq,
+                    operator,
                     left: operand,
                     right: compared,
                 })

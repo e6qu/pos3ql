@@ -527,6 +527,7 @@ fn reset_subplans() {
 fn register_subplan(
     select: &Select<'_>,
     correlated: bool,
+    compared: Compared,
 ) -> Result<crate::sql::catalog::deparse::SublinkPlan, SqlError> {
     SUBPLANS.with(|subplans| {
         let mut subplans = subplans.borrow_mut();
@@ -539,15 +540,41 @@ fn register_subplan(
             ));
         }
         let number = u16::try_from(count + 1).expect("bounded by MAX_SUBPLANS");
-        let plan = if correlated {
-            crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
-        } else {
-            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+        let plan = match (correlated, compared) {
+            (false, Compared::Hashed) => {
+                crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number)
+            }
+            (false, Compared::No) => crate::sql::catalog::deparse::SublinkPlan::InitPlan(number),
+            _ => crate::sql::catalog::deparse::SublinkPlan::SubPlan(number),
         };
         subplans.0[count] = (core::ptr::from_ref(select) as usize, plan);
         subplans.1 = count + 1;
         Ok(plan)
     })
+}
+
+/// How a subquery compares its rows with an operand: `IN` and `= ANY` hash
+/// an uncorrelated subquery's rows; any other comparison scans them per row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Compared {
+    No,
+    Hashed,
+    Scanned,
+}
+
+impl Compared {
+    fn of(expression: &Expr<'_>) -> Self {
+        match expression {
+            Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery {
+                operator: BinaryOp::Eq,
+                all: false,
+                ..
+            } => Self::Hashed,
+            Expr::QuantifiedSubquery { .. } => Self::Scanned,
+            _ => Self::No,
+        }
+    }
 }
 
 /// The subplan the explained statement runs `select` as, if any.
@@ -564,7 +591,11 @@ fn registered_sublink(select: *const ()) -> Option<crate::sql::catalog::deparse:
 /// The query of a subquery EXPLAIN can show as a subplan.
 fn sublink_query<'e>(expression: &'e Expr<'e>) -> Option<&'e Select<'e>> {
     match expression {
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => Some(select),
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
         _ => None,
     }
 }
@@ -2936,14 +2967,38 @@ fn plan_sublinks<'a>(
             OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
         }
         let Plan { nodes, count, .. } = inner?;
-        let nodes: &'a [PlanNode] = &nodes[..count];
-        let number = match register_subplan(select, correlated)? {
+        let compared = Compared::of(node);
+        // PostgreSQL rescans an uncorrelated subquery it compares row by
+        // row from a materialized copy.
+        let nodes: &'a [PlanNode] = if !correlated && compared == Compared::Scanned {
+            let wrapped = arena
+                .alloc_slice_with(count + 1, |index| match index {
+                    0 => PlanNode {
+                        name: StackStr::from_str("Materialize"),
+                        total_cost: nodes[0].total_cost,
+                        rows: nodes[0].rows,
+                        width: nodes[0].width,
+                        output: nodes[0].output,
+                        ..PlanNode::EMPTY
+                    },
+                    _ => PlanNode {
+                        depth: nodes[index - 1].depth + 1,
+                        ..nodes[index - 1]
+                    },
+                })
+                .map_err(|_| arena_full())?;
+            wrapped
+        } else {
+            &nodes[..count]
+        };
+        let number = match register_subplan(select, correlated, compared)? {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
-            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number) => number,
+            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
+            | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,
         };
         planned
             .push(Sublink {
-                kind: if correlated {
+                kind: if correlated || compared != Compared::No {
                     SubplanKind::SubPlan
                 } else {
                     SubplanKind::InitPlan
@@ -4011,6 +4066,9 @@ fn plan_pulled_select<'a>(
                 .with_qual(QualLabel::Filter, post_filters[position].take()),
             )?;
         }
+        // The outer relation's estimated rows: PostgreSQL rescans the inner
+        // relation itself rather than a materialized copy for one outer row.
+        let mut outer_rows = u64::MAX;
         for (position, &table) in table_order[..scope.n].iter().enumerate() {
             let depth = if n == 1 {
                 stage_count
@@ -4030,6 +4088,9 @@ fn plan_pulled_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
+            if position == 0 {
+                outer_rows = scan.rows;
+            }
             // PostgreSQL scans a function in FROM with a `Function Scan`.
             if let Some(source) = statement.from.as_ref().and_then(|from| {
                 core::iter::once(&from.base)
@@ -4048,8 +4109,9 @@ fn plan_pulled_select<'a>(
             }
             let position_role = u16::try_from(table).map_err(|_| arena_full())?;
             scan.key = key(Role::Scan(position_role));
-            let sequential =
-                scan.name.as_str() == "Seq Scan" && crate::sql::guc::planner_methods().material;
+            let sequential = scan.name.as_str() == "Seq Scan"
+                && crate::sql::guc::planner_methods().material
+                && !(n == 2 && outer_rows <= 1);
             scan = scan
                 .with_qual(QualLabel::IndexCond, index_conds[table].take())
                 .with_qual(QualLabel::Filter, filters[table].take());
@@ -4193,7 +4255,11 @@ fn postpones_select_list(storage: &Storage, txid: u32, statement: &Select<'_>) -
             subplan |= sublink_query(node)
                 .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
                 .is_some_and(|plan| {
-                    matches!(plan, crate::sql::catalog::deparse::SublinkPlan::SubPlan(_))
+                    matches!(
+                        plan,
+                        crate::sql::catalog::deparse::SublinkPlan::SubPlan(_)
+                            | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(_)
+                    )
                 });
         });
         statement.limit.is_some()

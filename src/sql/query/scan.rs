@@ -2869,7 +2869,9 @@ pub(crate) fn parameterized_index_access_plan<'a>(
             operand_bindings(constraint.operand)
                 .is_some_and(|(tables, has_outer)| has_outer || tables & bound_tables != 0)
         });
-    if !uses_bound_row {
+    // A semi or anti join's relation is probed once per outer row anyway,
+    // with the keys its query's constants imply.
+    if !uses_bound_row && !join.is_some_and(|join| join.kind.is_semi_or_anti()) {
         return Ok(None);
     }
     for position in 0..plan.n_columns {

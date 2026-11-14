@@ -2598,6 +2598,15 @@ pub(crate) fn external_materialized_into<'a>(
         )?;
         return Ok(emitted);
     }
+    let stages = materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
+    let below_limit = stages.below_limit();
+    // A sort under a DISTINCT returns every row it sorted.
+    let sorted_rows = if stages.unique.measured() {
+        stages.sort
+    } else {
+        instrument::Node::NONE
+    };
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
@@ -2746,6 +2755,7 @@ pub(crate) fn external_materialized_into<'a>(
             let Some(context) = reader.context() else {
                 break;
             };
+            sorted_rows.row();
             let crate::sql::external::ExternalRunContext {
                 row,
                 previous,
@@ -2807,6 +2817,10 @@ pub(crate) fn external_materialized_into<'a>(
                                 plan.n_order,
                             )?;
                         let lookahead = past_window && !in_ties;
+                        below_limit.row();
+                        if logical_index >= offset && !lookahead {
+                            stages.limit.row();
+                        }
                         let mark = arena.mark();
                         let encoded = if deferred.is_some() {
                             (|| {

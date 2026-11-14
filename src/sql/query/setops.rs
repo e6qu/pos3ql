@@ -568,28 +568,54 @@ fn external_set_leaf<'a>(
         .expect("spill-attached block store")
 }
 
+/// Runs a set tree into one provider-neutral run, numbering its set
+/// operations and leaves for EXPLAIN as [`eval_set_tree`] does.
 fn external_set_tree<'a>(
     tree: &'a SetTree<'a>,
     context: ExternalSetContext<'_, 'a>,
     target: &[ColType],
     sorted: bool,
+    numbers: &mut (u16, u16),
 ) -> Result<Option<ExternalRun>, SqlError> {
     let SetTree::Op {
+        syntax,
         operator,
         all,
         left,
         right,
-        ..
     } = tree
     else {
         let SetTree::Select(select) = tree else {
             unreachable!()
         };
+        let _branch = instrument::enter(instrument::Segment::Branch(numbers.1));
+        numbers.1 = numbers.1.saturating_add(1);
         return external_set_leaf(select, context, target, sorted);
     };
+    // EXPLAIN shows a `VALUES` list as one scan; its rows are not numbered
+    // branches.
+    let mut unnumbered = (0, 0);
+    let (_values, numbers, node, input) =
+        if matches!(syntax, crate::sql::ast::SetOperationSyntax::Values) {
+            (
+                Some(instrument::enter(instrument::Segment::Branch(u16::MAX))),
+                &mut unnumbered,
+                instrument::Node::NONE,
+                instrument::Node::NONE,
+            )
+        } else {
+            let node = instrument::node(instrument::Role::SetOperation(numbers.0));
+            let input = instrument::node(instrument::Role::SetInput(numbers.0));
+            numbers.0 = numbers.0.saturating_add(1);
+            (None, numbers, node, input)
+        };
+    let _loop = node.start();
+    let input_loop = input.start();
     let merge_inputs = !(*operator == SetOp::Union && *all);
-    let left_run = external_set_tree(left, context, target, sorted || merge_inputs)?;
-    let right_run = external_set_tree(right, context, target, sorted || merge_inputs)?;
+    let left_run = external_set_tree(left, context, target, sorted || merge_inputs, numbers)?;
+    let right_run = external_set_tree(right, context, target, sorted || merge_inputs, numbers)?;
+    input.rows(left_run.map_or(0, ExternalRun::rows) + right_run.map_or(0, ExternalRun::rows));
+    drop(input_loop);
 
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
@@ -736,10 +762,12 @@ fn external_set_tree<'a>(
             }
         }
     }
-    context
+    let run = context
         .storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut output_compare))
-        .expect("spill-attached block store")
+        .expect("spill-attached block store")?;
+    node.rows(run.map_or(0, ExternalRun::rows));
+    Ok(run)
 }
 
 /// Streams a set-operation body from immutable provider-neutral runs. This is
@@ -797,6 +825,9 @@ pub(crate) fn external_set_body_into<'a>(
                 )
             })?;
     }
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
+    let below_limit = stages.below_limit();
     let Some(run) = external_set_tree(
         tree,
         ExternalSetContext {
@@ -809,6 +840,7 @@ pub(crate) fn external_set_body_into<'a>(
         },
         &target[..column_count],
         false,
+        &mut (0, 0),
     )?
     else {
         return Ok(());
@@ -864,7 +896,9 @@ pub(crate) fn external_set_body_into<'a>(
         if logical >= window && !tied {
             break;
         }
+        below_limit.row();
         if logical >= offset {
+            stages.limit.row();
             let mut values = [Datum::Null; MAX_PROJ];
             for (column, value) in values.iter_mut().enumerate().take(column_count) {
                 *value = exec::decode_projected_col_record(context.row, column, arena)?;
@@ -905,6 +939,9 @@ fn external_set_query<'a>(
         ..crate::sql::eval::NO_HOOKS
     };
 
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
+    let below_limit = stages.below_limit();
     let run = match external_set_tree(
         tree,
         ExternalSetContext {
@@ -917,6 +954,7 @@ fn external_set_query<'a>(
         },
         target,
         false,
+        &mut (0, 0),
     ) {
         Ok(run) => run,
         Err(error) => return sql_fail(error),
@@ -1003,7 +1041,9 @@ fn external_set_query<'a>(
             if logical >= window && !tied {
                 false
             } else {
+                below_limit.row();
                 if logical >= offset {
+                    stages.limit.row();
                     let mut values = [Datum::Null; MAX_PROJ];
                     for (column, value) in values.iter_mut().enumerate().take(target.len()) {
                         *value = match exec::decode_projected_col_record(context.row, column, arena)

@@ -2419,13 +2419,40 @@ impl<'d> QueryScope<'d> {
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
                 let pushed = pushed.filter(|plan| plan.table_slot == slot);
+                // A grouped remote query fills its own relation.
+                if let Some(upper) = pushed.and_then(|plan| plan.upper.as_ref()) {
+                    let table = storage.table_def(slot, txid);
+                    self.defs.set_relation(
+                        source,
+                        crate::storage::RelationDefinition {
+                            schema: table.schema,
+                            name: table.name,
+                            n_columns: upper.columns.len(),
+                            columns: upper.columns,
+                        },
+                        arena,
+                    )?;
+                }
                 if self.sole_source && !tref.lateral {
                     // The only FROM item: the plan reads it as the remote
                     // cursor returns batches.
                     let pushed = match pushed {
                         Some(plan) => Some((
                             arena.alloc_str(plan.sql).map_err(|_| arena_full())?,
-                            plan.fetched,
+                            match plan.remote_columns() {
+                                crate::sql::foreign::RemoteColumns::Upper(columns) => {
+                                    crate::sql::foreign::RemoteColumns::Upper(
+                                        arena
+                                            .alloc_slice_with(columns.len(), |at| {
+                                                columns[at].clone()
+                                            })
+                                            .map_err(|_| arena_full())?,
+                                    )
+                                }
+                                crate::sql::foreign::RemoteColumns::Table(fetched) => {
+                                    crate::sql::foreign::RemoteColumns::Table(fetched)
+                                }
+                            },
                         )),
                         None => None,
                     };

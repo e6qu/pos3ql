@@ -189,7 +189,26 @@ pub(super) fn decode_foreign_field<'a>(
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    let declared = storage.declared_column_type(&table.columns()[column], txid)?;
+    decode_remote_field(
+        storage,
+        &table.columns()[column],
+        raw,
+        txid,
+        arena,
+        sequences,
+    )
+}
+
+/// A remote text field read into the local column `definition`.
+fn decode_remote_field<'a>(
+    storage: &Storage,
+    definition: &crate::storage::ColumnMeta,
+    raw: Option<&'a [u8]>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    let declared = storage.declared_column_type(definition, txid)?;
     let value = match raw {
         Some(raw) => super::exec::decode_text_input(
             storage,
@@ -210,14 +229,7 @@ pub(super) fn decode_foreign_field<'a>(
     if value.is_null() {
         return Ok(value);
     }
-    super::exec::coerce(
-        value,
-        &table.columns()[column],
-        storage,
-        txid,
-        arena,
-        sequences,
-    )
+    super::exec::coerce(value, definition, storage, txid, arena, sequences)
 }
 
 fn poll_client(
@@ -1363,12 +1375,68 @@ fn close_cursor(
 /// A foreign table a plan reads through its own remote cursor, and the rows
 /// fetched so far, which a rescan of the same source (a window's second
 /// pass) reads again instead of scanning the server twice.
+/// What a pushed remote query returns.
+#[derive(Clone, Copy)]
+pub(crate) enum RemoteColumns<'a> {
+    /// These columns of the table, in table order; the others read `NULL`.
+    Table(ColumnSet),
+    /// A grouped relation's columns, one per remote target.
+    Upper(&'a [crate::storage::ColumnMeta]),
+}
+
+impl RemoteColumns<'_> {
+    fn fields(&self) -> usize {
+        match self {
+            Self::Table(fetched) => (fetched.count_ones() as usize).max(1),
+            Self::Upper(columns) => columns.len(),
+        }
+    }
+}
+
+/// Encodes one remote row as the local scan reads it.
+fn decode_remote_row<'a>(
+    storage: &Storage,
+    table: &TableDef,
+    shape: RemoteColumns<'_>,
+    remote_row: &crate::pg::replication_client::SqlDataRow<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<&'a [u8], SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+    let mut fields = remote_row.columns().iter();
+    let width = match shape {
+        RemoteColumns::Table(fetched) => {
+            for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                if fetched.contains(column) {
+                    let raw = *fields
+                        .next()
+                        .expect("row shape checked against the fetched columns");
+                    *value =
+                        decode_foreign_field(storage, table, column, raw, txid, arena, sequences)?;
+                }
+            }
+            table.n_columns
+        }
+        RemoteColumns::Upper(columns) => {
+            for (definition, value) in columns.iter().zip(values.iter_mut()) {
+                let raw = *fields
+                    .next()
+                    .expect("row shape checked against the remote targets");
+                *value = decode_remote_field(storage, definition, raw, txid, arena, sequences)?;
+            }
+            columns.len()
+        }
+    };
+    super::exec::encode_projected_pub(&values[..width], arena)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ForeignStream<'a> {
     pub(crate) table_slot: usize,
     /// The remote query a pushed plan built and the columns it returns;
     /// `None` reads every column.
-    pub(crate) pushed: Option<(&'a str, ColumnSet)>,
+    pub(crate) pushed: Option<(&'a str, RemoteColumns<'a>)>,
     state: crate::mem::arena::ArenaHandle<StreamState<'a>>,
     owner: &'a Arena,
 }
@@ -1392,7 +1460,7 @@ struct StreamState<'a> {
 impl<'a> ForeignStream<'a> {
     pub(crate) fn new(
         table_slot: usize,
-        pushed: Option<(&'a str, ColumnSet)>,
+        pushed: Option<(&'a str, RemoteColumns<'a>)>,
         owner: &'a Arena,
     ) -> Result<Self, SqlError> {
         let state = owner
@@ -1506,18 +1574,18 @@ pub(crate) fn stream_rows<'a>(
     let remote = RemoteTable::open(storage, stream.table_slot, txid)?;
     let mut query = StackStr::<16_384>::new();
     let table = &remote.table;
-    let fetched = match stream.pushed {
-        Some((sql, fetched)) => {
+    let shape = match stream.pushed {
+        Some((sql, shape)) => {
             let _ = query.write_str(sql);
-            fetched
+            shape
         }
         None => {
             remote.write_select(&mut query);
-            ColumnSet::all(table.n_columns)
+            RemoteColumns::Table(ColumnSet::all(table.n_columns))
         }
     };
     checked(&query, "query")?;
-    let fields = (fetched.count_ones() as usize).max(1);
+    let fields = shape.fields();
     let fetch_size = remote.fetch_size();
     let mut index = 0usize;
     loop {
@@ -1587,19 +1655,8 @@ pub(crate) fn stream_rows<'a>(
             fetch_size,
             fields,
             &mut |remote_row| {
-                let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-                let mut columns = remote_row.columns().iter();
-                for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
-                    if fetched.contains(column) {
-                        let raw = *columns
-                            .next()
-                            .expect("row shape checked against the fetched columns");
-                        *value = decode_foreign_field(
-                            storage, table, column, raw, txid, arena, sequences,
-                        )?;
-                    }
-                }
-                let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+                let encoded =
+                    decode_remote_row(storage, table, shape, &remote_row, txid, arena, sequences)?;
                 if let Some(ordinal) = ordinal {
                     crate::sql::query::keep_foreign_row(ordinal, encoded)?;
                 }
@@ -1657,19 +1714,18 @@ pub(crate) fn materialize<'a>(
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let mut query = StackStr::<16_384>::new();
     let table = &remote.table;
-    let fetched = match pushed {
+    let shape = match pushed {
         Some(plan) => {
             debug_assert_eq!(plan.table_slot, table_slot);
             let _ = query.write_str(plan.sql);
-            plan.fetched
+            plan.remote_columns()
         }
         None => {
             remote.write_select(&mut query);
-            ColumnSet::all(table.n_columns)
+            RemoteColumns::Table(ColumnSet::all(table.n_columns))
         }
     };
     checked(&query, "query")?;
-    let fetched_count = fetched.count_ones() as usize;
     let mut rows: *mut &[u8] = core::ptr::null_mut();
     let mut row_count = 0usize;
     let mut row_capacity = 0usize;
@@ -1679,20 +1735,10 @@ pub(crate) fn materialize<'a>(
         lease,
         query.as_str(),
         remote.fetch_size(),
-        fetched_count.max(1),
+        shape.fields(),
         &mut |remote_row| {
-            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-            let mut fields = remote_row.columns().iter();
-            for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
-                if fetched.contains(column) {
-                    let raw = *fields
-                        .next()
-                        .expect("row shape checked against the fetched columns");
-                    *value =
-                        decode_foreign_field(storage, table, column, raw, txid, arena, sequences)?;
-                }
-            }
-            let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+            let encoded =
+                decode_remote_row(storage, table, shape, &remote_row, txid, arena, sequences)?;
             push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)
         },
     )?;
@@ -1749,6 +1795,7 @@ pub(crate) fn direct_modify_sql<'a>(
     };
     let deparser = deparse::Deparser {
         table: &table,
+        grouped: false,
         foreign: &foreign,
         exposed,
         arena,
@@ -1784,6 +1831,7 @@ pub(crate) fn modify_scan<'a>(
     };
     let deparser = deparse::Deparser {
         table: &table,
+        grouped: false,
         foreign: &foreign,
         exposed,
         arena,
@@ -2678,6 +2726,7 @@ fn child_modify_sql<'a>(
 ) -> Result<&'a str, SqlError> {
     let deparser = deparse::Deparser {
         table: &remote.table,
+        grouped: false,
         foreign: &remote.foreign,
         exposed: remote.table.name.as_str(),
         arena,

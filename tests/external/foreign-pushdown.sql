@@ -70,6 +70,15 @@ DO $$ DECLARE r int; BEGIN UPDATE ft SET q = q + 1 WHERE id = 14 RETURNING q INT
 UPDATE ft SET q = 2000 WHERE id = 15 RETURNING id;
 SELECT id, q FROM ft WHERE id BETWEEN 9 AND 20 ORDER BY id;
 
+-- Grouping and aggregates ship when the whole query does.
+:e SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;
+SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;
+SELECT flag, count(DISTINCT c), sum(f) FILTER (WHERE id > 3), string_agg(v, ',' ORDER BY v DESC) FROM ft GROUP BY flag ORDER BY flag;
+SELECT count(*), sum(q), bool_and(flag), every(id > 0) FROM ft;
+SELECT count(*) FROM ft WHERE id > 1000;
+SELECT id % 4 AS k, count(*) FROM ft GROUP BY k HAVING sum(id) > 30 ORDER BY sum(id);
+SELECT count(*) FROM ft GROUP BY note ORDER BY 1 LIMIT 1;
+
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.
 SELECT name FROM app;

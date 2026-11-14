@@ -92,7 +92,12 @@ fn respond_to(
         *status = b'I';
         out.extend(complete("ROLLBACK"));
     } else if command.starts_with("DECLARE ") {
-        *rows = 0..5;
+        // A grouped remote query returns one group, here valued 42.
+        *rows = if command.contains("count(*)") {
+            42..43
+        } else {
+            0..5
+        };
         *identities = command.contains("\nSELECT ctid ");
         out.extend(complete("DECLARE CURSOR"));
     } else if let Some(rest) = command.strip_prefix("FETCH ") {
@@ -234,9 +239,18 @@ fn postgres_fdw_caches_connections_and_spells_its_remote_commands() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let scanned = run_with(&mut engine, &mut budget, "SELECT sum(id) FROM ft");
+    // A condition kept local leaves the aggregates here, over the rows.
+    let scanned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT sum(id) FROM ft WHERE random() < 2",
+    );
     assert_eq!(data_rows(&scanned), ["10"]);
-    let scanned = run_with(&mut engine, &mut budget, "SELECT count(*) FROM ft");
+    let scanned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM ft WHERE random() < 2",
+    );
     assert_eq!(data_rows(&scanned), ["5"]);
     let inserted = run_with(
         &mut engine,
@@ -468,6 +482,45 @@ fn direct_modify_ships_returning_columns_and_projects_the_returned_rows() {
             "UPDATE public.ft SET note = 'y'::text WHERE ((id > 3)) RETURNING id",
             "DELETE FROM public.ft WHERE ((id = 9))",
             "UPDATE public.ft SET note = 'z'::text WHERE ((id > 3)) RETURNING id",
+        ]
+    );
+}
+
+#[test]
+fn grouped_queries_ship_their_aggregates() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let grouped = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) AS n FROM ft WHERE id > 1 HAVING count(*) > 1 LIMIT 3",
+    );
+    assert_eq!(
+        data_rows(&grouped),
+        ["42"],
+        "{}",
+        String::from_utf8_lossy(&grouped)
+    );
+    assert_eq!(
+        remote_statements(&log),
+        [
+            "DECLARE c1 CURSOR FOR\nSELECT count(*) FROM public.ft WHERE ((id > 1)) \
+          HAVING ((count(*) > 1))"
+        ]
+    );
+    let plan = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM ft LIMIT 1",
+    );
+    assert_eq!(
+        data_rows(&plan),
+        [
+            "Limit",
+            "  Output: (count(*))",
+            "  ->  Foreign Scan",
+            "        Output: (count(*))",
+            "        Relations: Aggregate on (public.ft)",
+            "        Remote SQL: SELECT count(*) FROM public.ft",
         ]
     );
 }

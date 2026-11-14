@@ -793,7 +793,11 @@ impl Context<'_> {
                 | BinaryOp::And
                 | BinaryOp::Or => Some(oid::BOOL),
                 BinaryOp::Concat => Some(oid::TEXT),
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                BinaryOp::Mod => {
+                    let (left, right) = self.binary_operands(*operator, left, right)?;
+                    left.or(right)
+                }
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                     let (left, right) = self.operand_types(left, right)?;
                     left.or(right)
                 }

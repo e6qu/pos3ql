@@ -864,7 +864,9 @@ with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
 and `differential_exact/504`. Remaining differences: joins, aggregates,
 `DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
 `COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
-with `RETURNING` runs row by row; an `UPDATE` sends no stored generated column
+with `RETURNING` runs row by row, as does one of a table with any trigger
+(PostgreSQL disqualifies only row triggers for the statement's event, so
+statement triggers must fire around the direct command first); an `UPDATE` sends no stored generated column
 values; a select list or `ORDER BY` with a subquery reads every column. A scan
 still reads all its rows before the plan consumes them (the cursor's `FETCH`
 batches are not streamed). COPY FROM into a foreign table sends one row at a

@@ -99,23 +99,23 @@ fn insert_select_streams_its_source_in_fixed_memory() {
             "x".repeat(560)
         )]
     );
-    // A source calling a volatile built-in reads differently each time it
-    // runs, so it materializes its rows first; they do not fit this arena.
-    let output = run(
+    // A source whose output calls a volatile built-in is read by the engine
+    // row by row, each row's output evaluated once as it is written, so it
+    // streams too.
+    let text = success(
         &mut engine,
         &mut budget,
         &mut txn,
         "INSERT INTO stream_dst SELECT id, label || (random() < 2)::text FROM stream_src",
     );
-    let text = String::from_utf8_lossy(&output);
-    assert!(text.contains("C54000"), "{text}");
+    assert!(text.contains("INSERT 0 8000"), "{text}");
     let output = run(
         &mut engine,
         &mut budget,
         &mut txn,
-        "SELECT count(*) FROM stream_dst",
+        "SELECT count(*), count(*) FILTER (WHERE label LIKE '%true') FROM stream_dst",
     );
-    assert_eq!(rows(&output), ["2000"]);
+    assert_eq!(rows(&output), ["10000|8000"]);
 }
 
 /// A streamed source restarts after a routine call in the rows and skips the

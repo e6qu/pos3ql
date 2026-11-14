@@ -1647,6 +1647,8 @@ pub fn prepare_subqueries<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    // A subquery's operators are kept apart from its query's.
+    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -2672,6 +2674,8 @@ pub(super) fn prepare_outer_subqueries<'a>(
     row_types: &dyn ColumnLookup<'a>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<OuterSubs<'a>, SqlError> {
+    // A subquery's operators are kept apart from its query's.
+    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -4281,6 +4285,8 @@ fn run_subquery<'a>(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    // A subquery's operators are kept apart from its query's.
+    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     // A binding describes the query as written; one rewritten for this row
     // is analysed again.

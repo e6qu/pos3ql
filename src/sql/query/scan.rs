@@ -31,8 +31,8 @@ use super::plan::{
     is_error_safe,
 };
 use super::{
-    MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, reorder_qual,
-    simplify_qual, where_passes,
+    MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, instrument,
+    reorder_qual, simplify_qual, where_passes,
 };
 
 #[derive(Clone, Copy)]
@@ -6317,7 +6317,7 @@ pub(crate) struct HashKeyLayout<'p> {
     pub(crate) capacity: usize,
 }
 
-impl HashJoinPlan<'_> {
+impl<'a> HashJoinPlan<'a> {
     /// PostgreSQL's name for this join node: the outer (probe) side's rows
     /// are preserved by a left join, the inner (hashed) side's by a right join.
     pub(crate) fn node_name(&self) -> &'static str {
@@ -6330,6 +6330,63 @@ impl HashJoinPlan<'_> {
     }
 
     /// Whether build rows nothing matched are returned after the probe.
+    /// For an outer join, the conjuncts each side's scan filters its rows
+    /// by, as PostgreSQL places them: a side the join never null-extends
+    /// takes the `WHERE` conjuncts that read only it, and a side whose rows
+    /// only it null-extends takes the `ON` conjuncts that read only it. Only
+    /// error-safe conjuncts move; the join still checks every condition.
+    /// None for an inner join.
+    pub(crate) fn outer_side_filters(
+        &self,
+        scope: &QueryScope<'_>,
+        where_clause: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Option<HashJoinFilters<'a, 'a>>, SqlError> {
+        if !self.preserves_probe_rows && !self.preserves_build_rows {
+            return Ok(None);
+        }
+        let side = |table: usize, preserved: bool, nullable: bool| {
+            let source = match (preserved, nullable) {
+                (true, false) => where_clause,
+                (false, true) => self.on,
+                _ => None,
+            };
+            let Some(condition) = source else {
+                return Ok(&[][..]);
+            };
+            let mut conjuncts = [condition; MAX_CONJUNCTS];
+            let mut count = 0;
+            let conjuncts: &[&Expr] = if flatten_and(condition, &mut conjuncts, &mut count) {
+                &conjuncts[..count]
+            } else {
+                core::slice::from_ref(&condition)
+            };
+            let own = arena
+                .alloc_slice_with(conjuncts.len(), |_| &Expr::Null)
+                .map_err(|_| arena_full())?;
+            let mut kept = 0;
+            for &conjunct in conjuncts {
+                if is_error_safe(conjunct) && expr_tables(conjunct, scope) == Some(1 << table) {
+                    own[kept] = conjunct;
+                    kept += 1;
+                }
+            }
+            Ok::<_, SqlError>(&own[..kept])
+        };
+        Ok(Some(HashJoinFilters {
+            probe: side(
+                self.probe_table,
+                self.preserves_probe_rows,
+                self.preserves_build_rows,
+            )?,
+            build: side(
+                self.build_table,
+                self.preserves_build_rows,
+                self.preserves_probe_rows,
+            )?,
+        }))
+    }
+
     pub(crate) fn preserves_build_rows(&self) -> bool {
         self.preserves_build_rows
     }
@@ -6830,6 +6887,96 @@ fn reads_no_query_column(
     }
 }
 
+/// The error-safe `WHERE` conjuncts a nested loop checks at one join-order
+/// depth: those reading only that depth's relation, PostgreSQL's filter of
+/// its scan, and those also reading earlier relations, its join's filter.
+/// Error-safe conjuncts raise nothing, so checking the scan's first only
+/// skips rows the join would have rejected anyway.
+#[derive(Clone, Copy)]
+struct DepthConjuncts<'p, 'a> {
+    scan: &'p [&'a Expr<'a>],
+    join: &'p [&'a Expr<'a>],
+}
+
+/// The conjuncts of a hash join's scans: [`DepthConjuncts::scan`] of each.
+#[derive(Clone, Copy)]
+pub(crate) struct HashJoinFilters<'p, 'a> {
+    pub(crate) probe: &'p [&'a Expr<'a>],
+    pub(crate) build: &'p [&'a Expr<'a>],
+}
+
+/// The `EXPLAIN ANALYZE` nodes of a hash join of two relations.
+struct HashJoinNodes {
+    probe: instrument::Node,
+    build: instrument::Node,
+    hash: instrument::Node,
+    join: instrument::Node,
+}
+
+impl HashJoinNodes {
+    fn of(probe: usize, build: usize) -> Self {
+        let position = |table: usize| u16::try_from(table).unwrap_or(u16::MAX);
+        Self {
+            probe: instrument::node(instrument::Role::Scan(position(probe))),
+            build: instrument::node(instrument::Role::Scan(position(build))),
+            hash: instrument::node(instrument::Role::Hash(position(build))),
+            join: instrument::node(instrument::Role::Join(1)),
+        }
+    }
+}
+
+/// The `EXPLAIN ANALYZE` nodes one join-order depth counts into.
+#[derive(Clone, Copy)]
+struct DepthNodes {
+    /// The scan of the depth's relation.
+    scan: instrument::Node,
+    /// The materialized copy of an inner relation a nested loop rescans:
+    /// its scan runs in its first loop only.
+    materialize: instrument::Node,
+    /// The join adding the depth's relation.
+    join: instrument::Node,
+}
+
+impl DepthNodes {
+    const NONE: Self = Self {
+        scan: instrument::Node::NONE,
+        materialize: instrument::Node::NONE,
+        join: instrument::Node::NONE,
+    };
+
+    fn of(order: &[usize], depth: usize) -> Self {
+        let position = |table: usize| u16::try_from(table).unwrap_or(u16::MAX);
+        let table = position(order[depth]);
+        Self {
+            scan: instrument::node(instrument::Role::Scan(table)),
+            materialize: if depth == 0 {
+                instrument::Node::NONE
+            } else {
+                instrument::node(instrument::Role::Materialize(table))
+            },
+            join: if depth == 0 {
+                instrument::Node::NONE
+            } else {
+                instrument::node(instrument::Role::Join(position(depth)))
+            },
+        }
+    }
+}
+
+/// Counts a complete joined row the scan's `WHERE` checked at its leaf: the
+/// filter of a single relation's scan, or of the top join.
+fn count_leaf(nodes: &[DepthNodes], passed: bool) {
+    let Some(last) = nodes.last() else {
+        return;
+    };
+    match (nodes.len(), passed) {
+        (1, true) => last.scan.row(),
+        (1, false) => last.scan.filtered(),
+        (_, true) => last.join.row(),
+        (_, false) => last.join.join_filtered(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -7203,6 +7350,7 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         order: &[usize],
         plan: HashJoinPlan<'a>,
+        filters: HashJoinFilters<'_, 'a>,
         decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
         pax_demand: PaxReadDemand,
@@ -7211,6 +7359,47 @@ fn scan_source_mode<'a>(
         use core::ops::ControlFlow;
         let probe_t = plan.probe_table;
         let build_t = plan.build_table;
+        let nodes = HashJoinNodes::of(probe_t, build_t);
+        // An outer join's `WHERE` is PostgreSQL's filter of the join's
+        // output; an inner join's is its join filter.
+        let where_removed = if plan.preserves_probe_rows || plan.preserves_build_rows {
+            instrument::Node::filtered
+        } else {
+            instrument::Node::join_filtered
+        };
+        // Whether a row of `table` alone passes its scan's conjuncts.
+        let scan_passes = |table: usize,
+                           row: BoundRow<'a>,
+                           rowid: Option<u64>,
+                           filter: &[&'a Expr<'a>],
+                           decode_buffers: &mut RowDecodeBuffers<'a>|
+         -> Result<bool, SqlError> {
+            if filter.is_empty() {
+                return Ok(true);
+            }
+            let mut bound = [None::<BoundRow>; 2];
+            let mut rowids = [None; 2];
+            bound[table] = Some(row);
+            rowids[table] = rowid;
+            let row = assemble(
+                storage,
+                txid,
+                scope,
+                &bound,
+                &rowids,
+                order,
+                2,
+                decode_buffers,
+                arena,
+            )?;
+            let chained = Chained { inner: &row, outer };
+            for &conjunct in filter {
+                if !conjunct_passes(conjunct, arena, params, &chained, hooks)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
         let keys = plan.keys;
         let nkeys = plan.key_count;
         let key_collations = plan.key_collations;
@@ -7221,7 +7410,16 @@ fn scan_source_mode<'a>(
         let build_derived_rows = scope.derived[build_t];
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
+        let hash_loop = nodes.hash.start();
+        let build_loop = nodes.build.start();
         let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+        let original_buckets = buckets_len;
+        // Every array the table allocates, those it outgrows included.
+        let table_bytes = |entries: usize, buckets: usize| {
+            entries * (core::mem::size_of::<HashEntry<'_>>() + core::mem::size_of::<u32>())
+                + buckets * core::mem::size_of::<u32>()
+        };
+        let mut allocated = table_bytes(build_count, buckets_len);
         let mut entries = arena
             .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
             .map_err(|_| arena_full())?;
@@ -7245,6 +7443,11 @@ fn scan_source_mode<'a>(
         // unlinked, only when unmatched build rows are returned.
         let mut insert =
             |rowid: Option<u64>, row: BoundRow<'a>, values: &[Datum<'a>]| -> Result<(), SqlError> {
+                if !scan_passes(build_t, row, rowid, filters.build, decode_buffers)? {
+                    nodes.build.filtered();
+                    return Ok(());
+                }
+                nodes.build.row();
                 let mut key_vals = [Datum::Null; 8];
                 let mut keyed = true;
                 for i in 0..nkeys {
@@ -7256,6 +7459,9 @@ fn scan_source_mode<'a>(
                 }
                 if !keyed && !keep_build {
                     return Ok(());
+                }
+                if keyed {
+                    nodes.hash.row();
                 }
                 if n == entries.len() {
                     // Double the entries and rehash them into twice as many
@@ -7271,6 +7477,7 @@ fn scan_source_mode<'a>(
                         .alloc_slice_with(grown, |_| u32::MAX)
                         .map_err(|_| arena_full())?;
                     buckets_len = (grown * 2).next_power_of_two().max(16);
+                    allocated += table_bytes(grown, buckets_len);
                     buckets = arena
                         .alloc_slice_with(buckets_len, |_| u32::MAX)
                         .map_err(|_| arena_full())?;
@@ -7406,6 +7613,14 @@ fn scan_source_mode<'a>(
         let entries = &mut entries[..n];
         let next = &*next;
         let buckets = &*buckets;
+        nodes.hash.hash_table(instrument::HashTable {
+            buckets: buckets_len,
+            original_buckets,
+            bytes: allocated,
+        });
+        drop(build_loop);
+        drop(hash_loop);
+        let _probe_loop = nodes.probe.start();
 
         // Probe: each outer row resolves its key against the build table
         // and returns its joined rows, or its NULL-extended row when it is
@@ -7425,6 +7640,11 @@ fn scan_source_mode<'a>(
         let mut visit_probe =
             |rowid: Option<u64>, probe_row: BoundRow<'a>| -> Result<bool, SqlError> {
                 check_timeout()?;
+                if !scan_passes(probe_t, probe_row, rowid, filters.probe, decode_buffers)? {
+                    nodes.probe.filtered();
+                    return Ok(true);
+                }
+                nodes.probe.row();
                 let mut probe_values = [Datum::Null; MAX_COLUMNS];
                 decode_hash_source(
                     probe_row,
@@ -7507,6 +7727,7 @@ fn scan_source_mode<'a>(
                         if let Some(condition) = on
                             && !join_condition_holds(condition, arena, params, &chained, hooks)?
                         {
+                            nodes.join.join_filtered();
                             continue;
                         }
                         matched_any = true;
@@ -7514,8 +7735,10 @@ fn scan_source_mode<'a>(
                         if let Some(predicate) = where_clause
                             && !where_passes(predicate, arena, params, &chained, hooks)?
                         {
+                            where_removed(nodes.join);
                             continue;
                         }
+                        nodes.join.row();
                         if !f(&row)? {
                             return Ok(false);
                         }
@@ -7540,9 +7763,11 @@ fn scan_source_mode<'a>(
                     if let Some(predicate) = where_clause {
                         let chained = Chained { inner: &row, outer };
                         if !where_passes(predicate, arena, params, &chained, hooks)? {
+                            where_removed(nodes.join);
                             return Ok(true);
                         }
                     }
+                    nodes.join.row();
                     return f(&row);
                 }
                 Ok(true)
@@ -7697,9 +7922,11 @@ fn scan_source_mode<'a>(
                 if let Some(predicate) = where_clause {
                     let chained = Chained { inner: &row, outer };
                     if !where_passes(predicate, arena, params, &chained, hooks)? {
+                        where_removed(nodes.join);
                         return Ok(true);
                     }
                 }
+                nodes.join.row();
                 f(&row)
             })?;
             if !keep {
@@ -7727,6 +7954,10 @@ fn scan_source_mode<'a>(
         }
     }
 
+    /// Whether the candidate bound at depth `count - 1` passes its scan's
+    /// filter, then its join's condition and filter, counting each step
+    /// into `nodes`. The top join's rows are counted at the leaf, after the
+    /// whole `WHERE`.
     #[allow(clippy::too_many_arguments)]
     fn candidate_passes<'a>(
         storage: &Storage,
@@ -7737,13 +7968,38 @@ fn scan_source_mode<'a>(
         order: &[usize],
         count: usize,
         on: Option<&Expr<'a>>,
-        pushdown: &[&Expr<'a>],
+        conjuncts: DepthConjuncts<'_, 'a>,
+        nodes: DepthNodes,
         decode_buffers: &mut RowDecodeBuffers<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<bool, SqlError> {
+        if !conjuncts.scan.is_empty() {
+            let row = assemble(
+                storage,
+                txid,
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                count,
+                decode_buffers,
+                arena,
+            )?;
+            let chained_row = Chained { inner: &row, outer };
+            for &conjunct in conjuncts.scan {
+                if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
+                    nodes.scan.filtered();
+                    return Ok(false);
+                }
+            }
+        }
+        if scope.n >= 2 {
+            nodes.scan.row();
+            nodes.materialize.row();
+        }
         if let Some(on) = on {
             let row = assemble(
                 storage,
@@ -7759,7 +8015,10 @@ fn scan_source_mode<'a>(
             let chained_row = Chained { inner: &row, outer };
             match eval_full(on, arena, params, &chained_row, hooks)? {
                 Datum::Bool(true) => {}
-                Datum::Bool(false) | Datum::Null => return Ok(false),
+                Datum::Bool(false) | Datum::Null => {
+                    nodes.join.join_filtered();
+                    return Ok(false);
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
@@ -7768,25 +8027,28 @@ fn scan_source_mode<'a>(
                 }
             }
         }
-        if pushdown.is_empty() {
-            return Ok(true);
-        }
-        let row = assemble(
-            storage,
-            txid,
-            scope,
-            bound,
-            bound_rowids,
-            order,
-            count,
-            decode_buffers,
-            arena,
-        )?;
-        let chained_row = Chained { inner: &row, outer };
-        for &conjunct in pushdown {
-            if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
-                return Ok(false);
+        if !conjuncts.join.is_empty() {
+            let row = assemble(
+                storage,
+                txid,
+                scope,
+                bound,
+                bound_rowids,
+                order,
+                count,
+                decode_buffers,
+                arena,
+            )?;
+            let chained_row = Chained { inner: &row, outer };
+            for &conjunct in conjuncts.join {
+                if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
+                    nodes.join.join_filtered();
+                    return Ok(false);
+                }
             }
+        }
+        if count < scope.n {
+            nodes.join.row();
         }
         Ok(true)
     }
@@ -7814,7 +8076,8 @@ fn scan_source_mode<'a>(
         matched: &[Option<JoinMatchFlags<'_>>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
-        pushdown: &[&[&'a Expr<'a>]],
+        conjuncts: DepthConjuncts<'_, 'a>,
+        nodes: DepthNodes,
         order: &[usize],
         decode_buffers: &mut RowDecodeBuffers<'a>,
         on: Option<&'a Expr<'a>>,
@@ -7863,7 +8126,8 @@ fn scan_source_mode<'a>(
             order,
             depth + 1,
             on,
-            pushdown[depth],
+            conjuncts,
+            nodes,
             decode_buffers,
             arena,
             params,
@@ -7906,7 +8170,9 @@ fn scan_source_mode<'a>(
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
-        pushdown: &[&[&'a Expr<'a>]],
+        pushdown: &[DepthConjuncts<'_, 'a>],
+        // The EXPLAIN ANALYZE nodes each depth counts into.
+        depth_nodes: &[DepthNodes],
         sample_plans: &[Option<TableSamplePlan>],
         // Execution order: `order[depth]` is the scope-table joined at this depth
         // (identity unless a cross join was cost-reordered).
@@ -7935,11 +8201,26 @@ fn scan_source_mode<'a>(
             if let Some(w) = where_clause {
                 let chained_row = Chained { inner: &row, outer };
                 if !where_passes(w, arena, params, &chained_row, hooks)? {
+                    count_leaf(depth_nodes, false);
                     return Ok(true);
                 }
             }
+            count_leaf(depth_nodes, true);
             return f(&row);
         }
+        // One execution of this depth's scan, or of the materialized copy a
+        // nested loop rescans, whose scan runs only the first time.
+        let nodes = depth_nodes[depth];
+        let _materialize_loop = nodes.materialize.start();
+        let nodes = if nodes.materialize.measured() && nodes.scan.loops() != 0 {
+            DepthNodes {
+                scan: instrument::Node::NONE,
+                ..nodes
+            }
+        } else {
+            nodes
+        };
+        let _scan_loop = nodes.scan.start();
 
         let join = if depth == 0 {
             None
@@ -7972,7 +8253,8 @@ fn scan_source_mode<'a>(
                     matched,
                     external_match_writer,
                     security_plans,
-                    pushdown,
+                    pushdown[depth],
+                    nodes,
                     order,
                     decode_buffers,
                     on,
@@ -7997,6 +8279,7 @@ fn scan_source_mode<'a>(
                         external_match_writer,
                         security_plans,
                         pushdown,
+                        depth_nodes,
                         sample_plans,
                         order,
                         parameterized,
@@ -8119,7 +8402,12 @@ fn scan_source_mode<'a>(
                 hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
                 &mut slots,
             );
-            match materialize_lateral_source(
+            // The item's query is its own block of an explained plan, run
+            // once per outer row.
+            let lateral_block = instrument::enter(instrument::Segment::Derived(
+                u16::try_from(t).unwrap_or(u16::MAX),
+            ));
+            let lateral_rows = materialize_lateral_source(
                 storage,
                 txid,
                 tref,
@@ -8128,7 +8416,9 @@ fn scan_source_mode<'a>(
                 params,
                 &lateral_outer,
                 hooks,
-            )? {
+            )?;
+            drop(lateral_block);
+            match lateral_rows {
                 LateralRows::External(run) => {
                     if let Some(run) = run
                         && !consume_external_lateral_run(
@@ -8635,6 +8925,9 @@ fn scan_source_mode<'a>(
         if !matched_any && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full)) {
             bound[order[depth]] = None;
             bound_rowids[order[depth]] = None;
+            if depth + 1 < scope.n {
+                nodes.join.row();
+            }
             if !level(
                 storage,
                 scope,
@@ -8652,6 +8945,7 @@ fn scan_source_mode<'a>(
                 external_match_writer,
                 security_plans,
                 pushdown,
+                depth_nodes,
                 sample_plans,
                 order,
                 parameterized,
@@ -8755,6 +9049,11 @@ fn scan_source_mode<'a>(
     let pushdown_counts = arena
         .alloc_slice_with(scope.n, |_| 0usize)
         .map_err(|_| arena_full())?;
+    // Per depth, how many of its conjuncts (placed first) read only its
+    // relation.
+    let scan_counts = arena
+        .alloc_slice_with(scope.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     if pushdown_allowed
         && scope.n >= 2
         && let Some(w) = where_clause
@@ -8780,17 +9079,54 @@ fn scan_source_mode<'a>(
                     .max()
                     .unwrap_or(0);
                 if d < scope.n && pushdown_counts[d] < MAX_CONJUNCTS {
-                    pushdown_buffers[d][pushdown_counts[d]] = c;
+                    let count = pushdown_counts[d];
+                    pushdown_buffers[d][count] = c;
+                    if mask == 1 << order[d] {
+                        // Keep the scan's conjuncts first, in their order.
+                        pushdown_buffers[d][scan_counts[d]..=count].rotate_right(1);
+                        scan_counts[d] += 1;
+                    }
                     pushdown_counts[d] += 1;
                 }
             }
         }
     }
-    let pushdown = arena
+    let pushdown_all = arena
         .alloc_slice_with(scope.n, |depth| {
             &pushdown_buffers[depth][..pushdown_counts[depth]]
         })
         .map_err(|_| arena_full())?;
+    let pushdown = arena
+        .alloc_slice_with(scope.n, |depth| {
+            let (scan, join) = pushdown_all[depth].split_at(scan_counts[depth]);
+            DepthConjuncts { scan, join }
+        })
+        .map_err(|_| arena_full())?;
+    let position_conjuncts = |table: usize| {
+        order.iter().position(|&ordered| ordered == table).map_or(
+            DepthConjuncts {
+                scan: &[],
+                join: &[],
+            },
+            |depth| pushdown[depth],
+        )
+    };
+    let depth_nodes = if instrument::active() {
+        &*arena
+            .alloc_slice_with(scope.n, |depth| DepthNodes::of(order, depth))
+            .map_err(|_| arena_full())?
+    } else {
+        &*arena
+            .alloc_slice_with(scope.n, |_| DepthNodes::NONE)
+            .map_err(|_| arena_full())?
+    };
+    let join_nodes = arena
+        .alloc_slice_with(scope.n.saturating_sub(1), |depth| {
+            depth_nodes[depth + 1].join
+        })
+        .map_err(|_| arena_full())?;
+    // Each join runs once per execution of the scan.
+    let _join_loops = instrument::Loops::start(join_nodes);
 
     let automatic_indexed = if !automatic_index || sample_plans.iter().any(Option::is_some) {
         None
@@ -8864,6 +9200,13 @@ fn scan_source_mode<'a>(
         None
     };
     if let Some(hash_plan) = hash_plan {
+        let filters = match hash_plan.outer_side_filters(scope, where_clause, arena)? {
+            Some(filters) => filters,
+            None => HashJoinFilters {
+                probe: position_conjuncts(hash_plan.probe_table).scan,
+                build: position_conjuncts(hash_plan.build_table).scan,
+            },
+        };
         execute_hash_join_plan(
             storage,
             scope,
@@ -8875,6 +9218,7 @@ fn scan_source_mode<'a>(
             outer,
             order,
             hash_plan,
+            filters,
             decode_buffers,
             recycle_rows,
             pax_demand,
@@ -8898,7 +9242,7 @@ fn scan_source_mode<'a>(
             scope,
             from,
             where_clause.filter(|_| where_filters),
-            pushdown[depth],
+            pushdown_all[depth],
             order,
             depth,
             outer,
@@ -8999,6 +9343,7 @@ fn scan_source_mode<'a>(
             external_match_writer,
             security_plans,
             pushdown,
+            depth_nodes,
             sample_plans,
             order,
             parameterized,
@@ -9096,9 +9441,11 @@ fn scan_source_mode<'a>(
                     if let Some(w) = where_clause {
                         let chained_row = Chained { inner: &row, outer };
                         if !where_passes(w, arena, params, &chained_row, hooks)? {
+                            count_leaf(depth_nodes, false);
                             return Ok(true);
                         }
                     }
+                    count_leaf(depth_nodes, true);
                     return f(&row);
                 }
                 level(
@@ -9118,6 +9465,7 @@ fn scan_source_mode<'a>(
                     external_match_writer,
                     security_plans,
                     pushdown,
+                    depth_nodes,
                     sample_plans,
                     order,
                     parameterized,

@@ -95,6 +95,10 @@ pub(super) struct WriteCompletionBoundary {
     /// transaction's immediate constraint checks, so a wait in them keeps
     /// the finished AFTER events instead of running the statement again.
     pub(super) statement_end: bool,
+    /// The write is one step of a rule-rewritten statement: its suspended
+    /// completion finishes the step, and the statement runs another attempt
+    /// for the steps after it.
+    pub(super) step: bool,
 }
 
 impl TxnState {
@@ -481,7 +485,6 @@ pub struct TxnState {
     /// Nested trigger-side SQL is bounded independently of row and arena
     /// capacity so a self-referential trigger cannot consume the call stack.
     trigger_depth: u16,
-    rule_stack: [i32; MAX_RULE_NESTING],
     rule_depth: u8,
     /// A concurrent partition detach published its first durable phase. The
     /// protocol executor commits that phase before it parks for finalization.
@@ -1470,7 +1473,6 @@ impl TxnState {
             command_id: 1,
             command_counter: 1,
             trigger_depth: 0,
-            rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
             concurrent_partition_detach_pending: false,
             concurrent_index: None,
@@ -2167,16 +2169,17 @@ impl TxnState {
         self.extension_script
     }
 
-    pub(crate) fn enter_rule(&mut self, oid: i32, relation: &str) -> Result<(), SqlError> {
-        let depth = usize::from(self.rule_depth);
-        if self.rule_stack[..depth].contains(&oid) || depth == MAX_RULE_NESTING {
+    /// Enters a rule action's execution. Recursion through rules is
+    /// rejected while the statement is rewritten; this bounds the nesting
+    /// of rule actions that run statements with rules of their own.
+    pub(crate) fn enter_rule(&mut self) -> Result<(), SqlError> {
+        if usize::from(self.rule_depth) == MAX_RULE_NESTING {
             return Err(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "infinite recursion detected in rules for relation \"{}\"",
-                relation
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewrite rules nest more than {} levels deep",
+                MAX_RULE_NESTING
             ));
         }
-        self.rule_stack[depth] = oid;
         self.rule_depth += 1;
         Ok(())
     }

@@ -2459,6 +2459,66 @@ pub(crate) struct RuleInsertTarget<'a> {
 /// the action set-oriented, so its statement triggers still fire once.
 /// `target` describes an `INSERT ... VALUES` action's relation; it is read
 /// only when a `VALUES` row writes `DEFAULT` or there are several rows.
+/// An action query's output list with each `*` spelled as the FROM items it
+/// covers, as PostgreSQL expands it when the rule is stored: the rule's
+/// OLD and NEW rows the action is joined with are not part of it.
+fn rule_action_star_items<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    let Some(from) = select.from.as_ref() else {
+        return Ok(select.items);
+    };
+    let stars = select
+        .items
+        .iter()
+        .filter(|item| matches!(item, SelectItem::Wildcard(_)))
+        .count();
+    if stars == 0 {
+        return Ok(select.items);
+    }
+    // Merged USING and NATURAL columns have no per-item spelling.
+    if from
+        .joins
+        .iter()
+        .any(|join| join.using.is_some() || join.natural)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a rule action's * over a USING or NATURAL join is not supported"
+        ));
+    }
+    let tables = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    let mut names = ArenaList::new(arena);
+    for table in tables {
+        let Some(name) = table
+            .alias
+            .or((table.subquery.is_none()).then_some(table.table))
+        else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a rule action's * over an unnamed subquery is not supported"
+            ));
+        };
+        names.push(name).map_err(|_| arena_full())?;
+    }
+    let names = names.as_slice();
+    let mut items = ArenaList::new(arena);
+    for item in select.items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for name in names {
+                    items
+                        .push(SelectItem::TableWildcard(name))
+                        .map_err(|_| arena_full())?;
+                }
+            }
+            other => items.push(*other).map_err(|_| arena_full())?,
+        }
+    }
+    Ok(items.as_slice())
+}
+
 pub(crate) fn attach_rule_source<'a>(
     statement: &'a Stmt<'a>,
     source: TableRef<'a>,
@@ -2468,8 +2528,10 @@ pub(crate) fn attach_rule_source<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let rewritten = match statement {
         Stmt::Select(select) => {
+            let items = rule_action_star_items(select, arena)?;
             let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
             Stmt::Select(Select {
+                items,
                 from: Some(from),
                 where_clause: and_where(condition, select.where_clause, arena)?,
                 ..*select
@@ -2497,8 +2559,10 @@ pub(crate) fn attach_rule_source<'a>(
         }
         Stmt::Insert(insert) => {
             let select = if let Some(select) = insert.select {
+                let items = rule_action_star_items(select, arena)?;
                 let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
                 Select {
+                    items,
                     from: Some(from),
                     where_clause: and_where(condition, select.where_clause, arena)?,
                     ..*select
@@ -4019,9 +4083,93 @@ pub fn rewrite_view_dml<'a>(
         }
         _ => unreachable!("statement kind checked above"),
     };
+    let rewritten = view_assignment_defaults(rewritten, view, storage, txid, arena)?;
     Ok(super::ViewRewrite {
         statement: arena.alloc(rewritten).map_err(|_| arena_full())?,
         written,
+    })
+}
+
+/// `rewritten`, a write onto `view`'s base relation, with each `SET column
+/// = DEFAULT` replaced by the view's own default for the column, or NULL:
+/// PostgreSQL's rewriter fills in the written view's defaults before it
+/// rewrites the write onto the base relation.
+fn view_assignment_defaults<'a>(
+    rewritten: Stmt<'a>,
+    view: &super::UpdatableView<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Stmt<'a>, SqlError> {
+    let defaults_cell = core::cell::Cell::new(None::<&'a [(&'a str, &'a Expr<'a>)]>);
+    let replace = |assignments: &'a [(&'a str, &'a Expr<'a>)]| -> Result<_, SqlError> {
+        if !assignments
+            .iter()
+            .any(|(_, value)| matches!(value, Expr::DefaultMarker))
+        {
+            return Ok(assignments);
+        }
+        let defaults = match defaults_cell.get() {
+            Some(defaults) => defaults,
+            None => {
+                let level = view.view_check(storage, txid, arena)?.defaults[0];
+                let defaults = crate::sql::exec::view_assignment_defaults(
+                    storage, level, view.base, txid, arena,
+                )?;
+                defaults_cell.set(Some(defaults));
+                defaults
+            }
+        };
+        let replaced = arena
+            .alloc_slice_with(assignments.len(), |index| {
+                let (name, value) = assignments[index];
+                if !matches!(value, Expr::DefaultMarker) {
+                    return (name, value);
+                }
+                let default = defaults
+                    .iter()
+                    .find(|(column, _)| *column == name)
+                    .map_or(&Expr::Null, |(_, default)| *default);
+                (name, default)
+            })
+            .map_err(|_| arena_full())?;
+        Ok(&*replaced)
+    };
+    Ok(match rewritten {
+        Stmt::Insert(insert) => Stmt::Insert(Insert {
+            on_conflict: match insert.on_conflict {
+                Some(conflict) => Some(OnConflict {
+                    update: conflict.update.map(replace).transpose()?,
+                    ..conflict
+                }),
+                None => None,
+            },
+            ..insert
+        }),
+        Stmt::Update(update) => Stmt::Update(Update {
+            assignments: replace(update.assignments)?,
+            ..update
+        }),
+        Stmt::Merge(merge) => {
+            let whens = arena
+                .alloc_slice_copy(merge.whens)
+                .map_err(|_| arena_full())?;
+            for when in whens.iter_mut() {
+                let action = match when {
+                    MergeWhen::Matched { action, .. }
+                    | MergeWhen::NotMatchedBySource { action, .. } => action,
+                    MergeWhen::NotMatchedByTarget { .. } => continue,
+                };
+                if let MergeTargetAction::Update(assignments) = action {
+                    *assignments = replace(assignments)?;
+                }
+            }
+            Stmt::Merge(Merge {
+                whens: &*whens,
+                ..merge
+            })
+        }
+        other => other,
     })
 }
 
@@ -4466,6 +4614,8 @@ fn materialize_query_cte<'a>(
     arena: &'a Arena,
     enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    // A WITH query run once is its own block of an explained plan.
+    let _cte = super::instrument::enter(super::instrument::Segment::Cte);
     let tree = arena
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
@@ -5620,6 +5770,50 @@ pub(crate) fn select_reads_repeatably(select: &Select<'_>, storage: &Storage, tx
     !select_contains_function(select, &|name, arity| {
         super::super::ast::is_volatile_function(name)
             || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+            || storage.has_aggregate_routine_candidate(name, arity, txid)
+    })
+}
+
+/// Whether an `INSERT ... SELECT` source streams although its output list
+/// calls volatile or user routines: everything that decides which rows it
+/// reads stays repeatable, so an attempt that skips the rows already
+/// written reads the same rows without evaluating their output again, and
+/// each written row evaluates its output as PostgreSQL's ModifyTable pulls
+/// it. Ordering or `DISTINCT` would evaluate output ahead of its row.
+pub(crate) fn select_streams_with_calls(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    if !select.order_by.is_empty()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.windows.is_empty()
+        || !select.with.is_empty()
+        || select.set_body.is_some()
+        || !select.locking.is_empty()
+    {
+        return false;
+    }
+    let calls = |name: &str, arity: usize| {
+        super::super::ast::is_volatile_function(name)
+            || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+            || storage.has_aggregate_routine_candidate(name, arity, txid)
+    };
+    let rest = Select {
+        items: &[],
+        ..*select
+    };
+    !select_contains_function(&rest, &calls)
+}
+
+/// Whether a query calls a user-defined function or aggregate anywhere.
+pub(crate) fn select_calls_user_routines(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    select_contains_function(select, &|name, arity| {
+        storage.has_non_aggregate_routine_candidate(name, arity, txid)
             || storage.has_aggregate_routine_candidate(name, arity, txid)
     })
 }
@@ -7014,6 +7208,8 @@ fn materialize_recursive<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    // A WITH query run once is its own block of an explained plan.
+    let _cte = super::instrument::enter(super::instrument::Segment::Cte);
     let (base_tree, recursive_tree, union_all) = recursive_parts(cte.query, cte.name)?;
     // References to earlier CTEs inline now; the self-reference stays a bare
     // table name (it is not in `outer`'s bindings) for per-iteration binding.

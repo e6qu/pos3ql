@@ -3,7 +3,6 @@
 # for parameterized queries.
 import datetime
 import faulthandler
-import json
 import re
 import sys
 import threading
@@ -266,10 +265,11 @@ print("plpgsql dynamic analyze extended protocol ok")
 # Parse/Bind/Execute path: SETTINGS reflects the active session and
 # GENERIC_PLAN accepts a bound placeholder without using its value to plan.
 cur.execute("SET search_path = public")
+# A JSON plan's column has type json, which psycopg decodes.
 cur.execute("EXPLAIN (SETTINGS, FORMAT JSON) SELECT 1")
-assert json.loads(cur.fetchone()[0])[0]["Settings"] == {"search_path": "public"}
+assert cur.fetchone()[0][0]["Settings"] == {"search_path": "public"}
 cur.execute("EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT %s::integer", (41,))
-assert '"Node Type"' in cur.fetchone()[0]
+assert "Node Type" in cur.fetchone()[0][0]["Plan"]
 cur.execute("EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT 1 UNION ALL SELECT 2")
 # PostgreSQL indents the document; compare its element nesting only.
 xml_plan = re.sub(r">\s+<", "><", cur.fetchone()[0])

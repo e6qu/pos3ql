@@ -1590,14 +1590,15 @@ use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     ProjectedValue, compare_projected_key, compare_projected_prefix, compare_projected_rows,
     compare_projected_values, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
-    pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
-    projected_rows_len, unpack_projected_rows,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
+    projected_row_len_by, projected_row_width, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
+#[cfg(test)]
+pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
 pub(crate) mod dependency_report;
@@ -21178,6 +21179,14 @@ static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 #[derive(Clone, Copy)]
 pub(crate) enum InsertSource<'a> {
     Statement,
+    /// One row of an `INSERT ... SELECT` whose source the engine reads:
+    /// rows before `index` were written by earlier calls, which kept their
+    /// progress. `Some` writes the row and stops at the next one's start;
+    /// `None` completes the statement after the last row.
+    Produced {
+        index: usize,
+        row: Option<&'a [Datum<'a>]>,
+    },
     MaterializedSelect {
         rows: &'a [&'a [u8]],
         assignments: AssignmentCasts<'a>,
@@ -30401,6 +30410,7 @@ impl PlpgsqlExecHost<'_> {
                 depth: txn.trigger_depth(),
                 retained: true,
                 statement_end: false,
+                step: false,
             });
         }
         Ok(())
@@ -31402,6 +31412,16 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     query: BoundPlpgsqlCommand<'a>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    // `FOR ... IN EXECUTE 'EXPLAIN ...'` reads the plan's lines.
+    if let Stmt::Explain { options, statement } = query.statement {
+        return execute_plpgsql_dynamic_explain(
+            context,
+            *options,
+            statement,
+            query.arguments,
+            &mut |line| emit(&[Datum::Text(line)]),
+        );
+    }
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     let arena = context.arena;
     let txid = context.txn.txid;
@@ -31721,6 +31741,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -31784,6 +31805,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -31846,6 +31868,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -31925,6 +31948,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -34231,6 +34255,7 @@ fn execute_rewritten_nested_write<'a>(
             depth: txn.trigger_depth(),
             retained,
             statement_end: false,
+            step: false,
         });
     let responder = &mut *context.responder;
     responder.clear_affected_rows();
@@ -34333,12 +34358,23 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             super::guc::PlannerSettings::EMPTY
         };
-        let plan = super::explain::plan_statement(
+        // A statement rewrite rules change is explained as their queries.
+        let mut rewritten = super::explain::rewritten_queries(
             context.storage(),
             context.txn.txid,
             planned.statement,
             context.arena,
         )?;
+        let mut plan = match rewritten {
+            Some(_) => None,
+            None => Some(super::explain::plan_statement(
+                context.storage(),
+                context.txn.txid,
+                planned.statement,
+                super::query::instrument::BlockId::ROOT,
+                context.arena,
+            )?),
+        };
         let actual = if options.analyze {
             let TriggerExecContext {
                 host,
@@ -34365,17 +34401,26 @@ fn execute_plpgsql_dynamic_explain(
             let touched_mark = txn.touched().len();
             let started = std::time::Instant::now();
             responder.begin_discard_query_output(options.serialize);
-            let execution = engine.execute_explained_statement(
-                planned.statement,
-                arena,
-                planned.arguments,
-                txn,
-                (sqlprep, cursors),
-                guc,
-                responder,
-            );
+            let run = || {
+                engine.execute_explained_statement(
+                    planned.statement,
+                    arena,
+                    planned.arguments,
+                    txn,
+                    (sqlprep, cursors),
+                    guc,
+                    responder,
+                )
+            };
+            let execution = match (plan.as_mut(), rewritten.as_mut()) {
+                (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                (None, Some(queries)) => {
+                    super::explain::analyze_rewritten(queries, arena, options.timing, run)
+                }
+                (None, None) => unreachable!("an unrewritten statement is planned"),
+            };
             let output = responder.finish_discard_query_output();
-            match execution {
+            match execution? {
                 Err(_) => {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -34405,7 +34450,25 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             None
         };
-        super::explain::visit_plan_rows(&plan, options, actual, &settings, context.arena, emit)
+        match (plan, rewritten) {
+            (Some(plan), _) => super::explain::visit_plan_rows(
+                &plan,
+                options,
+                actual,
+                &settings,
+                context.arena,
+                emit,
+            ),
+            (None, Some(queries)) => super::explain::visit_rewritten_rows(
+                &queries,
+                options,
+                actual,
+                &settings,
+                context.arena,
+                emit,
+            )?,
+            (None, None) => unreachable!("an unrewritten statement is planned"),
+        }
     })
 }
 
@@ -35976,6 +36039,10 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     arena,
                     crate::sql::exec::DescriptionTarget::Sql,
                 )?,
+                Stmt::Explain { options, .. } => {
+                    columns[0] = super::explain::result_column(options.format);
+                    1
+                }
                 _ => 0,
             };
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
@@ -38341,9 +38408,8 @@ fn execute_trigger_step_in<'a>(
                                     columns[..3].copy_from_slice(&super::guc::SHOW_ALL_COLUMNS);
                                     3
                                 }
-                                Stmt::Explain { .. } if record_target => {
-                                    columns[0] =
-                                        ColDesc::new("QUERY PLAN", super::types::oid::TEXT, -1);
+                                Stmt::Explain { options, .. } if record_target => {
+                                    columns[0] = super::explain::result_column(options.format);
                                     1
                                 }
                                 _ => 0,
@@ -39285,6 +39351,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -39505,6 +39572,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -39716,6 +39784,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -39897,6 +39966,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -78533,6 +78603,26 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
                 )?;
             }
         }
+        // A column the level exposes without a default of its own takes its
+        // domain type's, which PostgreSQL's `build_column_default` fills in
+        // at that level.
+        for base_name in defaults.base_columns {
+            if base_name.is_empty() {
+                continue;
+            }
+            let Some(base_index) = definition.column_index(base_name) else {
+                continue;
+            };
+            if claimed[base_index] {
+                continue;
+            }
+            if let Some(default) =
+                domain_type_default(storage, &definition.columns()[base_index], txid, arena)?
+            {
+                claimed[base_index] = true;
+                parsed[base_index] = Some(default);
+            }
+        }
     }
     Ok(parsed)
 }
@@ -78618,20 +78708,40 @@ fn parse_view_default<'a, Definition0: crate::storage::DefinitionBacking>(
     Ok(())
 }
 
+/// The default the views written through give base column `base_index`:
+/// the first level's own default for it, or, at the first level exposing it
+/// without one, its domain type's default.
 fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     view: Option<ViewCheck<'_>>,
     definition: &crate::storage::TableDefinition<Definition0>,
     base_index: usize,
-) -> Option<crate::storage::ColumnDefault> {
-    let base_name = definition.columns().get(base_index)?.name.as_str();
-    view?.defaults.iter().find_map(|defaults| {
-        defaults
-            .base_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| **candidate == base_name)
-            .find_map(|(view_index, _)| level_default(defaults, view_index))
-    })
+) -> Result<Option<crate::storage::ColumnDefault>, SqlError> {
+    let (Some(view), Some(column)) = (view, definition.columns().get(base_index)) else {
+        return Ok(None);
+    };
+    let base_name = column.name.as_str();
+    let mut domain_checked = false;
+    for defaults in view.defaults {
+        let mut exposed = false;
+        for (view_index, candidate) in defaults.base_columns.iter().enumerate() {
+            if *candidate != base_name {
+                continue;
+            }
+            exposed = true;
+            if let Some(default) = level_default(defaults, view_index) {
+                return Ok(Some(default));
+            }
+        }
+        if exposed && !domain_checked {
+            domain_checked = true;
+            if let Some(text) = domain_default_text(storage, column, txid)? {
+                return Ok(Some(crate::storage::ColumnDefault::Expression(text)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[expect(clippy::too_many_arguments, reason = "default evaluation context")]
@@ -78650,7 +78760,8 @@ where
     'arena: 'values,
 {
     let column = &definition.columns()[base_index];
-    let (default, expression) = match view_default_for(view, definition, base_index) {
+    let (default, expression) = match view_default_for(storage, txid, view, definition, base_index)?
+    {
         Some(default) => (default, view_expression),
         None => (column.default, table_expression),
     };
@@ -83351,13 +83462,205 @@ pub(crate) fn view_rule_defaults<'a>(
 ) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
     let definition = view_trigger_definition(storage, view_slot, txid, arena)?;
     let check = instead_of_view_defaults(storage, view_slot, &definition, above, txid, arena)?;
-    let mut parsed = parse_view_defaults(Some(check), &definition, arena, storage, txid)?;
+    let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+    Ok(parsed)
+}
+
+/// Overlays the defaults of the views an INSERT was written through
+/// (`views`) on `defaults`, a rewrite rule's `NEW` defaults for their base
+/// table: PostgreSQL fills the view's own defaults into the INSERT before
+/// it rewrites the write onto the base table.
+pub(crate) fn overlay_view_rule_defaults<'a>(
+    storage: &Storage,
+    views: ViewCheck<'a>,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    defaults: &mut constraints::ParsedDefaults<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let overlay = rule_view_defaults(storage, views, definition, txid, arena)?;
+    for (index, default) in overlay.iter().enumerate() {
+        if view_default_for(storage, txid, Some(views), definition, index)?.is_some() {
+            defaults[index] = *default;
+        }
+    }
+    Ok(())
+}
+
+/// The values `SET column = DEFAULT` writes through the auto-updatable view
+/// whose defaults are `view` (its own level, over its base relation's
+/// columns), by base column name: the view's own default, or NULL for a
+/// column without one. PostgreSQL's rewriter fills them in before it
+/// rewrites the write onto the base relation, whose defaults never apply.
+pub(crate) fn view_assignment_defaults<'a>(
+    storage: &Storage,
+    view: ViewInsertDefaults<'a>,
+    base: crate::sql::ast::QualName<'_>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    let levels = arena
+        .alloc_slice_copy(&[view])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let check = ViewCheck {
+        checks: &[],
+        defaults: levels,
+    };
+    match storage.resolve_relation(base.schema, base.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            let definition = storage.table_def(slot, txid);
+            let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+            assignment_defaults(&parsed, definition.columns(), arena)
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            let definition = view_trigger_definition(storage, slot, txid, arena)?;
+            let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+            assignment_defaults(&parsed, definition.columns(), arena)
+        }
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            base.name
+        )),
+    }
+}
+
+/// Per column of `columns` with a default in `parsed`, its name and default.
+fn assignment_defaults<'a>(
+    parsed: &constraints::ParsedDefaults<'a>,
+    columns: &[ColumnMeta],
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    let mut out = [("", &Expr::Null as &Expr); MAX_COLUMNS];
+    let mut count = 0;
+    for (index, column) in columns.iter().enumerate() {
+        if let Some(default) = parsed[index] {
+            out[count] = (
+                arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| super::query::arena_full_pub())?,
+                default,
+            );
+            count += 1;
+        }
+    }
+    arena
+        .alloc_slice_copy(&out[..count])
+        .map(|out| &*out)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+/// `read` of the domain that is `column`'s type, if it is one.
+fn with_column_domain<R>(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+    read: impl FnOnce(&crate::storage::DomainDef) -> Result<R, SqlError>,
+) -> Result<Option<R>, SqlError> {
+    let Some((crate::storage::NamedTypeKind::Domain, creation, false)) = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .and_then(crate::storage::NamedTypeKind::from_oid)
+    else {
+        return Ok(None);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Domain,
+        creation,
+    )?;
+    let domain = storage
+        .read_domain_definition(target, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "domain default source is unavailable"
+            )
+        })?;
+    read(&domain).map(Some)
+}
+
+/// The default expression of `column`'s type when it is a domain that has
+/// one.
+fn domain_default_text(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+) -> Result<Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>, SqlError> {
+    Ok(with_column_domain(storage, column, txid, |domain| Ok(domain.default_expr))?.flatten())
+}
+
+/// The default of `column`'s type when it is a domain that has one.
+fn domain_type_default<'a>(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some((text, inputs)) = with_column_domain(storage, column, txid, |domain| {
+        Ok(match domain.default_expr {
+            Some(text) => Some((
+                text,
+                domain
+                    .default_inputs
+                    .detached_bindings(crate::storage::StoredInputSection::DomainDefault, arena)?,
+            )),
+            None => None,
+        })
+    })?
+    .flatten() else {
+        return Ok(None);
+    };
+    let original = super::enum_values::checks::default_display(text.as_str(), arena)?;
+    let source = super::enum_values::checks::resolve_default(
+        text.as_str(),
+        column.ctype,
+        storage,
+        txid,
+        arena,
+    )?;
+    let inputs = super::type_inputs::rebase(
+        original,
+        source,
+        super::parser::StoredSqlKind::Expression,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )?;
+    Ok(Some(crate::sql::parser::parse_expression_with_type_inputs(
+        source,
+        inputs,
+        arena,
+        |parser| {
+            super::type_inputs::validate_restored_candidates(parser, |candidate| {
+                Ok(inputs
+                    .iter()
+                    .find(|input| {
+                        (input.start, input.end, input.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                    .map(|input| input.type_oid)
+                    .or_else(|| super::type_inputs::candidate_target_oid(storage, txid, candidate)))
+            })
+        },
+    )?))
+}
+
+/// The defaults `views` give the columns of `definition`, as a rewrite
+/// rule's `NEW` reads them.
+fn rule_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    check: ViewCheck<'a>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let mut parsed = parse_view_defaults(Some(check), definition, arena, storage, txid)?;
     // A constant default is stored typed; the rule reads it as a literal.
     for (index, column) in definition.columns().iter().enumerate() {
         if parsed[index].is_some() {
             continue;
         }
-        let Some(default) = view_default_for(Some(check), &definition, index) else {
+        let Some(default) = view_default_for(storage, txid, Some(check), definition, index)? else {
             continue;
         };
         let (Some(constant), Some(source)) = (default.constant(), default.expression()) else {
@@ -84011,8 +84314,13 @@ pub(crate) fn instead_of_view_dml<'a>(
                     }
                     Err(error) => return sql_fail(error),
                 };
+                let values_node = crate::sql::query::instrument::node(
+                    crate::sql::query::instrument::Role::Values,
+                );
+                let _values_loop = values_node.start();
                 (|| -> Outcome {
                     for (row_index, row) in insert.rows.iter().enumerate().skip(first) {
+                        values_node.row();
                         match row_progress::start_row(
                             progress.as_deref_mut(),
                             row_index,
@@ -84884,13 +85192,12 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
 }
 
 /// A streamed `INSERT ... SELECT` source: the retained reader, the fixed
-/// arena block its state lives in, and the row read ahead of the writes.
+/// arena block its state lives in, and whether its next row is already
+/// read (a sorted, grouped or subquery source reads its first row at open).
 struct StreamedSource<'a> {
     reader: super::query::RetainedSelect<'a>,
     block: &'a Arena,
-    /// The next row: `None` at the source's end, `Some(None)` for a row only
-    /// filtered because an earlier attempt already wrote it.
-    next: Option<Option<&'a [Datum<'a>]>>,
+    prepared: bool,
 }
 
 /// The fixed block a streamed source's reader holds (a table scan's cursor
@@ -84899,10 +85206,13 @@ struct StreamedSource<'a> {
 /// materializes instead.
 const STREAMED_SOURCE_BLOCK: usize = 512 << 10;
 
-/// Opens a streamed source and reads its first row before the first row
-/// change, so a wait there restarts the statement and a sort or hash table
-/// that does not fit reports `plan_build_exhausted` before anything is
-/// written. `None` when the retained reader does not run the source.
+/// Opens a streamed source before the first row change. A source that
+/// sorts, groups or runs subqueries reads its first row here, so a sort or
+/// hash table that does not fit reports `plan_build_exhausted` before
+/// anything is written; any other source reads each row inside the row
+/// that writes it, as PostgreSQL's ModifyTable pulls its source row after
+/// the previous row. `None` when the retained reader does not run the
+/// source.
 #[expect(
     clippy::too_many_arguments,
     reason = "a streamed source reads with the write's storage, snapshot and arenas"
@@ -84929,21 +85239,29 @@ fn open_streamed_source<'a>(
     let Some(mut reader) = reader else {
         return Ok(None);
     };
-    let next = next_streamed_row(
-        &mut reader,
+    let _snapshot = storage.dml_expression_snapshot(command);
+    reader.build_tables(
         storage,
         txid,
-        command,
+        crate::sql::datetime::now_micros(),
         block,
         buffers,
         arena,
-        params,
-        true,
     )?;
+    let prepared = reader.prepares_ahead()
+        && reader.prepare_statement_row(
+            storage,
+            txid,
+            crate::sql::datetime::now_micros(),
+            block,
+            buffers,
+            arena,
+            params,
+        )?;
     Ok(Some(StreamedSource {
         reader,
         block,
-        next,
+        prepared,
     }))
 }
 
@@ -84956,70 +85274,78 @@ fn open_streamed_source<'a>(
     reason = "a streamed source reads with the write's storage, snapshot and arenas"
 )]
 fn next_streamed_row<'a>(
-    reader: &mut super::query::RetainedSelect<'a>,
+    stream: &mut StreamedSource<'a>,
     storage: &Storage,
     txid: u32,
     command: u32,
-    block: &'a Arena,
     buffers: &mut crate::storage::RowCursorBuffers,
     arena: &'a Arena,
     params: &[Datum<'a>],
     evaluate: bool,
+    sequences: &dyn super::eval::SequenceAccess,
 ) -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(command);
-    let calls = super::query::active_invocation_position();
-    let row = super::query::without_routine_invocations(
-        || -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
-            loop {
-                let mark = arena.mark();
-                if !reader.prepare_statement_row(
-                    storage,
-                    txid,
-                    crate::sql::datetime::now_micros(),
-                    block,
-                    buffers,
-                    arena,
-                    params,
-                )? {
-                    return Ok(None);
+    let reader = &mut stream.reader;
+    loop {
+        let mark = arena.mark();
+        if !core::mem::take(&mut stream.prepared)
+            && !reader.prepare_statement_row(
+                storage,
+                txid,
+                crate::sql::datetime::now_micros(),
+                stream.block,
+                buffers,
+                arena,
+                params,
+            )?
+        {
+            return Ok(None);
+        }
+        let passes = super::query::without_routine_invocations(|| {
+            reader.evaluate_statement_predicate(storage, txid, arena, params, None, None, arena)
+        })?;
+        if !passes || reader.skip_statement_row() {
+            reader.finish_statement_row(stream.block, false);
+            // SAFETY: the filtered row's values were dropped.
+            unsafe { arena.rewind_to(mark) };
+            continue;
+        }
+        let values = if evaluate {
+            let calls = super::query::active_invocation_position();
+            let mut projected = crate::mem::arena::ArenaList::new(arena);
+            for index in 0..reader.statement_items_len() {
+                let values = super::query::without_routine_invocations(|| {
+                    reader.evaluate_statement_item(
+                        index,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        Some(sequences),
+                        None,
+                        arena,
+                    )
+                })?;
+                for value in values {
+                    projected
+                        .push(*value)
+                        .map_err(|_| super::eval::arena_full())?;
                 }
-                let passes = reader.evaluate_statement_predicate(
-                    storage, txid, arena, params, None, None, arena,
-                )?;
-                if !passes || reader.skip_statement_row() {
-                    reader.finish_statement_row(block, false);
-                    // SAFETY: the filtered row's values were dropped.
-                    unsafe { arena.rewind_to(mark) };
-                    continue;
-                }
-                let values = if evaluate {
-                    let mut projected = crate::mem::arena::ArenaList::new(arena);
-                    for index in 0..reader.statement_items_len() {
-                        for value in reader.evaluate_statement_item(
-                            index, storage, txid, arena, params, None, None, arena,
-                        )? {
-                            projected
-                                .push(*value)
-                                .map_err(|_| super::eval::arena_full())?;
-                        }
-                    }
-                    Some(projected.as_slice())
-                } else {
-                    None
-                };
-                reader.finish_statement_row(block, true);
-                return Ok(Some(values));
             }
-        },
-    );
-    if super::query::active_invocation_position() != calls {
-        // A source that reads repeatably calls no user routine.
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "a streamed INSERT source called a routine"
-        ));
+            if super::query::active_invocation_position() != calls {
+                // A source that reads repeatably calls no user routine.
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a streamed INSERT source called a routine"
+                ));
+            }
+            Some(projected.as_slice())
+        } else {
+            None
+        };
+        reader.finish_statement_row(stream.block, true);
+        return Ok(Some(values));
     }
-    row
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -85065,16 +85391,18 @@ where
     }
     let assignment_casts = match source {
         InsertSource::MaterializedSelect { assignments, .. } => assignments,
-        InsertSource::Statement => match prepare_dml_assignment_casts(
-            &Stmt::Insert(*statement),
-            storage,
-            txn.txid,
-            arena,
-            transition,
-        ) {
-            Ok(casts) => casts,
-            Err(error) => return sql_fail(error),
-        },
+        InsertSource::Statement | InsertSource::Produced { .. } => {
+            match prepare_dml_assignment_casts(
+                &Stmt::Insert(*statement),
+                storage,
+                txn.txid,
+                arena,
+                transition,
+            ) {
+                Ok(casts) => casts,
+                Err(error) => return sql_fail(error),
+            }
+        }
     };
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -85142,7 +85470,8 @@ where
         InsertSource::MaterializedSelect {
             deferred: Some(_), ..
         }
-        | InsertSource::Statement => match statement.select {
+        | InsertSource::Statement
+        | InsertSource::Produced { .. } => match statement.select {
             Some(select) => match prepare_insert_select_casts(
                 statement, select, storage, txn.txid, arena, transition,
             ) {
@@ -85427,17 +85756,22 @@ where
     // reads the table being inserted into, as in PostgreSQL. A source that
     // the retained reader runs and that reads repeatably streams: it holds
     // one source row at a time in a fixed block of the arena, and each row
-    // is written before the next is read. Any other source materializes its
-    // rows and their assignment conversions in the arena before writing,
-    // where exhaustion is the named `54000`; each emitted source row
-    // converts before the next row runs, so encoded values are typed.
+    // reads its source row before it is written. (A source with calls that
+    // the engine reads row by row arrives as `InsertSource::Produced`.) Any
+    // other source materializes its rows and their assignment conversions in
+    // the arena before writing, where exhaustion is the named `54000`; each
+    // emitted source row converts before the next row runs, so encoded
+    // values are typed.
     if let Some(sel) = statement.select {
         let source_command = txn.command_id();
         let stream_mark = arena.mark();
         let mut stream = None;
+        // EXPLAIN ANALYZE counts the source's operators in the general
+        // executor, which materializes it.
         if matches!(source, InsertSource::Statement)
             && transition_relations.is_none()
             && !capturing
+            && !crate::sql::query::instrument::active()
             && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
             && super::query::select_reads_repeatably(sel, storage, txn.txid)
         {
@@ -85465,7 +85799,11 @@ where
             }
         }
         let deferred;
-        let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() {
+        let produced = match source {
+            InsertSource::Produced { index, row } => Some((index, row)),
+            _ => None,
+        };
+        let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() || produced.is_some() {
             deferred = None;
             (&[], 0)
         } else if let InsertSource::MaterializedSelect {
@@ -85527,6 +85865,9 @@ where
                 // without the rows earlier attempts inserted.
                 let _snapshot = storage.dml_expression_snapshot(txn.command_id());
                 let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let _source = crate::sql::query::instrument::enter(
+                    crate::sql::query::instrument::Segment::Source,
+                );
                 if let Err(e) = super::query::select_into_rows_recycling(
                     storage,
                     txn.txid,
@@ -85545,9 +85886,9 @@ where
         // Row changes start here; a wait before them restarts the statement.
         row_progress::enter_rows(progress.as_deref_mut());
         let resumed = match progress.as_deref() {
-            Some(progress) => match progress
-                .resume_rows(|index| (stream.is_some() || index < count).then_some(None))
-            {
+            Some(progress) => match progress.resume_rows(|index| {
+                (stream.is_some() || produced.is_some() || index < count).then_some(None)
+            }) {
                 Ok(resumed) => resumed,
                 Err(error) => return sql_fail(error),
             },
@@ -85620,15 +85961,49 @@ where
         };
         let mut inserted = resumed.changed;
         let first_row = resumed.first;
+        // A streamed source's row is read inside its row, after the row's
+        // start: a call or a data-modifying `WITH` query's step there runs
+        // the row again, and its end leaves the started row empty.
+        let source_ended = core::cell::Cell::new(false);
         let mut write_row = |storage: &mut Storage,
                              txn: &mut TxnState,
                              services: &mut TriggerServices<'_>,
                              responder: &mut Responder<'_>,
                              index: usize,
                              bytes: &'a [u8],
-                             streamed: Option<&'a [Datum<'a>]>|
+                             mut stream: Option<&mut StreamedSource<'a>>,
+                             given: Option<&'a [Datum<'a>]>|
          -> Outcome {
             {
+                let streaming = stream.is_some();
+                let mut read_source =
+                    |storage: &Storage,
+                     services: &mut TriggerServices<'_>,
+                     evaluate: bool|
+                     -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+                        let Some(stream) = stream.as_deref_mut() else {
+                            return Ok(None);
+                        };
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, coercion_txid);
+                        match next_streamed_row(
+                            stream,
+                            storage,
+                            coercion_txid,
+                            source_command,
+                            services.row_buffers,
+                            arena,
+                            params,
+                            evaluate,
+                            &sequences,
+                        )? {
+                            Some(row) => Ok(Some(row)),
+                            None => {
+                                source_ended.set(true);
+                                Ok(None)
+                            }
+                        }
+                    };
                 match row_progress::start_row(
                     progress.as_deref_mut(),
                     index,
@@ -85645,6 +86020,18 @@ where
                 ) {
                     Ok(None) => {}
                     Ok(Some(resumed)) => {
+                        if streaming {
+                            match read_source(storage, services, false) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "a resumed write selected different rows"
+                                    ));
+                                }
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
                         match emit_row_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
@@ -85675,10 +86062,42 @@ where
                             Ok(()) => inserted += 1,
                             Err(error) => return sql_fail(error),
                         }
+                        if given.is_some() {
+                            return match row_progress::stop_after_row(
+                                progress.as_deref_mut(),
+                                index + 1,
+                                inserted,
+                                row_progress::capture_lengths([
+                                    transition_capture.as_ref(),
+                                    conflict_transition_capture.as_ref(),
+                                    None,
+                                ]),
+                                txn,
+                                responder,
+                            ) {
+                                Ok(()) => sql_ok(),
+                                Err(error) => sql_fail(error),
+                            };
+                        }
                         return sql_ok();
                     }
                     Err(error) => return sql_fail(error),
                 }
+                let streamed = if streaming {
+                    match read_source(storage, services, true) {
+                        Ok(Some(Some(values))) => Some(values),
+                        Ok(Some(None)) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "streamed INSERT source row was not evaluated"
+                            ));
+                        }
+                        Ok(None) => return sql_ok(),
+                        Err(error) => return sql_fail(error),
+                    }
+                } else {
+                    given
+                };
                 // A streamed row converts here, inside its row: an
                 // assignment cast that calls a routine resumes at the row.
                 let converted = match (streamed, &deferred) {
@@ -85836,12 +86255,54 @@ where
                     Err(error) => return sql_fail(error),
                 }
             }
+            if given.is_some() {
+                // The engine reads the next row after this one returns.
+                return match row_progress::stop_after_row(
+                    progress.as_deref_mut(),
+                    index + 1,
+                    inserted,
+                    row_progress::capture_lengths([
+                        transition_capture.as_ref(),
+                        conflict_transition_capture.as_ref(),
+                        None,
+                    ]),
+                    txn,
+                    responder,
+                ) {
+                    Ok(()) => sql_ok(),
+                    Err(error) => sql_fail(error),
+                };
+            }
             sql_ok()
         };
         let rows_outcome = match stream.as_mut() {
+            None if produced.is_some() => (|| -> Outcome {
+                let Some((index, row)) = produced else {
+                    return sql_ok();
+                };
+                if index != first_row {
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a produced INSERT row does not continue its write"
+                    ));
+                }
+                let Some(row) = row else {
+                    return sql_ok();
+                };
+                write_row(
+                    storage,
+                    txn,
+                    services,
+                    responder,
+                    index,
+                    &[],
+                    None,
+                    Some(row),
+                )
+            })(),
             None => (|| -> Outcome {
                 for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
-                    match write_row(storage, txn, services, responder, index, bytes, None)? {
+                    match write_row(storage, txn, services, responder, index, bytes, None, None)? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
                     }
@@ -85850,53 +86311,57 @@ where
             })(),
             Some(stream) => (|| -> Outcome {
                 let row_mark = arena.mark();
-                let mut index = 0;
-                while let Some(row) = stream.next.take() {
-                    if index >= first_row {
-                        let Some(values) = row else {
+                // The rows an earlier attempt wrote are read again without
+                // evaluating their output.
+                for _ in 0..first_row {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    match next_streamed_row(
+                        stream,
+                        storage,
+                        txn.txid,
+                        source_command,
+                        services.row_buffers,
+                        arena,
+                        params,
+                        false,
+                        &sequences,
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             return sql_fail(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
-                                "streamed INSERT source row was not evaluated"
+                                "a resumed write selected different rows"
                             ));
-                        };
-                        match write_row(
-                            storage,
-                            txn,
-                            services,
-                            responder,
-                            index,
-                            &[],
-                            Some(values),
-                        )? {
-                            Ok(()) => {}
-                            Err(error) => return sql_fail(error),
                         }
+                        Err(error) => return sql_fail(error),
+                    }
+                    // SAFETY: the skipped row's values were dropped.
+                    unsafe { arena.rewind_to(row_mark) };
+                }
+                let mut index = first_row;
+                loop {
+                    match write_row(
+                        storage,
+                        txn,
+                        services,
+                        responder,
+                        index,
+                        &[],
+                        Some(&mut *stream),
+                        None,
+                    )? {
+                        Ok(()) => {}
+                        Err(error) => return sql_fail(error),
+                    }
+                    if source_ended.get() {
+                        break;
                     }
                     index += 1;
                     // SAFETY: the row is written. What a write keeps across
                     // rows (transition rows, the invocation log) lives in the
                     // arena's persistent tail or outside the arena.
                     unsafe { arena.rewind_to(row_mark) };
-                    stream.next = match next_streamed_row(
-                        &mut stream.reader,
-                        storage,
-                        txn.txid,
-                        source_command,
-                        stream.block,
-                        services.row_buffers,
-                        arena,
-                        params,
-                        index >= first_row,
-                    ) {
-                        Ok(next) => next,
-                        Err(error) => return sql_fail(error),
-                    };
-                }
-                if index < first_row {
-                    return sql_fail(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "a resumed write selected different rows"
-                    ));
                 }
                 sql_ok()
             })(),
@@ -86038,8 +86503,12 @@ where
     }
     let mut inserted = resumed.changed;
     let first_row = resumed.first;
+    let values_node =
+        crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Values);
+    let _values_loop = values_node.start();
     let rows_outcome = (|| -> Outcome {
         for (index, row_exprs) in statement.rows.iter().enumerate().skip(first_row) {
+            values_node.row();
             match row_progress::start_row(
                 progress.as_deref_mut(),
                 index,
@@ -86230,6 +86699,20 @@ where
                 Ok(false) => {}
                 Err(error) => return sql_fail(error),
             }
+        }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            statement.rows.len(),
+            inserted,
+            row_progress::capture_lengths([
+                transition_capture.as_ref(),
+                conflict_transition_capture.as_ref(),
+                None,
+            ]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
         }
         sql_ok()
     })();
@@ -87523,16 +88006,15 @@ pub(crate) fn update<'a>(
                 updated += 1;
                 continue;
             }
-            if let Some(progress) = progress.as_deref_mut()
-                && let Err(error) = progress.begin_row(
-                    i,
-                    Some(scratch[i]),
-                    updated,
-                    row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
-                    txn,
-                    responder,
-                )
-            {
+            if let Err(error) = row_progress::start_selected_row(
+                progress.as_deref_mut(),
+                i,
+                scratch[i],
+                updated,
+                row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+                txn,
+                responder,
+            ) {
                 return sql_fail(error);
             }
             match dml_row_available(storage, txn, scratch[i], "updated") {
@@ -88370,6 +88852,16 @@ pub(crate) fn update<'a>(
             }
             updated += 1;
         }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            scratch.len(),
+            updated,
+            row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
+        }
         sql_ok()
     })();
     if let Some(progress) = progress {
@@ -88966,16 +89458,15 @@ pub(crate) fn delete<'a>(
                 deleted += 1;
                 continue;
             }
-            if let Some(progress) = progress.as_deref_mut()
-                && let Err(error) = progress.begin_row(
-                    i,
-                    Some(scratch[i]),
-                    deleted,
-                    row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
-                    txn,
-                    responder,
-                )
-            {
+            if let Err(error) = row_progress::start_selected_row(
+                progress.as_deref_mut(),
+                i,
+                scratch[i],
+                deleted,
+                row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+                txn,
+                responder,
+            ) {
                 return sql_fail(error);
             }
             match dml_row_available(storage, txn, scratch[i], "deleted") {
@@ -89305,6 +89796,16 @@ pub(crate) fn delete<'a>(
                 return sql_fail(error);
             }
             deleted += 1;
+        }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            scratch.len(),
+            deleted,
+            row_progress::capture_lengths([transition_capture.as_ref(), None, None]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
         }
         sql_ok()
     })();
@@ -97785,6 +98286,11 @@ pub(super) fn collect_matches<'a>(
         }
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
+        // The write's scan of its target, as EXPLAIN ANALYZE counts it:
+        // each visible row it matched or its filter removed.
+        let scan =
+            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
+        let _scan = scan.start();
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(());
@@ -97825,6 +98331,9 @@ pub(super) fn collect_matches<'a>(
                             error
                         )
                     })?;
+                scan.row();
+            } else {
+                scan.filtered();
             }
             Ok::<(), SqlError>(())
         };

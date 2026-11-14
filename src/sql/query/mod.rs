@@ -34,7 +34,7 @@ use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::{
     LockedRow, MAX_RETAINED_SOURCES, RetainedSelect, RetainedUse, StreamSource, set_query_select,
-    stream_query,
+    stream_query, union_all_leaves,
 };
 
 #[cfg(test)]
@@ -96,9 +96,11 @@ pub(crate) use catalog_images::{
 pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;
 mod view_write;
-pub(crate) use cte::select_reads_repeatably;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
+pub(crate) use cte::{
+    select_calls_user_routines, select_reads_repeatably, select_streams_with_calls,
+};
 pub use view_write::{
     UpdatableView, ViewRewrite, ViewWrite, and_where, conditional_instead_view_error,
     function_view_write_error, resolve_view_for_dml, resolve_view_for_merge,
@@ -119,8 +121,10 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
+pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
+pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -885,6 +889,50 @@ pub(crate) use srf::{
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
+/// Whether a SELECT list calls a set-returning function, which PostgreSQL
+/// evaluates in a `ProjectSet` node.
+pub(crate) fn has_set_returning_items(
+    items: &[SelectItem<'_>],
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    has_project_set(items, storage, txid)
+}
+
+/// Whether a key of a FROM-less query is a constant PostgreSQL's planner
+/// drops from its sort and grouping keys: it reads no volatile function, set
+/// or subquery.
+pub(crate) fn fromless_key_is_constant(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    if expression_has_project_set(expression, storage, txid) {
+        return Ok(false);
+    }
+    if expression.contains_subquery() {
+        return Ok(false);
+    }
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    Ok(!predicate_safety::expression_properties(
+        expression,
+        &columns,
+        storage,
+        txid,
+        predicate_safety::AnalysisStage::RuntimeProjection,
+        arena,
+    )?
+    .volatile)
+}
+
 mod group;
 use group::{grouped_rows, grouped_select};
 
@@ -1054,18 +1102,31 @@ pub(crate) struct TriggerCall {
     pub rows: u64,
 }
 
-/// A data-modifying `WITH` query whose rows were first read. It runs at the
-/// invocation ordinal of that read; calls it makes take the ordinals after it.
+/// A data-modifying `WITH` query a read needs more rows of. It runs as
+/// PostgreSQL's ModifyTable node does under a CTE scan: one step writes
+/// source rows until it returns one row, so the reader and the query
+/// interleave row by row. Calls the query makes take a log of their own.
 #[derive(Clone, Copy)]
 pub(crate) struct PendingWriteQuery {
     with: (usize, usize),
     pub index: usize,
     params: (usize, usize),
-    pub ordinal: usize,
+    /// The row the read needs, or `None` for every row.
+    pub row: Option<usize>,
 }
 
 impl PendingWriteQuery {
-    fn key(&self) -> (usize, usize) {
+    /// Runs the remaining steps of a query to its end.
+    pub(crate) fn drain(source: &super::ast::WriteQuerySource<'_>) -> Self {
+        Self {
+            with: (source.with.as_ptr() as usize, source.with.len()),
+            index: source.index,
+            params: source.params,
+            row: None,
+        }
+    }
+
+    pub(crate) fn key(&self) -> (usize, usize) {
         (self.with.0, self.index)
     }
 
@@ -1084,15 +1145,69 @@ impl PendingWriteQuery {
     }
 }
 
-/// A completed data-modifying `WITH` query and its rows.
+/// The journal region (sequence values and statement effects) one step of
+/// a data-modifying `WITH` query consumed.
 #[derive(Clone, Copy)]
-struct WriteQueryResult {
+pub(crate) struct StepRegion {
+    start: Option<super::sequence::StatementReplayStart>,
+    end: super::sequence::StatementReplayCursor,
+}
+
+impl StepRegion {
+    /// Ends the region a step that started at `start` consumed.
+    pub(crate) fn finish(
+        start: Option<super::sequence::StatementReplayStart>,
+        scratch: &Arena,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            start,
+            end: super::sequence::finish_replay_cursor(start, scratch)?,
+        })
+    }
+
+    /// The region of a row whose step has not ended yet.
+    pub(crate) const fn unfinished() -> Self {
+        Self {
+            start: None,
+            end: super::sequence::StatementReplayCursor::EMPTY,
+        }
+    }
+
+    /// A reader reading the step's row again replays past the region.
+    fn skip(self) -> Result<(), SqlError> {
+        super::sequence::skip_replay_region(self.start, self.end)
+    }
+}
+
+/// One row a data-modifying `WITH` query returned, kept in the statement
+/// arena's retained tail with the region of the step that returned it.
+#[derive(Clone, Copy)]
+struct ProducedRow {
+    image: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+    region: StepRegion,
+}
+
+/// A data-modifying `WITH` query the statement runs as its rows are read:
+/// the rows it returned so far, and its write's row progress between steps.
+pub(crate) struct WriteProducer {
     key: (usize, usize),
-    /// The invocation log whose read ran the query, and that read's ordinal.
-    owner: u64,
-    ordinal: usize,
-    rows: OwnedRoutineResult,
-    replay: super::sequence::StatementReplayCursor,
+    /// Taken by the step that runs the query.
+    progress: Option<super::exec::RowProgress>,
+    /// The reader of an `INSERT ... SELECT` source the engine drives, kept
+    /// between steps in a block of the statement arena's retained tail.
+    driven: Option<super::KeptDriven>,
+    /// The source rows the driven reader has read, so a reader opened again
+    /// (after its statement memory moved) skips them.
+    read: usize,
+    rows: crate::mem::arena::RetainedList<ProducedRow>,
+    /// The region of the step that found the query's end.
+    end: Option<StepRegion>,
+}
+
+/// What a reader of a data-modifying `WITH` query finds at one position.
+pub(crate) enum ProducedRead<'q> {
+    Row(&'q [u8]),
+    End,
 }
 
 /// What a scan needs to run a deferred ordinary `WITH` query.
@@ -1122,6 +1237,7 @@ pub(crate) fn read_deferred_cte<'a>(
     arena: &'a Arena,
     query: Option<DeferredCteRead<'_, 'a>>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    let _cte = instrument::enter(instrument::Segment::Cte);
     let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
     if saved != 0 {
         // SAFETY: a nonzero address names an immutable persistent descriptor
@@ -1188,6 +1304,43 @@ pub(crate) fn read_deferred_cte<'a>(
         core::sync::atomic::Ordering::Relaxed,
     );
     Ok(kept)
+}
+
+/// Ends the attempt of a data-modifying `WITH` query's step at the start of
+/// the row after the one it returned, as ModifyTable returns each row to its
+/// reader before reading its next source row.
+pub(crate) fn producer_yield() -> SqlError {
+    with_active_routine_invocations(|context| {
+        if let Some((invocations, _)) = context {
+            invocations.produced.set(true);
+        }
+    });
+    sql_err!(
+        sqlstate::INTERNAL_ROUTINE_INVOCATION,
+        "data-modifying WITH query returned its row"
+    )
+}
+
+/// Reads row `index` of a data-modifying `WITH` query for the running
+/// attempt, or makes the query's next step the attempt's pending call.
+pub(crate) fn read_write_query_row<'a>(
+    source: &super::ast::WriteQuerySource<'_>,
+    index: usize,
+) -> Result<ProducedRead<'a>, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "data-modifying WITH query \"{}\" was read outside its statement",
+                source.with[source.index].name
+            ));
+        };
+        invocations.require_arena(statement_arena)?;
+        // The rows live in the statement arena's retained tail, which outlives
+        // every reader of the statement.
+        let statement_arena: &'a Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
+        invocations.read_produced_row(source, index, statement_arena)
+    })
 }
 
 /// Reads a data-modifying `WITH` query's rows for the running statement
@@ -1615,6 +1768,9 @@ pub(crate) struct RoutineInvocationState {
     pub(super) execution: RoutineExecution,
     unowned_values: Cell<bool>,
     next: Cell<usize>,
+    /// Where each attempt starts replaying: past the calls and saved inputs
+    /// of steps that finished before an attempt ran their `AFTER` work.
+    first: Cell<InvocationPosition>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     /// The transaction's effects when the pending trigger firing started.
@@ -1623,8 +1779,12 @@ pub(crate) struct RoutineInvocationState {
     results: RefCell<RoutineResults>,
     /// Identifies this log across relocation.
     id: u64,
-    writes: RefCell<crate::mem::arena::RetainedList<WriteQueryResult>>,
-    /// The address of the log holding `writes` for a write query's run;
+    /// The data-modifying `WITH` queries this statement runs as their rows
+    /// are read: `write_step_levels` records, leased at the first.
+    producers: RefCell<Option<crate::mem::lease_pool::MutableSlice<WriteProducer>>>,
+    /// A step's write returned its row and ended the attempt there.
+    produced: Cell<bool>,
+    /// The address of the log holding `producers` for a write query's run;
     /// zero for the statement's own log.
     writes_root: Cell<usize>,
     /// The statement reads data-modifying `WITH` queries, so any attempt may
@@ -1898,6 +2058,10 @@ impl RoutineInvocationState {
             execution,
             unowned_values: Cell::new(false),
             next: Cell::new(0),
+            first: Cell::new(InvocationPosition {
+                calls: 0,
+                inputs: 0,
+            }),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
             pending_firing: Cell::new(None),
@@ -1908,7 +2072,8 @@ impl RoutineInvocationState {
                 next.set(id.wrapping_add(1));
                 id
             }),
-            writes: RefCell::new(crate::mem::arena::RetainedList::new()),
+            producers: RefCell::new(None),
+            produced: Cell::new(false),
             writes_root: Cell::new(0),
             reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
@@ -1942,19 +2107,33 @@ impl RoutineInvocationState {
         child
     }
 
-    fn write_query(
+    /// Reads row `index` of a data-modifying `WITH` query, or its end. A row
+    /// the query has not returned yet makes its next step the attempt's
+    /// pending call.
+    fn read_produced_row<'query>(
         &self,
-        arena: &Arena,
-        key: (usize, usize),
-    ) -> Result<Option<WriteQueryResult>, SqlError> {
-        self.writes
-            .borrow()
-            .with_slice(arena, |writes| {
-                writes.iter().find(|write| write.key == key).copied()
-            })
-            .map_err(|_| inactive_pending_call())
+        source: &super::ast::WriteQuerySource<'_>,
+        index: usize,
+        statement_arena: &'query Arena,
+    ) -> Result<ProducedRead<'query>, SqlError> {
+        self.require_arena(statement_arena)?;
+        let key = (source.with.as_ptr() as usize, source.index);
+        let found = self.write_table().produced(statement_arena, key, index)?;
+        match found {
+            Some(Some(row)) => {
+                row.region.skip()?;
+                let bytes = statement_arena
+                    .retained_slice(row.image)
+                    .map_err(|_| inactive_pending_call())?;
+                Ok(ProducedRead::Row(bytes))
+            }
+            Some(None) => Ok(ProducedRead::End),
+            None => Err(self.pend_write_query(source, Some(index), statement_arena)),
+        }
     }
 
+    /// Every row of a data-modifying `WITH` query, once it has run to its
+    /// end; until then, its remaining steps are the attempt's pending call.
     fn resolve_write_query<'query>(
         &self,
         source: &super::ast::WriteQuerySource<'_>,
@@ -1963,56 +2142,70 @@ impl RoutineInvocationState {
     ) -> Result<&'query [&'query [u8]], SqlError> {
         self.require_arena(statement_arena)?;
         let key = (source.with.as_ptr() as usize, source.index);
-        let next = self.next.get();
-        if let Some(write) = self.write_table().write_query(statement_arena, key)? {
-            // A query first read here takes its ordinal in this log, and its
-            // first read in each attempt skips the sequence values it used. A
-            // query first read inside another query's run was skipped with it.
-            if write.owner == self.id {
-                if next == write.ordinal {
-                    self.next.set(next + 1);
-                    super::sequence::restore_replay_cursor(
-                        write.replay,
-                        super::sequence::ReplayInputPosition::KeepConsumed,
-                    )?;
-                } else if next < write.ordinal {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "data-modifying WITH query replay changed order"
-                    ));
-                }
-            }
-            let OwnedRoutineResult::Rows(rows) = write.rows else {
-                return Err(inactive_pending_call());
-            };
-            // The rows stay in the statement arena's retained tail until the
-            // statement ends, after every query that reads them; only the
-            // row index is built in the reading query's memory.
-            let statement_arena: &'query Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
-            return rows.rows(statement_arena, query_arena);
+        let table = self.write_table();
+        if !table.producer_finished(statement_arena, key)? {
+            return Err(self.pend_write_query(source, None, statement_arena));
         }
-        self.next.set(next + 1);
-        self.pending_replay
-            .set(super::sequence::begin_replay_cursor()?);
-        self.pending.set(Some(PendingRoutineInvocation {
-            constant_arguments: false,
-            plan_owner: super::type_input_plans::owner()?,
-            source_position: None,
-            input_collation: super::ast::Collation::None,
-            access: super::eval::RoutineCallAccess::Caller,
-            target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
-                with: (source.with.as_ptr() as usize, source.with.len()),
-                index: source.index,
-                params: source.params,
-                ordinal: next,
-            }),
-            arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
-            argument_count: 0,
-        }));
-        Err(sql_err!(
-            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-            "data-modifying WITH query is pending"
-        ))
+        let mut rows = ArenaList::new(query_arena);
+        let mut index = 0;
+        while let Some(Some(row)) = table.produced(statement_arena, key, index)? {
+            row.region.skip()?;
+            // The rows stay in the statement arena's retained tail until the
+            // statement ends, after every query that reads them.
+            let bytes: &'query [u8] = unsafe {
+                &*core::ptr::from_ref(
+                    statement_arena
+                        .retained_slice(row.image)
+                        .map_err(|_| inactive_pending_call())?,
+                )
+            };
+            rows.push(bytes).map_err(|_| arena_full())?;
+            index += 1;
+        }
+        if let Some(Some(end)) = table.producer_end(statement_arena, key)? {
+            end.skip()?;
+        }
+        Ok(rows.as_slice())
+    }
+
+    fn pend_write_query(
+        &self,
+        source: &super::ast::WriteQuerySource<'_>,
+        row: Option<usize>,
+        statement_arena: &Arena,
+    ) -> SqlError {
+        let pending = (|| {
+            self.pending_replay
+                .set(super::sequence::begin_replay_cursor()?);
+            self.pending.set(Some(PendingRoutineInvocation {
+                constant_arguments: false,
+                plan_owner: super::type_input_plans::owner()?,
+                source_position: None,
+                input_collation: super::ast::Collation::None,
+                access: super::eval::RoutineCallAccess::Caller,
+                target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
+                    with: (source.with.as_ptr() as usize, source.with.len()),
+                    index: source.index,
+                    params: source.params,
+                    row,
+                }),
+                arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
+                argument_count: 0,
+            }));
+            Ok::<_, SqlError>(())
+        })();
+        match pending {
+            Ok(()) => sql_err!(
+                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                "data-modifying WITH query is pending"
+            ),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether the step's write ended its attempt after the row it returned.
+    pub(crate) fn take_produced(&self) -> bool {
+        self.produced.replace(false)
     }
 
     /// The sequence position where the pending call was first reached.
@@ -2020,45 +2213,223 @@ impl RoutineInvocationState {
         self.pending_replay.take()
     }
 
-    /// Records a finished write query at the ordinal of the read that ran it.
-    pub(crate) fn complete_write_query(
+    /// `Some(Some(row))` for a returned row, `Some(None)` past the last row of
+    /// a query that ended, and `None` for a row not returned yet.
+    fn produced(
         &self,
-        write: PendingWriteQuery,
-        rows: crate::mem::arena::FrozenArenaSliceHandle<u8>,
-        replay: Option<super::sequence::StatementReplayStart>,
         arena: &Arena,
-        scratch: &Arena,
-    ) -> Result<(), SqlError> {
-        self.require_arena(arena)?;
-        if self.results.borrow().len() != write.ordinal {
-            return Err(inactive_pending_call());
+        key: (usize, usize),
+        index: usize,
+    ) -> Result<Option<Option<ProducedRow>>, SqlError> {
+        let producers = self.producers.borrow();
+        let Some(producer) = producers
+            .as_ref()
+            .and_then(|producers| producers.iter().find(|producer| producer.key == key))
+        else {
+            return Ok(None);
+        };
+        if let Some(row) = producer
+            .rows
+            .get(arena, index)
+            .map_err(|_| inactive_pending_call())?
+        {
+            return Ok(Some(Some(row)));
         }
-        let replay = super::sequence::finish_replay_cursor(replay, scratch)?;
-        let rows = OwnedRoutineResult::from_row_image(rows);
-        self.results
-            .borrow_mut()
-            .push(
-                arena,
-                RoutineInvocationResult {
-                    value: rows,
-                    replay,
-                },
-            )
-            .map_err(invocation_results::directory_error)?;
-        self.write_table()
-            .writes
-            .borrow_mut()
-            .push(
-                arena,
-                WriteQueryResult {
-                    key: write.key(),
-                    owner: self.id,
-                    ordinal: write.ordinal,
-                    rows,
-                    replay,
-                },
-            )
-            .map_err(invocation_results::directory_error)
+        Ok(producer.end.map(|_| None))
+    }
+
+    fn producer_finished(&self, arena: &Arena, key: (usize, usize)) -> Result<bool, SqlError> {
+        Ok(self.producer_end(arena, key)?.is_some())
+    }
+
+    fn producer_end(
+        &self,
+        _arena: &Arena,
+        key: (usize, usize),
+    ) -> Result<Option<Option<StepRegion>>, SqlError> {
+        Ok(self.producers.borrow().as_ref().and_then(|producers| {
+            producers
+                .iter()
+                .find(|producer| producer.key == key)
+                .and_then(|producer| producer.end.map(Some))
+        }))
+    }
+
+    /// The number of rows the query returned, and whether it ended.
+    pub(crate) fn producer_state(&self, key: (usize, usize)) -> (usize, bool) {
+        let producers = self.write_table().producers.borrow();
+        producers
+            .as_ref()
+            .and_then(|producers| producers.iter().find(|producer| producer.key == key))
+            .map_or((0, false), |producer| {
+                (producer.rows.len(), producer.end.is_some())
+            })
+    }
+
+    /// Takes the write progress of a query's next step, starting the query
+    /// with `start` at its first step. The records of the statement's
+    /// `queries` data-modifying `WITH` queries are leased at the first.
+    pub(crate) fn take_producer_progress(
+        &self,
+        key: (usize, usize),
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+        queries: usize,
+        start: impl FnOnce() -> Result<super::exec::RowProgress, SqlError>,
+    ) -> Result<super::exec::RowProgress, SqlError> {
+        let table = self.write_table();
+        let mut producers = table.producers.borrow_mut();
+        if producers.is_none() {
+            *producers = Some(pool.lease::<WriteProducer>(queries).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "data-modifying WITH query progress: {}",
+                    error
+                )
+            })?);
+        }
+        let producers = producers.as_mut().expect("producer records leased");
+        if let Some(producer) = producers.iter_mut().find(|producer| producer.key == key) {
+            return producer.progress.take().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a data-modifying WITH query read itself while it ran"
+                )
+            });
+        }
+        if producers.len() == queries {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a statement ran more data-modifying WITH queries than it has"
+            ));
+        }
+        producers
+            .push(WriteProducer {
+                key,
+                progress: None,
+                driven: None,
+                read: 0,
+                rows: crate::mem::arena::RetainedList::new(),
+                end: None,
+            })
+            .map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "data-modifying WITH query progress: {}",
+                    error
+                )
+            })?;
+        start()
+    }
+
+    fn producer_mut<R>(
+        &self,
+        key: (usize, usize),
+        change: impl FnOnce(&mut WriteProducer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let mut producers = self.write_table().producers.borrow_mut();
+        let producer = producers
+            .as_mut()
+            .and_then(|producers| producers.iter_mut().find(|producer| producer.key == key))
+            .ok_or_else(inactive_pending_call)?;
+        change(producer)
+    }
+
+    /// Records a row a step returned, with the journal region it consumed.
+    pub(crate) fn add_produced_row(
+        &self,
+        key: (usize, usize),
+        row: &[u8],
+        region: StepRegion,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            let image = arena
+                .retain_slice_with(row.len(), |index| row[index])
+                .map_err(|_| arena_full())?;
+            let image = arena
+                .freeze_retained_slice(image)
+                .map_err(|_| inactive_pending_call())?;
+            producer
+                .rows
+                .push(arena, ProducedRow { image, region })
+                .map_err(invocation_results::directory_error)
+        })
+    }
+
+    /// Gives the rows from index `first` on the region of the step that
+    /// returned them.
+    pub(crate) fn finish_produced_rows(
+        &self,
+        key: (usize, usize),
+        first: usize,
+        region: StepRegion,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer
+                .rows
+                .with_mut_slice(arena, |rows| {
+                    for row in rows.iter_mut().skip(first) {
+                        row.region = region;
+                    }
+                })
+                .map_err(|_| inactive_pending_call())
+        })
+    }
+
+    /// Records that the query ended in a step that consumed `region`.
+    pub(crate) fn finish_producer(
+        &self,
+        key: (usize, usize),
+        region: StepRegion,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.end = Some(region);
+            Ok(())
+        })
+    }
+
+    /// Gives back the write progress a step took; a query that ended keeps
+    /// only its rows.
+    pub(crate) fn return_producer_progress(
+        &self,
+        key: (usize, usize),
+        progress: super::exec::RowProgress,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.progress = producer.end.is_none().then_some(progress);
+            Ok(())
+        })
+    }
+
+    /// Takes the driven reader of a query's step, with the source rows read.
+    pub(crate) fn take_producer_driven(
+        &self,
+        key: (usize, usize),
+    ) -> Result<(Option<super::KeptDriven>, usize), SqlError> {
+        self.producer_mut(key, |producer| Ok((producer.driven.take(), producer.read)))
+    }
+
+    /// Gives back the driven reader a step took.
+    pub(crate) fn return_producer_driven(
+        &self,
+        key: (usize, usize),
+        driven: Option<super::KeptDriven>,
+        read: usize,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.driven = driven.filter(|_| producer.end.is_none());
+            producer.read = read;
+            Ok(())
+        })
+    }
+
+    /// Later attempts start replay where this one stands: the steps before
+    /// were finished and their calls are not evaluated again. Both logs move
+    /// together: a saved input carries the call position after it, so an
+    /// input log restarting at its beginning would rewind the calls too.
+    pub(crate) fn begin_attempts_here(&self) {
+        self.first.set(self.position());
     }
 
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
@@ -2079,10 +2450,11 @@ impl RoutineInvocationState {
     }
 
     pub(crate) fn begin_attempt(&self) {
-        self.next.set(0);
+        let first = self.first.get();
+        self.next.set(first.calls);
         self.pending.set(None);
         self.pending_firing.set(None);
-        self.inputs.begin_attempt();
+        self.inputs.seek(first.inputs);
     }
 
     #[expect(
@@ -8193,6 +8565,10 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         Some(w) => where_passes(w, arena, params, row, hooks)?,
         None => true,
     };
+    let aggregate = instrument::node(instrument::Role::Aggregate);
+    if pass {
+        instrument::node(instrument::Role::Result).row();
+    }
     if !statement.group_by.is_empty() && !pass {
         // Zero input rows grouped: zero groups, zero output rows (a plain
         // aggregate still emits its one row over the empty input).
@@ -8241,9 +8617,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
             Datum::Bool(true)
         );
         if !held {
+            aggregate.filtered();
             return Ok(None);
         }
     }
+    aggregate.row();
     Ok(Some((ptrs, values)))
 }
 
@@ -8602,6 +8980,64 @@ pub(crate) fn check_rule_insert_returning<'a>(
 /// with OLD and NEW typed by `transition`: a query's relations, operators
 /// and types, and a data-changing statement's condition and assignments.
 /// Nothing is read or written.
+/// PostgreSQL's grouping check of a rule action's query: the rule's OLD and
+/// NEW are range table entries of the action's own query, so a grouped
+/// query reads them only through its grouping keys or aggregates.
+fn check_rule_query_grouping(select: &Select<'_>) -> Result<(), SqlError> {
+    fn ungrouped<'a>(expression: &'a Expr<'a>, keys: &[&Expr<'_>]) -> Result<(), SqlError> {
+        if keys.iter().any(|key| **key == *expression) || expression.is_aggregate_use() {
+            return Ok(());
+        }
+        if let Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } = expression
+            && (qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new"))
+        {
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier,
+                    name
+                ),
+                qualifier,
+            ));
+        }
+        if matches!(
+            expression,
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. }
+        ) {
+            return Ok(());
+        }
+        walk_children(expression, &mut |child| ungrouped(child, keys))
+    }
+    let items = || {
+        select.items.iter().filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        })
+    };
+    let grouped = !select.group_by.is_empty()
+        || select.having.is_some()
+        || items().chain(select.having).any(|expression| {
+            let mut aggregate = false;
+            let _ = walk_expression_tree(expression, &mut |node| {
+                aggregate |= node.is_aggregate_use();
+            });
+            aggregate
+        });
+    if !grouped {
+        return Ok(());
+    }
+    for expression in items().chain(select.having) {
+        ungrouped(expression, select.group_by)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn analyse_rule_action<'a>(
     statement: &'a Stmt<'a>,
     storage: &'a Storage,
@@ -8624,6 +9060,7 @@ pub(crate) fn analyse_rule_action<'a>(
                     Some(transition),
                 )?;
                 analyse_select(select, storage, txid, arena, Some(transition))?;
+                check_rule_query_grouping(select)?;
                 if select.from.is_none() && select.set_body.is_none() {
                     let catalog = storage_catalog(storage, arena, txid);
                     let columns = super::eval::RuntimeColumnTypes {
@@ -8655,8 +9092,45 @@ pub(crate) fn analyse_rule_action<'a>(
         Stmt::SetQuery(query) => {
             analyse_set_tree(query.body, storage, txid, arena, Some(transition))
         }
+        Stmt::Insert(insert)
+            if insert
+                .select
+                .is_some_and(|select| select.set_body.is_none() && select.from.is_some()) =>
+        {
+            // The inserted query is analysed as a SELECT action is, with
+            // OLD and NEW as its outer row.
+            let select = insert.select.expect("checked above");
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let analysed = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    Some(transition),
+                )?;
+                analyse_select(select, storage, txid, arena, Some(transition))
+            });
+            unsafe { arena.rewind_to(mark) };
+            analysed?;
+            check_rule_query_grouping(select)?;
+            validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
+        }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-            analyse_dml_condition(statement, storage, txid, arena, Some(transition))?;
+            if let Stmt::Insert(crate::sql::ast::Insert {
+                select: Some(select),
+                ..
+            }) = statement
+            {
+                check_rule_query_grouping(select)?;
+            }
+            // Views the action reads are analysed through their queries.
+            let expanded =
+                cte::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            analyse_dml_condition(expanded, storage, txid, arena, Some(transition))?;
             validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
         }
         _ => Ok(()),
@@ -11879,6 +12353,8 @@ pub(crate) fn select_query_resumable<'a>(
     // PostgreSQL does — so a per-row error in an unreturned row does not
     // surface (constant errors already surfaced via the plan-time check).
     if limit == 0 {
+        // The limit runs and reads nothing.
+        let _limit = instrument::node(instrument::Role::Limit).start();
         if let Err(error) = scan::validate_materialized_view_reads(
             storage,
             &scope,
@@ -12007,6 +12483,9 @@ pub(crate) fn select_query_resumable<'a>(
         // scan path retains full rows until it proves an equivalent contract.
         let pax_columns =
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let scan_output = instrument::ScanOutput::current(scope.n);
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -12033,6 +12512,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &hooks,
                     )?
                 {
+                    scan_output.refiltered();
                     return Ok(true);
                 }
                 // The row's correlated subqueries run as its expressions
@@ -12094,8 +12574,10 @@ pub(crate) fn select_query_resumable<'a>(
                         }
                     }
                     emitted += 1;
+                    stages.limit.row();
                 }
-                Ok(true)
+                // A limit stops reading once it has its rows.
+                Ok(emitted < limit)
             },
         );
         if wire_full {
@@ -12375,6 +12857,7 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     {
         return Ok(srf::ProjectSet::empty());
     }
+    instrument::node(instrument::Role::Result).row();
     prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
 }
 
@@ -12595,6 +13078,13 @@ pub(crate) fn constant_select_resumable<'a>(
         merge_action: None,
     };
 
+    // EXPLAIN ANALYZE's nodes: the one-row `Result`, the stages above it
+    // and a `ProjectSet` expanding set-returning calls.
+    let mut stages = instrument::Stages::current();
+    // A `LIMIT 0` never runs the projection below it.
+    let projected = core::mem::replace(&mut stages.project_set, instrument::Node::NONE);
+    let _stages = stages.start();
+    let result_node = instrument::node(instrument::Role::Result);
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
     // over one virtual input row (zero when WHERE is false) and emits at most
     // one output row.
@@ -12652,6 +13142,8 @@ pub(crate) fn constant_select_resumable<'a>(
             );
         }
         responder.row_description(&columns[..n])?;
+        let _result = result_node.start();
+        let _projected = projected.start();
         let hook_data = match fromless_aggregate_hooks(
             statement,
             agg_nodes.as_slice(),
@@ -12698,6 +13190,7 @@ pub(crate) fn constant_select_resumable<'a>(
                 Ok(Err(error)) => return sql_fail(error),
                 Err(wire) => return Err(wire),
             }
+            stages.limit.row();
             rows = 1;
         }
         let tag = stack_format!(48, "SELECT {}", rows);
@@ -12806,6 +13299,8 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(l) => l,
             Err(e) => return sql_fail(e),
         };
+    let _result = (limit != 0).then(|| result_node.start());
+    let _projected = (limit != 0).then(|| projected.start());
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -12901,6 +13396,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(live) => live,
             Err(error) => return sql_fail(error),
         };
+        stages.unique.rows(live as u64);
     }
     let out_rows = &mut out_rows[..live];
     let mut order_collations = [super::ast::Collation::None; MAX_PROJ];
@@ -12956,6 +13452,7 @@ pub(crate) fn constant_select_resumable<'a>(
         if let Err(error) = sorted {
             return sql_fail(error);
         }
+        stages.sort.rows(out_rows.len() as u64);
     }
 
     let start = (offset as usize).min(out_rows.len());
@@ -12990,6 +13487,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),
         }
+        stages.limit.row();
         rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);
@@ -13175,6 +13673,8 @@ fn select_into_rows_mode<'a>(
                 outer,
             );
         }
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
         let offset =
@@ -13235,7 +13735,11 @@ fn select_into_rows_mode<'a>(
             }
         }
         let mut vals = [Datum::Null; MAX_PROJ];
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..end] {
+            below_limit.row();
+            stages.limit.row();
             for (c, slot) in vals[..n].iter_mut().enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, c, arena)?;
             }
@@ -13371,6 +13875,9 @@ fn select_into_rows_mode<'a>(
                 inner: &super::eval::NoColumns,
                 outer,
             };
+            let stages = instrument::Stages::current();
+            let _stages = stages.start();
+            let _result = instrument::node(instrument::Role::Result).start();
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -13419,6 +13926,7 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
+            stages.limit.row();
             emit(&vals[..n])?;
             return Ok(());
         };
@@ -13481,6 +13989,8 @@ fn select_into_rows_mode<'a>(
             sequences: seq,
             merge_action: None,
         };
+        let stages = materialize::materialized_stages(statement.limit.is_some());
+        let _stages = stages.start();
         let (rows, width) = grouped_rows(
             storage,
             &scope,
@@ -13493,6 +14003,7 @@ fn select_into_rows_mode<'a>(
             &hooks,
             outer_subs.correlated,
             outer,
+            &stages,
         )?;
         let offset =
             super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
@@ -13500,7 +14011,11 @@ fn select_into_rows_mode<'a>(
             super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
+        let below_limit = stages.below_limit();
+        below_limit.rows(start as u64);
         for row in &rows[start..start + n] {
+            below_limit.row();
+            stages.limit.row();
             let mut out = [Datum::Null; MAX_PROJ];
             for (i, slot) in out.iter_mut().take(width).enumerate() {
                 *slot = super::exec::decode_projected_col_record(row, i, arena)?;
@@ -13582,6 +14097,10 @@ fn select_into_rows_mode<'a>(
             merge_action: None,
         };
         let srf_call = find_srf(statement.items);
+        let stages = instrument::Stages::current();
+        let _stages = stages.start();
+        let result = instrument::node(instrument::Role::Result);
+        let _result = result.start();
         let project_set =
             prepare_fromless_projection(statement, storage, txid, arena, params, &cols, &hooks)?;
         let mut produced = 0u64;
@@ -13620,6 +14139,7 @@ fn select_into_rows_mode<'a>(
                 }
             }
             if produced >= offset {
+                stages.limit.row();
                 emit(&vals[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -13837,6 +14357,8 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
+        let stages = materialize::materialized_stages(limit != u64::MAX);
+        let _stages = stages.start();
         let (rows, width, deferred, identities_at) = materialized_rows(
             storage,
             &scope,
@@ -13854,6 +14376,7 @@ fn select_into_rows_mode<'a>(
                 && !statement.with_ties
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+            &stages,
         )?;
         materialize::materialized_rows_into(
             storage,
@@ -13873,6 +14396,7 @@ fn select_into_rows_mode<'a>(
             outer,
             limit,
             offset,
+            &stages,
             &mut |values| {
                 emit(values)?;
                 Ok(true)
@@ -13882,10 +14406,13 @@ fn select_into_rows_mode<'a>(
     }
     let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
     let stop_after = offset.saturating_add(limit);
+    let stages = instrument::Stages::current();
+    let _stages = stages.start();
     if stop_after == 0 {
         return Ok(());
     }
     let mut produced = 0u64;
+    let scan_output = instrument::ScanOutput::current(scope.n);
 
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
@@ -13903,6 +14430,7 @@ fn select_into_rows_mode<'a>(
                 &hooks,
             )?
         {
+            scan_output.refiltered();
             return Ok(true);
         }
         // The row's correlated subqueries run as its expressions reach them.
@@ -13934,6 +14462,7 @@ fn select_into_rows_mode<'a>(
                 outer,
             )?;
             if produced >= offset {
+                stages.limit.row();
                 emit(&projected[..n])?;
             }
             produced = produced.saturating_add(1);
@@ -13955,6 +14484,7 @@ fn select_into_rows_mode<'a>(
                     outer,
                 )?;
                 if produced >= offset {
+                    stages.limit.row();
                     emit(&projected[..n])?;
                 }
                 produced = produced.saturating_add(1);
@@ -16715,4 +17245,13 @@ pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeC
         Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
         _ => None,
     }
+}
+
+/// Visits `expression` and every expression below it, subqueries excepted.
+fn walk_expression_tree<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a Expr<'a>),
+) -> Result<(), SqlError> {
+    visit(expression);
+    walk_children(expression, &mut |child| walk_expression_tree(child, visit))
 }

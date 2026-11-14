@@ -534,9 +534,22 @@ function once there, raising its notice or error, and the prepared
 statement keeps the converted values (with its text, in its
 `prepared_bytes` slot; more fails with `54000`), which each `EXECUTE` reads.
 A cast's length coercion (`'123.45'::numeric(3,1)`) and constant folding
-(`1/0`) run when the statement is planned, at each `EXECUTE`. Remaining: a
-statement prepared through the extended protocol's Parse still converts its
-literals at each Execute, and an input notice carries no cursor position.
+(`1/0`) run when the statement is planned, at each `EXECUTE`. A query or data
+change the extended protocol's Parse prepares is analyzed the same way at
+Parse: its literal input notices and errors come back from Parse, and Bind,
+Describe and each Execute read the converted values; a declared parameter type
+beyond the highest `$n` the text uses still declares a parameter. Other
+statements Parse prepares (utilities, `EXPLAIN`, `CREATE TABLE AS`, `CALL`,
+`DECLARE`) convert their literals when they run, where PostgreSQL's parse
+analysis converts those of `EXPLAIN`, `CREATE TABLE AS`, `CALL` and `DECLARE`
+at Parse. A literal's input notice or error carries the literal's cursor
+position, as PostgreSQL's parser position callback reports it, when the
+literal is cast, assigned, compared or passed to a full-text routine.
+Remaining: a simple query converts an untyped literal compared with a column
+(`WHERE q = ''`) or an operator operand for each row it reads, so its notice
+repeats per row where PostgreSQL converts it once while analysing; a literal
+of an `INSERT ... SELECT` output or an `ARRAY[...]` element cast as a whole,
+and a statement a PL/pgSQL routine runs, report no cursor position.
 `UPDATE` and `DELETE` whose conditions (`WHERE`, `FROM` or `USING` items, or
 row-security policies) call a user routine or a volatile built-in qualify
 each candidate row in their change loop, just before changing it, as
@@ -568,13 +581,18 @@ single-relation query or write cheaper than ten operators runs before the
 first policy condition when it costs less, and right after it otherwise,
 as PostgreSQL's `order_qual_clauses` sorts by security level and cost; a
 write's WITH CHECK options test the OR of the permissive policies before
-each restrictive one. `EXPLAIN` of a single-relation query prints the
-policy conditions in its scan's `Filter` in that order. A foreign table's candidate
+each restrictive one. `EXPLAIN` of a single-relation query, `UPDATE` or
+`DELETE` prints the policy conditions in its scan's `Filter` in that order: a
+write's own policies, then the `SELECT` policies when it reads the target's
+columns, each listed once. `EXPLAIN VERBOSE` of an `UPDATE` or `DELETE` of a
+plain table prints its scan's `Output` (each assigned column's new value, then
+`ctid`) and its `RETURNING` list; a `DEFAULT` assignment, a constant the
+planner coerces to the column's type and a subscripted assignment leave the
+scan's `Output` unprinted. A foreign table's candidate
 rows are read again by their remote row identity and qualified in the
 change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
 ... USING` whose target reaches a foreign table's rows qualifies them
-before any change; `EXPLAIN` of `UPDATE` and `DELETE` prints the target
-scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
+before any change; `UPDATE ... FROM` and
 `DELETE ... USING` cost a routine reading a joined item's column as one
 operator; a data-modifying `WITH` sub-statement runs ahead of the main
 statement (above). A rule action reads the triggering statement's
@@ -609,11 +627,13 @@ contains (...)` follows `ExecBuildSlotValueDescription`: a user without
 `SELECT` on the table sees only the columns they may read or the statement
 wrote, named (`(a, c) = (1, 3)`), no detail when there are none, and none
 while row security applies. The written columns are an `INSERT`'s (or
-`COPY`'s) target columns, an `UPDATE`'s `SET` columns, those of every
-`MERGE` action and, under `ON CONFLICT DO UPDATE`, both. Remaining: an
-`INSERT ... SELECT *` without a column list counts every column as written,
-and a view written through `INSTEAD OF` triggers and a subscription's
-applied rows list every column. Revoking a table privilege revokes it on
+`COPY`'s) target columns, or without a column list the leading columns its
+source fills (a query's `*` counting each column it expands to), an
+`UPDATE`'s `SET` columns, those of every `MERGE` action and, under `ON
+CONFLICT DO UPDATE`, both. A view written through its `INSTEAD OF` trigger is
+described by the view's privileges and the columns the statement wrote, and a
+subscription's applied row by the applying role's privileges with no written
+columns, as PostgreSQL's apply worker writes. Revoking a table privilege revokes it on
 each column too.
 Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
@@ -1034,7 +1054,36 @@ limits do not count as evidence.
 finished only when every milestone's "done when" is demonstrated.
 
 The macOS arm64 native test build is memory-bound: compiling the library test
-executable peaks near 7 GB, all of the hosted runner, and takes about 7 minutes
-there against under 2 minutes on a larger machine. Lower that compiler peak,
-for example by moving large test fixtures out of the library crate, before the
-library grows enough to approach the 15-minute job limit again.
+executable peaks at 7.2 GB of rustc memory footprint (measured on revision
+`deb5c406`, `native-ci` profile, Apple M-series, `RUSTC_WRAPPER` running
+`/usr/bin/time -l`), all of the hosted runner, which then swaps; the build
+takes about 10.5 minutes there against under 3 minutes on a larger machine.
+The library alone peaks at 5.1 GB, so its 4,075 tests add about 2.1 GB.
+`-Ztime-passes` shows the front end holding its results into code
+generation: parsing and name resolution reach 2.5 GB (1.8 GB for the library
+alone), type checking adds 1.2 GB (1.0) and borrow checking 1.6 GB (0.9), and
+the monomorphization graph adds 0.9 GB (none for the library alone), peaking
+when code generation partitions. The test modules use crate-private
+interfaces throughout (`run_with` drives `Engine` with private transaction,
+cursor and responder state), and the crate keeps that surface private
+(`unreachable_pub`), so moving them into integration tests would publish the
+engine's internals. Remaining: split the library test build so no compiler
+process holds both the largest SQL fixture suites (`sql::tests`, 150,000
+lines) and the other native suites, for example by building two test
+executables selected by an explicit Cargo feature, each in its own CI job,
+before the library grows enough to approach the 15-minute job limit again.
+
+Commit-time catalog history (`catalog_snapshot::capture_transaction`)
+synthesizes each catalog a transaction's changes can affect twice, as
+committed and as the transaction sees it, and records the rows that differ.
+Profiling `configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery`
+(300 tables chained by foreign keys, debug `native-ci` build) puts 95% of its
+time there: `pg_depend` takes 45% of the synthesis (its constraint
+dependencies rebuild `pg_constraint`), `pg_class` 15%, `pg_constraint` 14%,
+`pg_trigger` 7%, `pg_attribute` 6%. Each table's index catalog is now scanned
+once per table instead of once per key, and a foreign key's parent
+constraint is looked up only for a partition clone, which takes the test from
+88.5 s to 86.8 s. Remaining: synthesize only the rows of the objects a change
+touched (with the tables its foreign keys, partitions and triggers reach),
+per catalog, and look up a table's indexes and a foreign key's parent table
+through identity maps instead of scans of every index and table name.

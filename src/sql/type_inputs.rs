@@ -267,6 +267,66 @@ pub(crate) fn bindings_for_active_source<'a>(
     Ok(Some(output))
 }
 
+/// The built-in type each UNKNOWN literal of a statement converts to, as
+/// the statement's analysis finds it. `PREPARE` converts those literals once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralTarget {
+    Unseen,
+    Type(i32),
+    /// Analysis converted the literal to two different types.
+    Conflicting,
+}
+
+pub(crate) struct LiteralTargets<'a> {
+    pub literals: &'a [(&'a Expr<'a>, super::parser::NamespaceSource)],
+    pub targets: &'a [core::cell::Cell<LiteralTarget>],
+}
+
+thread_local! {
+    static LITERAL_TARGETS: core::cell::Cell<*const ()> = const { core::cell::Cell::new(core::ptr::null()) };
+}
+
+/// Records, while `analyze` runs, the target of each literal in `targets`.
+pub(crate) fn record_literal_targets<R>(
+    targets: &LiteralTargets<'_>,
+    analyze: impl FnOnce() -> R,
+) -> R {
+    struct Restore(*const ());
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LITERAL_TARGETS.with(|active| active.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        LITERAL_TARGETS
+            .with(|active| active.replace((targets as *const LiteralTargets<'_>).cast())),
+    );
+    analyze()
+}
+
+/// Notes that analysis converts the literal `text` to the built-in `target`.
+pub(crate) fn note_literal_target(text: &str, target: i32) {
+    let active = LITERAL_TARGETS.with(core::cell::Cell::get);
+    if active.is_null() {
+        return;
+    }
+    // SAFETY: `record_literal_targets` keeps the recorder borrowed until it
+    // restores the previous pointer.
+    let targets = unsafe { &*active.cast::<LiteralTargets<'_>>() };
+    let Some(index) = targets.literals.iter().position(|(literal, _)| {
+        matches!(literal, Expr::Str(source)
+            if source.len() == text.len() && core::ptr::eq(source.as_ptr(), text.as_ptr()))
+    }) else {
+        return;
+    };
+    let cell = &targets.targets[index];
+    cell.set(match cell.get() {
+        LiteralTarget::Unseen => LiteralTarget::Type(target),
+        LiteralTarget::Type(prior) if prior == target => LiteralTarget::Type(target),
+        _ => LiteralTarget::Conflicting,
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum InputKind {
     ExplicitCast,
@@ -314,6 +374,42 @@ pub(crate) struct Binding<'a> {
     pub type_mod: i32,
     pub collation: Option<Collation>,
     pub encoded: &'a [u8],
+}
+
+/// Whether PostgreSQL's parse analysis runs `ctype`'s input function on an
+/// UNKNOWN literal it converts: a built-in type other than a pseudo-type.
+pub(crate) fn builtin_input_type(ctype: super::types::ColType) -> bool {
+    use super::types::ColType;
+    is_builtin_oid(ctype.oid())
+        && !matches!(
+            ctype,
+            ColType::Pseudo(_)
+                | ColType::Record
+                | ColType::Void
+                | ColType::Internal
+                | ColType::AnyArray
+                | ColType::PgDdlCommand
+        )
+}
+
+pub(crate) const fn is_builtin_oid(oid: i32) -> bool {
+    oid > 0 && oid < FIRST_USER_OID
+}
+
+const FIRST_USER_OID: i32 = 16_384;
+
+/// The type a prepared statement converts an explicitly cast literal to at
+/// `PREPARE`: an array domain, as [`target_oid`], or a built-in type.
+pub(crate) fn prepared_target_oid(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    type_name: &str,
+) -> Option<i32> {
+    target_oid(storage, txid, type_name).or_else(|| {
+        super::types::ColType::from_sql_name(type_name)
+            .filter(|ctype| builtin_input_type(*ctype))
+            .map(super::types::ColType::oid)
+    })
 }
 
 /// Array input invokes each domain element's input conversion during SQL
@@ -395,6 +491,16 @@ pub(crate) fn validate_restored(
     validate_restored_with(parser, |name| Ok(target_oid(storage, txid, name)))
 }
 
+/// [`validate_restored`] for a prepared statement, whose map also binds
+/// literals cast to built-in types.
+pub(crate) fn validate_prepared(
+    parser: &super::parser::Parser<'_>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    validate_restored_with(parser, |name| Ok(prepared_target_oid(storage, txid, name)))
+}
+
 pub(crate) fn validate_restored_with(
     parser: &super::parser::Parser<'_>,
     mut resolve: impl FnMut(&str) -> Result<Option<i32>, SqlError>,
@@ -432,6 +538,15 @@ pub(crate) fn validate_restored_candidates(
 }
 
 const MAGIC: &[u8; 4] = b"TIP2";
+/// A prepared statement's in-memory map, which also holds built-in values
+/// converted at `PREPARE`. It is never stored durably.
+const SESSION_MAGIC: &[u8; 4] = b"TIPS";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Durable,
+    Session,
+}
 const HEADER: usize = 8;
 const RECORD: usize = 44;
 
@@ -492,9 +607,17 @@ fn validate_value(encoded: &[u8]) -> Result<(), SqlError> {
     }
 }
 
-fn validate_binding(binding: Binding<'_>) -> Result<(), SqlError> {
+fn validate_binding(binding: Binding<'_>, owner: Owner) -> Result<(), SqlError> {
     if binding.start >= binding.end || binding.type_oid <= 0 {
         return Err(invalid());
+    }
+    if owner == Owner::Session && is_builtin_oid(binding.type_oid) {
+        // The session encoded this one projected value itself.
+        return if binding.encoded.len() >= 3 && binding.encoded[..2] == [1, 0] {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
     }
     validate_value(binding.encoded)?;
     if binding.encoded[2] == 200 {
@@ -512,6 +635,15 @@ fn validate_binding(binding: Binding<'_>) -> Result<(), SqlError> {
 }
 
 pub(crate) fn encoded_len(bindings: &[Binding<'_>]) -> Result<usize, SqlError> {
+    encoded_len_for(bindings, Owner::Durable)
+}
+
+/// [`encoded_len`] of a prepared statement's session map.
+pub(crate) fn session_encoded_len(bindings: &[Binding<'_>]) -> Result<usize, SqlError> {
+    encoded_len_for(bindings, Owner::Session)
+}
+
+fn encoded_len_for(bindings: &[Binding<'_>], owner: Owner) -> Result<usize, SqlError> {
     let _ = u32::try_from(bindings.len()).map_err(|_| full())?;
     let mut length = HEADER;
     let mut previous = None;
@@ -525,7 +657,7 @@ pub(crate) fn encoded_len(bindings: &[Binding<'_>]) -> Result<usize, SqlError> {
         {
             return Err(invalid());
         }
-        validate_binding(*binding)?;
+        validate_binding(*binding, owner)?;
         previous = Some(key);
         length = length
             .checked_add(RECORD)
@@ -571,9 +703,28 @@ pub(crate) fn encode(bindings: &[Binding<'_>], output: &mut FixedBuf) -> Result<
 }
 
 pub(crate) fn encode_into(bindings: &[Binding<'_>], output: &mut [u8]) -> Result<usize, SqlError> {
-    let length = encoded_len(bindings)?;
+    encode_for(bindings, output, Owner::Durable)
+}
+
+/// Encodes a prepared statement's session map, see [`session_encoded_len`].
+pub(crate) fn encode_session_into(
+    bindings: &[Binding<'_>],
+    output: &mut [u8],
+) -> Result<usize, SqlError> {
+    encode_for(bindings, output, Owner::Session)
+}
+
+fn encode_for(
+    bindings: &[Binding<'_>],
+    output: &mut [u8],
+    owner: Owner,
+) -> Result<usize, SqlError> {
+    let length = encoded_len_for(bindings, owner)?;
     let bytes = output.get_mut(..length).ok_or_else(full)?;
-    bytes[..4].copy_from_slice(MAGIC);
+    bytes[..4].copy_from_slice(match owner {
+        Owner::Durable => MAGIC,
+        Owner::Session => SESSION_MAGIC,
+    });
     bytes[4..8].copy_from_slice(&(bindings.len() as u32).to_le_bytes());
     let mut at = HEADER;
     for binding in bindings {
@@ -635,10 +786,18 @@ fn read_record<'a>(bytes: &'a [u8], at: &mut usize) -> Result<Binding<'a>, SqlEr
 }
 
 fn validate_image(bytes: &[u8]) -> Result<usize, SqlError> {
+    validate_image_for(bytes, Owner::Durable)
+}
+
+fn validate_image_for(bytes: &[u8], owner: Owner) -> Result<usize, SqlError> {
     if bytes.is_empty() {
         return Ok(0);
     }
-    if bytes.len() < HEADER || &bytes[..4] != MAGIC {
+    let magic = match owner {
+        Owner::Durable => MAGIC,
+        Owner::Session => SESSION_MAGIC,
+    };
+    if bytes.len() < HEADER || &bytes[..4] != magic {
         return Err(invalid());
     }
     let count = u32::from_le_bytes(bytes[4..8].try_into().expect("checked header")) as usize;
@@ -649,7 +808,7 @@ fn validate_image(bytes: &[u8]) -> Result<usize, SqlError> {
     let mut at = HEADER;
     for _ in 0..count {
         let binding = read_record(bytes, &mut at)?;
-        validate_binding(binding)?;
+        validate_binding(binding, owner)?;
         let key = (binding.start, binding.end, binding.kind);
         if previous.is_some_and(|prior| prior >= key) {
             return Err(invalid());
@@ -678,7 +837,23 @@ pub(crate) fn visit<'a>(
 
 /// Payload bytes borrow the owner; only actual binding descriptors use arena.
 pub(crate) fn decode<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<&'a [Binding<'a>], SqlError> {
-    let count = validate_image(bytes)?;
+    decode_for(bytes, arena, Owner::Durable)
+}
+
+/// Decodes a prepared statement's session map.
+pub(crate) fn decode_session<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<&'a [Binding<'a>], SqlError> {
+    decode_for(bytes, arena, Owner::Session)
+}
+
+fn decode_for<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    owner: Owner,
+) -> Result<&'a [Binding<'a>], SqlError> {
+    let count = validate_image_for(bytes, owner)?;
     if count == 0 {
         return Ok(&[]);
     }

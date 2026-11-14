@@ -76,7 +76,8 @@ pub(crate) use scan::{
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, lead_row_security,
-    plan_row_security, row_security_off_error, row_security_passes,
+    leakproof_at_first_security_level, plan_row_security, row_security_off_error,
+    row_security_passes,
 };
 
 mod scope;
@@ -9062,6 +9063,7 @@ pub(crate) fn analyse_routine_statement<'a>(
 /// operation branches, derived tables and subqueries resolve before it ever
 /// runs. `select` has its views and `WITH` queries expanded. `LATERAL`
 /// derived tables and `FROM`-less subqueries are analysed when they run.
+/// Constant folding errors wait for planning, as in PostgreSQL.
 pub(crate) fn analyse_select<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
@@ -9086,7 +9088,6 @@ pub(crate) fn analyse_select<'a>(
     check_select_types(select, &scope, storage, txid, arena, outer)?;
     // Unknown literals convert during analysis, before constants fold.
     check_key_types(select, &scope, arena, storage, txid)?;
-    check_select_constants(select, arena, storage, txid)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -9735,6 +9736,9 @@ pub(super) fn convert_literal<'a>(
     target: Option<ColType>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
+    if let Some(target) = target.filter(|target| super::type_inputs::builtin_input_type(*target)) {
+        super::type_inputs::note_literal_target(literal, target.oid());
+    }
     let Some(target) = target.filter(|target| {
         matches!(
             target,
@@ -13498,7 +13502,8 @@ pub(crate) fn first_aggregate<'a>(
 }
 
 /// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
-/// type and its constant inputs, as `PREPARE` checks them.
+/// type and its keys, as `PREPARE` checks them. Constant folding errors
+/// (`1/0`) wait for the planning of each execution.
 pub(crate) fn analyse_fromless_select<'a>(
     statement: &'a Select<'a>,
     storage: &'a Storage,
@@ -13519,8 +13524,7 @@ pub(crate) fn analyse_fromless_select<'a>(
     if let Some(condition) = statement.where_clause {
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
-    check_fromless_keys(statement, &columns, storage, txid, arena)?;
-    check_select_constants(statement, arena, storage, txid)
+    check_fromless_keys(statement, &columns, storage, txid, arena)
 }
 
 /// The ORDER BY and DISTINCT ON keys of a query without FROM: output

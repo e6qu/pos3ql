@@ -1122,6 +1122,7 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
     arena: &'arena Arena,
     params: &'params [Datum<'arena>],
     seq_session: &'sequence crate::sql::guc::SeqSession,
+    description: constraints::RowDescription,
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
@@ -8203,6 +8204,7 @@ fn handle_conflict<
     schema: &[ColType],
     values: &[Datum<'a>],
     on_conflict: &Option<super::ast::OnConflict<'a>>,
+    inserted: ColumnSet,
     alias: Option<&'a str>,
     arbiter: &Arbiter<'a>,
     checks: &ParsedChecks,
@@ -8474,6 +8476,12 @@ where
         let column = def.column_index(name).expect("validated above");
         updated_columns.insert(column);
     }
+    // PostgreSQL describes a failing row by the columns the INSERT and its
+    // ON CONFLICT DO UPDATE give values to.
+    let description = constraints::RowDescription::Write {
+        table: logical_table_index,
+        written: inserted | assigned_columns(oc.update.unwrap_or(&[]), logical_definition),
+    };
     let generated = parse_generated(def, arena, storage, txn.txid)?;
     if !fire_partition_row_triggers(
         storage,
@@ -8549,6 +8557,7 @@ where
             arena,
             params,
             seq_session,
+            description,
         },
     )?;
     if let Err(error) =
@@ -8562,7 +8571,7 @@ where
         }
         return Err(error);
     }
-    check_not_null(def, &new_values)?;
+    check_not_null(storage, txn.txid, def, &new_values, description)?;
     enforce_row_constraints(
         storage,
         table_index,
@@ -8576,6 +8585,7 @@ where
         arena,
         params,
         None,
+        description,
     )?;
     if !dml_row_available(storage, txn, conflict.selected, "updated")? {
         return Ok(ConflictOutcome::Skip);
@@ -16487,6 +16497,60 @@ pub fn revoke_privileges(
                         .restore_acl_pending(slot, prior)
                         .expect("transaction owns its object ACL undo");
                     return sql_fail(error);
+                }
+            }
+            // Revoking a table's privilege revokes it on every column too
+            // (PostgreSQL's `expand_all_col_privileges` when revoking).
+            let column_requested = crate::storage::PrivilegeSet(
+                requested.0
+                    & crate::storage::PrivilegeSet::SELECT
+                        .union(crate::storage::PrivilegeSet::INSERT)
+                        .union(crate::storage::PrivilegeSet::UPDATE)
+                        .union(crate::storage::PrivilegeSet::REFERENCES)
+                        .0,
+            );
+            if column_requested.0 != 0
+                && matches!(
+                    object.class,
+                    crate::storage::AccessClass::Table
+                        | crate::storage::AccessClass::View
+                        | crate::storage::AccessClass::MaterializedView
+                )
+            {
+                let target_count = storage.column_acl_targets(*object, txn.txid, targets);
+                for target in &targets[..target_count] {
+                    let (old_privileges, old_options) =
+                        storage.column_acl_from(*target, grantee, acl_grantor as u16, txn.txid);
+                    let new_privileges = if grant_option_only {
+                        old_privileges
+                    } else {
+                        old_privileges.without(column_requested)
+                    };
+                    let new_options = old_options.without(column_requested);
+                    if new_privileges == old_privileges && new_options == old_options {
+                        continue;
+                    }
+                    let (slot, prior) = match storage.change_column_acl(
+                        *target,
+                        grantee,
+                        acl_grantor as u16,
+                        new_privileges,
+                        new_options,
+                        txn.txid,
+                    ) {
+                        Ok(change) => change,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::ColumnAclChanged {
+                            slot: slot as u32,
+                            prior,
+                        },
+                    ) {
+                        storage.restore_column_acl_pending(slot, prior);
+                        return sql_fail(error);
+                    }
                 }
             }
             for specification in privileges
@@ -77496,6 +77560,7 @@ fn copy_row_in_frame<'a>(
         &checks,
         &generated_exprs,
         &mut values,
+        copy_columns(setup),
         arena,
     )
 }
@@ -77653,6 +77718,7 @@ fn copy_row_binary_in_frame<'a>(
         &checks,
         &generated_exprs,
         &mut values,
+        copy_columns(setup),
         arena,
     )
 }
@@ -77733,6 +77799,15 @@ fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
     clippy::too_many_arguments,
     reason = "COPY shares the bounded INSERT trigger and constraint context"
 )]
+/// The columns a COPY FROM gives values to, PostgreSQL's `insertedCols`.
+fn copy_columns(setup: &CopySetup) -> ColumnSet {
+    let mut columns = ColumnSet::EMPTY;
+    for column in &setup.targets[..setup.n_targets] {
+        columns.insert(*column);
+    }
+    columns
+}
+
 fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     frame: &crate::sql::error_context::CopyFrame<'_>,
     storage: &mut Storage,
@@ -77746,11 +77821,20 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     checks: &ParsedChecks<'a>,
     generated: &constraints::ParsedDefaults<'a>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
+    written: ColumnSet,
     arena: &'a Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let logical_table = logical_target.table();
+    let description = if txn.replication_apply {
+        constraints::RowDescription::Maintenance
+    } else {
+        constraints::RowDescription::Write {
+            table: logical_table,
+            written,
+        }
+    };
     partition_insert::with_partition_insert_row(
         storage,
         logical_target,
@@ -77806,7 +77890,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 &values[..physical.n_columns],
                 txn.txid,
             )?;
-            check_not_null(physical, values)?;
+            check_not_null(storage, txn.txid, physical, values, description)?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             physical.schema(&mut schema);
             let row = if physical.kind == crate::storage::TableKind::Foreign {
@@ -77827,6 +77911,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     seq_session,
                     coercion_txid,
                 )),
+                description,
             )?;
             if let Err(error) = constraints::enforce_row_keys(
                 storage,
@@ -78049,7 +78134,13 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 &values[..definition.n_columns],
                 txn.txid,
             )?;
-            check_not_null(definition, values)?;
+            check_not_null(
+                storage,
+                txn.txid,
+                definition,
+                values,
+                constraints::RowDescription::Maintenance,
+            )?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             definition.schema(&mut schema);
             let rowid = storage.next_rowid()?;
@@ -78066,6 +78157,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 arena,
                 &[],
                 None,
+                constraints::RowDescription::Maintenance,
             )?;
             store_row(
                 storage,
@@ -78653,7 +78745,13 @@ pub(crate) fn apply_replication_update(
         &new_values[..definition.n_columns],
         txn.txid,
     )?;
-    check_not_null(definition, &new_values)?;
+    check_not_null(
+        storage,
+        txn.txid,
+        definition,
+        &new_values,
+        constraints::RowDescription::Maintenance,
+    )?;
     enforce_row_constraints(
         storage,
         row_table,
@@ -78667,6 +78765,7 @@ pub(crate) fn apply_replication_update(
         arena,
         &[],
         None,
+        constraints::RowDescription::Maintenance,
     )?;
     row.available(storage, txn, "updated")?;
     store_row(
@@ -83196,6 +83295,7 @@ fn merge_target<'a>(
                                         insert_check,
                                         responder,
                                         insert_transitions.as_mut(),
+                                        update_columns | insert_columns,
                                     ) {
                                         Ok(Some(inserted)) => {
                                             if !statement.returning.is_empty() {
@@ -83946,7 +84046,17 @@ fn merge_target<'a>(
                                         Err(error) => return sql_fail(error),
                                     }
                                 }
-                                if let Err(error) = check_not_null(new_definition, &persisted) {
+                                let description = constraints::RowDescription::Write {
+                                    table: table_index,
+                                    written: update_columns | insert_columns,
+                                };
+                                if let Err(error) = check_not_null(
+                                    storage,
+                                    txn.txid,
+                                    new_definition,
+                                    &persisted,
+                                    description,
+                                ) {
                                     return sql_fail(error);
                                 }
                                 let stored_rowid =
@@ -83971,6 +84081,7 @@ fn merge_target<'a>(
                                         seq_session,
                                         coercion_txid,
                                     )),
+                                    description,
                                 ) {
                                     return sql_fail(error);
                                 }
@@ -84022,6 +84133,7 @@ fn merge_target<'a>(
                                         arena,
                                         params,
                                         seq_session,
+                                        description,
                                     },
                                 ) {
                                     return sql_fail(error);
@@ -84685,10 +84797,15 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
     row_security_check: Option<super::query::RowSecurityPlan<'a>>,
     responder: &mut Responder,
     transition_capture: Option<&mut TransitionCapture<'a>>,
+    written: ColumnSet,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let table_index = logical_target.table();
+    let description = constraints::RowDescription::Write {
+        table: table_index,
+        written,
+    };
     let (mut row, explicit) = merge_insert_values(
         def,
         columns,
@@ -84823,7 +84940,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     ));
                 }
             }
-            check_not_null(def, row_arr)?;
+            check_not_null(storage, txn.txid, def, row_arr, description)?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             def.schema(&mut schema);
             let row = if def.kind == crate::storage::TableKind::Foreign {
@@ -84848,6 +84965,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     seq_session,
                     coercion_txid,
                 )),
+                description,
             )?;
             if def.kind == crate::storage::TableKind::Foreign {
                 if crate::sql::foreign::insert_row(
@@ -84897,6 +85015,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                         arena,
                         params,
                         seq_session,
+                        description,
                     },
                 )?;
             }
@@ -85089,6 +85208,10 @@ where
             } else {
                 &values[..definition.n_columns]
             };
+            let description = constraints::RowDescription::Write {
+                table: logical_table_index,
+                written: inserted_columns(statement, logical_definition),
+            };
             if let Err(error) = enforce_view_check(
                 view_check,
                 logical_definition,
@@ -85099,11 +85222,12 @@ where
                     arena,
                     params,
                     seq_session,
+                    description,
                 },
             ) {
                 return Ok(Err(error));
             }
-            if let Err(error) = check_not_null(definition, values) {
+            if let Err(error) = check_not_null(storage, txn.txid, definition, values, description) {
                 return Ok(Err(error));
             }
             let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -85121,6 +85245,7 @@ where
                     &schema[..definition.n_columns],
                     &values[..definition.n_columns],
                     &statement.on_conflict,
+                    inserted_columns(statement, logical_definition),
                     statement.alias,
                     arbiter,
                     checks,
@@ -85227,6 +85352,7 @@ where
                     seq_session,
                     coercion_txid,
                 )),
+                description,
             ) {
                 return Ok(Err(error));
             }
@@ -86574,6 +86700,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                             arena,
                             params,
                             seq_session,
+                            // A view a trigger writes describes its whole row.
+                            description: constraints::RowDescription::Maintenance,
                         },
                     ) {
                         return sql_fail(error);
@@ -87058,6 +87186,8 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             arena,
             params,
             seq_session,
+            // A view a trigger writes describes its whole row.
+            description: constraints::RowDescription::Maintenance,
         },
     ) {
         return Ok(Err(error));
@@ -89795,6 +89925,17 @@ pub(crate) fn update<'a>(
         Ok(false) => (Some(&Expr::Bool(false)), false),
         Err(error) => return sql_fail(error),
     };
+    // Conjuncts that run among the security quals leave the condition.
+    let (selection_where, qualification_where) = match row_security.map(|plan| {
+        Ok::<_, SqlError>((
+            plan.residual(selection_where, arena)?,
+            plan.residual(statement.where_clause, arena)?,
+        ))
+    }) {
+        Some(Ok(conditions)) => conditions,
+        Some(Err(error)) => return sql_fail(error),
+        None => (selection_where, statement.where_clause),
+    };
     let selection_command = txn.command_id();
     let selection = if lazy {
         DmlSelection::Candidates
@@ -89936,7 +90077,7 @@ pub(crate) fn update<'a>(
         def,
         alias: statement.alias,
         from: statement.from,
-        where_clause: statement.where_clause,
+        where_clause: qualification_where,
         params,
         hooks: &hooks,
         row_security,
@@ -89963,7 +90104,7 @@ pub(crate) fn update<'a>(
         def,
         alias: statement.alias,
         from: statement.from,
-        where_clause: statement.where_clause,
+        where_clause: qualification_where,
         params,
         subs: &subs,
         row_security,
@@ -90578,6 +90719,10 @@ pub(crate) fn update<'a>(
                         Err(error) => return sql_fail(error),
                     }
                 }
+                let description = constraints::RowDescription::Write {
+                    table: table_index,
+                    written: assigned_columns(statement.assignments, def),
+                };
                 if let Err(error) = enforce_view_check(
                     view_check,
                     def,
@@ -90588,12 +90733,15 @@ pub(crate) fn update<'a>(
                         arena,
                         params,
                         seq_session,
+                        description,
                     },
                 ) {
                     return sql_fail(error);
                 }
                 let persisted = &persisted[..new_definition.n_columns];
-                if let Err(error) = check_not_null(new_definition, persisted) {
+                if let Err(error) =
+                    check_not_null(storage, txn.txid, new_definition, persisted, description)
+                {
                     return sql_fail(error);
                 }
                 if let Err(error) = constraints::enforce_row_checks(
@@ -90609,6 +90757,7 @@ pub(crate) fn update<'a>(
                         seq_session,
                         coercion_txid,
                     )),
+                    description,
                 ) {
                     return sql_fail(error);
                 }
@@ -91370,6 +91519,17 @@ pub(crate) fn delete<'a>(
         Ok(false) => (Some(&Expr::Bool(false)), false),
         Err(error) => return sql_fail(error),
     };
+    // Conjuncts that run among the security quals leave the condition.
+    let (selection_where, qualification_where) = match row_security.map(|plan| {
+        Ok::<_, SqlError>((
+            plan.residual(selection_where, arena)?,
+            plan.residual(statement.where_clause, arena)?,
+        ))
+    }) {
+        Some(Ok(conditions)) => conditions,
+        Some(Err(error)) => return sql_fail(error),
+        None => (selection_where, statement.where_clause),
+    };
     let selection_command = txn.command_id();
     let selection = if lazy {
         DmlSelection::Candidates
@@ -91507,7 +91667,7 @@ pub(crate) fn delete<'a>(
         def,
         alias: statement.alias,
         from: statement.using,
-        where_clause: statement.where_clause,
+        where_clause: qualification_where,
         params,
         hooks: &hooks,
         row_security,
@@ -91533,7 +91693,7 @@ pub(crate) fn delete<'a>(
         def,
         alias: statement.alias,
         from: statement.using,
-        where_clause: statement.where_clause,
+        where_clause: qualification_where,
         params,
         subs: &subs,
         row_security,
@@ -92555,7 +92715,13 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
                         values[index] = physical_values[source];
                     }
                     let values = &values[..new_def.n_columns];
-                    check_not_null(new_def, values)?;
+                    check_not_null(
+                        storage,
+                        txid,
+                        new_def,
+                        values,
+                        constraints::RowDescription::Maintenance,
+                    )?;
                     enforce_row_constraints(
                         storage,
                         candidate,
@@ -92572,6 +92738,7 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
                         arena,
                         &[],
                         None,
+                        constraints::RowDescription::Maintenance,
                     )
                 },
             )?;
@@ -95522,7 +95689,13 @@ fn alter_partition_attachment(
                                 child_def.name.as_str()
                             ));
                         }
-                        check_not_null(&parent_def, values)?;
+                        check_not_null(
+                            storage,
+                            txn.txid,
+                            &parent_def,
+                            values,
+                            constraints::RowDescription::Maintenance,
+                        )?;
                         enforce_row_constraints(
                             storage,
                             parent,
@@ -95539,6 +95712,7 @@ fn alter_partition_attachment(
                             arena,
                             &[],
                             None,
+                            constraints::RowDescription::Maintenance,
                         )
                     },
                 )
@@ -99389,6 +99563,7 @@ fn alter_table_relation(
                         seq_session,
                         coercion_txid,
                     )),
+                    constraints::RowDescription::Maintenance,
                 ) {
                     return sql_fail(e);
                 }
@@ -104405,16 +104580,75 @@ fn apply_numeric_typmod<'a>(
     Numeric::parse(rounded, arena)
 }
 
+/// The columns of `definition` an INSERT gives values to, PostgreSQL's
+/// `insertedCols`: those it names, or the leading ones its source fills.
+fn inserted_columns<Definition0: crate::storage::DefinitionBacking>(
+    statement: &Insert<'_>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+) -> ColumnSet {
+    let mut columns = ColumnSet::EMPTY;
+    if !statement.columns.is_empty() {
+        for name in statement.columns {
+            if let Some(column) = definition.column_index(name) {
+                columns.insert(column);
+            }
+        }
+        return columns;
+    }
+    let width = match (statement.rows.first(), statement.select) {
+        (Some(row), _) => row.len(),
+        // A `*` expands to columns this does not count; every column is
+        // then taken as written.
+        (None, Some(select))
+            if select.set_body.is_none()
+                && select
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, super::ast::SelectItem::Expr { .. })) =>
+        {
+            select.items.len()
+        }
+        _ => definition.n_columns,
+    };
+    for column in 0..width.min(definition.n_columns) {
+        columns.insert(column);
+    }
+    columns
+}
+
+/// The columns `assignments` set in `definition`, PostgreSQL's
+/// `updatedCols`.
+fn assigned_columns<Definition0: crate::storage::DefinitionBacking>(
+    assignments: &[(&str, &Expr<'_>)],
+    definition: &crate::storage::TableDefinition<Definition0>,
+) -> ColumnSet {
+    let mut columns = ColumnSet::EMPTY;
+    for (name, _) in assignments {
+        if let Some(column) = definition.column_index(name) {
+            columns.insert(column);
+        }
+    }
+    columns
+}
+
 fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     def: &crate::storage::TableDefinition<Definition0>,
     values: &[Datum],
+    description: constraints::RowDescription,
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
         if c.not_null.is_required() && values[i].is_null() {
-            let detail =
-                constraints::failing_row_detail(def.columns(), &values[..def.columns().len()])?;
+            let detail = constraints::failing_row_detail(
+                storage,
+                txid,
+                description,
+                def.columns(),
+                &values[..def.columns().len()],
+            )?;
             crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
+                detail.as_ref().map(constraints::DetailText::as_str),
                 crate::sql::eval::ErrorObjects::table_column(
                     def.schema.as_str(),
                     def.name.as_str(),
@@ -104894,11 +105128,14 @@ fn enforce_view_check<'a, Definition0: crate::storage::DefinitionBacking>(
             continue;
         }
         let detail = constraints::failing_row_detail(
+            check_context.storage,
+            check_context.txid,
+            check_context.description,
             definition.columns(),
             &values[..definition.columns().len()],
         )?;
         crate::sql::eval::stash_object_diagnostic(
-            Some(detail.as_str()),
+            detail.as_ref().map(constraints::DetailText::as_str),
             crate::sql::eval::ErrorObjects::default(),
         );
         return Err(sql_err!(

@@ -933,6 +933,8 @@ fn fire_trigger_merge_row<'a>(
                 arena,
                 params,
                 seq_session,
+                // A view a trigger writes describes its whole row.
+                description: super::constraints::RowDescription::Maintenance,
             },
         )?;
     }

@@ -655,3 +655,138 @@ fn join_conflict_and_merge_constants_fold_once() {
         }
     });
 }
+
+#[test]
+fn prepare_converts_each_literal_once() {
+    with_engine("notice-prepare-literals", |engine, budget| {
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        run_with(engine, budget, "CREATE TABLE pl (q tsquery, n int)");
+        // Parse analysis converts the cast, the inserted value and the
+        // compared literal at PREPARE; EXECUTE reads the converted values.
+        for (sql, tag) in [
+            ("SELECT ''::tsquery, int4 '7' + 1", "SELECT 1"),
+            ("INSERT INTO pl VALUES ('', 1)", "INSERT 0 1"),
+            ("SELECT q = '' FROM pl", "SELECT 2"),
+        ] {
+            assert_eq!(
+                messages(
+                    engine,
+                    budget,
+                    &format!("PREPARE p AS {sql}; EXECUTE p; EXECUTE p"),
+                ),
+                [empty, "PREPARE", tag, tag],
+                "{sql}"
+            );
+        }
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT * FROM pl WHERE n = 'q'",
+        );
+        assert!(
+            output[0].starts_with("ERROR 22P02 invalid input syntax for type integer: \"q\""),
+            "{output:?}"
+        );
+        // A length coercion and constant folding run when the statement is
+        // planned, at each EXECUTE.
+        let output = messages(
+            engine,
+            budget,
+            "PREPARE p AS SELECT '123.45'::numeric(3,1); EXECUTE p",
+        );
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22003 numeric field overflow"),
+            "{output:?}"
+        );
+        let output = messages(engine, budget, "PREPARE p AS SELECT 1/0; EXECUTE p");
+        assert_eq!(output[0], "PREPARE");
+        assert!(
+            output[1].starts_with("ERROR 22012 division by zero"),
+            "{output:?}"
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "PREPARE p AS SELECT 'abcd'::varchar(2); EXECUTE p",
+        );
+        assert_eq!(data_rows(&output), ["ab"]);
+    });
+}
+
+#[test]
+fn leakproof_conditions_run_at_the_first_security_level() {
+    with_engine("notice-row-security-levels", |engine, budget| {
+        for sql in [
+            "CREATE ROLE lsr",
+            "CREATE TABLE ls (a int, b int)",
+            "INSERT INTO ls VALUES (1, 1)",
+            "GRANT SELECT, UPDATE ON ls TO lsr",
+            "ALTER TABLE ls ENABLE ROW LEVEL SECURITY",
+            "CREATE FUNCTION ls_rp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'restrictive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_pp(int) RETURNS bool LANGUAGE plpgsql COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'permissive %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lp(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 1 AS \
+             $$ BEGIN RAISE NOTICE 'leakproof %', $1; RETURN true; END $$",
+            "CREATE FUNCTION ls_lq(int) RETURNS bool LANGUAGE plpgsql LEAKPROOF COST 0.5 AS \
+             $$ BEGIN RAISE NOTICE 'cheap %', $1; RETURN true; END $$",
+            "CREATE POLICY ls_r ON ls AS RESTRICTIVE USING (ls_rp(a))",
+            "CREATE POLICY ls_p ON ls USING (ls_pp(a))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The cheaper leakproof condition runs first, the other right after
+        // the first security qual; each runs once.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 cheap 1",
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+            ]
+        );
+        // A write's WITH CHECK options test the permissive policies first.
+        let output = messages(
+            engine,
+            budget,
+            "SET ROLE lsr; UPDATE ls SET a = a WHERE ls_lp(b); RESET ROLE",
+        );
+        let notices: Vec<_> = output
+            .iter()
+            .filter(|line| line.starts_with("NOTICE"))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "NOTICE 00000 restrictive 1",
+                "NOTICE 00000 leakproof 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 permissive 1",
+                "NOTICE 00000 restrictive 1",
+            ]
+        );
+        let output = run_with(
+            engine,
+            budget,
+            "SET ROLE lsr; EXPLAIN (COSTS OFF) SELECT a FROM ls WHERE ls_lp(b) AND ls_lq(b); RESET ROLE",
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "Seq Scan on ls",
+                "  Filter: (ls_lq(b) AND ls_rp(a) AND ls_lp(b) AND ls_pp(a))",
+            ]
+        );
+    });
+}

@@ -11035,6 +11035,166 @@ impl Engine {
         Ok(types)
     }
 
+    /// Converts each literal a prepared statement casts to a built-in type,
+    /// or that its analysis converts to one, and encodes them with the
+    /// statement's array domain inputs `bound` as its session input map.
+    fn bind_prepared_literals<'a>(
+        &self,
+        sql: &str,
+        bound: &[type_inputs::Binding<'a>],
+        candidates: &[type_inputs::Candidate<'a>],
+        targets: &type_inputs::LiteralTargets<'a>,
+        arena: &'a Arena,
+        txid: u32,
+    ) -> Result<&'a [u8], SqlError> {
+        let catalog = query::storage_catalog(&self.storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..NO_HOOKS
+        };
+        let empty = type_inputs::Binding {
+            kind: type_inputs::InputKind::ExplicitCast,
+            start: 0,
+            end: 0,
+            type_oid: 0,
+            type_mod: -1,
+            collation: None,
+            encoded: &[],
+        };
+        let capacity = bound
+            .len()
+            .checked_add(candidates.len())
+            .and_then(|count| count.checked_add(targets.literals.len()))
+            .ok_or_else(eval::arena_full)?;
+        let bindings = arena
+            .alloc_slice_with(capacity, |_| empty)
+            .map_err(|_| eval::arena_full())?;
+        bindings[..bound.len()].copy_from_slice(bound);
+        let mut count = bound.len();
+        let cast_operand = |literal: &ast::Expr<'_>| {
+            candidates.iter().any(|candidate| {
+                matches!(candidate.expression, ast::Expr::Cast { operand, .. }
+                    if core::ptr::eq(*operand, literal))
+            })
+        };
+        // Converted in source order, as parse analysis meets them: casts
+        // first, then the literals analysis converts.
+        let work = arena
+            .alloc_slice_with(candidates.len() + targets.literals.len(), |index| {
+                if index < candidates.len() {
+                    (candidates[index].start, false, index)
+                } else {
+                    let literal = index - candidates.len();
+                    (targets.literals[literal].1.start, true, literal)
+                }
+            })
+            .map_err(|_| eval::arena_full())?;
+        work.sort_unstable();
+        for &(_, implicit, index) in work.iter() {
+            if !implicit {
+                let candidate = candidates[index];
+                if candidate.kind != type_inputs::InputKind::ExplicitCast
+                    || bound.iter().any(|binding| {
+                        (binding.start, binding.end, binding.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                {
+                    continue;
+                }
+                let type_inputs::CandidateTarget::TypeName(name) = candidate.target else {
+                    continue;
+                };
+                let Some(type_oid) = type_inputs::prepared_target_oid(&self.storage, txid, name)
+                else {
+                    continue;
+                };
+                let ast::Expr::Cast {
+                    operand: ast::Expr::Str(text),
+                    ..
+                } = candidate.expression
+                else {
+                    continue;
+                };
+                if !type_inputs::is_builtin_oid(type_oid) {
+                    continue;
+                }
+                // PostgreSQL passes the modifier to `interval` input only;
+                // the cast's length coercion runs at execution.
+                let mut cast = *candidate.expression;
+                if type_oid != types::oid::INTERVAL
+                    && let ast::Expr::Cast { type_mod, .. } = &mut cast
+                {
+                    *type_mod = -1;
+                }
+                let value = eval::eval_full(&cast, arena, &[], &NoColumns, &hooks)
+                    .map_err(|error| error_position::at_subject(error, text))?;
+                bindings[count] = type_inputs::Binding {
+                    kind: candidate.kind,
+                    start: candidate.start,
+                    end: candidate.end,
+                    type_oid,
+                    type_mod: candidate.type_mod,
+                    collation: None,
+                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                };
+                count += 1;
+            } else {
+                let (expression, source) = targets.literals[index];
+                let type_inputs::LiteralTarget::Type(type_oid) = targets.targets[index].get()
+                else {
+                    continue;
+                };
+                let ast::Expr::Str(text) = expression else {
+                    continue;
+                };
+                if cast_operand(expression)
+                    || bound.iter().any(|binding| {
+                        binding.kind == type_inputs::InputKind::ImplicitLiteral
+                            && (binding.start, binding.end) == (source.start, source.end)
+                    })
+                {
+                    continue;
+                }
+                let Some(target) = types::ColType::from_oid(type_oid) else {
+                    continue;
+                };
+                let value =
+                    catalog::convert_literal_input(&self.storage, txid, text, target, arena)
+                        .map_err(|error| error_position::at_subject(error, text))?;
+                let Some(value) = value else {
+                    continue;
+                };
+                bindings[count] = type_inputs::Binding {
+                    kind: type_inputs::InputKind::ImplicitLiteral,
+                    start: source.start,
+                    end: source.end,
+                    type_oid,
+                    type_mod: -1,
+                    collation: None,
+                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                };
+                count += 1;
+            }
+        }
+        let bindings = &mut bindings[..count];
+        if bindings.is_empty() {
+            return Ok(&[]);
+        }
+        bindings.sort_unstable_by_key(|binding| (binding.start, binding.end, binding.kind));
+        let bytes = arena
+            .alloc_slice_with(type_inputs::session_encoded_len(bindings)?, |_| 0u8)
+            .map_err(|_| eval::arena_full())?;
+        type_inputs::encode_session_into(bindings, bytes)?;
+        // EXECUTE must restore every converted literal from this map.
+        let mut restored = Parser::new(sql, arena).map_err(|error| parse_error_to_sql(&error))?;
+        restored.set_type_inputs(bindings);
+        restored
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?;
+        type_inputs::validate_prepared(&restored, &self.storage, txid)?;
+        Ok(bytes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_prepare_statement(
         &mut self,
@@ -11160,24 +11320,16 @@ impl Engine {
             Ok(bindings) => bindings,
             Err(error) => return Ok(Err(error)),
         };
-        let bound_inputs = match (|| -> Result<&[u8], SqlError> {
-            if bindings.is_empty() {
-                return Ok(&[]);
-            }
-            let bytes = arena
-                .alloc_slice_with(type_inputs::encoded_len(bindings)?, |_| 0u8)
-                .map_err(|_| eval::arena_full())?;
-            type_inputs::encode_into(bindings, bytes)?;
-            Ok(bytes)
-        })() {
-            Ok(bytes) => bytes,
-            Err(error) => return Ok(Err(error)),
-        };
-        let (statement, source_copies) = if bindings.is_empty() {
+        let (statement, source_copies, literals, candidates) = if bindings.is_empty() {
             if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
                 return Ok(Err(error));
             }
-            (statement, parser.source_copies())
+            (
+                statement,
+                parser.source_copies(),
+                parser.string_literals(),
+                parser.type_input_candidates(),
+            )
         } else {
             let mut restored = match Parser::new(sql, arena) {
                 Ok(parser) => parser,
@@ -11194,7 +11346,12 @@ impl Engine {
                     {
                         return Ok(Err(error));
                     }
-                    (statement, restored.source_copies())
+                    (
+                        statement,
+                        restored.source_copies(),
+                        restored.string_literals(),
+                        restored.type_input_candidates(),
+                    )
                 }
                 Ok(None) => {
                     return Ok(Err(sql_err!(
@@ -11250,81 +11407,113 @@ impl Engine {
         // `pg_prepared_statements` lists result types as the query produces
         // them, keeping domains that the wire description reduces to base types.
         let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let literal_targets =
+            match arena.alloc_slice_with(literals.len(), |_| type_inputs::LiteralTarget::Unseen) {
+                Ok(targets) => core::cell::Cell::from_mut(targets).as_slice_of_cells(),
+                Err(_) => return Ok(Err(eval::arena_full())),
+            };
+        let literal_targets = type_inputs::LiteralTargets {
+            literals,
+            targets: literal_targets,
+        };
         // The query's analysis errors are positioned in the PREPARE text.
-        let described = exec::with_bound_parameter_types(parameter_oids, || {
-            crate::sql::error_position::with_analysis_of_parsed(sql, Some(source_copies), || {
-                type_inputs::with_source(
-                    type_inputs::Source::RootCommand { statement: 0 },
+        let described = type_inputs::record_literal_targets(&literal_targets, || {
+            exec::with_bound_parameter_types(parameter_oids, || {
+                crate::sql::error_position::with_analysis_of_parsed(
                     sql,
-                    bindings,
-                    || match statement {
-                        Stmt::Select(select) => query::expand_ctes(
-                            select,
-                            &self.storage,
-                            txn.txid,
-                            arena,
+                    Some(source_copies),
+                    || {
+                        type_inputs::with_source(
+                            type_inputs::Source::RootCommand { statement: 0 },
+                            sql,
+                            bindings,
+                            || match statement {
+                                Stmt::Select(select) => {
+                                    query::expand_ctes(select, &self.storage, txn.txid, arena)
+                                        .and_then(|select| {
+                                            let count = query::describe_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                                &mut result_columns,
+                                                crate::sql::exec::DescriptionTarget::Sql,
+                                                None,
+                                            )?;
+                                            query::analyse_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                                None,
+                                            )?;
+                                            query::analyse_fromless_select(
+                                                select,
+                                                &self.storage,
+                                                txn.txid,
+                                                arena,
+                                            )?;
+                                            Ok(count)
+                                        })
+                                }
+                                Stmt::SetQuery(query) => query::describe_set_query(
+                                    &self.storage,
+                                    txn.txid,
+                                    query,
+                                    &mut result_columns,
+                                    arena,
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                )
+                                .and_then(|count| {
+                                    query::analyse_set_query(
+                                        query,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                    )?;
+                                    Ok(count)
+                                }),
+                                Stmt::With { statement, .. } => self
+                                    .describe_data_modification_columns(
+                                        statement,
+                                        arena,
+                                        txn,
+                                        &mut result_columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    ),
+                                Stmt::Insert(_)
+                                | Stmt::Update(_)
+                                | Stmt::Delete(_)
+                                | Stmt::Merge(_) => {
+                                    let count = self.describe_data_modification_columns(
+                                        statement,
+                                        arena,
+                                        txn,
+                                        &mut result_columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    )?;
+                                    query::analyse_dml_condition(
+                                        statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                        None,
+                                    )?;
+                                    query::validate_dml_assignment_casts(
+                                        statement,
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                        None,
+                                    )?;
+                                    Ok(count)
+                                }
+                                _ => Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "utility statements cannot be prepared"
+                                )),
+                            },
                         )
-                        .and_then(|select| {
-                            let count = query::describe_select(
-                                select,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Sql,
-                                None,
-                            )?;
-                            query::analyse_select(select, &self.storage, txn.txid, arena, None)?;
-                            query::analyse_fromless_select(select, &self.storage, txn.txid, arena)?;
-                            Ok(count)
-                        }),
-                        Stmt::SetQuery(query) => query::describe_set_query(
-                            &self.storage,
-                            txn.txid,
-                            query,
-                            &mut result_columns,
-                            arena,
-                            crate::sql::exec::DescriptionTarget::Sql,
-                        )
-                        .and_then(|count| {
-                            query::analyse_set_query(query, &self.storage, txn.txid, arena)?;
-                            Ok(count)
-                        }),
-                        Stmt::With { statement, .. } => self.describe_data_modification_columns(
-                            statement,
-                            arena,
-                            txn,
-                            &mut result_columns,
-                            crate::sql::exec::DescriptionTarget::Sql,
-                        ),
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                            let count = self.describe_data_modification_columns(
-                                statement,
-                                arena,
-                                txn,
-                                &mut result_columns,
-                                crate::sql::exec::DescriptionTarget::Sql,
-                            )?;
-                            query::analyse_dml_condition(
-                                statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                None,
-                            )?;
-                            query::validate_dml_assignment_casts(
-                                statement,
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                None,
-                            )?;
-                            Ok(count)
-                        }
-                        _ => Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "utility statements cannot be prepared"
-                        )),
                     },
                 )
             })
@@ -11333,6 +11522,23 @@ impl Engine {
             Ok(count) => count,
             Err(error) => return Ok(Err(error)),
         };
+        // PostgreSQL's parse analysis converts each literal once, raising its
+        // input function's notices and errors at PREPARE; EXECUTE reads the
+        // converted values.
+        let bound_inputs =
+            match error_position::with_analysis_of_parsed(sql, Some(source_copies), || {
+                self.bind_prepared_literals(
+                    sql,
+                    bindings,
+                    candidates,
+                    &literal_targets,
+                    arena,
+                    txn.txid,
+                )
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Ok(Err(error)),
+            };
         let mut result_types = [0i32; MAX_PROJ];
         for (target, column) in result_types.iter_mut().zip(&result_columns[..result_count]) {
             *target = column.type_oid;
@@ -22313,7 +22519,7 @@ impl Engine {
             })?)
             .map_err(|_| eval::arena_full())?;
         let mut parser = Parser::new(text, arena).map_err(|error| parse_error_to_sql(&error))?;
-        parser.set_type_inputs(type_inputs::decode(inputs, arena)?);
+        parser.set_type_inputs(type_inputs::decode_session(inputs, arena)?);
         let statement = parser
             .next_stmt()
             .map_err(|error| parse_error_to_sql(&error))?
@@ -22328,7 +22534,7 @@ impl Engine {
                 "prepared statement must contain exactly one statement"
             ));
         }
-        type_inputs::validate_restored(&parser, &self.storage, txid)?;
+        type_inputs::validate_prepared(&parser, &self.storage, txid)?;
         arena
             .alloc(statement)
             .map(|statement| &*statement)
@@ -25712,7 +25918,7 @@ impl Engine {
                         }));
                     }
                 };
-                let source_bindings = match type_inputs::decode(bound_inputs, arena) {
+                let source_bindings = match type_inputs::decode_session(bound_inputs, arena) {
                     Ok(bindings) => bindings,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -25728,7 +25934,7 @@ impl Engine {
                         || match inner.next_stmt() {
                             Ok(Some(statement)) => {
                                 if let Err(error) =
-                                    type_inputs::validate_restored(&inner, &self.storage, txn.txid)
+                                    type_inputs::validate_prepared(&inner, &self.storage, txn.txid)
                                 {
                                     return Ok(Err(error));
                                 }

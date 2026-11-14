@@ -24,7 +24,8 @@ use super::{RowCtx, check_not_null};
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
 const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
 
-type DetailText = crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
+pub(crate) type DetailText =
+    crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
 
 fn detail_full() -> SqlError {
     sql_err!(
@@ -75,20 +76,101 @@ fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
     }
 }
 
+/// Whose row a NOT NULL, CHECK or view check option violation describes.
+#[derive(Clone, Copy)]
+pub(crate) enum RowDescription {
+    /// A row the current user's statement writes to the table in slot
+    /// `table`, giving values to the `written` columns.
+    Write {
+        table: usize,
+        written: crate::storage::ColumnSet,
+    },
+    /// A row a maintenance command rewrites or a subscription applies,
+    /// described in full.
+    Maintenance,
+}
+
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
-/// violates a NOT NULL or CHECK constraint. A virtual generated column,
-/// which the row does not hold in PostgreSQL, reads `virtual`.
+/// violates a NOT NULL or CHECK constraint (`ExecBuildSlotValueDescription`).
+/// A write's row shows nothing while row security applies to the user;
+/// without `SELECT` on the table it shows only the columns the user may read
+/// or the statement wrote, named (`(a, c) = (1, 3)`), and nothing when there
+/// are none. A virtual generated column, which the row does not hold in
+/// PostgreSQL, reads `virtual`.
 pub(crate) fn failing_row_detail(
+    storage: &Storage,
+    txid: u32,
+    description: RowDescription,
     columns: &[crate::storage::ColumnMeta],
     values: &[Datum<'_>],
-) -> Result<DetailText, SqlError> {
+) -> Result<Option<DetailText>, SqlError> {
     use core::fmt::Write;
+    let mut shown = crate::storage::ColumnSet::all(values.len());
+    let mut named = false;
+    if let RowDescription::Write { table, written } = description {
+        let Some(role) = storage.current_role_slot(txid) else {
+            return Ok(None);
+        };
+        if storage.row_security_applies(table, role, txid) {
+            return Ok(None);
+        }
+        let object = storage.table_access_object(table, txid);
+        let select = crate::storage::PrivilegeSet::SELECT;
+        if !storage.has_object_privilege(object, role, select, txid) {
+            named = true;
+            shown = crate::storage::ColumnSet::EMPTY;
+            // The row may be a partition's, whose columns match the written
+            // table's by name.
+            let target = storage.table_def(table, txid);
+            for (column, meta) in columns.iter().enumerate().take(values.len()) {
+                let Some(logical) = target
+                    .columns()
+                    .iter()
+                    .position(|candidate| candidate.name == meta.name)
+                else {
+                    continue;
+                };
+                let readable = written.contains(logical)
+                    || u16::try_from(logical).is_ok_and(|logical| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, logical).is_ok_and(
+                            |target| storage.has_column_privilege(target, role, select, txid),
+                        )
+                    });
+                if readable {
+                    shown.insert(column);
+                }
+            }
+            if !(0..values.len()).any(|column| shown.contains(column)) {
+                return Ok(None);
+            }
+        }
+    }
     let mut detail = DetailText::new();
-    let _ = detail.write_str("Failing row contains (");
+    let _ = detail.write_str("Failing row contains ");
+    if named {
+        let _ = detail.write_char('(');
+        let mut first = true;
+        for (index, column) in columns.iter().enumerate().take(values.len()) {
+            if shown.contains(index) {
+                if !first {
+                    let _ = detail.write_str(", ");
+                }
+                first = false;
+                let _ = detail.write_str(column.name.as_str());
+            }
+        }
+        let _ = detail.write_str(") = ");
+    }
+    let _ = detail.write_char('(');
+    let mut first = true;
     for (index, value) in values.iter().enumerate() {
-        if index > 0 {
+        if !shown.contains(index) {
+            continue;
+        }
+        if !first {
             let _ = detail.write_str(", ");
         }
+        first = false;
         if columns
             .get(index)
             .is_some_and(|column| column.default.is_virtual())
@@ -102,7 +184,7 @@ pub(crate) fn failing_row_detail(
     if detail.is_truncated() {
         return Err(detail_full());
     }
-    Ok(detail)
+    Ok(Some(detail))
 }
 
 /// `Key (a, b)=(1, 2)`, PostgreSQL's description of an index key
@@ -2890,8 +2972,19 @@ pub(crate) fn enforce_row_constraints(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
-    enforce_row_checks(storage, def, values, txid, checks, arena, params, sequences)?;
+    enforce_row_checks(
+        storage,
+        def,
+        values,
+        txid,
+        checks,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     enforce_row_keys(
         storage,
         table_index,
@@ -2918,9 +3011,20 @@ pub(crate) fn enforce_row_checks(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_row_checks(
+        storage,
+        def,
+        checks,
+        values,
+        txid,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     check_domain_constraints(storage, def, values, txid, arena, params, sequences)
 }
 
@@ -3015,11 +3119,22 @@ pub(crate) fn check_row_content(
     txid: u32,
     read: ValidationRead,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
-    check_not_null(def, values)?;
+    check_not_null(storage, txid, def, values, description)?;
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_row_checks(
+        storage,
+        def,
+        checks,
+        values,
+        txid,
+        arena,
+        params,
+        sequences,
+        description,
+    )?;
     check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_fk_child(storage, def, values, txid, read, arena)?;
     Ok(())
@@ -3062,6 +3177,7 @@ fn check_row_checks(
     arena: &Arena,
     params: &[Datum],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    description: RowDescription,
 ) -> Result<(), SqlError> {
     let context = RowCtx {
         table_oid: None,
@@ -3086,9 +3202,15 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
-            let detail = failing_row_detail(def.columns(), &values[..def.columns().len()])?;
+            let detail = failing_row_detail(
+                storage,
+                txid,
+                description,
+                def.columns(),
+                &values[..def.columns().len()],
+            )?;
             crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
+                detail.as_ref().map(DetailText::as_str),
                 crate::sql::eval::ErrorObjects::table_constraint(
                     def.schema.as_str(),
                     def.name.as_str(),

@@ -4973,50 +4973,52 @@ pub(crate) fn validate_literal_input(
     }) else {
         return Ok(());
     };
-    let builtin = (1..FIRST_USER_OID).contains(&target.oid())
-        && !matches!(
-            target,
-            ColType::Pseudo(_)
-                | ColType::Record
-                | ColType::Void
-                | ColType::Internal
-                | ColType::AnyArray
-                | ColType::PgDdlCommand
-        );
-    if !builtin {
+    if !super::type_inputs::builtin_input_type(target) {
         return Ok(());
+    }
+    if target.oid() == target_oid {
+        super::type_inputs::note_literal_target(text, target_oid);
     }
     // A probe: the evaluation that converts the literal raises its notices.
     super::eval::probe_constants(|| {
         arena
             .with_remaining_region(|scratch| {
-                let value = Datum::Text(text);
-                match target {
-                    ColType::Array(element) if element.is_catalog_reference() => {
-                        let catalog = super::query::storage_catalog(storage, scratch, txid);
-                        super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
-                    }
-                    ColType::Regtype => {
-                        let catalog = super::query::storage_catalog(storage, scratch, txid);
-                        super::eval::regtype_cast(value, Some(&catalog), scratch)?;
-                    }
-                    target if target.is_reg_object() => {
-                        let catalog = super::query::storage_catalog(storage, scratch, txid);
-                        super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
-                    }
-                    // An input the analysis cannot run here is reported by the
-                    // evaluation that converts the literal.
-                    target => match super::eval::cast_to(value, target, scratch) {
-                        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
-                        result => {
-                            result?;
-                        }
-                    },
-                }
-                Ok(())
+                convert_literal_input(storage, txid, text, target, scratch).map(|_| ())
             })
             .map_err(|_| super::query::arena_full_pub())?
     })
+}
+
+/// Runs the built-in `target`'s input function on the literal `text`, as
+/// PostgreSQL's parse analysis converts an UNKNOWN literal. `None` is an input
+/// the analysis cannot run, which the evaluation converting the literal
+/// reports.
+pub(crate) fn convert_literal_input<'a>(
+    storage: &Storage,
+    txid: u32,
+    text: &'a str,
+    target: ColType,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let value = Datum::Text(text);
+    match target {
+        ColType::Array(element) if element.is_catalog_reference() => {
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            super::eval::reg_array_cast(value, element, Some(&catalog), arena).map(Some)
+        }
+        ColType::Regtype => {
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            super::eval::regtype_cast(value, Some(&catalog), arena).map(Some)
+        }
+        target if target.is_reg_object() => {
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            super::eval::regobject_cast(value, target, Some(&catalog), arena).map(Some)
+        }
+        target => match super::eval::cast_to(value, target, arena) {
+            Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => Ok(None),
+            result => result.map(Some),
+        },
+    }
 }
 
 /// Runs [`validate_literal_input`] for each UNKNOWN literal a selected

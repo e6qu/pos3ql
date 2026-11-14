@@ -151,6 +151,10 @@ pub(crate) struct RowSecurityPlan<'a> {
     /// The statement's own conditions that run before the first policy
     /// condition (see [`lead_row_security`]).
     leading: Option<&'a Expr<'a>>,
+    /// Those that run right after it.
+    after_first: Option<&'a Expr<'a>>,
+    /// A WITH CHECK plan, which tests the permissive conditions first.
+    permissive_first: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -265,6 +269,8 @@ pub(crate) fn plan_row_security<'a>(
         groups: 1,
         permissive_always: [permissive_always, false],
         leading: None,
+        after_first: None,
+        permissive_first: matches!(expression_kind, RowSecurityExpression::WithCheck),
     }))
 }
 
@@ -272,8 +278,8 @@ pub(crate) fn plan_row_security<'a>(
 /// security qual (each restrictive policy, then the OR of the permissive
 /// ones) has its own security level below the statement's conditions, which
 /// run after them, but a statement condition that is leakproof and cheaper
-/// than ten operators drops to level zero and runs first when it costs less
-/// than the first security qual. `condition`'s conjuncts are already in
+/// than ten operators drops to level zero, the first security qual's: it
+/// runs before that qual when it costs less, and right after it otherwise. `condition`'s conjuncts are already in
 /// cost order and `columns` types the relation's columns; a conjunct that
 /// reads anything else stays behind the policies.
 pub(crate) fn lead_row_security<'a>(
@@ -308,13 +314,14 @@ pub(crate) fn lead_row_security<'a>(
         return Ok(Some(plan));
     }
     let mut leading: Option<&'a Expr<'a>> = None;
+    let mut after_first: Option<&'a Expr<'a>> = None;
     for &conjunct in &conjuncts[..count] {
         if conjunct.contains_subquery() {
             continue;
         }
         let conjunct_cost = cost(conjunct);
         // Ten times `cpu_operator_cost`, in the cost model's half-operator units.
-        if conjunct_cost >= 20.0 || conjunct_cost >= first {
+        if conjunct_cost >= 20.0 {
             continue;
         }
         let Ok(properties) = super::predicate_safety::expression_properties(
@@ -327,10 +334,18 @@ pub(crate) fn lead_row_security<'a>(
         ) else {
             continue;
         };
-        if properties.leaks_columns || properties.volatile {
+        // `order_qual_clauses` weighs leakproofness and cost, not volatility.
+        if properties.leaks_columns {
             continue;
         }
-        leading = Some(match leading {
+        // A stable sort by cost within level zero keeps the first security
+        // qual ahead of a conjunct that costs as much.
+        let group = if conjunct_cost < first {
+            &mut leading
+        } else {
+            &mut after_first
+        };
+        *group = Some(match *group {
             None => conjunct,
             Some(left) => arena
                 .alloc(Expr::Binary {
@@ -344,10 +359,123 @@ pub(crate) fn lead_row_security<'a>(
         });
     }
     plan.leading = leading;
+    plan.after_first = after_first;
     Ok(Some(plan))
 }
 
+/// Whether `conjunct`, a statement condition over the relation `columns`
+/// types, runs at the first security qual's level: leakproof, without a
+/// subquery, and cheaper than ten operators (see [`lead_row_security`]).
+pub(crate) fn leakproof_at_first_security_level(
+    conjunct: &Expr<'_>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> bool {
+    !conjunct.contains_subquery()
+        && super::plan::qual_cost(conjunct, columns, storage, txid, arena) < 20.0
+        && super::predicate_safety::expression_properties(
+            conjunct,
+            columns,
+            storage,
+            txid,
+            super::predicate_safety::AnalysisStage::ViewPushdown,
+            arena,
+        )
+        .is_ok_and(|properties| !properties.leaks_columns)
+}
+
 impl<'a> RowSecurityPlan<'a> {
+    /// `condition` without the conjuncts [`lead_row_security`] moved among
+    /// the security quals, which run there once per row.
+    pub(crate) fn residual(
+        self,
+        condition: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a Expr<'a>>, SqlError> {
+        let Some(condition) = condition else {
+            return Ok(None);
+        };
+        if self.leading.is_none() && self.after_first.is_none() {
+            return Ok(Some(condition));
+        }
+        let mut moved = [condition; super::plan::MAX_CONJUNCTS];
+        let mut moved_count = 0;
+        for group in [self.leading, self.after_first].into_iter().flatten() {
+            if !super::plan::flatten_and(group, &mut moved, &mut moved_count) {
+                return Ok(Some(condition));
+            }
+        }
+        let mut conjuncts = [condition; super::plan::MAX_CONJUNCTS];
+        let mut count = 0;
+        if !super::plan::flatten_and(condition, &mut conjuncts, &mut count) {
+            return Ok(Some(condition));
+        }
+        let mut residual: Option<&'a Expr<'a>> = None;
+        for &conjunct in &conjuncts[..count] {
+            if moved[..moved_count]
+                .iter()
+                .any(|held| core::ptr::eq(*held, conjunct))
+            {
+                continue;
+            }
+            residual = Some(match residual {
+                None => conjunct,
+                Some(left) => arena
+                    .alloc(Expr::Binary {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        operator: crate::sql::ast::BinaryOp::And,
+                        left,
+                        right: conjunct,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?,
+            });
+        }
+        Ok(residual)
+    }
+
+    /// The first group's security quals as the planner lists them: each
+    /// restrictive condition, then the OR of the permissive ones (none when
+    /// one of them always passes, `false` when there are none).
+    pub(crate) fn security_quals(self, arena: &'a Arena) -> Result<&'a [&'a Expr<'a>], SqlError> {
+        let group = self.predicates[0];
+        let restrictive = group.iter().filter(|predicate| !predicate.permissive);
+        let mut permissive = None::<&'a Expr<'a>>;
+        let mut any_permissive = false;
+        for predicate in group.iter().filter(|predicate| predicate.permissive) {
+            any_permissive = true;
+            permissive = Some(match permissive {
+                None => predicate.expression,
+                Some(left) => arena
+                    .alloc(Expr::Binary {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        operator: crate::sql::ast::BinaryOp::Or,
+                        left,
+                        right: predicate.expression,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?,
+            });
+        }
+        let last = if self.permissive_always[0] {
+            None
+        } else if any_permissive {
+            permissive
+        } else {
+            Some(&Expr::Bool(false))
+        };
+        let count = restrictive.clone().count() + usize::from(last.is_some());
+        let mut items = restrictive
+            .map(|predicate| predicate.expression)
+            .chain(last);
+        arena
+            .alloc_slice_with(count, |_| items.next().expect("counted security quals"))
+            .map(|quals| &*quals)
+            .map_err(|_| arena_full())
+    }
+
     /// Whether any policy condition of the plan satisfies `test`.
     pub(crate) fn any_predicate(self, test: impl Fn(&Expr<'a>) -> bool) -> bool {
         self.predicates[..usize::from(self.groups)]
@@ -410,8 +538,8 @@ pub(crate) fn row_security_passes<'a>(
     })?;
     let mark = arena.mark();
     let result = (|| {
-        // A leakproof statement condition evaluated again later cannot be
-        // observed, so it stays in the statement's condition too.
+        // The statement's condition no longer holds these conjuncts (see
+        // [`RowSecurityPlan::residual`]).
         if let Some(leading) = plan.leading
             && !super::plan::conjunct_passes(leading, arena, params, row, base_hooks)?
         {
@@ -463,39 +591,61 @@ pub(crate) fn row_security_passes<'a>(
         // SELECT policies of a write that reads its target) skips a qual an
         // earlier group already holds (`list_append_unique`).
         let groups = &plan.predicates[..usize::from(plan.groups)];
+        // The conditions that run right after the first security qual.
+        let mut after_first = plan.after_first;
+        let mut after_qual = || -> Result<bool, SqlError> {
+            match after_first.take() {
+                Some(condition) => {
+                    super::plan::conjunct_passes(condition, arena, params, row, base_hooks)
+                }
+                None => Ok(true),
+            }
+        };
         for (group, predicates) in groups.iter().enumerate() {
             let earlier = &groups[..group];
             let permissive = || predicates.iter().filter(|predicate| predicate.permissive);
             if permissive().next().is_none() && !plan.permissive_always[group] {
                 return Ok(false);
             }
-            for predicate in predicates.iter().filter(|predicate| !predicate.permissive) {
-                let repeated = earlier
-                    .iter()
-                    .flat_map(|group| group.iter())
-                    .any(|held| !held.permissive && held.expression == predicate.expression);
-                if !repeated && !passes(predicate)? {
+            // A write's WITH CHECK options test the OR of the permissive
+            // conditions before each restrictive one, as PostgreSQL's
+            // `add_with_check_options` lists them.
+            let phases = if plan.permissive_first {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            for permissive_phase in phases {
+                if !permissive_phase {
+                    for predicate in predicates.iter().filter(|predicate| !predicate.permissive) {
+                        let repeated = earlier.iter().flat_map(|group| group.iter()).any(|held| {
+                            !held.permissive && held.expression == predicate.expression
+                        });
+                        if !repeated && (!passes(predicate)? || !after_qual()?) {
+                            return Ok(false);
+                        }
+                    }
+                    continue;
+                }
+                let repeated = earlier.iter().any(|held| {
+                    held.iter()
+                        .filter(|predicate| predicate.permissive)
+                        .map(|predicate| predicate.expression)
+                        .eq(permissive().map(|predicate| predicate.expression))
+                });
+                if permissive().next().is_none() || repeated {
+                    continue;
+                }
+                let mut any = plan.permissive_always[group];
+                for predicate in permissive() {
+                    if passes(predicate)? {
+                        any = true;
+                        break;
+                    }
+                }
+                if !any || !after_qual()? {
                     return Ok(false);
                 }
-            }
-            let repeated = earlier.iter().any(|held| {
-                held.iter()
-                    .filter(|predicate| predicate.permissive)
-                    .map(|predicate| predicate.expression)
-                    .eq(permissive().map(|predicate| predicate.expression))
-            });
-            if permissive().next().is_none() || repeated {
-                continue;
-            }
-            let mut any = plan.permissive_always[group];
-            for predicate in permissive() {
-                if passes(predicate)? {
-                    any = true;
-                    break;
-                }
-            }
-            if !any {
-                return Ok(false);
             }
         }
         Ok(true)
@@ -7409,6 +7559,7 @@ fn scan_source_mode<'a>(
         }
         None => None,
     };
+    let mut where_clause = where_clause;
     if scope.n == 1 {
         security_plans[0] = lead_row_security(
             security_plans[0],
@@ -7418,6 +7569,9 @@ fn scan_source_mode<'a>(
             txid,
             arena,
         )?;
+        if let Some(plan) = security_plans[0] {
+            where_clause = plan.residual(where_clause, arena)?;
+        }
     }
 
     fn exact_partition_leaf<'a>(

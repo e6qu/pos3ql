@@ -36245,6 +36245,122 @@ fn plpgsql_local_is_row(local: &TriggerLocalDecl) -> bool {
 /// words are sub-fields. The assignment becomes one to the record's field
 /// whose value is the field with its sub-field replaced, after checking the
 /// sub-fields as PostgreSQL does while planning the assignment.
+/// PostgreSQL's planning error for an assignment, in the assignment's
+/// context, at its first word when `positioned`.
+fn assignment_planning_error(error: SqlError, positioned: bool) -> SqlError {
+    let Some(statement) = crate::sql::error_context::innermost_assignment() else {
+        return error;
+    };
+    let written = statement.trim_start();
+    let first_word = &written[..written.find('.').unwrap_or(written.len())];
+    match in_procedural_query::<()>(
+        statement,
+        crate::sql::error_context::QueryMode::Assignment,
+        false,
+        || {
+            Err(if positioned {
+                crate::sql::error_position::at_subject(error, first_word)
+            } else {
+                error
+            })
+        },
+    ) {
+        Err(error) => error,
+        Ok(()) => unreachable!("the planning error is returned"),
+    }
+}
+
+/// The value of `base` (a field of type `field_type` of the record
+/// `record`) with sub-field `steps` replaced by `value`, after checking the
+/// steps as PostgreSQL's planner does.
+fn field_path_expression<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    record: &str,
+    field_type: i32,
+    steps: &[&'a str],
+    base: &'a Expr<'a>,
+    value: &'a Expr<'a>,
+) -> Result<&'a Expr<'a>, SqlError> {
+    use crate::sql::eval::CatalogAccess as _;
+    use core::fmt::Write as _;
+    let planning_error = assignment_planning_error;
+    let arena = context.arena;
+    let storage = context.storage();
+    let txid = context.txn.txid;
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let mut type_oid = field_type;
+    for (index, step) in steps.iter().enumerate() {
+        let column = if index == 0 { record } else { steps[index - 1] };
+        let type_name = || crate::sql::catalog::format_type_name(storage, txid, type_oid);
+        let Some(fields) = catalog.null_composite_fields(type_oid, arena)? else {
+            return Err(planning_error(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot assign to field \"{}\" of column \"{}\" because its type {} is not a composite type",
+                    step,
+                    column,
+                    type_name()?.as_str()
+                ),
+                true,
+            ));
+        };
+        let Some(next) = fields.iter().find(|candidate| candidate.name == *step) else {
+            return Err(planning_error(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "cannot assign to field \"{}\" of column \"{}\" because there is no such column in data type {}",
+                    step,
+                    column,
+                    type_name()?.as_str()
+                ),
+                true,
+            ));
+        };
+        type_oid = next.type_oid;
+    }
+    let mut kinds = StackStr::<8>::new();
+    for _ in steps {
+        let _ = kinds.write_char('f');
+    }
+    let alloc = |expression| {
+        arena
+            .alloc(expression)
+            .map(|expression| &*expression)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let mut arguments = [base; 12];
+    arguments[0] = base;
+    arguments[1] = value;
+    arguments[2] = alloc(Expr::Int(i64::from(field_type)))?;
+    arguments[3] = alloc(Expr::Str(
+        arena
+            .alloc_str(kinds.as_str())
+            .map_err(|_| super::query::arena_full_pub())?,
+    ))?;
+    for (slot, step) in arguments[4..].iter_mut().zip(steps) {
+        *slot = alloc(Expr::Str(step))?;
+    }
+    let arguments = arena
+        .alloc_slice_copy(&arguments[..4 + steps.len()])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let expression = alloc(Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        bound_oid: None,
+        bound_strict: None,
+        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+        name: "__assign_path",
+        args: arguments,
+        argument_names: &[],
+        variadic: false,
+        star: false,
+        distinct: false,
+        order_by: &[],
+        over: None,
+        filter: None,
+    })?;
+    Ok(expression)
+}
+
 fn plpgsql_field_path_assignment<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl],
@@ -36253,7 +36369,6 @@ fn plpgsql_field_path_assignment<'a>(
 ) -> Result<TriggerLocalAssignment<'a>, SqlError> {
     let name = assignment.name;
     use crate::sql::eval::CatalogAccess as _;
-    use core::fmt::Write as _;
     let Some(first) = name.block else {
         return Ok(assignment);
     };
@@ -36321,29 +36436,7 @@ fn plpgsql_field_path_assignment<'a>(
         count += 1;
     }
     let steps = &steps[..count];
-    let statement = crate::sql::error_context::innermost_assignment();
-    let planning_error = |error: SqlError, positioned: bool| -> SqlError {
-        let Some(statement) = statement else {
-            return error;
-        };
-        let written = statement.trim_start();
-        let first_word = &written[..written.find('.').unwrap_or(written.len())];
-        match in_procedural_query::<()>(
-            statement,
-            crate::sql::error_context::QueryMode::Assignment,
-            false,
-            || {
-                Err(if positioned {
-                    crate::sql::error_position::at_subject(error, first_word)
-                } else {
-                    error
-                })
-            },
-        ) {
-            Err(error) => error,
-            Ok(()) => unreachable!("the planning error is returned"),
-        }
-    };
+    let planning_error = assignment_planning_error;
     let storage = context.storage();
     let txid = context.txn.txid;
     let catalog = super::query::storage_catalog(storage, arena, txid);
@@ -36378,80 +36471,14 @@ fn plpgsql_field_path_assignment<'a>(
             false,
         ));
     };
-    let mut type_oid = field_type;
-    for (index, step) in steps.iter().enumerate() {
-        let column = if index == 0 {
-            local.name.as_str()
-        } else {
-            steps[index - 1]
-        };
-        let type_name = || crate::sql::catalog::format_type_name(storage, txid, type_oid);
-        let Some(fields) = catalog.null_composite_fields(type_oid, arena)? else {
-            return Err(planning_error(
-                sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "cannot assign to field \"{}\" of column \"{}\" because its type {} is not a composite type",
-                    step,
-                    column,
-                    type_name()?.as_str()
-                ),
-                true,
-            ));
-        };
-        let Some(next) = fields.iter().find(|candidate| candidate.name == *step) else {
-            return Err(planning_error(
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "cannot assign to field \"{}\" of column \"{}\" because there is no such column in data type {}",
-                    step,
-                    column,
-                    type_name()?.as_str()
-                ),
-                true,
-            ));
-        };
-        type_oid = next.type_oid;
-    }
-    let mut kinds = StackStr::<8>::new();
-    for _ in steps {
-        let _ = kinds.write_char('f');
-    }
-    let alloc = |expression| {
-        arena
-            .alloc(expression)
-            .map(|expression| &*expression)
-            .map_err(|_| super::query::arena_full_pub())
-    };
-    let mut arguments = [base; 12];
-    arguments[0] = base;
-    arguments[1] = assignment.expression;
-    arguments[2] = alloc(Expr::Int(i64::from(field_type)))?;
-    arguments[3] = alloc(Expr::Str(
-        arena
-            .alloc_str(kinds.as_str())
-            .map_err(|_| super::query::arena_full_pub())?,
-    ))?;
-    for (slot, step) in arguments[4..].iter_mut().zip(steps) {
-        *slot = alloc(Expr::Str(step))?;
-    }
-    let arguments = arena
-        .alloc_slice_copy(&arguments[..4 + steps.len()])
-        .map_err(|_| super::query::arena_full_pub())?;
-    let expression = alloc(Expr::Call {
-        kind: crate::sql::ast::CallKind::SqlSyntax,
-        bound_oid: None,
-        bound_strict: None,
-        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        name: "__assign_path",
-        args: arguments,
-        argument_names: &[],
-        variadic: false,
-        star: false,
-        distinct: false,
-        order_by: &[],
-        over: None,
-        filter: None,
-    })?;
+    let expression = field_path_expression(
+        context,
+        local.name.as_str(),
+        field_type,
+        steps,
+        base,
+        assignment.expression,
+    )?;
     Ok(TriggerLocalAssignment {
         name: if variable_reading {
             PlpgsqlVariableName::qualified(Some(first), second)
@@ -36462,6 +36489,90 @@ fn plpgsql_field_path_assignment<'a>(
         expression,
         ..assignment
     })
+}
+
+/// `NEW.col.f := value` (or `OLD`, with more sub-fields): an assignment to
+/// the trigger row's column whose value is the column with its sub-field
+/// replaced, checked as PostgreSQL plans it. `None` when the first word is
+/// not the trigger row or a variable or block label of that name wins.
+fn trigger_record_path_assignment<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    definition: crate::storage::RelationDefinition<'_>,
+    locals: &[TriggerLocalDecl],
+    assignment: TriggerLocalAssignment<'a>,
+) -> Result<Option<TriggerLocalAssignment<'a>>, SqlError> {
+    let name = assignment.name;
+    let (Some(first), Some(second)) = (name.block, name.label) else {
+        return Ok(None);
+    };
+    if definition.n_columns == 0
+        || locals.iter().any(|local| local.name == first)
+        || name
+            .record()
+            .is_some_and(|record| locals.iter().any(|local| record.names(local)))
+        || TriggerRecordName::parse(
+            plpgsql_transition_alias(locals, first.as_str()).unwrap_or(first.as_str()),
+        )
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let arena = context.arena;
+    let text = |name: SqlName| -> Result<&'a str, SqlError> {
+        arena
+            .alloc_str(name.as_str())
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let Some(column) = definition.column_index(second.as_str()) else {
+        return Err(assignment_planning_error(
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "record \"{}\" has no field \"{}\"",
+                first.as_str(),
+                second.as_str()
+            ),
+            false,
+        ));
+    };
+    let metadata = &definition.columns()[column];
+    let storage = context.storage();
+    let field_type = storage
+        .routine_type_oid(metadata.ctype, metadata.user_type, context.txn.txid)
+        .unwrap_or(metadata.ctype.oid());
+    let mut steps = [""; 8];
+    steps[0] = text(name.name)?;
+    let mut count = 1;
+    for step in assignment.path {
+        if count == steps.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL assignment target has more than {} sub-fields",
+                steps.len()
+            ));
+        }
+        steps[count] = step;
+        count += 1;
+    }
+    let base = arena
+        .alloc(Expr::Column {
+            qualifier: Some(text(first)?),
+            name: text(second)?,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let expression = field_path_expression(
+        context,
+        first.as_str(),
+        field_type,
+        &steps[..count],
+        base,
+        assignment.expression,
+    )?;
+    Ok(Some(TriggerLocalAssignment {
+        name: PlpgsqlVariableName::qualified(Some(first), second),
+        path: &[],
+        expression,
+        ..assignment
+    }))
 }
 
 fn assign_trigger_local<'a>(
@@ -38828,12 +38939,17 @@ fn execute_trigger_step_in<'a>(
                 Ok(Some(TriggerFlow::Return(result)))
             }),
             TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
-                let assignment = plpgsql_field_path_assignment(
-                    context,
-                    locals,
-                    &local_values[..locals.len()],
-                    assignment,
-                )?;
+                let assignment = match trigger_record_path_assignment(
+                    context, definition, locals, assignment,
+                )? {
+                    Some(assignment) => assignment,
+                    None => plpgsql_field_path_assignment(
+                        context,
+                        locals,
+                        &local_values[..locals.len()],
+                        assignment,
+                    )?,
+                };
                 if let Some(record) =
                     trigger_record_field_target(locals, definition, assignment.name)
                 {

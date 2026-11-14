@@ -98,6 +98,7 @@ mod streamed_insert_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod trigger_row_subfields;
 mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;

@@ -74,6 +74,27 @@ struct PlanNode {
     verbose_quals: [(QualLabel, StackStr<512>); 3],
     /// The schema of `relation`, which `VERBOSE` prints.
     schema: StackStr<64>,
+    /// The query a postgres_fdw node sends, which `VERBOSE` prints.
+    remote_sql: StackStr<REMOTE_SQL_BYTES>,
+    /// The rows a postgres_fdw INSERT sends per remote command.
+    batch_size: Option<u32>,
+}
+
+/// The longest remote query an EXPLAIN node holds.
+const REMOTE_SQL_BYTES: usize = 2_048;
+
+/// `text` as a node's `Remote SQL`, which must fit it whole.
+fn remote_sql_text(text: &str) -> Result<StackStr<REMOTE_SQL_BYTES>, SqlError> {
+    let held = StackStr::from_str(text);
+    if held.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "remote SQL of {} bytes exceeds EXPLAIN's {}-byte node property",
+            text.len(),
+            REMOTE_SQL_BYTES
+        ));
+    }
+    Ok(held)
 }
 
 /// A node's `Sort Key` or `Group Key` items, separated by
@@ -230,6 +251,8 @@ impl PlanNode {
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::new(),
+        remote_sql: StackStr::new(),
+        batch_size: None,
     };
 }
 
@@ -2487,6 +2510,8 @@ fn scan_node<'a>(
         key: None,
         verbose_quals: NO_QUALS,
         schema,
+        remote_sql: StackStr::new(),
+        batch_size: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -2507,6 +2532,13 @@ pub(super) fn plan_select<'a>(
     // outer joins its conditions narrow reduced.
     let written = statement;
     let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    // A query of one foreign table plans what execution sends: the local
+    // plan covers what the remote query leaves.
+    let foreign_scan = crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena)?;
+    let statement = match &foreign_scan {
+        Some(pushed) => pushed.local_statement(statement, arena)?,
+        None => statement,
+    };
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
             storage, from, txid, arena, None,
@@ -3372,6 +3404,9 @@ pub(super) fn plan_select<'a>(
                     scan.depth += 1;
                 }
             }
+            if let Some(pushed) = &foreign_scan {
+                foreign_scan_node(&mut scan, pushed, statement, scope, storage, txid)?;
+            }
             push_scan(&mut plan, scan)?;
         }
     }
@@ -3426,6 +3461,45 @@ pub(super) fn plan_select<'a>(
     }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output
+/// carries the columns of the order the remote query applies.
+fn foreign_scan_node(
+    scan: &mut PlanNode,
+    pushed: &crate::sql::foreign::deparse::ForeignSelectPlan<'_>,
+    statement: &Select<'_>,
+    scope: &QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    scan.name = StackStr::from_str("Foreign Scan");
+    scan.remote_sql = remote_sql_text(pushed.sql)?;
+    let table = storage.table_def(pushed.table_slot, txid);
+    let exposed = scope.names[0];
+    for column in (0..table.n_columns).filter(|&column| pushed.ordered.contains(column)) {
+        let name = table.columns()[column].name.as_str();
+        let projected = statement.items.iter().any(|item| match item {
+            SelectItem::Wildcard(_) => true,
+            SelectItem::TableWildcard(qualifier) => *qualifier == exposed,
+            SelectItem::Expr {
+                expression:
+                    Expr::Column {
+                        qualifier,
+                        name: projected,
+                    },
+                ..
+            } => *projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed),
+            _ => false,
+        });
+        if !projected {
+            if !scan.output.is_empty() {
+                let _ = scan.output.write_str(", ");
+            }
+            crate::sql::catalog::write_identifier(&mut scan.output, name);
+        }
+    }
+    Ok(())
 }
 
 /// The plan of a derived table's own query.
@@ -3893,6 +3967,8 @@ fn physical_scan_node(
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
+        remote_sql: StackStr::new(),
+        batch_size: None,
     }
 }
 
@@ -4046,6 +4122,8 @@ fn push_set_tree(
                 key: Some(NodeKey::new(block, role)),
                 verbose_quals: NO_QUALS,
                 schema: StackStr::new(),
+                remote_sql: StackStr::new(),
+                batch_size: None,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -4453,6 +4531,8 @@ pub(super) fn plan_modification<'a>(
         schema: relation_slot(storage, txid, target.schema, target.name)
             .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
             .unwrap_or_default(),
+        remote_sql: StackStr::new(),
+        batch_size: None,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -5025,6 +5105,24 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
+        }
+        if options.verbose && !node.remote_sql.is_empty() {
+            let mut line = StackStr::<{ REMOTE_SQL_BYTES + 256 }>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Remote SQL: {}", node.remote_sql.as_str());
+            emit(line.as_str())?;
+        }
+        if options.verbose
+            && let Some(size) = node.batch_size
+        {
+            let mut line = StackStr::<64>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Batch Size: {size}");
+            emit(line.as_str())?;
         }
         if let Some(table) = hash_table(node_actual) {
             let mut line = StackStr::<256>::new();
@@ -5787,6 +5885,14 @@ fn structured_node(
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
         }
+    }
+    if options.verbose && !node.remote_sql.is_empty() {
+        document.text("Remote SQL", node.remote_sql.as_str());
+    }
+    if options.verbose
+        && let Some(size) = node.batch_size
+    {
+        document.number("Batch Size", size);
     }
     if let Some(actual) = actual {
         if options.buffers {

@@ -16,6 +16,8 @@ use crate::storage::{
 };
 use crate::util::StackStr;
 
+pub(crate) mod deparse;
+
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
 /// A PostgreSQL heap tuple identity returned by `ctid::text`.  Parsing it at
@@ -1029,7 +1031,12 @@ fn connection_for_server(
         )
     })?;
     let password = mapping.options.get("password");
-    let application_name = server.options.get("application_name").unwrap_or("pos3ql");
+    // libpq's `PGAPPNAME`, then postgres_fdw's `fallback_application_name`.
+    let application_name = server
+        .options
+        .get("application_name")
+        .or_else(|| environment("PGAPPNAME"))
+        .unwrap_or("postgres_fdw");
     let ssl_mode = match server.options.get("sslmode").unwrap_or("prefer") {
         "disable" => SslMode::Disable,
         "prefer" => SslMode::Prefer,
@@ -1351,18 +1358,32 @@ fn push_row<'a>(
     Ok(())
 }
 
+/// Reads a foreign table's rows: every column, or the remote query a
+/// `SELECT`'s plan pushed, whose unfetched columns read as `NULL`.
 pub(crate) fn materialize<'a>(
     storage: &'a Storage,
     table_slot: usize,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    pushed: Option<&deparse::ForeignSelectPlan<'_>>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let mut query = StackStr::<16_384>::new();
-    remote.write_select(&mut query);
-    checked(&query, "query")?;
     let table = &remote.table;
+    let fetched = match pushed {
+        Some(plan) => {
+            debug_assert_eq!(plan.table_slot, table_slot);
+            let _ = query.write_str(plan.sql);
+            plan.fetched
+        }
+        None => {
+            remote.write_select(&mut query);
+            ColumnSet::all(table.n_columns)
+        }
+    };
+    checked(&query, "query")?;
+    let fetched_count = fetched.count_ones() as usize;
     let mut rows: *mut &[u8] = core::ptr::null_mut();
     let mut row_count = 0usize;
     let mut row_capacity = 0usize;
@@ -1372,12 +1393,18 @@ pub(crate) fn materialize<'a>(
         lease,
         query.as_str(),
         remote.fetch_size(),
-        table.n_columns.max(1),
+        fetched_count.max(1),
         &mut |remote_row| {
             let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-            for (column, raw) in remote_row.columns()[..table.n_columns].iter().enumerate() {
-                values[column] =
-                    decode_foreign_field(storage, table, column, *raw, txid, arena, sequences)?;
+            let mut fields = remote_row.columns().iter();
+            for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                if fetched.contains(column) {
+                    let raw = *fields
+                        .next()
+                        .expect("row shape checked against the fetched columns");
+                    *value =
+                        decode_foreign_field(storage, table, column, raw, txid, arena, sequences)?;
+                }
             }
             let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
             push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)

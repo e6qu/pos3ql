@@ -26,7 +26,7 @@ use crate::util::StackStr;
 
 mod rewrite;
 
-const MAX_EXPLAIN_STAGES: usize = 8;
+const MAX_EXPLAIN_STAGES: usize = 24;
 
 // A SELECT can expose one heap and one bitmap node per source plus every
 // operator stage. Composed set trees reserve the sum of their actual leaves,
@@ -74,6 +74,28 @@ struct PlanNode {
     verbose_quals: [(QualLabel, StackStr<512>); 3],
     /// The schema of `relation`, which `VERBOSE` prints.
     schema: StackStr<64>,
+    /// For the root of a subplan, how its parent runs it and its name
+    /// (`InitPlan 1`, `SubPlan 2`, `CTE w`).
+    subplan: Option<(SubplanKind, StackStr<72>)>,
+    /// The subplans this node is nested in: PostgreSQL indents each
+    /// subplan two columns past its parent's children.
+    shift: u8,
+}
+
+/// How a node runs a subplan: once before its first row, or per row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubplanKind {
+    InitPlan,
+    SubPlan,
+}
+
+impl SubplanKind {
+    const fn relationship(self) -> &'static str {
+        match self {
+            Self::InitPlan => "InitPlan",
+            Self::SubPlan => "SubPlan",
+        }
+    }
 }
 
 /// A node's `Sort Key` or `Group Key` items, separated by
@@ -126,6 +148,10 @@ enum QualLabel {
     IndexCond,
     RecheckCond,
     JoinFilter,
+    /// A `WindowAgg`'s window definition.
+    Window,
+    /// An incremental sort's keys its input is already sorted by.
+    PresortedKey,
 }
 
 impl QualLabel {
@@ -133,7 +159,12 @@ impl QualLabel {
     /// its filter.
     const fn rank(self) -> u8 {
         match self {
-            Self::OneTimeFilter | Self::HashCond | Self::IndexCond | Self::RecheckCond => 0,
+            Self::Window
+            | Self::PresortedKey
+            | Self::OneTimeFilter
+            | Self::HashCond
+            | Self::IndexCond
+            | Self::RecheckCond => 0,
             Self::JoinFilter => 1,
             Self::Filter => 2,
             Self::None => 3,
@@ -149,6 +180,8 @@ impl QualLabel {
             Self::IndexCond => "Index Cond",
             Self::RecheckCond => "Recheck Cond",
             Self::JoinFilter => "Join Filter",
+            Self::Window => "Window",
+            Self::PresortedKey => "Presorted Key",
         }
     }
 }
@@ -230,6 +263,8 @@ impl PlanNode {
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::new(),
+        subplan: None,
+        shift: 0,
     };
 }
 
@@ -255,7 +290,11 @@ impl NodeActual {
             QualLabel::Filter => counters.filtered,
             QualLabel::JoinFilter => counters.join_filtered,
             QualLabel::IndexCond | QualLabel::RecheckCond => 0,
-            QualLabel::OneTimeFilter | QualLabel::HashCond | QualLabel::None => return None,
+            QualLabel::OneTimeFilter
+            | QualLabel::HashCond
+            | QualLabel::Window
+            | QualLabel::PresortedKey
+            | QualLabel::None => return None,
         };
         Some(removed as f64 / counters.loops as f64)
     }
@@ -268,7 +307,11 @@ impl QualLabel {
             Self::Filter => Some("Rows Removed by Filter"),
             Self::JoinFilter => Some("Rows Removed by Join Filter"),
             Self::IndexCond | Self::RecheckCond => Some("Rows Removed by Index Recheck"),
-            Self::OneTimeFilter | Self::HashCond | Self::None => None,
+            Self::OneTimeFilter
+            | Self::HashCond
+            | Self::Window
+            | Self::PresortedKey
+            | Self::None => None,
         }
     }
 }
@@ -408,6 +451,22 @@ impl<'a> Plan<'a> {
                 ..NodeCounters::default()
             });
         }
+        // A `Result` whose filter the planner folded to false returns no
+        // rows, once per row request of the node reading it.
+        if node.constant_false
+            && node.key.is_none()
+            && let Some(parent) = self.nodes[..index]
+                .iter()
+                .rposition(|parent| parent.depth + 1 == node.depth)
+        {
+            return match self.actual(parent, Some(actual)) {
+                NodeActual::Ran(counters) => NodeActual::Ran(NodeCounters {
+                    loops: counters.loops,
+                    ..NodeCounters::default()
+                }),
+                other => other,
+            };
+        }
         let (Some(measured), Some(_)) = (self.measured, counters) else {
             return NodeActual::Unmeasured;
         };
@@ -437,6 +496,139 @@ impl<'a> Plan<'a> {
                 .div_ceil(1024),
         )
     }
+}
+
+/// The most subqueries one EXPLAIN shows as subplans.
+const MAX_SUBPLANS: usize = 64;
+
+thread_local! {
+    /// The subqueries the statement being explained runs as subplans, by the
+    /// address of their query, and the number of the last one.
+    static SUBPLANS: core::cell::RefCell<([(usize, crate::sql::catalog::deparse::SublinkPlan); MAX_SUBPLANS], usize)> =
+        const {
+            core::cell::RefCell::new(
+                ([(0, crate::sql::catalog::deparse::SublinkPlan::InitPlan(0)); MAX_SUBPLANS], 0),
+            )
+        };
+}
+
+/// Forgets the subplans of the statement explained before.
+fn reset_subplans() {
+    SUBPLANS.with(|subplans| subplans.borrow_mut().1 = 0);
+}
+
+/// Numbers `select` as the next subplan, as PostgreSQL numbers each
+/// subquery once it has planned it (and so the subqueries inside it).
+fn register_subplan(
+    select: &Select<'_>,
+    correlated: bool,
+) -> Result<crate::sql::catalog::deparse::SublinkPlan, SqlError> {
+    SUBPLANS.with(|subplans| {
+        let mut subplans = subplans.borrow_mut();
+        let count = subplans.1;
+        if count == MAX_SUBPLANS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN subplans exceed {}",
+                MAX_SUBPLANS
+            ));
+        }
+        let number = u16::try_from(count + 1).expect("bounded by MAX_SUBPLANS");
+        let plan = if correlated {
+            crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
+        } else {
+            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+        };
+        subplans.0[count] = (core::ptr::from_ref(select) as usize, plan);
+        subplans.1 = count + 1;
+        Ok(plan)
+    })
+}
+
+/// The subplan the explained statement runs `select` as, if any.
+fn registered_sublink(select: *const ()) -> Option<crate::sql::catalog::deparse::SublinkPlan> {
+    SUBPLANS.with(|subplans| {
+        let subplans = subplans.borrow();
+        subplans.0[..subplans.1]
+            .iter()
+            .find(|(held, _)| *held == select as usize)
+            .map(|(_, plan)| *plan)
+    })
+}
+
+/// The query of a subquery EXPLAIN can show as a subplan.
+fn sublink_query<'e>(expression: &'e Expr<'e>) -> Option<&'e Select<'e>> {
+    match expression {
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => Some(select),
+        _ => None,
+    }
+}
+
+/// Whether every subquery of `expression` is a registered subplan, a
+/// correlated one only when `correlated` allows it.
+fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
+    let mut registered = true;
+    visit_sublinks(expression, &mut |node| {
+        registered &= sublink_query(node)
+            .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
+            .is_some_and(|plan| {
+                correlated || matches!(plan, crate::sql::catalog::deparse::SublinkPlan::InitPlan(_))
+            });
+    });
+    registered
+}
+
+/// Calls `visit` with each subquery of `expression` outside other
+/// subqueries, in written order.
+fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
+    if matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+    ) {
+        visit(expression);
+        if let Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } =
+            expression
+        {
+            visit_sublinks(operand, visit);
+        }
+        return;
+    }
+    let _ = query::walk_children(expression, &mut |child| {
+        visit_sublinks(child, visit);
+        Ok(())
+    });
+}
+
+/// `condition` split into its conjuncts that read no column and only
+/// subplans run once, which PostgreSQL checks once, and the rest.
+fn split_gating<'e>(
+    condition: Option<&'e Expr<'e>>,
+    arena: &'e Arena,
+) -> Result<(Option<&'e Expr<'e>>, Option<&'e Expr<'e>>), SqlError> {
+    let Some(condition) = condition else {
+        return Ok((None, None));
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok((None, Some(condition)));
+    }
+    let (mut gating, mut rest) = (None, None);
+    for conjunct in &conjuncts[..count] {
+        let mut columns = false;
+        conjunct.for_each_column_reference(&mut |_, _| columns = true);
+        if !columns && conjunct.contains_subquery() && sublinks_registered(conjunct, false) {
+            gating = query::and_where(gating, Some(conjunct), arena)?;
+        } else {
+            rest = query::and_where(rest, Some(conjunct), arena)?;
+        }
+    }
+    Ok((gating, rest))
 }
 
 /// The most conjuncts a condition's EXPLAIN qualification is split into.
@@ -474,7 +666,10 @@ fn relation_mask(
     expression: &Expr<'_>,
     resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
 ) -> Option<u64> {
-    if expression.contains_subquery() {
+    // A subplan run once reads no relation of the query; one run per row
+    // reads the relations it is correlated with, which only a single
+    // relation's scan places.
+    if expression.contains_subquery() && !sublinks_registered(expression, false) {
         return None;
     }
     let mut mask = 0u64;
@@ -879,6 +1074,7 @@ fn join_quals<'a>(
         pretty: false,
         qualify: true,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1010,6 +1206,7 @@ fn outer_hash_quals<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
     };
     let Some(hash_cond) = deparse_qual(&context, &hash_conds[..hash_count], arena)? else {
@@ -1064,6 +1261,7 @@ fn one_time_filter(
         qualify: false,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1103,6 +1301,7 @@ fn scan_filters<'a>(
                 qualify: false,
                 bare: None,
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1134,6 +1333,7 @@ fn scan_filters<'a>(
                 qualify: true,
                 bare: Some(exposed),
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1376,6 +1576,7 @@ fn outer_join_quals<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1424,6 +1625,7 @@ fn joined_index_conditions<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1486,6 +1688,7 @@ fn having_filter<'a>(
         pretty: false,
         qualify: relations > 1,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1576,6 +1779,7 @@ fn derived_relation_filter<'a>(
         pretty: false,
         qualify: verbose || names == DerivedNames::Qualified,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1597,19 +1801,44 @@ fn single_relation_quals<'a>(
         return Ok((None, None));
     };
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
-        (qualifier.is_none_or(|qualifier| qualifier == exposed)
+        if qualifier.is_none_or(|qualifier| qualifier == exposed)
             && table
                 .columns()
                 .iter()
-                .any(|column| column.name.as_str() == name))
-        .then_some(0)
+                .any(|column| column.name.as_str() == name)
+        {
+            return Some(0);
+        }
+        // A correlated subquery's condition reads its enclosing query's
+        // relation as a parameter.
+        let mut outer = false;
+        outer_relations(storage, txid, |relation, definition| {
+            outer |= qualifier.is_some_and(|qualifier| qualifier == relation)
+                && definition
+                    .columns()
+                    .iter()
+                    .any(|column| column.name.as_str() == name);
+        });
+        outer.then_some(1)
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
+    // The one relation's scan evaluates its subplans, the ones it runs per
+    // row included.
+    let placeable = |conjunct: &Expr<'_>| {
+        if !conjunct.contains_subquery() {
+            return relation_mask(conjunct, &resolve).is_some();
+        }
+        let mut columns = true;
+        conjunct.for_each_column_reference(&mut |qualifier, name| {
+            columns &= resolve(qualifier, name).is_some();
+        });
+        columns && sublinks_registered(conjunct, true)
+    };
     if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
-        || conjuncts[..count]
+        || !conjuncts[..count]
             .iter()
-            .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
+            .all(|conjunct| placeable(conjunct))
     {
         return Ok((None, None));
     }
@@ -1621,7 +1850,30 @@ fn single_relation_quals<'a>(
         }
     }
     order_restrictions(&mut conjuncts[..kept]);
-    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    // The enclosing query's relation, whose columns print qualified.
+    let outer = OUTER_RELATIONS.with(|outer| {
+        let outer = outer.borrow();
+        outer.1.checked_sub(1).map(|top| outer.0[top])
+    });
+    let outer_definition = outer.map(|(_, slot)| storage.table_def(slot, txid));
+    let outer_name = match outer.as_ref() {
+        Some((name, _)) => Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?),
+        None => None,
+    };
+    let own = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    let with_outer;
+    let joined: &[crate::sql::catalog::deparse::Joined<'_>] =
+        match (outer_name, outer_definition.as_deref()) {
+            (Some(name), Some(definition)) => {
+                with_outer = [
+                    own[0],
+                    crate::sql::catalog::deparse::Joined::new(name, definition),
+                ];
+                &with_outer
+            }
+            _ => &own,
+        };
+    let outer_count = usize::from(outer.is_some());
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
@@ -1629,12 +1881,13 @@ fn single_relation_quals<'a>(
         dependencies: None,
         table: Some(table),
         parameters: &[],
-        joined: &joined,
+        joined,
         pretty: false,
         qualify: verbose,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
-        bare: None,
+        bare: (outer_count != 0 && !verbose).then_some(exposed),
     };
     let index_cond = match index {
         Some(index) => index_condition(&context, exposed, index, verbose, arena)?,
@@ -2487,6 +2740,8 @@ fn scan_node<'a>(
         key: None,
         verbose_quals: NO_QUALS,
         schema,
+        subplan: None,
+        shift: 0,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -2501,12 +2756,323 @@ pub(super) fn plan_select<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    let key = |role| Some(NodeKey::new(block, role));
-    let started = std::time::Instant::now();
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
+    let pulled = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    // PostgreSQL plans, and so numbers, a query's subqueries before it
+    // prints the conditions that refer to them.
+    let sublinks = plan_sublinks(storage, txid, pulled, block, arena)?;
+    let plan = plan_pulled_select(storage, txid, statement, pulled, block, arena)?;
+    attach_subplans(plan, pulled, block, sublinks, arena)
+}
+
+/// Where a query reads a subquery, which decides the node that runs it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SublinkOrigin {
+    Items,
+    Where,
+    Having,
+}
+
+/// A subquery of a query level planned as a subplan.
+#[derive(Clone, Copy)]
+struct Sublink<'a> {
+    kind: SubplanKind,
+    number: u16,
+    origin: SublinkOrigin,
+    nodes: &'a [PlanNode],
+}
+
+thread_local! {
+    /// How many subqueries deep the query being planned is: a subquery's
+    /// range table entries join its statement's.
+    static SUBLINK_DEPTH: core::cell::Cell<u16> = const { core::cell::Cell::new(0) };
+    /// The single stored relation of each query level around the one being
+    /// planned, by exposed name and slot, which a correlated subquery's
+    /// conditions name qualified.
+    static OUTER_RELATIONS: core::cell::RefCell<([(StackStr<64>, usize); 8], usize)> =
+        const { core::cell::RefCell::new(([(StackStr::new(), 0); 8], 0)) };
+}
+
+/// The relations of the query levels around the one being planned.
+fn outer_relations(
+    storage: &Storage,
+    txid: u32,
+    mut visit: impl FnMut(&str, &crate::storage::TableDef),
+) {
+    OUTER_RELATIONS.with(|outer| {
+        let outer = outer.borrow();
+        for (name, slot) in &outer.0[..outer.1] {
+            visit(name.as_str(), &storage.table_def(*slot, txid));
+        }
+    });
+}
+
+/// Plans the select-list, `WHERE` and `HAVING` subqueries of `statement`
+/// that EXPLAIN shows as subplans, numbering each after the subqueries
+/// inside it.
+fn plan_sublinks<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<&'a [Sublink<'a>], SqlError> {
+    let mut found = crate::mem::arena::ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit_sublinks(expression, &mut |node| {
+                let _ = found.push((node, SublinkOrigin::Items));
+            });
+        }
+    }
+    if let Some(condition) = statement.where_clause {
+        visit_sublinks(condition, &mut |node| {
+            let _ = found.push((node, SublinkOrigin::Where));
+        });
+    }
+    if let Some(having) = statement.having {
+        visit_sublinks(having, &mut |node| {
+            let _ = found.push((node, SublinkOrigin::Having));
+        });
+    }
+    let found = found.as_slice();
+    let relation = statement.from.as_ref().and_then(|from| {
+        (from.joins.is_empty() && from.base.subquery.is_none() && !from.base.is_function_source())
+            .then(|| {
+                (
+                    from.base.alias.unwrap_or(from.base.table),
+                    from.base.schema,
+                    from.base.table,
+                )
+            })
+    });
+    let mut planned = crate::mem::arena::ArenaList::new(arena);
+    for &(node, origin) in found {
+        let Some(select) = sublink_query(node) else {
+            continue;
+        };
+        let correlated = query::subquery_node_correlated(node, storage, txid, arena)?;
+        let outer_slot =
+            relation.and_then(|(_, schema, table)| relation_slot(storage, txid, schema, table));
+        if correlated && outer_slot.is_none() {
+            continue;
+        }
+        let pushed = correlated
+            && OUTER_RELATIONS.with(|outer| {
+                let mut outer = outer.borrow_mut();
+                let count = outer.1;
+                if count == outer.0.len() {
+                    return false;
+                }
+                outer.0[count] = (
+                    StackStr::from_str(relation.expect("checked").0),
+                    outer_slot.expect("checked"),
+                );
+                outer.1 = count + 1;
+                true
+            });
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let inner = plan_select(storage, txid, select, block.child(Segment::Sublink), arena);
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if pushed {
+            OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
+        }
+        let Plan { nodes, count, .. } = inner?;
+        // Execution does not count a subquery's operators per subplan yet,
+        // so `EXPLAIN ANALYZE` prints no figures for them.
+        for node in &mut nodes[..count] {
+            node.key = None;
+        }
+        let nodes: &'a [PlanNode] = &nodes[..count];
+        let number = match register_subplan(select, correlated)? {
+            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number) => number,
+        };
+        planned
+            .push(Sublink {
+                kind: if correlated {
+                    SubplanKind::SubPlan
+                } else {
+                    SubplanKind::InitPlan
+                },
+                number,
+                origin,
+                nodes,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
+}
+
+/// `plan` with each subplan under the node that runs it: an InitPlan under
+/// the query's top node, before its inputs, and a SubPlan after the inputs
+/// of the node evaluating the expression that reads it.
+fn attach_subplans<'a>(
+    plan: Plan<'a>,
+    statement: &Select<'_>,
+    block: BlockId,
+    sublinks: &[Sublink<'a>],
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    if sublinks.is_empty() {
+        return Ok(plan);
+    }
+    let nodes = &plan.nodes[..plan.count];
+    let find = |role: Role| {
+        nodes
+            .iter()
+            .position(|node| node.key == Some(NodeKey::new(block, role)))
+    };
+    let relations = statement
+        .from
+        .as_ref()
+        .map_or(0, |from| from.joins.len() + 1);
+    let scan = || {
+        if relations == 1 {
+            find(Role::Scan(0))
+        } else {
+            find(Role::Join(u16::try_from(relations - 1).unwrap_or(u16::MAX)))
+        }
+    };
+    let host = |sublink: &Sublink<'_>| -> usize {
+        let at = match (sublink.kind, sublink.origin) {
+            (SubplanKind::InitPlan, _) => None,
+            (SubplanKind::SubPlan, SublinkOrigin::Having) => find(Role::Aggregate),
+            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::Aggregate)
+                .or_else(|| find(Role::Result))
+                .or_else(scan),
+            (SubplanKind::SubPlan, SublinkOrigin::Where) => scan(),
+        };
+        at.unwrap_or(0)
+    };
+    let total = sublinks
+        .iter()
+        .fold(plan.count, |total, sublink| total + sublink.nodes.len());
+    let mut attached = Plan::new(arena, total)?;
+    attached.methods = plan.methods;
+    attached.planning_micros = plan.planning_micros;
+    // PostgreSQL names each relation of the statement's range table
+    // uniquely, in order: the query's own first, then each subplan's, a
+    // repeated name taking the first free `_1`, `_2`, ... suffix.
+    let used = arena
+        .alloc_slice_with(total, |_| StackStr::<96>::new())
+        .map_err(|_| arena_full())?;
+    let mut used_count = 0usize;
+    for node in nodes {
+        if !node.relation.as_str().is_empty() && used_count < used.len() {
+            used[used_count] = StackStr::from_str(node.exposed_name());
+            used_count += 1;
+        }
+    }
+    let ordered = arena
+        .alloc_slice_with(sublinks.len(), |index| index)
+        .map_err(|_| arena_full())?;
+    ordered.sort_unstable_by_key(|&index| sublinks[index].number);
+    let renamed = arena
+        .alloc_slice_with(total, |_| None::<StackStr<96>>)
+        .map_err(|_| arena_full())?;
+    let mut offsets = [0usize; MAX_SUBPLANS];
+    let mut offset = 0usize;
+    for (index, sublink) in sublinks.iter().enumerate() {
+        offsets[index.min(MAX_SUBPLANS - 1)] = offset;
+        offset += sublink.nodes.len();
+    }
+    for &index in ordered.iter() {
+        for (at, node) in sublinks[index].nodes.iter().enumerate() {
+            if node.relation.as_str().is_empty() {
+                continue;
+            }
+            let name = node.exposed_name();
+            let mut unique = StackStr::<96>::from_str(name);
+            let mut suffix = 1usize;
+            while used[..used_count]
+                .iter()
+                .any(|held| held.as_str() == unique.as_str())
+            {
+                unique = StackStr::new();
+                let _ = write!(unique, "{name}_{suffix}");
+                suffix += 1;
+            }
+            if unique.as_str() != name {
+                renamed[offsets[index] + at] = Some(unique);
+            }
+            if used_count < used.len() {
+                used[used_count] = unique;
+                used_count += 1;
+            }
+        }
+    }
+    let push_subplan = |attached: &mut Plan<'a>, parent: PlanNode, index: usize| {
+        let sublink = &sublinks[index];
+        for (at, node) in sublink.nodes.iter().enumerate() {
+            let mut name = StackStr::<72>::new();
+            let _ = write!(name, "{} {}", sublink.kind.relationship(), sublink.number);
+            attached.push(PlanNode {
+                depth: node.depth + parent.depth + 1,
+                shift: node.shift + parent.shift + 1,
+                subplan: if at == 0 {
+                    Some((sublink.kind, name))
+                } else {
+                    node.subplan
+                },
+                alias: renamed[offsets[index] + at].unwrap_or(node.alias),
+                ..*node
+            })?;
+        }
+        Ok::<(), SqlError>(())
+    };
+    for (index, node) in nodes.iter().enumerate() {
+        attached.push(*node)?;
+        // InitPlans precede the inputs of the top node.
+        if index == 0 {
+            for (at, _) in sublinks
+                .iter()
+                .enumerate()
+                .filter(|(_, sublink)| sublink.kind == SubplanKind::InitPlan)
+            {
+                push_subplan(&mut attached, *node, at)?;
+            }
+        }
+        // SubPlans follow the last node of their host's subtree: each
+        // ancestor of this node whose subtree ends here, deepest first.
+        let next_depth = nodes.get(index + 1).map(|next| next.depth);
+        let mut shallowest = u8::MAX;
+        for (host_index, host_node) in nodes[..=index].iter().enumerate().rev() {
+            if host_node.depth >= shallowest {
+                continue;
+            }
+            shallowest = host_node.depth;
+            if next_depth.is_some_and(|next| next > host_node.depth) {
+                break;
+            }
+            for (at, _) in sublinks.iter().enumerate().filter(|(_, sublink)| {
+                sublink.kind == SubplanKind::SubPlan && host(sublink) == host_index
+            }) {
+                push_subplan(&mut attached, *host_node, at)?;
+            }
+            if host_node.depth == 0 {
+                break;
+            }
+        }
+    }
+    Ok(attached)
+}
+
+/// [`plan_select`] of `statement` after its subqueries are pulled up into
+/// `pulled`.
+fn plan_pulled_select<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    pulled: &Select<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let key = |role| Some(NodeKey::new(block, role));
+    let started = std::time::Instant::now();
     let written = statement;
-    let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    let statement = pulled;
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
             storage, from, txid, arena, None,
@@ -2595,42 +3161,13 @@ pub(super) fn plan_select<'a>(
         _ => false,
     };
 
-    if statement
+    // A condition the planner folds to false leaves no relation to scan:
+    // PostgreSQL runs the query's upper nodes over a `Result` that returns
+    // no rows.
+    let constant_false = statement
         .where_clause
         .and_then(|predicate| query::plan_time_bool(predicate, arena))
-        == Some(false)
-    {
-        // An aggregate without grouping still aggregates the empty input.
-        let aggregated = aggregate && statement.group_by.is_empty();
-        if aggregated {
-            plan.push(PlanNode {
-                name: StackStr::from_str("Aggregate"),
-                key: key(Role::Aggregate),
-                output,
-                rows: 1,
-                width,
-                ..PlanNode::EMPTY
-            })?;
-        }
-        plan.push(PlanNode {
-            name: StackStr::from_str("Result"),
-            // Only a query without FROM counts its `Result`.
-            key: if aggregated && scope.is_none() {
-                key(Role::Result)
-            } else {
-                None
-            },
-            depth: u8::from(aggregated),
-            output,
-            rows: 0,
-            width,
-            total_cost: 0.0,
-            constant_false: true,
-            ..PlanNode::EMPTY
-        })?;
-        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        return Ok(plan);
-    }
+        == Some(false);
 
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
@@ -2759,7 +3296,7 @@ pub(super) fn plan_select<'a>(
     } else {
         block
     };
-    if fromless {
+    if fromless && !constant_false {
         add_stage(
             &mut stages,
             &mut stage_count,
@@ -2798,7 +3335,7 @@ pub(super) fn plan_select<'a>(
         }
         Ok(true)
     };
-    if scope.as_ref().is_some_and(|scope| scope.n > 1) {
+    if scope.as_ref().is_some_and(|scope| scope.n > 1) && !constant_false {
         total_cost += estimated_rows as f64 * 0.01;
         add_stage(
             &mut stages,
@@ -2878,22 +3415,34 @@ pub(super) fn plan_select<'a>(
             ),
         )?;
     }
+    // The keys the rows leave the last window sorted by.
+    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] = &[];
     if has_window(statement) {
         total_cost += estimated_rows as f64 * 0.02;
-        add_stage(
-            &mut stages,
-            &mut stage_count,
-            PlanNode {
-                name: StackStr::from_str("WindowAgg"),
-                key: key(Role::Window),
-                total_cost,
-                rows: estimated_rows,
-                width,
-                object_requests,
-                cache_blocks,
-                ..PlanNode::EMPTY
-            },
+        let (nodes, sorted) = window_stages(
+            storage,
+            txid,
+            scope.as_ref(),
+            statement,
+            columns,
+            block,
+            arena,
         )?;
+        window_sorted = sorted;
+        for node in nodes {
+            add_stage(
+                &mut stages,
+                &mut stage_count,
+                PlanNode {
+                    total_cost,
+                    rows: estimated_rows,
+                    width,
+                    object_requests,
+                    cache_blocks,
+                    ..*node
+                },
+            )?;
+        }
     }
     if query::has_set_returning_items(statement.items, storage, txid) {
         add_stage(
@@ -2931,31 +3480,53 @@ pub(super) fn plan_select<'a>(
     } else {
         order_keys(statement, arena)?
     };
-    if !sorted_keys.is_empty() && ordered_index.is_none() {
+    // Rows a window leaves sorted by the query's keys need no sort, and
+    // ones sorted by a prefix of them only an incremental one.
+    let presorted = presorted_order_keys(statement, sorted_keys, window_sorted);
+    if !sorted_keys.is_empty()
+        && ordered_index.is_none()
+        && presorted.is_none_or(|presorted| presorted < sorted_keys.len())
+    {
         total_cost += estimated_rows as f64 * (estimated_rows.max(2) as f64).log2() * 0.0025;
-        add_stage(
-            &mut stages,
-            &mut stage_count,
-            PlanNode {
-                name: StackStr::from_str("Sort"),
-                key: key(Role::Sort),
-                keys: plan_keys(
-                    storage,
-                    txid,
-                    scope.as_ref(),
-                    statement,
-                    KeyLabel::Sort,
-                    sorted_keys,
-                    arena,
-                )?,
-                total_cost,
-                rows: estimated_rows,
-                width,
-                object_requests,
-                cache_blocks,
-                ..PlanNode::EMPTY
-            },
-        )?;
+        let presorted = presorted.unwrap_or(0);
+        let mut node = PlanNode {
+            name: StackStr::from_str(if presorted == 0 {
+                "Sort"
+            } else {
+                "Incremental Sort"
+            }),
+            key: key(Role::Sort),
+            keys: plan_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                KeyLabel::Sort,
+                sorted_keys,
+                arena,
+            )?,
+            total_cost,
+            rows: estimated_rows,
+            width,
+            object_requests,
+            cache_blocks,
+            ..PlanNode::EMPTY
+        };
+        if presorted != 0 {
+            let prefix = plan_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                KeyLabel::Sort,
+                &sorted_keys[..presorted],
+                arena,
+            )?;
+            node = node
+                .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+        }
+        add_stage(&mut stages, &mut stage_count, node)?;
     }
     let distinct_items = || -> Result<bool, SqlError> {
         if !statement.distinct_on.is_empty() {
@@ -3018,6 +3589,24 @@ pub(super) fn plan_select<'a>(
                     None => PlanKeys::NONE,
                 },
                 total_cost,
+                rows: estimated_rows,
+                width,
+                object_requests,
+                cache_blocks,
+                ..PlanNode::EMPTY
+            },
+        )?;
+    }
+    // A locking clause locks each row below the limit, as PostgreSQL's
+    // `LockRows` does; a query without FROM has no rows to lock.
+    if !statement.locking.is_empty() && !fromless {
+        add_stage(
+            &mut stages,
+            &mut stage_count,
+            PlanNode {
+                name: StackStr::from_str("LockRows"),
+                key: key(Role::LockRows),
+                total_cost: total_cost + estimated_rows as f64 * 0.01,
                 rows: estimated_rows,
                 width,
                 object_requests,
@@ -3099,12 +3688,36 @@ pub(super) fn plan_select<'a>(
         if scope.n == 1
             && let Some((exposed, def)) = relation(0)
         {
+            // Conjuncts that read only subplans run once gate the scan
+            // from a `Result` above it, as PostgreSQL's pseudoconstant
+            // quals do.
+            let (gating, scanned) = split_gating(statement.where_clause, arena)?;
+            if let Some(gating) = gating {
+                let filter = one_time_filter(storage, txid, Some(gating), arena)?;
+                if stage_count == stages.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "EXPLAIN operator stack exceeds {} nodes",
+                        stages.len()
+                    ));
+                }
+                stages.copy_within(0..stage_count, 1);
+                stages[0] = PlanNode {
+                    name: StackStr::from_str("Result"),
+                    rows: estimated_rows,
+                    width,
+                    total_cost,
+                    ..PlanNode::EMPTY
+                }
+                .with_qual(QualLabel::OneTimeFilter, filter);
+                stage_count += 1;
+            }
             (index_conds[0], filters[0]) = single_relation_quals(
                 storage,
                 txid,
                 exposed,
                 def,
-                statement.where_clause,
+                scanned,
                 scan_indexes[0].as_ref(),
                 false,
                 arena,
@@ -3114,7 +3727,7 @@ pub(super) fn plan_select<'a>(
                 txid,
                 exposed,
                 def,
-                statement.where_clause,
+                scanned,
                 scan_indexes[0].as_ref(),
                 true,
                 arena,
@@ -3257,6 +3870,34 @@ pub(super) fn plan_select<'a>(
             post_filters[1] = quals.output_filter;
             filters[..2].copy_from_slice(&quals.scan_filters);
         }
+    }
+    if constant_false {
+        for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
+            plan.push(PlanNode {
+                depth: depth as u8,
+                output,
+                ..*stage
+            })?;
+        }
+        // An aggregate without grouping still aggregates the empty input;
+        // only a query without FROM counts its `Result`.
+        plan.push(PlanNode {
+            name: StackStr::from_str("Result"),
+            key: if aggregate && statement.group_by.is_empty() && scope.is_none() {
+                key(Role::Result)
+            } else {
+                None
+            },
+            depth: stage_count as u8,
+            output,
+            rows: 0,
+            width,
+            total_cost: 0.0,
+            constant_false: true,
+            ..PlanNode::EMPTY
+        })?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
     }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
         let mut stage = *stage;
@@ -3405,7 +4046,10 @@ pub(super) fn plan_select<'a>(
             let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
                 continue;
             };
+            // Locked rows carry their row identities out of the subquery,
+            // so PostgreSQL keeps its scan.
             let passes_through = from.joins.is_empty()
+                && body.locking.is_empty()
                 && statement
                     .items
                     .iter()
@@ -3426,6 +4070,395 @@ pub(super) fn plan_select<'a>(
     }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// A presorted key list as PostgreSQL prints it: its keys without their
+/// directions, which a sort's keys carry.
+fn presorted_text(keys: &PlanKeys, verbose: bool) -> Option<StackStr<512>> {
+    let (_, keys) = keys.shown(verbose)?;
+    let mut text = StackStr::new();
+    for (index, key) in keys.enumerate() {
+        if index != 0 {
+            let _ = write!(text, ", ");
+        }
+        let key = key
+            .split(" NULLS ")
+            .next()
+            .unwrap_or(key)
+            .trim_end_matches(" DESC");
+        let _ = write!(text, "{key}");
+    }
+    (!text.is_truncated()).then_some(text)
+}
+
+/// The expression an `ORDER BY` key sorts by: an output position or name
+/// stands for its select-list expression.
+fn order_key_expression<'e>(statement: &Select<'e>, key: &'e Expr<'e>) -> &'e Expr<'e> {
+    let item = match key {
+        Expr::Int(position) => usize::try_from(*position)
+            .ok()
+            .and_then(|position| statement.items.get(position.checked_sub(1)?)),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => statement.items.iter().find(
+            |item| matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name),
+        ),
+        _ => None,
+    };
+    match item {
+        Some(SelectItem::Expr { expression, .. }) => expression,
+        _ => key,
+    }
+}
+
+/// How many of the query's sort keys rows sorted by `sorted` already
+/// follow, when that is some: all of them needs no sort.
+fn presorted_order_keys(
+    statement: &Select<'_>,
+    keys: &[KeyItem<'_>],
+    sorted: &[crate::sql::ast::OrderBy<'_>],
+) -> Option<usize> {
+    let matched = keys
+        .iter()
+        .zip(sorted)
+        .take_while(|((key, order), held)| {
+            let (descending, nulls_first) = order.unwrap_or((false, false));
+            *order_key_expression(statement, key) == *held.expression
+                && held.descending == descending
+                && held.nulls_first == nulls_first
+        })
+        .count();
+    (matched != 0).then_some(matched)
+}
+
+/// PostgreSQL's window functions whose result does not depend on the frame,
+/// for which its planner evaluates the window `ROWS UNBOUNDED PRECEDING`.
+fn frame_independent(node: &Expr<'_>) -> bool {
+    let Expr::Call { name, .. } = node else {
+        return false;
+    };
+    [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+    ]
+    .iter()
+    .any(|function| name.eq_ignore_ascii_case(function))
+}
+
+/// A window definition as PostgreSQL's EXPLAIN prints it: `name AS
+/// (PARTITION BY ... ORDER BY ... frame)`, keys without their directions.
+#[expect(clippy::too_many_arguments, reason = "plan key context")]
+fn window_definition(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    name: &str,
+    spec: &crate::sql::ast::WindowSpec<'_>,
+    optimized_frame: bool,
+    verbose: bool,
+    arena: &Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    use crate::sql::ast::{FrameBound, FrameExclusion, FrameUnits};
+    let mut text = StackStr::<512>::new();
+    crate::sql::catalog::write_identifier(&mut text, name);
+    let _ = write!(text, " AS (");
+    let mut spaced = false;
+    let mut write_keys =
+        |text: &mut StackStr<512>, label: &str, items: &[KeyItem<'_>]| -> Result<bool, SqlError> {
+            if items.is_empty() {
+                return Ok(true);
+            }
+            let keys = plan_keys(
+                storage,
+                txid,
+                scope,
+                statement,
+                KeyLabel::Sort,
+                items,
+                arena,
+            )?;
+            let Some((_, keys)) = keys.shown(verbose) else {
+                return Ok(false);
+            };
+            if spaced {
+                let _ = write!(text, " ");
+            }
+            let _ = write!(text, "{label} ");
+            for (index, key) in keys.enumerate() {
+                if index != 0 {
+                    let _ = write!(text, ", ");
+                }
+                let _ = write!(text, "{key}");
+            }
+            spaced = true;
+            Ok(true)
+        };
+    let partition = arena
+        .alloc_slice_with(spec.partition_by.len(), |index| {
+            (spec.partition_by[index], None)
+        })
+        .map_err(|_| arena_full())?;
+    let order = arena
+        .alloc_slice_with(spec.order_by.len(), |index| {
+            (spec.order_by[index].expression, None)
+        })
+        .map_err(|_| arena_full())?;
+    if !write_keys(&mut text, "PARTITION BY", partition)?
+        || !write_keys(&mut text, "ORDER BY", order)?
+    {
+        return Ok(None);
+    }
+    let frame = if optimized_frame {
+        Some(crate::sql::ast::WindowFrame {
+            units: FrameUnits::Rows,
+            between: false,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+            exclusion: FrameExclusion::NoOthers,
+        })
+    } else {
+        spec.frame
+    };
+    if let Some(frame) = frame {
+        if spaced {
+            let _ = write!(text, " ");
+        }
+        let _ = write!(
+            text,
+            "{}",
+            match frame.units {
+                FrameUnits::Rows => "ROWS",
+                FrameUnits::Range => "RANGE",
+                FrameUnits::Groups => "GROUPS",
+            }
+        );
+        if frame.between {
+            let _ = write!(text, " BETWEEN");
+        }
+        let context = crate::sql::catalog::deparse::Context {
+            storage,
+            txid,
+            table: None,
+            parameters: &[],
+            joined: &[],
+            pretty: false,
+            qualify: false,
+            bare: None,
+            domain_value: None,
+            sublinks: Some(&registered_sublink),
+            folded: true,
+            arena,
+            dependencies: None,
+        };
+        let bound = |text: &mut StackStr<512>, bound: FrameBound<'_>| -> Result<bool, SqlError> {
+            let (offset, direction) = match bound {
+                FrameBound::UnboundedPreceding => {
+                    let _ = write!(text, " UNBOUNDED PRECEDING");
+                    return Ok(true);
+                }
+                FrameBound::UnboundedFollowing => {
+                    let _ = write!(text, " UNBOUNDED FOLLOWING");
+                    return Ok(true);
+                }
+                FrameBound::CurrentRow => {
+                    let _ = write!(text, " CURRENT ROW");
+                    return Ok(true);
+                }
+                FrameBound::Preceding(offset) => (offset, "PRECEDING"),
+                FrameBound::Following(offset) => (offset, "FOLLOWING"),
+            };
+            // The planner coerces a `ROWS` or `GROUPS` offset to bigint.
+            if frame.units != FrameUnits::Range
+                && let Expr::Int(value) = offset
+            {
+                let _ = write!(text, " '{value}'::bigint {direction}");
+                return Ok(true);
+            }
+            let mark = arena.mark();
+            let written = crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                offset,
+                crate::sql::catalog::deparse::Destination::Value,
+                arena,
+            )
+            .map(|part| {
+                part.map(|part| {
+                    let _ = write!(text, " {part} {direction}");
+                })
+                .is_some()
+            });
+            // SAFETY: the text was copied out of the arena.
+            unsafe { arena.rewind_to(mark) };
+            written
+        };
+        if !bound(&mut text, frame.start)? {
+            return Ok(None);
+        }
+        if frame.between {
+            let _ = write!(text, " AND");
+            if !bound(&mut text, frame.end)? {
+                return Ok(None);
+            }
+        }
+        let _ = write!(
+            text,
+            "{}",
+            match frame.exclusion {
+                FrameExclusion::NoOthers => "",
+                FrameExclusion::CurrentRow => " EXCLUDE CURRENT ROW",
+                FrameExclusion::Group => " EXCLUDE GROUP",
+                FrameExclusion::Ties => " EXCLUDE TIES",
+            }
+        );
+    }
+    let _ = write!(text, ")");
+    Ok((!text.is_truncated()).then_some(text))
+}
+
+/// The `WindowAgg` nodes of a query and the sorts of their inputs, bottom
+/// first, and the keys the last window leaves its rows sorted by. Each
+/// window clause sorts its input unless the rows already follow its keys,
+/// incrementally when they follow a prefix of them, as PostgreSQL plans.
+fn window_stages<'e>(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &'e Select<'e>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    block: BlockId,
+    arena: &'e Arena,
+) -> Result<(&'e [PlanNode], &'e [crate::sql::ast::OrderBy<'e>]), SqlError> {
+    let mut win_nodes = crate::mem::arena::ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            query::collect_windows(expression, &mut win_nodes, storage, txid, columns)?;
+        }
+    }
+    for order in statement.order_by {
+        query::collect_windows(order.expression, &mut win_nodes, storage, txid, columns)?;
+    }
+    let win_nodes = win_nodes.as_slice();
+    let windows = query::window_clauses(statement, win_nodes, arena)?;
+    let nodes = arena
+        .alloc_slice_with(windows.clauses.len() * 2, |_| PlanNode::EMPTY)
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = &[];
+    // Unnamed windows take the names `w1`, `w2`, ... the named ones leave.
+    let mut next_name = 1usize;
+    let last = windows.clauses.len().saturating_sub(1);
+    for (index, &(spec, name)) in windows.clauses.iter().enumerate() {
+        let position = u16::try_from(index).map_err(|_| arena_full())?;
+        let keys = query::window_sort_keys(spec, arena)?;
+        let held = keys.len() <= sorted.len() && *keys == sorted[..keys.len()];
+        if !keys.is_empty() && !held {
+            let presorted = keys
+                .iter()
+                .zip(sorted)
+                .take_while(|(key, held)| key == held)
+                .count();
+            let items = arena
+                .alloc_slice_with(keys.len(), |at| {
+                    (
+                        keys[at].expression,
+                        Some((keys[at].descending, keys[at].nulls_first)),
+                    )
+                })
+                .map_err(|_| arena_full())?;
+            let shown = plan_keys(
+                storage,
+                txid,
+                scope,
+                statement,
+                KeyLabel::Sort,
+                items,
+                arena,
+            )?;
+            let mut sort = PlanNode {
+                name: StackStr::from_str(if presorted == 0 {
+                    "Sort"
+                } else {
+                    "Incremental Sort"
+                }),
+                key: Some(NodeKey::new(block, Role::WindowSort(position))),
+                keys: shown,
+                ..PlanNode::EMPTY
+            };
+            if presorted != 0 {
+                let prefix = plan_keys(
+                    storage,
+                    txid,
+                    scope,
+                    statement,
+                    KeyLabel::Sort,
+                    &items[..presorted],
+                    arena,
+                )?;
+                sort = sort
+                    .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                    .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+            }
+            nodes[count] = sort;
+            count += 1;
+            sorted = keys;
+        }
+        let mut generated: StackStr<16>;
+        let name = match name {
+            Some(name) => name,
+            None => loop {
+                generated = StackStr::new();
+                let _ = write!(generated, "w{next_name}");
+                next_name += 1;
+                if !windows
+                    .clauses
+                    .iter()
+                    .any(|(_, held)| *held == Some(generated.as_str()))
+                {
+                    break generated.as_str();
+                }
+            },
+        };
+        let optimized_frame = win_nodes
+            .iter()
+            .zip(windows.of_node)
+            .filter(|(_, clause)| **clause == index)
+            .all(|(node, _)| frame_independent(node));
+        let definition = |verbose| {
+            window_definition(
+                storage,
+                txid,
+                scope,
+                statement,
+                name,
+                spec,
+                optimized_frame,
+                verbose,
+                arena,
+            )
+        };
+        nodes[count] = PlanNode {
+            name: StackStr::from_str("WindowAgg"),
+            key: Some(NodeKey::new(
+                block,
+                if index == last {
+                    Role::Window
+                } else {
+                    Role::WindowAgg(position)
+                },
+            )),
+            ..PlanNode::EMPTY
+        }
+        .with_qual(QualLabel::Window, definition(false)?)
+        .with_verbose_qual(QualLabel::Window, definition(true)?);
+        count += 1;
+    }
+    Ok((&nodes[..count], sorted))
 }
 
 /// The plan of a derived table's own query.
@@ -3549,9 +4582,10 @@ fn plan_keys(
             parameters: &[],
             joined,
             pretty: false,
-            qualify: verbose || relations > 1,
+            qualify: verbose || relations > 1 || shares_range_table(statement),
             bare: None,
             domain_value: None,
+            sublinks: Some(&registered_sublink),
             folded: true,
             arena,
             dependencies: None,
@@ -3633,6 +4667,33 @@ fn plan_keys(
         }
     }
     Ok(shown)
+}
+
+/// Whether the statement's range table holds relations besides this
+/// query's own: a subquery's, or the query around a subquery. PostgreSQL
+/// then qualifies the columns of sort and grouping keys.
+fn shares_range_table(statement: &Select<'_>) -> bool {
+    if SUBLINK_DEPTH.with(core::cell::Cell::get) != 0 {
+        return true;
+    }
+    let mut found = false;
+    let mut visit = |expression: &Expr<'_>| {
+        visit_sublinks(expression, &mut |node| {
+            found |= sublink_query(node).is_some()
+        });
+    };
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit(expression);
+        }
+    }
+    if let Some(condition) = statement.where_clause {
+        visit(condition);
+    }
+    if let Some(having) = statement.having {
+        visit(having);
+    }
+    found
 }
 
 /// The relations a block's sort and grouping keys read, as PostgreSQL names
@@ -3893,6 +4954,8 @@ fn physical_scan_node(
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
+        subplan: None,
+        shift: 0,
     }
 }
 
@@ -4046,6 +5109,8 @@ fn push_set_tree(
                 key: Some(NodeKey::new(block, role)),
                 verbose_quals: NO_QUALS,
                 schema: StackStr::new(),
+                subplan: None,
+                shift: 0,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -4205,14 +5270,42 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
     let SetTree::Select(branch) = first else {
         return PlanKeys::NONE;
     };
-    let column_name = |position: usize| match branch.items.get(position)? {
+    // A set operation's range table holds its branches, so PostgreSQL
+    // prints each key as the first branch's column, qualified by its
+    // relation.
+    let relation = branch.from.as_ref().and_then(|from| {
+        (from.joins.is_empty() && from.base.subquery.is_none() && from.base.func_args.is_none())
+            .then(|| from.base.alias.unwrap_or(from.base.table))
+    });
+    fn output_name<'s>(item: &SelectItem<'s>) -> Option<&'s str> {
+        match item {
+            SelectItem::Expr {
+                alias: Some(alias), ..
+            } => Some(alias),
+            SelectItem::Expr {
+                expression: Expr::Column { name, .. },
+                alias: None,
+            } => Some(name),
+            _ => None,
+        }
+    }
+    let column = |position: usize| match branch.items.get(position)? {
+        // A `VALUES` row's columns print bare, by their names.
+        item if branch.from.is_none() => Some((None, output_name(item)?)),
         SelectItem::Expr {
-            alias: Some(alias), ..
-        } => Some(*alias),
-        SelectItem::Expr {
-            expression: Expr::Column { name, .. },
-            alias: None,
-        } => Some(*name),
+            expression: Expr::Column { qualifier, name },
+            ..
+        } => match qualifier.or(relation) {
+            Some(qualifier) => Some((Some(qualifier), *name)),
+            // A `VALUES` list's columns print bare.
+            None if branch.from.as_ref().is_none_or(|from| {
+                from.joins.is_empty() && from.base.subquery.and_then(values_list).is_some()
+            }) =>
+            {
+                Some((None, *name))
+            }
+            None => None,
+        },
         _ => None,
     };
     let mut keys = PlanKeys {
@@ -4220,21 +5313,28 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
         ..PlanKeys::NONE
     };
     for (index, order) in query.order_by.iter().enumerate() {
-        let name = match order.expression {
+        let position = match order.expression {
             Expr::Int(position) => usize::try_from(*position)
                 .ok()
-                .and_then(|position| column_name(position.checked_sub(1)?)),
+                .and_then(|position| position.checked_sub(1)),
             Expr::Column {
                 qualifier: None,
                 name,
-            } => Some(*name),
+            } => branch
+                .items
+                .iter()
+                .position(|item| output_name(item).is_some_and(|output| output == *name)),
             _ => None,
         };
-        let Some(name) = name else {
+        let Some((qualifier, name)) = position.and_then(column) else {
             return PlanKeys::NONE;
         };
         if index != 0 {
             let _ = keys.plain.write_char(KEY_SEPARATOR);
+        }
+        if let Some(qualifier) = qualifier {
+            crate::sql::catalog::write_identifier(&mut keys.plain, qualifier);
+            let _ = keys.plain.write_char('.');
         }
         crate::sql::catalog::write_identifier(&mut keys.plain, name);
         if order.descending {
@@ -4453,6 +5553,8 @@ pub(super) fn plan_modification<'a>(
         schema: relation_slot(storage, txid, target.schema, target.name)
             .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
             .unwrap_or_default(),
+        subplan: None,
+        shift: 0,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -4615,6 +5717,7 @@ pub(super) fn plan_modification<'a>(
                 qualify: true,
                 bare: None,
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -4870,12 +5973,18 @@ fn property_indent(depth: u8) -> usize {
     }
 }
 
+/// The column `node`'s property lines start at, two further for each
+/// subplan it is nested in.
+fn node_indent(node: &PlanNode) -> usize {
+    property_indent(node.depth) + 2 * usize::from(node.shift)
+}
+
 fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> StackStr<2048> {
     let mut line = StackStr::new();
     // PostgreSQL indents each child's `->  ` arrow six columns past its
     // parent's, starting two columns in.
     if node.depth > 0 {
-        for _ in 0..property_indent(node.depth) - 6 {
+        for _ in 0..node_indent(node) - 6 {
             let _ = write!(line, " ");
         }
         let _ = write!(line, "->  ");
@@ -4939,6 +6048,16 @@ fn hash_table(actual: NodeActual) -> Option<query::instrument::HashTable> {
     }
 }
 
+/// How a sort node sorted while `EXPLAIN ANALYZE` ran: the method and the
+/// space of the rows it held, which pos3ql measures in its own row
+/// encoding, not PostgreSQL's allocator.
+fn sort_space(actual: NodeActual) -> Option<query::instrument::SortSpace> {
+    match actual {
+        NodeActual::Ran(counters) => counters.sort,
+        NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
+    }
+}
+
 /// The count of rows `label`'s qualification of `node` removed, when
 /// PostgreSQL shows one.
 fn removed_count(
@@ -4978,11 +6097,20 @@ pub(super) fn visit_text_rows<E>(
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
         let node_actual = plan.actual(index, actual);
+        // A subplan's name precedes it where its parent's children start.
+        if let Some((_, name)) = node.subplan.as_ref() {
+            let mut label = StackStr::<128>::new();
+            for _ in 0..node_indent(node) - 8 {
+                let _ = write!(label, " ");
+            }
+            let _ = write!(label, "{}", name.as_str());
+            emit(label.as_str())?;
+        }
         let line = text_line(node, options, node_actual);
         emit(line.as_str())?;
         if plan.disabled(node) {
             let mut disabled = StackStr::<512>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(disabled, " ");
             }
             let _ = write!(disabled, "Disabled: true");
@@ -4990,7 +6118,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if options.verbose && !node.output.as_str().is_empty() {
             let mut output = StackStr::<512>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(output, " ");
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
@@ -4998,7 +6126,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let _ = write!(line, "{label}: {}", keys.next().unwrap_or_default());
@@ -5007,9 +6135,23 @@ pub(super) fn visit_text_rows<E>(
             }
             emit(line.as_str())?;
         }
+        if let Some(space) = sort_space(node_actual).filter(|_| node.name.as_str() == "Sort") {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Sort Method: {}  {}: {}kB",
+                space.method.name(),
+                space.method.space_type(),
+                space.bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
         for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(qual, " ");
             }
             let _ = write!(qual, "{}: {}", label.text(), text);
@@ -5019,16 +6161,32 @@ pub(super) fn visit_text_rows<E>(
                 && removed > 0.0
             {
                 let mut line = StackStr::<128>::new();
-                for _ in 0..property_indent(node.depth) {
+                for _ in 0..node_indent(node) {
                     let _ = write!(line, " ");
                 }
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
         }
+        if let NodeActual::Ran(NodeCounters {
+            stored: Some(bytes),
+            ..
+        }) = node_actual
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Storage: Memory  Maximum Storage: {}kB",
+                bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
         if let Some(table) = hash_table(node_actual) {
             let mut line = StackStr::<256>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let memory = table.bytes.div_ceil(1024);
@@ -5049,7 +6207,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if node.constant_false {
             let mut filter = StackStr::<64>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(filter, " ");
             }
             let _ = write!(filter, "One-Time Filter: false");
@@ -5159,6 +6317,9 @@ pub(super) fn plan_statement<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    if block == BlockId::ROOT {
+        reset_subplans();
+    }
     match statement {
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
@@ -5691,6 +6852,9 @@ fn structured_node(
     if let Some(relationship) = relationship {
         document.text("Parent Relationship", relationship);
     }
+    if let Some((_, name)) = node.subplan.as_ref() {
+        document.text("Subplan Name", name.as_str());
+    }
     document.boolean("Parallel Aware", false);
     document.boolean("Async Capable", false);
     if kind.scan_direction {
@@ -5772,6 +6936,11 @@ fn structured_node(
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);
     }
+    if let Some(space) = sort_space(node_actual).filter(|_| node.name.as_str() == "Sort") {
+        document.text("Sort Method", space.method.name());
+        document.number("Sort Space Used", space.bytes.div_ceil(1024));
+        document.text("Sort Space Type", space.method.space_type());
+    }
     if node.constant_false {
         document.text("One-Time Filter", "false");
     }
@@ -5783,10 +6952,22 @@ fn structured_node(
         document.number("Peak Memory Usage", table.bytes.div_ceil(1024));
     }
     for (label, text) in node.shown_qualifications(options.verbose) {
+        if label == QualLabel::PresortedKey {
+            document.list(label.text(), text.split(", "));
+            continue;
+        }
         document.text(label.text(), text);
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
         }
+    }
+    if let NodeActual::Ran(NodeCounters {
+        stored: Some(bytes),
+        ..
+    }) = node_actual
+    {
+        document.text("Storage", "Memory");
+        document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if let Some(actual) = actual {
         if options.buffers {
@@ -5801,11 +6982,20 @@ fn structured_node(
     }
     let mut next = at + 1;
     let mut children = 0;
+    let mut inputs = 0;
     while next < plan.count && plan.nodes[next].depth == node.depth + 1 {
         if children == 0 {
             document.open_group("Plans", Some("Plans"), false);
         }
-        let relationship = if children == 0 { "Outer" } else { "Inner" };
+        // A subplan is no input of its parent: its first input is the outer.
+        let relationship = match plan.nodes[next].subplan.as_ref() {
+            Some((kind, _)) => kind.relationship(),
+            None if inputs == 0 => "Outer",
+            None => "Inner",
+        };
+        if plan.nodes[next].subplan.is_none() {
+            inputs += 1;
+        }
         next = structured_node(
             document,
             plan,

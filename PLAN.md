@@ -669,30 +669,70 @@ and distinct keys that are planner constants, as PostgreSQL does (a constant
 `DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
 the constants the planner folds them into (`'2'::double precision`). Times are measured
 per loop, to the first row and to the end; in pos3ql's push-based executor a
-node's time also includes the work of the nodes reading its rows. Not yet
-shown: subplans and InitPlans (a condition with a subquery prints no
-`Filter`), semi joins, the `Sort Method`, aggregate and `Materialize`
-storage lines that PostgreSQL measures in its own allocator, per-node `Buffers` and `WAL` (reported on the top node
-only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
-heap scan's `Heap Blocks`. A node of a path the executor does not count (a
-data-modifying `WITH`, a joined `UPDATE` or `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports the
-statement's rows; a `LIMIT` that stops `Unique` early leaves its `Sort`
-without figures, as pos3ql deduplicates before sorting. Where pos3ql's plan
-differs from PostgreSQL's cost-based one the figures are those of the plan it
-shows and runs: it hashes the second of two joined relations where PostgreSQL
-may hash the smaller filtered one, joins three or more relations in nested
-loops where PostgreSQL may hash them, sorts before `DISTINCT ... ORDER BY`
-where PostgreSQL may hash first, shows no window's input `Sort` or `Window:`
-line, and does not flatten a distinct union of more than two inputs into one
-`Append`. Notices carry
-no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
-calls with constant arguments are not folded once while planning: `SELECT
-timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where
-PostgreSQL warns once, and a later constant error (`SELECT
-timestamptypmodin('{7}'), 1/0`) is reported without the warning PostgreSQL's
-folding raised first. Folding needs each statement to keep its folded values
-for every later evaluation, including after a pause, before it can replace
-the per-row evaluation. Errors in a client's query report
+node's time also includes the work of the nodes reading its rows. A locking
+clause plans a `LockRows` node below the `Limit`, which counts the rows it
+locked. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
+`top-N heapsort` when a limit directly above bounds it and it read more than
+twice the bound, which pos3ql then also keeps to a heap of the bounded rows;
+`external merge` when its rows spilled to disk) and the space of the rows it
+held in pos3ql's own encoding, which differs from PostgreSQL's allocator
+figures. Each window clause plans its own `WindowAgg` in PostgreSQL's
+evaluation order, named `w1`, `w2`, ... when unnamed and printing its
+`Window:` definition (with the `ROWS UNBOUNDED PRECEDING` frame PostgreSQL
+gives windows of frame-independent functions), over a `Sort` of its input
+or an `Incremental Sort` when the rows already follow a prefix of its keys;
+a query `ORDER BY` the last window's rows follow needs no sort. Under
+`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own. A
+condition folded to false keeps the query's sort, limit, row locks,
+aggregation and windows over a `Result` with a false `One-Time Filter`. A
+subquery the planner does not merge runs as a subplan: an uncorrelated
+scalar, `EXISTS` or `ARRAY` subquery as `InitPlan n` under the query's top
+node (referenced as `(InitPlan n).col1`, and gating the scan from a `Result`
+when a condition reads only such subplans), a correlated one in the select
+list or `WHERE` of a one-relation query as `SubPlan n` after the inputs of the
+node evaluating it, numbered as PostgreSQL plans them, with the subplan's
+relations named uniquely (`u_1`). Not yet shown: `IN`/`ANY`/`ALL`/row
+subqueries as subplans, a correlated subquery of a join, the `Result` that
+PostgreSQL adds above a sorted, limited query to run select-list subplans
+after the sort, a subplan's figures under `ANALYZE` (its nodes print none:
+execution counts every subquery's operators in one block), `CTE` InitPlans
+and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
+merged into the statement, under a generated name when its relation's name
+clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
+them as per-row subqueries), an incremental sort's `ANALYZE` group lines,
+`VERBOSE` output lists of windows and expressions (the output columns' names
+are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
+and `WAL` (reported on the top node only), trigger time lines, an index-only
+scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A node of a path
+the executor does not count (a data-modifying `WITH`, a joined `UPDATE` or
+`DELETE`, `MERGE`) prints no actual figures, except the top node, which reports
+the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
+joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`
+early leaves its `Sort` without figures, as pos3ql deduplicates before
+sorting; a `LIMIT` over a locking query without `ORDER BY` reads every row
+where PostgreSQL's `LockRows` stops early. Where pos3ql's plan differs from
+PostgreSQL's cost-based one the figures are those of the plan it shows and
+runs: it hashes the second of two joined relations where PostgreSQL may hash
+the smaller filtered one, joins three or more relations in nested loops where
+PostgreSQL may hash them, sorts before `DISTINCT ... ORDER BY` (and a
+distinct union) where PostgreSQL may hash first, plans a grouped query whose
+condition is false with `HashAggregate` where PostgreSQL may sort, and does
+not flatten a distinct union of more than two inputs into one `Append`. A
+`top-N heapsort` of input that spills before the sort ends is reported as
+`external merge`. Notices carry
+no position (`''::tsquery` points at the literal in PostgreSQL). A constant
+error that folding reaches after a notice or warning (`SELECT
+timestamptypmodin('{7}'), 1/0` or `SELECT ''::tsquery, 1/0`) is reported
+without the earlier message, which PostgreSQL sends first. `EXPLAIN` plans
+the statement as written, without the planner's constant folding: a
+condition prints its constants unfolded (`Filter: (a > (1 + 1))` where
+PostgreSQL prints `(a > 2)`, and an `UPDATE` or `DELETE` whose condition
+is `WHERE 1 = 2` keeps its scan where PostgreSQL plans a `Result` with a
+false `One-Time Filter`), and a plain
+`EXPLAIN` raises none of the folding's notices or errors. Folding while
+planning needs the resumable executor that PL/pgSQL calls run in, which the
+planner does not have; an `EXPLAIN ANALYZE` of a statement that calls a
+PL/pgSQL function fails with `0A000`. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a

@@ -140,9 +140,6 @@ pub fn set_query<'a>(
     };
 
     // ORDER BY (by output column position or name), then LIMIT/OFFSET.
-    if let Err(e) = sort_set_rows(storage, txid, arena, rows, q.order_by, &columns[..n_cols]) {
-        return sql_fail(e);
-    }
     let offset = match exec::eval_offset_pub(q.offset, arena, params, &bound_hooks, None) {
         Ok(o) => o,
         Err(e) => return sql_fail(e),
@@ -151,6 +148,18 @@ pub fn set_query<'a>(
         Ok(l) => l,
         Err(e) => return sql_fail(e),
     };
+    if let Err(e) = sort_set_rows(
+        storage,
+        txid,
+        arena,
+        rows,
+        q.order_by,
+        &columns[..n_cols],
+        set_sort_bound(q.limit.is_some(), q.with_ties, limit, offset),
+        stages.sort,
+    ) {
+        return sql_fail(e);
+    }
 
     responder.row_description(&columns[..n_cols])?;
     let start = (offset as usize).min(rows.len());
@@ -293,6 +302,8 @@ pub(crate) fn set_query_into_rows<'a>(
         None,
         &mut (0, 0),
     )?;
+    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks, None)?;
+    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks, None)?;
     sort_set_rows(
         storage,
         txid,
@@ -300,9 +311,9 @@ pub(crate) fn set_query_into_rows<'a>(
         rows,
         query.order_by,
         &columns[..column_count],
+        set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset),
+        instrument::node(instrument::Role::Sort),
     )?;
-    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks, None)?;
-    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks, None)?;
     let start = (offset as usize).min(rows.len());
     let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
     if query.with_ties && limit > 0 && end < rows.len() && end > start {
@@ -845,6 +856,7 @@ pub(crate) fn external_set_body_into<'a>(
     else {
         return Ok(());
     };
+    let limit_written = limit.is_some();
     let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks, outer)?;
     let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks, outer)?;
     // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
@@ -868,10 +880,17 @@ pub(crate) fn external_set_body_into<'a>(
             )
         };
         push_run(storage, &mut reader, run, &mut sorter, &mut compare)?;
-        storage
+        if let Some(bound) = set_sort_bound(limit_written, with_ties, limit, offset) {
+            sorter.keep_least(bound, &mut compare)?;
+        }
+        let sorted = storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
             .expect("spill-attached block store")?
-            .unwrap_or(run)
+            .unwrap_or(run);
+        if let Some(space) = sorter.space() {
+            stages.sort.sorted(space);
+        }
+        sorted
     };
     let mut reader = storage.external_run_reader()?;
     storage
@@ -997,14 +1016,23 @@ fn external_set_query<'a>(
         if let Err(error) = push_run(storage, &mut reader, run, &mut sorter, &mut compare) {
             return sql_fail(error);
         }
-        match storage
+        if let Some(bound) = set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset)
+            && let Err(error) = sorter.keep_least(bound, &mut compare)
+        {
+            return sql_fail(error);
+        }
+        let sorted = match storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
             .expect("spill-attached block store")
         {
             Ok(Some(run)) => run,
             Ok(None) => unreachable!("sorting a non-empty run stays non-empty"),
             Err(error) => return sql_fail(error),
+        };
+        if let Some(space) = sorter.space() {
+            stages.sort.sorted(space);
         }
+        sorted
     };
     let mut reader = match storage.external_run_reader() {
         Ok(reader) => reader,
@@ -2328,6 +2356,10 @@ pub(crate) fn set_rows_tie(
     Ok(true)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sort keys and their limit's bound"
+)]
 pub(crate) fn sort_set_rows(
     storage: &Storage,
     txid: u32,
@@ -2335,6 +2367,8 @@ pub(crate) fn sort_set_rows(
     rows: &mut [&[u8]],
     order_by: &[OrderBy],
     columns: &[ColDesc],
+    bound: Option<usize>,
+    sort: instrument::Node,
 ) -> Result<(), SqlError> {
     if order_by.is_empty() {
         return Ok(());
@@ -2378,10 +2412,28 @@ pub(crate) fn sort_set_rows(
         nk += 1;
     }
     let keys = &keys[..nk];
-    crate::mem::arena::try_stable_sort_via(
-        arena,
-        rows,
-        |a, b| compare_set_order(storage, txid, columns, a, b, keys),
-        |_| arena_full(),
-    )
+    let compare = |a: &&[u8], b: &&[u8]| compare_set_order(storage, txid, columns, a, b, keys);
+    // Past twice its limit's bound the sort keeps only a heap of the rows
+    // the limit returns, as PostgreSQL's does.
+    let bound = bound.filter(|&bound| rows.len() > bound * 2);
+    match bound {
+        Some(bound) => {
+            crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| arena_full())?
+        }
+        None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
+    }
+    sort.sorted(instrument::SortSpace::in_memory(rows, bound.is_some()));
+    Ok(())
+}
+
+/// The rows a limit over a set operation's sort reads, which bounds the
+/// sort; none with `WITH TIES`, which reads past them, or without a limit.
+pub(crate) fn set_sort_bound(
+    query_limited: bool,
+    with_ties: bool,
+    limit: u64,
+    offset: u64,
+) -> Option<usize> {
+    (query_limited && limit != u64::MAX && !with_ties)
+        .then(|| offset.saturating_add(limit).min(usize::MAX as u64) as usize)
 }

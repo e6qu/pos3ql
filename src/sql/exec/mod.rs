@@ -24058,6 +24058,42 @@ fn trigger_label_prefix(statement: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((name, label[end + 2..].trim_start()))
 }
 
+/// `text` from its first token: whitespace and comments before it skipped,
+/// block comments nesting as PostgreSQL's scanner nests them.
+fn skip_leading_comments(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        if let Some(rest) = text.strip_prefix("--") {
+            text = rest.find('\n').map_or("", |end| &rest[end + 1..]);
+        } else if text.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut at = 0usize;
+            let bytes = text.as_bytes();
+            while at < bytes.len() {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+            if depth != 0 {
+                // An unterminated comment is the lexer's error to report.
+                return text;
+            }
+            text = &text[at..];
+        } else {
+            return text;
+        }
+    }
+}
+
 fn trigger_control_header<'a>(
     statement: &'a str,
     arena: &Arena,
@@ -24078,7 +24114,7 @@ fn trigger_control_header<'a>(
     }
     for keyword in ["loop", "else", "begin", "declare", "exception"] {
         if let Some(rest) = strip_trigger_keyword(content, keyword) {
-            let rest = rest.trim();
+            let rest = skip_leading_comments(rest).trim_end();
             return Ok((!rest.is_empty())
                 .then_some((statement[..content_offset + keyword.len()].trim_end(), rest)));
         }
@@ -24114,7 +24150,7 @@ fn trigger_control_header<'a>(
         }
         return Ok(None);
     }
-    let rest = content[at + terminator.len()..].trim();
+    let rest = skip_leading_comments(&content[at + terminator.len()..]).trim_end();
     Ok((!rest.is_empty()).then_some((
         statement[..content_offset + at + terminator.len()].trim_end(),
         rest,
@@ -24145,34 +24181,40 @@ fn split_trigger_statements<'a>(
         let remaining = &body[start..];
         // Only offsets leave scratch. Unescaped strings and folded identifiers
         // are discarded before allocating the retained statement directory.
-        let (boundary, consumed) = arena
+        // A statement starts at its first token: comments before it are
+        // not part of it.
+        let (first, boundary, consumed) = arena
             .with_remaining_region(|scratch| {
                 let mut lexer = Lexer::new(remaining, scratch);
                 let mut depth = 0usize;
+                let mut first = None;
                 loop {
                     let token = lexer.next_token().map_err(|error| {
                         super::parse_error_to_sql(&super::parser::ParseError::lexical(
                             error, remaining,
                         ))
                     })?;
+                    if !matches!(token, Tok::Eof) && first.is_none() {
+                        first = Some(lexer.token_start());
+                    }
                     match token {
                         Tok::Op("(") => depth += 1,
                         Tok::Op(")") if depth > 0 => depth -= 1,
                         Tok::Op(";") if depth == 0 => {
-                            return Ok((lexer.token_start(), lexer.token_end()));
+                            return Ok((first, lexer.token_start(), lexer.token_end()));
                         }
                         Tok::Eof => {
                             if depth != 0 {
                                 return Err(incomplete_trigger_body());
                             }
-                            return Ok((remaining.len(), remaining.len()));
+                            return Ok((first, remaining.len(), remaining.len()));
                         }
                         _ => {}
                     }
                 }
             })
             .map_err(|_| super::query::arena_full_pub())??;
-        let statement = remaining[..boundary].trim();
+        let statement = remaining[first.unwrap_or(boundary)..boundary].trim();
         if !statement.is_empty() {
             append_trigger_control(statement, &mut statements, arena)?;
         }

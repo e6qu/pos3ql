@@ -12452,7 +12452,9 @@ fn outer_join_nulls(from: &FromClause<'_>, index: usize) -> bool {
             crate::sql::ast::JoinKind::Full => index <= right,
             crate::sql::ast::JoinKind::Inner
             | crate::sql::ast::JoinKind::Cross
-            | crate::sql::ast::JoinKind::Comma => false,
+            | crate::sql::ast::JoinKind::Comma
+            | crate::sql::ast::JoinKind::Semi
+            | crate::sql::ast::JoinKind::Anti => false,
         }
     })
 }

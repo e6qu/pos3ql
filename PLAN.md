@@ -698,12 +698,24 @@ subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
 list (`make_sort_input_target`), which hosts the list's subplans; execution
 still evaluates the list before sorting, so such a subplan runs, and a
 routine is called, once per input row where PostgreSQL runs it only for the
-rows the sort and limit return. Not yet shown: `IN`/`ANY`/`ALL`/row
+rows the sort and limit return. A top-level query's `WHERE` conjunct
+`EXISTS`, `NOT EXISTS` or `x IN` over a subquery that reads one stored table
+with only a non-volatile condition (correlated for `EXISTS`, uncorrelated
+for `IN`) becomes a semi or anti join, as PostgreSQL's `pull_up_sublinks`
+makes it, and runs as one: two relations joined by column equalities hash
+the smaller side (`Hash Semi Join`, `Hash Anti Join`, or the `Hash Right`
+forms when the query's relation is smaller), others loop over a
+materialized copy (`Nested Loop Semi Join`), whose scan reads only as far
+as a loop needed. Such a subquery stays a subplan when it reads a relation
+named like one of the query's, when a second subquery reads the same
+relation (PostgreSQL names it `t_1`), and PostgreSQL's alternatives of
+hashing an expression key (`(big.id + 1) = b2.id`) or joining the unique
+subquery rows (`Hash Join` over a `HashAggregate`) are not planned. Not
+yet shown: `IN`/`ANY`/`ALL`/row
 subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
-clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
-them as per-row subqueries), an incremental sort's `ANALYZE` group lines,
+clashes), an incremental sort's `ANALYZE` group lines,
 `VERBOSE` output lists of windows and expressions (the output columns' names
 are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only

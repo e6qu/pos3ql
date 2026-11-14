@@ -6502,7 +6502,20 @@ pub(crate) struct HashJoinPlan<'a> {
     /// The build rows no probe row matched are returned NULL-extended after
     /// the probe, as PostgreSQL's Hash Right and Hash Full joins return them.
     preserves_build_rows: bool,
+    /// A pulled-up subquery's semi or anti join.
+    filter_join: Option<FilterJoin>,
     build_capacity: usize,
+}
+
+/// How a hash plan runs a semi or anti join. PostgreSQL hashes the smaller
+/// side: the subquery's rows (`Hash Semi Join`, `Hash Anti Join`), or the
+/// query's own (`Hash Right Semi Join`, `Hash Right Anti Join`), whose rows
+/// the subquery's then probe.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FilterJoin {
+    anti: bool,
+    /// The query's own rows probe the hashed subquery rows.
+    probes_left: bool,
 }
 
 /// A hash plan's sources and keys, as a retained reader rebuilds it.
@@ -6520,6 +6533,14 @@ impl<'a> HashJoinPlan<'a> {
     /// PostgreSQL's name for this join node: the outer (probe) side's rows
     /// are preserved by a left join, the inner (hashed) side's by a right join.
     pub(crate) fn node_name(&self) -> &'static str {
+        if let Some(join) = self.filter_join {
+            return match (join.anti, join.probes_left) {
+                (false, true) => "Hash Semi Join",
+                (true, true) => "Hash Anti Join",
+                (false, false) => "Hash Right Semi Join",
+                (true, false) => "Hash Right Anti Join",
+            };
+        }
         match (self.preserves_probe_rows, self.preserves_build_rows) {
             (false, false) => "Hash Join",
             (true, false) => "Hash Left Join",
@@ -6541,7 +6562,7 @@ impl<'a> HashJoinPlan<'a> {
         where_clause: Option<&'a Expr<'a>>,
         arena: &'a Arena,
     ) -> Result<Option<HashJoinFilters<'a, 'a>>, SqlError> {
-        if !self.preserves_probe_rows && !self.preserves_build_rows {
+        if !self.preserves_probe_rows && !self.preserves_build_rows && self.filter_join.is_none() {
             return Ok(None);
         }
         let side = |table: usize, preserved: bool, nullable: bool| {
@@ -6572,6 +6593,24 @@ impl<'a> HashJoinPlan<'a> {
             }
             Ok::<_, SqlError>(&own[..kept])
         };
+        // A semi or anti join's query rows take the `WHERE` conjuncts that
+        // read only them, as a left join's do; the subquery's rows take the
+        // condition's conjuncts that read only them.
+        if let Some(join) = self.filter_join {
+            let (left, right) = if join.probes_left {
+                (self.probe_table, self.build_table)
+            } else {
+                (self.build_table, self.probe_table)
+            };
+            let left = side(left, true, false)?;
+            let right = side(right, false, true)?;
+            let (probe, build) = if join.probes_left {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            return Ok(Some(HashJoinFilters { probe, build }));
+        }
         Ok(Some(HashJoinFilters {
             probe: side(
                 self.probe_table,
@@ -6706,14 +6745,35 @@ pub(crate) fn select_hash_join_plan<'a>(
             }
         },
         JoinKind::Full => swapped(true, true)?,
+        // The smaller side is hashed, the subquery's on a tie.
+        JoinKind::Semi | JoinKind::Anti => {
+            match (capacity(first_table)?, capacity(second_table)?) {
+                (Some(left), Some(right)) if left < right => {
+                    Some((second_table, first_table, false, false, left))
+                }
+                (_, Some(right)) => Some((first_table, second_table, false, false, right)),
+                (Some(left), None) => Some((second_table, first_table, false, false, left)),
+                (None, None) => None,
+            }
+        }
     };
     let Some((probe_table, build_table, preserves_probe_rows, preserves_build_rows, rows)) = sides
     else {
         return Ok(None);
     };
     let on = join.on.or(scope.join_on[0]);
-    let Some((keys, key_count)) =
-        hash_join_keys(scope, on, where_clause, probe_table, build_table)?
+    let filter_join = join.kind.is_semi_or_anti().then_some(FilterJoin {
+        anti: join.kind == JoinKind::Anti,
+        probes_left: probe_table == first_table,
+    });
+    // A semi or anti join's keys come from its own condition: the query's
+    // `WHERE` never reads the subquery's rows.
+    let keyed_where = if filter_join.is_some() {
+        None
+    } else {
+        where_clause
+    };
+    let Some((keys, key_count)) = hash_join_keys(scope, on, keyed_where, probe_table, build_table)?
     else {
         return Ok(None);
     };
@@ -6740,6 +6800,7 @@ pub(crate) fn select_hash_join_plan<'a>(
         on,
         preserves_probe_rows,
         preserves_build_rows,
+        filter_join,
         build_capacity,
     }))
 }
@@ -7134,6 +7195,32 @@ struct DepthNodes {
     materialize: instrument::Node,
     /// The join adding the depth's relation.
     join: instrument::Node,
+    /// The scan under a semi or anti join's materialized copy, which
+    /// PostgreSQL reads only as far as the furthest loop needed: it counts
+    /// just the rows past that point.
+    lazy_scan: instrument::Node,
+}
+
+thread_local! {
+    /// Per depth of a semi or anti join's nested loop: how many inner rows
+    /// its materialized copy has read, and how many the current loop has.
+    static MATERIALIZED_READS: core::cell::RefCell<[(u64, u64); 64]> =
+        const { core::cell::RefCell::new([(0, 0); 64]) };
+}
+
+/// Advances a semi or anti join's loop at `depth` by one inner row, and
+/// whether the materialized copy had to read it from the scan.
+fn materialized_read(depth: usize) -> bool {
+    MATERIALIZED_READS.with(|reads| {
+        let mut reads = reads.borrow_mut();
+        let Some((read, position)) = reads.get_mut(depth) else {
+            return false;
+        };
+        *position += 1;
+        let fresh = *position > *read;
+        *read = (*read).max(*position);
+        fresh
+    })
 }
 
 impl DepthNodes {
@@ -7141,7 +7228,26 @@ impl DepthNodes {
         scan: instrument::Node::NONE,
         materialize: instrument::Node::NONE,
         join: instrument::Node::NONE,
+        lazy_scan: instrument::Node::NONE,
     };
+
+    /// Counts an inner row the scan returned.
+    fn scanned(self, depth: usize) {
+        if !self.lazy_scan.measured() {
+            self.scan.row();
+        } else if materialized_read(depth) {
+            self.lazy_scan.row();
+        }
+    }
+
+    /// Counts an inner row the scan's filter removed.
+    fn scan_filtered(self, depth: usize) {
+        if !self.lazy_scan.measured() {
+            self.scan.filtered();
+        } else if materialized_read(depth) {
+            self.lazy_scan.filtered();
+        }
+    }
 
     fn of(order: &[usize], depth: usize) -> Self {
         let position = |table: usize| u16::try_from(table).unwrap_or(u16::MAX);
@@ -7158,6 +7264,7 @@ impl DepthNodes {
             } else {
                 instrument::node(instrument::Role::Join(position(depth)))
             },
+            lazy_scan: instrument::Node::NONE,
         }
     }
 }
@@ -7561,11 +7668,13 @@ fn scan_source_mode<'a>(
         let nodes = HashJoinNodes::of(probe_t, build_t);
         // An outer join's `WHERE` is PostgreSQL's filter of the join's
         // output; an inner join's is its join filter.
-        let where_removed = if plan.preserves_probe_rows || plan.preserves_build_rows {
-            instrument::Node::filtered
-        } else {
-            instrument::Node::join_filtered
-        };
+        let where_removed =
+            if plan.preserves_probe_rows || plan.preserves_build_rows || plan.filter_join.is_some()
+            {
+                instrument::Node::filtered
+            } else {
+                instrument::Node::join_filtered
+            };
         // Whether a row of `table` alone passes its scan's conjuncts.
         let scan_passes = |table: usize,
                            row: BoundRow<'a>,
@@ -7603,7 +7712,11 @@ fn scan_source_mode<'a>(
         let nkeys = plan.key_count;
         let key_collations = plan.key_collations;
         let on = plan.on;
-        let keep_build = plan.preserves_build_rows;
+        let filter_join = plan.filter_join;
+        // A right anti join returns the query rows it hashed that nothing
+        // matched, as a right join returns its unmatched build rows.
+        let right_anti = filter_join.is_some_and(|join| join.anti && !join.probes_left);
+        let keep_build = plan.preserves_build_rows || right_anti;
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs.get(build_t).expect("resolved");
         let build_derived_rows = scope.derived[build_t];
@@ -7659,9 +7772,9 @@ fn scan_source_mode<'a>(
                 if !keyed && !keep_build {
                     return Ok(());
                 }
-                if keyed {
-                    nodes.hash.row();
-                }
+                // PostgreSQL's hash reports the NULL-keyed rows it keeps for
+                // returning unmatched too.
+                nodes.hash.row();
                 if n == entries.len() {
                     // Double the entries and rehash them into twice as many
                     // buckets. Chains keep their order: later rows first.
@@ -7930,6 +8043,35 @@ fn scan_source_mode<'a>(
                             continue;
                         }
                         matched_any = true;
+                        if let Some(join) = filter_join {
+                            // An anti join only notes the match; a semi join
+                            // returns each query row once.
+                            let returned = entries[candidate].matched;
+                            entries[candidate].matched = true;
+                            if join.anti {
+                                if join.probes_left {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if !join.probes_left && returned {
+                                continue;
+                            }
+                            if let Some(predicate) = where_clause
+                                && !where_passes(predicate, arena, params, &chained, hooks)?
+                            {
+                                where_removed(nodes.join);
+                            } else {
+                                nodes.join.row();
+                                if !f(&row)? {
+                                    return Ok(false);
+                                }
+                            }
+                            if join.probes_left {
+                                break;
+                            }
+                            continue;
+                        }
                         entries[candidate].matched = true;
                         if let Some(predicate) = where_clause
                             && !where_passes(predicate, arena, params, &chained, hooks)?
@@ -7943,7 +8085,8 @@ fn scan_source_mode<'a>(
                         }
                     }
                 }
-                if !matched_any && plan.preserves_probe_rows {
+                let anti_probe = filter_join.is_some_and(|join| join.anti && join.probes_left);
+                if !matched_any && (plan.preserves_probe_rows || anti_probe) {
                     let mut bound = [None::<BoundRow>; 2];
                     let mut rowids = [None; 2];
                     bound[probe_t] = Some(probe_row);
@@ -8190,13 +8333,13 @@ fn scan_source_mode<'a>(
             let chained_row = Chained { inner: &row, outer };
             for &conjunct in conjuncts.scan {
                 if !conjunct_passes(conjunct, arena, params, &chained_row, hooks)? {
-                    nodes.scan.filtered();
+                    nodes.scan_filtered(count - 1);
                     return Ok(false);
                 }
             }
         }
         if scope.n >= 2 {
-            nodes.scan.row();
+            nodes.scanned(count - 1);
             nodes.materialize.row();
         }
         if let Some(on) = on {
@@ -8411,13 +8554,29 @@ fn scan_source_mode<'a>(
         // nested loop rescans, whose scan runs only the first time.
         let nodes = depth_nodes[depth];
         let _materialize_loop = nodes.materialize.start();
-        let nodes = if nodes.materialize.measured() && nodes.scan.loops() != 0 {
-            DepthNodes {
-                scan: instrument::Node::NONE,
-                ..nodes
-            }
-        } else {
-            nodes
+        let first_loop = nodes.scan.loops() == 0;
+        let lazy = nodes.materialize.measured()
+            && depth > 0
+            && from.joins[depth - 1].kind.is_semi_or_anti();
+        if lazy {
+            MATERIALIZED_READS.with(|reads| {
+                if let Some(read) = reads.borrow_mut().get_mut(depth) {
+                    *read = (if first_loop { 0 } else { read.0 }, 0);
+                }
+            });
+        }
+        let nodes = DepthNodes {
+            scan: if nodes.materialize.measured() && !first_loop {
+                instrument::Node::NONE
+            } else {
+                nodes.scan
+            },
+            lazy_scan: if lazy {
+                nodes.scan
+            } else {
+                instrument::Node::NONE
+            },
+            ..nodes
         };
         let _scan_loop = nodes.scan.start();
 
@@ -8459,6 +8618,51 @@ fn scan_source_mode<'a>(
                     on,
                 )? {
                     Ok(true)
+                } else if let Some(kind) = join
+                    .map(|join| join.kind)
+                    .filter(|kind| kind.is_semi_or_anti())
+                {
+                    // A semi join returns its left row with the first match
+                    // and an anti join drops it: either way this level's
+                    // scan ends here, while the levels around it continue.
+                    matched_any = true;
+                    let keep = kind == JoinKind::Anti
+                        || filter_join_resumed(
+                            depth + 1,
+                            level(
+                                storage,
+                                scope,
+                                from,
+                                txid,
+                                where_clause,
+                                arena,
+                                params,
+                                hooks,
+                                outer,
+                                depth + 1,
+                                bound,
+                                bound_rowids,
+                                matched,
+                                external_match_writer,
+                                security_plans,
+                                pushdown,
+                                depth_nodes,
+                                sample_plans,
+                                order,
+                                parameterized,
+                                keyed,
+                                indexed,
+                                decode_buffers,
+                                recycle_rows,
+                                retain_match,
+                                pax_demand,
+                                f,
+                            )?,
+                        );
+                    if keep {
+                        FILTER_JOIN_STOPPED.with(|stopped| stopped.set(depth));
+                    }
+                    Ok(false)
                 } else {
                     matched_any = true;
                     level(
@@ -8490,6 +8694,7 @@ fn scan_source_mode<'a>(
                         pax_demand,
                         f,
                     )
+                    .map(|keep| filter_join_resumed(depth + 1, keep))
                 }
             }};
         }
@@ -9133,47 +9338,67 @@ fn scan_source_mode<'a>(
         }
         // LEFT/FULL join with no match at this level: emit one null row (the
         // left side preserved, this table nulled).
-        if !matched_any && join.is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full)) {
+        if !matched_any
+            && join
+                .is_some_and(|j| matches!(j.kind, JoinKind::Left | JoinKind::Full | JoinKind::Anti))
+        {
             bound[order[depth]] = None;
             bound_rowids[order[depth]] = None;
             if depth + 1 < scope.n {
                 nodes.join.row();
             }
-            if !level(
-                storage,
-                scope,
-                from,
-                txid,
-                where_clause,
-                arena,
-                params,
-                hooks,
-                outer,
+            if !filter_join_resumed(
                 depth + 1,
-                bound,
-                bound_rowids,
-                matched,
-                external_match_writer,
-                security_plans,
-                pushdown,
-                depth_nodes,
-                sample_plans,
-                order,
-                parameterized,
-                keyed,
-                indexed,
-                decode_buffers,
-                recycle_rows,
-                retain_match,
-                pax_demand,
-                f,
-            )? {
+                level(
+                    storage,
+                    scope,
+                    from,
+                    txid,
+                    where_clause,
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                    depth + 1,
+                    bound,
+                    bound_rowids,
+                    matched,
+                    external_match_writer,
+                    security_plans,
+                    pushdown,
+                    depth_nodes,
+                    sample_plans,
+                    order,
+                    parameterized,
+                    keyed,
+                    indexed,
+                    decode_buffers,
+                    recycle_rows,
+                    retain_match,
+                    pax_demand,
+                    f,
+                )?,
+            ) {
                 return Ok(false);
             }
         }
         bound[order[depth]] = None;
         bound_rowids[order[depth]] = None;
         Ok(true)
+    }
+
+    thread_local! {
+        /// The depth of the semi or anti join whose scan the last `false`
+        /// from [`level`] ended, which its caller continues past.
+        static FILTER_JOIN_STOPPED: core::cell::Cell<usize> =
+            const { core::cell::Cell::new(usize::MAX) };
+    }
+
+    /// Whether the join continues after [`level`] at `depth` returned
+    /// `keep`: a semi or anti join's scan ending at its match stops only
+    /// that level.
+    fn filter_join_resumed(depth: usize, keep: bool) -> bool {
+        keep || FILTER_JOIN_STOPPED.with(|stopped| stopped.replace(usize::MAX) == depth)
     }
 
     // Predicate pushdown: assign each error-safe WHERE conjunct to the join

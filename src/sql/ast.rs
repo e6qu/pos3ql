@@ -3860,6 +3860,15 @@ pub enum JoinKind {
     /// item, so later USING, NATURAL and ON clauses cannot see the tables
     /// before it.
     Comma,
+    /// A `WHERE` clause's `EXISTS` or `IN` subquery pulled up into the
+    /// query (PostgreSQL's `pull_up_sublinks`): each left row is returned
+    /// once when some right row satisfies the condition. The parser never
+    /// produces it, and the right item's columns answer only qualified
+    /// references.
+    Semi,
+    /// A pulled-up `NOT EXISTS` subquery: each left row is returned when no
+    /// right row satisfies the condition.
+    Anti,
 }
 
 impl JoinKind {
@@ -3872,6 +3881,12 @@ impl JoinKind {
     /// `LATERAL` right side cannot read its left side.
     pub const fn is_right_or_full(self) -> bool {
         matches!(self, Self::Right | Self::Full)
+    }
+
+    /// Whether the join is a pulled-up subquery's: its right item only
+    /// decides which left rows are returned.
+    pub const fn is_semi_or_anti(self) -> bool {
+        matches!(self, Self::Semi | Self::Anti)
     }
 }
 

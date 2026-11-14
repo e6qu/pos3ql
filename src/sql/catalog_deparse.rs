@@ -149,13 +149,20 @@ impl<'s> Columns<'s> {
     }
 }
 
+/// The name a FROM item prints under: a pulled-up subquery's relation
+/// answers to its own name behind a NUL byte, which no SQL identifier
+/// contains (see `JoinKind::Semi`).
+pub(crate) fn printed_name(name: &str) -> &str {
+    name.strip_prefix('\0').unwrap_or(name)
+}
+
 impl<'s> Joined<'s> {
     pub(crate) fn new(name: &'s str, table: &'s TableDef) -> Self {
         Self {
             name,
-            printed: name,
+            printed: printed_name(name),
             columns: Columns::Table(table),
-            unqualified: true,
+            unqualified: !name.starts_with('\0'),
             addressable: true,
             level: 0,
             row_type: None,

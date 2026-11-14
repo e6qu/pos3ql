@@ -82,6 +82,7 @@ mod row_layout;
 mod row_lock_conflicts;
 mod runtime_input_validity;
 mod runtime_plan_invalidation;
+mod semi_joins;
 mod sequence_inheritance;
 mod shared_dependencies;
 mod shared_dependency_databases;

@@ -1410,11 +1410,12 @@ fn resolve_relation(
         Some(qualifier) => relations
             .iter()
             .position(|(exposed, table)| *exposed == qualifier && has(table)),
+        // A pulled-up subquery's relation answers only qualified names.
         None => {
             let mut found = relations
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, table))| has(table))
+                .filter(|(_, (exposed, table))| !exposed.starts_with('\0') && has(table))
                 .map(|(index, _)| index);
             match (found.next(), found.next()) {
                 (Some(index), None) => Some(index),
@@ -1556,7 +1557,9 @@ fn outer_join_quals<'a>(
                 }
                 let kind = joins[depth - 1].kind;
                 let pushed_down = match (kind, single) {
-                    (JoinKind::Left, Some(relation)) => relation == depth,
+                    (JoinKind::Left | JoinKind::Semi | JoinKind::Anti, Some(relation)) => {
+                        relation == depth
+                    }
                     (JoinKind::Right | JoinKind::Inner, Some(relation)) => {
                         (kind == JoinKind::Inner || relation < depth)
                             && !nulled_below(relation, depth)
@@ -2734,16 +2737,17 @@ fn scan_node<'a>(
     let mut relation = StackStr::new();
     let mut schema = StackStr::new();
     let mut alias = StackStr::new();
+    let exposed = crate::sql::catalog::deparse::printed_name(scope.names[table]);
     match scope.defs.stored(table).filter(|_| !derived) {
         Some(definition) => {
             let _ = write!(relation, "{}", definition.name.as_str());
             let _ = write!(schema, "{}", definition.schema.as_str());
-            if scope.names[table] != definition.name.as_str() {
-                let _ = write!(alias, "{}", scope.names[table]);
+            if exposed != definition.name.as_str() {
+                let _ = write!(alias, "{exposed}");
             }
         }
         None => {
-            let _ = write!(alias, "{}", scope.names[table]);
+            let _ = write!(alias, "{exposed}");
         }
     }
     let mut bitmap_index = StackStr::new();
@@ -3918,6 +3922,8 @@ fn plan_pulled_select<'a>(
                 crate::sql::ast::JoinKind::Left
                     | crate::sql::ast::JoinKind::Right
                     | crate::sql::ast::JoinKind::Full
+                    | crate::sql::ast::JoinKind::Semi
+                    | crate::sql::ast::JoinKind::Anti
             )
             && let Some(condition) = join.on.or(scope.join_on[0])
             && let (Some(first), Some(second)) = (relation(0), relation(1))
@@ -4960,6 +4966,8 @@ fn values_list<'s>(select: &'s Select<'s>) -> Option<&'s SetTree<'s>> {
 /// join's when several are listed).
 fn join_node(kind: Option<crate::sql::ast::JoinKind>, hash: bool) -> &'static str {
     match (kind, hash) {
+        (Some(crate::sql::ast::JoinKind::Semi), false) => "Nested Loop Semi Join",
+        (Some(crate::sql::ast::JoinKind::Anti), false) => "Nested Loop Anti Join",
         (Some(crate::sql::ast::JoinKind::Left), true) => "Hash Left Join",
         (Some(crate::sql::ast::JoinKind::Left), false) => "Nested Loop Left Join",
         // The executor keeps each preserved row that found no match.
@@ -6916,7 +6924,7 @@ struct NodeKind<'n> {
     node_type: &'n str,
     strategy: Option<&'static str>,
     operation: Option<&'n str>,
-    join_type: Option<&'static str>,
+    join_type: Option<&'n str>,
     index_name: Option<&'n str>,
     scan_direction: bool,
 }
@@ -6942,23 +6950,20 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
             kind.strategy = Some("Hashed");
         }
         "Nested Loop" | "Hash Join" => kind.join_type = Some("Inner"),
-        "Nested Loop Left Join" => {
-            kind.node_type = "Nested Loop";
-            kind.join_type = Some("Left");
+        // `Nested Loop Left Join`, `Hash Right Semi Join`, ...: the node
+        // type, then the join type.
+        _ => {
+            let joined = name
+                .strip_prefix("Nested Loop ")
+                .map(|rest| ("Nested Loop", rest))
+                .or_else(|| name.strip_prefix("Hash ").map(|rest| ("Hash Join", rest)));
+            if let Some((node_type, rest)) = joined
+                && let Some(join_type) = rest.strip_suffix(" Join")
+            {
+                kind.node_type = node_type;
+                kind.join_type = Some(join_type);
+            }
         }
-        "Hash Left Join" => {
-            kind.node_type = "Hash Join";
-            kind.join_type = Some("Left");
-        }
-        "Hash Right Join" => {
-            kind.node_type = "Hash Join";
-            kind.join_type = Some("Right");
-        }
-        "Hash Full Join" => {
-            kind.node_type = "Hash Join";
-            kind.join_type = Some("Full");
-        }
-        _ => {}
     }
     kind
 }

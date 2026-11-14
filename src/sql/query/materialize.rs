@@ -1077,6 +1077,13 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         "a locked row changed on the nullable side of a full join"
                     ));
                 }
+                // A locking query keeps its subqueries in place.
+                crate::sql::ast::JoinKind::Semi | crate::sql::ast::JoinKind::Anti => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a locking query joined a pulled-up subquery"
+                    ));
+                }
             }
         }
         let joined = sources_row(scope, bound, order, rowids);

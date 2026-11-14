@@ -97,7 +97,11 @@ pub(crate) fn pull_up_subqueries<'a>(
         }
     }
     current = super::outer_joins::reduce_outer_joins(current, storage, txid, arena, outer)?;
-    for step in [push_down_restrictions, move_having_to_where] {
+    for step in [
+        pull_up_sublinks,
+        push_down_restrictions,
+        move_having_to_where,
+    ] {
         let mark = arena.mark();
         match step(current, storage, txid, arena, outer) {
             Ok(rewritten) => current = rewritten,
@@ -641,6 +645,15 @@ fn pull_up_one<'a>(
     }
     // Inner subqueries first, as PostgreSQL pulls up bottom-up.
     let body = pull_up_subqueries(body, storage, txid, arena, None)?;
+    // A subquery's pulled-up subqueries join last in its own FROM clause.
+    if body.from.as_ref().is_some_and(|body_from| {
+        body_from
+            .joins
+            .iter()
+            .any(|join| join.kind.is_semi_or_anti())
+    }) {
+        return Err(Stop::Keep);
+    }
     let body_from = body.from.as_ref();
     let nullable = match body_from {
         Some(body_from) => nullable_position(from, position, body_from)?,
@@ -2021,4 +2034,353 @@ fn computes_outputs(body: &Select<'_>) -> bool {
         }
         _ => false,
     })
+}
+
+/// The most FROM items a query keeps after its subqueries become joins.
+const MAX_FILTER_JOIN_ITEMS: usize = 16;
+
+/// Turns each `WHERE` conjunct `EXISTS (subquery)`, `NOT EXISTS (subquery)`
+/// and `expression IN (subquery)` of a top-level query into a semi or anti
+/// join with the subquery's relation, as PostgreSQL's `pull_up_sublinks`
+/// does, so the subquery's rows are read once rather than per row. The
+/// subquery must read one stored table and carry only a condition: no
+/// grouping, bounds, locking or volatile functions. `EXISTS` must and `IN`
+/// must not read the query's columns, and the `IN` operand must.
+///
+/// The joined table answers to its name prefixed with a NUL byte, which no
+/// SQL identifier contains, so nothing outside its condition can name it.
+fn pull_up_sublinks<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Step<&'a Select<'a>> {
+    let (Some(from), Some(condition)) = (select.from.as_ref(), select.where_clause) else {
+        return Ok(select);
+    };
+    if outer.is_some()
+        || select.set_body.is_some()
+        || !select.locking.is_empty()
+        || merges_columns(from)
+        || !condition.contains_subquery()
+    {
+        return Ok(select);
+    }
+    let count = 1 + from.joins.len();
+    if (0..count).any(|index| item(from, index).join_members.is_some())
+        || from.joins.iter().any(|join| join.kind.is_semi_or_anti())
+    {
+        return Ok(select);
+    }
+    let outer_scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    for index in 0..outer_scope.n {
+        if outer_scope.names[..index].contains(&outer_scope.names[index]) {
+            return Ok(select);
+        }
+    }
+    let mut conjuncts = crate::mem::arena::ArenaList::new(arena);
+    flatten_and(Some(condition), &mut conjuncts).map_err(|_| Stop::full())?;
+    let mut joins = crate::mem::arena::ArenaList::new(arena);
+    for join in from.joins {
+        joins.push(*join).map_err(|_| Stop::full())?;
+    }
+    let mut remaining = None;
+    for &conjunct in conjuncts.as_slice() {
+        let pulled = if count + joins.len() - from.joins.len() < MAX_FILTER_JOIN_ITEMS {
+            sublink_join(conjunct, &outer_scope, storage, txid, arena)?
+        } else {
+            None
+        };
+        // Two subqueries of one relation keep the second in place, as
+        // their joined names would clash.
+        let pulled = pulled.filter(|join| {
+            !joins.as_slice()[from.joins.len()..]
+                .iter()
+                .any(|held| held.table.alias == join.table.alias)
+        });
+        match pulled {
+            Some(join) => joins.push(join).map_err(|_| Stop::full())?,
+            None => remaining = super::and_where(remaining, Some(conjunct), arena)?,
+        }
+    }
+    if joins.len() == from.joins.len() {
+        return Ok(select);
+    }
+    // `*` lists the query's own items only.
+    let mut items = crate::mem::arena::ArenaList::new(arena);
+    for item in select.items {
+        if matches!(item, SelectItem::Wildcard(_)) {
+            for &name in &outer_scope.names[..outer_scope.n] {
+                items
+                    .push(SelectItem::TableWildcard(name))
+                    .map_err(|_| Stop::full())?;
+            }
+        } else {
+            items.push(*item).map_err(|_| Stop::full())?;
+        }
+    }
+    let rewritten = &*arena
+        .alloc(Select {
+            items: items.into_mut_slice().map_err(|_| Stop::full())?,
+            from: Some(FromClause {
+                base: from.base,
+                joins: joins.into_mut_slice().map_err(|_| Stop::full())?,
+            }),
+            where_clause: remaining,
+            ..*select
+        })
+        .map_err(|_| Stop::full())?;
+    // The joined tables must resolve as stored tables.
+    let scope = QueryScope::resolve_schema(
+        storage,
+        rewritten.from.as_ref().expect("built"),
+        txid,
+        arena,
+        None,
+    )?;
+    if (outer_scope.n..scope.n).any(|table| scope.derived[table].is_some()) {
+        return Err(Stop::Keep);
+    }
+    Ok(rewritten)
+}
+
+/// The semi or anti join a `WHERE` conjunct becomes, if it pulls up.
+fn sublink_join<'a>(
+    conjunct: &'a Expr<'a>,
+    outer_scope: &QueryScope<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Step<Option<Join<'a>>> {
+    let (subquery, kind, operand) = match conjunct {
+        Expr::Exists(subquery) => (*subquery, JoinKind::Semi, None),
+        Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand: Expr::Exists(subquery),
+            ..
+        } => (*subquery, JoinKind::Anti, None),
+        Expr::InSubquery {
+            operand,
+            select,
+            negated: false,
+        } => (*select, JoinKind::Semi, Some(*operand)),
+        _ => return Ok(None),
+    };
+    let Some(sub_from) = subquery.from.as_ref() else {
+        return Ok(None);
+    };
+    let table = &sub_from.base;
+    if subquery.set_body.is_some()
+        || !subquery.with.is_empty()
+        || !sub_from.joins.is_empty()
+        || !subquery.group_by.is_empty()
+        || !subquery.grouping_sets.is_empty()
+        || subquery.having.is_some()
+        || !subquery.windows.is_empty()
+        || subquery.limit.is_some()
+        || subquery.offset.is_some()
+        || !subquery.locking.is_empty()
+        || !subquery.distinct_on.is_empty()
+        || table.subquery.is_some()
+        || table.is_function_source()
+        || table.cte.is_some()
+        || table.sample.is_some()
+        || table.lateral
+        || table.col_alias.is_some()
+        || table.join_members.is_some()
+        || table.view_access.is_some()
+        || table.table.contains('\0')
+    {
+        return Ok(None);
+    }
+    let condition = subquery.where_clause;
+    if condition.is_some_and(|condition| {
+        condition.contains_subquery()
+            || super::expression_contains_volatile(condition, storage, txid, false)
+    }) || operand.is_some_and(|operand| {
+        operand.contains_subquery()
+            || super::expression_contains_volatile(operand, storage, txid, false)
+    }) {
+        return Ok(None);
+    }
+    // EXISTS ignores its list; IN compares its one column.
+    let compared = match operand {
+        None => {
+            if !subquery.items.iter().all(|item| match item {
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
+                SelectItem::Expr { expression, .. } => matches!(
+                    expression,
+                    Expr::Null
+                        | Expr::Bool(_)
+                        | Expr::Int(_)
+                        | Expr::Float(_)
+                        | Expr::NumericLit(_)
+                        | Expr::Str(_)
+                        | Expr::Column { .. }
+                ),
+                SelectItem::RecordStar(_) => false,
+            }) {
+                return Ok(None);
+            }
+            None
+        }
+        Some(_) => match subquery.items {
+            [
+                SelectItem::Expr {
+                    expression: column @ Expr::Column { .. },
+                    ..
+                },
+            ] => Some(*column),
+            _ => return Ok(None),
+        },
+    };
+    let inner_scope = match QueryScope::resolve_schema(storage, sub_from, txid, arena, None) {
+        Ok(scope) => scope,
+        Err(_) => return Ok(None),
+    };
+    let inner_name = inner_scope.names[0];
+    // EXPLAIN names the joined relation as written, which must stay unique.
+    if inner_scope.derived[0].is_some() || outer_scope.names[..outer_scope.n].contains(&inner_name)
+    {
+        return Ok(None);
+    }
+    let hidden = arena
+        .alloc_str_display(format_args!("\0{inner_name}"))
+        .map_err(|_| Stop::full())?;
+    // Each column reference: the subquery's own, qualified by its hidden
+    // name, or the query's, which must answer it. Anything else (an
+    // enclosing query's column, a whole row) keeps the subquery in place.
+    let mut correlated = false;
+    let mut unbindable = false;
+    let mut requalify = |expression: &'a Expr<'a>| -> Step<&'a Expr<'a>> {
+        rewrite_expression(expression, arena, &mut |node| match node {
+            Expr::Column { qualifier, name } => {
+                let inner = match qualifier {
+                    Some(qualifier) if qualifier.contains('.') => {
+                        unbindable = true;
+                        false
+                    }
+                    Some(qualifier) if *qualifier == inner_name => {
+                        unbindable |= inner_scope
+                            .find_column_unsuggested(Some(qualifier), name)
+                            .is_err();
+                        true
+                    }
+                    Some(_) => false,
+                    None => inner_scope.find_column_unsuggested(None, name).is_ok(),
+                };
+                if inner {
+                    return Ok(Some(&*arena.alloc(Expr::Column {
+                        qualifier: Some(hidden),
+                        name,
+                    })?));
+                }
+                if outer_scope
+                    .find_column_unsuggested(*qualifier, name)
+                    .is_ok()
+                {
+                    correlated = true;
+                } else {
+                    unbindable = true;
+                }
+                Ok(None)
+            }
+            Expr::WholeRow(_)
+            | Expr::SchemaColumn { .. }
+            | Expr::RoutineParam { .. }
+            | Expr::RecursiveState { .. }
+            | Expr::OuterAggregate { .. }
+            | Expr::Param(_) => {
+                unbindable = true;
+                Ok(None)
+            }
+            _ => Ok(None),
+        })
+        .map_err(|_: crate::mem::arena::ArenaFull| Stop::full())
+    };
+    let condition = match condition {
+        Some(condition) => Some(requalify(condition)?),
+        None => None,
+    };
+    let compared = match compared {
+        Some(compared) => Some(requalify(compared)?),
+        None => None,
+    };
+    let read_outer = correlated;
+    if unbindable {
+        return Ok(None);
+    }
+    let condition = match (operand, compared) {
+        (Some(operand), Some(compared)) => {
+            // The subquery must not read the query; its operand must.
+            if read_outer {
+                return Ok(None);
+            }
+            let mut operand_columns = true;
+            let mut operand_reads = false;
+            operand.for_each_column_reference(&mut |qualifier, name| {
+                if outer_scope.find_column_unsuggested(qualifier, name).is_ok() {
+                    operand_reads = true;
+                } else {
+                    operand_columns = false;
+                }
+            });
+            if !operand_columns || !operand_reads || has_unbound_node(operand) {
+                return Ok(None);
+            }
+            let equality = &*arena
+                .alloc(Expr::Binary {
+                    source_position: SourcePosition::UNKNOWN,
+                    operator: crate::sql::ast::BinaryOp::Eq,
+                    left: operand,
+                    right: compared,
+                })
+                .map_err(|_| Stop::full())?;
+            super::and_where(Some(equality), condition, arena)?
+        }
+        _ => {
+            if !read_outer {
+                return Ok(None);
+            }
+            condition
+        }
+    };
+    Ok(Some(Join {
+        table: TableRef {
+            alias: Some(hidden),
+            ..*table
+        },
+        kind,
+        on: condition,
+        using: None,
+        natural: false,
+    }))
+}
+
+/// Whether `expression` holds a node a semi join's operand cannot read.
+fn has_unbound_node(expression: &Expr<'_>) -> bool {
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found |= matches!(
+            child,
+            Expr::WholeRow(_)
+                | Expr::SchemaColumn { .. }
+                | Expr::RoutineParam { .. }
+                | Expr::RecursiveState { .. }
+                | Expr::OuterAggregate { .. }
+                | Expr::Param(_)
+        ) || has_unbound_node(child);
+        Ok(())
+    });
+    found
+        || matches!(
+            expression,
+            Expr::WholeRow(_)
+                | Expr::SchemaColumn { .. }
+                | Expr::RoutineParam { .. }
+                | Expr::RecursiveState { .. }
+                | Expr::OuterAggregate { .. }
+                | Expr::Param(_)
+        )
 }

@@ -670,6 +670,10 @@ pub struct QueryScope<'d> {
     /// Set while adding the right side of a `RIGHT` or `FULL` join, which
     /// may not read the join's other side even when `LATERAL`.
     right_of_outer_join: bool,
+    /// The first FROM item a pulled-up subquery's semi or anti join added.
+    /// Those items, which follow every other, answer only qualified names:
+    /// the query around the subquery never saw them.
+    filter_join_from: usize,
     /// The rows of the first FROM item a hash join of a data-modifying
     /// statement's target found for the current target row, in scan order.
     /// The statement's conditions still decide each of them.
@@ -1456,7 +1460,16 @@ impl<'d> QueryScope<'d> {
         arena: &'d Arena,
         from: &FromClause<'d>,
     ) -> Result<Self, SqlError> {
-        Self::empty_sources(storage, txid, arena, from.joins.len() + 1, from.joins.len())
+        let mut scope =
+            Self::empty_sources(storage, txid, arena, from.joins.len() + 1, from.joins.len())?;
+        if let Some(index) = from
+            .joins
+            .iter()
+            .position(|join| join.kind.is_semi_or_anti())
+        {
+            scope.filter_join_from = index + 1;
+        }
+        Ok(scope)
     }
 
     pub(super) fn singleton(
@@ -1557,6 +1570,7 @@ impl<'d> QueryScope<'d> {
             hidden_origins: &[],
             lateral_from: 0,
             right_of_outer_join: false,
+            filter_join_from: usize::MAX,
             target_hash_candidates: None,
         })
     }
@@ -4070,7 +4084,9 @@ impl<'d> QueryScope<'d> {
             }
             None => {
                 let mut found = None;
-                for table in items.filter(|&table| self.stores_rows(table)) {
+                for table in
+                    items.filter(|&table| table < self.filter_join_from && self.stores_rows(table))
+                {
                     if found.is_some() {
                         return Err(sql_err!(
                             crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
@@ -4232,6 +4248,7 @@ impl<'d> QueryScope<'d> {
                 }
             }
             None => {
+                let items = items.start..items.end.min(self.filter_join_from);
                 // Unqualified names resolve against the join tree's output
                 // columns: a USING/NATURAL-merged column appears there once,
                 // so referencing it is not ambiguous.

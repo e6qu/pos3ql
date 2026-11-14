@@ -34097,7 +34097,7 @@ fn execute_static_rewritten_write<'a>(
     local_values: &mut [Datum<'a>],
     into: Option<PlpgsqlInto<'a>>,
     status: &mut TriggerExecutionStatus<'a>,
-    progress: Option<&mut RowProgress>,
+    mut progress: Option<&mut RowProgress>,
 ) -> Result<(), SqlError> {
     let arena = context.arena;
     let txid = context.txn.txid;
@@ -34123,11 +34123,11 @@ fn execute_static_rewritten_write<'a>(
     with_bound_parameter_types(bound.parameter_types, || {
         let mut returning =
             StaticReturning::new(context, locals, targets.definition, into, *statement)?;
-        let mut capture =
-            |_: &Storage,
-             _: u32,
-             _: &dyn crate::sql::eval::SequenceAccess,
-             values: &[Datum<'_>]| { returning.capture(values, arena) };
+        returning.resume(progress.as_deref(), arena)?;
+        let mut capture = StaticReturningSink {
+            returning: &mut returning,
+            arena,
+        };
         let result = execute_nested_data_modification(
             context,
             statement,
@@ -34135,8 +34135,9 @@ fn execute_static_rewritten_write<'a>(
             transition_relations,
             returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
             &mut status.pending_write,
-            progress,
+            progress.as_deref_mut(),
         );
+        returning.keep(progress, arena, &context.storage().row_work)?;
         match result {
             Ok(rows) => {
                 let width = returning.width;
@@ -39269,6 +39270,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Insert(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -39288,11 +39290,9 @@ fn execute_trigger_step_in<'a>(
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     insert(
                         storage,
@@ -39359,6 +39359,11 @@ fn execute_trigger_step_in<'a>(
                     return Ok(None);
                 }
                 leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -39490,6 +39495,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Update(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -39515,11 +39521,9 @@ fn execute_trigger_step_in<'a>(
                 })?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     update(
                         storage,
@@ -39577,7 +39581,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -39701,6 +39710,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Delete(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -39726,11 +39736,9 @@ fn execute_trigger_step_in<'a>(
                 })?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     delete(
                         storage,
@@ -39787,7 +39795,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -39882,6 +39895,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Merge(*statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -39900,11 +39914,9 @@ fn execute_trigger_step_in<'a>(
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     merge(
                         storage,
@@ -39959,7 +39971,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -41074,6 +41091,9 @@ struct StaticReturning<'a> {
     rows: u64,
     /// The columns of the first returned row.
     width: usize,
+    /// The first returned row as the statement returned it, kept with an
+    /// interrupted attempt.
+    first: Option<&'a [Datum<'a>]>,
 }
 
 impl<'a> StaticReturning<'a> {
@@ -41121,11 +41141,53 @@ impl<'a> StaticReturning<'a> {
             selected: [Datum::Null; MAX_COLUMNS],
             rows: 0,
             width: 0,
+            first: None,
         })
+    }
+
+    /// Continues with the rows the earlier attempts of an interrupted write
+    /// returned.
+    fn resume(&mut self, progress: Option<&RowProgress>, arena: &'a Arena) -> Result<(), SqlError> {
+        let Some((rows, first)) = progress
+            .map(|progress| progress.resumed_into_rows(arena))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        if let Some(first) = first {
+            self.capture(first, arena)?;
+        }
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// Keeps the returned rows with an interrupted write's unfinished row.
+    fn keep(
+        &self,
+        progress: Option<&mut RowProgress>,
+        arena: &Arena,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> Result<(), SqlError> {
+        match progress {
+            Some(progress) if self.into.is_some() => {
+                progress.keep_into_rows(self.rows, self.first, arena, pool)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
         if self.rows == 0 && self.into.is_some() {
+            let mut first = [Datum::Null; MAX_COLUMNS];
+            for (slot, value) in first.iter_mut().zip(values) {
+                *slot = detached_trigger_datum(*value, arena)?;
+            }
+            self.first = Some(
+                arena
+                    .alloc_slice_copy(&first[..values.len()])
+                    .map_err(|_| super::query::arena_full_pub())?,
+            );
             self.width = values.len();
             match self.record {
                 Some(fields) => {
@@ -41173,6 +41235,31 @@ impl<'a> StaticReturning<'a> {
             self.selected[0] = Datum::Record(row);
         }
         Ok(&self.selected[..into.targets.len()])
+    }
+}
+
+/// A static data change's RETURNING destination. With INTO it asks for two
+/// rows, as PL/pgSQL's executor call does: one to assign and one to prove
+/// the result is not a single row, so the change stops after its second
+/// returned row.
+struct StaticReturningSink<'s, 'a> {
+    returning: &'s mut StaticReturning<'a>,
+    arena: &'a Arena,
+}
+
+impl super::ReturningSink for StaticReturningSink<'_, '_> {
+    fn row(
+        &mut self,
+        _: &Storage,
+        _: u32,
+        _: &dyn crate::sql::eval::SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError> {
+        self.returning.capture(values, self.arena)
+    }
+
+    fn row_limit(&self) -> Option<u64> {
+        self.returning.into.map(|_| 2)
     }
 }
 
@@ -81067,7 +81154,10 @@ fn merge_target<'a>(
     // unfinished row.
     let mut matched = false;
     let rows_outcome = (|| -> Outcome {
-        loop {
+        'rows: loop {
+            if returning_satisfied(&capture, affected_count) {
+                break;
+            }
             let by_source = source_index == source_rows.len();
             if by_source && !has_not_matched_by_source {
                 break;
@@ -81264,6 +81354,9 @@ fn merge_target<'a>(
             let resumed = core::mem::take(&mut resumed_match);
             matched = by_source || resumed.matched;
             for j in core::mem::take(&mut first_target)..n_target {
+                if returning_satisfied(&capture, affected_count) {
+                    break 'rows;
+                }
                 if core::mem::take(&mut resumed_lost_pair) == Some(j) {
                     run_not_matched!(source_index * stride + n_target + j);
                     continue;
@@ -82314,6 +82407,7 @@ fn merge_target<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, affected_count)),
     )
 }
 
@@ -83895,6 +83989,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                 };
                 (|| -> Outcome {
                     for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                        if returning_satisfied(&capture, affected) {
+                            break;
+                        }
                         match row_progress::start_row(
                             progress.as_deref_mut(),
                             row_index,
@@ -84013,6 +84110,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                 };
                 (|| -> Outcome {
                     for (row_index, row) in insert.rows.iter().enumerate().skip(first) {
+                        if returning_satisfied(&capture, affected) {
+                            break;
+                        }
                         match row_progress::start_row(
                             progress.as_deref_mut(),
                             row_index,
@@ -84170,6 +84270,9 @@ pub(crate) fn instead_of_view_dml<'a>(
             };
             (|| -> Outcome {
                 for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    if returning_satisfied(&capture, affected) {
+                        break;
+                    }
                     match row_progress::start_row(
                         progress.as_deref_mut(),
                         row_index,
@@ -84446,6 +84549,9 @@ pub(crate) fn instead_of_view_dml<'a>(
             };
             (|| -> Outcome {
                 for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    if returning_satisfied(&capture, affected) {
+                        break;
+                    }
                     match row_progress::start_row(
                         progress.as_deref_mut(),
                         row_index,
@@ -85626,14 +85732,16 @@ where
                              responder: &mut Responder<'_>,
                              index: usize,
                              bytes: &'a [u8],
-                             streamed: Option<&'a [Datum<'a>]>|
+                             streamed: Option<&'a [Datum<'a>]>,
+                             capture: &mut Option<&mut super::ReturningCapture<'_>>,
+                             inserted: &mut u64|
          -> Outcome {
             {
                 match row_progress::start_row(
                     progress.as_deref_mut(),
                     index,
                     None,
-                    inserted,
+                    *inserted,
                     row_progress::capture_lengths([
                         transition_capture.as_ref(),
                         conflict_transition_capture.as_ref(),
@@ -85650,7 +85758,7 @@ where
                             ChangedRow {
                                 index,
                                 row: None,
-                                changed: inserted,
+                                changed: *inserted,
                                 transitions: row_progress::capture_lengths([
                                     transition_capture.as_ref(),
                                     conflict_transition_capture.as_ref(),
@@ -85669,10 +85777,10 @@ where
                             arena,
                             params,
                             responder,
-                            &mut capture,
+                            capture,
                             seq_session,
                         )? {
-                            Ok(()) => inserted += 1,
+                            Ok(()) => *inserted += 1,
                             Err(error) => return sql_fail(error),
                         }
                         return sql_ok();
@@ -85824,14 +85932,14 @@ where
                     params,
                     services,
                     responder,
-                    &mut capture,
+                    capture,
                     transition_capture.as_mut(),
                     conflict_transition_capture.as_mut(),
                     conflict_outer,
                     progress.as_deref_mut(),
-                    (index, inserted),
+                    (index, *inserted),
                 )? {
-                    Ok(true) => inserted += 1,
+                    Ok(true) => *inserted += 1,
                     Ok(false) => {}
                     Err(error) => return sql_fail(error),
                 }
@@ -85841,7 +85949,20 @@ where
         let rows_outcome = match stream.as_mut() {
             None => (|| -> Outcome {
                 for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
-                    match write_row(storage, txn, services, responder, index, bytes, None)? {
+                    if returning_satisfied(&capture, inserted) {
+                        break;
+                    }
+                    match write_row(
+                        storage,
+                        txn,
+                        services,
+                        responder,
+                        index,
+                        bytes,
+                        None,
+                        &mut capture,
+                        &mut inserted,
+                    )? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
                     }
@@ -85867,12 +85988,19 @@ where
                             index,
                             &[],
                             Some(values),
+                            &mut capture,
+                            &mut inserted,
                         )? {
                             Ok(()) => {}
                             Err(error) => return sql_fail(error),
                         }
                     }
                     index += 1;
+                    if returning_satisfied(&capture, inserted) {
+                        // The executor stops pulling source rows once its
+                        // destination has every row it asked for.
+                        break;
+                    }
                     // SAFETY: the row is written. What a write keeps across
                     // rows (transition rows, the invocation log) lives in the
                     // arena's persistent tail or outside the arena.
@@ -85948,6 +86076,7 @@ where
             } else {
                 write_completion::CompletionReply::Command
             },
+            write_completion::RowPhaseEnd::of(returning_satisfied(&capture, inserted)),
         );
     }
     if matches!(source, InsertSource::MaterializedSelect { .. }) {
@@ -86040,6 +86169,9 @@ where
     let first_row = resumed.first;
     let rows_outcome = (|| -> Outcome {
         for (index, row_exprs) in statement.rows.iter().enumerate().skip(first_row) {
+            if returning_satisfied(&capture, inserted) {
+                break;
+            }
             match row_progress::start_row(
                 progress.as_deref_mut(),
                 index,
@@ -86280,6 +86412,7 @@ where
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, inserted)),
     )
 }
 
@@ -86290,6 +86423,19 @@ struct ChangedRow {
     row: Option<PhysicalRow>,
     changed: u64,
     transitions: row_progress::CaptureLengths,
+}
+
+/// Whether a nested data change that has returned `returned` rows (its
+/// processed-row count, counted across restarted attempts) has every row its
+/// RETURNING destination asked for, so it processes no further rows.
+pub(super) fn returning_satisfied(
+    capture: &Option<&mut super::ReturningCapture<'_>>,
+    returned: u64,
+) -> bool {
+    capture
+        .as_deref()
+        .and_then(super::ReturningSink::row_limit)
+        .is_some_and(|limit| returned >= limit)
 }
 
 /// Emits a changed row's `RETURNING` values. A routine call there ends the
@@ -86603,7 +86749,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     // A data-modifying CTE captures its RETURNING rows in memory instead of
     // streaming them to the client.
     if let Some(sink) = capture.as_deref_mut() {
-        if let Err(e) = sink(
+        if let Err(e) = sink.row(
             storage,
             txid,
             &super::sequence::SeqEval::new(storage, seq_session, txid),
@@ -86797,7 +86943,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if let Some(sink) = capture.as_deref_mut() {
-        match sink(
+        match sink.row(
             storage,
             txid,
             &super::sequence::SeqEval::new(storage, seq_session, txid),
@@ -87462,6 +87608,9 @@ pub(crate) fn update<'a>(
 
     let rows_outcome = (|| -> Outcome {
         for i in first_row..scratch.len() {
+            if returning_satisfied(&capture, updated) {
+                break;
+            }
             let mut matched_from: &[Datum<'a>] = &[];
             let returning_from = statement.from.filter(|_| !statement.returning.is_empty());
             let resumed_returning = match progress
@@ -88420,6 +88569,7 @@ pub(crate) fn update<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, updated)),
     )
 }
 
@@ -88905,6 +89055,9 @@ pub(crate) fn delete<'a>(
         .is_some();
     let rows_outcome = (|| -> Outcome {
         for i in first_row..scratch.len() {
+            if returning_satisfied(&capture, deleted) {
+                break;
+            }
             let resumed_returning = match progress
                 .as_deref_mut()
                 .map(|progress| progress.take_returning(i, arena))
@@ -89352,6 +89505,7 @@ pub(crate) fn delete<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, deleted)),
     )
 }
 
@@ -97695,6 +97849,68 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
     })
 }
 
+/// Visits a table's visible rows (or the visible ones among `candidates`)
+/// in the physical order a sequential scan reads them: saved rows by row
+/// identity, then heap rows by heap position. PostgreSQL's data changes read
+/// their target this way, so routines they call observe earlier rows'
+/// changes in the same order.
+fn for_each_physical_row<'a>(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    candidates: Option<&[u64]>,
+    arena: &'a Arena,
+    visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let count = match candidates {
+        Some(rowids) => rowids.len(),
+        None => storage.visible_row_count(table, txid)?,
+    };
+    let snapshot = storage.table_row_snapshot(table, Some(arena))?;
+    let ordered = arena
+        .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement row selection order exceeds the statement arena"
+            )
+        })?;
+    let mut fill = 0usize;
+    let mut retain = |rowid, home: &crate::storage::VisibleRowHome| {
+        let slot = ordered.get_mut(fill).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "visible row count changed during a data change's scan"
+            )
+        })?;
+        *slot = Some(snapshot.retain(rowid, home)?);
+        fill += 1;
+        Ok::<(), SqlError>(())
+    };
+    match candidates {
+        Some(rowids) => {
+            for &rowid in rowids {
+                if let Some(state) = storage.row_state(table, rowid)?
+                    && let Some(home) = storage.visible_row_home(table, rowid, state, txid)?
+                {
+                    retain(rowid, &home)?;
+                }
+            }
+        }
+        None => storage.for_each_row_state(table, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
+                retain(rowid, &home)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?,
+    }
+    ordered[..fill].sort_unstable_by_key(|row| row.map(|row| row.sort_key()));
+    for row in ordered[..fill].iter().copied().flatten() {
+        visit(row.rowid(), row.read()?)?;
+    }
+    Ok(())
+}
+
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
@@ -97785,10 +98001,7 @@ pub(super) fn collect_matches<'a>(
         }
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
-            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                return Ok(());
-            };
+        let mut visit = |rowid, loc: crate::storage::VisibleRowHome| {
             storage.record_relation_tuple_read(
                 txid,
                 leaf,
@@ -97828,23 +98041,16 @@ pub(super) fn collect_matches<'a>(
             }
             Ok::<(), SqlError>(())
         };
-        if let Some(access) = access {
-            for &rowid in access.rowids() {
-                if let Some(state) = storage.row_state(leaf, rowid)? {
-                    visit(rowid, state)?;
-                }
-            }
-        } else {
-            storage.for_each_row_state(leaf, &mut |rowid, state| {
-                visit(rowid, state)?;
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
-        }
-        // DML RETURNING follows each leaf's physical row order. The row map
-        // is hash-addressed, so restore the monotonic row identity assigned
-        // when the heap image was first appended before locks and writes
-        // begin.
-        scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
+        // Rows are selected, and their RETURNING lists computed, in each
+        // leaf's physical row order.
+        for_each_physical_row(
+            storage,
+            leaf,
+            txid,
+            access.map(|access| access.rowids()),
+            arena,
+            &mut visit,
+        )?;
     }
     images.finish()
 }
@@ -97980,111 +98186,104 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        storage.for_each_row_state(
-            leaf,
-            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
-                use core::ops::ControlFlow;
-                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                storage.record_relation_tuple_read(txid, leaf, None)?;
-                // Consume-in-place, as in row_matches: the joined-row probe reads
-                // this row's values only while it runs.
-                let snapshot = loc.snapshot();
-                let mut joined = None;
-                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                    let mark = arena.mark();
-                    let found = (|| -> Result<bool, SqlError> {
-                        let mut physical = [Datum::Null; MAX_COLUMNS];
-                        rowenc::decode(bytes, layout.schema, &mut physical)?;
-                        let mut tv = [Datum::Null; MAX_COLUMNS];
-                        layout.project(&physical, &mut tv);
-                        let context = RowCtx {
-                            table_oid: None,
-                            def: crate::storage::RelationDefinition::from_definition(def),
-                            values: &tv[..def.n_columns],
-                            alias,
-                        };
-                        if let Some(plan) = row_security
-                            && !super::query::row_security_passes(
-                                plan, &context, storage, txid, arena, params, hooks,
-                            )?
-                        {
-                            return Ok(false);
-                        }
-                        if capture.retains_joined() {
-                            joined = super::query::joined_from_match(
-                                storage,
-                                from,
-                                txid,
-                                where_clause,
-                                arena,
-                                params,
-                                &context,
-                                None,
-                                target_hash_candidates(
-                                    hash.as_ref(),
-                                    storage,
-                                    txid,
-                                    context.values,
-                                    arena,
-                                )?,
-                                arena,
-                            )?;
-                            Ok(joined.is_some())
-                        } else {
-                            super::query::first_from_match(
-                                storage,
-                                from,
-                                txid,
-                                where_clause,
-                                &[],
-                                arena,
-                                params,
-                                &context,
-                                &mut |_| Ok(()),
-                                None,
-                                None,
-                                target_hash_candidates(
-                                    hash.as_ref(),
-                                    storage,
-                                    txid,
-                                    context.values,
-                                    arena,
-                                )?,
-                            )
-                        }
-                    })();
-                    // SAFETY: joined predicates retain no decoded values or front scratch.
-                    unsafe { arena.rewind_to(mark) };
-                    if !found? {
-                        return Ok(None);
+        for_each_physical_row(storage, leaf, txid, None, arena, &mut |rowid, loc| {
+            storage.record_relation_tuple_read(txid, leaf, None)?;
+            // Consume-in-place, as in row_matches: the joined-row probe reads
+            // this row's values only while it runs.
+            let snapshot = loc.snapshot();
+            let mut joined = None;
+            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                let mark = arena.mark();
+                let found = (|| -> Result<bool, SqlError> {
+                    let mut physical = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, layout.schema, &mut physical)?;
+                    let mut tv = [Datum::Null; MAX_COLUMNS];
+                    layout.project(&physical, &mut tv);
+                    let context = RowCtx {
+                        table_oid: None,
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values: &tv[..def.n_columns],
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(false);
                     }
-                    Ok(Some(if capture_bytes {
-                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                    if capture.retains_joined() {
+                        joined = super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &context,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                            arena,
+                        )?;
+                        Ok(joined.is_some())
                     } else {
-                        MatchedDmlRow::Identity
-                    }))
-                })?;
-                if let Some(image) = found {
-                    if let MatchedDmlRow::Bytes(bytes) = image {
-                        images.push(leaf, rowid, bytes)?;
-                    }
-                    let row = PhysicalRow::local(leaf, rowid, snapshot);
-                    if let Some(joined) = joined {
-                        images.push_joined(row, joined)?;
-                    }
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &context,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
                         )
-                    })?;
+                    }
+                })();
+                // SAFETY: joined predicates retain no decoded values or front scratch.
+                unsafe { arena.rewind_to(mark) };
+                if !found? {
+                    return Ok(None);
                 }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
+                Ok(Some(if capture_bytes {
+                    MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                } else {
+                    MatchedDmlRow::Identity
+                }))
+            })?;
+            if let Some(image) = found {
+                if let MatchedDmlRow::Bytes(bytes) = image {
+                    images.push(leaf, rowid, bytes)?;
+                }
+                let row = PhysicalRow::local(leaf, rowid, snapshot);
+                if let Some(joined) = joined {
+                    images.push_joined(row, joined)?;
+                }
+                scratch.push(row).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "statement row selection: {}",
+                        error
+                    )
+                })?;
+            }
+            Ok(())
+        })?;
     }
     images.finish()
 }
@@ -98213,113 +98412,106 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        storage.for_each_row_state(
-            leaf,
-            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
-                use core::ops::ControlFlow;
-                let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                storage.record_relation_tuple_read(txid, leaf, None)?;
-                let snapshot = loc.snapshot();
-                let mut joined = None;
-                let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
-                    let mark = arena.mark();
-                    let found = (|| -> Result<bool, SqlError> {
-                        let mut physical = [Datum::Null; MAX_COLUMNS];
-                        rowenc::decode(bytes, layout.schema, &mut physical)?;
-                        let mut values = [Datum::Null; MAX_COLUMNS];
-                        layout.project(&physical, &mut values);
-                        let context = RowCtx {
-                            table_oid: None,
-                            def: crate::storage::RelationDefinition::from_definition(def),
-                            values: &values[..def.n_columns],
-                            alias,
-                        };
-                        if let Some(plan) = row_security
-                            && !super::query::row_security_passes(
-                                plan, &context, storage, txid, arena, params, hooks,
-                            )?
-                        {
-                            return Ok(false);
-                        }
-                        let scope = JoinedTriggerDmlScope {
-                            row: &context,
-                            outer,
-                        };
-                        if capture.retains_joined() {
-                            joined = super::query::joined_from_match(
-                                storage,
-                                from,
-                                txid,
-                                where_clause,
-                                arena,
-                                params,
-                                &scope,
-                                None,
-                                target_hash_candidates(
-                                    hash.as_ref(),
-                                    storage,
-                                    txid,
-                                    context.values,
-                                    arena,
-                                )?,
-                                arena,
-                            )?;
-                            Ok(joined.is_some())
-                        } else {
-                            super::query::first_from_match(
-                                storage,
-                                from,
-                                txid,
-                                where_clause,
-                                &[],
-                                arena,
-                                params,
-                                &scope,
-                                &mut |_| Ok(()),
-                                None,
-                                None,
-                                target_hash_candidates(
-                                    hash.as_ref(),
-                                    storage,
-                                    txid,
-                                    context.values,
-                                    arena,
-                                )?,
-                            )
-                        }
-                    })();
-                    // SAFETY: joined predicates retain no decoded values or front scratch.
-                    unsafe { arena.rewind_to(mark) };
-                    if !found? {
-                        return Ok(None);
+        for_each_physical_row(storage, leaf, txid, None, arena, &mut |rowid, loc| {
+            storage.record_relation_tuple_read(txid, leaf, None)?;
+            let snapshot = loc.snapshot();
+            let mut joined = None;
+            let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
+                let mark = arena.mark();
+                let found = (|| -> Result<bool, SqlError> {
+                    let mut physical = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, layout.schema, &mut physical)?;
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    layout.project(&physical, &mut values);
+                    let context = RowCtx {
+                        table_oid: None,
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values: &values[..def.n_columns],
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(false);
                     }
-                    Ok(Some(if capture_bytes {
-                        MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                    let scope = JoinedTriggerDmlScope {
+                        row: &context,
+                        outer,
+                    };
+                    if capture.retains_joined() {
+                        joined = super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &scope,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                            arena,
+                        )?;
+                        Ok(joined.is_some())
                     } else {
-                        MatchedDmlRow::Identity
-                    }))
-                })?;
-                if let Some(image) = found {
-                    if let MatchedDmlRow::Bytes(bytes) = image {
-                        images.push(leaf, rowid, bytes)?;
-                    }
-                    let row = PhysicalRow::local(leaf, rowid, snapshot);
-                    if let Some(joined) = joined {
-                        images.push_joined(row, joined)?;
-                    }
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &scope,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
                         )
-                    })?;
+                    }
+                })();
+                // SAFETY: joined predicates retain no decoded values or front scratch.
+                unsafe { arena.rewind_to(mark) };
+                if !found? {
+                    return Ok(None);
                 }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
+                Ok(Some(if capture_bytes {
+                    MatchedDmlRow::Bytes(retain_dml_bytes(arena, bytes)?)
+                } else {
+                    MatchedDmlRow::Identity
+                }))
+            })?;
+            if let Some(image) = found {
+                if let MatchedDmlRow::Bytes(bytes) = image {
+                    images.push(leaf, rowid, bytes)?;
+                }
+                let row = PhysicalRow::local(leaf, rowid, snapshot);
+                if let Some(joined) = joined {
+                    images.push_joined(row, joined)?;
+                }
+                scratch.push(row).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "statement row selection: {}",
+                        error
+                    )
+                })?;
+            }
+            Ok(())
+        })?;
     }
     images.finish()
 }

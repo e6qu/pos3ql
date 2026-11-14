@@ -23,6 +23,28 @@ pub(super) enum WriteCompletion {
     },
 }
 
+/// How a write's row phase ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowPhaseEnd {
+    /// The write processed every row it selected.
+    Exhausted,
+    /// Its RETURNING destination had every row it asked for. PostgreSQL's
+    /// executor, run with a row count, then never reaches the end of the
+    /// rows: the write fires its AFTER ROW triggers but none of its AFTER
+    /// STATEMENT triggers.
+    Stopped,
+}
+
+impl RowPhaseEnd {
+    pub(super) fn of(stopped: bool) -> Self {
+        if stopped {
+            Self::Stopped
+        } else {
+            Self::Exhausted
+        }
+    }
+}
+
 pub(super) enum CompletionReply {
     Command,
     CountOnly,
@@ -893,6 +915,7 @@ impl WriteCompletion {
         definition: &crate::storage::TableDefinition<Definition>,
         transitions: TransitionRowSets<'_>,
         deferred: bool,
+        end: RowPhaseEnd,
     ) -> Result<(), SqlError> {
         context.txn.queue_all_pending_row_events()?;
         let target = crate::storage::TriggerTarget::Table(table);
@@ -908,7 +931,9 @@ impl WriteCompletion {
                     )?;
                 }
             }
-            if !has_statement_triggers(context, target, event, false)? {
+            if end == RowPhaseEnd::Stopped
+                || !has_statement_triggers(context, target, event, false)?
+            {
                 continue;
             }
             let start = context.txn.begin_after_statement_triggers(table, event)?;
@@ -934,6 +959,7 @@ impl WriteCompletion {
         definition: &crate::storage::TableDefinition<Definition>,
         transitions: TransitionRowSets<'values>,
         reply: CompletionReply,
+        end: RowPhaseEnd,
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
         let command = context.txn.command_id();
@@ -949,7 +975,7 @@ impl WriteCompletion {
             ));
         };
         if let Err(error) =
-            self.queue_statement_events(&mut context, table, definition, transitions, deferred)
+            self.queue_statement_events(&mut context, table, definition, transitions, deferred, end)
         {
             return sql_fail(error);
         }

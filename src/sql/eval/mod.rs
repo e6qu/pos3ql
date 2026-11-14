@@ -415,12 +415,45 @@ pub struct EvalMessage {
     pub sqlstate: SqlState,
     pub message: StackStr<MAX_EVAL_MESSAGE_BYTES>,
     pub detail: Option<&'static str>,
+    /// The one-based character position in the client's statement of the
+    /// literal whose input function raised the message.
+    pub position: Option<usize>,
 }
 
 struct PendingEvalMessages {
     messages: [Option<EvalMessage>; MAX_PENDING_EVAL_MESSAGES],
     head: usize,
     len: usize,
+}
+
+std::thread_local! {
+    static INPUT_SUBJECT: core::cell::Cell<Option<(*const u8, usize)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Runs `convert`, the input function of the statement's literal `subject`,
+/// so the notices and warnings it raises point at the literal, as
+/// PostgreSQL's parser position callback positions them.
+pub(crate) fn with_input_subject<R>(subject: &str, convert: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(*const u8, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INPUT_SUBJECT.with(|subject| subject.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        INPUT_SUBJECT.with(|active| active.replace(Some((subject.as_ptr(), subject.len())))),
+    );
+    convert()
+}
+
+fn input_subject_position() -> Option<usize> {
+    let (start, length) = INPUT_SUBJECT.with(core::cell::Cell::get)?;
+    // SAFETY: `with_input_subject` borrows the subject until it restores
+    // the previous one, and this runs within that call.
+    let subject =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(start, length)) };
+    crate::sql::error_position::client_position(subject)
 }
 
 std::thread_local! {
@@ -482,6 +515,7 @@ fn queue_eval_message(
             sqlstate: SqlState::from(sqlstate),
             message: text,
             detail,
+            position: input_subject_position(),
         });
         pending.len += 1;
         Ok(())
@@ -5720,16 +5754,29 @@ fn eval_binary_expression<'a>(
         }
         return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
     }
-    Ok(eval_binary_values(
-        expression,
-        left,
-        right,
-        comparison_collation,
-        arena,
-        row,
-        hooks,
-    )?
-    .value)
+    let (left_operand, right_operand) = (expression.left, expression.right);
+    let evaluate = || {
+        eval_binary_values(
+            expression,
+            left,
+            right,
+            comparison_collation,
+            arena,
+            row,
+            hooks,
+        )
+    };
+    // An untyped literal operand converts to the other operand's type, whose
+    // input function runs on the literal.
+    let value = match (left_operand, right_operand) {
+        (Expr::Str(literal), other) | (other, Expr::Str(literal))
+            if !matches!(other, Expr::Str(_)) =>
+        {
+            with_input_subject(literal, evaluate)?
+        }
+        _ => evaluate()?,
+    };
+    Ok(value.value)
 }
 
 /// PostgreSQL checks `EXECUTE` on the function behind every built-in
@@ -8141,7 +8188,10 @@ fn eval_full_inner<'a>(
                 )
                 .error());
             }
-            let v = cast(v, type_name, arena)?;
+            let v = match operand {
+                Expr::Str(subject) => with_input_subject(subject, || cast(v, type_name, arena))?,
+                _ => cast(v, type_name, arena)?,
+            };
             let v = if let Some(target) = ColType::from_sql_name(type_name)
                 && matches!(target, ColType::AclItem | ColType::Array(ArrElem::AclItem))
                 && !v.is_null()

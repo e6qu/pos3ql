@@ -5014,7 +5014,9 @@ pub(crate) fn convert_literal_input<'a>(
             let catalog = super::query::storage_catalog(storage, arena, txid);
             super::eval::regobject_cast(value, target, Some(&catalog), arena).map(Some)
         }
-        target => match super::eval::cast_to(value, target, arena) {
+        target => match super::eval::with_input_subject(text, || {
+            super::eval::cast_to(value, target, arena)
+        }) {
             Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => Ok(None),
             result => result.map(Some),
         },

@@ -103765,6 +103765,10 @@ fn eval_prepared_assignment<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut cast = casts.selected(expression, column, storage, txid)?;
     cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
+    let literal = match expression {
+        Expr::Str(literal) => Some(*literal),
+        _ => None,
+    };
     let expression = typed_assignment_path(
         typed_subscript_base(expression, column.ctype, arena)?,
         column,
@@ -103773,7 +103777,12 @@ fn eval_prepared_assignment<'a>(
         arena,
     )?;
     let value = eval_full(expression, arena, params, row, hooks)?;
-    coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)
+    let coerce = || coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences);
+    // An assigned literal's input function runs on the literal.
+    match literal {
+        Some(literal) => super::eval::with_input_subject(literal, coerce),
+        None => coerce(),
+    }
 }
 
 fn prepare_assignment_cast(

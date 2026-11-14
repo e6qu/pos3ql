@@ -3281,3 +3281,170 @@ fn parse_fixes_parameter_types_and_reports_undeterminable_ones() {
         [mood.parse::<i32>().unwrap(), crate::sql::types::oid::INT8]
     );
 }
+
+/// Each `(code, value)` field of the first message of `kind`.
+fn message_fields(mut bytes: &[u8], kind: u8) -> Option<Vec<(u8, String)>> {
+    while bytes.len() >= 5 {
+        let total = 1 + i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        if bytes[0] == kind {
+            let mut fields = Vec::new();
+            let mut body = &bytes[5..total];
+            while let [code, rest @ ..] = body
+                && *code != 0
+            {
+                let end = rest.iter().position(|byte| *byte == 0).unwrap();
+                fields.push((*code, String::from_utf8_lossy(&rest[..end]).into_owned()));
+                body = &rest[end + 1..];
+            }
+            return Some(fields);
+        }
+        bytes = &bytes[total..];
+    }
+    None
+}
+
+fn field(fields: &[(u8, String)], code: u8) -> Option<&str> {
+    fields
+        .iter()
+        .find(|(field, _)| *field == code)
+        .map(|(_, value)| value.as_str())
+}
+
+/// PostgreSQL's parse analysis converts a statement's literals when Parse
+/// prepares it: an input function's notice or error comes back from Parse,
+/// positioned at the literal, and each Execute reads the converted value
+/// without raising it again. A utility statement converts its literals when
+/// it runs.
+#[test]
+fn parse_converts_literals_once_with_positioned_notices_and_errors() {
+    let config = config("parse-literals", crate::config::TransactionMode::Mvcc);
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut conn = Conn::new(&config, &mut budget).unwrap();
+    conn.id = 1;
+    conn.enter_ready_for_tests(&engine);
+    query(
+        &mut conn,
+        &mut engine,
+        "CREATE TABLE parse_queries(id integer, q tsquery)",
+    );
+    for (sql, position) in [
+        ("SELECT 1, ''::tsquery", "11"),
+        ("INSERT INTO parse_queries VALUES (1, '')", "38"),
+        ("SELECT count(*) FROM parse_queries WHERE q = ''", "46"),
+    ] {
+        let mut payload = b"bound\0".to_vec();
+        payload.extend_from_slice(sql.as_bytes());
+        payload.extend_from_slice(&[0, 0, 0]);
+        let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &payload, false);
+        assert!(has_message(&response, wire::MSG_PARSE_COMPLETE), "{sql}");
+        let notice = message_fields(&response, wire::MSG_NOTICE_RESPONSE)
+            .unwrap_or_else(|| panic!("{sql}: Parse raised no notice"));
+        assert_eq!(
+            field(&notice, b'M'),
+            Some("text-search query doesn't contain lexemes: \"\""),
+            "{sql}"
+        );
+        assert_eq!(field(&notice, b'P'), Some(position), "{sql}");
+        for _ in 0..2 {
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_BIND,
+                &bind_payload("", &[]),
+                false,
+            );
+            let response = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+            assert!(has_message(&response, wire::MSG_COMMAND_COMPLETE), "{sql}");
+            assert!(
+                !has_message(&response, wire::MSG_NOTICE_RESPONSE),
+                "{sql}: Execute converted the literal again: {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+    }
+    assert_eq!(
+        first_row(&query(
+            &mut conn,
+            &mut engine,
+            "SELECT count(*) FROM parse_queries"
+        )),
+        "2"
+    );
+
+    // A simple query positions the notice of each literal input the same way:
+    // a literal assigned, compared or passed as a routine argument.
+    for (sql, position) in [
+        ("INSERT INTO parse_queries VALUES (3, '')", "38"),
+        ("UPDATE parse_queries SET q = '' WHERE id = 3", "30"),
+        (
+            "SELECT count(*) FROM parse_queries WHERE id = 3 AND q = ''",
+            "57",
+        ),
+        ("SELECT numnode('')", "16"),
+    ] {
+        let response = query(&mut conn, &mut engine, sql);
+        let notice = message_fields(&response, wire::MSG_NOTICE_RESPONSE)
+            .unwrap_or_else(|| panic!("{sql}: no notice"));
+        assert_eq!(field(&notice, b'P'), Some(position), "{sql}");
+    }
+    query(
+        &mut conn,
+        &mut engine,
+        "DELETE FROM parse_queries WHERE id = 3",
+    );
+
+    let mut payload = b"bound\0SELECT 1 WHERE 2 = 'abc'\0".to_vec();
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &payload, true);
+    let error = message_fields(&response, wire::MSG_ERROR_RESPONSE).unwrap();
+    assert_eq!(field(&error, b'C'), Some("22P02"));
+    assert_eq!(
+        field(&error, b'M'),
+        Some("invalid input syntax for type integer: \"abc\"")
+    );
+    assert_eq!(field(&error, b'P'), Some("20"));
+    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+
+    let mut payload =
+        b"bound\0CREATE TABLE parse_defaults(q tsquery DEFAULT ''::tsquery)\0".to_vec();
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &payload, false);
+    assert!(!has_message(&response, wire::MSG_NOTICE_RESPONSE));
+    message(
+        &mut conn,
+        &mut engine,
+        wire::FMSG_BIND,
+        &bind_payload("", &[]),
+        false,
+    );
+    let response = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+    let notice = message_fields(&response, wire::MSG_NOTICE_RESPONSE).unwrap();
+    assert_eq!(field(&notice, b'P'), Some("47"));
+    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+
+    // A declared type beyond the highest `$n` the text uses still declares a
+    // parameter, as PostgreSQL's Parse keeps it.
+    message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+    parse(
+        &mut conn,
+        &mut engine,
+        "SELECT $1::int",
+        &[crate::sql::types::oid::INT4, crate::sql::types::oid::TEXT],
+    );
+    let response = message(
+        &mut conn,
+        &mut engine,
+        wire::FMSG_DESCRIBE,
+        b"Sbound\0",
+        false,
+    );
+    assert_eq!(
+        parameter_description(&response),
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::TEXT]
+    );
+    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+}

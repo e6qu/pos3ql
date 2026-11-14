@@ -423,7 +423,14 @@ fn unspecified_parameter_fields_report_unknown() {
     let arena = Arena::new(&mut budget, "parameter inference", 1 << 18).unwrap();
     let transaction = TxnState::new(&mut budget, 64).unwrap();
     let error = engine
-        .infer_param_types("SELECT ($1).a", &arena, &transaction, 1, &[], &[])
+        .infer_param_types(
+            "SELECT ($1).a",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
+        )
         .expect_err("a field of an unknown parameter is rejected");
     assert_eq!(error.sqlstate, "42809");
     assert_eq!(
@@ -431,7 +438,14 @@ fn unspecified_parameter_fields_report_unknown() {
         "column notation .a applied to type unknown, which is not a composite type"
     );
     let inferred = engine
-        .infer_param_types("SELECT $1", &arena, &transaction, 1, &[], &[])
+        .infer_param_types(
+            "SELECT $1",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
+        )
         .unwrap();
     assert_eq!(inferred, [crate::sql::types::oid::TEXT]);
 }

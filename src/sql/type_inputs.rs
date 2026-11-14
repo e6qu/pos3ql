@@ -828,6 +828,37 @@ fn validate_image_for(bytes: &[u8], owner: Owner) -> Result<usize, SqlError> {
     Ok(count)
 }
 
+/// A statement's bound input map and what it holds. Admission binds only
+/// array domain inputs; a prepared statement whose parse analysis ran also
+/// holds the built-in literals it converted, as PostgreSQL's analysis does.
+#[derive(Clone, Copy)]
+pub(crate) enum BoundInputs<'a> {
+    Admitted(&'a [u8]),
+    Prepared(&'a [u8]),
+}
+
+impl<'a> BoundInputs<'a> {
+    pub(crate) fn decode(self, arena: &'a Arena) -> Result<&'a [Binding<'a>], SqlError> {
+        match self {
+            Self::Admitted(bytes) => decode(bytes, arena),
+            Self::Prepared(bytes) => decode_session(bytes, arena),
+        }
+    }
+
+    /// Checks that a parser restored from this map bound every input it must.
+    pub(crate) fn validate(
+        self,
+        parser: &super::parser::Parser<'_>,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        match self {
+            Self::Admitted(_) => validate_restored(parser, storage, txid),
+            Self::Prepared(_) => validate_prepared(parser, storage, txid),
+        }
+    }
+}
+
 /// Validate the complete image before invoking any consumer. Catalog recovery
 /// can inspect source/type identities without reserving temporary descriptors.
 pub(crate) fn visit<'a>(

@@ -595,15 +595,16 @@ pub(crate) struct TypeInputSyntax<'a> {
     pub expression: Option<&'a Expr<'a>>,
 }
 
-/// A bound input's value: a built-in type's value converted when a prepared
-/// statement was prepared, or a checked array domain input.
+/// A bound input's value: a checked array (or null) input, or a scalar
+/// value of a built-in type converted when a prepared statement was
+/// prepared.
 fn bound_literal_value<'a>(
     binding: super::type_inputs::Binding<'a>,
 ) -> crate::sql::ast::BoundLiteralValue<'a> {
-    if super::type_inputs::is_builtin_oid(binding.type_oid) {
-        crate::sql::ast::BoundLiteralValue::Folded(binding.encoded)
-    } else {
+    if super::type_inputs::checked_input_value(binding.encoded) {
         crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded)
+    } else {
+        crate::sql::ast::BoundLiteralValue::Folded(binding.encoded)
     }
 }
 

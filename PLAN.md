@@ -582,7 +582,9 @@ expressions, and an `INSERT ... SELECT` statement's query without volatile
 output is pulled up into it the same way. Remaining: an action that also
 reads other relations (its own `FROM`, an `UPDATE` or `DELETE` action, or
 several `VALUES` rows), and an `INSERT` statement whose query has volatile
-output, read a derived relation evaluated for every row first, where
+output, read a derived relation evaluated for every row first (one
+`VALUES` row's expressions run before an action expression written ahead
+of the reference), where
 PostgreSQL's subquery scan streams it; an `INSERT ... SELECT` whose
 condition and output both call routines evaluates every row's condition
 before the outputs. A policy that a write's `UPDATE` (or `DELETE`)

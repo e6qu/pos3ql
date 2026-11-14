@@ -2890,7 +2890,10 @@ fn pull_up_derived<'a>(
                     && !calls_grouping_or_set_routine(expression, storage, txid))
         })
     };
+    // A source without FROM (one `VALUES` row) has one row, which its
+    // relation evaluates before the action's own expressions.
     if from.base.alias != Some(alias)
+        || source.from.is_none()
         || !from.joins.is_empty()
         || from.base.lateral
         || !simple(select)

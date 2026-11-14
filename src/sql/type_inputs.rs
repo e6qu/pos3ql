@@ -563,6 +563,13 @@ fn invalid() -> SqlError {
     )
 }
 
+/// Whether `encoded` is a null or array value, which the checked input
+/// path validates before decoding; a prepared statement's session map also
+/// holds scalar values of built-in types.
+pub(crate) fn checked_input_value(encoded: &[u8]) -> bool {
+    matches!(encoded.get(2), Some(0 | 200))
+}
+
 // The current input boundary binds serialized arrays. Validate the existing
 // projected payload before its trusted decoder can inspect any byte offsets.
 fn validate_value(encoded: &[u8]) -> Result<(), SqlError> {

@@ -2314,6 +2314,16 @@ pub struct ForeignKey {
     /// TABLE ... ENABLE/DISABLE TRIGGER` on the referencing or referenced
     /// table changes them.
     pub(crate) trigger_enabled: [TriggerEnabled; 4],
+    /// The partition parent's foreign key this key is attached to
+    /// (PostgreSQL's `conparentid`): a copy made for the partition or an
+    /// equivalent key adopted when the partition was attached.
+    pub(crate) inherited_from: Option<ConstraintIdentity>,
+    /// The stamp of the key's two action triggers on the referenced table.
+    /// A key attached to a parent's has none: the parent's reach it.
+    pub(crate) action_triggers: Option<ConstraintIdentity>,
+    /// The stamp of the key's two check triggers on this table, taken after
+    /// the key's partition clones as PostgreSQL creates them.
+    pub(crate) check_triggers: Option<ConstraintIdentity>,
 }
 
 impl ForeignKey {
@@ -2334,6 +2344,9 @@ impl ForeignKey {
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
         trigger_enabled: [TriggerEnabled::Origin; 4],
+        inherited_from: None,
+        action_triggers: None,
+        check_triggers: None,
     };
 
     pub(crate) const fn trigger_enabled(&self, trigger: ForeignKeyTrigger) -> TriggerEnabled {

@@ -33,6 +33,7 @@ mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
 mod foreign_connection_cache;
+mod foreign_key_attach;
 mod foreign_key_clones;
 mod foreign_key_lookups;
 mod foreign_parent_admission;

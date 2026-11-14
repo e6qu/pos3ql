@@ -14,11 +14,14 @@ use super::*;
 
 /// Brings every referencing table's clones in line with the partition trees
 /// its foreign keys reference. Existing clones keep their identity and name.
+/// A key the statement created (stamped after `statement_stamp`) gets its
+/// check triggers after its first clones, as `addFkConstraint` creates them.
 pub(crate) fn reconcile_foreign_key_clones(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     undo_mark: usize,
+    statement_stamp: u64,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::sql::txn::DdlUndo;
@@ -72,6 +75,12 @@ pub(crate) fn reconcile_foreign_key_clones(
             ) else {
                 continue;
             };
+            let first_clones = identity.created_at() > statement_stamp
+                && key.check_triggers == Some(identity)
+                && !current
+                    .fkey_clones()
+                    .iter()
+                    .any(|clone| clone.foreign_key == identity);
             let mut count = 0usize;
             partitions_in_bound_order(storage, txn.txid, referenced, order, &mut count, scratch)?;
             for &partition in &order[..count] {
@@ -98,6 +107,10 @@ pub(crate) fn reconcile_foreign_key_clones(
                     name,
                 };
                 next.n_fkey_clones += 1;
+                if first_clones {
+                    // Stamped again once the clones are.
+                    next.fkeys[key_index].check_triggers = None;
+                }
             }
         }
         drop(current);
@@ -237,7 +250,7 @@ pub(super) fn partitions_in_bound_order(
 
 /// PostgreSQL's `ChooseConstraintName(key, NULL, "", namespace)`: the key's
 /// name with the first `_N` suffix no constraint in the namespace has.
-fn clone_name(
+pub(super) fn clone_name(
     storage: &Storage,
     definition: &TableDefBuilder,
     key: &str,

@@ -4692,6 +4692,12 @@ fn build_partitioned_table_def(
             for column in &mut def.columns[..def.n_columns] {
                 column.local = false;
             }
+            // Its foreign keys are attached to the parent's (`CloneFkReferencing`).
+            for key in &mut def.fkeys[..def.n_fkeys] {
+                key.inherited_from = key.identity;
+                key.action_triggers = None;
+                key.check_triggers = None;
+            }
             def.name = SqlName::parse(statement.name.name)?;
             def.schema = storage.creation_schema(
                 statement.name.schema,
@@ -9458,7 +9464,27 @@ fn drop_table_kind_with_columns(
                 selected_table_count += 1;
             }
         }
-        for name in statement.names {
+        // PostgreSQL resolves every name before it drops anything, so a
+        // partition listed after its parent goes with the parent.
+        let initial = match arena.alloc_slice_with(statement.names.len(), |position| {
+            let name = &statement.names[position];
+            match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                    Some((slot, storage.table(slot).created_at()))
+                }
+                _ => None,
+            }
+        }) {
+            Ok(initial) => initial,
+            Err(_) => return sql_fail(arena_full()),
+        };
+        for (position, name) in statement.names.iter().enumerate() {
+            if let Some((slot, created_at)) = initial[position]
+                && !(storage.table_slot_visible_to(slot, txn.txid)
+                    && storage.table(slot).created_at() == created_at)
+            {
+                continue;
+            }
             // A DROP whose qualifier names no schema is PostgreSQL's 3F000 (a
             // SELECT of the same spelling is 42P01 — the codes really differ).
             if let Some(schema) = name.schema
@@ -94728,6 +94754,9 @@ fn alter_foreign_key_trigger_modes(
                     ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
                     ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
                 };
+                if foreign_key.trigger_oid(trigger).is_none() {
+                    continue;
+                }
                 let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
                 if owner == Some(table)
                     && selected(name.as_str())
@@ -94769,6 +94798,9 @@ fn alter_foreign_key_trigger_modes(
                     ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
                     ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
                 };
+                if foreign_key.trigger_oid(trigger).is_none() {
+                    continue;
+                }
                 let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
                 if (owned(owner, storage)
                     && (owner == Some(table)
@@ -95037,27 +95069,68 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.n_checks += 1;
         child.copy_constraint_expression_dependencies(parent, constraint.name, constraint.name)?;
     }
+    // PostgreSQL's `CloneFkReferencing`: each parent key adopts the first
+    // equivalent key of the partition not yet attached
+    // (`tryAttachPartitionForeignKey`), or gets a copy named after it.
     for constraint in parent.fkeys() {
-        let columns = remap_columns(child, parent, constraint.columns())?;
-        if let Some(existing) = child
+        let link = constraint.identity.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "partition parent's foreign key has no identity"
+            )
+        })?;
+        if child
             .fkeys()
             .iter()
-            .find(|existing| existing.name == constraint.name)
+            .any(|existing| existing.inherited_from == Some(link))
         {
-            if existing.columns() != &columns[..constraint.n_cols]
-                || existing.parent_schema != constraint.parent_schema
-                || existing.parent != constraint.parent
-                || existing.parent_cols() != constraint.parent_cols()
-                || existing.on_delete != constraint.on_delete
-                || existing.on_update != constraint.on_update
-            {
+            continue;
+        }
+        let columns = remap_columns(child, parent, constraint.columns())?;
+        let columns = &columns[..constraint.n_cols];
+        if let Some(position) = child.fkeys().iter().position(|existing| {
+            existing.inherited_from.is_none()
+                && existing.parent_schema == constraint.parent_schema
+                && existing.parent == constraint.parent
+                && existing.columns() == columns
+                && existing.parent_cols() == constraint.parent_cols()
+        }) {
+            let existing = child.fkeys[position];
+            let enforced = |key: &crate::storage::ForeignKey| {
+                key.validation != crate::storage::ConstraintValidation::NotEnforced
+            };
+            if enforced(&existing) != enforced(constraint) {
                 return Err(sql_err!(
-                    sqlstate::DUPLICATE_OBJECT,
-                    "constraint \"{}\" conflicts with inherited constraint of the same name",
-                    constraint.name.as_str()
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "constraint \"{}\" enforceability conflicts with constraint \"{}\" on relation \"{}\"",
+                    constraint.name.as_str(),
+                    existing.name.as_str(),
+                    child.name.as_str()
                 ));
             }
-            continue;
+            if existing.timing == constraint.timing
+                && existing.on_update == constraint.on_update
+                && existing.on_delete == constraint.on_delete
+            {
+                // A valid parent key implies valid copies.
+                if constraint.validation == crate::storage::ConstraintValidation::EnforcedValidated
+                    && existing.validation == crate::storage::ConstraintValidation::EnforcedNotValid
+                {
+                    crate::sql::exec::constraints::validate_foreign_key_constraint(
+                        storage,
+                        child_slot,
+                        child,
+                        &existing,
+                        transaction,
+                        arena,
+                    )?;
+                    child.fkeys[position].validation =
+                        crate::storage::ConstraintValidation::EnforcedValidated;
+                }
+                child.fkeys[position].inherited_from = Some(link);
+                child.fkeys[position].action_triggers = None;
+                continue;
+            }
         }
         if child.n_fkeys == crate::storage::MAX_FKEYS {
             return Err(sql_err!(
@@ -95067,7 +95140,19 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         }
         let mut inherited = *constraint;
         inherited.identity = None;
-        inherited.columns = columns;
+        inherited.action_triggers = None;
+        inherited.check_triggers = None;
+        inherited.inherited_from = Some(link);
+        inherited.columns[..constraint.n_cols].copy_from_slice(columns);
+        if ddl::constraint_name_taken(child, constraint.name.as_str()) {
+            inherited.name = foreign_key_clones::clone_name(
+                storage,
+                child,
+                constraint.name.as_str(),
+                child_slot,
+                transaction,
+            )?;
+        }
         child.fkeys[child.n_fkeys] = inherited;
         child.n_fkeys += 1;
     }
@@ -95166,19 +95251,6 @@ fn drop_unique_identity(
     true
 }
 
-fn same_foreign_key_body(
-    left: &crate::storage::ForeignKey,
-    right: &crate::storage::ForeignKey,
-) -> bool {
-    left.columns() == right.columns()
-        && left.parent_schema == right.parent_schema
-        && left.parent == right.parent
-        && left.parent_cols() == right.parent_cols()
-        && left.on_delete == right.on_delete
-        && left.delete_set_cols() == right.delete_set_cols()
-        && left.on_update == right.on_update
-}
-
 fn same_exclusion_body(
     left: &crate::storage::ExclusionConstraint,
     right: &crate::storage::ExclusionConstraint,
@@ -95270,19 +95342,22 @@ fn synchronize_inherited_constraint_changes<
             }
         }
     }
+    // A partition's foreign key follows the parent key it is attached to;
+    // a rename does not reach it (`rename_constraint_internal` recurses only
+    // for CHECK constraints).
     for old in old_parent.fkeys() {
-        match new_parent
-            .fkeys()
-            .iter()
-            .find(|new| same_foreign_key_body(old, new))
+        if old.identity.is_some()
+            && !new_parent
+                .fkeys()
+                .iter()
+                .any(|new| new.identity == old.identity)
+            && let Some(attached) = child
+                .fkeys()
+                .iter()
+                .find(|key| key.inherited_from == old.identity)
+                .map(|key| key.name)
         {
-            Some(new) if new.name != old.name => {
-                changed |= rename_stored_constraint(child, old.name.as_str(), new.name);
-            }
-            Some(_) => {}
-            None => {
-                changed |= drop_named_constraint(child, old.name.as_str());
-            }
+            changed |= drop_named_constraint(child, attached.as_str());
         }
     }
     for old in old_parent.exclusions() {
@@ -96008,6 +96083,22 @@ fn alter_partition_attachment(
                     "partition \"{}\" is not pending detach",
                     child_def.name.as_str()
                 ));
+            }
+        }
+        // `DetachPartitionFinalize`: each attached foreign key becomes the
+        // partition's own and gets new action triggers.
+        if new_def.partition.attachment.is_none() {
+            for position in 0..new_def.n_fkeys {
+                if new_def.fkeys[position].inherited_from.take().is_some()
+                    && new_def.fkeys[position].validation
+                        != crate::storage::ConstraintValidation::NotEnforced
+                {
+                    new_def.fkeys[position].action_triggers =
+                        match storage.reserve_constraint_identity() {
+                            Ok(stamp) => Some(stamp),
+                            Err(error) => return sql_fail(error),
+                        };
+                }
             }
         }
     }
@@ -99046,9 +99137,31 @@ fn alter_table_relation(
                             }
                             new_def.fkeys[index].validation =
                                 crate::storage::ConstraintValidation::EnforcedValidated;
+                            // `ATExecAlterConstrEnforceability` creates the
+                            // key's action triggers, then its check triggers.
+                            let stamps = (|| {
+                                Ok::<_, SqlError>((
+                                    if new_def.fkeys[index].inherited_from.is_none() {
+                                        Some(storage.reserve_constraint_identity()?)
+                                    } else {
+                                        None
+                                    },
+                                    storage.reserve_constraint_identity()?,
+                                ))
+                            })();
+                            match stamps {
+                                Ok((action, check)) => {
+                                    new_def.fkeys[index].action_triggers = action;
+                                    new_def.fkeys[index].check_triggers = Some(check);
+                                }
+                                Err(error) => return sql_fail(error),
+                            }
                         } else if !enforced {
+                            // A NOT ENFORCED key has no triggers.
                             new_def.fkeys[index].validation =
                                 crate::storage::ConstraintValidation::NotEnforced;
+                            new_def.fkeys[index].action_triggers = None;
+                            new_def.fkeys[index].check_triggers = None;
                         }
                     }
                 } else if new_def.checks[..new_def.n_checks]
@@ -99212,7 +99325,12 @@ fn alter_table_relation(
                         arena,
                     ));
                 }
-                if inherited.is_some() {
+                if inherited.is_some()
+                    || new_def
+                        .fkeys()
+                        .iter()
+                        .any(|key| key.name.as_str() == *name && key.inherited_from.is_some())
+                {
                     return sql_fail(sql_err!(
                         sqlstate::INVALID_TABLE_DEFINITION,
                         "cannot drop inherited constraint \"{}\" of relation \"{}\"",

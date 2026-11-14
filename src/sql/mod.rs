@@ -22724,6 +22724,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let event_ddl_mark = txn.ddl().len();
+        let event_catalog_stamp = self.storage.catalog_identity_sequence();
         let event_ddl_origin = txn.ddl_origin();
         let event_drop = event_tag.is_some_and(|tag| {
             event_trigger_drop_command(statement)
@@ -22779,6 +22780,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 event_ddl_mark,
+                event_catalog_stamp,
                 arena,
             )
         {
@@ -23209,6 +23211,7 @@ impl Engine {
         // command. DDL executed by a start trigger has already completed its
         // own nested invocation and must not leak into the outer command set.
         let event_ddl_mark = txn.ddl().len();
+        let event_catalog_stamp = self.storage.catalog_identity_sequence();
         let event_ddl_origin = txn.ddl_origin();
         let event_drop = event_tag.is_some_and(|tag| {
             event_trigger_drop_command(statement)
@@ -25816,6 +25819,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 event_ddl_mark,
+                event_catalog_stamp,
                 arena,
             )
         {

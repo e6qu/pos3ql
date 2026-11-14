@@ -159,10 +159,12 @@ pub(crate) fn capture_before<'a>(
                 .push((reference, true))
                 .map_err(|_| graph_full())?;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
-                let reference = foreign_key_trigger_reference(child, foreign_key, trigger);
-                dependent_drops
-                    .push((reference, false))
-                    .map_err(|_| graph_full())?;
+                if let Some(reference) = foreign_key_trigger_reference(child, foreign_key, trigger)
+                {
+                    dependent_drops
+                        .push((reference, false))
+                        .map_err(|_| graph_full())?;
+                }
             }
         }
     }
@@ -3825,11 +3827,11 @@ fn foreign_key_trigger_reference<Definition0: crate::storage::DefinitionBacking>
     child: &crate::storage::TableDefinition<Definition0>,
     foreign_key: &crate::storage::ForeignKey,
     trigger: crate::storage::ForeignKeyTrigger,
-) -> EventObjectRef {
-    let oid = foreign_key.trigger_oid(trigger);
+) -> Option<EventObjectRef> {
+    let oid = foreign_key.trigger_oid(trigger)?;
     let ordinal = trigger.ordinal();
     let side = if ordinal < 2 { "a" } else { "c" };
-    EventObjectRef::DetachedTrigger {
+    Some(EventObjectRef::DetachedTrigger {
         oid,
         schema: if ordinal < 2 {
             foreign_key.parent_schema
@@ -3842,7 +3844,7 @@ fn foreign_key_trigger_reference<Definition0: crate::storage::DefinitionBacking>
             child.name
         },
         name: crate::stack_format!(128, "RI_ConstraintTrigger_{}_{}", side, oid),
-    }
+    })
 }
 
 fn push_foreign_key_trigger_drops<Definition0: crate::storage::DefinitionBacking>(
@@ -3852,13 +3854,9 @@ fn push_foreign_key_trigger_drops<Definition0: crate::storage::DefinitionBacking
     count: &mut usize,
 ) -> Result<(), SqlError> {
     for trigger in crate::storage::ForeignKeyTrigger::ALL {
-        push_drop_once(
-            output,
-            count,
-            foreign_key_trigger_reference(child, foreign_key, trigger),
-            false,
-            false,
-        )?;
+        if let Some(reference) = foreign_key_trigger_reference(child, foreign_key, trigger) {
+            push_drop_once(output, count, reference, false, false)?;
+        }
     }
     Ok(())
 }
@@ -4935,11 +4933,9 @@ fn foreign_key_trigger_object(
             else {
                 continue;
             };
-            let inherited =
-                catalog::inherited_foreign_key_parent_oid(storage, txid, table, key) != 0;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
                 let action = trigger.ordinal() < 2;
-                if (inherited && action) || key.trigger_oid(trigger) != oid {
+                if key.trigger_oid(trigger) != Some(oid) {
                     continue;
                 }
                 return Ok(Some(EventObjectRef::ForeignKeyTrigger {

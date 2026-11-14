@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v45` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v46` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `33` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -121,7 +121,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 25: version byte, ten-byte catalog
+- **Table definition payload** is version 26: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
   column's NOT NULL inheritance byte carries inheritability in bit 0 and
   PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
@@ -135,8 +135,12 @@ Other payload rules:
   `SET DEFAULT (...)` list changes (PostgreSQL's `confdelsetcols`; zero means
   every key column), then the four-byte creation stamp of the referenced
   table's unique index the key depends on (PostgreSQL's `conindid`; zero is
-  rejected). The manifest's `fkey` line carries the same four codes, count,
-  positions and stamp after the validation code. After the inline key names
+  rejected), then three four-byte stamps (zero for none): the partition
+  parent's key it is attached to (PostgreSQL's `conparentid`), its action
+  triggers' and its check triggers' stamps, from which their OIDs derive. A
+  NOT ENFORCED key has no triggers; an enforced key has check triggers, and
+  action triggers exactly when it is not attached; anything else is rejected. The manifest's `fkey` line carries the
+  same four codes, count, positions and four stamps after the validation code. After the inline key names
   come the foreign keys' partition clones (PostgreSQL's `pg_constraint` row
   per partition of a referenced partitioned table): a two-byte count of at
   most 256, then for each the four-byte creation stamp of the key it belongs

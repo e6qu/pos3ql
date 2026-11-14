@@ -3460,6 +3460,43 @@ fn key_recheck_trigger_name<Definition0: crate::storage::DefinitionBacking>(
     )
 }
 
+/// The key `foreign_key` of `table` is attached to at the top of its
+/// partition tree, or the key itself.
+fn attached_root(
+    storage: &Storage,
+    txid: u32,
+    mut table: usize,
+    mut foreign_key: crate::storage::ForeignKey,
+) -> Result<crate::storage::ForeignKey, SqlError> {
+    while let Some(link) = foreign_key.inherited_from {
+        let parent = storage
+            .table_def(table, txid)
+            .partition
+            .attachment
+            .map(|attachment| usize::from(attachment.parent))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "attached foreign key's table is not a partition"
+                )
+            })?;
+        foreign_key = storage
+            .table_def(parent, txid)
+            .fkeys()
+            .iter()
+            .find(|key| key.identity == Some(link))
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "attached foreign key's parent key is absent"
+                )
+            })?;
+        table = parent;
+    }
+    Ok(foreign_key)
+}
+
 /// The name of a foreign key's RI trigger, which orders its queued check
 /// among the row's AFTER triggers.
 pub(super) fn foreign_key_trigger_name(
@@ -3477,7 +3514,10 @@ pub(super) fn foreign_key_trigger_name(
             64,
             "RI_ConstraintTrigger_{}_{}",
             side,
-            foreign_key.trigger_oid(trigger)
+            foreign_key.trigger_oid(trigger).ok_or_else(|| sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign key attached to its partition parent's has no action trigger"
+            ))?
         )
         .as_str(),
     )
@@ -4457,9 +4497,12 @@ pub(crate) fn apply_fk_parent_actions(
                 )?,
             };
             let identity = txn.constraint_identity(child_index as u32, fk.name);
+            // A key attached to its partition parent's acts through the
+            // topmost key's action trigger.
+            let acting = attached_root(storage, txn.txid, child_index, fk)?;
             txn.pend_key_check_event(
                 parent_index as u16,
-                foreign_key_trigger_name(&fk, trigger)?,
+                foreign_key_trigger_name(&acting, trigger)?,
                 identity,
                 check,
                 parent_index as u16,

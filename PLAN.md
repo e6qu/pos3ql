@@ -741,15 +741,8 @@ referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
 detached and dropped; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
-clones (`54000`). Attaching a partition that already has an equivalent
-foreign key under another name adds the parent's copy beside it, where
-PostgreSQL adopts the existing key (`tryAttachPartitionForeignKey`), and a
-key's insert and update check triggers take OIDs before its clones' action
-triggers, where PostgreSQL creates them after: a key's four trigger OIDs
-derive from its one constraint identity, so the check triggers need their own
-identity, allocated after the clones, which changes the stored key layout.
-Adopting a key needs a durable link from a partition's key to its parent's
-in place of matching by name. A btree index may use
+clones (`54000`). `CREATE TABLE ... PARTITION OF parent (...)` with column
+options or table constraints fails with `42601`. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

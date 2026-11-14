@@ -93,13 +93,7 @@ fn classify(
         .iter()
         .find(|key| key.identity == Some(identity))
     {
-        let inherited = parent.as_ref().is_some_and(|parent| {
-            parent
-                .fkeys()
-                .iter()
-                .any(|candidate| candidate.name == key.name)
-        });
-        return (!inherited).then_some(FoundKind::Other);
+        return key.inherited_from.is_none().then_some(FoundKind::Other);
     }
     for column in 0..definition.n_columns {
         let attribute = usize::from(definition.attribute_number(column) - 1);
@@ -705,7 +699,7 @@ pub(super) fn rebuild_retyped_dependents(
             let definition = storage.table_def(table, txid);
             enum Named {
                 Check(SqlName),
-                ForeignKey(SqlName),
+                ForeignKey,
                 NotNull(SqlName),
             }
             let named = if let Some(check) = definition
@@ -714,12 +708,12 @@ pub(super) fn rebuild_retyped_dependents(
                 .find(|check| check.identity == Some(found.identity))
             {
                 Named::Check(check.name)
-            } else if let Some(key) = definition
+            } else if definition
                 .fkeys()
                 .iter()
-                .find(|key| key.identity == Some(found.identity))
+                .any(|key| key.identity == Some(found.identity))
             {
-                Named::ForeignKey(key.name)
+                Named::ForeignKey
             } else {
                 let column = (0..definition.n_columns)
                     .find(|&column| {
@@ -735,7 +729,7 @@ pub(super) fn rebuild_retyped_dependents(
             };
             rekey_with_clones(storage, txid, &mut rekeys, table, found.identity)?;
             if definition.partition.is_partitioned() {
-                let bound_order = matches!(named, Named::ForeignKey(_));
+                let bound_order = matches!(named, Named::ForeignKey);
                 for &partition in descendants(storage, txid, table, bound_order, arena)? {
                     let child = storage.table_def(partition, txid);
                     let identity = match named {
@@ -744,10 +738,16 @@ pub(super) fn rebuild_retyped_dependents(
                             .iter()
                             .find(|check| check.name == name)
                             .and_then(|check| check.identity),
-                        Named::ForeignKey(name) => child
+                        // A key attached to one rebuilt above.
+                        Named::ForeignKey => child
                             .fkeys()
                             .iter()
-                            .find(|key| key.name == name)
+                            .find(|key| {
+                                rekeys.as_slice().iter().any(|rekey| {
+                                    matches!(*rekey, Rekey::Constraint { old, .. }
+                                        if key.inherited_from == Some(old))
+                                })
+                            })
                             .and_then(|key| key.identity),
                         Named::NotNull(name) => {
                             child.column_index(name.as_str()).and_then(|column| {
@@ -836,7 +836,40 @@ pub(super) fn rebuild_retyped_dependents(
                 }
             }
         }
+        // A rebuilt key's triggers are created with it; an attached key's
+        // link follows its parent's new identity.
+        let remap_constraint = |stamp: ConstraintIdentity| {
+            rekeys.iter().find_map(|rekey| match *rekey {
+                Rekey::Constraint { old, new, .. } if old == stamp => Some(new),
+                _ => None,
+            })
+        };
         for position in 0..next.n_fkeys {
+            let key = next.fkeys[position];
+            let original = current
+                .fkeys()
+                .iter()
+                .find(|candidate| candidate.name == key.name)
+                .and_then(|candidate| candidate.identity);
+            if let (Some(original), Some(identity)) = (original, key.identity)
+                && original != identity
+            {
+                next.fkeys[position].action_triggers = (key.inherited_from.is_none()
+                    && key.validation != crate::storage::ConstraintValidation::NotEnforced)
+                    .then_some(identity);
+                next.fkeys[position].check_triggers = key.check_triggers.map(|check| {
+                    if check == original {
+                        identity
+                    } else {
+                        remap_constraint(check).unwrap_or(check)
+                    }
+                });
+                changed = true;
+            }
+            if let Some(new) = key.inherited_from.and_then(remap_constraint) {
+                next.fkeys[position].inherited_from = Some(new);
+                changed = true;
+            }
             if let Some(new) = next.fkeys[position]
                 .referenced_index
                 .identity()
@@ -1111,6 +1144,16 @@ fn rekey_with_clones(
         if let Some(clone) = clone.identity {
             rekey_constraint(storage, rekeys, table, clone)?;
         }
+    }
+    // Check triggers stamped apart from their key follow its clones.
+    if let Some(check) = definition
+        .fkeys()
+        .iter()
+        .find(|key| key.identity == Some(identity))
+        .and_then(|key| key.check_triggers)
+        .filter(|check| *check != identity)
+    {
+        rekey_constraint(storage, rekeys, table, check)?;
     }
     Ok(())
 }

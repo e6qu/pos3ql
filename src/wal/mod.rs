@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 25;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 26;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1226,7 +1226,8 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + 8
             + 1
             + fk.n_delete_set_cols * 2
-            + 4;
+            + 4
+            + 3 * crate::storage::ConstraintIdentity::ENCODED_BYTES;
     }
     // exclusion constraints
     n += 1;
@@ -1631,6 +1632,11 @@ fn append_table_payload<B: DefinitionBacking>(
             u32::try_from(identity.created_at())
                 .is_ok_and(|created_at| buffer.append(&created_at.to_le_bytes()))
         });
+        // The parent key it is attached to and its trigger stamps.
+        ok &= fk.trigger_stamps_consistent();
+        for stamp in [fk.inherited_from, fk.action_triggers, fk.check_triggers] {
+            ok &= buffer.append(&stamp.map_or([0; 4], |stamp| stamp.to_le_bytes()));
+        }
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -8818,6 +8824,18 @@ fn decode_op_inner<'a>(
                 fk.referenced_index = crate::storage::ReferencedIndex::Index(
                     crate::storage::RelationIdentity::parse(u64::from(referenced))?,
                 );
+                let mut stamps = [None; 3];
+                for stamp in &mut stamps {
+                    let bytes: [u8; 4] = payload.get(at..at + 4)?.try_into().ok()?;
+                    at += 4;
+                    if bytes != [0; 4] {
+                        *stamp = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes)?);
+                    }
+                }
+                [fk.inherited_from, fk.action_triggers, fk.check_triggers] = stamps;
+                if !fk.trigger_stamps_consistent() {
+                    return None;
+                }
                 *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
@@ -15772,6 +15790,8 @@ mod tests {
         fk.referenced_index = crate::storage::ReferencedIndex::Index(
             crate::storage::RelationIdentity::parse(7).unwrap(),
         );
+        fk.action_triggers = crate::storage::ConstraintIdentity::parse(91);
+        fk.check_triggers = crate::storage::ConstraintIdentity::parse(92);
         def.fkeys[0] = fk;
         def.n_fkeys = 1;
         let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
@@ -16207,6 +16227,63 @@ mod tests {
                 }
             ));
             let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                (
+                    decoded.fkeys[0].inherited_from,
+                    decoded.fkeys[0].action_triggers,
+                    decoded.fkeys[0].check_triggers
+                ),
+                (
+                    None,
+                    crate::storage::ConstraintIdentity::parse(91),
+                    crate::storage::ConstraintIdentity::parse(92)
+                )
+            );
+            // Trigger stamps must fit the key: action triggers exactly when
+            // it is not attached, and none for a NOT ENFORCED key.
+            for (inherited_from, action, check, validation) in [
+                (
+                    None,
+                    None,
+                    Some(92),
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    Some(90),
+                    Some(91),
+                    Some(92),
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    None,
+                    Some(91),
+                    None,
+                    crate::storage::ConstraintValidation::EnforcedValidated,
+                ),
+                (
+                    None,
+                    Some(91),
+                    Some(92),
+                    crate::storage::ConstraintValidation::NotEnforced,
+                ),
+            ] {
+                let mut inconsistent = marked.clone();
+                inconsistent.fkeys[0].inherited_from =
+                    inherited_from.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].action_triggers =
+                    action.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].check_triggers =
+                    check.and_then(crate::storage::ConstraintIdentity::parse);
+                inconsistent.fkeys[0].validation = validation;
+                payload.clear();
+                assert!(!append_payload(
+                    &mut payload,
+                    &WalOp::CreateTable {
+                        identity,
+                        definition: (&inconsistent).into(),
+                    }
+                ));
+            }
             assert_eq!(
                 decoded.fkeys[0].referenced_index.identity(),
                 crate::storage::RelationIdentity::parse(u64::from(stamp))

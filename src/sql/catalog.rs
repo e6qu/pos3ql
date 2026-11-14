@@ -15515,7 +15515,7 @@ fn fkey_clone_parent_oid(
             .parent,
     );
     if parent == referenced {
-        return trigger.map_or_else(|| fk.oid(), |trigger| fk.trigger_oid(trigger));
+        return trigger.map_or_else(|| fk.oid(), |trigger| fk.trigger_oid(trigger).unwrap_or(0));
     }
     let identity = fk.identity.expect("admitted foreign key has an identity");
     storage
@@ -15572,22 +15572,14 @@ fn inherited_foreign_key_parent(
     child_slot: usize,
     child: &crate::storage::ForeignKey,
 ) -> Option<crate::storage::ForeignKey> {
+    let link = child.inherited_from?;
     let attachment = storage.table_def(child_slot, txid).partition.attachment?;
     let parent_slot = usize::from(attachment.parent);
     storage
         .table_def(parent_slot, txid)
         .fkeys()
         .iter()
-        .find(|parent| {
-            parent.name == child.name
-                && parent.columns() == child.columns()
-                && parent.parent_schema == child.parent_schema
-                && parent.parent == child.parent
-                && parent.parent_cols() == child.parent_cols()
-                && parent.on_delete == child.on_delete
-                && parent.delete_set_cols() == child.delete_set_cols()
-                && parent.on_update == child.on_update
-        })
+        .find(|parent| parent.identity == Some(link))
         .copied()
 }
 
@@ -24388,15 +24380,13 @@ fn pg_trigger<'a>(
             // the referenced table's actions belong to the parent constraint.
             let inherited_from =
                 inherited_foreign_key_parent(storage, txid, child_slot, foreign_key);
-            let cloned = inherited_from.is_some();
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
-                if cloned && trigger.ordinal() < 2 {
+                let Some(oid) = foreign_key.trigger_oid(trigger) else {
                     continue;
-                }
+                };
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));
                 }
-                let oid = foreign_key.trigger_oid(trigger);
                 let side = if trigger.ordinal() < 2 { "a" } else { "c" };
                 let name = crate::stack_format!(64, "RI_ConstraintTrigger_{}_{}", side, oid);
                 let (relation, function, trigger_type, constrained_relation) = match trigger {
@@ -24424,7 +24414,11 @@ fn pg_trigger<'a>(
                         Datum::Int4(PG_TRIGGER_OID),
                         Datum::Int4(oid),
                         Datum::Int4(relation),
-                        Datum::Int4(inherited_from.map_or(0, |parent| parent.trigger_oid(trigger))),
+                        Datum::Int4(
+                            inherited_from
+                                .and_then(|parent| parent.trigger_oid(trigger))
+                                .unwrap_or(0),
+                        ),
                         text(name.as_str(), arena)?,
                         Datum::Int4(function),
                         Datum::Int2(trigger_type),

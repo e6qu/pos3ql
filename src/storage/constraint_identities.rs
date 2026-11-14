@@ -111,10 +111,31 @@ impl ForeignKey {
             .oid()
     }
 
-    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> i32 {
-        self.identity
-            .expect("admitted foreign key has a creation identity")
-            .foreign_key_trigger_oid(trigger)
+    /// The OID of one of the key's RI triggers; `None` when the key has no
+    /// such trigger: a NOT ENFORCED key has none, and a key attached to its
+    /// partition parent's has no action triggers.
+    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> Option<i32> {
+        match trigger {
+            ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => {
+                self.action_triggers
+            }
+            ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => self.check_triggers,
+        }
+        .map(|stamp| stamp.foreign_key_trigger_oid(trigger))
+    }
+}
+
+impl ForeignKey {
+    /// Whether the key's trigger stamps fit it: a NOT ENFORCED key has no
+    /// triggers; an enforced one has check triggers, and action triggers
+    /// exactly when it is not attached to its partition parent's key.
+    pub(crate) fn trigger_stamps_consistent(&self) -> bool {
+        if self.validation == super::ConstraintValidation::NotEnforced {
+            self.action_triggers.is_none() && self.check_triggers.is_none()
+        } else {
+            self.check_triggers.is_some()
+                && self.action_triggers.is_some() != self.inherited_from.is_some()
+        }
     }
 }
 
@@ -652,6 +673,11 @@ impl Storage {
         if partition {
             for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
             for key in &mut definition.fkeys[..definition.n_fkeys] {
+                // Trigger stamps belong to the identity they were taken with.
+                if key.identity.is_none() {
+                    key.action_triggers = None;
+                    key.check_triggers = None;
+                }
                 reserve(&mut key.identity)?;
             }
         }
@@ -679,6 +705,11 @@ impl Storage {
         if !partition {
             for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
             for key in &mut definition.fkeys[..definition.n_fkeys] {
+                // Trigger stamps belong to the identity they were taken with.
+                if key.identity.is_none() {
+                    key.action_triggers = None;
+                    key.check_triggers = None;
+                }
                 reserve(&mut key.identity)?;
             }
         }
@@ -686,6 +717,36 @@ impl Storage {
         // definition's own order.
         for identity in definition.constraint_identities_mut() {
             reserve(identity)?;
+        }
+        // A key's check triggers follow its partition clones' action
+        // triggers (`addFkRecurseReferenced`, then
+        // `addFkRecurseReferencing`); a key attached to its partition
+        // parent's has no action triggers.
+        for position in 0..definition.n_fkeys {
+            let key = definition.fkeys[position];
+            let identity = key.identity.expect("reserved above");
+            let mut stamped = key;
+            if key.validation == super::ConstraintValidation::NotEnforced {
+                stamped.action_triggers = None;
+                stamped.check_triggers = None;
+                definition.fkeys[position] = stamped;
+                continue;
+            }
+            stamped.action_triggers = match key.inherited_from {
+                Some(_) => None,
+                None => key.action_triggers.or(Some(identity)),
+            };
+            if key.check_triggers.is_none() {
+                let cloned = definition.fkey_clones[..definition.n_fkey_clones]
+                    .iter()
+                    .any(|clone| clone.foreign_key == identity);
+                stamped.check_triggers = Some(if cloned {
+                    ConstraintIdentity::reserve(self)?
+                } else {
+                    identity
+                });
+            }
+            definition.fkeys[position] = stamped;
         }
         Ok(())
     }

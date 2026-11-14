@@ -5260,6 +5260,19 @@ fn check_referenced_key(
     if !referenced {
         return Ok(());
     }
+    // The partition's own clone of the key fires for a row of a referenced
+    // partition, and the report names it.
+    let reported = if parent_index == declared_index {
+        fk.name
+    } else {
+        fk.identity
+            .and_then(|identity| {
+                child
+                    .fkey_clone(identity, storage.table_position(parent_index))
+                    .map(|clone| clone.name)
+            })
+            .unwrap_or(fk.name)
+    };
     let detail = key_detail(
         &mut parent_columns
             .iter()
@@ -5279,7 +5292,7 @@ fn check_referenced_key(
         crate::sql::eval::ErrorObjects::table_constraint(
             child.schema.as_str(),
             child.name.as_str(),
-            fk.name.as_str(),
+            reported.as_str(),
         ),
     );
     // PostgreSQL names the RESTRICT setting (ri_ReportViolation).
@@ -5293,7 +5306,7 @@ fn check_referenced_key(
         "update or delete on table \"{}\" violates {}foreign key constraint \"{}\" on table \"{}\"",
         physical_parent.name.as_str(),
         setting,
-        fk.name.as_str(),
+        reported.as_str(),
         child.name.as_str()
     ))
 }
@@ -5434,4 +5447,113 @@ mod tests {
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
         assert!(error.message.as_str().contains("outside row width 1"));
     }
+}
+
+/// PostgreSQL's `ATDetachCheckNoForeignKeyRefs`: detaching `partition` from
+/// a referenced partitioned table fails while a row of a referencing table
+/// still points at one of its keys, naming the partition's clone of the key.
+pub(crate) fn check_partition_removal(
+    storage: &Storage,
+    partition: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let position = storage.table_position(partition);
+    let partition_definition = storage.table_def(partition, txid).clone();
+    for table in 0..storage.table_count() {
+        if !storage.relation_visible_to_current_session(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid).clone();
+        for key in definition.fkeys() {
+            let Some(clone) = key
+                .identity
+                .and_then(|identity| definition.fkey_clone(identity, position))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(referenced) =
+                storage.find_visible(key.parent_schema.as_str(), key.parent.as_str(), txid)
+            else {
+                continue;
+            };
+            let referenced_definition = storage.table_def(referenced, txid).clone();
+            let mapped = super::remap_columns(
+                &partition_definition,
+                &referenced_definition,
+                key.parent_cols(),
+            )?;
+            let partition_columns = &mapped[..key.parent_cols().len()];
+            let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+            for (target, &column) in key_types.iter_mut().zip(partition_columns) {
+                *target = partition_definition.columns()[usize::from(column)].ctype;
+            }
+            let key_types = &key_types[..partition_columns.len()];
+            let read = storage.validation_read();
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            constraint_row_tables(storage, table, txid, |row_table| {
+                // SAFETY: the callback returns only an owned result.
+                unsafe {
+                    for_each_validation_row(
+                        storage,
+                        row_table,
+                        txid,
+                        read,
+                        &schema[..definition.n_columns],
+                        arena,
+                        &mut |_, values| {
+                            let mut row_key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+                            for (target, &column) in row_key.iter_mut().zip(key.columns()) {
+                                *target = values[usize::from(column)];
+                            }
+                            let row_key = &row_key[..key.columns().len()];
+                            if row_key.iter().any(Datum::is_null)
+                                || !parent_has_key(
+                                    storage,
+                                    partition,
+                                    partition_columns,
+                                    row_key,
+                                    key_types,
+                                    txid,
+                                    ParentRead::Validation(read),
+                                    arena,
+                                )?
+                            {
+                                return Ok(());
+                            }
+                            let detail = key_detail(
+                                &mut partition_columns.iter().map(|&column| {
+                                    partition_definition.columns()[usize::from(column)]
+                                        .name
+                                        .as_str()
+                                }),
+                                &mut row_key.iter().copied(),
+                                format_args!(
+                                    " is still referenced from table \"{}\".",
+                                    definition.name.as_str()
+                                ),
+                            )?;
+                            crate::sql::eval::stash_object_diagnostic(
+                                Some(detail.as_str()),
+                                crate::sql::eval::ErrorObjects::table_constraint(
+                                    definition.schema.as_str(),
+                                    definition.name.as_str(),
+                                    clone.name.as_str(),
+                                ),
+                            );
+                            Err(sql_err!(
+                                sqlstate::FOREIGN_KEY_VIOLATION,
+                                "removing partition \"{}\" violates foreign key constraint \"{}\"",
+                                partition_definition.name.as_str(),
+                                clone.name.as_str()
+                            ))
+                        },
+                    )
+                }
+            })?;
+        }
+    }
+    Ok(())
 }

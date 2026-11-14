@@ -53,6 +53,8 @@ impl ForeignKeyTrigger {
 
 impl ConstraintIdentity {
     pub(crate) const ENCODED_BYTES: usize = core::mem::size_of::<u32>();
+    /// Fills unused fixed-capacity slots; never an admitted identity.
+    pub(crate) const PLACEHOLDER: Self = Self(NonZeroU32::MAX);
 
     pub(crate) fn parse(created_at: u64) -> Option<Self> {
         if created_at > MAX_CONSTRAINT_CREATION {
@@ -205,6 +207,7 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
                         _ => None,
                     }),
             )
+            .chain(self.fkey_clones().iter().map(|clone| clone.identity))
     }
 }
 
@@ -283,6 +286,11 @@ impl super::TableDefBuilder {
                         }
                         _ => None,
                     }),
+            )
+            .chain(
+                self.fkey_clones[..self.n_fkey_clones]
+                    .iter_mut()
+                    .map(|clone| &mut clone.identity),
             )
     }
 }

@@ -2583,6 +2583,9 @@ pub(super) fn constraint_name_taken<Definition0: crate::storage::DefinitionBacki
         || def.fkeys.as_ref()[..def.n_fkeys]
             .iter()
             .any(|f| f.name.as_str() == name)
+        || def
+            .keyed_fkey_clones()
+            .any(|clone| clone.name.as_str() == name)
         || def.exclusions.as_ref()[..def.n_exclusions]
             .iter()
             .any(|exclusion| exclusion.name.as_str() == name)

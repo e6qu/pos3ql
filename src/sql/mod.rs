@@ -21850,6 +21850,18 @@ impl Engine {
             return Ok(Err(error));
         }
         if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::reconcile_foreign_key_clones(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                event_ddl_mark,
+                arena,
+            )
+        {
+            return Ok(Err(error));
+        }
+        if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
             && let Err(error) = self.fire_statement_ddl_events(
@@ -24814,6 +24826,18 @@ impl Engine {
             && let Err(error) = self
                 .storage
                 .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = exec::reconcile_foreign_key_clones(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                event_ddl_mark,
+                arena,
+            )
         {
             return Ok(Err(error));
         }

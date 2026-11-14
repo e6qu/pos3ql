@@ -15385,6 +15385,12 @@ pub(crate) fn table_constraint_identity_by_oid(
         if let Some(foreign_key) = table.fkeys().iter().find(|key| key.oid() == oid) {
             return found(foreign_key.name.as_str());
         }
+        if let Some(clone) = table
+            .keyed_fkey_clones()
+            .find(|clone| clone.identity.is_some_and(|identity| identity.oid() == oid))
+        {
+            return found(clone.name.as_str());
+        }
         for (position, column) in table.columns().iter().enumerate() {
             if column.not_null.is_required() && table.not_null_constraint_oid(position) == oid {
                 return found(not_null_constraint_name(&table, column).as_str());
@@ -15453,15 +15459,112 @@ fn collect_fkeys<'a>(
     Ok(foreign_keys)
 }
 
-fn inherited_foreign_key_parent_oid(
+/// The partition clones of a foreign key whose partition is still in the
+/// tree the key references.
+fn live_fkey_clones<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    child_slot: usize,
+    identity: Option<crate::storage::ConstraintIdentity>,
+    referenced: usize,
+) -> impl Iterator<Item = crate::storage::ForeignKeyClone> + 'a {
+    let child = storage.table_def(child_slot, txid);
+    let clones = child.fkey_clones();
+    let mut live = [crate::storage::ForeignKeyClone::EMPTY; crate::storage::MAX_FKEY_CLONES];
+    let mut count = 0usize;
+    for clone in clones {
+        let partition = clone.partition.slot();
+        if Some(clone.foreign_key) == identity
+            && partition < storage.table_count()
+            && storage.table_slot_visible_to(partition, txid)
+            && storage.table_position(partition) == clone.partition
+            && partition != referenced
+            && storage.partition_descends_from(partition, referenced, txid)
+        {
+            live[count] = *clone;
+            count += 1;
+        }
+    }
+    (0..count).map(move |index| live[index])
+}
+
+/// A clone's `conparentid`: the clone for the partition's parent, or the key
+/// itself when the parent is the referenced table.
+fn fkey_clone_parent_oid(
+    storage: &Storage,
+    txid: u32,
+    (child_slot, referenced): (usize, usize),
+    fk: &crate::storage::ForeignKey,
+    partition: usize,
+    trigger: Option<crate::storage::ForeignKeyTrigger>,
+) -> i32 {
+    let parent = usize::from(
+        storage
+            .table_def(partition, txid)
+            .partition
+            .attachment
+            .expect("a referenced partition has a parent")
+            .parent,
+    );
+    if parent == referenced {
+        return trigger.map_or_else(|| fk.oid(), |trigger| fk.trigger_oid(trigger));
+    }
+    let identity = fk.identity.expect("admitted foreign key has an identity");
+    storage
+        .table_def(child_slot, txid)
+        .fkey_clone(identity, storage.table_position(parent))
+        .map_or(0, |clone| {
+            trigger.map_or_else(|| clone.oid(), |trigger| clone.trigger_oid(trigger))
+        })
+}
+
+/// The partition's index that descends from the referenced table's unique
+/// index (`index_get_partition`).
+fn fkey_clone_index_oid(
+    storage: &Storage,
+    txid: u32,
+    indexes: &[IdxInfo],
+    referenced: usize,
+    partition: usize,
+    referenced_index: i32,
+) -> i32 {
+    if partition == referenced {
+        return referenced_index;
+    }
+    let Some(attachment) = storage.table_def(partition, txid).partition.attachment else {
+        return 0;
+    };
+    let parent_index = fkey_clone_index_oid(
+        storage,
+        txid,
+        indexes,
+        referenced,
+        usize::from(attachment.parent),
+        referenced_index,
+    );
+    indexes
+        .iter()
+        .find(|index| index.table_slot == partition && index.index_parent_oid == Some(parent_index))
+        .map_or(0, |index| index.oid)
+}
+
+pub(crate) fn inherited_foreign_key_parent_oid(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
     child: &crate::storage::ForeignKey,
 ) -> i32 {
-    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
-        return 0;
-    };
+    inherited_foreign_key_parent(storage, txid, child_slot, child).map_or(0, |key| key.oid())
+}
+
+/// The parent table's foreign key a partition's key was cloned from.
+fn inherited_foreign_key_parent(
+    storage: &Storage,
+    txid: u32,
+    child_slot: usize,
+    child: &crate::storage::ForeignKey,
+) -> Option<crate::storage::ForeignKey> {
+    let attachment = storage.table_def(child_slot, txid).partition.attachment?;
     let parent_slot = usize::from(attachment.parent);
     storage
         .table_def(parent_slot, txid)
@@ -15477,7 +15580,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.delete_set_cols() == child.delete_set_cols()
                 && parent.on_update == child.on_update
         })
-        .map_or(0, |constraint| constraint.oid())
+        .copied()
 }
 
 fn check_inheritance_count(
@@ -15667,15 +15770,26 @@ pub fn constraint_def_text<'a>(
     }
     let fks = collect_fkeys(storage, txid, arena)?;
     for info in fks {
-        if info.oid != oid {
-            continue;
-        }
         let child = storage.table_def(info.child_slot, txid);
         let fk = &child.fkeys()[info.fk_index];
-        let Some(pslot) = storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
-        else {
-            return Ok(None);
+        // A partition clone names the partition it references; the partition
+        // has its parent's column names.
+        let pslot = if info.oid == oid {
+            info.parent_slot
+        } else if let Some(clone) = live_fkey_clones(
+            storage,
+            txid,
+            info.child_slot,
+            fk.identity,
+            info.parent_slot,
+        )
+        .find(|clone| clone.oid() == oid)
+        {
+            clone.partition.slot()
+        } else {
+            continue;
         };
+        let referenced = storage.table_def(info.parent_slot, txid);
         let parent = storage.table_def(pslot, txid);
         let mut s = StackStr::<1280>::new();
         use core::fmt::Write as _;
@@ -15701,7 +15815,7 @@ pub fn constraint_def_text<'a>(
             if k > 0 {
                 let _ = s.write_str(", ");
             }
-            write_identifier(&mut s, parent.columns()[c as usize].name.as_str());
+            write_identifier(&mut s, referenced.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(")");
         // ruleutils.c spells ON UPDATE before ON DELETE and its column list.
@@ -20812,10 +20926,18 @@ fn pg_constraint_values<'a>(
             .into_iter()
             .filter(|domain| domain.check().is_some())
             .count();
+    let clone_constraints = fks
+        .iter()
+        .map(|info| {
+            let identity = storage.table_def(info.child_slot, txid).fkeys()[info.fk_index].identity;
+            live_fkey_clones(storage, txid, info.child_slot, identity, info.parent_slot).count()
+        })
+        .sum::<usize>();
     let out = catalog_rows(
         arena,
         index_constraints
             + fks.len()
+            + clone_constraints
             + trigger_constraints
             + table_constraints
             + domain_constraints,
@@ -20967,7 +21089,57 @@ fn pg_constraint_values<'a>(
             ],
             arena,
         )?;
+        let root_row = n;
         n += 1;
+        for clone in live_fkey_clones(
+            storage,
+            txid,
+            info.child_slot,
+            fk.identity,
+            info.parent_slot,
+        ) {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_constraint"));
+            }
+            let partition = clone.partition.slot();
+            let partition_def = storage.table_def(partition, txid);
+            let referenced = storage.table_def(info.parent_slot, txid);
+            let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+            for (target, &column) in columns.iter_mut().zip(fk.parent_cols()) {
+                let name = referenced.columns()[usize::from(column)].name;
+                *target = partition_def
+                    .column_index(name.as_str())
+                    .expect("a partition has its parent's columns")
+                    as u16;
+            }
+            let mut values = [Datum::Null; 29];
+            values.copy_from_slice(out[root_row]);
+            values[0] = Datum::Int4(clone.oid());
+            values[1] = text(clone.name.as_str(), arena)?;
+            values[5] = Datum::Int4(fkey_clone_parent_oid(
+                storage,
+                txid,
+                (info.child_slot, info.parent_slot),
+                &fk,
+                partition,
+                None,
+            ));
+            values[6] = Datum::Int4(fkey_clone_index_oid(
+                storage,
+                txid,
+                indexes,
+                info.parent_slot,
+                partition,
+                conindid,
+            ));
+            values[7] = Datum::Int4(user_table_oid(storage, partition));
+            values[16] = attnum_array(&columns[..fk.n_parent_cols], &partition_def, arena)?;
+            values[20] = Datum::Bool(false);
+            values[21] = Datum::Int4(1);
+            values[22] = Datum::Bool(false);
+            out[n] = row(&values, arena)?;
+            n += 1;
+        }
     }
     // User constraint triggers have a pg_constraint identity linked from
     // pg_trigger.tgconstraint. They do not own an index.
@@ -24097,7 +24269,10 @@ fn pg_trigger<'a>(
     let definition = schema::require("pg_trigger", false);
     let foreign_key_rows = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
-        .map(|slot| storage.table_def(slot, txid).fkeys().len() * 4)
+        .map(|slot| {
+            let definition = storage.table_def(slot, txid);
+            definition.fkeys().len() * 4 + definition.fkey_clones().len() * 2
+        })
         .sum::<usize>();
     let user_trigger_rows = storage
         .triggers_with_slots_visible_to(txid)
@@ -24145,8 +24320,9 @@ fn pg_trigger<'a>(
             let constraint_oid = foreign_key.oid();
             // A partition's cloned constraint checks rows on the partition;
             // the referenced table's actions belong to the parent constraint.
-            let cloned =
-                inherited_foreign_key_parent_oid(storage, txid, child_slot, foreign_key) != 0;
+            let inherited_from =
+                inherited_foreign_key_parent(storage, txid, child_slot, foreign_key);
+            let cloned = inherited_from.is_some();
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
                 if cloned && trigger.ordinal() < 2 {
                     continue;
@@ -24182,7 +24358,7 @@ fn pg_trigger<'a>(
                         Datum::Int4(PG_TRIGGER_OID),
                         Datum::Int4(oid),
                         Datum::Int4(relation),
-                        Datum::Int4(0),
+                        Datum::Int4(inherited_from.map_or(0, |parent| parent.trigger_oid(trigger))),
                         text(name.as_str(), arena)?,
                         Datum::Int4(function),
                         Datum::Int2(trigger_type),
@@ -24208,6 +24384,62 @@ fn pg_trigger<'a>(
                     arena,
                 )?;
                 count += 1;
+            }
+            // Each partition clone owns the partition's two action triggers.
+            for clone in
+                live_fkey_clones(storage, txid, child_slot, foreign_key.identity, parent_slot)
+            {
+                let partition = clone.partition.slot();
+                let partition_index = fkey_clone_index_oid(
+                    storage,
+                    txid,
+                    indexes,
+                    parent_slot,
+                    partition,
+                    parent_index,
+                );
+                for trigger in [
+                    crate::storage::ForeignKeyTrigger::ActionDelete,
+                    crate::storage::ForeignKeyTrigger::ActionUpdate,
+                ] {
+                    if count == rows.len() {
+                        return Err(catalog_capacity_exceeded("pg_trigger"));
+                    }
+                    let oid = clone.trigger_oid(trigger);
+                    let name = crate::stack_format!(64, "RI_ConstraintTrigger_a_{}", oid);
+                    let (function, trigger_type) =
+                        if matches!(trigger, crate::storage::ForeignKeyTrigger::ActionDelete) {
+                            (foreign_key_action_routine(foreign_key.on_delete, false), 9)
+                        } else {
+                            (foreign_key_action_routine(foreign_key.on_update, true), 17)
+                        };
+                    let mut values = [Datum::Null; 20];
+                    values.copy_from_slice(rows[count - 1]);
+                    values[1] = Datum::Int4(oid);
+                    values[2] = Datum::Int4(user_table_oid(storage, partition));
+                    values[3] = Datum::Int4(fkey_clone_parent_oid(
+                        storage,
+                        txid,
+                        (child_slot, parent_slot),
+                        foreign_key,
+                        partition,
+                        Some(trigger),
+                    ));
+                    values[4] = text(name.as_str(), arena)?;
+                    values[5] = Datum::Int4(function);
+                    values[6] = Datum::Int2(trigger_type);
+                    values[7] = Datum::Bpchar(match foreign_key.trigger_enabled(trigger) {
+                        crate::storage::TriggerEnabled::Origin => "O",
+                        crate::storage::TriggerEnabled::Replica => "R",
+                        crate::storage::TriggerEnabled::Always => "A",
+                        crate::storage::TriggerEnabled::Disabled => "D",
+                    });
+                    values[9] = Datum::Int4(child_oid);
+                    values[10] = Datum::Int4(partition_index);
+                    values[11] = Datum::Int4(clone.oid());
+                    rows[count] = row(&values, arena)?;
+                    count += 1;
+                }
             }
         }
     }

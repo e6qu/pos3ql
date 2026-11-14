@@ -90,6 +90,41 @@ impl<'row, 'value, B: DefinitionBacking> PartitionRow<'row, 'value, B> {
 }
 
 impl PartitionKeyRow<'_, '_> {
+    /// PostgreSQL's `ExecBuildSlotPartitionKeyDescription` detail, naming the
+    /// keys by `parent`'s columns.
+    pub(crate) fn describe(
+        self,
+        parent: &TableDefinition<impl DefinitionBacking>,
+    ) -> crate::util::StackStr<1024> {
+        use core::fmt::Write;
+        let mut detail =
+            crate::util::StackStr::<1024>::from_str("Partition key of the failing row contains (");
+        let keys = &self.scheme.keys[..usize::from(self.scheme.n_keys)];
+        let names = parent
+            .partition
+            .scheme
+            .expect("a routing parent is partitioned")
+            .keys;
+        for (index, &name) in names[..keys.len()].iter().enumerate() {
+            let _ = detail.write_str(if index == 0 { "" } else { ", " });
+            let _ = detail.write_str(parent.columns()[usize::from(name)].name.as_str());
+        }
+        let _ = detail.write_str(") = (");
+        for (index, &key) in keys.iter().enumerate() {
+            let _ = detail.write_str(if index == 0 { "" } else { ", " });
+            match self.values[usize::from(key)] {
+                Datum::Null => {
+                    let _ = detail.write_str("null");
+                }
+                value => {
+                    let _ = write!(detail, "{value}");
+                }
+            }
+        }
+        let _ = detail.write_str(").");
+        detail
+    }
+
     pub(crate) fn all_known(self, known: &[bool]) -> bool {
         self.scheme.keys[..usize::from(self.scheme.n_keys)]
             .iter()

@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 24;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 25;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1269,6 +1269,16 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         .iter()
         .map(|key| 2 + 1 + key.name.as_str().len())
         .sum::<usize>();
+    n += 2 + def
+        .fkey_clones()
+        .iter()
+        .map(|clone| {
+            crate::storage::ConstraintIdentity::ENCODED_BYTES
+                + crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + clone.name.as_str().len()
+        })
+        .sum::<usize>();
     n += def.table_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
     n += 1 + def
@@ -1688,6 +1698,12 @@ fn append_table_payload<B: DefinitionBacking>(
     }
     for key in def.inline_key_names() {
         ok &= buffer.append(&key.attribute.to_le_bytes()) && name_bytes(buffer, key.name.as_str());
+    }
+    ok &= buffer.append(&(def.n_fkey_clones as u16).to_le_bytes());
+    for clone in def.fkey_clones() {
+        ok &= buffer.append(&clone.foreign_key.to_le_bytes())
+            && buffer.append(&clone.partition.encode())
+            && name_bytes(buffer, clone.name.as_str());
     }
     for identity in def.table_index_identities() {
         ok &= identity.is_some()
@@ -8918,6 +8934,26 @@ fn decode_op_inner<'a>(
                 def.n_inline_key_names += 1;
             }
             crate::storage::Storage::validate_inline_key_names(&def).ok()?;
+            let clones = usize::from(u16::from_le_bytes(
+                payload.get(at..at + 2)?.try_into().ok()?,
+            ));
+            at += 2;
+            if clones > crate::storage::MAX_FKEY_CLONES {
+                return None;
+            }
+            for clone in &mut def.fkey_clones[..clones] {
+                let bytes =
+                    payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+                clone.foreign_key =
+                    crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?;
+                clone.partition = crate::storage::CatalogPosition::decode(
+                    payload.get(at..at + crate::storage::CatalogPosition::ENCODED_BYTES)?,
+                )?;
+                at += crate::storage::CatalogPosition::ENCODED_BYTES;
+                clone.name = SqlName::parse(take_name(&mut at)?).ok()?;
+            }
+            def.n_fkey_clones = clones;
             // Stored names are authoritative during later column remapping.
             def.not_null_name_edits = crate::storage::ColumnSet::all(n_cols);
             for identity in def.table_index_identities_mut() {
@@ -8938,6 +8974,9 @@ fn decode_op_inner<'a>(
                 identity.created_at(),
             )
             .ok()?;
+            if !def.fkey_clones_are_valid() {
+                return None;
+            }
             let dependencies = usize::from(*payload.get(at)?);
             at += 1;
             if dependencies > crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES {

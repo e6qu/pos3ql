@@ -108,6 +108,50 @@ pub(crate) fn for_each_dependency(
         })?;
     }
 
+    // Each RI trigger is internal to its foreign key or partition clone.
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for key in definition.fkeys() {
+            let Some(referenced) =
+                storage.find_visible(key.parent_schema.as_str(), key.parent.as_str(), txid)
+            else {
+                continue;
+            };
+            let inherited = inherited_foreign_key_parent_oid(storage, txid, table, key) != 0;
+            for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                if inherited && trigger.ordinal() < 2 {
+                    continue;
+                }
+                push!(
+                    2620,
+                    key.trigger_oid(trigger),
+                    PG_CONSTRAINT_OID,
+                    key.oid(),
+                    0,
+                    "i"
+                )?;
+            }
+            for clone in live_fkey_clones(storage, txid, table, key.identity, referenced) {
+                for trigger in [
+                    crate::storage::ForeignKeyTrigger::ActionDelete,
+                    crate::storage::ForeignKeyTrigger::ActionUpdate,
+                ] {
+                    push!(
+                        2620,
+                        clone.trigger_oid(trigger),
+                        PG_CONSTRAINT_OID,
+                        clone.oid(),
+                        0,
+                        "i"
+                    )?;
+                }
+            }
+        }
+    }
+
     // Sequence ownership is how pg_dump distinguishes serial/identity
     // generators from independent sequences and orders them with the owning
     // column.

@@ -1606,6 +1606,7 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 
 pub(crate) mod constraints;
+mod foreign_key_clones;
 mod foreign_key_equality;
 pub use constraints::check_unique_indexes;
 use constraints::{
@@ -1614,6 +1615,7 @@ use constraints::{
     table_is_referenced,
 };
 pub(crate) use constraints::{coerce_domain_value, parse_defaults};
+pub(crate) use foreign_key_clones::reconcile_foreign_key_clones;
 pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
 
 #[derive(Clone, Copy)]
@@ -9505,22 +9507,25 @@ fn drop_table_kind_with_columns(
                             {
                                 return None;
                             }
-                            storage
-                                .table_def(child, txn.txid)
+                            let child_definition = storage.table_def(child, txn.txid);
+                            // A key referencing a partitioned ancestor depends
+                            // on the partition through its clone.
+                            let dropped = storage.table_position(index);
+                            child_definition
                                 .fkeys()
                                 .iter()
                                 .position(|foreign_key| {
-                                    foreign_key.parent_schema == def.schema
-                                        && foreign_key.parent == def.name
+                                    (foreign_key.parent_schema == def.schema
+                                        && foreign_key.parent == def.name)
+                                        || foreign_key.identity.is_some_and(|identity| {
+                                            child_definition.fkey_clone(identity, dropped).is_some()
+                                        })
                                 })
                                 .map(|foreign_key| (child, foreign_key))
                         });
                         let Some((child, foreign_key)) = inbound else {
                             break;
                         };
-                        let (child_target, child_definition) =
-                            storage.select_table_definition(child, txn.txid);
-                        let constraint = child_definition.fkeys()[foreign_key].name;
                         if !statement.cascade {
                             return sql_fail(sql_err!(
                                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -9528,42 +9533,65 @@ fn drop_table_kind_with_columns(
                                 def.name.as_str()
                             ));
                         }
-                        let lsn = storage.bump_lsn();
-                        if let Err(error) = wal.stage_reserved(
-                            txn.txid,
-                            lsn,
-                            &WalOp::DropTableFk {
-                                schema: child_definition.schema.as_str(),
-                                table: child_definition.name.as_str(),
-                                fk_name: constraint.as_str(),
-                            },
-                        ) {
-                            return sql_fail(error);
-                        }
-                        let mut updated = TableDefBuilder::from_definition(&child_definition);
-                        if !drop_named_constraint(&mut updated, constraint.as_str()) {
-                            return sql_fail(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "inbound foreign key vanished during DROP TABLE"
-                            ));
-                        }
-                        let mut identity_mapping = [None; MAX_COLUMNS];
-                        for (column, target) in identity_mapping
-                            .iter_mut()
-                            .enumerate()
-                            .take(child_definition.n_columns)
-                        {
-                            *target = Some(child_definition.columns()[column].name);
-                        }
-                        if let Err(error) = txn.write_table_definition(
+                        // The key's copies on the referencing table's
+                        // partitions go with it.
+                        let copies = match arena.alloc_slice_with(storage.table_count() + 1, |_| {
+                            (0usize, crate::storage::SqlName::EMPTY)
+                        }) {
+                            Ok(copies) => copies,
+                            Err(_) => return sql_fail(arena_full()),
+                        };
+                        let key = storage.table_def(child, txn.txid).fkeys()[foreign_key];
+                        copies[0] = (child, key.name);
+                        let mut copy_count = 1usize;
+                        foreign_key_clones::inherited_key_copies(
                             storage,
-                            child_target,
-                            updated,
-                            &identity_mapping,
-                            false,
-                            crate::storage::ColumnSet::EMPTY,
-                        ) {
-                            return sql_fail(error);
+                            txn.txid,
+                            child,
+                            key.oid(),
+                            copies,
+                            &mut copy_count,
+                        );
+                        for &(child, constraint) in copies[..copy_count].iter() {
+                            let (child_target, child_definition) =
+                                storage.select_table_definition(child, txn.txid);
+                            let lsn = storage.bump_lsn();
+                            if let Err(error) = wal.stage_reserved(
+                                txn.txid,
+                                lsn,
+                                &WalOp::DropTableFk {
+                                    schema: child_definition.schema.as_str(),
+                                    table: child_definition.name.as_str(),
+                                    fk_name: constraint.as_str(),
+                                },
+                            ) {
+                                return sql_fail(error);
+                            }
+                            let mut updated = TableDefBuilder::from_definition(&child_definition);
+                            if !drop_named_constraint(&mut updated, constraint.as_str()) {
+                                return sql_fail(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "inbound foreign key vanished during DROP TABLE"
+                                ));
+                            }
+                            let mut identity_mapping = [None; MAX_COLUMNS];
+                            for (column, target) in identity_mapping
+                                .iter_mut()
+                                .enumerate()
+                                .take(child_definition.n_columns)
+                            {
+                                *target = Some(child_definition.columns()[column].name);
+                            }
+                            if let Err(error) = txn.write_table_definition(
+                                storage,
+                                child_target,
+                                updated,
+                                &identity_mapping,
+                                false,
+                                crate::storage::ColumnSet::EMPTY,
+                            ) {
+                                return sql_fail(error);
+                            }
                         }
                     }
                     // Owned serial/identity sequences are internal dependencies:
@@ -93756,22 +93784,26 @@ fn alter_partition_attachment(
         });
         new_def.partition.detached_bound = None;
     } else {
-        let Some(attachment) = child_def.partition.attachment else {
+        // `RemoveInheritance` finds no partition edge to this parent.
+        let Some(attachment) = child_def
+            .partition
+            .attachment
+            .filter(|attachment| usize::from(attachment.parent) == parent)
+        else {
             return sql_fail(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "relation \"{}\" is not a partition",
-                child_def.name.as_str()
-            ));
-        };
-        if usize::from(attachment.parent) != parent {
-            return sql_fail(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
+                sqlstate::UNDEFINED_TABLE,
                 "relation \"{}\" is not a partition of relation \"{}\"",
                 child_def.name.as_str(),
                 parent_def.name.as_str()
             ));
-        }
+        };
         let detach_mode = detach_mode.expect("detach has a mode");
+        if detach_mode != crate::sql::ast::PartitionDetachMode::Finalize
+            && let Err(error) =
+                constraints::check_partition_removal(storage, child, txn.txid, arena)
+        {
+            return sql_fail(error);
+        }
         let mut scheme = scheme;
         for key in &mut scheme.keys[..usize::from(scheme.n_keys)] {
             let name = parent_def.columns()[usize::from(*key)].name;

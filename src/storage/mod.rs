@@ -1762,6 +1762,9 @@ pub(crate) const MAX_CHECKS: usize = MAX_TABLE_CONSTRAINTS;
 pub(crate) const CHECK_SQL_MAX: usize = 512;
 /// Maximum number of FOREIGN KEY constraints per table.
 pub(crate) const MAX_FKEYS: usize = MAX_TABLE_CONSTRAINTS;
+/// Maximum number of partition clones of a table's foreign keys: one per
+/// partition, at any depth, of each partitioned table a key references.
+pub(crate) const MAX_FKEY_CLONES: usize = 256;
 /// Maximum number of exclusion constraints per table.
 pub(crate) const MAX_EXCLUSIONS: usize = MAX_TABLE_CONSTRAINTS;
 /// Exclusion predicates share the bounded table-definition footprint with
@@ -2249,6 +2252,41 @@ impl ReferencedIndex {
     }
 }
 
+/// The `pg_constraint` row PostgreSQL's `addFkRecurseReferenced` adds for a
+/// foreign key on each partition of the partitioned table it references. Its
+/// name is chosen against the namespace when the clone is made and kept, and
+/// it owns the partition's two RI action triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForeignKeyClone {
+    pub(crate) identity: Option<ConstraintIdentity>,
+    /// The foreign key, on this table, the clone belongs to.
+    pub(crate) foreign_key: ConstraintIdentity,
+    /// The referenced partition.
+    pub(crate) partition: CatalogPosition,
+    pub(crate) name: SqlName,
+}
+
+impl ForeignKeyClone {
+    pub(crate) const EMPTY: Self = Self {
+        identity: None,
+        foreign_key: ConstraintIdentity::PLACEHOLDER,
+        partition: CatalogPosition::PLACEHOLDER,
+        name: SqlName::EMPTY,
+    };
+
+    pub(crate) fn oid(&self) -> i32 {
+        self.identity
+            .expect("admitted foreign key clone has a creation identity")
+            .oid()
+    }
+
+    pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> i32 {
+        self.identity
+            .expect("admitted foreign key clone has a creation identity")
+            .foreign_key_trigger_oid(trigger)
+    }
+}
+
 /// A FOREIGN KEY constraint on a child table's column tuple referencing a
 /// parent table's column tuple.
 #[derive(Debug, Clone, Copy)]
@@ -2385,6 +2423,8 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_checks: usize,
     pub fkeys: B::Slice<ForeignKey, MAX_FKEYS>,
     pub n_fkeys: usize,
+    pub(crate) fkey_clones: B::Slice<ForeignKeyClone, MAX_FKEY_CLONES>,
+    pub(crate) n_fkey_clones: usize,
     pub exclusions: B::Slice<ExclusionConstraint, MAX_EXCLUSIONS>,
     pub n_exclusions: usize,
     /// What the CHECK constraints and column expressions were bound to.
@@ -2898,6 +2938,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
+            n_fkey_clones: self.n_fkey_clones,
             n_exclusions: self.n_exclusions,
             n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
@@ -2921,6 +2962,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             uniques: &self.uniques.as_ref()[..self.n_uniques],
             checks: &self.checks.as_ref()[..self.n_checks],
             fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
+            fkey_clones: &self.fkey_clones.as_ref()[..self.n_fkey_clones],
             exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
             expression_dependencies: &self.expression_dependencies.as_ref()
                 [..self.n_expression_dependencies],
@@ -2994,6 +3036,42 @@ impl<B: DefinitionBacking> TableDefinition<B> {
 
     pub fn exclusions(&self) -> &[ExclusionConstraint] {
         &self.exclusions.as_ref()[..self.n_exclusions]
+    }
+
+    pub(crate) fn fkey_clones(&self) -> &[ForeignKeyClone] {
+        &self.fkey_clones.as_ref()[..self.n_fkey_clones]
+    }
+
+    /// Whether every stored clone is named and names a distinct (key,
+    /// partition) pair. A clone whose key a statement dropped is dead until
+    /// the statement's end reconciles it away.
+    pub(crate) fn fkey_clones_are_valid(&self) -> bool {
+        self.fkey_clones().iter().enumerate().all(|(at, clone)| {
+            clone.name != SqlName::EMPTY
+                && !self.fkey_clones()[..at].iter().any(|earlier| {
+                    earlier.foreign_key == clone.foreign_key && earlier.partition == clone.partition
+                })
+        })
+    }
+
+    /// The clone of `foreign_key` for the referenced `partition`.
+    pub(crate) fn fkey_clone(
+        &self,
+        foreign_key: ConstraintIdentity,
+        partition: CatalogPosition,
+    ) -> Option<&ForeignKeyClone> {
+        self.fkey_clones()
+            .iter()
+            .find(|clone| clone.foreign_key == foreign_key && clone.partition == partition)
+    }
+
+    /// The clones whose foreign key is still on this table.
+    pub(crate) fn keyed_fkey_clones(&self) -> impl Iterator<Item = &ForeignKeyClone> {
+        self.fkey_clones().iter().filter(|clone| {
+            self.fkeys()
+                .iter()
+                .any(|key| key.identity == Some(clone.foreign_key))
+        })
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
@@ -3100,6 +3178,7 @@ impl TableDefBuilder {
         result.n_uniques = source.n_uniques;
         result.n_checks = source.n_checks;
         result.n_fkeys = source.n_fkeys;
+        result.n_fkey_clones = source.n_fkey_clones;
         result.n_exclusions = source.n_exclusions;
         result.has_toast = source.has_toast;
         result.toast_index_identity = source.toast_index_identity;
@@ -3127,6 +3206,7 @@ impl TableDefBuilder {
         result.checks[..source.n_checks]
             .copy_from_slice(&source.checks.as_ref()[..source.n_checks]);
         result.fkeys[..source.n_fkeys].copy_from_slice(&source.fkeys.as_ref()[..source.n_fkeys]);
+        result.fkey_clones[..source.n_fkey_clones].copy_from_slice(source.fkey_clones());
         result.exclusions[..source.n_exclusions]
             .copy_from_slice(&source.exclusions.as_ref()[..source.n_exclusions]);
         result.n_expression_dependencies = source.n_expression_dependencies;
@@ -3149,6 +3229,7 @@ impl TableDefBuilder {
             || self.n_uniques > MAX_UNIQUES
             || self.n_checks > MAX_CHECKS
             || self.n_fkeys > MAX_FKEYS
+            || self.n_fkey_clones > MAX_FKEY_CLONES
             || self.n_exclusions > MAX_EXCLUSIONS
             || self.n_expression_dependencies > MAX_TABLE_EXPRESSION_DEPENDENCIES
         {
@@ -3176,6 +3257,7 @@ impl TableDefBuilder {
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
+            n_fkey_clones: self.n_fkey_clones,
             n_exclusions: self.n_exclusions,
             n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
@@ -3213,6 +3295,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             fkeys: pool
                 .copy_slice(&self.fkeys[..self.n_fkeys])
+                .map_err(exhausted)?,
+            fkey_clones: pool
+                .copy_slice(&self.fkey_clones[..self.n_fkey_clones])
                 .map_err(exhausted)?,
             exclusions: pool
                 .copy_slice(&self.exclusions[..self.n_exclusions])
@@ -3258,6 +3343,8 @@ impl TableDefBuilder {
             n_checks: 0,
             fkeys: [ForeignKey::EMPTY; MAX_FKEYS],
             n_fkeys: 0,
+            fkey_clones: [ForeignKeyClone::EMPTY; MAX_FKEY_CLONES],
+            n_fkey_clones: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
             expression_dependencies: [ExpressionDependency::EMPTY;
@@ -3305,6 +3392,8 @@ impl TableDef {
             n_checks: 0,
             fkeys: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_fkeys: 0,
+            fkey_clones: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_fkey_clones: 0,
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_exclusions: 0,
             expression_dependencies: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -3350,6 +3439,8 @@ impl TableDefView<'_> {
             n_checks: 0,
             fkeys: &[],
             n_fkeys: 0,
+            fkey_clones: &[],
+            n_fkey_clones: 0,
             exclusions: &[],
             n_exclusions: 0,
             expression_dependencies: &[],
@@ -38625,10 +38716,17 @@ impl Storage {
             }
         }
         match_slot.or(default).ok_or_else(|| {
+            // `ExecFindPartition`: the key values and `errtable`.
+            let parent = self.table_def(parent_slot, txid);
+            let detail = row.describe(&parent);
+            crate::sql::eval::stash_object_diagnostic(
+                Some(detail.as_str()),
+                crate::sql::eval::ErrorObjects::table(parent.schema.as_str(), parent.name.as_str()),
+            );
             sql_err!(
                 sqlstate::CHECK_VIOLATION,
                 "no partition of relation \"{}\" found for row",
-                self.table_def(parent_slot, txid).name.as_str()
+                parent.name.as_str()
             )
         })
     }

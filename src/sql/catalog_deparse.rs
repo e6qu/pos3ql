@@ -71,6 +71,7 @@ pub(crate) struct Context<'s> {
 
 /// How EXPLAIN refers to a subquery its plan runs separately.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[expect(clippy::enum_variant_names, reason = "PostgreSQL's EXPLAIN plan names")]
 pub(crate) enum SublinkPlan {
     /// Run once before the query's first row: `(InitPlan 1).col1`.
     InitPlan(u16),

@@ -3105,7 +3105,7 @@ fn plan_sublinks<'a>(
             && crate::sql::guc::planner_methods().material
             && !materializes
         {
-            let wrapped = arena
+            arena
                 .alloc_slice_with(count + 1, |index| match index {
                     0 => PlanNode {
                         name: StackStr::from_str("Materialize"),
@@ -3120,8 +3120,7 @@ fn plan_sublinks<'a>(
                         ..nodes[index - 1]
                     },
                 })
-                .map_err(|_| arena_full())?;
-            wrapped
+                .map_err(|_| arena_full())?
         } else {
             &nodes[..count]
         };

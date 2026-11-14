@@ -534,10 +534,17 @@ pub(super) fn for_each_key_in_creation_order(
 }
 
 impl Storage {
+    /// A new constraint stamp, for a constraint PostgreSQL drops and creates
+    /// again under a new OID.
+    pub(crate) fn reserve_constraint_identity(&self) -> Result<ConstraintIdentity, SqlError> {
+        ConstraintIdentity::reserve(self)
+    }
+
     pub(super) fn reserve_constraint_identities(
         &self,
         definition: &mut super::TableDefBuilder,
         declared: Option<&ConstraintDeclarationOrder>,
+        creating: bool,
     ) -> Result<(), SqlError> {
         for (identity, slot) in definition
             .attribute_identities
@@ -573,7 +580,7 @@ impl Storage {
                 *identity = None;
             }
         }
-        self.reserve_table_constraints_in_creation_order(definition, declared)?;
+        self.reserve_table_constraints_in_creation_order(definition, declared, creating)?;
         validate_constraint_identities(definition.constraint_identities())
     }
 
@@ -581,11 +588,15 @@ impl Storage {
     /// assigns their OIDs: column defaults, CHECK constraints, NOT NULL
     /// constraints (a table primary key's undeclared columns last, in key
     /// order), the primary key, the other keys and exclusion constraints as
-    /// `declared`, then foreign keys.
+    /// `declared`, then foreign keys. A table being created
+    /// (`DefineRelation`) adds its local NOT NULL constraints before those it
+    /// inherits; a new partition clones its parent's keys and foreign keys
+    /// before it adds any NOT NULL constraint.
     fn reserve_table_constraints_in_creation_order(
         &self,
         definition: &mut super::TableDefBuilder,
         declared: Option<&ConstraintDeclarationOrder>,
+        creating: bool,
     ) -> Result<(), SqlError> {
         let reserve = |identity: &mut Option<ConstraintIdentity>| -> Result<(), SqlError> {
             if identity.is_none() {
@@ -637,11 +648,25 @@ impl Storage {
         let declared_not_null = |column: usize| {
             declared.is_some_and(|declared| declared.declared_not_null.contains(column))
         };
-        for attribute in 0..attributes {
-            if not_null(definition, attribute).is_some_and(|column| {
-                !primary.contains(&(column as u16)) || declared_not_null(column)
-            }) {
-                reserve(&mut definition.attribute_identities[attribute].not_null)?;
+        let partition = creating && definition.partition.attachment.is_some();
+        if partition {
+            for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
+            for key in &mut definition.fkeys[..definition.n_fkeys] {
+                reserve(&mut key.identity)?;
+            }
+        }
+        // Local NOT NULL constraints, then (for a new table) inherited ones.
+        for local_pass in [true, false] {
+            for attribute in 0..attributes {
+                if not_null(definition, attribute).is_some_and(|column| {
+                    (!creating || definition.columns[column].not_null.is_local() == local_pass)
+                        && (!primary.contains(&(column as u16)) || declared_not_null(column))
+                }) {
+                    reserve(&mut definition.attribute_identities[attribute].not_null)?;
+                }
+            }
+            if !creating {
+                break;
             }
         }
         for &column in primary {
@@ -651,9 +676,11 @@ impl Storage {
                 reserve(&mut definition.attribute_identities[attribute].not_null)?;
             }
         }
-        for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
-        for key in &mut definition.fkeys[..definition.n_fkeys] {
-            reserve(&mut key.identity)?;
+        if !partition {
+            for_each_key_in_creation_order(definition, declared, |identity, _| reserve(identity))?;
+            for key in &mut definition.fkeys[..definition.n_fkeys] {
+                reserve(&mut key.identity)?;
+            }
         }
         // Anything the creation order above does not name keeps the
         // definition's own order.

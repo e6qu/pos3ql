@@ -32857,6 +32857,7 @@ fn apply_wal_op(
             expressions,
             unique,
             definition,
+            parent,
             expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
@@ -32894,7 +32895,10 @@ fn apply_wal_op(
                     .map(crate::storage::index_predicate_stackstr)
                     .transpose()?,
                 unique,
-                mutable: definition,
+                mutable: crate::storage::IndexMutableDefinition {
+                    parent: storage.resolve_index_parent(parent, 0)?,
+                    ..definition
+                },
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Present,
                 pending_parent_drop_txid: None,
@@ -32935,6 +32939,7 @@ fn apply_wal_op(
             schema,
             name,
             definition,
+            parent,
             expressions,
             predicate,
         } => {
@@ -32947,6 +32952,10 @@ fn apply_wal_op(
             })?;
             let (expressions, predicate) =
                 crate::storage::index_expression_image(expressions, predicate)?;
+            let definition = crate::storage::IndexMutableDefinition {
+                parent: storage.resolve_index_parent(parent, 0)?,
+                ..definition
+            };
             storage.alter_index_definition(slot, definition, 0)?;
             storage.alter_index_expressions(slot, expressions, predicate, 0)?;
             storage.commit_index_definition(slot)?;

@@ -199,7 +199,7 @@ pub(super) fn allocate(
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }
-                storage.reserve_declared_table_catalog_identities(&mut def, declared)?;
+                storage.reserve_declared_table_catalog_identities(&mut def, declared, true)?;
             }
             super::CatalogAllocation::Restore(_) => {
                 storage.validate_table_catalog_identities(&def, created_at)?

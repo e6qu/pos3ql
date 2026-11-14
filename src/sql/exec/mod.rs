@@ -1764,6 +1764,7 @@ pub(crate) mod expression_bindings;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 
+mod alter_type_rebuild;
 pub(crate) mod constraints;
 mod foreign_key_clones;
 mod foreign_key_equality;
@@ -68493,6 +68494,7 @@ fn rewrite_table_index_expressions<Definition0: crate::storage::DefinitionBackin
                     schema: index.schema.as_str(),
                     name: name.as_str(),
                     definition: index.mutable_for(txn.txid),
+                    parent: storage.index_parent_identity(index.mutable_for(txn.txid), txn.txid),
                     expressions,
                     predicate,
                 },
@@ -72320,6 +72322,7 @@ pub(super) fn stage_index_definition(
                 schema: schema.as_str(),
                 name: name.as_str(),
                 definition,
+                parent: storage.index_parent_identity(definition, txn.txid),
                 expressions,
                 predicate,
             },
@@ -72515,6 +72518,7 @@ fn journal_index_creation(
                 predicate: index.predicate.as_ref().map(|text| text.as_str()),
                 unique: index.unique,
                 definition: index.mutable_for(txn.txid),
+                parent: storage.index_parent_identity(index.mutable_for(txn.txid), txn.txid),
                 expression_dependencies: crate::wal::ExpressionDependencyList::Entries(
                     index.expression_dependencies(),
                 ),
@@ -96249,8 +96253,28 @@ fn alter_table_inner(
             }
             _ => None,
         };
+    let retypes = statement
+        .actions
+        .iter()
+        .any(|action| matches!(action, AlterAction::AlterColumnType { .. }));
     let Some((root, tree)) = planned else {
-        return alter_table_relation(
+        if !retypes {
+            return alter_table_relation(
+                storage,
+                wal,
+                txn,
+                scratch,
+                statement,
+                arena,
+                seq_session,
+                responder,
+                emit_completion,
+                expected_kind,
+                tag,
+                inheritance_scope,
+            );
+        }
+        match alter_table_relation(
             storage,
             wal,
             txn,
@@ -96259,11 +96283,31 @@ fn alter_table_inner(
             arena,
             seq_session,
             responder,
-            emit_completion,
+            false,
             expected_kind,
             tag,
             inheritance_scope,
-        );
+        ) {
+            Ok(Ok(())) => {}
+            other => return other,
+        }
+        if let Some(crate::storage::ResolvedRelation::Table(table)) =
+            storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid)
+            && let Err(error) = alter_type_rebuild::rebuild_retyped_dependents(
+                storage,
+                wal,
+                txn,
+                &[table],
+                statement.actions,
+                arena,
+            )
+        {
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
     };
     // One bounded parent-first plan replaces recursive ALTER frames. A diamond
     // reaches its shared descendant once, after both inherited parents change.
@@ -96463,6 +96507,18 @@ fn alter_table_inner(
             Ok(Ok(())) => {}
             other => return other,
         }
+    }
+    if retypes
+        && let Err(error) = alter_type_rebuild::rebuild_retyped_dependents(
+            storage,
+            wal,
+            txn,
+            order,
+            statement.actions,
+            arena,
+        )
+    {
+        return sql_fail(error);
     }
     if emit_completion {
         responder.command_complete(tag)?;

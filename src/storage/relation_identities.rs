@@ -157,23 +157,40 @@ impl super::TableDefBuilder {
 }
 
 impl Storage {
+    /// A new relation stamp, for an index PostgreSQL drops and creates again
+    /// under a new OID.
+    pub(crate) fn reserve_relation_identity(&self) -> Result<RelationIdentity, SqlError> {
+        RelationIdentity::parse(
+            self.catalog_sequence
+                .next_bounded(MAX_RELATION_GENERATION, "relation")?,
+        )
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "bounded creation stamp is not a relation identity"
+            )
+        })
+    }
+
     pub(crate) fn reserve_table_catalog_identities(
         &self,
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
-        self.reserve_declared_table_catalog_identities(definition, None)
+        self.reserve_declared_table_catalog_identities(definition, None, false)
     }
 
-    /// Reserves a new table's identities, numbering its NOT NULL, key and
-    /// exclusion constraints and key indexes as `declared` when given.
+    /// Reserves a table's missing identities, numbering its NOT NULL, key and
+    /// exclusion constraints and key indexes as `declared` when given;
+    /// `creating` when the table itself is new.
     pub(crate) fn reserve_declared_table_catalog_identities(
         &self,
         definition: &mut super::TableDefBuilder,
         declared: Option<&super::ConstraintDeclarationOrder>,
+        creating: bool,
     ) -> Result<(), SqlError> {
         Self::validate_inline_key_names(definition)?;
         definition.prune_expression_dependencies();
-        self.reserve_constraint_identities(definition, declared)?;
+        self.reserve_constraint_identities(definition, declared, creating)?;
         definition.has_toast |= definition
             .columns()
             .iter()

@@ -200,6 +200,7 @@ pub(super) fn stage_type_record(
             expressions,
             unique,
             definition,
+            parent,
             expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
@@ -237,7 +238,10 @@ pub(super) fn stage_type_record(
                     .map(crate::storage::index_predicate_stackstr)
                     .transpose()?,
                 unique: *unique,
-                mutable: *definition,
+                mutable: crate::storage::IndexMutableDefinition {
+                    parent: storage.resolve_index_parent(*parent, txid)?,
+                    ..*definition
+                },
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Present,
                 pending_parent_drop_txid: None,
@@ -251,6 +255,7 @@ pub(super) fn stage_type_record(
             schema,
             name,
             definition,
+            parent,
             expressions,
             predicate,
         } => {
@@ -259,7 +264,11 @@ pub(super) fn stage_type_record(
                 .ok_or_else(|| missing("index"))?;
             let (expressions, predicate) =
                 crate::storage::index_expression_image(*expressions, *predicate)?;
-            let prior = storage.alter_index_definition(slot, *definition, txid)?;
+            let definition = crate::storage::IndexMutableDefinition {
+                parent: storage.resolve_index_parent(*parent, txid)?,
+                ..*definition
+            };
+            let prior = storage.alter_index_definition(slot, definition, txid)?;
             storage.alter_index_expressions(slot, expressions, predicate, txid)?;
             transaction.record_catalog_change(
                 storage,

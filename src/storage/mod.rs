@@ -53575,6 +53575,45 @@ impl Storage {
             })
     }
 
+    /// The creation stamp of the partitioned index `definition` is attached
+    /// to, which the journal records in place of its slot.
+    pub(crate) fn index_parent_identity(
+        &self,
+        definition: IndexMutableDefinition,
+        txid: u32,
+    ) -> Option<u64> {
+        definition
+            .parent
+            .and_then(|slot| self.index_visible_to(usize::from(slot), txid))
+            .map(|parent| parent.created_at)
+    }
+
+    /// The slot of the journaled parent index created at `parent`.
+    pub(crate) fn resolve_index_parent(
+        &self,
+        parent: Option<u64>,
+        txid: u32,
+    ) -> Result<Option<u16>, SqlError> {
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        let slot = (0..self.index_count())
+            .find(|&slot| {
+                self.index_visible_to(slot, txid)
+                    .is_some_and(|index| index.created_at == parent)
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journaled index parent {} does not exist",
+                    parent
+                )
+            })?;
+        u16::try_from(slot)
+            .map(Some)
+            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many indexes"))
+    }
+
     /// Recovery check of the current database's partitioned indexes, in the
     /// committed catalog: an attached index's parent index lives on its
     /// table's direct partitioned parent, and a valid partitioned index has

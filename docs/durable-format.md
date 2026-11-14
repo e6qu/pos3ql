@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v45` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `33` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -87,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`32`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`33`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -444,7 +444,10 @@ Index lifecycle codes retain PostgreSQL's `indisvalid`, `indisready`,
 | 5 | Dead | false, false, false |
 
 Invalid indexes cannot serve reads; ready indexes participate in writes and
-uniqueness. TOAST index sources are encoded in 11 journal bytes: one tag plus a
+uniqueness. An index create or definition change journals the partitioned
+index it is attached to as that index's four-byte creation stamp (zero for
+none), never its catalog slot, which replay does not reproduce; recovery
+resolves the stamp and rejects one that names no index. TOAST index sources are encoded in 11 journal bytes: one tag plus a
 ten-byte owner identity (the ordinary-table tag requires ten zero bytes). They
 distinguish real columns from virtual `chunk_id`/`chunk_seq` keys. Unknown tags,
 stale owners and contradictory keys are rejected.

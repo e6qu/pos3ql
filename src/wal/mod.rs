@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 32;
+pub(crate) const RECORD_VERSION: u8 = 33;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -2151,7 +2151,11 @@ pub(crate) enum WalOp<'a> {
         /// source persisted alongside the physical key columns.
         predicate: Option<&'a str>,
         unique: bool,
+        /// Journaled without its parent slot, which replay does not reproduce.
         definition: crate::storage::IndexMutableDefinition,
+        /// The creation stamp of the partitioned index this index is attached
+        /// to.
+        parent: Option<u64>,
         /// What the key expressions and predicate were bound to.
         expression_dependencies: ExpressionDependencyList<'a>,
     },
@@ -2168,7 +2172,11 @@ pub(crate) enum WalOp<'a> {
     AlterIndexDefinition {
         schema: &'a str,
         name: &'a str,
+        /// Journaled without its parent slot, which replay does not reproduce.
         definition: crate::storage::IndexMutableDefinition,
+        /// The creation stamp of the partitioned index this index is attached
+        /// to.
+        parent: Option<u64>,
         /// The complete key expressions and predicate after the change.
         expressions: [Option<&'a str>; MAX_INDEX_COLS],
         predicate: Option<&'a str>,
@@ -4261,7 +4269,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + MAX_INDEX_COLS * 2
-                + 2
+                + 4
                 + 1
                 + 1
                 + 1
@@ -4286,7 +4294,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + MAX_INDEX_COLS * 2
-                + 2
+                + 4
                 + 4
                 + 8
                 + 6
@@ -5172,7 +5180,17 @@ fn append_subscription_behavior(
 fn append_index_definition(
     buffer: &mut FixedBuf,
     definition: crate::storage::IndexMutableDefinition,
+    parent: Option<u64>,
 ) -> bool {
+    // A parent is named by its creation stamp; zero means none.
+    let Some(parent) = parent.map_or(Some(0), |parent| {
+        u32::try_from(parent).ok().filter(|parent| *parent != 0)
+    }) else {
+        return false;
+    };
+    if definition.parent.is_some() != (parent != 0) {
+        return false;
+    }
     let fillfactor = definition.options.fillfactor.unwrap_or(0);
     let deduplicate = match definition.options.deduplicate_items {
         None => 0,
@@ -5185,7 +5203,7 @@ fn append_index_definition(
     for statistic in definition.statistics {
         ok &= buffer.append(&statistic.to_le_bytes());
     }
-    ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
+    ok &= buffer.append(&parent.to_le_bytes());
     ok &= buffer.append(&[
         kind,
         u8::from(definition.clustered),
@@ -6011,6 +6029,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             predicate,
             unique,
             definition,
+            parent,
             expression_dependencies,
         } => {
             let mut ok = buffer.append(&created_at.to_le_bytes())
@@ -6090,7 +6109,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
-            ok && append_index_definition(buffer, *definition)
+            ok && append_index_definition(buffer, *definition, *parent)
                 && buffer.append(&[0xa7])
                 && expression_dependencies.append(buffer)
         }
@@ -6118,6 +6137,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             definition,
+            parent,
             expressions,
             predicate,
         } => {
@@ -6129,7 +6149,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 });
             name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
-                && append_index_definition(buffer, *definition)
+                && append_index_definition(buffer, *definition, *parent)
                 && buffer.append(&mask.to_le_bytes())
                 && expressions.iter().flatten().all(|text| {
                     text.len() <= u16::MAX as usize
@@ -7754,10 +7774,12 @@ fn decode_subscription_behavior(
     Some(behavior)
 }
 
+/// An index's journaled definition, without a parent slot, and its parent
+/// index's creation stamp.
 fn decode_index_definition(
     payload: &[u8],
     at: &mut usize,
-) -> Option<crate::storage::IndexMutableDefinition> {
+) -> Option<(crate::storage::IndexMutableDefinition, Option<u64>)> {
     let tablespace = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
     let fillfactor = match *payload.get(*at)? {
@@ -7781,8 +7803,8 @@ fn decode_index_definition(
             return None;
         }
     }
-    let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
-    *at += 2;
+    let parent = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
     let kind = crate::storage::IndexKind::from_code(*payload.get(*at)?)?;
     *at += 1;
     let clustered = match *payload.get(*at)? {
@@ -7853,24 +7875,27 @@ fn decode_index_definition(
     if (clustered || replica_identity) && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
-    Some(crate::storage::IndexMutableDefinition {
-        tablespace,
-        options: crate::storage::IndexStorageOptions {
-            fillfactor,
-            deduplicate_items,
-            pages_per_range,
-            autosummarize,
-            buffering,
-            fastupdate,
-            gin_pending_list_limit,
+    Some((
+        crate::storage::IndexMutableDefinition {
+            tablespace,
+            options: crate::storage::IndexStorageOptions {
+                fillfactor,
+                deduplicate_items,
+                pages_per_range,
+                autosummarize,
+                buffering,
+                fastupdate,
+                gin_pending_list_limit,
+            },
+            statistics,
+            parent: None,
+            kind,
+            clustered,
+            replica_identity,
+            immediate,
         },
-        statistics,
-        parent: (parent != u16::MAX).then_some(parent),
-        kind,
-        clustered,
-        replica_identity,
-        immediate,
-    })
+        (parent != 0).then_some(u64::from(parent)),
+    ))
 }
 
 fn decode_tablespace_options(
@@ -10418,7 +10443,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             at += 1;
-            let definition = decode_index_definition(payload, &mut at)?;
+            let (definition, parent) = decode_index_definition(payload, &mut at)?;
             if *payload.get(at)? != 0xa7 {
                 return None;
             }
@@ -10447,6 +10472,7 @@ fn decode_op_inner<'a>(
                 predicate,
                 unique,
                 definition,
+                parent,
                 expression_dependencies,
             })
         }),
@@ -10483,7 +10509,7 @@ fn decode_op_inner<'a>(
         KIND_ALTER_INDEX_DEFINITION_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
-            let definition = decode_index_definition(payload, &mut at)?;
+            let (definition, parent) = decode_index_definition(payload, &mut at)?;
             let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let mut expressions = [None; MAX_INDEX_COLS];
@@ -10518,6 +10544,7 @@ fn decode_op_inner<'a>(
                 schema,
                 name,
                 definition,
+                parent,
                 expressions,
                 predicate,
             })
@@ -17663,6 +17690,7 @@ mod tests {
                     predicate: None,
                     unique: true,
                     definition: crate::storage::IndexMutableDefinition::DEFAULT,
+                    parent: None,
                     expression_dependencies: ExpressionDependencyList::Entries(&[]),
                 };
                 let result = append_record(&mut buffer, 2, &operation);
@@ -17723,6 +17751,7 @@ mod tests {
             predicate: None,
             unique: true,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let length = encoded_payload_len(&operation);
@@ -17778,6 +17807,7 @@ mod tests {
                 clustered: true,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut budget = Budget::new(4096);
@@ -17883,6 +17913,7 @@ mod tests {
             predicate: None,
             unique: false,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
@@ -17938,6 +17969,7 @@ mod tests {
                 },
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
@@ -18016,6 +18048,7 @@ mod tests {
                     options,
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 },
+                parent: None,
                 expression_dependencies: ExpressionDependencyList::Entries(&[]),
             };
             let mut bytes = [0; 4096];
@@ -18092,11 +18125,13 @@ mod tests {
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 };
                 payload.clear();
-                assert!(append_index_definition(&mut payload, definition));
+                assert!(append_index_definition(&mut payload, definition, None));
                 let mut at = 0;
-                let decoded = decode_index_definition(payload.readable(), &mut at).unwrap();
+                let (decoded, parent) =
+                    decode_index_definition(payload.readable(), &mut at).unwrap();
                 assert_eq!(at, payload.len());
                 assert_eq!(decoded, definition);
+                assert_eq!(parent, None);
                 assert_eq!(
                     (
                         decoded.kind.valid(),
@@ -18127,10 +18162,29 @@ mod tests {
                             clustered,
                             replica_identity,
                             ..crate::storage::IndexMutableDefinition::DEFAULT
-                        }
+                        },
+                        None,
                     ));
                     assert!(decode_index_definition(payload.readable(), &mut 0).is_none());
                 }
+            }
+            // A parent is journaled by its creation stamp, never its slot.
+            let attached = crate::storage::IndexMutableDefinition {
+                parent: Some(3),
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            };
+            payload.clear();
+            assert!(append_index_definition(&mut payload, attached, Some(42)));
+            let (decoded, parent) = decode_index_definition(payload.readable(), &mut 0).unwrap();
+            assert_eq!((decoded.parent, parent), (None, Some(42)));
+            for (definition, parent) in [
+                (attached, None),
+                (crate::storage::IndexMutableDefinition::DEFAULT, Some(42)),
+                (attached, Some(0)),
+                (attached, Some(u64::from(u32::MAX) + 1)),
+            ] {
+                payload.clear();
+                assert!(!append_index_definition(&mut payload, definition, parent));
             }
             assert_eq!(IndexKind::from_code(6), None);
             assert_eq!(IndexKind::from_code(u8::MAX), None);
@@ -18147,6 +18201,7 @@ mod tests {
                 immediate: false,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            parent: None,
             expressions: {
                 let mut expressions = [None; MAX_INDEX_COLS];
                 expressions[1] = Some("lower(renamed)");
@@ -18167,6 +18222,7 @@ mod tests {
             schema,
             name,
             definition,
+            parent: None,
             expressions,
             predicate,
         }) = decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable())

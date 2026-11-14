@@ -73,9 +73,7 @@ pub(crate) fn reconcile_foreign_key_clones(
                 continue;
             };
             let mut count = 0usize;
-            partitions_in_creation_order(
-                storage, txn.txid, referenced, order, &mut count, scratch,
-            )?;
+            partitions_in_bound_order(storage, txn.txid, referenced, order, &mut count, scratch)?;
             for &partition in &order[..count] {
                 let position = storage.table_position(partition);
                 if next.fkey_clones[..next.n_fkey_clones]
@@ -144,7 +142,7 @@ fn clones_current(
             continue;
         };
         let mut count = 0usize;
-        partitions_in_creation_order(storage, txid, referenced, order, &mut count, scratch)?;
+        partitions_in_bound_order(storage, txid, referenced, order, &mut count, scratch)?;
         if order[..count].iter().any(|&partition| {
             current
                 .fkey_clone(identity, storage.table_position(partition))
@@ -195,7 +193,7 @@ fn cloned_referenced_table(
 /// `parent`'s partitions at every depth, each before its own partitions and
 /// siblings in partition-descriptor order, as `addFkRecurseReferenced` visits
 /// them.
-fn partitions_in_creation_order(
+pub(super) fn partitions_in_bound_order(
     storage: &Storage,
     txid: u32,
     parent: usize,
@@ -231,7 +229,7 @@ fn partitions_in_creation_order(
         out[*count] = child;
         *count += 1;
         if storage.table_def(child, txid).partition.is_partitioned() {
-            partitions_in_creation_order(storage, txid, child, out, count, rest)?;
+            partitions_in_bound_order(storage, txid, child, out, count, rest)?;
         }
     }
     Ok(())

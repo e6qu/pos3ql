@@ -703,7 +703,11 @@ subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
 clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
-them as per-row subqueries), an incremental sort's `ANALYZE` group lines,
+them as per-row subqueries; a pull-up into semi and anti joins that run as
+hash or nested-loop joins matches PostgreSQL's plans and figures in the
+common shapes, but its join is not yet read by the retained executor, so a
+cold statement with such a subquery would no longer wait for its blocks),
+an incremental sort's `ANALYZE` group lines,
 `VERBOSE` output lists of windows and expressions (the output columns' names
 are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only

@@ -86109,6 +86109,27 @@ where
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_insert_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = &folded;
+    // The conversions now apply to the folded rows.
+    let assignment_casts = match source {
+        InsertSource::MaterializedSelect { .. } => assignment_casts,
+        InsertSource::Statement => match prepare_dml_assignment_casts(
+            &Stmt::Insert(*statement),
+            storage,
+            txn.txid,
+            arena,
+            transition,
+        ) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        },
+    };
     let current_role = authorization_role;
     let insert_check = match super::query::plan_row_security(
         storage,

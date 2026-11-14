@@ -1657,8 +1657,14 @@ pub(crate) struct RoutineInvocationState {
     reads_writes: Cell<bool>,
     inputs: input_progress::RoutineInputs,
     /// Where each uncorrelated subquery the statement keeps the value of
-    /// (PostgreSQL's initPlan) first ran, keyed by its expression's address.
+    /// (PostgreSQL's initPlan) first ran, keyed by its expression's address
+    /// and the count of earlier evaluations of that expression in the same
+    /// attempt (a `BETWEEN` operand keeps one value per copy).
     initplans: RefCell<crate::mem::arena::RetainedList<InitPlanStart>>,
+    /// Each kept subquery's evaluations so far in the current attempt.
+    initplan_counts: RefCell<crate::mem::arena::RetainedList<InitPlanCount>>,
+    /// Numbers attempts, so [`Self::initplan_counts`] restart with each.
+    attempt: Cell<u64>,
 }
 
 /// The log positions at which an uncorrelated subquery's one evaluation
@@ -1666,8 +1672,16 @@ pub(crate) struct RoutineInvocationState {
 #[derive(Clone, Copy)]
 pub(super) struct InitPlanStart {
     node: usize,
+    occurrence: u32,
     position: InvocationPosition,
     replay: Option<super::sequence::StatementReplayStart>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InitPlanCount {
+    node: usize,
+    attempt: u64,
+    count: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1775,11 +1789,53 @@ pub(crate) fn evaluate_initplan<T>(
         invocations.require_arena(arena)?;
         let key = node as usize;
         let here = invocations.position();
+        let attempt = invocations.attempt.get();
+        let occurrence = {
+            let mut counts = invocations.initplan_counts.borrow_mut();
+            let found = counts
+                .with_mut_slice(arena, |counts| {
+                    counts
+                        .iter_mut()
+                        .find(|count| count.node == key)
+                        .map(|count| {
+                            if count.attempt != attempt {
+                                *count = InitPlanCount {
+                                    node: key,
+                                    attempt,
+                                    count: 0,
+                                };
+                            }
+                            let occurrence = count.count;
+                            count.count += 1;
+                            occurrence
+                        })
+                })
+                .map_err(|_| inactive_pending_call())?;
+            match found {
+                Some(occurrence) => occurrence,
+                None => {
+                    counts
+                        .push(
+                            arena,
+                            InitPlanCount {
+                                node: key,
+                                attempt,
+                                count: 1,
+                            },
+                        )
+                        .map_err(invocation_results::directory_error)?;
+                    0
+                }
+            }
+        };
         let recorded = invocations
             .initplans
             .borrow()
             .with_slice(arena, |starts| {
-                starts.iter().find(|start| start.node == key).copied()
+                starts
+                    .iter()
+                    .find(|start| start.node == key && start.occurrence == occurrence)
+                    .copied()
             })
             .map_err(|_| inactive_pending_call())?;
         match recorded {
@@ -1802,6 +1858,7 @@ pub(crate) fn evaluate_initplan<T>(
                         arena,
                         InitPlanStart {
                             node: key,
+                            occurrence,
                             position: here,
                             replay,
                         },
@@ -1820,6 +1877,7 @@ pub(crate) fn forget_initplans() {
     with_active_routine_invocations(|context| {
         if let Some((invocations, _)) = context {
             invocations.initplans.borrow_mut().truncate(0);
+            invocations.initplan_counts.borrow_mut().truncate(0);
         }
     });
 }
@@ -2016,6 +2074,8 @@ impl RoutineInvocationState {
             reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
             initplans: RefCell::new(crate::mem::arena::RetainedList::new()),
+            initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
+            attempt: Cell::new(0),
         }
     }
 
@@ -2183,6 +2243,7 @@ impl RoutineInvocationState {
     }
 
     pub(crate) fn begin_attempt(&self) {
+        self.attempt.set(self.attempt.get().wrapping_add(1));
         self.next.set(0);
         self.pending.set(None);
         self.pending_firing.set(None);
@@ -11317,9 +11378,9 @@ fn check_select_constants_in<'a>(
 /// subexpressions replaced with their values (see
 /// [`super::eval::fold_constants`]), in the order PostgreSQL's planner
 /// preprocesses them: the target list with its `ORDER BY`, `GROUP BY` and
-/// `DISTINCT ON` entries, then `WHERE`, `HAVING`, `OFFSET` and `LIMIT`. A key
-/// written like a select item is that item's target entry and folds with it.
-/// Window specifications keep their constants, which only report errors.
+/// `DISTINCT ON` entries, then `WHERE`, `HAVING`, `OFFSET` and `LIMIT`. A key written like a select item is that
+/// item's target entry and folds with it. Window specifications keep their
+/// constants, which only report errors.
 pub fn fold_select_constants<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -11489,6 +11550,47 @@ pub(crate) fn fold_update_constants<'a>(
     }
     folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
     folded.where_clause = statement.where_clause.map(fold).transpose()?;
+    Ok(folded)
+}
+
+/// [`fold_select_constants`] for an `INSERT ... VALUES` about to write rows.
+/// One `VALUES` row is the target list, which folds before `RETURNING`;
+/// several rows form a `VALUES` list, which PostgreSQL's planner folds with
+/// the range table after `RETURNING`. An `INSERT ... SELECT` source folds
+/// when it runs.
+pub(crate) fn fold_insert_constants<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    let fold_rows = || -> Result<&'a [&'a [&'a Expr<'a>]], SqlError> {
+        if statement.select.is_some() || statement.rows.is_empty() {
+            return Ok(statement.rows);
+        }
+        let rows = arena
+            .alloc_slice_copy(statement.rows)
+            .map_err(|_| arena_full())?;
+        for row in rows.iter_mut() {
+            let values = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
+            for value in values.iter_mut() {
+                *value = fold(value)?;
+            }
+            *row = values;
+        }
+        Ok(rows)
+    };
+    if statement.rows.len() <= 1 {
+        folded.rows = fold_rows()?;
+        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+    } else {
+        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        folded.rows = fold_rows()?;
+    }
     Ok(folded)
 }
 

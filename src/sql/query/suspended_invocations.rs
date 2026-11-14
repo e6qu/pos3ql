@@ -126,6 +126,19 @@ impl RoutineInvocationState {
                 .push(target, start)
                 .map_err(invocation_results::directory_error)?;
         }
+        let counts = self.initplan_counts.borrow();
+        for index in 0..counts.len() {
+            let count = counts
+                .get(source, index)
+                .map_err(|_| inactive_pending_call())?
+                .ok_or_else(inactive_pending_call)?;
+            output
+                .initplan_counts
+                .borrow_mut()
+                .push(target, count)
+                .map_err(invocation_results::directory_error)?;
+        }
+        output.attempt.set(self.attempt.get());
         output.reads_writes.set(self.reads_writes.get());
         output.writes_root.set(self.writes_root.get());
         Ok(Self {

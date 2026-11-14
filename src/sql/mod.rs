@@ -22048,6 +22048,7 @@ impl Engine {
         let _ = eval::take_diagnostic();
         if reset_workspace {
             eval::clear_eval_messages();
+            eval::clear_folded_notices();
             event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();

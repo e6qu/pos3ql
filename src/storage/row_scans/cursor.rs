@@ -126,7 +126,7 @@ impl RowCursor {
         self.close();
         let commit = storage.commit_snapshot();
         let mut rows_handle = None;
-        let (snapshot, rows, _) = storage.capture_byte_partition(
+        let (snapshot, mut rows, _) = storage.capture_byte_partition(
             table,
             txid,
             storage.read_snapshot(),
@@ -140,6 +140,9 @@ impl RowCursor {
                 arena.retained_slice_mut(handle).map_err(state_error)
             },
         )?;
+        // Resident rows go in a sequential scan's heap order, as the
+        // general executor and data changes read them.
+        rows.sort_unstable_by_key(CapturedRowRecord::physical_order);
         drop(rows);
         let member_count = snapshot
             .roots()

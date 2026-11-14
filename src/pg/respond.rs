@@ -344,6 +344,7 @@ pub struct Responder<'b> {
 pub(crate) struct AttemptMark {
     output: OutputMark,
     eval_messages: usize,
+    folded_notices: usize,
 }
 
 impl AttemptMark {
@@ -984,6 +985,7 @@ impl<'b> Responder<'b> {
         AttemptMark {
             output: self.mark(),
             eval_messages: crate::sql::eval::eval_message_mark(),
+            folded_notices: crate::sql::eval::folded_notice_mark(),
         }
     }
 
@@ -992,6 +994,7 @@ impl<'b> Responder<'b> {
     pub(crate) fn restart_attempt(&mut self, mark: AttemptMark) -> Result<(), SqlError> {
         self.truncate_to(mark.output)?;
         crate::sql::eval::truncate_eval_messages(mark.eval_messages);
+        crate::sql::eval::truncate_folded_notices(mark.folded_notices);
         Ok(())
     }
 

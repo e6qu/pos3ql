@@ -87686,16 +87686,13 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let outer_lookup = outer;
-    let assignment_casts = match prepare_dml_assignment_casts(
-        &Stmt::Update(*statement),
-        storage,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(casts) => casts,
-        Err(error) => return sql_fail(error),
-    };
+    // Analysis resolves each assignment's conversion; the conversions the
+    // rows use are prepared again once constants fold.
+    if let Err(error) =
+        prepare_dml_assignment_casts(&Stmt::Update(*statement), storage, txn.txid, arena, outer)
+    {
+        return sql_fail(error);
+    }
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -87810,6 +87807,24 @@ pub(crate) fn update<'a>(
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = &folded;
+    // The conversions now apply to the folded assignments.
+    let assignment_casts = match prepare_dml_assignment_casts(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+        outer,
+    ) {
+        Ok(casts) => casts,
+        Err(error) => return sql_fail(error),
+    };
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -89304,6 +89319,13 @@ pub(crate) fn delete<'a>(
     {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = &folded;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];

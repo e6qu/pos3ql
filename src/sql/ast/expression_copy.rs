@@ -65,6 +65,9 @@ pub(crate) fn duplicate_expression<'a>(
                 super::BoundLiteralValue::CachedDefault(encoded) => {
                     super::BoundLiteralValue::CachedDefault(arena.alloc_slice_copy(encoded)?)
                 }
+                super::BoundLiteralValue::Folded(encoded) => {
+                    super::BoundLiteralValue::Folded(arena.alloc_slice_copy(encoded)?)
+                }
             };
             *source = duplicate_expression(source, arena, &[])?;
         }

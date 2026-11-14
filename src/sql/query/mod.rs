@@ -4276,7 +4276,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "PL/pgSQL functions require a resumable query executor"
-            ));
+            )
+            .routine_engine_required());
         }
         let _formal_scope = super::exec::enter_routine_parameter_types(
             routine.arguments(),
@@ -4348,7 +4349,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a resumable query executor"
-            ));
+            )
+            .routine_engine_required());
         }
 
         let track = matches!(
@@ -4430,7 +4432,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "data-modifying SQL function results require a resumable query executor"
-                        ));
+                        )
+                        .routine_engine_required());
                     }
                     RoutineFunctionResult::Void(statement) => {
                         let query = match statement {
@@ -4440,7 +4443,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 return Err(sql_err!(
                                     sqlstate::FEATURE_NOT_SUPPORTED,
                                     "data-modifying SQL functions require a resumable query executor"
-                                ));
+                                )
+            .routine_engine_required());
                             }
                         };
                         execute_bound_routine_query(
@@ -11106,6 +11110,40 @@ fn for_each_inline_window<'a>(
     })
 }
 
+/// Unknown-type literals of a query without columns convert as its
+/// operators resolve them.
+fn check_fromless_literal_operands<'a>(
+    statement: &Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check_literal_operands_typed(
+                expression,
+                &|other| {
+                    super::exec::infer_type_res(other, &columns)
+                        .ok()
+                        .and_then(|(oid, _)| ColType::from_oid(oid))
+                },
+                storage,
+                txid,
+                arena,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
 /// of a SELECT, matching PostgreSQL's constant folding.
 pub fn check_select_constants<'a>(
@@ -11123,34 +11161,10 @@ fn check_select_constants_in<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<(), SqlError> {
-    let catalog = storage_catalog(storage, arena, txid);
     if statement.from.is_none() {
-        // Unknown-type literals of a query without columns convert as its
-        // operators resolve them.
-        let columns = super::exec::CatalogCols {
-            definition: None,
-            alias: None,
-            output_aliases: &[],
-            storage,
-            txid,
-            arena,
-        };
-        for item in statement.items {
-            if let SelectItem::Expr { expression, .. } = item {
-                check_literal_operands_typed(
-                    expression,
-                    &|other| {
-                        super::exec::infer_type_res(other, &columns)
-                            .ok()
-                            .and_then(|(oid, _)| ColType::from_oid(oid))
-                    },
-                    storage,
-                    txid,
-                    arena,
-                )?;
-            }
-        }
+        check_fromless_literal_operands(statement, arena, storage, txid)?;
     }
+    let catalog = storage_catalog(storage, arena, txid);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             super::eval::check_constant_errors(expression, arena, Some(&catalog))?;
@@ -11192,6 +11206,222 @@ fn check_select_constants_in<'a>(
         for_each_inline_window(expression, &mut window_constants)?;
     }
     Ok(())
+}
+
+/// PostgreSQL's planner folding of a SELECT about to run: the analysis checks
+/// [`check_select_constants`] makes, then each clause's constant
+/// subexpressions replaced with their values (see
+/// [`super::eval::fold_constants`]), in the order PostgreSQL's planner
+/// preprocesses them: the target list with its `ORDER BY`, `GROUP BY` and
+/// `DISTINCT ON` entries, then `WHERE`, `HAVING`, `OFFSET` and `LIMIT`. A key
+/// written like a select item is that item's target entry and folds with it.
+/// Window specifications keep their constants, which only report errors.
+pub fn fold_select_constants<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a Select<'a>, SqlError> {
+    if statement.from.is_none() {
+        super::eval::probe_constants(|| {
+            check_fromless_literal_operands(statement, arena, storage, txid)
+        })?;
+    }
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut changed = false;
+    let mut rebuilt = *statement;
+    let items = arena
+        .alloc_slice_copy(statement.items)
+        .map_err(|_| arena_full())?;
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                *expression = fold(expression)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+        }
+    }
+    // The folded select item a key repeats, which PostgreSQL's analysis made
+    // the key's target entry.
+    let item_entry = |key: &'a Expr<'a>| {
+        statement
+            .items
+            .iter()
+            .zip(items.iter())
+            .find_map(|(written, folded)| match (written, folded) {
+                (
+                    SelectItem::Expr { expression, .. },
+                    SelectItem::Expr {
+                        expression: folded, ..
+                    },
+                ) if *expression == key => Some(*folded),
+                _ => None,
+            })
+    };
+    let fold_key = |key: &'a Expr<'a>| match item_entry(key) {
+        Some(folded) => Ok(folded),
+        None => fold(key),
+    };
+    let order_by = arena
+        .alloc_slice_copy(statement.order_by)
+        .map_err(|_| arena_full())?;
+    for key in order_by.iter_mut() {
+        key.expression = fold_key(key.expression)?;
+    }
+    let fold_list = |list: &'a [&'a Expr<'a>]| -> Result<&'a [&'a Expr<'a>], SqlError> {
+        let copy = arena.alloc_slice_copy(list).map_err(|_| arena_full())?;
+        for key in copy.iter_mut() {
+            *key = fold_key(key)?;
+        }
+        Ok(copy)
+    };
+    let group_by = fold_list(statement.group_by)?;
+    let distinct_on = fold_list(statement.distinct_on)?;
+    let fold_optional = |expression: Option<&'a Expr<'a>>| expression.map(fold).transpose();
+    rebuilt.where_clause = fold_optional(statement.where_clause)?;
+    rebuilt.having = fold_optional(statement.having)?;
+    rebuilt.offset = fold_optional(statement.offset)?;
+    rebuilt.limit = fold_optional(statement.limit)?;
+    let same = |new: &[&Expr<'_>], old: &[&Expr<'_>]| {
+        new.iter()
+            .zip(old)
+            .all(|(new, old)| core::ptr::eq(*new, *old))
+    };
+    changed |= !statement
+        .items
+        .iter()
+        .zip(items.iter())
+        .all(|(old, new)| match (old, new) {
+            (
+                SelectItem::Expr {
+                    expression: old, ..
+                },
+                SelectItem::Expr {
+                    expression: new, ..
+                },
+            )
+            | (SelectItem::RecordStar(old), SelectItem::RecordStar(new)) => {
+                core::ptr::eq(*old, *new)
+            }
+            _ => true,
+        });
+    changed |= !statement
+        .order_by
+        .iter()
+        .zip(order_by.iter())
+        .all(|(old, new)| core::ptr::eq(old.expression, new.expression));
+    changed |= !same(group_by, statement.group_by) || !same(distinct_on, statement.distinct_on);
+    for (new, old) in [
+        (rebuilt.where_clause, statement.where_clause),
+        (rebuilt.having, statement.having),
+        (rebuilt.offset, statement.offset),
+        (rebuilt.limit, statement.limit),
+    ] {
+        changed |= !new
+            .zip(old)
+            .is_none_or(|(new, old)| core::ptr::eq(new, old));
+    }
+    super::eval::probe_constants(|| {
+        let catalog = storage_catalog(storage, arena, txid);
+        let mut window_constants = |spec: &crate::sql::ast::WindowSpec<'a>| {
+            for key in spec
+                .partition_by
+                .iter()
+                .copied()
+                .chain(spec.order_by.iter().map(|key| key.expression))
+            {
+                super::eval::check_constant_errors(key, arena, Some(&catalog))?;
+            }
+            Ok(())
+        };
+        for spec in statement.windows {
+            window_constants(spec)?;
+        }
+        for expression in select_window_owners(statement) {
+            for_each_inline_window(expression, &mut window_constants)?;
+        }
+        Ok(())
+    })?;
+    if !changed {
+        return Ok(statement);
+    }
+    rebuilt.items = items;
+    rebuilt.order_by = order_by;
+    rebuilt.group_by = group_by;
+    rebuilt.distinct_on = distinct_on;
+    arena
+        .alloc(rebuilt)
+        .map(|select| &*select)
+        .map_err(|_| arena_full())
+}
+
+/// [`fold_select_constants`] for an `UPDATE` about to change rows: its
+/// assignments, then `RETURNING`, then `WHERE`, the order PostgreSQL's
+/// planner preprocesses them.
+pub(crate) fn fold_update_constants<'a>(
+    statement: &crate::sql::ast::Update<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Update<'a>, SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    if statement
+        .assignments
+        .iter()
+        .any(|(_, expression)| !matches!(expression, Expr::DefaultMarker))
+    {
+        let assignments = arena
+            .alloc_slice_copy(statement.assignments)
+            .map_err(|_| arena_full())?;
+        for (_, expression) in assignments.iter_mut() {
+            *expression = fold(expression)?;
+        }
+        folded.assignments = assignments;
+    }
+    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+    folded.where_clause = statement.where_clause.map(fold).transpose()?;
+    Ok(folded)
+}
+
+/// [`fold_update_constants`] for a `DELETE`: `RETURNING`, then `WHERE`.
+pub(crate) fn fold_delete_constants<'a>(
+    statement: &crate::sql::ast::Delete<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+    folded.where_clause = statement.where_clause.map(fold).transpose()?;
+    Ok(folded)
+}
+
+fn fold_returning_items<'a>(
+    items: &'a [SelectItem<'a>],
+    fold: &dyn Fn(&'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError>,
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    if items.is_empty() {
+        return Ok(items);
+    }
+    let folded = arena.alloc_slice_copy(items).map_err(|_| arena_full())?;
+    for item in folded.iter_mut() {
+        match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                *expression = fold(expression)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+        }
+    }
+    Ok(folded)
 }
 
 /// The SELECT entry point (FROM present; FROM-less selects stay in the
@@ -11833,9 +12063,10 @@ pub(crate) fn select_query_resumable<'a>(
 
     // Constant folding runs after type analysis, matching PostgreSQL's
     // analyze-then-plan order: `min(boolean)` errors before `1/0` folds.
-    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
-        return sql_fail(e);
-    }
+    let statement = match fold_select_constants(statement, arena, storage, txid) {
+        Ok(statement) => statement,
+        Err(e) => return sql_fail(e),
+    };
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -12469,9 +12700,10 @@ pub(crate) fn constant_select_resumable<'a>(
     if let Err(error) = check_fromless_keys(statement, &resolved_columns, storage, txid, arena) {
         return sql_fail(error);
     }
-    if let Err(e) = check_select_constants(statement, arena, storage, txid) {
-        return sql_fail(e);
-    }
+    let statement = match fold_select_constants(statement, arena, storage, txid) {
+        Ok(statement) => statement,
+        Err(e) => return sql_fail(e),
+    };
     let constant_type = |e: &Expr| {
         super::exec::infer_type_res(e, &resolved_columns)
             .ok()
@@ -13261,7 +13493,7 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    check_select_constants(statement, arena, storage, txid)?;
+    let statement = fold_select_constants(statement, arena, storage, txid)?;
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,

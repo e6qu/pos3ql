@@ -1845,6 +1845,15 @@ where
     if stored == candidate {
         return true;
     }
+    // A key the planner folded matches the stored key written the same way.
+    if let Expr::BoundLiteral {
+        value: crate::sql::ast::BoundLiteralValue::Folded(_),
+        source,
+        ..
+    } = candidate
+    {
+        return index_expression_matches(stored, source, definition, resolve_candidate);
+    }
     match (stored, candidate) {
         (Expr::WholeRow(_), candidate) => resolve_candidate(candidate) == Some(WHOLE_ROW_KEY),
         (Expr::Column { name: stored, .. }, candidate @ Expr::Column { .. }) => {
@@ -3180,6 +3189,57 @@ pub(crate) fn dml_condition_reaches_index(
     let Some(predicate) = where_clause else {
         return false;
     };
+    let leading = index_leading_columns(storage, definition, txid);
+    !leading.is_empty()
+        && condition_reaches_columns(
+            predicate,
+            &|column| dml_target_column(definition, alias, column),
+            leading,
+        )
+}
+
+/// [`dml_condition_reaches_index`] for a query reading one table: PostgreSQL
+/// returns such a query's rows in the order its index or bitmap scan reaches
+/// them, an updated row at its first position.
+pub(crate) fn select_condition_reaches_index(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
+    txid: u32,
+    where_clause: Option<&Expr<'_>>,
+) -> bool {
+    let Some(predicate) = where_clause else {
+        return false;
+    };
+    if scope.n != 1 || scope.derived[0].is_some() || scope.lateral[0] {
+        return false;
+    }
+    let Some(definition) = scope.defs.stored(0) else {
+        return false;
+    };
+    let leading = index_leading_columns(storage, definition, txid);
+    !leading.is_empty()
+        && condition_reaches_columns(
+            predicate,
+            &|column| {
+                if let Some(key) = scope_whole_row(scope, 0, column) {
+                    return Some(key);
+                }
+                let Expr::Column { qualifier, name } = column else {
+                    return None;
+                };
+                match crate::sql::error_position::preserving_pending(|| {
+                    scope.find_column(*qualifier, name)
+                }) {
+                    Ok(ResolvedColumn::Table(0, index)) => Some(index),
+                    _ => None,
+                }
+            },
+            leading,
+        )
+}
+
+/// The columns that lead one of the table's B-tree keys.
+fn index_leading_columns(storage: &Storage, definition: &TableDef, txid: u32) -> ColumnSet {
     let mut leading = ColumnSet::EMPTY;
     for (column, metadata) in definition.columns().iter().enumerate() {
         if metadata.primary || metadata.unique {
@@ -3196,16 +3256,12 @@ pub(crate) fn dml_condition_reaches_index(
             leading.insert(usize::from(index.columns[0]));
         }
     }
-    if leading.is_empty() {
-        return false;
-    }
-    condition_reaches_columns(predicate, definition, alias, leading)
+    leading
 }
 
 fn condition_reaches_columns(
     expression: &Expr<'_>,
-    definition: &TableDef,
-    alias: Option<&str>,
+    resolve: &dyn Fn(&Expr<'_>) -> Option<usize>,
     leading: ColumnSet,
 ) -> bool {
     match expression {
@@ -3215,8 +3271,8 @@ fn condition_reaches_columns(
             right,
             ..
         } => {
-            condition_reaches_columns(left, definition, alias, leading)
-                || condition_reaches_columns(right, definition, alias, leading)
+            condition_reaches_columns(left, resolve, leading)
+                || condition_reaches_columns(right, resolve, leading)
         }
         Expr::Binary {
             operator: BinaryOp::Or,
@@ -3224,8 +3280,8 @@ fn condition_reaches_columns(
             right,
             ..
         } => {
-            condition_reaches_columns(left, definition, alias, leading)
-                && condition_reaches_columns(right, definition, alias, leading)
+            condition_reaches_columns(left, resolve, leading)
+                && condition_reaches_columns(right, resolve, leading)
         }
         Expr::InList {
             operand,
@@ -3233,15 +3289,14 @@ fn condition_reaches_columns(
             negated: false,
             ..
         } => {
-            dml_target_column(definition, alias, operand)
-                .is_some_and(|column| column < MAX_COLUMNS && leading.contains(column))
+            resolve(operand).is_some_and(|column| column < MAX_COLUMNS && leading.contains(column))
                 && list.iter().all(|item| dml_index_operand_is_invariant(item))
         }
         _ => {
             let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
             collect_index_constraints(
                 expression,
-                &mut |column: &Expr<'_>| dml_target_column(definition, alias, column),
+                &mut |column: &Expr<'_>| resolve(column),
                 &dml_index_operand_is_invariant,
                 &mut by_column,
             );
@@ -8550,6 +8605,9 @@ fn scan_source_mode<'a>(
                 .then_some(scope.target_hash_candidates)
                 .flatten();
             let candidates = access.map(|access| access.rowids).or(hashed);
+            let index_order = depth == 0
+                && hashed.is_none()
+                && select_condition_reaches_index(storage, scope, txid, where_clause);
             if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
                 visit_sequential_physical_rows!(slot);
                 return Ok(true);
@@ -8692,10 +8750,19 @@ fn scan_source_mode<'a>(
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group. A hash
             // chain's order is the hash join's output order.
+            // A condition an index answers reaches rows through their index
+            // entries, which keep an updated row's first position: rows go in
+            // row identity order, as data changes take them.
             if hashed.is_none() && access.is_none_or(|access| !access.preserves_order) {
-                ordered[..fill].sort_unstable_by_key(|row| {
-                    row.expect("row snapshots are initialized").sort_key()
-                });
+                if index_order {
+                    ordered[..fill].sort_unstable_by_key(|row| {
+                        row.expect("row snapshots are initialized").rowid()
+                    });
+                } else {
+                    ordered[..fill].sort_unstable_by_key(|row| {
+                        row.expect("row snapshots are initialized").sort_key()
+                    });
+                }
             }
             for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
                 let rowid = row.rowid();

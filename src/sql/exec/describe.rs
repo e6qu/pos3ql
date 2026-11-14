@@ -1679,7 +1679,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // a name manufactured by an inner cast does not propagate outward.
         Expr::Cast {
             operand, type_name, ..
-        } => match operand {
+        } => match operand.written() {
             Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::SchemaColumn { .. }

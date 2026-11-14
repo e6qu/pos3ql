@@ -127,7 +127,7 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
                 }
                 None => {}
             }
-            if let Some(function) = expression.find_function(&|name| {
+            if let Some(function) = expression.find_function(&|name, _| {
                 let name = name.rsplit('.').next().unwrap_or(name);
                 crate::sql::catalog::builtin_callable_signatures(name)
                     .next()

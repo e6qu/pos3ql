@@ -1,6 +1,7 @@
 //! Notices and warnings PostgreSQL 18.6 sends, in the order it sends them:
 //! a PL/pgSQL `INTO` data change stops at its second row, a dropped column's
-//! cascade is one report, and analysis passes do not repeat input notices.
+//! cascade is one report, analysis passes do not repeat input notices, the
+//! planner folds a constant once, and an index answers in its rows' order.
 
 use super::compatibility_diagnostics::{diagnostics, with_engine};
 use super::*;
@@ -378,6 +379,111 @@ fn catalog_and_role_notices_match_postgresql() {
                 "NOTICE 42701 column \"id\" of relation \"ppd\" already exists, skipping",
                 "ALTER TABLE"
             ]
+        );
+    });
+}
+
+/// The notices and errors `sql` sends, without its command tags.
+fn notices(engine: &mut Engine, budget: &mut Budget, sql: &str) -> Vec<String> {
+    messages(engine, budget, sql)
+        .into_iter()
+        .filter(|message| message.starts_with("NOTICE") || message.starts_with("ERROR"))
+        .collect()
+}
+
+#[test]
+fn planner_folds_each_constant_once() {
+    with_engine("notice-constant-folding", |engine, budget| {
+        for sql in [
+            "CREATE TABLE folded (a int)",
+            "INSERT INTO folded VALUES (1), (2), (3)",
+            "CREATE FUNCTION note(int) RETURNS int IMMUTABLE LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'note %', $1; RETURN $1; END $$",
+            "CREATE FUNCTION steady(int) RETURNS int STABLE LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'steady %', $1; RETURN $1; END $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        assert_eq!(
+            notices(engine, budget, "SELECT a, ''::tsquery FROM folded"),
+            [empty]
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "SELECT a FROM folded WHERE false AND a > note(0)"
+            ),
+            Vec::<String>::new()
+        );
+        // An arm no row reaches still folds; only an immutable call folds.
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "SELECT CASE WHEN a > 9 THEN note(1) END, steady(2) FROM folded",
+            ),
+            [
+                "NOTICE 00000 note 1",
+                "NOTICE 00000 steady 2",
+                "NOTICE 00000 steady 2",
+                "NOTICE 00000 steady 2",
+            ]
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "UPDATE folded SET a = a + note(0) WHERE a > note(10)",
+            ),
+            ["NOTICE 00000 note 0", "NOTICE 00000 note 10"]
+        );
+        // A constant operand settles which arms a CASE keeps.
+        assert!(
+            notices(
+                engine,
+                budget,
+                "SELECT CASE 1 WHEN 2 THEN 1 / 0 ELSE a END FROM folded",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            notices(
+                engine,
+                budget,
+                "SELECT CASE WHEN a > 9 THEN 1 / 0 END FROM folded"
+            ),
+            ["ERROR 22012 division by zero"]
+        );
+    });
+}
+
+#[test]
+fn index_answered_queries_return_rows_at_their_first_position() {
+    with_engine("index-answered-row-order", |engine, budget| {
+        for sql in [
+            "CREATE TABLE keyed (id int PRIMARY KEY, v text)",
+            "INSERT INTO keyed VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "UPDATE keyed SET v = 'x' WHERE v = 'a'",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "SELECT id FROM keyed WHERE id > 0"
+            )),
+            ["1", "2", "3"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "SELECT id FROM keyed WHERE v <> ''"
+            )),
+            ["2", "3", "1"]
         );
     });
 }

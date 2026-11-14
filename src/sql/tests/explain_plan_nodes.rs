@@ -1,8 +1,9 @@
 use super::*;
 
 /// Expected plans were read from PostgreSQL 18.6 (`initdb --locale=C`).
-fn setup() -> (ConfiguredTransactionSession, Engine) {
-    let config = test_config("explain-plan-nodes");
+/// Each test names its own data directory: tests run in parallel in one process.
+fn setup(test: &str) -> (ConfiguredTransactionSession, Engine) {
+    let config = test_config(&format!("explain-plan-nodes-{test}"));
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -42,7 +43,7 @@ fn without_memory(lines: Vec<String>) -> Vec<String> {
 
 #[test]
 fn locking_clauses_show_lock_rows_below_the_limit() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("locking_clauses_show_lock_rows_below_the_limit");
     let costs = "COSTS OFF";
     assert_eq!(
         plan(
@@ -114,7 +115,7 @@ fn locking_clauses_show_lock_rows_below_the_limit() {
 
 #[test]
 fn analyzed_sorts_report_their_method() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("analyzed_sorts_report_their_method");
     let analyze = "ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF";
     // A limit bounds the sort only past twice its rows.
     for (query, method) in [
@@ -172,7 +173,7 @@ fn analyzed_sorts_report_their_method() {
 
 #[test]
 fn window_clauses_show_their_definitions_and_input_sorts() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("window_clauses_show_their_definitions_and_input_sorts");
     let costs = "COSTS OFF";
     assert_eq!(
         plan(
@@ -277,7 +278,7 @@ fn window_clauses_show_their_definitions_and_input_sorts() {
 
 #[test]
 fn constant_false_conditions_keep_the_upper_nodes() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("constant_false_conditions_keep_the_upper_nodes");
     assert_eq!(
         plan(
             &mut session,
@@ -310,7 +311,7 @@ fn constant_false_conditions_keep_the_upper_nodes() {
 
 #[test]
 fn set_operation_sort_keys_name_the_first_branch_column() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("set_operation_sort_keys_name_the_first_branch_column");
     assert_eq!(
         plan(
             &mut session,
@@ -330,7 +331,7 @@ fn set_operation_sort_keys_name_the_first_branch_column() {
 
 #[test]
 fn with_ties_without_order_by_points_at_with() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("with_ties_without_order_by_points_at_with");
     let query = "SELECT * FROM pn_t FETCH FIRST 2 ROWS WITH TIES";
     let bytes = session.execute(&mut engine, query, true);
     let position = (query.find("WITH").unwrap() + 1).to_string();
@@ -362,7 +363,7 @@ fn with_ties_without_order_by_points_at_with() {
 
 #[test]
 fn subqueries_run_as_numbered_init_plans_and_subplans() {
-    let (mut session, mut engine) = setup();
+    let (mut session, mut engine) = setup("subqueries_run_as_numbered_init_plans_and_subplans");
     let costs = "COSTS OFF";
     assert_eq!(
         plan(

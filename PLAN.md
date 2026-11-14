@@ -720,14 +720,19 @@ condition is false with `HashAggregate` where PostgreSQL may sort, and does
 not flatten a distinct union of more than two inputs into one `Append`. A
 `top-N heapsort` of input that spills before the sort ends is reported as
 `external merge`. Notices carry
-no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
-calls with constant arguments are not folded once while planning: `SELECT
-timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where
-PostgreSQL warns once, and a later constant error (`SELECT
-timestamptypmodin('{7}'), 1/0`) is reported without the warning PostgreSQL's
-folding raised first. Folding needs each statement to keep its folded values
-for every later evaluation, including after a pause, before it can replace
-the per-row evaluation. Errors in a client's query report
+no position (`''::tsquery` points at the literal in PostgreSQL). A constant
+error that folding reaches after a notice or warning (`SELECT
+timestamptypmodin('{7}'), 1/0` or `SELECT ''::tsquery, 1/0`) is reported
+without the earlier message, which PostgreSQL sends first. `EXPLAIN` plans
+the statement as written, without the planner's constant folding: a
+condition prints its constants unfolded (`Filter: (a > (1 + 1))` where
+PostgreSQL prints `(a > 2)`, and an `UPDATE` or `DELETE` whose condition
+is `WHERE 1 = 2` keeps its scan where PostgreSQL plans a `Result` with a
+false `One-Time Filter`), and a plain
+`EXPLAIN` raises none of the folding's notices or errors. Folding while
+planning needs the resumable executor that PL/pgSQL calls run in, which the
+planner does not have; an `EXPLAIN ANALYZE` of a statement that calls a
+PL/pgSQL function fails with `0A000`. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a

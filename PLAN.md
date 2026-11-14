@@ -823,9 +823,9 @@ does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
 Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
 figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
 its whole query where PostgreSQL pulls only the rows read, a
-data-modifying `WITH` query's nodes print no `ANALYZE` figures (the
-statement's restart after the deferred write resets its counters), a
-`WITH` inside a subquery is still merged into it, and a recursive term's
+data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
+`ANALYZE` figures (its write runs on a path that does not enter the query's
+plan block), a `WITH` inside a subquery is still merged into it, and a recursive term's
 join is planned as a nested loop with conditions naming the relations
 before their `_1` renaming. When a derived table or `CTE Scan` joins a
 stored relation of equal size, PostgreSQL's cost tie may pick the other
@@ -838,8 +838,11 @@ item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
-scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A node of a path
-the executor does not count (a data-modifying `WITH`, a joined `UPDATE` or
+scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A statement that runs again after an attempt stopped for a call counts each
+node in the last attempt that ran it, so a data-modifying `WITH` query whose
+write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
+and scan figures. A node of a path
+the executor does not count (a joined `UPDATE` or
 `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports
 the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
 joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`

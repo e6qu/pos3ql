@@ -12,8 +12,12 @@
 //! slots for the current thread. Each operator asks for its node with
 //! [`node`], opens one loop per execution ([`Node::start`]) and counts the
 //! rows it returns and the rows its qualifications remove. The slots live in
-//! the statement arena next to the plan, so counting allocates nothing; an
-//! attempt that restarts after a wait plans, and so counts, afresh.
+//! the statement arena next to the plan, so counting allocates nothing. A
+//! statement that runs again from its first row after an attempt stopped
+//! counts each node in the last attempt that ran it: a node's counters
+//! restart when a later attempt first reaches it, so a node an earlier
+//! attempt finished for good (a data-modifying `WITH` query whose write the
+//! later attempts keep) reports that attempt's work.
 //!
 //! Routine and trigger bodies run statements of their own, which are not part
 //! of the explained plan: [`suspend`] hides the counters while they run.
@@ -231,8 +235,10 @@ pub(crate) struct Slot {
     started: Option<std::time::Instant>,
     first_row: Option<u64>,
     /// Rows a write's change loop finished qualifying or removing, which a
-    /// later attempt does not see again: [`restart`] keeps them.
+    /// later attempt does not see again: a restarted slot keeps them.
     carried: Option<(u64, u64)>,
+    /// The attempt whose work the counters hold.
+    attempt: u32,
 }
 
 impl Slot {
@@ -254,6 +260,21 @@ impl Slot {
             started: None,
             first_row: None,
             carried: None,
+            attempt: 0,
+        }
+    }
+
+    /// Restarts the counters for `attempt`, which reached the node after an
+    /// earlier attempt counted it, keeping the rows the earlier attempts'
+    /// write finished.
+    fn restart(&mut self, attempt: u32) {
+        let carried = self.carried;
+        *self = Self::new(self.key);
+        self.attempt = attempt;
+        if let Some((rows, filtered)) = carried {
+            self.carried = carried;
+            self.counters.rows = rows;
+            self.counters.filtered = filtered;
         }
     }
 
@@ -268,6 +289,8 @@ struct Registry {
     /// For a statement rewrite rules turn into several queries, the
     /// position of the next query to run.
     next_query: Option<u16>,
+    /// The statement's current attempt.
+    attempt: u32,
 }
 
 thread_local! {
@@ -313,6 +336,7 @@ fn install<R>(
         slots: NonNull::from(slots),
         timing,
         next_query,
+        attempt: 0,
     };
     let _restore = Restore {
         active: ACTIVE.with(|active| active.replace(Some(NonNull::from(&mut registry)))),
@@ -338,7 +362,8 @@ pub(crate) fn next_query() {
 
 /// Starts another attempt of the analyzed statement, which runs it again
 /// from its first row after an earlier attempt stopped for a routine call:
-/// the counters restart, so they report the attempt that completes.
+/// each node's counters restart when this attempt first reaches it, so they
+/// report the last attempt that ran the node.
 pub(crate) fn restart() {
     let Some(mut registry) = ACTIVE.with(Cell::get) else {
         return;
@@ -346,16 +371,7 @@ pub(crate) fn restart() {
     // SAFETY: see `node`; no `Node` of the statement is open between
     // attempts, and nothing else borrows the registry here.
     let registry = unsafe { registry.as_mut() };
-    let slots = unsafe { &mut *registry.slots.as_ptr() };
-    for slot in slots.iter_mut() {
-        let carried = slot.carried;
-        *slot = Slot::new(slot.key);
-        if let Some((rows, filtered)) = carried {
-            slot.carried = carried;
-            slot.counters.rows = rows;
-            slot.counters.filtered = filtered;
-        }
-    }
+    registry.attempt = registry.attempt.wrapping_add(1);
     if registry.next_query.is_some() {
         registry.next_query = Some(0);
     }
@@ -452,6 +468,7 @@ pub(crate) fn node(role: Role) -> Node {
     Node {
         slot: slot.map(NonNull::from),
         timing: registry.timing,
+        attempt: registry.attempt,
     }
 }
 
@@ -460,19 +477,26 @@ pub(crate) fn node(role: Role) -> Node {
 pub(crate) struct Node {
     slot: Option<NonNull<Slot>>,
     timing: bool,
+    /// The attempt the node counts for.
+    attempt: u32,
 }
 
 impl Node {
     pub(crate) const NONE: Self = Self {
         slot: None,
         timing: false,
+        attempt: 0,
     };
 
     fn with(self, update: impl FnOnce(&mut Slot, bool)) {
         if let Some(mut slot) = self.slot {
             // SAFETY: see `node`; the executor is single-threaded and no
             // reference into a slot is held across calls.
-            update(unsafe { slot.as_mut() }, self.timing);
+            let slot = unsafe { slot.as_mut() };
+            if slot.attempt != self.attempt {
+                slot.restart(self.attempt);
+            }
+            update(slot, self.timing);
         }
     }
 
@@ -599,6 +623,32 @@ impl Node {
         });
     }
 
+    /// Opens one step of the node's single execution: a node run in
+    /// several steps (a data-modifying `WITH` query its readers run a row at
+    /// a time) adds each step's time to one loop.
+    pub(crate) fn step(self) -> Step {
+        self.begin();
+        Step(self)
+    }
+
+    fn end_step(self) {
+        self.with(|slot, _| {
+            slot.open = slot.open.saturating_sub(1);
+            if slot.open != 0 {
+                return;
+            }
+            let first = slot.counters.loops == 0;
+            slot.counters.loops = 1;
+            if let Some(started) = slot.started.take() {
+                let total = elapsed_nanos(started);
+                slot.counters.total_nanos = slot.counters.total_nanos.saturating_add(total);
+                if first {
+                    slot.counters.startup_nanos = slot.first_row.take().unwrap_or(total);
+                }
+            }
+        });
+    }
+
     fn end(self) {
         self.with(|slot, _| {
             slot.open = slot.open.saturating_sub(1);
@@ -654,6 +704,16 @@ impl ScanOutput {
 
 fn elapsed_nanos(started: std::time::Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// One open step of a node's single execution.
+#[must_use]
+pub(crate) struct Step(Node);
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        self.0.end_step();
+    }
 }
 
 /// One open execution of a node.
@@ -804,6 +864,52 @@ mod tests {
         let inner = slots[1].counters();
         assert_eq!((inner.loops, inner.rows), (1, 3));
         assert_eq!(slots[2].counters().loops, 0);
+    }
+
+    #[test]
+    fn each_node_reports_the_last_attempt_that_ran_it() {
+        let write = NodeKey::new(BlockId::ROOT.child(Segment::Cte(0)), Role::Scan(0));
+        let read = NodeKey::new(BlockId::ROOT, Role::Scan(0));
+        let mut slots = [Slot::new(Some(write)), Slot::new(Some(read))];
+        analyze(&mut slots, false, || {
+            restart();
+            {
+                let _cte = enter(Segment::Cte(0));
+                let scan = node(Role::Scan(0));
+                let _loop = scan.start();
+                scan.rows(4);
+                scan.filtered();
+            }
+            let scan = node(Role::Scan(0));
+            {
+                let _loop = scan.start();
+                scan.rows(2);
+            }
+            // The next attempt keeps the write and reads again.
+            restart();
+            let scan = node(Role::Scan(0));
+            let _loop = scan.start();
+            scan.rows(3);
+        });
+        let kept = slots[0].counters();
+        assert_eq!((kept.loops, kept.rows, kept.filtered), (1, 4, 1));
+        let read = slots[1].counters();
+        assert_eq!((read.loops, read.rows), (1, 3));
+    }
+
+    #[test]
+    fn a_node_run_in_steps_counts_one_loop() {
+        let modify = NodeKey::new(BlockId::ROOT, Role::Modify);
+        let mut slots = [Slot::new(Some(modify))];
+        analyze(&mut slots, false, || {
+            for _ in 0..3 {
+                let node = node(Role::Modify);
+                let _step = node.step();
+                node.row();
+            }
+        });
+        let counters = slots[0].counters();
+        assert_eq!((counters.loops, counters.rows), (1, 3));
     }
 
     #[test]

@@ -15736,6 +15736,9 @@ impl Engine {
         row_buffers: &mut crate::storage::RowCursorBuffers,
         responder: &mut Responder,
     ) -> Result<&'a [&'a [u8]], SqlError> {
+        // The query's `ModifyTable` node returns its RETURNING rows.
+        let modify = query::instrument::node(query::instrument::Role::Modify);
+        let _modify = modify.start();
         let (rows, outcome) = Self::execute_write_step(
             storage,
             dml_scratch,
@@ -15751,6 +15754,9 @@ impl Engine {
             responder,
             None,
         );
+        if outcome.is_ok() {
+            modify.rows(rows.len() as u64);
+        }
         outcome.map(|()| rows)
     }
 
@@ -16124,6 +16130,10 @@ impl Engine {
             // also takes the step's retained calls; its executor uses the
             // query workspace, which the next attempt resets.
             let _cte = query::instrument::enter_block(write.block);
+            // The query's `ModifyTable` node returns its RETURNING rows,
+            // one step of its execution per run.
+            let modify = query::instrument::node(query::instrument::Role::Modify);
+            let _modify = modify.step();
             let (rows, result) = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, arena)),
                 || {
@@ -16141,6 +16151,7 @@ impl Engine {
                 },
             );
             self.storage.set_read_snapshot(snapshot);
+            modify.rows(rows.len() as u64);
             for row in rows {
                 invocations.add_produced_row(key, row, query::StepRegion::unfinished(), arena)?;
             }

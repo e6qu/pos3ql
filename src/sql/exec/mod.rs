@@ -101065,7 +101065,9 @@ pub(super) enum DmlSelection {
 /// loop, just before changing it, as PostgreSQL's executor does: when its
 /// conditions can call routines (see
 /// [`super::query::dml_qualification_calls_routines`]). A foreign table's
-/// rows are selected, qualified, before any changes.
+/// rows are qualified so too, except under `UPDATE ... FROM` or
+/// `DELETE ... USING`, whose joined candidates come from local tables and
+/// whose foreign rows are qualified before any change.
 #[allow(clippy::too_many_arguments)]
 fn qualifies_in_change_loop(
     storage: &Storage,
@@ -101077,13 +101079,15 @@ fn qualifies_in_change_loop(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
+    // A joined write reads its candidates from local leaves only.
     Ok(super::query::dml_qualification_calls_routines(
         where_clause,
         from,
         row_security,
         storage,
         txid,
-    ) && !dml_reaches_foreign_rows(storage, table_index, inheritance, txid, arena)?)
+    ) && (from.is_none()
+        || !dml_reaches_foreign_rows(storage, table_index, inheritance, txid, arena)?))
 }
 
 /// Whether the rows `UPDATE` or `DELETE` reaches include a foreign table's.
@@ -101193,6 +101197,47 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             sequences: Some(&sequences),
             merge_action: None,
         };
+        // A foreign row is read again by its remote identity and qualified
+        // on that image, as postgres_fdw's scan hands each row to the
+        // statement's conditions just before the row is changed.
+        if let PhysicalRow::Foreign {
+            table_index,
+            tuple_id,
+        } = row
+        {
+            let Some(bytes) = crate::sql::foreign::fetch_row(
+                storage,
+                table_index,
+                txn.txid,
+                tuple_id,
+                arena,
+                Some(&sequences),
+            )?
+            else {
+                return Ok(None);
+            };
+            let layout = retained_rows.layout(table_index)?;
+            let mut physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, layout.schema, &mut physical)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&physical, &mut values);
+            let _snapshot = storage.dml_expression_snapshot(self.command);
+            let qualified = row_matches_values(
+                storage,
+                txn.txid,
+                Some(table_index),
+                self.def,
+                self.alias,
+                &values[..self.def.n_columns],
+                self.where_clause,
+                arena,
+                self.params,
+                &hooks,
+                self.row_security,
+                self.outer,
+            )?;
+            return Ok(qualified.then_some(row));
+        }
         let conditions = DmlRequalify {
             def: self.def,
             alias: self.alias,

@@ -532,8 +532,11 @@ costs its declared `COST` (100 by default) times an operator, so
 their `EXPLAIN` filters. Under row security each policy condition runs
 before the statement's conditions, except that a leakproof conjunct of a
 single-relation query or write cheaper than ten operators and than the first
-policy condition runs before the policies. Remaining gaps: a foreign table's
-rows are qualified before any change; such a leakproof conjunct that costs at
+policy condition runs before the policies. A foreign table's candidate
+rows are read again by their remote row identity and qualified in the
+change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
+... USING` whose target reaches a foreign table's rows qualifies them
+before any change; such a leakproof conjunct that costs at
 least as much as the first policy condition runs after every policy
 condition, where PostgreSQL runs it right after the first; `EXPLAIN` prints
 a scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and

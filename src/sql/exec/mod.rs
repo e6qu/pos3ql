@@ -42016,7 +42016,7 @@ fn execute_queued_firing<'a>(
     own: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let Some(trigger_slot) = firing.trigger_slot else {
-        return constraints::fire_queued_foreign_key_event(context, firing.index);
+        return constraints::fire_queued_key_check_event(context, firing.index);
     };
     let trigger = context.storage().trigger(usize::from(trigger_slot));
     let rows = write_completion::queued_transition_rows(context, &trigger, firing, own)?;
@@ -42233,10 +42233,10 @@ pub(crate) fn fire_constraint_triggers(
                     ));
                 }
             },
-            crate::sql::txn::DeferredTriggerKind::ForeignKey {
+            crate::sql::txn::DeferredTriggerKind::KeyCheck {
                 identity, check, ..
             } => {
-                let Some(mode) = constraints::foreign_key_event_mode(
+                let Some(mode) = constraints::key_check_event_mode(
                     context.storage(),
                     context.txn,
                     identity,
@@ -42258,7 +42258,7 @@ pub(crate) fn fire_constraint_triggers(
                     }
                 };
                 if fires {
-                    constraints::fire_queued_foreign_key_event(&mut context, index)?;
+                    constraints::fire_queued_key_check_event(&mut context, index)?;
                 }
                 continue;
             }

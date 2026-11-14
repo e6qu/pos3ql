@@ -6851,19 +6851,6 @@ impl Engine {
             return Err(error);
         }
         self.work.reset();
-        if let Err(error) =
-            exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
-        {
-            // A foreign key check waiting for its parent row's lock keeps
-            // the admission, the completed checks and their locks, and
-            // continues when the commit runs again.
-            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
-                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
-            {
-                self.rollback_txn(txn, guc);
-            }
-            return Err(error);
-        }
         if txn.isolation == TransactionIsolation::Serializable
             && (!txn.touched().is_empty() || !txn.ddl().is_empty())
             && let Err(error) = self.storage.validate_serializable(txn.txid)
@@ -9698,8 +9685,6 @@ impl Engine {
         txn.rewind_statistics(mark.statistics);
         txn.rewind_subscription_advances(mark.subscription_advances);
         txn.rewind_constraints(
-            mark.constraint_obligations,
-            mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
             (
@@ -10931,35 +10916,6 @@ impl Engine {
         }
         if mode == ast::ConstraintMode::Immediate {
             if matches!(targets, ast::ConstraintTargets::All) {
-                if let Err(error) = exec::constraints::validate_deferred_constraints(
-                    &self.storage,
-                    txn,
-                    false,
-                    arena,
-                ) {
-                    return Ok(Err(error));
-                }
-            } else {
-                for identity in identities[..count].iter().copied() {
-                    while let Some((index, obligation)) = txn.deferred_constraint_for(identity) {
-                        if let Err(error) = exec::constraints::validate_constraint_obligation(
-                            &self.storage,
-                            identity,
-                            obligation.rowid,
-                            txn.txid,
-                            txn.isolation,
-                            self.storage.validation_read(),
-                            arena,
-                        ) {
-                            return Ok(Err(error));
-                        }
-                        if let Err(error) = txn.complete_deferred_constraint(index) {
-                            return Ok(Err(error));
-                        }
-                    }
-                }
-            }
-            if matches!(targets, ast::ConstraintTargets::All) {
                 if let Err(error) = self.fire_constraint_trigger_boundary(
                     txn,
                     guc,
@@ -12185,7 +12141,6 @@ impl Engine {
             responder,
             inserted,
         )?;
-        exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
         exec::fire_constraint_triggers(
             storage,
             txn,
@@ -12194,7 +12149,7 @@ impl Engine {
             responder,
             boundary,
         )?;
-        txn.compact_completed_constraints();
+        txn.compact_trigger_events();
         Ok(())
     }
 
@@ -13207,14 +13162,6 @@ impl Engine {
                 };
                 let outcome = outcome
                     .and_then(|()| {
-                        exec::constraints::validate_deferred_constraints(
-                            &self.storage,
-                            txn,
-                            true,
-                            arena,
-                        )
-                    })
-                    .and_then(|()| {
                         self.fire_constraint_trigger_boundary(
                             txn,
                             guc,
@@ -13405,7 +13352,7 @@ impl Engine {
                         wait: crate::sql::StatementWait::Lock,
                     });
                 }
-                txn.compact_completed_constraints();
+                txn.compact_trigger_events();
                 // Only the last statement's tag waits for the commit.
                 txn.held_command_complete = responder
                     .take_held_command_complete()
@@ -13947,14 +13894,6 @@ impl Engine {
                                 Err(error) => Err(error),
                             }
                             .and_then(|()| {
-                                exec::constraints::validate_deferred_constraints(
-                                    &self.storage,
-                                    txn,
-                                    true,
-                                    arena,
-                                )
-                            })
-                            .and_then(|()| {
                                 self.fire_constraint_trigger_boundary(
                                     txn,
                                     guc,
@@ -14021,7 +13960,7 @@ impl Engine {
                                         wait: crate::sql::StatementWait::Lock,
                                     });
                                 }
-                                txn.compact_completed_constraints();
+                                txn.compact_trigger_events();
                                 if immediate.is_none()
                                     && index_completion.is_none()
                                     && !matches!(
@@ -14321,7 +14260,7 @@ impl Engine {
                     return Ok(ExtendedExecutionStatus::Complete(false));
                 }
             };
-            txn.compact_completed_constraints();
+            txn.compact_trigger_events();
             let response_mark = responder.mark();
             responder.function_call_response(&value, binary_result)?;
             if txn.is_implicit()

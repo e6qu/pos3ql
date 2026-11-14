@@ -483,11 +483,10 @@ inheritance children drop the column too, reports `cannot drop desired
 object(s) ...`. `ON CONFLICT DO NOTHING` without a target refuses a table
 with a deferrable unique or exclusion constraint with `55000` even for a row
 an earlier arbiter would skip, and an inference target with an index
-predicate (`ON CONFLICT (a) WHERE a > 0`) fails with `42601`. A deferred unique or exclusion check that fails at commit runs before
-or after the row's deferred constraint triggers by a separate queue, where
-PostgreSQL fires it among them in trigger-name order
-(`PK_ConstraintTrigger`, `Unique_ConstraintTrigger`), so a deferred trigger's
-notice can precede the error that PostgreSQL reports first. A statement's own catalog scans, including those through views, read the
+predicate (`ON CONFLICT (a) WHERE a > 0`) fails with `42601`. `pg_trigger` omits the internal
+`PK_ConstraintTrigger_*` and `Unique_ConstraintTrigger_*` rows of deferrable
+unique and exclusion keys; their rechecks do fire among the row's AFTER
+triggers in that name order. A statement's own catalog scans, including those through views, read the
 catalog as the statement began (images built at its start), so `SELECT mk(g),
 (SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as

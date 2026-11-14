@@ -19401,12 +19401,13 @@ fn configured_catalog_version_pools_do_not_allocate_while_serving() {
 fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
     for (label, metadata, row_bytes, failing_insert) in [
         (
-            // Only a row that meets a possible duplicate is queued for the
-            // deferred recheck: three duplicates exceed two obligations.
-            "deferred-metadata",
-            2,
+            // A row that meets a possible duplicate queues its recheck in
+            // the event log beside its trigger events, so many duplicates
+            // fill the one in-memory page.
+            "deferred-rechecks",
+            8,
             crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
-            "INSERT INTO bounded_deferred VALUES(1, 'x'), (1, 'x'), (1, 'x'), (1, 'x')",
+            "INSERT INTO bounded_deferred SELECT 1, 'x' FROM generate_series(1, 20000)",
         ),
         (
             // One in-memory page and no spill file: an event larger than the

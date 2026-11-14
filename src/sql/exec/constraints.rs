@@ -1753,7 +1753,20 @@ fn check_row_keys(
             {
                 crate::sql::eval::take_diagnostic();
                 let identity = transaction.constraint_identity(constraint_table as u32, name);
-                return transaction.defer_constraint(identity, rowid);
+                return transaction.pend_key_check_event(
+                    table_index as u16,
+                    key_recheck_trigger_name(def, name)?,
+                    identity,
+                    crate::sql::txn::KeyCheck::Unique,
+                    constraint_table as u16,
+                    if row.excluded().is_some() {
+                        crate::sql::ast::TriggerEvents::UPDATE
+                    } else {
+                        crate::sql::ast::TriggerEvents::INSERT
+                    },
+                    rowid,
+                    None,
+                );
             }
             Err(error)
         };
@@ -3033,11 +3046,11 @@ fn check_or_defer_fk_child(
                     crate::sql::ast::TriggerEvents::INSERT,
                 )
             };
-            transaction.pend_foreign_key_event(
+            transaction.pend_key_check_event(
                 table_index as u16,
                 foreign_key_trigger_name(fk, trigger)?,
                 identity,
-                crate::sql::txn::ForeignKeyCheck::Referencing,
+                crate::sql::txn::KeyCheck::Referencing,
                 constraint_table as u16,
                 event,
                 rowid,
@@ -3269,6 +3282,43 @@ fn missing_parent_key(
     )
 }
 
+/// The name of the trigger PostgreSQL creates for the deferrable unique or
+/// exclusion key `name`, which orders the key's recheck among the row's AFTER
+/// triggers. Its number is the constraint's OID, which keeps creation order.
+fn key_recheck_trigger_name<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: SqlName,
+) -> Result<SqlName, SqlError> {
+    let (primary, identity) = def
+        .uniques()
+        .iter()
+        .find(|key| key.name == name)
+        .map(|key| (key.kind.is_primary(), key.identity))
+        .or_else(|| {
+            def.exclusions()
+                .iter()
+                .find(|constraint| constraint.name == name)
+                .map(|constraint| (false, constraint.identity))
+        })
+        .and_then(|(primary, identity)| Some((primary, identity?)))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "deferrable key \"{}\" has no constraint identity",
+                name.as_str()
+            )
+        })?;
+    SqlName::parse(
+        crate::stack_format!(
+            64,
+            "{}_ConstraintTrigger_{}",
+            if primary { "PK" } else { "Unique" },
+            identity.oid()
+        )
+        .as_str(),
+    )
+}
+
 /// The name of a foreign key's RI trigger, which orders its queued check
 /// among the row's AFTER triggers.
 pub(super) fn foreign_key_trigger_name(
@@ -3295,11 +3345,11 @@ pub(super) fn foreign_key_trigger_name(
 /// When a queued foreign key check fires: `None` once its constraint is gone.
 /// A `RESTRICT` check and the rewriting actions are never deferred, as
 /// PostgreSQL creates their triggers not deferrable.
-pub(crate) fn foreign_key_event_mode(
+pub(crate) fn key_check_event_mode(
     storage: &Storage,
     txn: &TxnState,
     identity: crate::sql::txn::ConstraintIdentity,
-    check: crate::sql::txn::ForeignKeyCheck,
+    check: crate::sql::txn::KeyCheck,
 ) -> Option<crate::sql::ast::ConstraintMode> {
     if !txn.constraint_identity_is_current(identity) {
         return None;
@@ -3312,24 +3362,24 @@ pub(crate) fn foreign_key_event_mode(
 }
 
 /// Runs the queued foreign key event `index`: a referential action or a
-/// check (see [`fire_foreign_key_event`]).
-pub(super) fn fire_queued_foreign_key_event(
+/// check (see [`fire_key_check_event`]).
+pub(super) fn fire_queued_key_check_event(
     context: &mut super::TriggerExecContext<'_, '_, '_>,
     index: u64,
 ) -> Result<(), SqlError> {
     let (event, _, _) = context.txn.trigger_event(index)?;
     match event.kind {
-        crate::sql::txn::DeferredTriggerKind::ForeignKey {
-            check: crate::sql::txn::ForeignKeyCheck::Action(_),
+        crate::sql::txn::DeferredTriggerKind::KeyCheck {
+            check: crate::sql::txn::KeyCheck::Action(_),
             ..
         } => fire_foreign_key_action(context, index),
-        _ => fire_foreign_key_event(context.host.storage(), context.txn, index, context.arena),
+        _ => fire_key_check_event(context.host.storage(), context.txn, index, context.arena),
     }
 }
 
 /// Runs the queued foreign key check `index` and marks it fired. A check
 /// that waits for a row lock runs again under the snapshot it started with.
-fn fire_foreign_key_event(
+fn fire_key_check_event(
     storage: &Storage,
     txn: &mut TxnState,
     index: u64,
@@ -3339,7 +3389,7 @@ fn fire_foreign_key_event(
     if fired {
         return Ok(());
     }
-    let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+    let crate::sql::txn::DeferredTriggerKind::KeyCheck {
         identity,
         check,
         effective_table,
@@ -3362,21 +3412,23 @@ fn fire_foreign_key_event(
     // A data-modifying `WITH` reads below its own command; its checks do not.
     let _own_changes = storage.own_changes_snapshot();
     let result = match check {
-        crate::sql::txn::ForeignKeyCheck::Referencing => validate_constraint_obligation(
-            storage,
-            current,
-            rowid,
-            txn.txid,
-            txn.isolation,
-            read,
-            arena,
-        )
-        .map(|_| ()),
-        crate::sql::txn::ForeignKeyCheck::Action(_) => Err(sql_err!(
+        crate::sql::txn::KeyCheck::Referencing | crate::sql::txn::KeyCheck::Unique => {
+            validate_constraint_obligation(
+                storage,
+                current,
+                rowid,
+                txn.txid,
+                txn.isolation,
+                read,
+                arena,
+            )
+            .map(|_| ())
+        }
+        crate::sql::txn::KeyCheck::Action(_) => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "a referential action was run as a check"
         )),
-        crate::sql::txn::ForeignKeyCheck::Referenced { restrict } => {
+        crate::sql::txn::KeyCheck::Referenced { restrict } => {
             let old = event
                 .old
                 .map(|tuple| txn.trigger_event_tuple(tuple, arena))
@@ -3658,64 +3710,6 @@ pub(crate) fn validate_check_constraint(
             )
         }
     })
-}
-
-/// Checks and removes obligations whose current mode requires this boundary.
-/// `immediate_only` is the statement boundary; `false` is transaction commit.
-pub(crate) fn validate_deferred_constraints(
-    storage: &Storage,
-    txn: &mut TxnState,
-    immediate_only: bool,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let mut index = 0;
-    while index < txn.deferred_constraints().len() {
-        if txn.deferred_constraint_is_complete(index) {
-            index += 1;
-            continue;
-        }
-        let obligation = txn.deferred_constraints()[index];
-        let current = txn.current_constraint_identity(obligation.constraint);
-        if !txn.constraint_identity_is_current(obligation.constraint) {
-            txn.complete_deferred_constraint(index)?;
-            index += 1;
-            continue;
-        }
-        let Some(timing) = constraint_timing(storage, current, txn.txid) else {
-            txn.complete_deferred_constraint(index)?;
-            index += 1;
-            continue;
-        };
-        if immediate_only
-            && txn.constraint_mode(obligation.constraint, timing)
-                == crate::sql::ast::ConstraintMode::Deferred
-        {
-            index += 1;
-            continue;
-        }
-        // A check that waited for its parent row's lock runs again under
-        // the snapshot it started with, as in-row checks do.
-        let read = txn
-            .take_awaited_parent_read(current)
-            .unwrap_or_else(|| storage.validation_read());
-        if let Err(error) = validate_constraint_obligation(
-            storage,
-            current,
-            obligation.rowid,
-            txn.txid,
-            txn.isolation,
-            read,
-            arena,
-        ) {
-            if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
-                txn.await_parent_read(current, read);
-            }
-            return Err(error);
-        }
-        txn.complete_deferred_constraint(index)?;
-        index += 1;
-    }
-    Ok(())
 }
 
 pub(crate) fn constraint_timing(
@@ -4294,25 +4288,25 @@ pub(crate) fn apply_fk_parent_actions(
             };
             let check = match action {
                 StorageFkAction::NoAction => {
-                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: false }
+                    crate::sql::txn::KeyCheck::Referenced { restrict: false }
                 }
                 StorageFkAction::Restrict => {
-                    crate::sql::txn::ForeignKeyCheck::Referenced { restrict: true }
+                    crate::sql::txn::KeyCheck::Referenced { restrict: true }
                 }
-                StorageFkAction::Cascade => crate::sql::txn::ForeignKeyCheck::Action(
-                    crate::sql::txn::ReferentialAction::Cascade,
-                ),
-                StorageFkAction::SetNull => crate::sql::txn::ForeignKeyCheck::Action(
-                    crate::sql::txn::ReferentialAction::SetNull,
-                ),
-                StorageFkAction::SetDefault => crate::sql::txn::ForeignKeyCheck::Action(
+                StorageFkAction::Cascade => {
+                    crate::sql::txn::KeyCheck::Action(crate::sql::txn::ReferentialAction::Cascade)
+                }
+                StorageFkAction::SetNull => {
+                    crate::sql::txn::KeyCheck::Action(crate::sql::txn::ReferentialAction::SetNull)
+                }
+                StorageFkAction::SetDefault => crate::sql::txn::KeyCheck::Action(
                     crate::sql::txn::ReferentialAction::SetDefault,
                 ),
             };
             // A check keeps the old key alone; a cascaded update also the new
             // key (see [`decode_action_keys`]).
             let encoded = match check {
-                crate::sql::txn::ForeignKeyCheck::Action(_) => encode_action_keys(
+                crate::sql::txn::KeyCheck::Action(_) => encode_action_keys(
                     old_parent,
                     new_parent,
                     parent_columns,
@@ -4327,7 +4321,7 @@ pub(crate) fn apply_fk_parent_actions(
                 )?,
             };
             let identity = txn.constraint_identity(child_index as u32, fk.name);
-            txn.pend_foreign_key_event(
+            txn.pend_key_check_event(
                 parent_index as u16,
                 foreign_key_trigger_name(&fk, trigger)?,
                 identity,
@@ -4360,9 +4354,9 @@ fn fire_foreign_key_action(
     if fired {
         return Ok(());
     }
-    let crate::sql::txn::DeferredTriggerKind::ForeignKey {
+    let crate::sql::txn::DeferredTriggerKind::KeyCheck {
         identity,
-        check: crate::sql::txn::ForeignKeyCheck::Action(referential),
+        check: crate::sql::txn::KeyCheck::Action(referential),
         effective_table,
         ..
     } = event.kind

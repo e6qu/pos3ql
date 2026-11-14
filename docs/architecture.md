@@ -128,6 +128,11 @@ STATEMENT` triggers follow its row events. A referencing check reads the
 row's current version, so a row deleted before the check is not checked; a
 referenced check carries the old key, and NO ACTION passes when another row
 provides that key again. Checks see every change of their transaction.
+A row that meets a possible conflict of a deferrable unique or exclusion key
+queues that key's recheck the same way, by the name of PostgreSQL's
+`PK_ConstraintTrigger_<oid>` or `Unique_ConstraintTrigger_<oid>` trigger
+(here the constraint's OID), so a deferred trigger named after it does not
+run for a row whose recheck fails.
 
 A `CASCADE`, `SET NULL` or `SET DEFAULT` action runs PostgreSQL's
 `ri_triggers.c` query (`DELETE FROM ONLY child WHERE $1 OPERATOR(pg_catalog.=)

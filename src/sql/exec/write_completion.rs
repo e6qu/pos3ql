@@ -57,11 +57,6 @@ impl AfterRowCursor {
         }
     }
 
-    /// Yields the event at `index` again next.
-    fn revisit(&mut self, index: u64) {
-        self.next = Some(index);
-    }
-
     pub(super) fn next(
         &mut self,
         context: &mut TriggerExecContext<'_, '_, '_>,
@@ -95,7 +90,7 @@ impl AfterRowCursor {
                 } if trigger_depth == self.depth && command == self.command => {
                     Some((Some(trigger_slot), effective_table, true))
                 }
-                crate::sql::txn::DeferredTriggerKind::ForeignKey {
+                crate::sql::txn::DeferredTriggerKind::KeyCheck {
                     identity,
                     check,
                     effective_table,
@@ -106,7 +101,7 @@ impl AfterRowCursor {
                     && command == self.command
                     && context.txn.with_sub_statement != Some((self.depth, self.command)) =>
                 {
-                    match constraints::foreign_key_event_mode(
+                    match constraints::key_check_event_mode(
                         context.host.storage(),
                         context.txn,
                         identity,
@@ -224,8 +219,6 @@ enum AfterPhase {
     /// checks and actions, AFTER STATEMENT triggers, and those its
     /// referential actions queued after them.
     Rows(AfterRowCursor),
-    /// A top-level statement's last immediate constraint checks.
-    Constraints,
     Reply,
     Replied,
 }
@@ -233,24 +226,15 @@ enum AfterPhase {
 #[derive(Clone, Copy)]
 enum AfterFiring {
     Row(QueuedFiring),
-    /// A top-level statement's immediate constraint checks, after the row
-    /// events before its first AFTER STATEMENT trigger, as PostgreSQL
-    /// queues them, and again after any events queued later.
-    Constraints,
 }
 
 struct CompletionCursor {
     completion: WriteCompletion,
     reply: CompletionReply,
     phase: AfterPhase,
-    /// The completion ends a top-level statement: it runs the immediate
-    /// constraint checks.
-    statement_end: bool,
     /// Its owner keeps it across a wait, so its reads yield again at each
     /// event: a top-level statement, or a write in a `CALL` or `DO` body.
     reopen_reads: bool,
-    /// Row events ran since the constraint checks last ran.
-    constraints_pending: bool,
 }
 
 pub(crate) struct SuspendedWriteCompletion {
@@ -602,21 +586,12 @@ fn run_selected_firing<'run>(
 ) -> Result<Option<(trigger_firing::SuspendedTriggerFiring, SqlError)>, SqlError> {
     let mut context = context.for_trigger();
     let selected = match selected {
-        AfterFiring::Constraints => {
-            constraints::validate_deferred_constraints(
-                context.host.storage(),
-                context.txn,
-                true,
-                context.arena,
-            )?;
-            return Ok(None);
-        }
         AfterFiring::Row(QueuedFiring {
             index,
             trigger_slot: None,
             ..
         }) => {
-            constraints::fire_queued_foreign_key_event(&mut context, index)?;
+            constraints::fire_queued_key_check_event(&mut context, index)?;
             return Ok(None);
         }
         AfterFiring::Row(selected) => selected,
@@ -780,15 +755,12 @@ impl CompletionCursor {
         command: u32,
         boundary: Option<super::super::txn::WriteCompletionBoundary>,
     ) -> Self {
-        let statement_end = boundary.is_some_and(|boundary| boundary.statement_end);
         Self {
             completion,
             reply,
             phase: AfterPhase::Rows(AfterRowCursor::new(depth, command)),
-            statement_end,
             reopen_reads: boundary
                 .is_some_and(|boundary| boundary.statement_end || boundary.retained),
-            constraints_pending: statement_end,
         }
     }
 
@@ -800,26 +772,9 @@ impl CompletionCursor {
             match &mut self.phase {
                 AfterPhase::Rows(cursor) => {
                     if let Some(firing) = cursor.next(context)? {
-                        if firing.statement && self.constraints_pending {
-                            cursor.revisit(firing.index);
-                            self.constraints_pending = false;
-                            return Ok(Some(AfterFiring::Constraints));
-                        }
-                        if !firing.statement && self.statement_end {
-                            self.constraints_pending = true;
-                        }
                         return Ok(Some(AfterFiring::Row(firing)));
                     }
-                    self.phase = if self.constraints_pending {
-                        AfterPhase::Constraints
-                    } else {
-                        AfterPhase::Reply
-                    };
-                }
-                AfterPhase::Constraints => {
                     self.phase = AfterPhase::Reply;
-                    self.constraints_pending = false;
-                    return Ok(Some(AfterFiring::Constraints));
                 }
                 AfterPhase::Reply | AfterPhase::Replied => return Ok(None),
             }
@@ -1004,10 +959,6 @@ impl WriteCompletion {
                         .flatten();
                     execute_queued_firing(&mut context, firing, own)
                 }
-                AfterFiring::Constraints => Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "an inline write completion runs no constraint checks"
-                )),
             };
             if let Err(error) = result {
                 return sql_fail(error);
@@ -1102,9 +1053,7 @@ mod ownership_tests {
                 },
                 reply: CompletionReply::CountOnly,
                 phase: AfterPhase::Reply,
-                statement_end: false,
                 reopen_reads: false,
-                constraints_pending: false,
             };
             nested.complete(&mut responder).unwrap().unwrap();
             assert_eq!(responder.buffer.len(), completed_bytes);

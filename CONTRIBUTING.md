@@ -164,13 +164,16 @@ temporary validation workflows before the final head.
   `POS3QL_EXACT_SHARDS`, like the SQLLogicTest query slices.
   Coverage tracing and `runtest:` correctness shards stay in separate matrix
   entries.
-- Bound compiler concurrency and debug data rather than adding time. Native
-  arm64 jobs build every target once with the `native-ci` profile and
-  `--jobs 1` (debug assertions, overflow checks and line backtraces, without
-  full variable debug data); separate test jobs run that build's library
-  executable with the full native filter lists. The artifact helper checks
-  revision, target, length and SHA-256, and restores `RUST_MIN_STACK` from the
-  checked-in Cargo configuration.
+- Bound debug data and split compilation rather than adding time. Native arm64
+  jobs use the `native-ci` profile (debug assertions, overflow checks and line
+  backtraces, without full variable debug data). `native-test-build` compiles
+  only the library test executable that the native test jobs run with the full
+  native filter lists; `native-build` compiles every other `--all-targets`
+  target on its own runner. The library test compile peaks near 7 GB of
+  compiler memory, all of a hosted macOS arm64 runner, so no job compiles both
+  library units at once and macOS uses one Cargo job; Linux arm64 uses four.
+  The artifact helper checks revision, target, length and SHA-256, and
+  restores `RUST_MIN_STACK` from the checked-in Cargo configuration.
 - Coverage builds and runs use the `coverage` profile (release with
   optimization level 1). Production release builds keep release settings.
 - Preserve explicit profiles, assertions, native targets and test selections.
@@ -287,7 +290,8 @@ capacity, rollback, failure cleanup, WAL/checkpoint and empty-cache recovery.
   extend timeouts. A job waiting for a runner is a scheduling delay, not an
   execution timeout.
 - Keep compiler and per-test progress visible through cancellation. Native
-  builds retain `native-build-progress-<target>-<revision>` (Cargo progress and
+  builds retain `native-build-progress-<target>-<revision>` and
+  `native-test-build-progress-<target>-<revision>` (Cargo progress and
   timings); coverage library shards stream compiler output and each test's
   progress so the last running test is visible.
 - Native crashes need thread backtraces; a retry or longer deadline is not a

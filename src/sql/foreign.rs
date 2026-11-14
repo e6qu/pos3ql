@@ -1718,11 +1718,25 @@ pub(crate) fn direct_modify_sql<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let table = storage.table_def(table_slot, txid);
+    // `make_modifytable`: a row trigger for the statement's event or a
+    // stored generated column needs each row here; statement triggers fire
+    // around the remote statement.
+    let event = if assignments.is_some() {
+        crate::sql::ast::TriggerEvents::UPDATE
+    } else {
+        crate::sql::ast::TriggerEvents::DELETE
+    };
     if table.kind != crate::storage::TableKind::Foreign
         || storage
             .triggers_for_table(table_slot, txid)
-            .next()
-            .is_some()
+            .any(|(_, trigger)| {
+                matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                    && trigger.events.contains(event)
+            })
+        || table
+            .columns()
+            .iter()
+            .any(|column| column.default.generation() == Some(crate::storage::Generation::Stored))
         || table.row_level_security.enabled
         || inheritance == crate::sql::ast::RelationInheritance::Descendants
             && storage.relation_has_descendants(table_slot, txid)
@@ -2674,7 +2688,10 @@ pub(crate) fn update_row<'data>(
     let mut parameters = [None; crate::storage::MAX_COLUMNS + 1];
     parameters[0] = Some(identity.as_str().as_bytes());
     let mut count = 1;
-    for column in (0..remote.table.n_columns).filter(|&column| target_columns.contains(column)) {
+    // A generated column is set to DEFAULT and takes no parameter.
+    for column in (0..remote.table.n_columns).filter(|&column| {
+        target_columns.contains(column) && !remote.table.columns()[column].default.is_generated()
+    }) {
         parameters[count] = Responder::datum_wire_text(&values[column], render, arena)?;
         count += 1;
     }

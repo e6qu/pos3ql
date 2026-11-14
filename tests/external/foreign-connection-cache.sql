@@ -124,6 +124,32 @@ INSERT INTO fdw_cache_local.b VALUES (41, fdw_cache_local.label(41)), (42, fdw_c
   (43, fdw_cache_local.label(43)), (44, fdw_cache_local.label(44));
 SELECT count(*) FROM fdw_cache_local.calls;
 SELECT id, note FROM fdw_cache_local.b WHERE id > 30 ORDER BY id;
+
+-- A direct UPDATE or DELETE fires statement triggers around its remote
+-- statement; a row trigger for its event or a stored generated column
+-- changes the rows one by one, a generated column set to DEFAULT.
+CREATE FUNCTION fdw_cache_local.noted() RETURNS trigger LANGUAGE plpgsql
+  AS $$BEGIN RAISE NOTICE '% % % %', TG_OP, TG_WHEN, TG_LEVEL,
+    (SELECT count(*) FROM fdw_cache_local.b WHERE note = 'y'); RETURN NULL; END$$;
+CREATE TRIGGER s1 BEFORE UPDATE ON fdw_cache_local.b
+  FOR EACH STATEMENT EXECUTE FUNCTION fdw_cache_local.noted();
+CREATE TRIGGER s2 AFTER UPDATE ON fdw_cache_local.b
+  FOR EACH STATEMENT EXECUTE FUNCTION fdw_cache_local.noted();
+CREATE TRIGGER s3 BEFORE DELETE ON fdw_cache_local.b
+  FOR EACH STATEMENT EXECUTE FUNCTION fdw_cache_local.noted();
+EXPLAIN (VERBOSE, COSTS OFF) UPDATE fdw_cache_local.b SET note = 'y' WHERE id = 11;
+UPDATE fdw_cache_local.b SET note = 'y' WHERE id = 11;
+DELETE FROM fdw_cache_local.b WHERE id = 12;
+CREATE TRIGGER r1 AFTER UPDATE ON fdw_cache_local.b
+  FOR EACH ROW EXECUTE FUNCTION fdw_cache_local.noted();
+EXPLAIN (VERBOSE, COSTS OFF) UPDATE fdw_cache_local.b SET note = 'y' WHERE id = 13;
+EXPLAIN (VERBOSE, COSTS OFF) DELETE FROM fdw_cache_local.b WHERE id = 13;
+UPDATE fdw_cache_local.b SET note = 'y' WHERE id = 13;
+DELETE FROM fdw_cache_local.b WHERE id = 14 AND pg_typeof(id) IS NOT NULL RETURNING b;
+EXPLAIN (VERBOSE, COSTS OFF) UPDATE fdw_cache_local.t SET id = id + 1000 WHERE id = 25;
+EXPLAIN (VERBOSE, COSTS OFF) UPDATE fdw_cache_local.t SET note = 'g' WHERE id = 25;
+UPDATE fdw_cache_local.t SET id = id + 1000 WHERE id = 25;
+SELECT id, note, g FROM fdw_cache_local.t WHERE id > 1000;
 ALTER FOREIGN TABLE fdw_cache_local.t OPTIONS (ADD batch_size '0x10');
 INSERT INTO fdw_cache_local.t (id, note) VALUES (200, 'f'), (1, 'skipped'), (201, 'g')
   ON CONFLICT DO NOTHING;

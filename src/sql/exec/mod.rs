@@ -90688,9 +90688,16 @@ fn expression_dml_target_columns_with_output_aliases<
                 qualifier == target_name || output_aliases.contains(&qualifier)
             }) =>
             {
-                definition
-                    .column_index(name)
-                    .map_or(ColumnSet::EMPTY, ColumnSet::from_column)
+                match definition.column_index(name) {
+                    Some(column) => ColumnSet::from_column(column),
+                    // A bare name that is no column names the row (`RETURNING t`).
+                    None if qualifier.is_none()
+                        && (*name == target_name || output_aliases.contains(name)) =>
+                    {
+                        all_columns_mask(definition)
+                    }
+                    None => ColumnSet::EMPTY,
+                }
             }
             Expr::WholeRow(qualifier)
                 if *qualifier == target_name || output_aliases.contains(qualifier) =>
@@ -90755,6 +90762,22 @@ fn finish_foreign_batches(
         (Ok(Ok(())), Err(error)) => sql_fail(error),
         (outcome, _) => outcome,
     }
+}
+
+/// Whether a row trigger for `event` (of `timing`, or any) is on the
+/// foreign table `table`, which postgres_fdw's modify planning checks.
+pub(crate) fn foreign_row_trigger(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    event: u8,
+    timing: Option<TriggerTiming>,
+) -> bool {
+    storage.triggers_for_table(table, txid).any(|(_, trigger)| {
+        matches!(trigger.level, TriggerLevel::Row)
+            && trigger.events.contains(event)
+            && timing.is_none_or(|timing| trigger.timing == timing)
+    })
 }
 
 /// Whether a row trigger of `timing` on INSERT applies to `leaf`'s rows,
@@ -90857,17 +90880,20 @@ fn foreign_insert_has_after_row_trigger(storage: &Storage, leaf: usize, txid: u3
 /// The columns a foreign UPDATE or DELETE reads back per row, as
 /// postgres_fdw's `deparseReturningList` chooses them: every column for a
 /// local row trigger or a view's check option, else those `RETURNING` reads.
+#[expect(clippy::too_many_arguments, reason = "the statement's parts")]
 pub(crate) fn foreign_modify_returned(
     storage: &Storage,
     txid: u32,
     table: usize,
+    event: u8,
     returning: crate::sql::ast::Returning<'_>,
     alias: Option<&str>,
     every_column: bool,
     arena: &Arena,
 ) -> Result<ColumnSet, SqlError> {
     let definition = storage.table_def(table, txid);
-    if every_column || storage.triggers_for_table(table, txid).next().is_some() {
+    if every_column || foreign_row_trigger(storage, table, txid, event, Some(TriggerTiming::After))
+    {
         return Ok(ColumnSet::all(definition.n_columns));
     }
     returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)
@@ -91224,6 +91250,24 @@ pub(crate) fn update<'a>(
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
                 }
+                // Statement triggers fire around the remote statement.
+                fire_statement_triggers(
+                    TriggerExecContext {
+                        host: PlpgsqlExecHost::Atomic {
+                            storage,
+                            services: services.reborrow(),
+                        },
+                        txn,
+                        arena,
+                        params: crate::sql::eval::NO_PARAMS,
+                        responder,
+                    },
+                    table_index,
+                    def,
+                    2,
+                    true,
+                    updated_columns,
+                )?;
                 crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
             })
             .transpose()
@@ -91268,6 +91312,7 @@ pub(crate) fn update<'a>(
             storage,
             txn.txid,
             table_index,
+            TriggerEvents::UPDATE,
             statement.returning,
             statement.alias,
             view_check.is_some(),
@@ -92936,6 +92981,24 @@ pub(crate) fn delete<'a>(
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
                 }
+                // Statement triggers fire around the remote statement.
+                fire_statement_triggers(
+                    TriggerExecContext {
+                        host: PlpgsqlExecHost::Atomic {
+                            storage,
+                            services: services.reborrow(),
+                        },
+                        txn,
+                        arena,
+                        params: crate::sql::eval::NO_PARAMS,
+                        responder,
+                    },
+                    table_index,
+                    def,
+                    4,
+                    true,
+                    ColumnSet::EMPTY,
+                )?;
                 crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
             })
             .transpose()
@@ -92973,14 +93036,12 @@ pub(crate) fn delete<'a>(
             return Ok(None);
         }
         let whole_old = capture.is_some()
-            || storage
-                .triggers_for_table(table_index, txn.txid)
-                .next()
-                .is_some();
+            || foreign_row_trigger(storage, table_index, txn.txid, TriggerEvents::DELETE, None);
         let returned = foreign_modify_returned(
             storage,
             txn.txid,
             table_index,
+            TriggerEvents::DELETE,
             statement.returning,
             statement.alias,
             false,

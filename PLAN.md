@@ -859,15 +859,18 @@ ships its needed columns, the conditions `is_foreign_expr` accepts (built-in
 immutable operators and functions over modeled built-in types, constants and
 `IN` lists, ordered as `order_qual_clauses` orders them), its `ORDER BY` when
 every key is a table column, and `LIMIT`/`OFFSET` when nothing stays local;
-direct `UPDATE`/`DELETE` and the row-by-row `WHERE ctid = $1` commands match,
+direct `UPDATE`/`DELETE` (with statement triggers firing around the remote
+statement; a row trigger for its event or a stored generated column keeps it
+row by row) and the row-by-row `WHERE ctid = $1` commands (a stored generated
+column that depends on an updated one set to `DEFAULT`, `RETURNING` all
+columns only for an `AFTER` row trigger) match,
 with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
 and `differential_exact/504`. Remaining differences: joins, aggregates,
 `DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
 `COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
-with `RETURNING` runs row by row, as does one of a table with any trigger
-(PostgreSQL disqualifies only row triggers for the statement's event, so
-statement triggers must fire around the direct command first); an `UPDATE` sends no stored generated column
-values; a select list or `ORDER BY` with a subquery reads every column. A query whose
+with `RETURNING` runs row by row (PostgreSQL ships the `RETURNING` columns
+with the direct command), and `EXPLAIN VERBOSE` of a write with `RETURNING`
+omits the write node's `Output:` line; a select list or `ORDER BY` with a subquery reads every column. A query whose
 only FROM item is a foreign table, a scalar or `EXISTS` subquery over one,
 and a foreign partition or inheritance child read its cursor one `FETCH`
 batch at a time as the plan consumes rows, and close it as soon as the plan

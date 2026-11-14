@@ -587,3 +587,48 @@ fn foreign_insert_batches_wait_through_routine_calls() {
         .collect();
     assert_eq!(batches, [3, 1]);
 }
+
+#[test]
+fn direct_modification_admits_statement_triggers_and_sets_generated_columns() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION noted() RETURNS trigger LANGUAGE plpgsql \
+           AS $$BEGIN RETURN NULL; END$$; \
+         CREATE TRIGGER noted BEFORE UPDATE ON ft \
+           FOR EACH STATEMENT EXECUTE FUNCTION noted(); \
+         CREATE FOREIGN TABLE fg (id integer, g integer GENERATED ALWAYS AS (id * 2) STORED) \
+           SERVER scripted OPTIONS (schema_name 'public', table_name 'fg')",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE ft SET note = 'y' WHERE id = 3",
+    );
+    let modified: Vec<String> = remote_statements(&log)
+        .into_iter()
+        .filter(|command| command.starts_with("UPDATE "))
+        .collect();
+    assert_eq!(
+        modified,
+        ["UPDATE public.ft SET note = 'y'::text WHERE ((id = 3))"]
+    );
+    let explained = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (VERBOSE, COSTS OFF) UPDATE fg SET id = id + 1 WHERE id = 3",
+    );
+    assert!(
+        data_rows(&explained).iter().any(|line| {
+            line.contains("UPDATE public.fg SET id = $2, g = DEFAULT WHERE ctid = $1")
+        }),
+        "{}",
+        String::from_utf8_lossy(&explained)
+    );
+}

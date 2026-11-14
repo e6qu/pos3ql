@@ -4939,9 +4939,14 @@ fn foreign_modification<'a>(
             updated.insert(column);
         }
     }
-    let triggers = storage.triggers_for_table(slot, txid).next().is_some();
+    let event = if assignments.is_some() {
+        crate::sql::ast::TriggerEvents::UPDATE
+    } else {
+        crate::sql::ast::TriggerEvents::DELETE
+    };
+    let triggers = crate::sql::exec::foreign_row_trigger(storage, slot, txid, event, None);
     let returned = crate::sql::exec::foreign_modify_returned(
-        storage, txid, slot, returning, alias, false, arena,
+        storage, txid, slot, event, returning, alias, false, arena,
     )?;
     let Some(planned) = crate::sql::foreign::modify_scan(
         storage,

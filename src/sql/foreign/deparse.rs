@@ -2048,13 +2048,26 @@ pub(crate) fn plan_modify_scan<'a>(
             let _ = modify.write_str("UPDATE ");
             deparser.write_relation(&mut modify);
             let _ = modify.write_str(" SET ");
-            let assigned = (0..deparser.table.n_columns).filter(|&column| columns.contains(column));
-            for (parameter, column) in (2..).zip(assigned) {
-                if parameter != 2 {
+            // `deparseUpdateSql` over the updated columns and the stored
+            // generated columns that depend on them, in column order; a
+            // generated column is set to DEFAULT.
+            let generated = dependent_generated_columns(deparser.table, columns, arena)?;
+            let mut parameter = 2;
+            let mut first = true;
+            for column in (0..deparser.table.n_columns)
+                .filter(|&column| columns.contains(column) || generated.contains(column))
+            {
+                if !first {
                     let _ = modify.write_str(", ");
                 }
+                first = false;
                 deparser.write_column(&mut modify, column);
-                let _ = write!(modify, " = ${parameter}");
+                if deparser.table.columns()[column].default.is_generated() {
+                    let _ = modify.write_str(" = DEFAULT");
+                } else {
+                    let _ = write!(modify, " = ${parameter}");
+                    parameter += 1;
+                }
             }
         }
         None => {
@@ -2077,6 +2090,57 @@ pub(crate) fn plan_modify_scan<'a>(
         modify_sql: arena.alloc_str(modify.as_str()).map_err(|_| arena_full())?,
         returned,
     })
+}
+
+/// `get_dependent_generated_columns`: the stored generated columns whose
+/// expressions read a column of `updated`.
+fn dependent_generated_columns(
+    table: &crate::storage::TableDef,
+    updated: ColumnSet,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let mut dependent = ColumnSet::EMPTY;
+    for (index, column) in table.columns().iter().enumerate() {
+        let crate::storage::ColumnDefault::Generated {
+            expression,
+            kind: crate::storage::Generation::Stored,
+        } = &column.default
+        else {
+            continue;
+        };
+        let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena).map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored generation expression does not parse"
+            )
+        })?;
+        if expression_reads(parsed, table, updated)? {
+            dependent.insert(index);
+        }
+    }
+    Ok(dependent)
+}
+
+fn expression_reads(
+    expression: &Expr<'_>,
+    table: &crate::storage::TableDef,
+    columns: ColumnSet,
+) -> Result<bool, SqlError> {
+    if let Expr::Column { name, .. } = expression
+        && table
+            .column_index(name)
+            .is_some_and(|index| columns.contains(index))
+    {
+        return Ok(true);
+    }
+    let mut found = false;
+    crate::sql::query::walk_children(expression, &mut |child| {
+        if !found {
+            found = expression_reads(child, table, columns)?;
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 #[cfg(test)]

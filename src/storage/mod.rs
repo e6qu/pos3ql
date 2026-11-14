@@ -5518,6 +5518,21 @@ impl Table {
         self.publication().enforcers.len()
     }
 
+    /// Reads one published binding in place; [`Self::enforcer`] copies it.
+    fn read_enforcer<R>(
+        &self,
+        binding: usize,
+        read: impl FnOnce(&Enforcer, EnforcerPublicationState, u32) -> R,
+    ) -> Option<R> {
+        let publication = self.publication();
+        let selected = publication.enforcers.get(binding)?.as_ref()?;
+        Some(read(
+            selected,
+            publication.enforcer_state[binding],
+            publication.enforcer_transaction,
+        ))
+    }
+
     fn enforcer(&self, binding: usize) -> Option<EnforcerSnapshot> {
         let publication = self.publication();
         let selected = publication.enforcers.get(binding)?.as_ref()?.clone();
@@ -38631,17 +38646,32 @@ impl Storage {
                 "no partition of relation \"{}\" found for row",
                 parent.name.as_str()
             );
-            let Some(scheme) = parent.partition.scheme else {
+            // `errtable`: the relation the row was routed through.
+            let objects =
+                crate::sql::eval::ErrorObjects::table(parent.schema.as_str(), parent.name.as_str());
+            let scheme = parent.partition.scheme;
+            let keys = scheme
+                .as_ref()
+                .map_or(&[][..], |scheme| &scheme.keys[..usize::from(scheme.n_keys)]);
+            if keys.is_empty()
+                || !crate::sql::exec::key_values_visible(
+                    self,
+                    parent_slot,
+                    txid,
+                    &mut keys.iter().map(|key| Some(*key)),
+                )
+            {
+                crate::sql::eval::stash_object_diagnostic(None, objects);
                 return error;
-            };
-            let names = scheme.keys[..usize::from(scheme.n_keys)]
+            }
+            let names = keys
                 .iter()
                 .map(|key| parent.columns()[usize::from(*key)].name.as_str());
             match crate::sql::exec::partition_key_detail(&mut { names }, &mut row.key_values()) {
-                Ok(detail) => crate::sql::error_position::with_detail(
-                    error,
-                    format_args!("{}", detail.as_str()),
-                ),
+                Ok(detail) => {
+                    crate::sql::eval::stash_object_diagnostic(Some(detail.as_str()), objects);
+                    error
+                }
                 Err(error) => error,
             }
         })
@@ -40383,9 +40413,8 @@ impl Storage {
         binding: usize,
     ) -> Option<u64> {
         self.tables[table_index]
-            .enforcer(binding)
+            .read_enforcer(binding, |enforcer, _, _| enforcer.index_created_at)
             .expect("binding")
-            .index_created_at
     }
 
     /// Walks a manifest-published key generation and the resident changes
@@ -40912,8 +40941,11 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> ([u16; MAX_INDEX_COLS], usize) {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        (enforcer.columns, enforcer.n_cols)
+        self.tables[table_index]
+            .read_enforcer(binding, |enforcer, _, _| {
+                (enforcer.columns, enforcer.n_cols)
+            })
+            .expect("binding")
     }
 
     pub(crate) fn value_binding_include_mask(
@@ -40922,9 +40954,8 @@ impl Storage {
         binding: usize,
     ) -> ColumnSet {
         self.tables[table_index]
-            .enforcer(binding)
+            .read_enforcer(binding, |enforcer, _, _| enforcer.include_mask)
             .expect("binding")
-            .include_mask
     }
 
     pub(crate) fn value_binding_handle(
@@ -40952,11 +40983,11 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> Option<u64> {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        enforcer
-            .state
-            .durable_dirty
-            .then_some(enforcer.state.durable_dirty_lsn)
+        self.tables[table_index]
+            .read_enforcer(binding, |_, state, _| {
+                state.durable_dirty.then_some(state.durable_dirty_lsn)
+            })
+            .expect("binding")
     }
 
     pub(crate) fn value_binding_requires_rebuild(
@@ -40996,30 +41027,37 @@ impl Storage {
     }
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
-        let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
+        let (evaluation_txid, index_created_at, key, n_cols) = self.tables[table_index]
+            .read_enforcer(binding, |enforcer, _, evaluation_txid| {
+                (
+                    evaluation_txid,
+                    enforcer.index_created_at,
+                    enforcer.columns,
+                    enforcer.n_cols,
+                )
+            })
+            .expect("binding");
         // A committed index identity can still belong to a private rewritten
         // shape. Maintenance must not decode committed rows with that shape.
-        if enforcer.evaluation_txid != 0 {
+        if evaluation_txid != 0 {
             return false;
         }
-        if let Some(created_at) = enforcer.index_created_at {
-            let table = &self.tables[table_index];
+        let table = &self.tables[table_index];
+        if let Some(created_at) = index_created_at {
+            let (schema, name) = {
+                let definition = table.definition();
+                (definition.schema, definition.name)
+            };
+            let database = table.database();
             return self.index_catalog().iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
-                    && index.database == table.database()
-                    && index.schema == {
-                        let definition = table.definition();
-                        definition.schema
-                    }
-                    && index.table == {
-                        let definition = table.definition();
-                        definition.name
-                    }
+                    && index.database == database
+                    && index.schema == schema
+                    && index.table == name
                     && index.created_at == created_at
             });
         }
-        let columns = enforcer.columns();
-        let table = &self.tables[table_index];
+        let columns = &key[..n_cols];
         let definition = &*table.definition();
         definition
             .columns()
@@ -52993,7 +53031,25 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        let selected = self.find_visible(schema, table, txid).map(|slot| {
+        self.indexes_for_selected(self.find_visible(schema, table, txid), txid)
+    }
+
+    /// [`Self::indexes_for`] for the table in `slot`, which a catalog walk
+    /// already selected, without looking its name up again.
+    pub(crate) fn indexes_for_slot(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = IndexDef> + '_ {
+        self.indexes_for_selected(Some(slot), txid)
+    }
+
+    fn indexes_for_selected(
+        &self,
+        slot: Option<usize>,
+        txid: u32,
+    ) -> impl Iterator<Item = IndexDef> + '_ {
+        let selected = slot.map(|slot| {
             let identity = self.tables[slot].identity();
             self.catalog_object_identity(
                 catalog_sources::CatalogObjectSlot::Table(slot),

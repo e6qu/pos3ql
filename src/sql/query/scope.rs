@@ -1375,6 +1375,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
+    /// The catalog the scope's names resolve against.
+    pub(super) const fn catalog(&self) -> (&'d Storage, u32) {
+        (self.storage, self.txid)
+    }
+
     pub(super) fn set_target_aliases(
         &mut self,
         names: &[&'d str],

@@ -487,3 +487,171 @@ fn index_answered_queries_return_rows_at_their_first_position() {
         );
     });
 }
+
+#[test]
+fn rule_actions_substitute_each_new_reference() {
+    with_engine("notice-rule-new-references", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ruled (id serial, a int, b int)",
+            "CREATE TABLE ruled_log (x int, y int)",
+            "INSERT INTO ruled (a, b) VALUES (10, 20)",
+            "CREATE FUNCTION seen(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ruled_also AS ON UPDATE TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.a, new.a + 1)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The action reads NEW.a twice and NEW.b never; the original
+        // statement then evaluates both of its SET expressions.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE ruled SET a = seen('a', a), b = seen('b', b)",
+            ),
+            [
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 b 20",
+                "UPDATE 1",
+            ]
+        );
+        run_with(engine, budget, "DROP RULE ruled_also ON ruled");
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_instead AS ON UPDATE TO ruled \
+             DO INSTEAD INSERT INTO ruled_log VALUES (new.a, old.b)",
+        );
+        // An unread SET expression never runs, so its division never fails.
+        assert_eq!(
+            messages(engine, budget, "UPDATE ruled SET a = 1, b = b / 0"),
+            ["UPDATE 0"]
+        );
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_insert AS ON INSERT TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.id, new.id)",
+        );
+        run_with(engine, budget, "DELETE FROM ruled_log");
+        // Each NEW.id reference evaluates the column default again.
+        run_with(engine, budget, "INSERT INTO ruled (a, b) VALUES (1, 2)");
+        run_with(engine, budget, "INSERT INTO ruled (a, b) SELECT 3, 4");
+        let rows = run_with(engine, budget, "SELECT x, y FROM ruled_log ORDER BY x");
+        assert_eq!(data_rows(&rows), ["3|4", "6|7"]);
+    });
+}
+
+#[test]
+fn conditions_run_cheapest_first_under_row_security() {
+    with_engine("notice-qual-cost-order", |engine, budget| {
+        for sql in [
+            "CREATE TABLE costed (id int, a int)",
+            "INSERT INTO costed SELECT g, g FROM generate_series(1, 4) g",
+            "CREATE FUNCTION seen(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'seen %', v; RETURN true; END $$",
+            "CREATE FUNCTION policy(v int) RETURNS bool LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE 'policy %', v; RETURN true; END $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // A routine costs 100 operators, so the comparison runs first.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SELECT id FROM costed WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "SELECT 1"]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE costed SET a = a WHERE seen(id) AND id < 2"
+            ),
+            ["NOTICE 00000 seen 1", "UPDATE 1"]
+        );
+        for sql in [
+            "CREATE ROLE costed_reader",
+            "GRANT ALL ON costed TO costed_reader",
+            "ALTER TABLE costed ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY costed_policy ON costed USING (policy(id))",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The leakproof comparison runs before the policy; the routine after.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; SELECT id FROM costed WHERE seen(id) AND id < 2",
+            ),
+            [
+                "SET",
+                "NOTICE 00000 policy 1",
+                "NOTICE 00000 seen 1",
+                "SELECT 1"
+            ]
+        );
+        // Addition can fail, so it is not leakproof and waits for the policy.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE costed_reader; DELETE FROM costed WHERE id + 0 < 2",
+            ),
+            [
+                "SET",
+                // The UPDATE above moved row 1 to the end.
+                "NOTICE 00000 policy 2",
+                "NOTICE 00000 policy 3",
+                "NOTICE 00000 policy 4",
+                "NOTICE 00000 policy 1",
+                "DELETE 1",
+            ]
+        );
+    });
+}
+
+#[test]
+fn join_conflict_and_merge_constants_fold_once() {
+    with_engine("notice-fold-join-merge", |engine, budget| {
+        for sql in [
+            "CREATE TABLE folded (id int PRIMARY KEY, q tsquery)",
+            "INSERT INTO folded VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TABLE folded_source (id int)",
+            "INSERT INTO folded_source VALUES (1), (2), (3), (4)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        for (sql, tag) in [
+            (
+                "SELECT f.id FROM folded f JOIN folded_source s \
+                 ON f.id = s.id + numnode(''::tsquery)",
+                "SELECT 3",
+            ),
+            (
+                "SELECT g FROM folded f, \
+                 LATERAL generate_series(1, numnode(''::tsquery) + f.id) g",
+                "SELECT 6",
+            ),
+            (
+                "INSERT INTO folded SELECT id, 'z' FROM folded_source WHERE id < 3 \
+                 ON CONFLICT (id) DO UPDATE SET q = ''::tsquery",
+                "INSERT 0 2",
+            ),
+            (
+                "MERGE INTO folded f USING folded_source s ON f.id = s.id \
+                 WHEN MATCHED AND numnode(''::tsquery) = 0 THEN DELETE",
+                "MERGE 3",
+            ),
+        ] {
+            assert_eq!(messages(engine, budget, sql), [empty, tag], "{sql}");
+        }
+    });
+}

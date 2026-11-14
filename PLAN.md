@@ -122,8 +122,16 @@ is owned.
   in the statement arena to capture the changed rows. `pg_proc` history
   includes only the built-in routines that have a per-database entry, so
   `CREATE FUNCTION` is bounded by the stored and altered routines, not the
-  3,000-row built-in catalog. Capturing only the rows the transaction's
-  changes name would bound every relation by the change.
+  3,000-row built-in catalog. The synthesis walks each table's indexes by
+  its slot, and collects indexes and foreign keys in one walk, so a commit
+  no longer looks every table up by name for each table; checkpoint
+  maintenance reads a value index binding's fields in place instead of
+  copying it. A commit's cost still grows with the catalog: each table's
+  index lookup scans every index and each foreign key finds its parent by
+  name. Capturing only the rows the transaction's changes name would bound
+  every relation by the change (`configured_transaction_capacity_covers_
+  truncate_fanout_and_prepared_cold_recovery`, which commits 300 tables'
+  DDL, took 175 s in a local debug build before and 108 s after).
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the
@@ -492,15 +500,17 @@ calls an immutable routine, converts a value or runs an operator's routine
 is evaluated once and replaced with its value, so `''::tsquery` in a query
 returning three rows sends its notice once, and a constant in an arm no row
 reaches still folds and reports its error. An `INSERT` folds its `VALUES`
-rows and `RETURNING` list before its statement triggers fire. Folding gaps
-remain: aggregate arguments, window specifications, `MERGE`,
-`ON CONFLICT DO UPDATE` and `FROM` subqueries are evaluated where they run;
-join conditions and `FROM` function arguments are evaluated where they run
-(a constant in a join condition already raises its notice once, but a
-`LATERAL` function's argument raises it for each outer row); folding them
-with the target list raised the notice a second time, because the join and
-function-scan executors evaluate the written conditions and arguments
-again, so both need to read the folded clause; a parameter of a custom plan does not fold; a literal conversion
+rows and `RETURNING` list before its statement triggers fire. A `SELECT`
+folds its join conditions (after the target list, before `WHERE`) and the
+arguments of each function a `LATERAL` item calls for every row to its
+left, and its join and function scans read that folded clause; a function
+scanned once is evaluated when the scope materializes it. `ON CONFLICT DO
+UPDATE` folds its assignments and condition after `RETURNING`, and `MERGE`
+folds `RETURNING`, each action's assignments or values and condition, then
+its join condition, before its statement triggers fire. Folding gaps
+remain: aggregate arguments, window specifications, `FROM` subqueries and a
+`MERGE` into a view are evaluated where they run; join conditions inside a
+parenthesized join are not folded; a parameter of a custom plan does not fold; a literal conversion
 in a prepared statement raises its notice at each `EXECUTE` where
 PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
 prepared statement to keep every converted literal, not only the typed
@@ -522,22 +532,53 @@ write resumed after a routine call or a wait neither qualifies earlier
 candidates again, whether they changed or failed, nor repeats their calls;
 an uncorrelated subquery the statement keeps (an initPlan) replays at the
 log position where it first ran. Conditions without such calls select and
-lock every row first, which no client can tell apart. Remaining gaps: a
-foreign table's rows are qualified before any change; PostgreSQL orders a
-condition's conjuncts by cost and evaluates leakproof ones before
-row-security conditions (`id < 4 AND f(id)` runs `id < 4` first), where
-conditions here run row-security policies first, then the condition left to
-right; a data-modifying `WITH` sub-statement runs ahead of the main
-statement (above); and a rule action's `NEW` row evaluates every `SET`
-expression of the original statement, where PostgreSQL's rewrite evaluates
-only those the action reads. A policy that a write's `UPDATE` (or `DELETE`)
+lock every row first, which no client can tell apart. A condition's
+top-level conjuncts run in PostgreSQL's `order_qual_clauses` order: by
+per-row cost, stably, where a routine or a user-defined operator's function
+costs its declared `COST` (100 by default) times an operator, so
+`f(id) AND id < 4` runs `id < 4` first, in queries, `UPDATE`, `DELETE` and
+their `EXPLAIN` filters. An uncorrelated scalar, `EXISTS` or `ARRAY`
+subquery is an initPlan that costs nothing per row, and an uncorrelated
+`IN` or `ANY` below the top level a hashed subPlan that costs its
+comparison; a top-level `IN (SELECT ...)` becomes a semi-join that runs
+after the relation's own conditions, except that a write runs it first
+when an index leads with its column, as PostgreSQL's plan then reads the
+subquery's rows and probes the index. Under row security each policy condition runs
+before the statement's conditions, except that a leakproof conjunct of a
+single-relation query or write cheaper than ten operators and than the first
+policy condition runs before the policies. A foreign table's candidate
+rows are read again by their remote row identity and qualified in the
+change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
+... USING` whose target reaches a foreign table's rows qualifies them
+before any change; such a leakproof conjunct that costs at
+least as much as the first policy condition runs after every policy
+condition, where PostgreSQL runs it right after the first; `EXPLAIN` prints
+a scan's `Filter` without its row-security conditions; `UPDATE ... FROM` and
+`DELETE ... USING` cost a routine reading a joined item's column as one
+operator; a data-modifying `WITH` sub-statement runs ahead of the main
+statement (above). A rule action reads the triggering statement's
+expression for each `OLD` or `NEW` reference it (or its rule's condition)
+makes, as PostgreSQL's rewriter substitutes them: it evaluates only the
+`SET` expressions, single `VALUES` row expressions and column defaults it
+reads, once per reference, while an `INSERT` reading a query or several
+`VALUES` rows evaluates each input column once per row. Those expressions
+form a derived relation the action reads, which is evaluated for every row
+before the action's own expressions run, where PostgreSQL interleaves them
+row by row. A policy that a write's `UPDATE` (or `DELETE`)
 and `SELECT` commands share runs once per row, as PostgreSQL's
 `list_append_unique` keeps it; each command's restrictive policies run
 before the OR of its permissive ones, which stops at the first that passes.
 A row no partition accepts reports its partition key
-(`Partition key of the failing row contains (id) = (21).`); like the key
-details of unique violations, it is not withheld from a role without
-`SELECT` privilege or under row security as PostgreSQL withholds it.
+(`Partition key of the failing row contains (id) = (21).`). That detail,
+and the keys of unique, exclusion and foreign key violations, show only to
+a user with `SELECT` on the table or on every key column, and never while
+row security applies to the user, as PostgreSQL decides; otherwise a unique
+violation has no detail and the others say `Key conflicts with existing
+key.`, `Key is not present in table "p".` or `Key is still referenced from
+table "c".`. A NOT NULL, CHECK or view check option violation's `Failing row
+contains (...)` still lists every column, where PostgreSQL lists only the
+columns the user may read or the statement wrote, as `(a, c) = (1, 3)`, and
+none under row security; that needs the written columns at each check.
 Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
 its cost-based plan: a query or data change on one table whose condition

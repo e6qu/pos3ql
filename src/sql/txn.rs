@@ -3676,8 +3676,12 @@ impl TxnState {
         }
         let event =
             super::plan_invalidations::PlanInvalidationEvent::capture(storage, &undo, self.txid)?;
+        // The changing client's own connections see the change at once.
         if let Some(target) = foreign_connection_target(&undo) {
-            storage.invalidate_foreign_connections(target);
+            storage.invalidate_foreign_connections(
+                target,
+                crate::storage::ForeignInvalidation::Owner(storage.current_connection_id()),
+            );
         }
         self.ddl
             .push(undo)
@@ -4090,7 +4094,9 @@ mod tests {
 /// The foreign server or user mapping whose change invalidates cached
 /// postgres_fdw connections, as its syscache invalidation does in PostgreSQL:
 /// any update of its catalog row, including its owner and privileges.
-fn foreign_connection_target(undo: &DdlUndo) -> Option<crate::storage::ForeignConnectionTarget> {
+pub(super) fn foreign_connection_target(
+    undo: &DdlUndo,
+) -> Option<crate::storage::ForeignConnectionTarget> {
     use crate::storage::ForeignConnectionTarget::{Mapping, Server};
     use crate::storage::foreign::ForeignObjectClass;
     match undo {

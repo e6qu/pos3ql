@@ -8004,6 +8004,18 @@ impl Engine {
                 return Err(error);
             }
         };
+        // Other clients see a server or user-mapping change once it
+        // commits, as PostgreSQL's invalidation messages reach them.
+        if prepared_slot.is_none() {
+            for undo in txn.ddl() {
+                if let Some(target) = txn::foreign_connection_target(undo) {
+                    self.storage.invalidate_foreign_connections(
+                        target,
+                        crate::storage::ForeignInvalidation::Everyone,
+                    );
+                }
+            }
+        }
         // A cold row needed for final WAL staging can park this COMMIT. Keep
         // transaction state and locks live until every staged image and the
         // commit boundary are complete, so the statement retry can resume the

@@ -9645,7 +9645,10 @@ fn foreign_connection_cache_is_mapping_keyed_and_startup_bounded() {
 
     // A server change marks a connection in use and closes an idle one.
     storage.foreign_client(other).unwrap().finish_transaction();
-    storage.invalidate_foreign_connections(ForeignConnectionTarget::Server(0));
+    storage.invalidate_foreign_connections(
+        ForeignConnectionTarget::Server(0),
+        crate::storage::ForeignInvalidation::Everyone,
+    );
     assert_eq!(storage.foreign_connections(2, &mut statuses), 0);
     assert_eq!(storage.foreign_connections(1, &mut statuses), 1);
     assert!(!statuses[0].valid);

@@ -727,13 +727,17 @@ per-row commands differ (`WHERE ctid = $N::tid RETURNING` every column, where
 postgres_fdw writes `WHERE ctid = $1` and returns only needed columns). COPY
 FROM into a foreign table sends one row at a time, ignoring `batch_size`. A
 batched INSERT also sends its queued rows when the statement pauses for a
-PL/pgSQL call or a full output buffer, which PostgreSQL does not. Remote
-savepoints take the local savepoint's name where postgres_fdw numbers them
-`s1`, `s2`. A server or user-mapping change marks another client's cached
-connection invalid when it runs, where PostgreSQL waits for that change to
-commit. An unknown option fails without PostgreSQL's `Perhaps you meant`
-hint, and libpq options beyond host, hostaddr, port, dbname, user, password,
-connect_timeout, application_name and sslmode fail with `HV00D`. `CREATE
+PL/pgSQL call or a full output buffer, which PostgreSQL does not. A server
+or user-mapping change committed by `COMMIT PREPARED` does not invalidate
+other clients' cached connections; a plain `COMMIT` does. libpq options
+beyond host, hostaddr, port, dbname, user, password, connect_timeout,
+application_name and sslmode fail with `HV00D`. EXPLAIN shows a foreign
+table's scan as `Seq Scan` without postgres_fdw's `Foreign Scan`, `Foreign
+Update`/`Foreign Delete`, `Remote SQL:` and `Batch Size:` lines; matching them
+needs postgres_fdw's deparser (`deparse.c`: shippable built-in expressions
+per `is_foreign_expr`, `ORDER BY ... NULLS FIRST/LAST`, `LIMIT n::bigint`)
+in the planner, which also enables pushing quals, order and limits and
+direct modification. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per

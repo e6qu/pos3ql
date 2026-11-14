@@ -96577,23 +96577,7 @@ fn alter_table_inner(
         .iter()
         .any(|action| matches!(action, AlterAction::AlterColumnType { .. }));
     let Some((root, tree)) = planned else {
-        if !retypes {
-            return alter_table_relation(
-                storage,
-                wal,
-                txn,
-                scratch,
-                statement,
-                arena,
-                seq_session,
-                responder,
-                emit_completion,
-                expected_kind,
-                tag,
-                inheritance_scope,
-            );
-        }
-        match alter_table_relation(
+        return alter_table_relation(
             storage,
             wal,
             txn,
@@ -96602,31 +96586,11 @@ fn alter_table_inner(
             arena,
             seq_session,
             responder,
-            false,
+            emit_completion,
             expected_kind,
             tag,
             inheritance_scope,
-        ) {
-            Ok(Ok(())) => {}
-            other => return other,
-        }
-        if let Some(crate::storage::ResolvedRelation::Table(table)) =
-            storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid)
-            && let Err(error) = alter_type_rebuild::rebuild_retyped_dependents(
-                storage,
-                wal,
-                txn,
-                &[table],
-                statement.actions,
-                arena,
-            )
-        {
-            return sql_fail(error);
-        }
-        if emit_completion {
-            responder.command_complete(tag)?;
-        }
-        return sql_ok();
+        );
     };
     // One bounded parent-first plan replaces recursive ALTER frames. A diamond
     // reaches its shared descendant once, after both inherited parents change.
@@ -100736,6 +100700,21 @@ fn alter_table_relation(
         return sql_fail(error);
     }
     if let Err(error) = storage.prepare_table_definition_enforcers(row_write_target) {
+        return sql_fail(error);
+    }
+    // A command's own table rebuilds what its retyped columns carry; a
+    // partition or inheritance tree does so once every table is altered.
+    if emit_completion
+        && retyped_any
+        && let Err(error) = alter_type_rebuild::rebuild_retyped_dependents(
+            storage,
+            wal,
+            txn,
+            &[table_index],
+            statement.actions,
+            arena,
+        )
+    {
         return sql_fail(error);
     }
     if emit_completion {

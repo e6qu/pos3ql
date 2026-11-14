@@ -16995,6 +16995,15 @@ impl ForeignSessionLease {
     }
 }
 
+/// Whose cached connections a foreign server or user-mapping change reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForeignInvalidation {
+    /// The changing client's, while its transaction runs.
+    Owner(i32),
+    /// Every client's, once the change commits.
+    Everyone,
+}
+
 /// What a transaction must do before using a reserved connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForeignSessionStart {
@@ -24827,7 +24836,11 @@ impl Storage {
     /// PostgreSQL's `pgfdw_inval_callback`: a change to a foreign server or
     /// user mapping closes the connections built from it that no transaction
     /// uses, and marks the others to close when their transaction ends.
-    pub(crate) fn invalidate_foreign_connections(&self, target: ForeignConnectionTarget) {
+    pub(crate) fn invalidate_foreign_connections(
+        &self,
+        target: ForeignConnectionTarget,
+        scope: ForeignInvalidation,
+    ) {
         let _assignment = self
             .foreign_sessions
             .assignment
@@ -24842,7 +24855,10 @@ impl Storage {
                 ForeignConnectionTarget::Server(server) => session.key.server == server,
                 ForeignConnectionTarget::Mapping(mapping) => session.key.mapping == mapping,
             };
-            if !matches || session.phase == ForeignSessionPhase::Opening {
+            if !matches
+                || session.phase == ForeignSessionPhase::Opening
+                || matches!(scope, ForeignInvalidation::Owner(owner) if session.key.owner != owner)
+            {
                 continue;
             }
             if session.transaction_id.is_some() {

@@ -4407,7 +4407,10 @@ pub(crate) fn apply_fk_parent_actions(
             } else {
                 crate::storage::ForeignKeyTrigger::ActionUpdate
             };
-            if !fk.trigger_enabled(action_trigger).fires_in(role) {
+            // A key attached to its partition parent's acts through the
+            // topmost key's action trigger and its firing mode.
+            let acting = attached_root(storage, txn.txid, child_index, fk)?;
+            if !acting.trigger_enabled(action_trigger).fires_in(role) {
                 continue;
             }
             let declared_parent = storage
@@ -4497,9 +4500,6 @@ pub(crate) fn apply_fk_parent_actions(
                 )?,
             };
             let identity = txn.constraint_identity(child_index as u32, fk.name);
-            // A key attached to its partition parent's acts through the
-            // topmost key's action trigger.
-            let acting = attached_root(storage, txn.txid, child_index, fk)?;
             txn.pend_key_check_event(
                 parent_index as u16,
                 foreign_key_trigger_name(&acting, trigger)?,

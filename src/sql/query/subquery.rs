@@ -1647,8 +1647,6 @@ pub fn prepare_subqueries<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    // A subquery's operators are kept apart from its query's.
-    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -1798,6 +1796,8 @@ fn eval_subquery_nodes<'a>(
         if defers(node) {
             continue;
         }
+        // Each subquery's operators count in its own block.
+        let _sublink = sublink_select(node).map(|select| super::instrument::enter_sublink(select));
         let mut evaluate = || -> Result<(), SqlError> {
             match node {
                 Expr::RowSubquery { select, arity } => {
@@ -2674,8 +2674,6 @@ pub(super) fn prepare_outer_subqueries<'a>(
     row_types: &dyn ColumnLookup<'a>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<OuterSubs<'a>, SqlError> {
-    // A subquery's operators are kept apart from its query's.
-    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
@@ -2986,6 +2984,12 @@ fn sort_nested_sublinks<'a>(
         }
     }
     Ok(())
+}
+
+/// Runs the subquery `node` in its own instrumented block until the
+/// returned scope ends.
+pub(crate) fn enter_sublink_of(node: &Expr<'_>) -> Option<super::instrument::SublinkEntered> {
+    sublink_select(node).map(|select| super::instrument::enter_sublink(select))
 }
 
 fn sublink_select<'a>(node: &'a Expr<'a>) -> Option<&'a Select<'a>> {
@@ -4070,6 +4074,7 @@ fn run_scalar_record_subquery<'a>(
     // The row type the statement bound, when it did.
     bound_witness: Option<Datum<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let _sublink = super::instrument::enter_sublink(select);
     let witness = match bound_witness {
         Some(witness) => witness,
         None => {
@@ -4155,6 +4160,7 @@ fn run_record_subquery<'a>(
     // The row type the statement bound, when it did.
     bound_witness: Option<Datum<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let _sublink = super::instrument::enter_sublink(select);
     let witness = match bound_witness {
         Some(witness) => witness,
         None => {
@@ -4233,6 +4239,7 @@ fn run_row_subquery<'a>(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let _sublink = super::instrument::enter_sublink(select);
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     // A binding describes the query as written; one rewritten for this row
     // is analysed again.
@@ -4286,7 +4293,7 @@ fn run_subquery<'a>(
     binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     // A subquery's operators are kept apart from its query's.
-    let _sublink = super::instrument::enter(super::instrument::Segment::Sublink);
+    let _sublink = super::instrument::enter_sublink(select);
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     // A binding describes the query as written; one rewritten for this row
     // is analysed again.
@@ -4626,6 +4633,9 @@ fn run_subquery<'a>(
         None => agg_nodes.as_slice(),
     };
     if !agg_nodes.is_empty() {
+        // The subplan's `Aggregate` returns its one row once per run.
+        let aggregate = super::instrument::node(super::instrument::Role::Aggregate);
+        let aggregate_loop = aggregate.start();
         let agg_values = fold_aggregates(
             storage,
             &scope,
@@ -4659,6 +4669,8 @@ fn run_subquery<'a>(
             inner: &schema,
             outer,
         };
+        aggregate.row();
+        drop(aggregate_loop);
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
         // OFFSET and LIMIT apply to the aggregate's one row.
         let offset =
@@ -4813,6 +4825,7 @@ fn run_set_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let _sublink = super::instrument::enter_sublink(outer_select);
     let bound_catalog = super::storage_catalog(storage, arena, txid);
     let bound_queries = super::ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {

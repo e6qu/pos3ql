@@ -1192,7 +1192,14 @@ pub(super) fn insert_source_plan<'a>(
     let source = block.child(Segment::Source);
     let (plan, wrapper) = if select.set_body.is_some() {
         (plan_derived(storage, txid, select, source, arena)?, None)
-    } else if pulled_up(storage, txid, select, arena)? {
+    } else if pulled_up(storage, txid, select, arena)?
+        // PostgreSQL's `is_simple_subquery` keeps a source whose select
+        // list calls a volatile function as a subquery.
+        && !select.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. }
+                if query::expression_contains_volatile(expression, storage, txid, false))
+        })
+    {
         match lone_derived(select) {
             Some((alias, body)) => {
                 let passes = passes_columns(storage, txid, insert, select, Some(body), arena)?;
@@ -1230,6 +1237,7 @@ pub(super) fn insert_source_plan<'a>(
         total_cost: root.total_cost,
         object_requests: root.object_requests,
         cache_blocks: root.cache_blocks,
+        passthrough: true,
         ..PlanNode::EMPTY
     })?;
     for node in &plan.nodes[..plan.count] {

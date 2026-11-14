@@ -625,6 +625,11 @@ impl Context<'_> {
     /// The types this module derives itself, as PostgreSQL's parser does.
     fn modeled_type(&self, expression: &Expr<'_>) -> Result<Option<i32>, SqlError> {
         Ok(match expression {
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(_),
+                type_oid,
+                ..
+            } if self.folded => Some(*type_oid),
             Expr::Int(value) => Some(if i32::try_from(*value).is_ok() {
                 oid::INT4
             } else {
@@ -1117,6 +1122,21 @@ impl Context<'_> {
                 },
                 output,
             ),
+            // A planned expression prints the value the planner folded.
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                type_oid,
+                ..
+            } if self.folded => {
+                let mut values = [crate::sql::types::Datum::Null];
+                crate::sql::exec::decode_projected_row_into(encoded, output.arena, &mut values)?;
+                if matches!(values[0], crate::sql::types::Datum::Null) {
+                    output.push("NULL::")?;
+                    return self.type_name(*type_oid, output);
+                }
+                let text = crate::sql::eval::datum_to_text(values[0], output.arena)?;
+                self.constant(text, *type_oid, output)
+            }
             Expr::BoundLiteral { source, .. } => self.bare(source, output),
             Expr::BoundDefault { expression, .. } => self.bare(expression, output),
             Expr::OuterAggregate { call, .. } => self.bare(call, output),

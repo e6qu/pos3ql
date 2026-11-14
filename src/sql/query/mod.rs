@@ -156,6 +156,31 @@ pub(crate) fn expression_contains_volatile(
     })
 }
 
+/// Whether qualifying a target row of `UPDATE` or `DELETE` can call a user
+/// routine or a volatile built-in: in its `WHERE`, its `FROM` or `USING`
+/// items, or the row-security policies that filter it. PostgreSQL qualifies
+/// each row just before changing it, so such calls interleave with the
+/// change's own calls, triggers and `RETURNING`; the write then qualifies
+/// its rows one at a time in its change loop. Other conditions select every
+/// row first, which no client can tell apart.
+pub(crate) fn dml_qualification_calls_routines(
+    where_clause: Option<&Expr<'_>>,
+    from: Option<&crate::sql::ast::FromClause<'_>>,
+    row_security: Option<RowSecurityPlan<'_>>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    let matches = |name: &str, arity: usize| {
+        crate::sql::ast::is_volatile_function(name)
+            || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+    };
+    where_clause.is_some_and(|condition| cte::expression_contains_function(condition, &matches))
+        || from.is_some_and(|from| cte::from_contains_function(from, &matches))
+        || row_security.is_some_and(|plan| {
+            plan.any_predicate(|condition| cte::expression_contains_function(condition, &matches))
+        })
+}
+
 pub(crate) fn stored_query_dependencies(
     sql: &str,
     storage: &Storage,
@@ -1631,6 +1656,18 @@ pub(crate) struct RoutineInvocationState {
     /// still restart after its main query has produced rows.
     reads_writes: Cell<bool>,
     inputs: input_progress::RoutineInputs,
+    /// Where each uncorrelated subquery the statement keeps the value of
+    /// (PostgreSQL's initPlan) first ran, keyed by its expression's address.
+    initplans: RefCell<crate::mem::arena::RetainedList<InitPlanStart>>,
+}
+
+/// The log positions at which an uncorrelated subquery's one evaluation
+/// started.
+#[derive(Clone, Copy)]
+pub(super) struct InitPlanStart {
+    node: usize,
+    position: InvocationPosition,
+    replay: Option<super::sequence::StatementReplayStart>,
 }
 
 #[derive(Clone, Copy)]
@@ -1719,6 +1756,72 @@ pub(crate) fn without_routine_invocations<R>(execute: impl FnOnce() -> R) -> R {
 pub(crate) struct InvocationPosition {
     calls: usize,
     inputs: usize,
+}
+
+/// Runs the evaluation of the uncorrelated subquery `node` whose value the
+/// statement keeps for its later rows (PostgreSQL's initPlan). A write that
+/// stopped for a routine call continues at its unfinished row with the
+/// subquery's value not yet kept; when the subquery first ran at an earlier
+/// position of the log, its evaluation replays there, so it neither calls
+/// its routines again nor shifts the log positions of the calls after it.
+pub(crate) fn evaluate_initplan<T>(
+    node: *const (),
+    evaluate: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, arena)) = context else {
+            return evaluate();
+        };
+        invocations.require_arena(arena)?;
+        let key = node as usize;
+        let here = invocations.position();
+        let recorded = invocations
+            .initplans
+            .borrow()
+            .with_slice(arena, |starts| {
+                starts.iter().find(|start| start.node == key).copied()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        match recorded {
+            Some(start) if start.position != here => {
+                let resume = super::sequence::begin_replay_cursor()?;
+                invocations.seek(start.position)?;
+                super::sequence::rewind_replay_cursor(start.replay)?;
+                let result = evaluate();
+                invocations.seek(here)?;
+                super::sequence::rewind_replay_cursor(resume)?;
+                result
+            }
+            Some(_) => evaluate(),
+            None => {
+                let replay = super::sequence::begin_replay_cursor()?;
+                invocations
+                    .initplans
+                    .borrow_mut()
+                    .push(
+                        arena,
+                        InitPlanStart {
+                            node: key,
+                            position: here,
+                            replay,
+                        },
+                    )
+                    .map_err(invocation_results::directory_error)?;
+                evaluate()
+            }
+        }
+    })
+}
+
+/// Forgets where the active log's kept subqueries first ran, when a write
+/// step that evaluated them finished and the next step's expressions may
+/// reuse their addresses.
+pub(crate) fn forget_initplans() {
+    with_active_routine_invocations(|context| {
+        if let Some((invocations, _)) = context {
+            invocations.initplans.borrow_mut().truncate(0);
+        }
+    });
 }
 
 /// The active invocation log's position; `None` without a log.
@@ -1912,6 +2015,7 @@ impl RoutineInvocationState {
             writes_root: Cell::new(0),
             reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
+            initplans: RefCell::new(crate::mem::arena::RetainedList::new()),
         }
     }
 

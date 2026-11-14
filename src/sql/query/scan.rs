@@ -264,6 +264,16 @@ pub(crate) fn plan_row_security<'a>(
     }))
 }
 
+impl<'a> RowSecurityPlan<'a> {
+    /// Whether any policy condition of the plan satisfies `test`.
+    pub(crate) fn any_predicate(self, test: impl Fn(&Expr<'a>) -> bool) -> bool {
+        self.predicates[..usize::from(self.groups)]
+            .iter()
+            .flat_map(|group| group.iter())
+            .any(|predicate| test(predicate.expression))
+    }
+}
+
 pub(crate) fn conjoin_row_security<'a>(
     first: Option<RowSecurityPlan<'a>>,
     second: Option<RowSecurityPlan<'a>>,
@@ -348,29 +358,57 @@ pub(crate) fn row_security_passes<'a>(
             sequences: base_hooks.sequences,
             merge_action: base_hooks.merge_action,
         };
-        let mut permissive = plan.permissive_always;
-        for (group, predicates) in plan.predicates.iter().enumerate() {
-            for predicate in *predicates {
-                let passes = match eval_full(predicate.expression, arena, params, row, &hooks)? {
-                    Datum::Bool(value) => value,
-                    Datum::Null => false,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "row-level security policy expression must be type boolean"
-                        ));
-                    }
-                };
-                if predicate.permissive {
-                    permissive[group] |= passes;
-                } else if !passes {
+        let passes = |predicate: &PolicyPredicate<'a>| -> Result<bool, SqlError> {
+            match eval_full(predicate.expression, arena, params, row, &hooks)? {
+                Datum::Bool(value) => Ok(value),
+                Datum::Null => Ok(false),
+                _ => Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "row-level security policy expression must be type boolean"
+                )),
+            }
+        };
+        // PostgreSQL's security quals, in order: each group's restrictive
+        // conditions, then the OR of its permissive ones; a later group (the
+        // SELECT policies of a write that reads its target) skips a qual an
+        // earlier group already holds (`list_append_unique`).
+        let groups = &plan.predicates[..usize::from(plan.groups)];
+        for (group, predicates) in groups.iter().enumerate() {
+            let earlier = &groups[..group];
+            let permissive = || predicates.iter().filter(|predicate| predicate.permissive);
+            if permissive().next().is_none() && !plan.permissive_always[group] {
+                return Ok(false);
+            }
+            for predicate in predicates.iter().filter(|predicate| !predicate.permissive) {
+                let repeated = earlier
+                    .iter()
+                    .flat_map(|group| group.iter())
+                    .any(|held| !held.permissive && held.expression == predicate.expression);
+                if !repeated && !passes(predicate)? {
                     return Ok(false);
                 }
             }
+            let repeated = earlier.iter().any(|held| {
+                held.iter()
+                    .filter(|predicate| predicate.permissive)
+                    .map(|predicate| predicate.expression)
+                    .eq(permissive().map(|predicate| predicate.expression))
+            });
+            if permissive().next().is_none() || repeated {
+                continue;
+            }
+            let mut any = plan.permissive_always[group];
+            for predicate in permissive() {
+                if passes(predicate)? {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
+                return Ok(false);
+            }
         }
-        Ok(permissive[..usize::from(plan.groups)]
-            .iter()
-            .all(|value| *value))
+        Ok(true)
     })();
     // SAFETY: policy subquery values and evaluator scratch do not escape this
     // boolean gate; the parsed policy expressions were allocated before mark.

@@ -488,6 +488,7 @@ impl RowProgress {
 
     /// [`Self::finish_step`] at a claimed `level`.
     pub(crate) fn finish_step_at(&mut self, level: usize) {
+        query::forget_initplans();
         let steps = &mut self.steps[level];
         steps.finished += 1;
         steps.start = None;

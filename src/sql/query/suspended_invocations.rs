@@ -114,6 +114,18 @@ impl RoutineInvocationState {
                 )
                 .map_err(invocation_results::directory_error)?;
         }
+        let initplans = self.initplans.borrow();
+        for index in 0..initplans.len() {
+            let start = initplans
+                .get(source, index)
+                .map_err(|_| inactive_pending_call())?
+                .ok_or_else(inactive_pending_call)?;
+            output
+                .initplans
+                .borrow_mut()
+                .push(target, start)
+                .map_err(invocation_results::directory_error)?;
+        }
         output.reads_writes.set(self.reads_writes.get());
         output.writes_root.set(self.writes_root.get());
         Ok(Self {

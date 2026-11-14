@@ -5712,7 +5712,7 @@ pub(super) fn select_contains_function(
             .any(|cte| select_contains_function(cte.query, matches))
 }
 
-fn from_contains_function(
+pub(super) fn from_contains_function(
     from: &crate::sql::ast::FromClause<'_>,
     matches: &impl Fn(&str, usize) -> bool,
 ) -> bool {

@@ -76,6 +76,9 @@ pub(crate) enum SublinkPlan {
     InitPlan(u16),
     /// Run for each row that reads it: `(SubPlan 1)`.
     SubPlan(u16),
+    /// An uncorrelated `IN` or `= ANY` subquery whose rows are hashed once
+    /// and probed per row: `(hashed SubPlan 1).col1`.
+    HashedSubPlan(u16),
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -1908,10 +1911,45 @@ impl Context<'_> {
                     (Expr::ArraySubquery(_), SublinkPlan::SubPlan(number)) => {
                         output.push_display(format_args!("ARRAY(SubPlan {number})"))
                     }
-                    (_, SublinkPlan::SubPlan(number)) => {
+                    (_, SublinkPlan::SubPlan(number) | SublinkPlan::HashedSubPlan(number)) => {
                         output.push_display(format_args!("(SubPlan {number})"))
                     }
                 }
+            }
+            // A compared subquery the plan runs separately prints as its
+            // comparison with the subplan's column (`get_rule_expr`'s
+            // SubPlan of an ANY or ALL sublink).
+            Expr::InSubquery {
+                operand,
+                select,
+                negated,
+            } if let Some(plan) = self
+                .sublinks
+                .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
+            {
+                if *negated {
+                    self.open(output)?;
+                    output.push("NOT ")?;
+                }
+                self.quantified_subplan(operand, "=", false, plan, output)?;
+                if *negated {
+                    self.close(output)?;
+                }
+                Ok(())
+            }
+            Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            } if let Some(plan) = self
+                .sublinks
+                .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
+            {
+                let Some(symbol) = operator_symbol(*operator) else {
+                    return output.unsupported();
+                };
+                self.quantified_subplan(operand, symbol, *all, plan, output)
             }
             // `get_sublink_expr`: a sublink parenthesizes itself.
             Expr::Exists(select) => {
@@ -1967,6 +2005,29 @@ impl Context<'_> {
                 output.push("))")
             }
             _ => output.unsupported(),
+        }
+    }
+
+    /// `(ANY (operand op (SubPlan n).col1))`, or `ALL`, as PostgreSQL prints
+    /// the subplan of a compared subquery.
+    fn quantified_subplan(
+        &self,
+        operand: &Expr<'_>,
+        symbol: &str,
+        all: bool,
+        plan: SublinkPlan,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        output.push(if all { "(ALL (" } else { "(ANY (" })?;
+        self.write(operand, None, output)?;
+        output.push_display(format_args!(" {symbol} "))?;
+        match plan {
+            SublinkPlan::InitPlan(number) | SublinkPlan::SubPlan(number) => {
+                output.push_display(format_args!("(SubPlan {number}).col1))"))
+            }
+            SublinkPlan::HashedSubPlan(number) => {
+                output.push_display(format_args!("(hashed SubPlan {number}).col1))"))
+            }
         }
     }
 

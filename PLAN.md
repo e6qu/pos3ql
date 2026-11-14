@@ -772,8 +772,15 @@ subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
 list (`make_sort_input_target`), which hosts the list's subplans; execution
 still evaluates the list before sorting, so such a subplan runs, and a
 routine is called, once per input row where PostgreSQL runs it only for the
-rows the sort and limit return. Not yet shown: `IN`/`ANY`/`ALL`/row
-subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
+rows the sort and limit return. An `IN`, `NOT IN`, `ANY` or `ALL`
+subquery run as a subplan prints its comparison in the condition
+(`Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))`): hashed when it is
+uncorrelated `IN` or `= ANY`, and scanned through the `Materialize`
+PostgreSQL adds over another uncorrelated one; that `Materialize` reports no
+`ANALYZE` figures yet, `VERBOSE` does not qualify the statement's columns
+when it has subplans, and an uncorrelated `< ANY` in `WHERE`, which
+PostgreSQL pulls up into a semi join, is shown as a subplan. Not yet shown:
+row subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
 and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
 merged into the statement, under a generated name when its relation's name
 clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs

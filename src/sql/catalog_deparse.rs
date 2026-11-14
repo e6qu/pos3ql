@@ -489,6 +489,9 @@ impl Context<'_> {
                 Columns::Derived(columns) => Ok(columns[column].type_oid),
             };
         }
+        if let Some((_, type_oid)) = self.system_column(qualifier, name) {
+            return Ok(Some(type_oid));
+        }
         let Some(table) = self.table else {
             return Ok(None);
         };
@@ -515,6 +518,7 @@ impl Context<'_> {
                     .iter()
                     .any(|parameter| parameter.name.as_str() == name)))
             || self.joined_source(qualifier, name).is_some()
+            || self.system_column(qualifier, name).is_some()
             || self.table.is_some_and(|table| {
                 qualifier.is_none_or(|qualifier| qualifier == table.name.as_str())
                     && table.column_index(name).is_some()
@@ -523,6 +527,34 @@ impl Context<'_> {
 
     /// The one FROM item a column reference names, searching the innermost
     /// query level first, and the column's position in it.
+    /// A system column (`tableoid`, `ctid`, ...) of the one table FROM item
+    /// the reference reaches, with the column's type.
+    fn system_column(&self, qualifier: Option<&str>, name: &str) -> Option<(&Joined<'_>, i32)> {
+        let type_oid = match name {
+            "tableoid" => oid::OID,
+            "ctid" => oid::TID,
+            "xmin" | "xmax" => oid::XID,
+            "cmin" | "cmax" => oid::CID,
+            _ => return None,
+        };
+        let mut found = None;
+        for joined in self.joined.iter().filter(|joined| {
+            joined.level == 0 && !joined.cte && matches!(joined.columns, Columns::Table(_))
+        }) {
+            let reachable = match qualifier {
+                Some(qualifier) => joined.addressable && joined.name == qualifier,
+                None => joined.unqualified,
+            };
+            if reachable {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(joined);
+            }
+        }
+        found.map(|joined| (joined, type_oid))
+    }
+
     fn joined_source(&self, qualifier: Option<&str>, name: &str) -> Option<(&Joined<'_>, usize)> {
         let deepest = self.joined.iter().map(|joined| joined.level).max()?;
         for level in 0..=deepest {
@@ -1301,8 +1333,12 @@ impl Context<'_> {
                     }
                     None => {
                         if self.qualifies() {
-                            let Some((source, _)) = source else {
-                                return output.unsupported();
+                            let source = match source {
+                                Some((source, _)) => source,
+                                None => match self.system_column(*qualifier, name) {
+                                    Some((source, _)) => source,
+                                    None => return output.unsupported(),
+                                },
                             };
                             if self.bare != Some(source.printed) {
                                 write_identifier(&mut identifier, source.printed);

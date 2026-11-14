@@ -59,6 +59,16 @@ UPDATE ft SET q = q + 1 WHERE id IN (6, 7);
 DELETE FROM ft WHERE id = 4 RETURNING note;
 DELETE FROM ft WHERE id = 8 AND random() < 2;
 SELECT id, q, note FROM ft WHERE id BETWEEN 3 AND 8 ORDER BY id;
+-- A direct command ships what its RETURNING list reads.
+:e UPDATE ft SET q = q + 1 WHERE id = 9 RETURNING id, q, tableoid::regclass;
+UPDATE ft SET q = q + 1 WHERE id IN (9, 10) RETURNING id, q, tableoid::regclass;
+UPDATE ft SET q = q + 1 WHERE id = 9 RETURNING old.q, new.q;
+DELETE FROM ft WHERE id = 11 RETURNING ft;
+DELETE FROM ft WHERE id IN (12, 13) RETURNING 1;
+WITH w AS (UPDATE ft SET q = q + 1 WHERE id > 15 RETURNING id, q) SELECT * FROM w ORDER BY id;
+DO $$ DECLARE r int; BEGIN UPDATE ft SET q = q + 1 WHERE id = 14 RETURNING q INTO r; RAISE NOTICE 'r=%', r; END $$;
+UPDATE ft SET q = 2000 WHERE id = 15 RETURNING id;
+SELECT id, q FROM ft WHERE id BETWEEN 9 AND 20 ORDER BY id;
 
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.

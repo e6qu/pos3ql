@@ -90899,6 +90899,147 @@ pub(crate) fn foreign_modify_returned(
     returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)
 }
 
+/// The columns a direct foreign `UPDATE` or `DELETE` returns for its local
+/// `RETURNING` list, or `None` when that list reads the `old` or `new` row
+/// image, which PostgreSQL's `create_modifytable_plan` changes row by row
+/// (`contain_vars_returning_old_or_new`).
+pub(crate) fn foreign_direct_returned(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    returning: crate::sql::ast::Returning<'_>,
+    alias: Option<&str>,
+    arena: &Arena,
+) -> Result<Option<ColumnSet>, SqlError> {
+    let definition = storage.table_def(table, txid);
+    let images = [returning.old_name(), returning.new_name()];
+    let names_image = |expression: &Expr<'_>| match expression {
+        Expr::Column {
+            qualifier: Some(qualifier),
+            ..
+        }
+        | Expr::WholeRow(qualifier) => images.contains(qualifier),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => images.contains(name) && definition.column_index(name).is_none(),
+        _ => false,
+    };
+    for item in returning.items {
+        let reads_image = match item {
+            SelectItem::Wildcard(_) => false,
+            SelectItem::TableWildcard(qualifier) => images.contains(qualifier),
+            SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
+                let mut found = false;
+                super::query::walk_expression_tree(expression, &mut |node| {
+                    found |= names_image(node);
+                })?;
+                found
+            }
+        };
+        if reads_image {
+            return Ok(None);
+        }
+    }
+    returning_dml_target_columns(returning, &definition, alias, storage, txid, arena).map(Some)
+}
+
+/// The result of a direct foreign `UPDATE` (`updated`) or `DELETE`: the rows
+/// its tag reports and the rows its remote `RETURNING` list sent.
+struct DirectRows<'a> {
+    changed: u64,
+    rows: &'a [&'a [u8]],
+    updated: bool,
+}
+
+/// Projects a direct foreign `UPDATE`'s or `DELETE`'s `RETURNING` list over
+/// each row `postgresIterateDirectModify` returns: the remote rows, or as
+/// many all-`NULL` rows as the tag reports when no column is read. `true`
+/// when the destination's row limit stopped it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection needs the write's target and destination"
+)]
+fn emit_direct_returning(
+    storage: &Storage,
+    txn: &TxnState,
+    def: &crate::storage::TableDef,
+    table_index: usize,
+    alias: Option<&str>,
+    returning: crate::sql::ast::Returning<'_>,
+    direct: DirectRows<'_>,
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<Result<bool, SqlError>, WireFull> {
+    if returning.is_empty() {
+        return Ok(Ok(false));
+    }
+    // A data-modifying CTE describes its captured rows itself.
+    if capture.is_none() {
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match describe_returning_items(
+            returning,
+            Some(def),
+            alias,
+            Some(storage),
+            txn.txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
+            Ok(n) => responder.row_description(&columns[..n])?,
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    let table_oid = Some(crate::sql::catalog::user_table_oid(storage, table_index) as u32);
+    let mut values = [Datum::Null; MAX_COLUMNS];
+    let mut emitted = 0u64;
+    while emitted < direct.changed {
+        if returning_satisfied(capture, emitted) {
+            return Ok(Ok(true));
+        }
+        let row = &mut values[..def.n_columns];
+        match direct.rows.get(emitted as usize) {
+            Some(bytes) => {
+                if let Err(error) = projected::decode_projected_row_into(bytes, arena, row) {
+                    return Ok(Err(error));
+                }
+            }
+            None => row.fill(Datum::Null),
+        }
+        let row = &values[..def.n_columns];
+        let (old, new) = if direct.updated {
+            (None, Some(row))
+        } else {
+            (Some(row), None)
+        };
+        if let Err(error) = emit_projected(
+            storage,
+            txn,
+            def,
+            alias,
+            table_oid,
+            row,
+            returning,
+            old,
+            new,
+            None,
+            arena,
+            params,
+            responder,
+            capture,
+            seq_session,
+        )? {
+            return Ok(Err(error));
+        }
+        emitted += 1;
+    }
+    Ok(Ok(returning_satisfied(capture, emitted)))
+}
+
 /// What `EXPLAIN` shows of a foreign INSERT target: postgres_fdw's single
 /// row INSERT text and the batch size its executor would use.
 pub(crate) fn foreign_insert_explain(
@@ -91224,14 +91365,19 @@ pub(crate) fn update<'a>(
     let fresh = progress
         .as_ref()
         .is_none_or(|progress| !progress.resuming());
-    let direct = match (
-        statement.from,
-        statement.returning.items,
-        &capture,
-        outer,
-        &view_check,
-    ) {
-        (None, [], None, None, None) if fresh => crate::sql::foreign::direct_modify_sql(
+    let direct_returned = match (statement.from, outer, &view_check) {
+        (None, None, None) if fresh => foreign_direct_returned(
+            storage,
+            txn.txid,
+            table_index,
+            statement.returning,
+            statement.alias,
+            arena,
+        ),
+        _ => Ok(None),
+    };
+    let direct = direct_returned.and_then(|returned| match returned {
+        Some(returned) => crate::sql::foreign::direct_modify_sql(
             storage,
             table_index,
             txn.txid,
@@ -91239,13 +91385,15 @@ pub(crate) fn update<'a>(
             statement.inheritance,
             Some(statement.assignments),
             statement.where_clause,
+            returned,
             arena,
-        ),
-        _ => Ok(None),
-    };
+        )
+        .map(|sql| sql.map(|sql| (sql, returned))),
+        None => Ok(None),
+    });
     match direct.and_then(|direct| {
         direct
-            .map(|sql| {
+            .map(|(sql, returned)| {
                 // A rollback cannot undo the remote change.
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
@@ -91268,11 +91416,44 @@ pub(crate) fn update<'a>(
                     true,
                     updated_columns,
                 )?;
-                crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
+                crate::sql::foreign::direct_modify(
+                    storage,
+                    table_index,
+                    txn.txid,
+                    sql,
+                    returned,
+                    arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
+                )
             })
             .transpose()
     }) {
-        Ok(Some(updated)) => {
+        Ok(Some((updated, returned_rows))) => {
+            let stopped = match emit_direct_returning(
+                storage,
+                txn,
+                def,
+                table_index,
+                statement.alias,
+                statement.returning,
+                DirectRows {
+                    changed: updated,
+                    rows: returned_rows,
+                    updated: true,
+                },
+                arena,
+                params,
+                responder,
+                &mut capture,
+                seq_session,
+            )? {
+                Ok(stopped) => stopped,
+                Err(error) => return sql_fail(error),
+            };
             return write_completion::WriteCompletion::Update {
                 rows: updated,
                 columns: updated_columns,
@@ -91295,8 +91476,12 @@ pub(crate) fn update<'a>(
                     updated: None,
                     deleted: None,
                 },
-                write_completion::CompletionReply::Command,
-                write_completion::RowPhaseEnd::Exhausted,
+                if capture.is_some() {
+                    write_completion::CompletionReply::CountOnly
+                } else {
+                    write_completion::CompletionReply::Command
+                },
+                write_completion::RowPhaseEnd::of(stopped),
             );
         }
         Ok(None) => {}
@@ -92961,8 +93146,19 @@ pub(crate) fn delete<'a>(
     let fresh = progress
         .as_ref()
         .is_none_or(|progress| !progress.resuming());
-    let direct = match (statement.using, statement.returning.items, &capture, outer) {
-        (None, [], None, None) if fresh => crate::sql::foreign::direct_modify_sql(
+    let direct_returned = match (statement.using, outer) {
+        (None, None) if fresh => foreign_direct_returned(
+            storage,
+            txn.txid,
+            table_index,
+            statement.returning,
+            statement.alias,
+            arena,
+        ),
+        _ => Ok(None),
+    };
+    let direct = direct_returned.and_then(|returned| match returned {
+        Some(returned) => crate::sql::foreign::direct_modify_sql(
             storage,
             table_index,
             txn.txid,
@@ -92970,13 +93166,15 @@ pub(crate) fn delete<'a>(
             statement.inheritance,
             None,
             statement.where_clause,
+            returned,
             arena,
-        ),
-        _ => Ok(None),
-    };
+        )
+        .map(|sql| sql.map(|sql| (sql, returned))),
+        None => Ok(None),
+    });
     match direct.and_then(|direct| {
         direct
-            .map(|sql| {
+            .map(|(sql, returned)| {
                 // A rollback cannot undo the remote change.
                 if let Some(progress) = progress.as_deref_mut() {
                     progress.forbid_restart();
@@ -92999,11 +93197,44 @@ pub(crate) fn delete<'a>(
                     true,
                     ColumnSet::EMPTY,
                 )?;
-                crate::sql::foreign::direct_modify(storage, table_index, txn.txid, sql)
+                crate::sql::foreign::direct_modify(
+                    storage,
+                    table_index,
+                    txn.txid,
+                    sql,
+                    returned,
+                    arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
+                )
             })
             .transpose()
     }) {
-        Ok(Some(deleted)) => {
+        Ok(Some((deleted, returned_rows))) => {
+            let stopped = match emit_direct_returning(
+                storage,
+                txn,
+                def,
+                table_index,
+                statement.alias,
+                statement.returning,
+                DirectRows {
+                    changed: deleted,
+                    rows: returned_rows,
+                    updated: false,
+                },
+                arena,
+                params,
+                responder,
+                &mut capture,
+                seq_session,
+            )? {
+                Ok(stopped) => stopped,
+                Err(error) => return sql_fail(error),
+            };
             return write_completion::WriteCompletion::Delete { rows: deleted }.finish(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
@@ -93022,8 +93253,12 @@ pub(crate) fn delete<'a>(
                     updated: None,
                     deleted: None,
                 },
-                write_completion::CompletionReply::Command,
-                write_completion::RowPhaseEnd::Exhausted,
+                if capture.is_some() {
+                    write_completion::CompletionReply::CountOnly
+                } else {
+                    write_completion::CompletionReply::Command
+                },
+                write_completion::RowPhaseEnd::of(stopped),
             );
         }
         Ok(None) => {}

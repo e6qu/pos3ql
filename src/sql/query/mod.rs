@@ -18292,7 +18292,7 @@ pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeC
 }
 
 /// Visits `expression` and every expression below it, subqueries excepted.
-fn walk_expression_tree<'a>(
+pub(crate) fn walk_expression_tree<'a>(
     expression: &'a Expr<'a>,
     visit: &mut dyn FnMut(&'a Expr<'a>),
 ) -> Result<(), SqlError> {

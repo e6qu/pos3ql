@@ -1925,12 +1925,14 @@ fn plan_with<'a>(
 /// postgres_fdw's direct modification (`postgresPlanDirectModify`): an
 /// `UPDATE` (with `assignments`) or `DELETE` of one foreign table sent as one
 /// remote statement, when every condition and assigned value ships and no
-/// local trigger or generated column needs the rows. `None` when it does not
-/// apply.
+/// local trigger or generated column needs the rows. `returned` lists the
+/// columns the local `RETURNING` list reads, which `deparseReturningList`
+/// appends. `None` when it does not apply.
 pub(crate) fn direct_modify_sql<'a>(
     deparser: &Deparser<'_>,
     assignments: Option<&[(&str, &'a Expr<'a>)]>,
     predicate: Option<&'a Expr<'a>>,
+    returned: ColumnSet,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut conditions = RemoteText::new();
@@ -1981,6 +1983,10 @@ pub(crate) fn direct_modify_sql<'a>(
         }
     }
     let _ = sql.write_str(conditions.as_str());
+    if !returned.is_empty() {
+        let _ = sql.write_str(" RETURNING ");
+        deparser.write_target_list(&mut sql, returned);
+    }
     if sql.is_truncated() || conditions.is_truncated() {
         return Err(query_too_long());
     }

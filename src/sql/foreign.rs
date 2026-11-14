@@ -1715,6 +1715,7 @@ pub(crate) fn direct_modify_sql<'a>(
     inheritance: crate::sql::ast::RelationInheritance,
     assignments: Option<&[(&str, &'a crate::sql::ast::Expr<'a>)]>,
     predicate: Option<&'a crate::sql::ast::Expr<'a>>,
+    returned: ColumnSet,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let table = storage.table_def(table_slot, txid);
@@ -1754,7 +1755,7 @@ pub(crate) fn direct_modify_sql<'a>(
         storage,
         txid,
     };
-    deparse::direct_modify_sql(&deparser, assignments, predicate, arena)
+    deparse::direct_modify_sql(&deparser, assignments, predicate, returned, arena)
 }
 
 /// The row-by-row plan of an `UPDATE` (with its `updated` columns) or
@@ -1792,16 +1793,28 @@ pub(crate) fn modify_scan<'a>(
     deparse::plan_modify_scan(&deparser, updated, predicate, returned, whole_old, arena).map(Some)
 }
 
-/// Runs a direct `UPDATE` or `DELETE` and returns the rows its tag reports.
-pub(crate) fn direct_modify(
+/// Runs a direct `UPDATE` or `DELETE` as postgres_fdw's `execute_dml_stmt`
+/// does: the rows its tag reports and, when the command carries a
+/// `RETURNING` list of the `returned` columns, the rows the server returned,
+/// encoded in table order with the other columns `NULL`. The whole result
+/// arrives before the local `RETURNING` projection reads it.
+pub(crate) fn direct_modify<'a>(
     storage: &Storage,
     table_slot: usize,
     txid: u32,
     sql: &str,
-) -> Result<u64, SqlError> {
+    returned: ColumnSet,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(u64, &'a [&'a [u8]]), SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let table = &remote.table;
     let lease = enter_session(storage, txid, &remote.server)?;
-    let mut rows = None;
+    let expected = returned.count_ones() as usize;
+    let mut changed = None;
+    let mut rows: *mut &[u8] = core::ptr::null_mut();
+    let mut row_count = 0usize;
+    let mut row_capacity = 0usize;
     exchange(
         storage,
         lease,
@@ -1809,16 +1822,50 @@ pub(crate) fn direct_modify(
         Some(&[]),
         sql,
         &mut |event| match event {
+            SqlEvent::RowDescription { fields } if expected != 0 && fields as usize == expected => {
+                Ok(())
+            }
+            SqlEvent::DataRow(row) if expected != 0 && row.columns().len() == expected => {
+                let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                let mut fields = row.columns().iter();
+                for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                    if returned.contains(column) {
+                        let raw = *fields.next().expect("row shape checked");
+                        *value = decode_foreign_field(
+                            storage, table, column, raw, txid, arena, sequences,
+                        )?;
+                    }
+                }
+                let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+                push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)
+            }
             SqlEvent::CommandComplete { tag }
                 if tag.starts_with("UPDATE ") || tag.starts_with("DELETE ") =>
             {
-                rows = Some(tag_rows(tag)?);
+                changed = Some(tag_rows(tag)?);
                 Ok(())
             }
             _ => Err(unexpected_response(sql)),
         },
     )?;
-    rows.ok_or_else(|| unexpected_response(sql))
+    let changed = changed.ok_or_else(|| unexpected_response(sql))?;
+    if expected != 0 && changed != row_count as u64 {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "foreign command reported {} rows but returned {}",
+            changed,
+            row_count
+        ));
+    }
+    Ok((
+        changed,
+        if row_count == 0 {
+            &[]
+        } else {
+            // SAFETY: `push_row` wrote `row_count` entries at `rows`.
+            unsafe { core::slice::from_raw_parts(rows, row_count) }
+        },
+    ))
 }
 
 /// Visits the remote rows of an UPDATE or DELETE target with their parsed

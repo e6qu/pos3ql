@@ -4900,8 +4900,10 @@ fn foreign_modification<'a>(
         return Ok(false);
     }
     let exposed = alias.unwrap_or(table_name);
-    let direct = if returning.items.is_empty() {
-        crate::sql::foreign::direct_modify_sql(
+    let direct = match crate::sql::exec::foreign_direct_returned(
+        storage, txid, slot, returning, alias, arena,
+    )? {
+        Some(returned) => crate::sql::foreign::direct_modify_sql(
             storage,
             slot,
             txid,
@@ -4909,11 +4911,12 @@ fn foreign_modification<'a>(
             inheritance,
             assignments,
             predicate,
+            returned,
             arena,
-        )?
-    } else {
-        None
+        )?,
+        None => None,
     };
+    plan.nodes[0].output = returning_output(storage, txid, slot, exposed, returning, arena)?;
     let scan = |name: &str| PlanNode {
         name: StackStr::from_str(name),
         relation: target_node.relation,
@@ -5038,6 +5041,90 @@ fn foreign_modification<'a>(
     node = node.with_qual(QualLabel::Filter, filter);
     plan.push(node)?;
     Ok(true)
+}
+
+/// The write node's `VERBOSE` output: its `RETURNING` list as
+/// `show_plan_tlist` prints it for a plan of one relation, unqualified.
+fn returning_output(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    exposed: &str,
+    returning: crate::sql::ast::Returning<'_>,
+    arena: &Arena,
+) -> Result<StackStr<256>, SqlError> {
+    let table = storage.table_def(slot, txid);
+    // `old` and `new` are reached only by their names and print qualified.
+    let joined = [
+        crate::sql::catalog::deparse::Joined::new(exposed, &table),
+        crate::sql::catalog::deparse::Joined::rule_row(returning.old_name(), &table),
+        crate::sql::catalog::deparse::Joined::rule_row(returning.new_name(), &table),
+    ];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: Some(&table),
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: true,
+        domain_value: None,
+        folded: true,
+        bare: Some(exposed),
+        sublinks: Some(&registered_sublink),
+    };
+    let mut output = StackStr::<256>::new();
+    let separate = |output: &mut StackStr<256>| {
+        if !output.is_empty() {
+            let _ = output.write_str(", ");
+        }
+    };
+    for item in returning.items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for column in table.columns() {
+                    separate(&mut output);
+                    crate::sql::catalog::write_identifier(&mut output, column.name.as_str());
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                let image = [returning.old_name(), returning.new_name()].contains(qualifier);
+                for column in table.columns() {
+                    separate(&mut output);
+                    if image {
+                        crate::sql::catalog::write_identifier(&mut output, qualifier);
+                        let _ = output.write_str(".");
+                    }
+                    crate::sql::catalog::write_identifier(&mut output, column.name.as_str());
+                }
+            }
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                let text = crate::sql::catalog::deparse::deparse_expression(
+                    &context,
+                    expression,
+                    crate::sql::catalog::deparse::Destination::Value,
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN cannot print this RETURNING item"
+                    )
+                })?;
+                separate(&mut output);
+                let _ = output.write_str(text);
+            }
+        }
+    }
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN output column list exceeds 256 bytes"
+        ));
+    }
+    Ok(output)
 }
 
 /// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output

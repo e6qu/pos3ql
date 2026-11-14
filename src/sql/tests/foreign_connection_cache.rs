@@ -123,6 +123,12 @@ fn respond_to(
         }
         out.extend(complete(&format!("INSERT 0 {values}")));
     } else if command.starts_with("UPDATE ") {
+        // A direct UPDATE's RETURNING list of `id` returns the two rows.
+        if command.ends_with(" RETURNING id") {
+            out.extend(id_description());
+            out.extend(id_row(4));
+            out.extend(id_row(5));
+        }
         out.extend(complete("UPDATE 2"));
     } else if command.starts_with("DELETE ") {
         out.extend(complete(if command.ends_with("ctid = $1") {
@@ -433,6 +439,40 @@ fn postgres_fdw_pushes_conditions_order_and_limit_and_modifies_directly() {
 }
 
 #[test]
+fn direct_modify_ships_returning_columns_and_projects_the_returned_rows() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE ft SET note = 'y' WHERE id > 3 RETURNING id * 10, 'k'",
+    );
+    assert_eq!(data_rows(&updated), ["40|k", "50|k"]);
+    assert!(String::from_utf8_lossy(&updated).contains("UPDATE 2"));
+    // No column read: the tag's rows each project the list once.
+    let counted = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM ft WHERE id = 9 RETURNING 7",
+    );
+    assert_eq!(data_rows(&counted), ["7", "7", "7"]);
+    // A data-modifying WITH query captures the returned rows.
+    let captured = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH w AS (UPDATE ft SET note = 'z' WHERE id > 3 RETURNING id) SELECT sum(id) FROM w",
+    );
+    assert_eq!(data_rows(&captured), ["9"]);
+    assert_eq!(
+        remote_statements(&log),
+        [
+            "UPDATE public.ft SET note = 'y'::text WHERE ((id > 3)) RETURNING id",
+            "DELETE FROM public.ft WHERE ((id = 9))",
+            "UPDATE public.ft SET note = 'z'::text WHERE ((id > 3)) RETURNING id",
+        ]
+    );
+}
+
+#[test]
 fn explain_verbose_shows_postgres_fdw_remote_sql() {
     let (_log, mut engine, mut budget) = scripted_table();
     let plan = |engine: &mut Engine, budget: &mut Budget, sql: &str| {
@@ -479,17 +519,49 @@ fn explain_verbose_shows_postgres_fdw_remote_sql() {
             "        Remote SQL: UPDATE public.ft SET note = 'y'::text WHERE ((id = 1))",
         ]
     );
+    // A direct command ships the columns its RETURNING list reads.
     assert_eq!(
         plan(
             &mut engine,
             &mut budget,
-            "DELETE FROM ft WHERE id = 1 RETURNING note"
+            "DELETE FROM ft WHERE id = 1 RETURNING note, upper(note), tableoid::regclass"
         ),
         [
             "Delete on public.ft",
+            "  Output: note, upper(note), (tableoid)::regclass",
+            "  ->  Foreign Delete on public.ft",
+            "        Remote SQL: DELETE FROM public.ft WHERE ((id = 1)) RETURNING note",
+        ]
+    );
+    // RETURNING of the old or new image changes the rows one at a time.
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "UPDATE ft SET id = 2 WHERE id = 1 RETURNING old.id, new.id, 1"
+        ),
+        [
+            "Update on public.ft",
+            "  Output: old.id, new.id, 1",
+            "  Remote SQL: UPDATE public.ft SET id = $2 WHERE ctid = $1 RETURNING id",
+            "  ->  Foreign Scan on public.ft",
+            "        Output: 2, ctid, ft.*",
+            "        Remote SQL: SELECT id, note, ctid FROM public.ft WHERE ((id = 1)) FOR UPDATE",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM ft WHERE id = 1 AND random() < 2 RETURNING note"
+        ),
+        [
+            "Delete on public.ft",
+            "  Output: note",
             "  Remote SQL: DELETE FROM public.ft WHERE ctid = $1 RETURNING note",
             "  ->  Foreign Scan on public.ft",
             "        Output: ctid",
+            "        Filter: (random() < '2'::double precision)",
             "        Remote SQL: SELECT ctid FROM public.ft WHERE ((id = 1)) FOR UPDATE",
         ]
     );

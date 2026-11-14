@@ -487,3 +487,60 @@ fn index_answered_queries_return_rows_at_their_first_position() {
         );
     });
 }
+
+#[test]
+fn rule_actions_substitute_each_new_reference() {
+    with_engine("notice-rule-new-references", |engine, budget| {
+        for sql in [
+            "CREATE TABLE ruled (id serial, a int, b int)",
+            "CREATE TABLE ruled_log (x int, y int)",
+            "INSERT INTO ruled (a, b) VALUES (10, 20)",
+            "CREATE FUNCTION seen(label text, v int) RETURNS int LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE NOTICE '% %', label, v; RETURN v; END $$",
+            "CREATE RULE ruled_also AS ON UPDATE TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.a, new.a + 1)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        // The action reads NEW.a twice and NEW.b never; the original
+        // statement then evaluates both of its SET expressions.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "UPDATE ruled SET a = seen('a', a), b = seen('b', b)",
+            ),
+            [
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 a 10",
+                "NOTICE 00000 b 20",
+                "UPDATE 1",
+            ]
+        );
+        run_with(engine, budget, "DROP RULE ruled_also ON ruled");
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_instead AS ON UPDATE TO ruled \
+             DO INSTEAD INSERT INTO ruled_log VALUES (new.a, old.b)",
+        );
+        // An unread SET expression never runs, so its division never fails.
+        assert_eq!(
+            messages(engine, budget, "UPDATE ruled SET a = 1, b = b / 0"),
+            ["UPDATE 0"]
+        );
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE ruled_insert AS ON INSERT TO ruled \
+             DO ALSO INSERT INTO ruled_log VALUES (new.id, new.id)",
+        );
+        run_with(engine, budget, "DELETE FROM ruled_log");
+        // Each NEW.id reference evaluates the column default again.
+        run_with(engine, budget, "INSERT INTO ruled (a, b) VALUES (1, 2)");
+        run_with(engine, budget, "INSERT INTO ruled (a, b) SELECT 3, 4");
+        let rows = run_with(engine, budget, "SELECT x, y FROM ruled_log ORDER BY x");
+        assert_eq!(data_rows(&rows), ["3|4", "6|7"]);
+    });
+}

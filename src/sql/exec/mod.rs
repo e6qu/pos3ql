@@ -57597,6 +57597,7 @@ fn stored_rule_definition<'a>(
             &transition_values[..condition_columns.count],
             condition_columns.old,
             condition_columns.new,
+            None,
         )?;
         if super::query::statement_returns_rows(action.statement) {
             let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];

@@ -528,9 +528,15 @@ condition's conjuncts by cost and evaluates leakproof ones before
 row-security conditions (`id < 4 AND f(id)` runs `id < 4` first), where
 conditions here run row-security policies first, then the condition left to
 right; a data-modifying `WITH` sub-statement runs ahead of the main
-statement (above); and a rule action's `NEW` row evaluates every `SET`
-expression of the original statement, where PostgreSQL's rewrite evaluates
-only those the action reads. A policy that a write's `UPDATE` (or `DELETE`)
+statement (above). A rule action reads the triggering statement's
+expression for each `OLD` or `NEW` reference it (or its rule's condition)
+makes, as PostgreSQL's rewriter substitutes them: it evaluates only the
+`SET` expressions, single `VALUES` row expressions and column defaults it
+reads, once per reference, while an `INSERT` reading a query or several
+`VALUES` rows evaluates each input column once per row. Those expressions
+form a derived relation the action reads, which is evaluated for every row
+before the action's own expressions run, where PostgreSQL interleaves them
+row by row. A policy that a write's `UPDATE` (or `DELETE`)
 and `SELECT` commands share runs once per row, as PostgreSQL's
 `list_append_unique` keeps it; each command's restrictive policies run
 before the OR of its permissive ones, which stops at the first that passes.

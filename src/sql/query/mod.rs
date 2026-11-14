@@ -130,6 +130,7 @@ use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleInsertTarget, RuleReturningRelation, RuleReturningSource, RuleTransitionType,
+    TransitionReferences,
     attach_rule_source, check_rule_condition_aggregates, check_rule_insert_values,
     describe_stored_set_query, dml_parameter_scope_query, expand_set_tree, expand_stored_query,
     expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,

@@ -956,7 +956,7 @@ pub(crate) use subquery::{
     uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
-pub(crate) use subquery::{type_witness, walk_children};
+pub(crate) use subquery::{subquery_node_correlated, type_witness, walk_children};
 
 mod window;
 use window::{

@@ -74,6 +74,28 @@ struct PlanNode {
     verbose_quals: [(QualLabel, StackStr<512>); 3],
     /// The schema of `relation`, which `VERBOSE` prints.
     schema: StackStr<64>,
+    /// For the root of a subplan, how its parent runs it and its name
+    /// (`InitPlan 1`, `SubPlan 2`, `CTE w`).
+    subplan: Option<(SubplanKind, StackStr<72>)>,
+    /// The subplans this node is nested in: PostgreSQL indents each
+    /// subplan two columns past its parent's children.
+    shift: u8,
+}
+
+/// How a node runs a subplan: once before its first row, or per row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubplanKind {
+    InitPlan,
+    SubPlan,
+}
+
+impl SubplanKind {
+    const fn relationship(self) -> &'static str {
+        match self {
+            Self::InitPlan => "InitPlan",
+            Self::SubPlan => "SubPlan",
+        }
+    }
 }
 
 /// A node's `Sort Key` or `Group Key` items, separated by
@@ -241,6 +263,8 @@ impl PlanNode {
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::new(),
+        subplan: None,
+        shift: 0,
     };
 }
 
@@ -474,6 +498,139 @@ impl<'a> Plan<'a> {
     }
 }
 
+/// The most subqueries one EXPLAIN shows as subplans.
+const MAX_SUBPLANS: usize = 64;
+
+thread_local! {
+    /// The subqueries the statement being explained runs as subplans, by the
+    /// address of their query, and the number of the last one.
+    static SUBPLANS: core::cell::RefCell<([(usize, crate::sql::catalog::deparse::SublinkPlan); MAX_SUBPLANS], usize)> =
+        const {
+            core::cell::RefCell::new(
+                ([(0, crate::sql::catalog::deparse::SublinkPlan::InitPlan(0)); MAX_SUBPLANS], 0),
+            )
+        };
+}
+
+/// Forgets the subplans of the statement explained before.
+fn reset_subplans() {
+    SUBPLANS.with(|subplans| subplans.borrow_mut().1 = 0);
+}
+
+/// Numbers `select` as the next subplan, as PostgreSQL numbers each
+/// subquery once it has planned it (and so the subqueries inside it).
+fn register_subplan(
+    select: &Select<'_>,
+    correlated: bool,
+) -> Result<crate::sql::catalog::deparse::SublinkPlan, SqlError> {
+    SUBPLANS.with(|subplans| {
+        let mut subplans = subplans.borrow_mut();
+        let count = subplans.1;
+        if count == MAX_SUBPLANS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN subplans exceed {}",
+                MAX_SUBPLANS
+            ));
+        }
+        let number = u16::try_from(count + 1).expect("bounded by MAX_SUBPLANS");
+        let plan = if correlated {
+            crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
+        } else {
+            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+        };
+        subplans.0[count] = (core::ptr::from_ref(select) as usize, plan);
+        subplans.1 = count + 1;
+        Ok(plan)
+    })
+}
+
+/// The subplan the explained statement runs `select` as, if any.
+fn registered_sublink(select: *const ()) -> Option<crate::sql::catalog::deparse::SublinkPlan> {
+    SUBPLANS.with(|subplans| {
+        let subplans = subplans.borrow();
+        subplans.0[..subplans.1]
+            .iter()
+            .find(|(held, _)| *held == select as usize)
+            .map(|(_, plan)| *plan)
+    })
+}
+
+/// The query of a subquery EXPLAIN can show as a subplan.
+fn sublink_query<'e>(expression: &'e Expr<'e>) -> Option<&'e Select<'e>> {
+    match expression {
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => Some(select),
+        _ => None,
+    }
+}
+
+/// Whether every subquery of `expression` is a registered subplan, a
+/// correlated one only when `correlated` allows it.
+fn sublinks_registered(expression: &Expr<'_>, correlated: bool) -> bool {
+    let mut registered = true;
+    visit_sublinks(expression, &mut |node| {
+        registered &= sublink_query(node)
+            .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
+            .is_some_and(|plan| {
+                correlated || matches!(plan, crate::sql::catalog::deparse::SublinkPlan::InitPlan(_))
+            });
+    });
+    registered
+}
+
+/// Calls `visit` with each subquery of `expression` outside other
+/// subqueries, in written order.
+fn visit_sublinks<'e>(expression: &'e Expr<'e>, visit: &mut dyn FnMut(&'e Expr<'e>)) {
+    if matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+    ) {
+        visit(expression);
+        if let Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } =
+            expression
+        {
+            visit_sublinks(operand, visit);
+        }
+        return;
+    }
+    let _ = query::walk_children(expression, &mut |child| {
+        visit_sublinks(child, visit);
+        Ok(())
+    });
+}
+
+/// `condition` split into its conjuncts that read no column and only
+/// subplans run once, which PostgreSQL checks once, and the rest.
+fn split_gating<'e>(
+    condition: Option<&'e Expr<'e>>,
+    arena: &'e Arena,
+) -> Result<(Option<&'e Expr<'e>>, Option<&'e Expr<'e>>), SqlError> {
+    let Some(condition) = condition else {
+        return Ok((None, None));
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok((None, Some(condition)));
+    }
+    let (mut gating, mut rest) = (None, None);
+    for conjunct in &conjuncts[..count] {
+        let mut columns = false;
+        conjunct.for_each_column_reference(&mut |_, _| columns = true);
+        if !columns && conjunct.contains_subquery() && sublinks_registered(conjunct, false) {
+            gating = query::and_where(gating, Some(conjunct), arena)?;
+        } else {
+            rest = query::and_where(rest, Some(conjunct), arena)?;
+        }
+    }
+    Ok((gating, rest))
+}
+
 /// The most conjuncts a condition's EXPLAIN qualification is split into.
 const MAX_CONJUNCTS: usize = 32;
 
@@ -509,7 +666,10 @@ fn relation_mask(
     expression: &Expr<'_>,
     resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
 ) -> Option<u64> {
-    if expression.contains_subquery() {
+    // A subplan run once reads no relation of the query; one run per row
+    // reads the relations it is correlated with, which only a single
+    // relation's scan places.
+    if expression.contains_subquery() && !sublinks_registered(expression, false) {
         return None;
     }
     let mut mask = 0u64;
@@ -914,6 +1074,7 @@ fn join_quals<'a>(
         pretty: false,
         qualify: true,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1045,6 +1206,7 @@ fn outer_hash_quals<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
     };
     let Some(hash_cond) = deparse_qual(&context, &hash_conds[..hash_count], arena)? else {
@@ -1099,6 +1261,7 @@ fn one_time_filter(
         qualify: false,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1138,6 +1301,7 @@ fn scan_filters<'a>(
                 qualify: false,
                 bare: None,
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1169,6 +1333,7 @@ fn scan_filters<'a>(
                 qualify: true,
                 bare: Some(exposed),
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1411,6 +1576,7 @@ fn outer_join_quals<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1459,6 +1625,7 @@ fn joined_index_conditions<'a>(
         qualify: true,
         bare: None,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         arena,
         dependencies: None,
@@ -1521,6 +1688,7 @@ fn having_filter<'a>(
         pretty: false,
         qualify: relations > 1,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1611,6 +1779,7 @@ fn derived_relation_filter<'a>(
         pretty: false,
         qualify: verbose || names == DerivedNames::Qualified,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
         bare: None,
     };
@@ -1632,19 +1801,44 @@ fn single_relation_quals<'a>(
         return Ok((None, None));
     };
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
-        (qualifier.is_none_or(|qualifier| qualifier == exposed)
+        if qualifier.is_none_or(|qualifier| qualifier == exposed)
             && table
                 .columns()
                 .iter()
-                .any(|column| column.name.as_str() == name))
-        .then_some(0)
+                .any(|column| column.name.as_str() == name)
+        {
+            return Some(0);
+        }
+        // A correlated subquery's condition reads its enclosing query's
+        // relation as a parameter.
+        let mut outer = false;
+        outer_relations(storage, txid, |relation, definition| {
+            outer |= qualifier.is_some_and(|qualifier| qualifier == relation)
+                && definition
+                    .columns()
+                    .iter()
+                    .any(|column| column.name.as_str() == name);
+        });
+        outer.then_some(1)
     };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
+    // The one relation's scan evaluates its subplans, the ones it runs per
+    // row included.
+    let placeable = |conjunct: &Expr<'_>| {
+        if !conjunct.contains_subquery() {
+            return relation_mask(conjunct, &resolve).is_some();
+        }
+        let mut columns = true;
+        conjunct.for_each_column_reference(&mut |qualifier, name| {
+            columns &= resolve(qualifier, name).is_some();
+        });
+        columns && sublinks_registered(conjunct, true)
+    };
     if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
-        || conjuncts[..count]
+        || !conjuncts[..count]
             .iter()
-            .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
+            .all(|conjunct| placeable(conjunct))
     {
         return Ok((None, None));
     }
@@ -1656,7 +1850,30 @@ fn single_relation_quals<'a>(
         }
     }
     order_restrictions(&mut conjuncts[..kept]);
-    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    // The enclosing query's relation, whose columns print qualified.
+    let outer = OUTER_RELATIONS.with(|outer| {
+        let outer = outer.borrow();
+        outer.1.checked_sub(1).map(|top| outer.0[top])
+    });
+    let outer_definition = outer.map(|(_, slot)| storage.table_def(slot, txid));
+    let outer_name = match outer.as_ref() {
+        Some((name, _)) => Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?),
+        None => None,
+    };
+    let own = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    let with_outer;
+    let joined: &[crate::sql::catalog::deparse::Joined<'_>] =
+        match (outer_name, outer_definition.as_deref()) {
+            (Some(name), Some(definition)) => {
+                with_outer = [
+                    own[0],
+                    crate::sql::catalog::deparse::Joined::new(name, definition),
+                ];
+                &with_outer
+            }
+            _ => &own,
+        };
+    let outer_count = usize::from(outer.is_some());
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
@@ -1664,12 +1881,13 @@ fn single_relation_quals<'a>(
         dependencies: None,
         table: Some(table),
         parameters: &[],
-        joined: &joined,
+        joined,
         pretty: false,
         qualify: verbose,
         domain_value: None,
+        sublinks: Some(&registered_sublink),
         folded: true,
-        bare: None,
+        bare: (outer_count != 0 && !verbose).then_some(exposed),
     };
     let index_cond = match index {
         Some(index) => index_condition(&context, exposed, index, verbose, arena)?,
@@ -2522,6 +2740,8 @@ fn scan_node<'a>(
         key: None,
         verbose_quals: NO_QUALS,
         schema,
+        subplan: None,
+        shift: 0,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -2536,12 +2756,323 @@ pub(super) fn plan_select<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    let key = |role| Some(NodeKey::new(block, role));
-    let started = std::time::Instant::now();
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
+    let pulled = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    // PostgreSQL plans, and so numbers, a query's subqueries before it
+    // prints the conditions that refer to them.
+    let sublinks = plan_sublinks(storage, txid, pulled, block, arena)?;
+    let plan = plan_pulled_select(storage, txid, statement, pulled, block, arena)?;
+    attach_subplans(plan, pulled, block, sublinks, arena)
+}
+
+/// Where a query reads a subquery, which decides the node that runs it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SublinkOrigin {
+    Items,
+    Where,
+    Having,
+}
+
+/// A subquery of a query level planned as a subplan.
+#[derive(Clone, Copy)]
+struct Sublink<'a> {
+    kind: SubplanKind,
+    number: u16,
+    origin: SublinkOrigin,
+    nodes: &'a [PlanNode],
+}
+
+thread_local! {
+    /// How many subqueries deep the query being planned is: a subquery's
+    /// range table entries join its statement's.
+    static SUBLINK_DEPTH: core::cell::Cell<u16> = const { core::cell::Cell::new(0) };
+    /// The single stored relation of each query level around the one being
+    /// planned, by exposed name and slot, which a correlated subquery's
+    /// conditions name qualified.
+    static OUTER_RELATIONS: core::cell::RefCell<([(StackStr<64>, usize); 8], usize)> =
+        const { core::cell::RefCell::new(([(StackStr::new(), 0); 8], 0)) };
+}
+
+/// The relations of the query levels around the one being planned.
+fn outer_relations(
+    storage: &Storage,
+    txid: u32,
+    mut visit: impl FnMut(&str, &crate::storage::TableDef),
+) {
+    OUTER_RELATIONS.with(|outer| {
+        let outer = outer.borrow();
+        for (name, slot) in &outer.0[..outer.1] {
+            visit(name.as_str(), &storage.table_def(*slot, txid));
+        }
+    });
+}
+
+/// Plans the select-list, `WHERE` and `HAVING` subqueries of `statement`
+/// that EXPLAIN shows as subplans, numbering each after the subqueries
+/// inside it.
+fn plan_sublinks<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<&'a [Sublink<'a>], SqlError> {
+    let mut found = crate::mem::arena::ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit_sublinks(expression, &mut |node| {
+                let _ = found.push((node, SublinkOrigin::Items));
+            });
+        }
+    }
+    if let Some(condition) = statement.where_clause {
+        visit_sublinks(condition, &mut |node| {
+            let _ = found.push((node, SublinkOrigin::Where));
+        });
+    }
+    if let Some(having) = statement.having {
+        visit_sublinks(having, &mut |node| {
+            let _ = found.push((node, SublinkOrigin::Having));
+        });
+    }
+    let found = found.as_slice();
+    let relation = statement.from.as_ref().and_then(|from| {
+        (from.joins.is_empty() && from.base.subquery.is_none() && !from.base.is_function_source())
+            .then(|| {
+                (
+                    from.base.alias.unwrap_or(from.base.table),
+                    from.base.schema,
+                    from.base.table,
+                )
+            })
+    });
+    let mut planned = crate::mem::arena::ArenaList::new(arena);
+    for &(node, origin) in found {
+        let Some(select) = sublink_query(node) else {
+            continue;
+        };
+        let correlated = query::subquery_node_correlated(node, storage, txid, arena)?;
+        let outer_slot =
+            relation.and_then(|(_, schema, table)| relation_slot(storage, txid, schema, table));
+        if correlated && outer_slot.is_none() {
+            continue;
+        }
+        let pushed = correlated
+            && OUTER_RELATIONS.with(|outer| {
+                let mut outer = outer.borrow_mut();
+                let count = outer.1;
+                if count == outer.0.len() {
+                    return false;
+                }
+                outer.0[count] = (
+                    StackStr::from_str(relation.expect("checked").0),
+                    outer_slot.expect("checked"),
+                );
+                outer.1 = count + 1;
+                true
+            });
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let inner = plan_select(storage, txid, select, block.child(Segment::Sublink), arena);
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if pushed {
+            OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
+        }
+        let Plan { nodes, count, .. } = inner?;
+        // Execution does not count a subquery's operators per subplan yet,
+        // so `EXPLAIN ANALYZE` prints no figures for them.
+        for node in &mut nodes[..count] {
+            node.key = None;
+        }
+        let nodes: &'a [PlanNode] = &nodes[..count];
+        let number = match register_subplan(select, correlated)? {
+            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number) => number,
+        };
+        planned
+            .push(Sublink {
+                kind: if correlated {
+                    SubplanKind::SubPlan
+                } else {
+                    SubplanKind::InitPlan
+                },
+                number,
+                origin,
+                nodes,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
+}
+
+/// `plan` with each subplan under the node that runs it: an InitPlan under
+/// the query's top node, before its inputs, and a SubPlan after the inputs
+/// of the node evaluating the expression that reads it.
+fn attach_subplans<'a>(
+    plan: Plan<'a>,
+    statement: &Select<'_>,
+    block: BlockId,
+    sublinks: &[Sublink<'a>],
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    if sublinks.is_empty() {
+        return Ok(plan);
+    }
+    let nodes = &plan.nodes[..plan.count];
+    let find = |role: Role| {
+        nodes
+            .iter()
+            .position(|node| node.key == Some(NodeKey::new(block, role)))
+    };
+    let relations = statement
+        .from
+        .as_ref()
+        .map_or(0, |from| from.joins.len() + 1);
+    let scan = || {
+        if relations == 1 {
+            find(Role::Scan(0))
+        } else {
+            find(Role::Join(u16::try_from(relations - 1).unwrap_or(u16::MAX)))
+        }
+    };
+    let host = |sublink: &Sublink<'_>| -> usize {
+        let at = match (sublink.kind, sublink.origin) {
+            (SubplanKind::InitPlan, _) => None,
+            (SubplanKind::SubPlan, SublinkOrigin::Having) => find(Role::Aggregate),
+            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::Aggregate)
+                .or_else(|| find(Role::Result))
+                .or_else(scan),
+            (SubplanKind::SubPlan, SublinkOrigin::Where) => scan(),
+        };
+        at.unwrap_or(0)
+    };
+    let total = sublinks
+        .iter()
+        .fold(plan.count, |total, sublink| total + sublink.nodes.len());
+    let mut attached = Plan::new(arena, total)?;
+    attached.methods = plan.methods;
+    attached.planning_micros = plan.planning_micros;
+    // PostgreSQL names each relation of the statement's range table
+    // uniquely, in order: the query's own first, then each subplan's, a
+    // repeated name taking the first free `_1`, `_2`, ... suffix.
+    let used = arena
+        .alloc_slice_with(total, |_| StackStr::<96>::new())
+        .map_err(|_| arena_full())?;
+    let mut used_count = 0usize;
+    for node in nodes {
+        if !node.relation.as_str().is_empty() && used_count < used.len() {
+            used[used_count] = StackStr::from_str(node.exposed_name());
+            used_count += 1;
+        }
+    }
+    let ordered = arena
+        .alloc_slice_with(sublinks.len(), |index| index)
+        .map_err(|_| arena_full())?;
+    ordered.sort_unstable_by_key(|&index| sublinks[index].number);
+    let renamed = arena
+        .alloc_slice_with(total, |_| None::<StackStr<96>>)
+        .map_err(|_| arena_full())?;
+    let mut offsets = [0usize; MAX_SUBPLANS];
+    let mut offset = 0usize;
+    for (index, sublink) in sublinks.iter().enumerate() {
+        offsets[index.min(MAX_SUBPLANS - 1)] = offset;
+        offset += sublink.nodes.len();
+    }
+    for &index in ordered.iter() {
+        for (at, node) in sublinks[index].nodes.iter().enumerate() {
+            if node.relation.as_str().is_empty() {
+                continue;
+            }
+            let name = node.exposed_name();
+            let mut unique = StackStr::<96>::from_str(name);
+            let mut suffix = 1usize;
+            while used[..used_count]
+                .iter()
+                .any(|held| held.as_str() == unique.as_str())
+            {
+                unique = StackStr::new();
+                let _ = write!(unique, "{name}_{suffix}");
+                suffix += 1;
+            }
+            if unique.as_str() != name {
+                renamed[offsets[index] + at] = Some(unique);
+            }
+            if used_count < used.len() {
+                used[used_count] = unique;
+                used_count += 1;
+            }
+        }
+    }
+    let push_subplan = |attached: &mut Plan<'a>, parent: PlanNode, index: usize| {
+        let sublink = &sublinks[index];
+        for (at, node) in sublink.nodes.iter().enumerate() {
+            let mut name = StackStr::<72>::new();
+            let _ = write!(name, "{} {}", sublink.kind.relationship(), sublink.number);
+            attached.push(PlanNode {
+                depth: node.depth + parent.depth + 1,
+                shift: node.shift + parent.shift + 1,
+                subplan: if at == 0 {
+                    Some((sublink.kind, name))
+                } else {
+                    node.subplan
+                },
+                alias: renamed[offsets[index] + at].unwrap_or(node.alias),
+                ..*node
+            })?;
+        }
+        Ok::<(), SqlError>(())
+    };
+    for (index, node) in nodes.iter().enumerate() {
+        attached.push(*node)?;
+        // InitPlans precede the inputs of the top node.
+        if index == 0 {
+            for (at, _) in sublinks
+                .iter()
+                .enumerate()
+                .filter(|(_, sublink)| sublink.kind == SubplanKind::InitPlan)
+            {
+                push_subplan(&mut attached, *node, at)?;
+            }
+        }
+        // SubPlans follow the last node of their host's subtree: each
+        // ancestor of this node whose subtree ends here, deepest first.
+        let next_depth = nodes.get(index + 1).map(|next| next.depth);
+        let mut shallowest = u8::MAX;
+        for (host_index, host_node) in nodes[..=index].iter().enumerate().rev() {
+            if host_node.depth >= shallowest {
+                continue;
+            }
+            shallowest = host_node.depth;
+            if next_depth.is_some_and(|next| next > host_node.depth) {
+                break;
+            }
+            for (at, _) in sublinks.iter().enumerate().filter(|(_, sublink)| {
+                sublink.kind == SubplanKind::SubPlan && host(sublink) == host_index
+            }) {
+                push_subplan(&mut attached, *host_node, at)?;
+            }
+            if host_node.depth == 0 {
+                break;
+            }
+        }
+    }
+    Ok(attached)
+}
+
+/// [`plan_select`] of `statement` after its subqueries are pulled up into
+/// `pulled`.
+fn plan_pulled_select<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    pulled: &Select<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let key = |role| Some(NodeKey::new(block, role));
+    let started = std::time::Instant::now();
     let written = statement;
-    let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    let statement = pulled;
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
             storage, from, txid, arena, None,
@@ -3157,12 +3688,36 @@ pub(super) fn plan_select<'a>(
         if scope.n == 1
             && let Some((exposed, def)) = relation(0)
         {
+            // Conjuncts that read only subplans run once gate the scan
+            // from a `Result` above it, as PostgreSQL's pseudoconstant
+            // quals do.
+            let (gating, scanned) = split_gating(statement.where_clause, arena)?;
+            if let Some(gating) = gating {
+                let filter = one_time_filter(storage, txid, Some(gating), arena)?;
+                if stage_count == stages.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "EXPLAIN operator stack exceeds {} nodes",
+                        stages.len()
+                    ));
+                }
+                stages.copy_within(0..stage_count, 1);
+                stages[0] = PlanNode {
+                    name: StackStr::from_str("Result"),
+                    rows: estimated_rows,
+                    width,
+                    total_cost,
+                    ..PlanNode::EMPTY
+                }
+                .with_qual(QualLabel::OneTimeFilter, filter);
+                stage_count += 1;
+            }
             (index_conds[0], filters[0]) = single_relation_quals(
                 storage,
                 txid,
                 exposed,
                 def,
-                statement.where_clause,
+                scanned,
                 scan_indexes[0].as_ref(),
                 false,
                 arena,
@@ -3172,7 +3727,7 @@ pub(super) fn plan_select<'a>(
                 txid,
                 exposed,
                 def,
-                statement.where_clause,
+                scanned,
                 scan_indexes[0].as_ref(),
                 true,
                 arena,
@@ -3696,6 +4251,7 @@ fn window_definition(
             qualify: false,
             bare: None,
             domain_value: None,
+            sublinks: Some(&registered_sublink),
             folded: true,
             arena,
             dependencies: None,
@@ -4026,9 +4582,10 @@ fn plan_keys(
             parameters: &[],
             joined,
             pretty: false,
-            qualify: verbose || relations > 1,
+            qualify: verbose || relations > 1 || shares_range_table(statement),
             bare: None,
             domain_value: None,
+            sublinks: Some(&registered_sublink),
             folded: true,
             arena,
             dependencies: None,
@@ -4110,6 +4667,33 @@ fn plan_keys(
         }
     }
     Ok(shown)
+}
+
+/// Whether the statement's range table holds relations besides this
+/// query's own: a subquery's, or the query around a subquery. PostgreSQL
+/// then qualifies the columns of sort and grouping keys.
+fn shares_range_table(statement: &Select<'_>) -> bool {
+    if SUBLINK_DEPTH.with(core::cell::Cell::get) != 0 {
+        return true;
+    }
+    let mut found = false;
+    let mut visit = |expression: &Expr<'_>| {
+        visit_sublinks(expression, &mut |node| {
+            found |= sublink_query(node).is_some()
+        });
+    };
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit(expression);
+        }
+    }
+    if let Some(condition) = statement.where_clause {
+        visit(condition);
+    }
+    if let Some(having) = statement.having {
+        visit(having);
+    }
+    found
 }
 
 /// The relations a block's sort and grouping keys read, as PostgreSQL names
@@ -4370,6 +4954,8 @@ fn physical_scan_node(
         key: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
+        subplan: None,
+        shift: 0,
     }
 }
 
@@ -4523,6 +5109,8 @@ fn push_set_tree(
                 key: Some(NodeKey::new(block, role)),
                 verbose_quals: NO_QUALS,
                 schema: StackStr::new(),
+                subplan: None,
+                shift: 0,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -4951,6 +5539,8 @@ pub(super) fn plan_modification<'a>(
         schema: relation_slot(storage, txid, target.schema, target.name)
             .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
             .unwrap_or_default(),
+        subplan: None,
+        shift: 0,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -5113,6 +5703,7 @@ pub(super) fn plan_modification<'a>(
                 qualify: true,
                 bare: None,
                 domain_value: None,
+                sublinks: Some(&registered_sublink),
                 folded: true,
                 arena,
                 dependencies: None,
@@ -5368,12 +5959,18 @@ fn property_indent(depth: u8) -> usize {
     }
 }
 
+/// The column `node`'s property lines start at, two further for each
+/// subplan it is nested in.
+fn node_indent(node: &PlanNode) -> usize {
+    property_indent(node.depth) + 2 * usize::from(node.shift)
+}
+
 fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> StackStr<2048> {
     let mut line = StackStr::new();
     // PostgreSQL indents each child's `->  ` arrow six columns past its
     // parent's, starting two columns in.
     if node.depth > 0 {
-        for _ in 0..property_indent(node.depth) - 6 {
+        for _ in 0..node_indent(node) - 6 {
             let _ = write!(line, " ");
         }
         let _ = write!(line, "->  ");
@@ -5486,11 +6083,20 @@ pub(super) fn visit_text_rows<E>(
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
         let node_actual = plan.actual(index, actual);
+        // A subplan's name precedes it where its parent's children start.
+        if let Some((_, name)) = node.subplan.as_ref() {
+            let mut label = StackStr::<128>::new();
+            for _ in 0..node_indent(node) - 8 {
+                let _ = write!(label, " ");
+            }
+            let _ = write!(label, "{}", name.as_str());
+            emit(label.as_str())?;
+        }
         let line = text_line(node, options, node_actual);
         emit(line.as_str())?;
         if plan.disabled(node) {
             let mut disabled = StackStr::<512>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(disabled, " ");
             }
             let _ = write!(disabled, "Disabled: true");
@@ -5498,7 +6104,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if options.verbose && !node.output.as_str().is_empty() {
             let mut output = StackStr::<512>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(output, " ");
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
@@ -5506,7 +6112,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let _ = write!(line, "{label}: {}", keys.next().unwrap_or_default());
@@ -5517,7 +6123,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let Some(space) = sort_space(node_actual).filter(|_| node.name.as_str() == "Sort") {
             let mut line = StackStr::<256>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let _ = write!(
@@ -5531,7 +6137,7 @@ pub(super) fn visit_text_rows<E>(
         }
         for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(qual, " ");
             }
             let _ = write!(qual, "{}: {}", label.text(), text);
@@ -5541,7 +6147,7 @@ pub(super) fn visit_text_rows<E>(
                 && removed > 0.0
             {
                 let mut line = StackStr::<128>::new();
-                for _ in 0..property_indent(node.depth) {
+                for _ in 0..node_indent(node) {
                     let _ = write!(line, " ");
                 }
                 let _ = write!(line, "{removed_label}: {removed:.0}");
@@ -5554,7 +6160,7 @@ pub(super) fn visit_text_rows<E>(
         }) = node_actual
         {
             let mut line = StackStr::<256>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let _ = write!(
@@ -5566,7 +6172,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if let Some(table) = hash_table(node_actual) {
             let mut line = StackStr::<256>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
             let memory = table.bytes.div_ceil(1024);
@@ -5587,7 +6193,7 @@ pub(super) fn visit_text_rows<E>(
         }
         if node.constant_false {
             let mut filter = StackStr::<64>::new();
-            for _ in 0..property_indent(node.depth) {
+            for _ in 0..node_indent(node) {
                 let _ = write!(filter, " ");
             }
             let _ = write!(filter, "One-Time Filter: false");
@@ -5697,6 +6303,9 @@ pub(super) fn plan_statement<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    if block == BlockId::ROOT {
+        reset_subplans();
+    }
     match statement {
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
@@ -6229,6 +6838,9 @@ fn structured_node(
     if let Some(relationship) = relationship {
         document.text("Parent Relationship", relationship);
     }
+    if let Some((_, name)) = node.subplan.as_ref() {
+        document.text("Subplan Name", name.as_str());
+    }
     document.boolean("Parallel Aware", false);
     document.boolean("Async Capable", false);
     if kind.scan_direction {
@@ -6356,11 +6968,20 @@ fn structured_node(
     }
     let mut next = at + 1;
     let mut children = 0;
+    let mut inputs = 0;
     while next < plan.count && plan.nodes[next].depth == node.depth + 1 {
         if children == 0 {
             document.open_group("Plans", Some("Plans"), false);
         }
-        let relationship = if children == 0 { "Outer" } else { "Inner" };
+        // A subplan is no input of its parent: its first input is the outer.
+        let relationship = match plan.nodes[next].subplan.as_ref() {
+            Some((kind, _)) => kind.relationship(),
+            None if inputs == 0 => "Outer",
+            None => "Inner",
+        };
+        if plan.nodes[next].subplan.is_none() {
+            inputs += 1;
+        }
         next = structured_node(
             document,
             plan,

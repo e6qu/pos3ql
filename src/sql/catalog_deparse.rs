@@ -64,6 +64,18 @@ pub(crate) struct Context<'s> {
     /// Print a planned expression, as EXPLAIN does: the planner folds a
     /// coerced numeric literal into a constant of the coerced type.
     pub folded: bool,
+    /// EXPLAIN's names for the subqueries the planner runs as subplans, by
+    /// the address of their query.
+    pub sublinks: Option<&'s dyn Fn(*const ()) -> Option<SublinkPlan>>,
+}
+
+/// How EXPLAIN refers to a subquery its plan runs separately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SublinkPlan {
+    /// Run once before the query's first row: `(InitPlan 1).col1`.
+    InitPlan(u16),
+    /// Run for each row that reads it: `(SubPlan 1)`.
+    SubPlan(u16),
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -295,6 +307,10 @@ impl<'a> Output<'a> {
 impl Output<'_> {
     fn push(&mut self, text: &str) -> Result<(), SqlError> {
         self.text.write_str(text).map_err(|_| arena_full())
+    }
+
+    fn push_display(&mut self, text: core::fmt::Arguments<'_>) -> Result<(), SqlError> {
+        self.text.write_fmt(text).map_err(|_| arena_full())
     }
 
     fn push_spaces(&mut self, count: usize) -> Result<(), SqlError> {
@@ -1855,6 +1871,28 @@ impl Context<'_> {
                 }
                 output.push(" END")
             }
+            // A subquery the plan runs separately prints as a reference to
+            // its subplan, as `get_rule_expr` prints a SubPlan or Param.
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select)
+                if let Some(plan) = self
+                    .sublinks
+                    .and_then(|names| names(core::ptr::from_ref(*select).cast())) =>
+            {
+                match (expression, plan) {
+                    (_, SublinkPlan::InitPlan(number)) => {
+                        output.push_display(format_args!("(InitPlan {number}).col1"))
+                    }
+                    (Expr::Exists(_), SublinkPlan::SubPlan(number)) => {
+                        output.push_display(format_args!("EXISTS(SubPlan {number})"))
+                    }
+                    (Expr::ArraySubquery(_), SublinkPlan::SubPlan(number)) => {
+                        output.push_display(format_args!("ARRAY(SubPlan {number})"))
+                    }
+                    (_, SublinkPlan::SubPlan(number)) => {
+                        output.push_display(format_args!("(SubPlan {number})"))
+                    }
+                }
+            }
             // `get_sublink_expr`: a sublink parenthesizes itself.
             Expr::Exists(select) => {
                 output.push("(EXISTS (")?;
@@ -2586,6 +2624,7 @@ pub(crate) fn rule_action_definition<'a>(
         pretty,
         qualify: true,
         domain_value: None,
+        sublinks: None,
         folded: false,
         bare: None,
     };

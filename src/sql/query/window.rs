@@ -2523,6 +2523,9 @@ pub(crate) fn external_window_into<'a>(
                 )
             };
         let mut position = 0i64;
+        // PostgreSQL reads the source once: the first window's scan is the
+        // plan's, the others' and the projection's rescans are not.
+        let _rescan = (wi > 0).then(instrument::suspend);
         scan_source_recycling_with_pax_columns(
             storage,
             scope,
@@ -2852,6 +2855,7 @@ pub(crate) fn external_window_into<'a>(
         .alloc_slice_with(n_order, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut position = 0i64;
+    let rescan = instrument::suspend();
     scan_source_recycling_with_pax_columns(
         storage,
         scope,
@@ -2975,6 +2979,14 @@ pub(crate) fn external_window_into<'a>(
             Ok(true)
         },
     )?;
+    drop(rescan);
+    // A limit directly over the sort bounds it, as in the in-memory path.
+    if !statement.order_by.is_empty()
+        && !statement.distinct
+        && let Some(bound) = super::group::sort_bound(statement, limit, offset)
+    {
+        out_sorter.keep_least(bound, &mut out_compare)?;
+    }
     let out_run = storage
         .with_block_store(|blocks| out_sorter.finish(blocks, &mut out_compare))
         .expect("spill-attached block store")?;

@@ -856,6 +856,7 @@ pub(crate) fn external_set_body_into<'a>(
     else {
         return Ok(());
     };
+    let limit_written = limit.is_some();
     let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks, outer)?;
     let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks, outer)?;
     // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
@@ -879,10 +880,17 @@ pub(crate) fn external_set_body_into<'a>(
             )
         };
         push_run(storage, &mut reader, run, &mut sorter, &mut compare)?;
-        storage
+        if let Some(bound) = set_sort_bound(limit_written, with_ties, limit, offset) {
+            sorter.keep_least(bound, &mut compare)?;
+        }
+        let sorted = storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
             .expect("spill-attached block store")?
-            .unwrap_or(run)
+            .unwrap_or(run);
+        if let Some(space) = sorter.space() {
+            stages.sort.sorted(space);
+        }
+        sorted
     };
     let mut reader = storage.external_run_reader()?;
     storage
@@ -1008,14 +1016,23 @@ fn external_set_query<'a>(
         if let Err(error) = push_run(storage, &mut reader, run, &mut sorter, &mut compare) {
             return sql_fail(error);
         }
-        match storage
+        if let Some(bound) = set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset)
+            && let Err(error) = sorter.keep_least(bound, &mut compare)
+        {
+            return sql_fail(error);
+        }
+        let sorted = match storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
             .expect("spill-attached block store")
         {
             Ok(Some(run)) => run,
             Ok(None) => unreachable!("sorting a non-empty run stays non-empty"),
             Err(error) => return sql_fail(error),
+        };
+        if let Some(space) = sorter.space() {
+            stages.sort.sorted(space);
         }
+        sorted
     };
     let mut reader = match storage.external_run_reader() {
         Ok(reader) => reader,

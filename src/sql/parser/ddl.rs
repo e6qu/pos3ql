@@ -420,24 +420,19 @@ impl<'a> Parser<'a> {
     fn aggregate_argument(&mut self) -> Result<AggregateArgument<'a>, ParseError> {
         let _ = self.eat_ident("in")?;
         let variadic = self.eat_ident("variadic")?;
-        let first = self.any_ident("aggregate argument")?;
-        let (name, type_name) = if self.peeked == Tok::Op("[") {
-            self.advance()?;
-            self.expect_op("]")?;
-            while self.peeked == Tok::Op("[") {
-                self.advance()?;
-                self.expect_op("]")?;
-            }
-            (
-                "",
-                self.arena_str(stack_format!(132, "{}[]", first).as_str())?,
-            )
-        } else if matches!(self.peeked, Tok::Op(",") | Tok::Op(")"))
-            || matches!(self.peeked, Tok::Ident("order"))
-        {
-            ("", first)
+        // As for a routine argument, a complete type followed by an argument
+        // boundary is unnamed; otherwise the first word is the name.
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let candidate_type = self.type_name()?;
+        let (name, type_name) = if matches!(self.peeked, Tok::Op("," | ")") | Tok::Ident("order")) {
+            ("", candidate_type)
         } else {
-            (first, self.type_name()?)
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+            let name = self.any_ident("aggregate argument")?;
+            (name, self.type_name()?)
         };
         Ok(AggregateArgument {
             name,

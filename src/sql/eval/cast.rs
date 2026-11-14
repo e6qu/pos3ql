@@ -566,8 +566,16 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Float4(f)
         }
         ColType::Char => {
-            if let Datum::Char(_) = v {
-                return Ok(v);
+            match v {
+                Datum::Char(_) => return Ok(v),
+                // PostgreSQL's `i4tochar`: the integer is the byte itself.
+                Datum::Int4(value) => {
+                    let byte = i8::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "\"char\" out of range")
+                    })?;
+                    return Ok(Datum::Char(byte as u8));
+                }
+                _ => {}
             }
             let text = cast_to_text(v, arena)?;
             let bytes = text.as_bytes();

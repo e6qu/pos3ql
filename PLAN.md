@@ -596,9 +596,18 @@ end, and `postgres_fdw_validator` is run only by wrapper DDL. `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key cannot reference columns covered only
 by a unique index (`CREATE UNIQUE INDEX`), which PostgreSQL accepts. A
-qualified type name with an unknown schema (`'1'::nope.int4`) reports `type
-"nope.int4" does not exist` (`42704`) where PostgreSQL reports `schema "nope"
-does not exist` (`3F000`). A literal passed to a function's `regclass`
+type name whose quoted schema contains a dot (`1::"no.pe".x`) is split at
+that dot, so its error names schema `no`. A missing type has no cursor
+position inside a `DEFAULT` expression, a column definition list,
+`json_populate_record(NULL::t, ...)` or `pg_typeof(NULL::nope.t)`;
+`ARRAY[]::nope.t[]` reports `cannot determine type of empty array` (`42P18`)
+before the type; `JSON_SERIALIZE(... RETURNING t)` rejects a type that is not
+built in while parsing (`0A000`); a routine parameter written with `%TYPE` is a
+syntax error; and PL/pgSQL declaration errors raised while compiling a block
+(`v t.a%TYPE`, `v t%ROWTYPE`) lack PostgreSQL's `compilation of PL/pgSQL
+function` CONTEXT. `1::trigger` reports `cannot accept a value of type
+trigger` (`0A000`) where PostgreSQL reports `cannot cast type integer to
+trigger` (`42846`). A literal passed to a function's `regclass`
 argument (`nextval('nope')`) is converted when the call runs, so its error has
 no cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

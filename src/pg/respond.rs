@@ -466,7 +466,8 @@ fn write_wire_text(
     }
     match value {
         Datum::Char(0) => {}
-        Datum::Char(byte @ 0x20..=0x7e) => out(&[*byte]),
+        // PostgreSQL's `charout` escapes only bytes with the high bit set.
+        Datum::Char(byte @ 0x01..=0x7f) => out(&[*byte]),
         Datum::Char(byte) => out(&[
             b'\\',
             b'0' + (byte >> 6),

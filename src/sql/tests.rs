@@ -94,6 +94,7 @@ mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
+mod unknown_type_schema;
 mod view_reloptions;
 mod virtual_search_path;
 mod write_progress;

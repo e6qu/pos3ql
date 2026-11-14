@@ -89,14 +89,18 @@ impl QualifiedObjectName {
     pub(crate) fn parse(input: &str) -> Result<Self, SqlError> {
         let mut names = [SqlName::EMPTY; 3];
         let mut count = 0;
+        // PostgreSQL's `NameListToString` of every part, for the error that
+        // rejects four or more.
+        let mut written = crate::util::StackStr::<{ 4 * 64 + 3 }>::new();
         for_each_qualified_identifier(input, IdentifierGrammar::ObjectReference, true, |part| {
-            if count == names.len() {
-                return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "object name has too many parts"
-                ));
+            let name = part.sql_name()?;
+            if count != 0 {
+                let _ = core::fmt::Write::write_char(&mut written, '.');
             }
-            names[count] = part.sql_name()?;
+            let _ = core::fmt::Write::write_str(&mut written, name.as_str());
+            if let Some(slot) = names.get_mut(count) {
+                *slot = name;
+            }
             count += 1;
             Ok(())
         })
@@ -122,8 +126,30 @@ impl QualifiedObjectName {
                 schema: Some(names[1]),
                 name: names[2],
             },
-            _ => unreachable!("the identifier parser admits one through three object name parts"),
+            0 => unreachable!("the identifier parser admits at least one object name part"),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "improper relation name (too many dotted names): {}",
+                    written.as_str()
+                ));
+            }
         })
+    }
+
+    /// PostgreSQL's rejection of a relation name qualified by another
+    /// database than `current`.
+    pub(crate) fn require_database(&self, current: SqlName) -> Result<(), SqlError> {
+        match self.database {
+            Some(database) if database != current => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cross-database references are not implemented: \"{}.{}.{}\"",
+                database.as_str(),
+                self.schema.as_ref().map_or("", SqlName::as_str),
+                self.name.as_str()
+            )),
+            _ => Ok(()),
+        }
     }
 }
 

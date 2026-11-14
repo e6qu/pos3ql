@@ -6555,6 +6555,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
+    fn type_schema_exists(&self, schema: &str) -> bool {
+        super::type_name_miss::type_schema_exists(self.storage, self.txid, schema)
+    }
+
     fn schema_oid(&self, name: &str) -> Option<i32> {
         super::catalog::schema_oid_by_name(self.storage, self.txid, name)
     }
@@ -7746,15 +7750,7 @@ fn privilege_relation_oid(
         PrivilegeRelation::Oid(oid) => return Ok(oid),
     };
     let parsed = super::identifiers::QualifiedObjectName::parse(written)?;
-    if parsed
-        .database
-        .is_some_and(|database| database != storage.current_database_name(transaction))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cross-database relation references are not supported"
-        ));
-    }
+    parsed.require_database(storage.current_database_name(transaction))?;
     if let Some(schema) = parsed.schema.as_ref() {
         let schema_exists = if schema.as_str() == "pg_temp" {
             super::catalog::current_temporary_namespace_oid(storage, transaction) != 0

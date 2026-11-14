@@ -31557,12 +31557,11 @@ impl Storage {
                     })
             })
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}.{}\" does not exist",
-                    schema,
-                    name
-                )
+                crate::sql::type_name_miss::TypeNameMiss::Type {
+                    schema: Some(schema),
+                    name,
+                }
+                .error()
             })?;
         let role = self.current_role_slot(txid).ok_or_else(|| {
             sql_err!(

@@ -3146,16 +3146,11 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
-                if matches!(name, "to_regtype" | "to_regtypemod")
-                    && let Some(identity) =
-                        super::super::cross_database_catalog_reference(written, false)
-                {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "cross-database references are not implemented: {}",
-                        identity
-                    ));
-                }
+                let written = if matches!(name, "to_regtype" | "to_regtypemod") {
+                    super::super::without_catalog_qualifier(written, false)?
+                } else {
+                    written
+                };
                 if name == "to_regtypemod" {
                     let (type_name, type_mod) =
                         crate::sql::parser::parse_type_name(written, arena)?;

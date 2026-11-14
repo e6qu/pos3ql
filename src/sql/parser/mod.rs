@@ -1709,6 +1709,50 @@ impl<'a> Parser<'a> {
         Ok((second, third))
     }
 
+    /// The rest of a type name after `first.second` when another `.` follows,
+    /// as PostgreSQL's `DeconstructQualifiedName`: `database.schema.type` must
+    /// name the session's database, and a longer name is improper. Both are
+    /// analysis errors without a cursor. Returns the schema, the type name and
+    /// whether the type name was quoted.
+    fn catalog_qualified_type_name(
+        &mut self,
+        first: &'a str,
+        second: &'a str,
+    ) -> Result<(&'a str, &'a str, bool), ParseError> {
+        let at = self.peek_at;
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{first}.{second}");
+        let mut parts = 2;
+        let (mut schema, mut base, mut base_quoted) = (first, second, false);
+        while self.eat_op(".")? {
+            let quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+            let part = self.any_ident("type name")?;
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            parts += 1;
+            (schema, base, base_quoted) = (base, part, quoted);
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 3 {
+            self.analysis_error(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ))?;
+        } else if !crate::sql::eval::funcs::system::is_current_database(first) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: {written}"),
+            ))?;
+        }
+        Ok((schema, base, base_quoted))
+    }
+
     /// PostgreSQL's `any_name`: a `ColId` optionally followed by dotted
     /// `ColLabel`s, so an unquoted reserved keyword cannot start it.
     fn any_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
@@ -9827,16 +9871,26 @@ impl<'a> Parser<'a> {
         // it aliases same-named domains/enums in different schemas.
         if self.peeked == Tok::Op(".") {
             self.record_namespace(source)?;
-            let schema = name;
+            let mut schema = name;
             self.advance()?;
-            let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
-            let base = self.any_ident("type name")?;
+            let mut base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+            let mut base = self.any_ident("type name")?;
+            if self.peeked == Tok::Op(".") {
+                (schema, base, base_quoted) = self.catalog_qualified_type_name(schema, base)?;
+            }
             written = WrittenTypeName {
                 schema: Some(schema),
                 name: base,
                 array: false,
             };
-            name = if schema == "pg_catalog" {
+            // `pg_catalog.name` names a built-in only by its `pg_type` name
+            // (`pg_catalog.integer` is no type); any other keeps its schema so
+            // the miss names it as written.
+            name = if schema == "pg_catalog"
+                && crate::sql::catalog::builtin_type_rows()
+                    .iter()
+                    .any(|row| row.name == base)
+            {
                 quoted = base_quoted;
                 base
             } else {

@@ -666,7 +666,7 @@ pub(crate) fn expression_error(
             source_position,
             ..
         } => {
-            if state == sqlstate::UNDEFINED_OBJECT && message.starts_with("type \"") {
+            if crate::sql::type_name_miss::is_type_name_miss(&error) {
                 at_subject(error, type_name)
             } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
                 at_parsed_offset(error, source_position.get())

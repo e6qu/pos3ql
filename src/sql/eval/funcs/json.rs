@@ -389,11 +389,14 @@ pub(crate) fn sql_json_cast<'a>(
             return Ok(value);
         }
     }
-    Err(sql_err!(
-        sqlstate::UNDEFINED_OBJECT,
-        "type \"{}\" does not exist",
-        type_name
-    ))
+    Err(
+        crate::sql::type_name_miss::TypeNameMiss::of_written(type_name, |schema| {
+            hooks
+                .catalog
+                .is_none_or(|catalog| catalog.type_schema_exists(schema))
+        })
+        .error(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

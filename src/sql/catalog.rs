@@ -10726,15 +10726,7 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
     match crate::sql::identifiers::ObjectReference::parse(name)? {
         crate::sql::identifiers::ObjectReference::Oid(oid) => Ok(Some(oid as i32)),
         crate::sql::identifiers::ObjectReference::Name(parsed) => {
-            if parsed
-                .database
-                .is_some_and(|database| database != storage.current_database_name(txid))
-            {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cross-database relation references are not supported"
-                ));
-            }
+            parsed.require_database(storage.current_database_name(txid))?;
             if let Some(schema) = parsed.schema.as_ref()
                 && storage.find_schema_visible(schema.as_str(), txid).is_some()
             {
@@ -10878,15 +10870,7 @@ fn table_slot_by_written_name(
     written: &str,
 ) -> Result<Option<usize>, SqlError> {
     let parsed = crate::sql::identifiers::QualifiedObjectName::parse(written)?;
-    if parsed
-        .database
-        .is_some_and(|database| database != storage.current_database_name(txid))
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cross-database relation references are not supported"
-        ));
-    }
+    parsed.require_database(storage.current_database_name(txid))?;
     let oid = relation_oid_for_name(
         storage,
         txid,

@@ -1280,6 +1280,10 @@ mod tests {
         use crate::sql::types::{ColType, oid};
         struct DomainCatalog;
         impl crate::sql::eval::CatalogAccess for DomainCatalog {
+            fn type_schema_exists(&self, _: &str) -> bool {
+                unreachable!()
+            }
+
             fn relation_is_visible(&self, _: i32) -> Option<bool> {
                 unreachable!()
             }

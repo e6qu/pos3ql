@@ -256,6 +256,13 @@ pub(super) fn build_column(
     txid: u32,
     arena: &Arena,
 ) -> Result<ColumnMeta, SqlError> {
+    let missing_type = || {
+        crate::sql::error_position::at_subject(
+            crate::sql::type_name_miss::TypeNameMiss::in_storage(storage, txid, c.type_name)
+                .error(),
+            c.type_name,
+        )
+    };
     if let Some(pseudo) = crate::sql::types::pseudo_type_column_name(c.type_name) {
         return Err(sql_err!(
             sqlstate::INVALID_TABLE_DEFINITION,
@@ -345,14 +352,7 @@ pub(super) fn build_column(
                     let result = storage.relation_row_type_result(relation, true, txid)?;
                     (result.ctype, -1, result.user_type, None)
                 } else {
-                    return Err(crate::sql::error_position::at_subject(
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "type \"{}\" does not exist",
-                            c.type_name
-                        ),
-                        c.type_name,
-                    ));
+                    return Err(missing_type());
                 }
             } else {
                 match storage.find_domain(c.type_name, txid) {
@@ -395,14 +395,7 @@ pub(super) fn build_column(
                                     (result.ctype, -1, result.user_type, None)
                                 }
                                 None => {
-                                    return Err(crate::sql::error_position::at_subject(
-                                        sql_err!(
-                                            sqlstate::UNDEFINED_OBJECT,
-                                            "type \"{}\" does not exist",
-                                            c.type_name
-                                        ),
-                                        c.type_name,
-                                    ));
+                                    return Err(missing_type());
                                 }
                             },
                         },

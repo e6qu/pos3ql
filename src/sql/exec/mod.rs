@@ -4752,10 +4752,15 @@ fn build_declared_table_def(
     let (composite, reference) = storage
         .composite_source(type_name.schema, type_name.name, txid)?
         .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                type_name.name
+            crate::sql::error_position::at_subject(
+                crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                    storage,
+                    txid,
+                    type_name.schema,
+                    type_name.name,
+                )
+                .error(),
+                type_name.schema.unwrap_or(type_name.name),
             )
         })?;
     let mut definition = TableDefBuilder {
@@ -10353,11 +10358,13 @@ pub fn alter_owner(
                 name.name
             ),
             AlterOwnerKind::Type | AlterOwnerKind::Domain => {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    name.name
+                crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                    storage,
+                    txn.txid,
+                    name.schema,
+                    name.name,
                 )
+                .error()
             }
             AlterOwnerKind::Sequence => undefined_kind("sequence", name.name),
             AlterOwnerKind::Statistics => sql_err!(
@@ -14781,11 +14788,13 @@ fn resolve_privilege_objects(
                                 })
                             })
                             .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "type \"{}\" does not exist",
-                                    name.name
+                                crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                                    storage,
+                                    txid,
+                                    name.schema,
+                                    name.name,
                                 )
+                                .error()
                             })?;
                         add_privilege_object(objects, &mut count, object)?;
                     }
@@ -20311,9 +20320,20 @@ fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCurso
 /// In particular, `%TYPE` and `%ROWTYPE` cannot reach execution as strings.
 #[derive(Clone, Copy)]
 enum ParsedPlpgsqlLocalType<'a> {
-    Named { name: &'a str, type_mod: i32 },
-    Column { relation: &'a str, column: &'a str },
-    Row { relation: &'a str },
+    /// `written` is the declaration's text, where a missing type is
+    /// positioned.
+    Named {
+        name: &'a str,
+        type_mod: i32,
+        written: &'a str,
+    },
+    Column {
+        relation: &'a str,
+        column: &'a str,
+    },
+    Row {
+        relation: &'a str,
+    },
     Record,
 }
 
@@ -23802,6 +23822,7 @@ fn parse_trigger_local<'a>(
             ty: ParsedPlpgsqlLocalType::Named {
                 name: "refcursor",
                 type_mod: -1,
+                written: declaration,
             },
             initial: None,
             constant: false,
@@ -23833,7 +23854,11 @@ fn parse_trigger_local<'a>(
         let (name, type_mod) = crate::sql::error_context::within(&frame, || {
             super::parser::parse_declared_type_name(declaration, arena)
         })?;
-        ParsedPlpgsqlLocalType::Named { name, type_mod }
+        ParsedPlpgsqlLocalType::Named {
+            name,
+            type_mod,
+            written: declaration,
+        }
     };
     Ok(ParsedTriggerLocalDecl {
         source: statement,
@@ -27465,13 +27490,23 @@ fn resolve_plpgsql_local(
     }
     let (ctype, user_type, type_mod, record_shape) = match local.ty {
         // A table's name also names its row type, as with `%ROWTYPE`.
-        ParsedPlpgsqlLocalType::Named { name, type_mod }
+        ParsedPlpgsqlLocalType::Named { name, type_mod, .. }
             if type_mod < 0 && relation_row_type_exists(storage, txid, name) =>
         {
             resolve_plpgsql_rowtype(storage, txid, name)?
         }
-        ParsedPlpgsqlLocalType::Named { name, type_mod } => {
-            let result = resolve_routine_type(storage, txid, name)?;
+        ParsedPlpgsqlLocalType::Named {
+            name,
+            type_mod,
+            written,
+        } => {
+            let result = resolve_routine_type(storage, txid, name).map_err(|error| {
+                if crate::sql::type_name_miss::is_type_name_miss(&error) {
+                    crate::sql::error_position::at_subject(error, written)
+                } else {
+                    error
+                }
+            })?;
             (result.ctype, result.user_type, type_mod, None)
         }
         ParsedPlpgsqlLocalType::Column { relation, column } => {
@@ -28126,7 +28161,7 @@ fn resolve_plpgsql_column_type(
         let field = definition.columns()[column];
         return Ok((field.ctype, field.user_type, field.type_mod, None));
     }
-    let result = resolve_routine_type(storage, txid, relation)?;
+    let result = resolve_plpgsql_relation_type(storage, txid, relation)?;
     let ColType::Composite(slot) = result.ctype else {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -28190,7 +28225,7 @@ fn resolve_plpgsql_rowtype(
             Some(PlpgsqlRecordShape::Table { slot, row_type }),
         ));
     }
-    let result = resolve_routine_type(storage, txid, written)?;
+    let result = resolve_plpgsql_relation_type(storage, txid, written)?;
     let ColType::Composite(_) = result.ctype else {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -28199,6 +28234,30 @@ fn resolve_plpgsql_rowtype(
         ));
     };
     Ok((result.ctype, result.user_type, -1, None))
+}
+
+/// The composite type `%TYPE` or `%ROWTYPE` names when no table does.
+/// PostgreSQL looks the name up as a relation, so a miss in an existing
+/// schema is a missing relation.
+fn resolve_plpgsql_relation_type(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    use crate::sql::type_name_miss::TypeNameMiss;
+    resolve_routine_type(storage, txid, written).map_err(|error| {
+        if !crate::sql::type_name_miss::is_type_name_miss(&error) {
+            return error;
+        }
+        match TypeNameMiss::in_storage(storage, txid, written) {
+            miss @ TypeNameMiss::Schema(_) => miss.error(),
+            TypeNameMiss::Type { .. } => sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "relation \"{}\" does not exist",
+                written
+            ),
+        }
+    })
 }
 
 fn parse_trigger_program<'a>(
@@ -37563,11 +37622,12 @@ fn execute_trigger_step_in<'a>(
                                             context.txn.txid,
                                         )
                                         .ok_or_else(|| {
-                                            sql_err!(
-                                                sqlstate::UNDEFINED_OBJECT,
-                                                "type \"{}\" does not exist",
-                                                argument.type_name
+                                            crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                                                context.storage(),
+                                                context.txn.txid,
+                                                argument.type_name,
                                             )
+                                            .error()
                                         })?;
                                     *slot = super::cursor::CursorLocal {
                                         conflict: invocation.variable_conflict,
@@ -44342,11 +44402,9 @@ pub(crate) fn resolve_routine_type(
         // A relation's row type is named and owned by the relation itself.
         return storage.relation_row_type_result(relation, array, txid);
     } else {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "type \"{}\" does not exist",
-            written
-        ));
+        return Err(
+            crate::sql::type_name_miss::TypeNameMiss::in_storage(storage, txid, written).error(),
+        );
     };
     storage.require_type_usage(
         usage_identity.schema.as_str(),
@@ -44354,6 +44412,43 @@ pub(crate) fn resolve_routine_type(
         txid,
     )?;
     storage.bind_routine_result(result, txid)
+}
+
+/// [`resolve_routine_type`] where PostgreSQL positions a missing type at its
+/// name (`PREPARE`, `CREATE DOMAIN`, a column).
+pub(crate) fn resolve_routine_type_at(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    resolve_routine_type(storage, txid, written).map_err(|error| {
+        if crate::sql::type_name_miss::is_type_name_miss(&error) {
+            crate::sql::error_position::at_subject(error, written)
+        } else {
+            error
+        }
+    })
+}
+
+/// [`resolve_routine_type`] for a routine parameter (an argument, an `OUT`
+/// parameter or a `TABLE` column): PostgreSQL names a missing type without
+/// quotes and positions the error at it.
+pub(crate) fn resolve_routine_parameter_type(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    resolve_routine_type(storage, txid, written).map_err(|error| {
+        if crate::sql::type_name_miss::is_type_name_miss(&error) {
+            crate::sql::error_position::at_subject(
+                crate::sql::type_name_miss::TypeNameMiss::in_storage(storage, txid, written)
+                    .parameter_error(),
+                written,
+            )
+        } else {
+            error
+        }
+    })
 }
 
 /// Whether `written` names a table or view whose row type would resolve here
@@ -49163,6 +49258,16 @@ pub(crate) fn resolve_routine_declaration(
         crate::storage::SchemaObjectKind::NonRelation,
     )?;
     let name = SqlName::parse(routine.name.name)?;
+    // PostgreSQL resolves every parameter (arguments, then `TABLE` columns)
+    // before the result type.
+    for argument in routine.arguments {
+        resolve_routine_parameter_type(storage, txn.txid, argument.type_name)?;
+    }
+    if let super::ast::RoutineCreateKind::TableFunction { columns } = routine.kind {
+        for column in columns {
+            resolve_routine_parameter_type(storage, txn.txid, column.type_name)?;
+        }
+    }
     let mut result_columns = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS];
     let mut result_column_count = 0;
     let kind = match routine.kind {
@@ -50836,7 +50941,7 @@ pub fn create_aggregate(
             }
             variadic_argument = Some(index as u8);
         }
-        let resolved = match resolve_routine_type(storage, txn.txid, argument.type_name) {
+        let resolved = match resolve_routine_parameter_type(storage, txn.txid, argument.type_name) {
             Ok(resolved) => resolved,
             Err(error) => return sql_fail(error),
         };
@@ -52006,11 +52111,13 @@ pub(crate) fn resolve_extension_member(
                     storage.resolve_access_object(AccessClass::Composite, schema, name.name, txid)
                 })
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        name.name
+                    crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                        storage,
+                        txid,
+                        name.schema,
+                        name.name,
                     )
+                    .error()
                 })
         }
         ExtensionMemberIdentity::EventTrigger(name) => storage
@@ -57711,11 +57818,10 @@ pub fn comment(
                         type_name
                     ));
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    type_name
-                ));
+                return sql_fail(
+                    crate::sql::type_name_miss::TypeNameMiss::in_storage(storage, txid, type_name)
+                        .error(),
+                );
             } else if let Some(slot) = enum_slot {
                 let definition = storage.enum_for(slot, txn.txid);
                 (definition.schema, definition.name)
@@ -57730,11 +57836,12 @@ pub fn comment(
                 (schema, stored)
             } else {
                 let Some((catalog_name, _)) = builtin else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        type_name
-                    ));
+                    return sql_fail(
+                        crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                            storage, txid, type_name,
+                        )
+                        .error(),
+                    );
                 };
                 let stored = match SqlName::parse(catalog_name) {
                     Ok(name) => name,
@@ -60342,7 +60449,7 @@ fn build_domain_spec(
             (true, name.map(SqlName::parse).transpose()?)
         }
     };
-    let resolved = resolve_routine_type(storage, txid, base_type)?;
+    let resolved = resolve_routine_type_at(storage, txid, base_type)?;
     let (base_domain, base_user_type, inherited_default, inherited_inputs) =
         if let Some(parent) = storage.find_domain(base_type, txid) {
             (
@@ -61098,19 +61205,18 @@ pub(crate) fn drop_domain(
                 None => storage.resolve_domain_slot(name.name, txn.txid),
             };
             let Some(slot) = slot else {
+                let miss = crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                    storage,
+                    txn.txid,
+                    name.schema,
+                    name.name,
+                );
                 if if_exists {
-                    responder.notice(
-                        sqlstate::SUCCESSFUL_COMPLETION,
-                        stack_format!(128, "type \"{}\" does not exist, skipping", name.name)
-                            .as_str(),
-                    )?;
+                    responder
+                        .notice(sqlstate::SUCCESSFUL_COMPLETION, miss.skip_notice().as_str())?;
                     continue;
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    name.name
-                ));
+                return sql_fail(miss.error());
             };
             if let Err(error) = storage.require_not_extension_member(
                 crate::storage::AccessObject {
@@ -61467,11 +61573,15 @@ pub fn alter_domain(
         None => storage.resolve_domain_slot(name.name, txn.txid),
     };
     let Some(slot) = slot else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "type \"{}\" does not exist",
-            name.name
-        ));
+        return sql_fail(
+            crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                storage,
+                txn.txid,
+                name.schema,
+                name.name,
+            )
+            .error(),
+        );
     };
     if let Err(error) = storage.require_owner(
         crate::storage::AccessObject {
@@ -62328,11 +62438,12 @@ fn build_composite_spec(
             let result = storage.relation_row_type_result(relation, array, txid)?;
             (result.ctype, result.user_type)
         } else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                field.type_name
-            ));
+            return Err(crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                storage,
+                txid,
+                field.type_name,
+            )
+            .error());
         };
         if matches!(
             ctype,
@@ -62546,19 +62657,18 @@ pub(crate) fn drop_type(
                     }
                     continue;
                 }
+                let miss = crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                    storage,
+                    txn.txid,
+                    name.schema,
+                    name.name,
+                );
                 if if_exists {
-                    responder.notice(
-                        sqlstate::SUCCESSFUL_COMPLETION,
-                        stack_format!(128, "type \"{}\" does not exist, skipping", name.name)
-                            .as_str(),
-                    )?;
+                    responder
+                        .notice(sqlstate::SUCCESSFUL_COMPLETION, miss.skip_notice().as_str())?;
                     continue;
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "type \"{}\" does not exist",
-                    name.name
-                ));
+                return sql_fail(miss.error());
             };
             if let Err(error) = storage.require_not_extension_member(
                 crate::storage::AccessObject {
@@ -65297,11 +65407,15 @@ pub fn alter_type(
         };
         return match composite {
             Some(slot) => alter_composite_type(storage, wal, txn, slot, action, arena, responder),
-            None => sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                name.name
-            )),
+            None => sql_fail(
+                crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                    storage,
+                    txn.txid,
+                    name.schema,
+                    name.name,
+                )
+                .error(),
+            ),
         };
     };
     if let Err(error) = storage.require_owner(
@@ -65810,6 +65924,14 @@ fn alter_composite_type(
             }
             let spec = match build_composite_spec(storage, txn.txid, core::slice::from_ref(field)) {
                 Ok(spec) => spec,
+                // ALTER TYPE positions a missing attribute type; CREATE TYPE
+                // does not.
+                Err(error) if crate::sql::type_name_miss::is_type_name_miss(&error) => {
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        error,
+                        field.type_name,
+                    ));
+                }
                 Err(error) => return sql_fail(error),
             };
             let mut attribute = spec.fields[0];
@@ -93649,11 +93771,13 @@ fn alter_table_relation(
                 .composite_source(type_name.schema, type_name.name, txn.txid)
                 .and_then(|source| {
                     source.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "type \"{}\" does not exist",
-                            type_name.name
+                        crate::sql::type_name_miss::TypeNameMiss::qualified_in_storage(
+                            storage,
+                            txn.txid,
+                            type_name.schema,
+                            type_name.name,
                         )
+                        .error()
                     })
                 });
             let (composite, reference) = match source {
@@ -95222,10 +95346,12 @@ fn alter_table_relation(
                     invalidated_statistics.insert(usize::from(attribute - 1));
                 }
                 let Some(target) = ColType::from_sql_name(type_name) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        type_name
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        crate::sql::type_name_miss::TypeNameMiss::in_storage(
+                            storage, txn.txid, type_name,
+                        )
+                        .error(),
+                        type_name,
                     ));
                 };
                 // Without USING, the stored value casts through the assignment

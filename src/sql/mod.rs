@@ -89,6 +89,7 @@ pub mod txn;
 pub(crate) mod type_input_plans;
 pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
+pub(crate) mod type_name_miss;
 pub mod types;
 pub mod tzif;
 pub(crate) mod unicode;
@@ -11017,7 +11018,7 @@ impl Engine {
             .alloc_slice_with(count, |_| types::oid::TEXT)
             .map_err(|_| eval::arena_full())?;
         for (target, name) in types.iter_mut().zip(names) {
-            let resolved = exec::resolve_routine_type(&self.storage, txid, name)?;
+            let resolved = exec::resolve_routine_type_at(&self.storage, txid, name)?;
             if resolved.polymorphic_type().is_some() {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -11029,11 +11030,7 @@ impl Engine {
                 .storage
                 .routine_type_oid(resolved.ctype, resolved.user_type, txid)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        name
-                    )
+                    type_name_miss::TypeNameMiss::in_storage(&self.storage, txid, name).error()
                 })?;
         }
         Ok(types)
@@ -28135,13 +28132,8 @@ impl Engine {
         }
         if let Some(type_name) = type_name
             && let Err(error) = exec::resolve_routine_type(&self.storage, txid, type_name)
-            && error.sqlstate == eval::sqlstate::UNDEFINED_OBJECT
+            && type_name_miss::is_type_name_miss(&error)
         {
-            let error = sql_err!(
-                eval::sqlstate::UNDEFINED_OBJECT,
-                "type \"{}\" does not exist",
-                type_name
-            );
             if let Some(deferred_at) = deferred_at {
                 error_position::restore_position(&error, deferred_at);
             }

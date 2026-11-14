@@ -492,15 +492,17 @@ calls an immutable routine, converts a value or runs an operator's routine
 is evaluated once and replaced with its value, so `''::tsquery` in a query
 returning three rows sends its notice once, and a constant in an arm no row
 reaches still folds and reports its error. An `INSERT` folds its `VALUES`
-rows and `RETURNING` list before its statement triggers fire. Folding gaps
-remain: aggregate arguments, window specifications, `MERGE`,
-`ON CONFLICT DO UPDATE` and `FROM` subqueries are evaluated where they run;
-join conditions and `FROM` function arguments are evaluated where they run
-(a constant in a join condition already raises its notice once, but a
-`LATERAL` function's argument raises it for each outer row); folding them
-with the target list raised the notice a second time, because the join and
-function-scan executors evaluate the written conditions and arguments
-again, so both need to read the folded clause; a parameter of a custom plan does not fold; a literal conversion
+rows and `RETURNING` list before its statement triggers fire. A `SELECT`
+folds its join conditions (after the target list, before `WHERE`) and the
+arguments of each function a `LATERAL` item calls for every row to its
+left, and its join and function scans read that folded clause; a function
+scanned once is evaluated when the scope materializes it. `ON CONFLICT DO
+UPDATE` folds its assignments and condition after `RETURNING`, and `MERGE`
+folds `RETURNING`, each action's assignments or values and condition, then
+its join condition, before its statement triggers fire. Folding gaps
+remain: aggregate arguments, window specifications, `FROM` subqueries and a
+`MERGE` into a view are evaluated where they run; join conditions inside a
+parenthesized join are not folded; a parameter of a custom plan does not fold; a literal conversion
 in a prepared statement raises its notice at each `EXECUTE` where
 PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
 prepared statement to keep every converted literal, not only the typed

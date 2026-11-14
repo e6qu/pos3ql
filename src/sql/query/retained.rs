@@ -3610,6 +3610,8 @@ impl<'a> RetainedSelect<'a> {
             Err(error) if error.requires_routine_engine() => return Ok(None),
             Err(error) => return Err(error),
         };
+        // The join reads its folded conditions.
+        let from = statement.from.as_ref().unwrap_or(from);
         let demand = match aggregates {
             Some(_) => grouping::input_demand(&scope, from, statement, arena)?,
             None => streaming_pax_columns_ordered(

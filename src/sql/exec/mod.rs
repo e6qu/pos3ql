@@ -82196,6 +82196,12 @@ fn merge_target<'a>(
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire; the conversions apply to the folded actions.
+    let statement = match super::query::fold_merge_constants(statement, arena, storage, txn.txid) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let assignment_casts = match prepare_dml_assignment_casts(
         &Stmt::Merge(*statement),
         storage,
@@ -87479,10 +87485,27 @@ where
     };
     let refolded = !core::ptr::eq(folded.rows, statement.rows)
         || !core::ptr::eq(folded.returning.items, statement.returning.items);
+    let conflict_refolded = match (folded.on_conflict, statement.on_conflict) {
+        (Some(folded), Some(written)) => match (folded.update, written.update) {
+            (Some(folded), Some(written)) => !core::ptr::eq(folded, written),
+            _ => false,
+        },
+        _ => false,
+    };
     let statement = &folded;
-    // The conversions now apply to the folded rows.
+    // The conversions now apply to the folded rows and conflict assignments.
     let assignment_casts = match source {
         InsertSource::Statement if refolded => match prepare_dml_assignment_casts(
+            &Stmt::Insert(*statement),
+            storage,
+            txn.txid,
+            arena,
+            transition,
+        ) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        },
+        _ if conflict_refolded => match prepare_dml_assignment_casts(
             &Stmt::Insert(*statement),
             storage,
             txn.txid,

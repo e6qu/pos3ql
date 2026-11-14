@@ -616,3 +616,42 @@ fn conditions_run_cheapest_first_under_row_security() {
         );
     });
 }
+
+#[test]
+fn join_conflict_and_merge_constants_fold_once() {
+    with_engine("notice-fold-join-merge", |engine, budget| {
+        for sql in [
+            "CREATE TABLE folded (id int PRIMARY KEY, q tsquery)",
+            "INSERT INTO folded VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TABLE folded_source (id int)",
+            "INSERT INTO folded_source VALUES (1), (2), (3), (4)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
+        for (sql, tag) in [
+            (
+                "SELECT f.id FROM folded f JOIN folded_source s \
+                 ON f.id = s.id + numnode(''::tsquery)",
+                "SELECT 3",
+            ),
+            (
+                "SELECT g FROM folded f, \
+                 LATERAL generate_series(1, numnode(''::tsquery) + f.id) g",
+                "SELECT 6",
+            ),
+            (
+                "INSERT INTO folded SELECT id, 'z' FROM folded_source WHERE id < 3 \
+                 ON CONFLICT (id) DO UPDATE SET q = ''::tsquery",
+                "INSERT 0 2",
+            ),
+            (
+                "MERGE INTO folded f USING folded_source s ON f.id = s.id \
+                 WHEN MATCHED AND numnode(''::tsquery) = 0 THEN DELETE",
+                "MERGE 3",
+            ),
+        ] {
+            assert_eq!(messages(engine, budget, sql), [empty, tag], "{sql}");
+        }
+    });
+}

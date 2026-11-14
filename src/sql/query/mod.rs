@@ -11972,6 +11972,66 @@ pub fn fold_select_constants<'a>(
     let group_by = fold_list(statement.group_by)?;
     let distinct_on = fold_list(statement.distinct_on)?;
     let fold_optional = |expression: Option<&'a Expr<'a>>| expression.map(fold).transpose();
+    // The join tree's conditions, each join's after those of the joins it
+    // contains, fold before WHERE (`preprocess_qual_conditions`). A function
+    // the scan calls for each row to its left (any but the first FROM item,
+    // outside the right of a RIGHT or FULL join) folds its arguments here
+    // too; the others ran when the scope materialized them.
+    let lateral_call = |join: &crate::sql::ast::Join<'a>| {
+        !join.kind.is_right_or_full()
+            && (join.table.func_args.is_some() || join.table.rows_from.is_some())
+    };
+    if let Some(from) = statement.from
+        && from
+            .joins
+            .iter()
+            .any(|join| join.on.is_some() || lateral_call(join))
+    {
+        let joins = arena
+            .alloc_slice_copy(from.joins)
+            .map_err(|_| arena_full())?;
+        let folded_arguments = core::cell::Cell::new(false);
+        let fold_arguments =
+            |arguments: &'a [&'a Expr<'a>]| -> Result<&'a [&'a Expr<'a>], SqlError> {
+                let copy = arena
+                    .alloc_slice_copy(arguments)
+                    .map_err(|_| arena_full())?;
+                let mut folded_here = false;
+                for argument in copy.iter_mut() {
+                    let folded = fold(argument)?;
+                    folded_here |= !core::ptr::eq(folded, *argument);
+                    *argument = folded;
+                }
+                folded_arguments.set(folded_arguments.get() | folded_here);
+                Ok(if folded_here { copy } else { arguments })
+            };
+        let mut folded_any = false;
+        for join in joins.iter_mut() {
+            if lateral_call(join) {
+                if let Some(arguments) = join.table.func_args {
+                    join.table.func_args = Some(fold_arguments(arguments)?);
+                }
+                if let Some(members) = join.table.rows_from {
+                    let members = arena.alloc_slice_copy(members).map_err(|_| arena_full())?;
+                    for member in members.iter_mut() {
+                        if let Some(arguments) = member.func_args {
+                            member.func_args = Some(fold_arguments(arguments)?);
+                        }
+                    }
+                    join.table.rows_from = Some(members);
+                }
+            }
+            if let Some(on) = join.on {
+                let folded = fold(on)?;
+                folded_any |= !core::ptr::eq(folded, on);
+                join.on = Some(folded);
+            }
+        }
+        if folded_any || folded_arguments.get() {
+            rebuilt.from = Some(crate::sql::ast::FromClause { joins, ..from });
+            changed = true;
+        }
+    }
     rebuilt.where_clause = fold_optional(statement.where_clause)?;
     rebuilt.having = fold_optional(statement.having)?;
     rebuilt.offset = fold_optional(statement.offset)?;
@@ -12158,14 +12218,135 @@ pub(crate) fn fold_insert_constants<'a>(
             items
         })
     };
+    // `ON CONFLICT DO UPDATE`'s assignments and condition fold after
+    // `RETURNING`, before a `VALUES` list of several rows.
+    let fold_conflict = || -> Result<Option<crate::sql::ast::OnConflict<'a>>, SqlError> {
+        let Some(conflict) = statement.on_conflict else {
+            return Ok(None);
+        };
+        let Some(update) = conflict.update else {
+            return Ok(Some(conflict));
+        };
+        let assignments = arena.alloc_slice_copy(update).map_err(|_| arena_full())?;
+        let mut changed = false;
+        for (_, expression) in assignments.iter_mut() {
+            if !matches!(expression, Expr::DefaultMarker)
+                && !assigns_through_indirection(expression)
+            {
+                let folded = fold(expression)?;
+                changed |= !core::ptr::eq(folded, *expression);
+                *expression = folded;
+            }
+        }
+        Ok(Some(crate::sql::ast::OnConflict {
+            update: Some(if changed { assignments } else { update }),
+            update_where: conflict.update_where.map(&fold).transpose()?,
+            ..conflict
+        }))
+    };
     if statement.rows.len() <= 1 {
         folded.rows = fold_rows()?;
         folded.returning.items = fold_returning()?;
+        folded.on_conflict = fold_conflict()?;
     } else {
         folded.returning.items = fold_returning()?;
+        folded.on_conflict = fold_conflict()?;
         folded.rows = fold_rows()?;
     }
     Ok(folded)
+}
+
+/// [`fold_update_constants`] for a `MERGE`: `RETURNING`, then each action's
+/// assignments or values and its condition, then the join condition, the
+/// order PostgreSQL's planner preprocesses them.
+pub(crate) fn fold_merge_constants<'a>(
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<&'a crate::sql::ast::Merge<'a>, SqlError> {
+    use crate::sql::ast::{MergeSourceAction, MergeTargetAction, MergeWhen};
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+    let fold_assignments = |assignments: &'a [(&'a str, &'a Expr<'a>)]| {
+        let copy = arena
+            .alloc_slice_copy(assignments)
+            .map_err(|_| arena_full())?;
+        for (_, expression) in copy.iter_mut() {
+            if !matches!(expression, Expr::DefaultMarker)
+                && !assigns_through_indirection(expression)
+            {
+                *expression = fold(expression)?;
+            }
+        }
+        Ok::<_, SqlError>(&*copy)
+    };
+    let fold_target_action = |action: MergeTargetAction<'a>| match action {
+        MergeTargetAction::Update(assignments) => {
+            fold_assignments(assignments).map(MergeTargetAction::Update)
+        }
+        other => Ok(other),
+    };
+    let whens = arena
+        .alloc_slice_copy(statement.whens)
+        .map_err(|_| arena_full())?;
+    for when in whens.iter_mut() {
+        *when = match *when {
+            MergeWhen::Matched { cond, action } => {
+                let action = fold_target_action(action)?;
+                MergeWhen::Matched {
+                    cond: cond.map(&fold).transpose()?,
+                    action,
+                }
+            }
+            MergeWhen::NotMatchedBySource { cond, action } => {
+                let action = fold_target_action(action)?;
+                MergeWhen::NotMatchedBySource {
+                    cond: cond.map(&fold).transpose()?,
+                    action,
+                }
+            }
+            MergeWhen::NotMatchedByTarget { cond, action } => {
+                let action = match action {
+                    MergeSourceAction::Insert {
+                        columns,
+                        values,
+                        default_values,
+                        overriding,
+                    } => {
+                        let copy = arena.alloc_slice_copy(values).map_err(|_| arena_full())?;
+                        for value in copy.iter_mut() {
+                            if !matches!(value, Expr::DefaultMarker)
+                                && !assigns_through_indirection(value)
+                            {
+                                *value = fold(value)?;
+                            }
+                        }
+                        MergeSourceAction::Insert {
+                            columns,
+                            values: copy,
+                            default_values,
+                            overriding,
+                        }
+                    }
+                    MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                };
+                MergeWhen::NotMatchedByTarget {
+                    cond: cond.map(&fold).transpose()?,
+                    action,
+                }
+            }
+        };
+    }
+    folded.whens = whens;
+    folded.on = fold(statement.on)?;
+    arena
+        .alloc(folded)
+        .map(|merge| &*merge)
+        .map_err(|_| arena_full())
 }
 
 /// [`fold_update_constants`] for a `DELETE`: `RETURNING`, then `WHERE`.
@@ -12847,6 +13028,11 @@ pub(crate) fn select_query_resumable<'a>(
         Ok(statement) => statement,
         Err(e) => return sql_fail(e),
     };
+    // The scans read the folded join conditions.
+    let from = statement
+        .from
+        .as_ref()
+        .expect("FROM-less handled by caller");
 
     // Result description.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];

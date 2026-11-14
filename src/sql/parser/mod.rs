@@ -595,6 +595,19 @@ pub(crate) struct TypeInputSyntax<'a> {
     pub expression: Option<&'a Expr<'a>>,
 }
 
+/// A bound input's value: a checked array (or null) input, or a scalar
+/// value of a built-in type converted when a prepared statement was
+/// prepared.
+fn bound_literal_value<'a>(
+    binding: super::type_inputs::Binding<'a>,
+) -> crate::sql::ast::BoundLiteralValue<'a> {
+    if super::type_inputs::checked_input_value(binding.encoded) {
+        crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded)
+    } else {
+        crate::sql::ast::BoundLiteralValue::Folded(binding.encoded)
+    }
+}
+
 pub(crate) fn type_input_sources<'a>(
     sql: &'a str,
     kind: StoredSqlKind,
@@ -1485,7 +1498,7 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
             }
             return self.arena_expr(Expr::BoundLiteral {
-                value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded),
+                value: bound_literal_value(binding),
                 type_oid: binding.type_oid,
                 type_mod: binding.type_mod,
                 collation: binding.collation,
@@ -10946,17 +10959,37 @@ impl<'a> Parser<'a> {
                                 self.arena_full("type input source map exceeds SQL arena")
                             })?;
                     }
-                    return self
+                    // PostgreSQL runs a built-in input function with the
+                    // modifier only for `interval`; the length coercion the
+                    // cast adds still runs when the statement executes.
+                    let length_coercion = super::type_inputs::is_builtin_oid(binding.type_oid)
+                        && binding.type_mod != -1
+                        && binding.type_oid != super::types::oid::INTERVAL;
+                    let bound = self
                         .arena
                         .alloc(Expr::BoundLiteral {
-                            value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(
-                                binding.encoded,
-                            ),
+                            value: bound_literal_value(binding),
                             type_oid: binding.type_oid,
-                            type_mod: binding.type_mod,
+                            type_mod: if length_coercion {
+                                -1
+                            } else {
+                                binding.type_mod
+                            },
                             collation: binding.collation,
-                            source: expression,
+                            source: if length_coercion { operand } else { expression },
                         })
+                        .map(|expression| &*expression)
+                        .map_err(|_| self.arena_full("bound type input exceeds SQL arena"))?;
+                    if !length_coercion {
+                        return Ok(bound);
+                    }
+                    let mut cast = *expression;
+                    if let Expr::Cast { operand, .. } = &mut cast {
+                        *operand = bound;
+                    }
+                    return self
+                        .arena
+                        .alloc(cast)
                         .map(|expression| &*expression)
                         .map_err(|_| self.arena_full("bound type input exceeds SQL arena"));
                 }

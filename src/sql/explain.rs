@@ -1819,6 +1819,32 @@ fn derived_relation_filter<'a>(
     deparse_qual(&context, &conjuncts[..count], arena)
 }
 
+/// The row-security quals a query reading the one relation of `scope`
+/// adds to its scan, as the role the scope reads it as.
+fn select_security_quals<'a>(
+    storage: &Storage,
+    scope: &query::QueryScope<'_>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let Some(current) = storage.current_role_slot(txid) else {
+        return Ok(&[]);
+    };
+    let role = scope.authorization_roles[0].map_or(current, usize::from);
+    match query::plan_row_security(
+        storage,
+        scope.slots[0],
+        role,
+        crate::storage::PolicyCommandKind::Select,
+        query::RowSecurityExpression::Using,
+        txid,
+        arena,
+    )? {
+        Some(plan) => plan.security_quals(arena),
+        None => Ok(&[]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn single_relation_quals<'a>(
     storage: &Storage,
@@ -1826,13 +1852,14 @@ fn single_relation_quals<'a>(
     exposed: &'a str,
     table: &'a crate::storage::TableDef,
     condition: Option<&'a Expr<'a>>,
+    security: &[&'a Expr<'a>],
     index: Option<&query::IndexAccessPlan<'a>>,
     verbose: bool,
     arena: &'a Arena,
 ) -> Result<(Option<StackStr<512>>, Option<StackStr<512>>), SqlError> {
-    let Some(condition) = condition else {
+    if condition.is_none() && security.is_empty() {
         return Ok((None, None));
-    };
+    }
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
         if qualifier.is_none_or(|qualifier| qualifier == exposed)
             && table
@@ -1868,10 +1895,11 @@ fn single_relation_quals<'a>(
         });
         columns && sublinks_registered(conjunct, true)
     };
-    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
-        || !conjuncts[..count]
-            .iter()
-            .all(|conjunct| placeable(conjunct))
+    if let Some(condition) = condition
+        && (split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
+            || !conjuncts[..count]
+                .iter()
+                .all(|conjunct| placeable(conjunct)))
     {
         return Ok((None, None));
     }
@@ -1882,10 +1910,48 @@ fn single_relation_quals<'a>(
             kept += 1;
         }
     }
-    order_restrictions(
-        &mut conjuncts[..kept],
-        &table_qual_cost(storage, txid, exposed, table, arena),
-    );
+    let cost = table_qual_cost(storage, txid, exposed, table, arena);
+    order_restrictions(&mut conjuncts[..kept], &cost);
+    let conjuncts = if security.is_empty() {
+        &conjuncts[..kept]
+    } else {
+        // `order_qual_clauses` under row security: each security qual has
+        // its own level below the statement's conditions, except that any
+        // cheap leakproof qual takes level zero; sorted stably by level,
+        // then cost.
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(table),
+            alias: (exposed != table.name.as_str()).then_some(exposed),
+            output_aliases: &[],
+        };
+        let ordered = arena
+            .alloc_slice_with(security.len() + kept, |position| {
+                let (level, qual) = match security.get(position) {
+                    Some(qual) => (position, *qual),
+                    None => (security.len(), conjuncts[position - security.len()]),
+                };
+                let level = if query::leakproof_at_first_security_level(
+                    qual, &columns, storage, txid, arena,
+                ) {
+                    0
+                } else {
+                    level
+                };
+                (level, cost(qual), qual)
+            })
+            .map_err(|_| arena_full())?;
+        for index in 1..ordered.len() {
+            let mut at = index;
+            while at > 0 && (ordered[at - 1].0, ordered[at - 1].1) > (ordered[at].0, ordered[at].1)
+            {
+                ordered.swap(at - 1, at);
+                at -= 1;
+            }
+        }
+        &*arena
+            .alloc_slice_with(ordered.len(), |position| ordered[position].2)
+            .map_err(|_| arena_full())?
+    };
     // The enclosing query's relation, whose columns print qualified.
     let outer = OUTER_RELATIONS.with(|outer| {
         let outer = outer.borrow();
@@ -1929,10 +1995,7 @@ fn single_relation_quals<'a>(
         Some(index) => index_condition(&context, exposed, index, verbose, arena)?,
         None => None,
     };
-    Ok((
-        index_cond,
-        deparse_qual(&context, &conjuncts[..kept], arena)?,
-    ))
+    Ok((index_cond, deparse_qual(&context, conjuncts, arena)?))
 }
 
 /// Pushes `scan`; a bitmap heap scan rechecks the index condition its
@@ -3748,12 +3811,14 @@ fn plan_pulled_select<'a>(
                 .with_qual(QualLabel::OneTimeFilter, filter);
                 stage_count += 1;
             }
+            let security = select_security_quals(storage, scope, txid, arena)?;
             (index_conds[0], filters[0]) = single_relation_quals(
                 storage,
                 txid,
                 exposed,
                 def,
                 scanned,
+                security,
                 scan_indexes[0].as_ref(),
                 false,
                 arena,
@@ -3764,6 +3829,7 @@ fn plan_pulled_select<'a>(
                 exposed,
                 def,
                 scanned,
+                security,
                 scan_indexes[0].as_ref(),
                 true,
                 arena,
@@ -5958,6 +6024,7 @@ pub(super) fn plan_modification<'a>(
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
+                &[],
                 index.as_ref().map(|(plan, _)| plan),
                 false,
                 arena,
@@ -5968,6 +6035,7 @@ pub(super) fn plan_modification<'a>(
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
+                &[],
                 index.as_ref().map(|(plan, _)| plan),
                 true,
                 arena,

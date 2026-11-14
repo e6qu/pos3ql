@@ -1225,3 +1225,71 @@ fn key_details_need_select_on_the_key_and_no_row_security() {
         );
     });
 }
+
+#[test]
+fn failing_rows_show_readable_or_written_columns() {
+    with_engine("failing-row-columns", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE fw; \
+             CREATE TABLE fr (a int, b int NOT NULL, c int CHECK (c > 0)); \
+             INSERT INTO fr VALUES (1, 1, 1); \
+             GRANT INSERT, UPDATE ON fr TO fw; GRANT SELECT (a) ON fr TO fw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SET ROLE fw; INSERT INTO fr (c) VALUES (1)",
+                    &[
+                        "E|C=23502|M=null value in column \"b\" of relation \"fr\" violates not-null constraint|D=Failing row contains (a, c) = (null, 1).|s=public|t=fr|c=b",
+                    ],
+                ),
+                (
+                    "SET ROLE fw; UPDATE fr SET c = 0",
+                    &[
+                        "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (a, c) = (1, 0).|s=public|t=fr|n=fr_c_check",
+                    ],
+                ),
+                (
+                    "UPDATE fr SET c = 0",
+                    &[
+                        "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (1, 1, 0).|s=public|t=fr|n=fr_c_check",
+                    ],
+                ),
+            ],
+        );
+        // Revoking the table's SELECT revokes the column's too.
+        run_with(engine, budget, "REVOKE SELECT ON fr FROM fw");
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE fw; UPDATE fr SET c = 0",
+                &[
+                    "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|D=Failing row contains (c) = (0).|s=public|t=fr|n=fr_c_check",
+                ],
+            )],
+        );
+        // Nothing shows while row security applies to the user.
+        run_with(
+            engine,
+            budget,
+            "ALTER TABLE fr ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY fr_all ON fr USING (true) WITH CHECK (true); \
+             GRANT SELECT ON fr TO fw",
+        );
+        assert_reports(
+            engine,
+            budget,
+            &[(
+                "SET ROLE fw; UPDATE fr SET c = 0",
+                &[
+                    "E|C=23514|M=new row for relation \"fr\" violates check constraint \"fr_c_check\"|s=public|t=fr|n=fr_c_check",
+                ],
+            )],
+        );
+    });
+}

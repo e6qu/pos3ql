@@ -1272,6 +1272,17 @@ fn scan_cursor(
     fields: usize,
     visit: &mut dyn FnMut(crate::pg::replication_client::SqlDataRow<'_>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let cursor = declare_cursor(storage, lease, query)?;
+    while fetch_batch(storage, lease, cursor, query, fetch_size, fields, visit)? {}
+    close_cursor(storage, lease, cursor)
+}
+
+/// `DECLARE cN CURSOR FOR query`, returning `N`.
+fn declare_cursor(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    query: &str,
+) -> Result<u32, SqlError> {
     let cursor = storage.foreign_client(lease)?.next_cursor_number();
     let mut declare = StackStr::<16_448>::new();
     let _ = write!(declare, "DECLARE c{cursor} CURSOR FOR\n{query}");
@@ -1289,47 +1300,322 @@ fn scan_cursor(
             _ => Err(unexpected_response("DECLARE")),
         },
     )?;
+    Ok(cursor)
+}
+
+/// One `FETCH fetch_size FROM cN`; whether a full batch came back, so more
+/// rows may follow.
+fn fetch_batch(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    cursor: u32,
+    query: &str,
+    fetch_size: i32,
+    fields: usize,
+    visit: &mut dyn FnMut(crate::pg::replication_client::SqlDataRow<'_>) -> Result<(), SqlError>,
+) -> Result<bool, SqlError> {
     let mut fetch = StackStr::<64>::new();
     let _ = write!(fetch, "FETCH {fetch_size} FROM c{cursor}");
-    loop {
-        let mut rows = 0i64;
-        exchange(
-            storage,
-            lease,
-            fetch.as_str(),
-            None,
-            query,
-            &mut |event| match event {
-                SqlEvent::RowDescription { fields: received } if received as usize != fields => {
-                    Err(sql_err!(
+    let mut rows = 0i64;
+    exchange(
+        storage,
+        lease,
+        fetch.as_str(),
+        None,
+        query,
+        &mut |event| match event {
+            SqlEvent::RowDescription { fields: received } if received as usize != fields => {
+                Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "foreign scan returned {} columns, expected {}",
+                    received,
+                    fields
+                ))
+            }
+            SqlEvent::RowDescription { .. } | SqlEvent::CommandComplete { .. } => Ok(()),
+            SqlEvent::DataRow(row) => {
+                if row.columns().len() != fields {
+                    return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
-                        "foreign scan returned {} columns, expected {}",
-                        received,
-                        fields
-                    ))
+                        "foreign scan returned an invalid row shape"
+                    ));
                 }
-                SqlEvent::RowDescription { .. } | SqlEvent::CommandComplete { .. } => Ok(()),
-                SqlEvent::DataRow(row) => {
-                    if row.columns().len() != fields {
-                        return Err(sql_err!(
-                            sqlstate::PROTOCOL_VIOLATION,
-                            "foreign scan returned an invalid row shape"
-                        ));
-                    }
-                    rows += 1;
-                    visit(row)
-                }
-                _ => Err(unexpected_response("FETCH")),
-            },
-        )?;
-        if rows < i64::from(fetch_size) {
-            break;
-        }
-    }
+                rows += 1;
+                visit(row)
+            }
+            _ => Err(unexpected_response("FETCH")),
+        },
+    )?;
+    Ok(rows >= i64::from(fetch_size))
+}
+
+fn close_cursor(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    cursor: u32,
+) -> Result<(), SqlError> {
     let mut close = StackStr::<32>::new();
     let _ = write!(close, "CLOSE c{cursor}");
     command(storage, lease, close.as_str(), "CLOSE CURSOR")?;
     Ok(())
+}
+
+/// A foreign table a plan reads through its own remote cursor, and the rows
+/// fetched so far, which a rescan of the same source (a window's second
+/// pass) reads again instead of scanning the server twice.
+#[derive(Clone, Copy)]
+pub(crate) struct ForeignStream<'a> {
+    pub(crate) table_slot: usize,
+    /// The remote query a pushed plan built and the columns it returns;
+    /// `None` reads every column.
+    pub(crate) pushed: Option<(&'a str, ColumnSet)>,
+    state: crate::mem::arena::ArenaHandle<StreamState<'a>>,
+    owner: &'a Arena,
+}
+
+#[derive(Clone, Copy)]
+struct StreamState<'a> {
+    /// Fetched rows, in the owner's durable tail so per-row rewinds keep them.
+    rows: *mut &'a [u8],
+    len: usize,
+    capacity: usize,
+    started: bool,
+    /// The open cursor, until its last batch arrives or the plan stops.
+    cursor: Option<(ForeignSessionLease, u32)>,
+    /// The plan stopped before the last batch and the cursor was closed.
+    truncated: bool,
+    /// The scan's number in the statement log that keeps rows across
+    /// attempts, when the statement has one.
+    ordinal: Option<u32>,
+}
+
+impl<'a> ForeignStream<'a> {
+    pub(crate) fn new(
+        table_slot: usize,
+        pushed: Option<(&'a str, ColumnSet)>,
+        owner: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let state = owner
+            .retain(StreamState {
+                rows: core::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+                started: false,
+                cursor: None,
+                truncated: false,
+                ordinal: None,
+            })
+            .map_err(|_| super::eval::arena_full())?;
+        Ok(Self {
+            table_slot,
+            pushed,
+            state,
+            owner,
+        })
+    }
+
+    fn state(&self) -> Result<StreamState<'a>, SqlError> {
+        self.owner
+            .retained(self.state)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "foreign scan state is stale"))
+    }
+
+    fn set_state(&self, state: StreamState<'a>) -> Result<(), SqlError> {
+        if self.owner.replace_retained(self.state, state) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign scan state is stale"
+            ))
+        }
+    }
+
+    /// Keeps `bytes` as the next fetched row.
+    fn push(&self, bytes: &[u8]) -> Result<(), SqlError> {
+        let mut state = self.state()?;
+        let full = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "foreign scan rows exceed statement memory"
+            )
+        };
+        let bytes: &'a [u8] = self
+            .owner
+            .alloc_persistent_slice_with(bytes.len(), |at| bytes[at])
+            .map_err(|_| full())?;
+        if state.len == state.capacity {
+            const EMPTY: &[u8] = &[];
+            let capacity = if state.capacity == 0 {
+                8
+            } else {
+                state.capacity * 2
+            };
+            let grown = self
+                .owner
+                .alloc_persistent_slice_with(capacity, |_| EMPTY)
+                .map_err(|_| full())?;
+            if state.len != 0 {
+                // SAFETY: `rows` holds `len` initialized entries in the tail.
+                let kept = unsafe { core::slice::from_raw_parts(state.rows, state.len) };
+                grown[..state.len].copy_from_slice(kept);
+            }
+            state.rows = grown.as_mut_ptr();
+            state.capacity = capacity;
+        }
+        // SAFETY: `len < capacity` entries of `rows` are allocated.
+        unsafe { state.rows.add(state.len).write(bytes) };
+        state.len += 1;
+        self.set_state(state)
+    }
+
+    fn row(&self, index: usize) -> Result<Option<&'a [u8]>, SqlError> {
+        let state = self.state()?;
+        // SAFETY: entries below `len` were written by `push`.
+        Ok((index < state.len).then(|| unsafe { *state.rows.add(index) }))
+    }
+}
+
+/// A remote cursor a statement's scan left open, kept in the statement log.
+#[derive(Clone, Copy)]
+pub(crate) struct KeptForeignScan {
+    /// The scan's place among the foreign scans of an attempt.
+    pub(crate) ordinal: u32,
+    /// The open cursor, until its last batch arrives or the plan stops.
+    pub(crate) cursor: Option<(ForeignSessionLease, u32)>,
+}
+
+/// Streams a foreign table's rows (as [`materialize`] encodes them) to
+/// `visit`, as postgres_fdw's executor reads its cursor: `DECLARE` at the
+/// first row the plan needs, one `FETCH fetch_size` batch whenever the rows
+/// fetched so far are consumed, and `CLOSE` after the last batch or as soon
+/// as the plan stops reading.
+///
+/// A statement that restarts attempts after routine calls keeps each scan's
+/// fetched rows and open cursor in its invocation log: a later attempt reads
+/// the kept rows again and continues the same cursor, so remote rows, their
+/// volatile values and the remote commands are those of one scan.
+pub(crate) fn stream_rows<'a>(
+    storage: &'a Storage,
+    stream: &ForeignStream<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    visit: &mut dyn FnMut(&'a [u8]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    let remote = RemoteTable::open(storage, stream.table_slot, txid)?;
+    let mut query = StackStr::<16_384>::new();
+    let table = &remote.table;
+    let fetched = match stream.pushed {
+        Some((sql, fetched)) => {
+            let _ = query.write_str(sql);
+            fetched
+        }
+        None => {
+            remote.write_select(&mut query);
+            ColumnSet::all(table.n_columns)
+        }
+    };
+    checked(&query, "query")?;
+    let fields = (fetched.count_ones() as usize).max(1);
+    let fetch_size = remote.fetch_size();
+    let mut index = 0usize;
+    loop {
+        while let Some(bytes) = stream.row(index)? {
+            index += 1;
+            if !visit(bytes)? {
+                let mut state = stream.state()?;
+                if let Some((lease, cursor)) = state.cursor {
+                    // The plan needs no more rows: postgres_fdw closes the
+                    // cursor when its scan ends.
+                    close_cursor(storage, lease, cursor)?;
+                    if let Some(ordinal) = state.ordinal {
+                        crate::sql::query::set_foreign_scan_cursor(ordinal, None)?;
+                    }
+                    state.cursor = None;
+                    state.truncated = true;
+                    stream.set_state(state)?;
+                }
+                return Ok(false);
+            }
+        }
+        let mut state = stream.state()?;
+        if !state.started {
+            state.started = true;
+            match crate::sql::query::begin_foreign_scan()? {
+                crate::sql::query::ForeignScanStart::Kept(scan) => {
+                    // The rows an earlier attempt fetched, in their order.
+                    state.ordinal = Some(scan.ordinal);
+                    state.cursor = scan.cursor;
+                    stream.set_state(state)?;
+                    let mut kept = 0usize;
+                    while let Some(bytes) =
+                        crate::sql::query::kept_foreign_row(scan.ordinal, kept, arena)?
+                    {
+                        kept += 1;
+                        stream.push(bytes)?;
+                    }
+                }
+                start => {
+                    let lease = enter_session(storage, txid, &remote.server)?;
+                    let cursor = declare_cursor(storage, lease, query.as_str())?;
+                    if let crate::sql::query::ForeignScanStart::New(ordinal) = start {
+                        crate::sql::query::set_foreign_scan_cursor(ordinal, Some((lease, cursor)))?;
+                        state.ordinal = Some(ordinal);
+                    }
+                    state.cursor = Some((lease, cursor));
+                    stream.set_state(state)?;
+                }
+            }
+            continue;
+        }
+        let Some((lease, cursor)) = state.cursor else {
+            if state.truncated {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign scan was read again past the rows its closed cursor fetched"
+                ));
+            }
+            return Ok(true);
+        };
+        let ordinal = state.ordinal;
+        let more = fetch_batch(
+            storage,
+            lease,
+            cursor,
+            query.as_str(),
+            fetch_size,
+            fields,
+            &mut |remote_row| {
+                let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                let mut columns = remote_row.columns().iter();
+                for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                    if fetched.contains(column) {
+                        let raw = *columns
+                            .next()
+                            .expect("row shape checked against the fetched columns");
+                        *value = decode_foreign_field(
+                            storage, table, column, raw, txid, arena, sequences,
+                        )?;
+                    }
+                }
+                let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+                if let Some(ordinal) = ordinal {
+                    crate::sql::query::keep_foreign_row(ordinal, encoded)?;
+                }
+                stream.push(encoded)
+            },
+        )?;
+        if !more {
+            close_cursor(storage, lease, cursor)?;
+            if let Some(ordinal) = ordinal {
+                crate::sql::query::set_foreign_scan_cursor(ordinal, None)?;
+            }
+            let mut state = stream.state()?;
+            state.cursor = None;
+            stream.set_state(state)?;
+        }
+    }
 }
 
 /// Appends one arena-owned row to an arena-grown array.

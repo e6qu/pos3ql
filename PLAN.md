@@ -867,9 +867,17 @@ and `differential_exact/504`. Remaining differences: joins, aggregates,
 with `RETURNING` runs row by row, as does one of a table with any trigger
 (PostgreSQL disqualifies only row triggers for the statement's event, so
 statement triggers must fire around the direct command first); an `UPDATE` sends no stored generated column
-values; a select list or `ORDER BY` with a subquery reads every column. A scan
-still reads all its rows before the plan consumes them (the cursor's `FETCH`
-batches are not streamed). COPY FROM into a foreign table sends one row at a
+values; a select list or `ORDER BY` with a subquery reads every column. A query whose
+only FROM item is a foreign table, a scalar or `EXISTS` subquery over one,
+and a foreign partition or inheritance child read its cursor one `FETCH`
+batch at a time as the plan consumes rows, and close it as soon as the plan
+stops (`LIMIT`, `EXISTS`); a window's second pass reads the fetched rows
+again, and a statement restarted by routine calls reads the rows its earlier
+attempts fetched and continues the same cursor. Remaining: a foreign table
+joined with other FROM items is read whole before the join, and a SQL
+cursor or a PL/pgSQL `FOR` loop over a query runs the query to completion
+before the first row is returned, so both fetch every remote batch where
+PostgreSQL fetches only what the reads need. COPY FROM into a foreign table sends one row at a
 time, ignoring `batch_size`. A batched INSERT also sends its queued rows when
 the statement pauses for a PL/pgSQL call or a full output buffer, which
 PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,

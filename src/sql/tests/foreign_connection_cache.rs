@@ -504,3 +504,51 @@ fn explain_verbose_shows_postgres_fdw_remote_sql() {
         ]
     );
 }
+
+#[test]
+fn foreign_scans_fetch_batches_as_the_plan_reads_them() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FOREIGN TABLE ft OPTIONS (ADD fetch_size '2')",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    // A limit kept local reads one batch, then closes the cursor.
+    let limited = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM ft WHERE pg_typeof(id) IS NOT NULL LIMIT 1",
+    );
+    assert_eq!(data_rows(&limited), ["0"]);
+    // A window's second pass reads the fetched rows again.
+    let windowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, count(*) OVER () FROM ft WHERE pg_typeof(id) IS NOT NULL ORDER BY id LIMIT 1",
+    );
+    assert_eq!(data_rows(&windowed), ["0|5"]);
+    let fetches: Vec<String> = commands(&log)
+        .concat()
+        .into_iter()
+        .filter(|command| {
+            command.starts_with("DECLARE")
+                || command.starts_with("FETCH")
+                || command.starts_with("CLOSE")
+        })
+        .map(|command| command.lines().next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        fetches,
+        [
+            "DECLARE c1 CURSOR FOR",
+            "FETCH 2 FROM c1",
+            "CLOSE c1",
+            "DECLARE c1 CURSOR FOR",
+            "FETCH 2 FROM c1",
+            "FETCH 2 FROM c1",
+            "FETCH 2 FROM c1",
+            "CLOSE c1",
+        ]
+    );
+}

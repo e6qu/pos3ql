@@ -1841,6 +1841,153 @@ pub(crate) struct RoutineInvocationState {
     initplan_counts: RefCell<crate::mem::arena::RetainedList<InitPlanCount>>,
     /// Numbers attempts, so [`Self::initplan_counts`] restart with each.
     attempt: Cell<u64>,
+    /// The foreign scans the statement ran, by their place among an
+    /// attempt's foreign scans, with the remote cursor each left open.
+    foreign_scans: RefCell<crate::mem::arena::RetainedList<crate::sql::foreign::KeptForeignScan>>,
+    /// Every row those scans fetched, tagged with its scan, in fetch order.
+    foreign_rows: RefCell<crate::mem::arena::RetainedList<KeptForeignRow>>,
+    /// The attempt and count of foreign scans it started so far.
+    foreign_scan_count: Cell<(u64, u32)>,
+}
+
+/// A fetched foreign row a statement keeps for its later attempts.
+#[derive(Clone, Copy)]
+pub(super) struct KeptForeignRow {
+    scan: u32,
+    bytes: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+}
+
+/// Where a foreign scan starts in the active statement.
+#[derive(Clone, Copy)]
+pub(crate) enum ForeignScanStart {
+    /// No statement log keeps foreign rows (the statement cannot restart).
+    Untracked,
+    /// The first time this attempt reaches the scan with this number.
+    New(u32),
+    /// An earlier attempt ran this scan: its kept rows come first.
+    Kept(crate::sql::foreign::KeptForeignScan),
+}
+
+fn foreign_log_error() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "kept foreign scan rows exceed statement memory"
+    )
+}
+
+/// Numbers the next foreign scan of the active statement's attempt and
+/// returns what an earlier attempt left of it.
+pub(crate) fn begin_foreign_scan() -> Result<ForeignScanStart, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(ForeignScanStart::Untracked);
+        };
+        let attempt = calls.attempt.get();
+        let (counted, count) = calls.foreign_scan_count.get();
+        let ordinal = if counted == attempt { count } else { 0 };
+        calls.foreign_scan_count.set((attempt, ordinal + 1));
+        let kept = calls
+            .foreign_scans
+            .borrow()
+            .with_slice(arena, |scans| {
+                scans.iter().find(|scan| scan.ordinal == ordinal).copied()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        Ok(match kept {
+            Some(scan) => ForeignScanStart::Kept(scan),
+            None => ForeignScanStart::New(ordinal),
+        })
+    })
+}
+
+/// Records scan `ordinal`'s open cursor, or that it has none left.
+pub(crate) fn set_foreign_scan_cursor(
+    ordinal: u32,
+    cursor: Option<(crate::storage::ForeignSessionLease, u32)>,
+) -> Result<(), SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(());
+        };
+        let mut scans = calls.foreign_scans.borrow_mut();
+        let updated = scans
+            .with_mut_slice(arena, |scans| {
+                scans
+                    .iter_mut()
+                    .find(|scan| scan.ordinal == ordinal)
+                    .map(|scan| scan.cursor = cursor)
+                    .is_some()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        if !updated {
+            scans
+                .push(
+                    arena,
+                    crate::sql::foreign::KeptForeignScan { ordinal, cursor },
+                )
+                .map_err(|_| foreign_log_error())?;
+        }
+        Ok(())
+    })
+}
+
+/// Keeps one fetched row of scan `ordinal` for later attempts.
+pub(crate) fn keep_foreign_row(ordinal: u32, bytes: &[u8]) -> Result<(), SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(());
+        };
+        let handle = arena
+            .retain_slice_with(bytes.len(), |at| bytes[at])
+            .map_err(|_| foreign_log_error())?;
+        let bytes = arena
+            .freeze_retained_slice(handle)
+            .map_err(|_| inactive_pending_call())?;
+        calls
+            .foreign_rows
+            .borrow_mut()
+            .push(
+                arena,
+                KeptForeignRow {
+                    scan: ordinal,
+                    bytes,
+                },
+            )
+            .map_err(|_| foreign_log_error())
+    })
+}
+
+/// Row `index` of the rows scan `ordinal` kept, copied into `output`.
+pub(crate) fn kept_foreign_row(
+    ordinal: u32,
+    index: usize,
+    output: &Arena,
+) -> Result<Option<&[u8]>, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(None);
+        };
+        let handle = calls
+            .foreign_rows
+            .borrow()
+            .with_slice(arena, |rows| {
+                rows.iter()
+                    .filter(|row| row.scan == ordinal)
+                    .nth(index)
+                    .map(|row| row.bytes)
+            })
+            .map_err(|_| inactive_pending_call())?;
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let bytes = arena
+            .retained_slice(handle)
+            .map_err(|_| inactive_pending_call())?;
+        output
+            .alloc_slice_copy(bytes)
+            .map(|bytes| Some(&*bytes))
+            .map_err(|_| arena_full())
+    })
 }
 
 /// The log positions at which an uncorrelated subquery's one evaluation
@@ -2257,6 +2404,9 @@ impl RoutineInvocationState {
             initplans: RefCell::new(crate::mem::arena::RetainedList::new()),
             initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
             attempt: Cell::new(0),
+            foreign_scans: RefCell::new(crate::mem::arena::RetainedList::new()),
+            foreign_rows: RefCell::new(crate::mem::arena::RetainedList::new()),
+            foreign_scan_count: Cell::new((0, 0)),
         }
     }
 

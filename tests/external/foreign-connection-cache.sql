@@ -69,6 +69,29 @@ ALTER SERVER fdw_cache OPTIONS (SET keep_connections 'yes');
 SELECT count(*) FROM fdw_cache_local.t;
 SELECT count(*), max(n) FROM fdw_cache_local.v;
 
+-- A FETCH batch is read when the plan needs its first row, and a plan that
+-- stops early closes the cursor: each remote row draws a sequence value, so
+-- the next full scan's least value counts the rows read before it.
+SELECT id, n FROM fdw_cache_local.v WHERE pg_typeof(n) IS NOT NULL LIMIT 2;
+SELECT min(n) FROM fdw_cache_local.v;
+SELECT (SELECT n FROM fdw_cache_local.v WHERE pg_typeof(n) IS NOT NULL LIMIT 1);
+SELECT min(n) FROM fdw_cache_local.v;
+SELECT EXISTS (SELECT FROM fdw_cache_local.v WHERE pg_typeof(n) IS NOT NULL);
+SELECT min(n) FROM fdw_cache_local.v;
+SELECT * FROM (SELECT n FROM fdw_cache_local.v WHERE pg_typeof(n) IS NOT NULL LIMIT 1) s;
+SELECT min(n) FROM fdw_cache_local.v;
+-- A window's second pass reads the rows the first fetched.
+SELECT id, row_number() OVER (ORDER BY id DESC) FROM fdw_cache_local.v
+  WHERE pg_typeof(n) IS NOT NULL ORDER BY id LIMIT 3;
+SELECT min(n) FROM fdw_cache_local.v;
+-- Routine calls restart a statement's attempts, which read the rows the
+-- earlier attempts fetched and continue the same cursor.
+CREATE FUNCTION fdw_cache_local.same(i bigint) RETURNS bigint LANGUAGE plpgsql
+  AS $$BEGIN RETURN i; END$$;
+SELECT id, fdw_cache_local.same(n) FROM fdw_cache_local.v
+  WHERE fdw_cache_local.same(n) > 0 LIMIT 3;
+SELECT min(n) FROM fdw_cache_local.v;
+
 -- batch_size: one remote INSERT per batch, counted by its statement trigger.
 INSERT INTO fdw_cache_local.b SELECT i, 'b' || i FROM generate_series(1, 7) i;
 SELECT count(*) FROM fdw_cache_local.calls;

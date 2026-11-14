@@ -13282,9 +13282,13 @@ impl Engine {
                             } else {
                                 sequence_scope.discard(guc.seq_session());
                             }
+                            // The resumed commit only finishes the staged
+                            // transaction: the notices and warnings its
+                            // deferred triggers or index phases already sent
+                            // stay, as PostgreSQL sends them once.
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
-                                output_mark,
+                                output_mark: responder.mark(),
                                 wait: if txn.staged_commit().is_some()
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {

@@ -204,15 +204,11 @@ impl<'arena> DmlRowImages<'arena> {
         Ok(())
     }
 
-    /// The stored image kept for a local `row`, when its write needs one.
+    /// The stored image kept for a local `row`, when its write needs one, or
+    /// a foreign row as its locking scan read it.
     fn image(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
-        let PhysicalRow::Local {
-            table_index, rowid, ..
-        } = row
-        else {
-            return None;
-        };
-        self.bytes(table_index, rowid).ok()
+        let (table, key) = row.sort_key();
+        self.bytes(table, key).ok()
     }
 
     /// The joined row kept for `row`, when the selection joined one.
@@ -101883,17 +101879,25 @@ fn resumed_foreign_matches<'a>(
     let mut images = DmlRowImages::new(arena);
     let mut stored = selection.images(arena)?.iter();
     for row in selection.rows {
-        let (leaf, rowid) = match *row {
+        // A foreign row always keeps the image its locking scan read.
+        let (leaf, rowid, kept) = match *row {
             PhysicalRow::Local {
-                table_index, rowid, ..
-            } => (table_index, Some(rowid)),
-            PhysicalRow::Foreign { table_index, .. } => (table_index, None),
+                table_index: leaf,
+                rowid,
+                ..
+            } => (
+                leaf,
+                rowid,
+                capture.needs_bytes(storage, table_index, leaf, txid),
+            ),
+            PhysicalRow::Foreign {
+                table_index: leaf,
+                tuple_id,
+            } => (leaf, tuple_id.sort_key(), true),
         };
         let physical = (*storage.table_def(leaf, txid)).clone();
         images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
-        if let Some(rowid) = rowid
-            && capture.needs_bytes(storage, table_index, leaf, txid)
-        {
+        if kept {
             let bytes = stored.next().ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,

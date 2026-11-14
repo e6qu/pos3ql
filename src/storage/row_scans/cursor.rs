@@ -446,6 +446,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Backend,
                     |parser| crate::sql::type_inputs::validate_restored(parser, &storage, 0),
                 )

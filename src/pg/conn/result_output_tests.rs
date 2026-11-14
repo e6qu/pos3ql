@@ -2084,7 +2084,14 @@ fn paged_portals_evaluate_rows_per_execute_across_client_waits() {
             .count()
             == 0
         {
-            assert!(Instant::now() < deadline, "first page did not arrive");
+            assert!(
+                Instant::now() < deadline,
+                "first page did not arrive: {:?}",
+                messages(&received)
+                    .iter()
+                    .map(|m| (m.0 as char, String::from_utf8_lossy(m.1).into_owned()))
+                    .collect::<Vec<_>>()
+            );
             read_available(&mut client, &mut received);
             assert_eq!(conn.on_writable(), After::Continue);
         }

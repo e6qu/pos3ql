@@ -266,7 +266,9 @@ fn analysis_does_not_repeat_literal_input_notices() {
             "SELECT ts_rewrite('a | (b & c)'::tsquery, 'b & c'::tsquery, ''::tsquery)",
         ] {
             let output = messages(engine, budget, sql);
-            assert_eq!(output, [empty, "SELECT 1"], "{sql}");
+            // The notice points at the literal.
+            let at = format!("{empty} @{}", sql.find("''").unwrap() + 1);
+            assert_eq!(output, [at.as_str(), "SELECT 1"], "{sql}");
         }
     });
 }
@@ -408,7 +410,7 @@ fn planner_folds_each_constant_once() {
         let empty = "NOTICE 00000 text-search query doesn't contain lexemes: \"\"";
         assert_eq!(
             notices(engine, budget, "SELECT a, ''::tsquery FROM folded"),
-            [empty]
+            [format!("{empty} @11")]
         );
         assert_eq!(
             notices(
@@ -652,7 +654,8 @@ fn join_conflict_and_merge_constants_fold_once() {
                 "MERGE 3",
             ),
         ] {
-            assert_eq!(messages(engine, budget, sql), [empty, tag], "{sql}");
+            let at = format!("{empty} @{}", sql.find("''").unwrap() + 1);
+            assert_eq!(messages(engine, budget, sql), [at.as_str(), tag], "{sql}");
         }
     });
 }
@@ -669,13 +672,11 @@ fn prepare_converts_each_literal_once() {
             ("INSERT INTO pl VALUES ('', 1)", "INSERT 0 1"),
             ("SELECT q = '' FROM pl", "SELECT 2"),
         ] {
+            let text = format!("PREPARE p AS {sql}; EXECUTE p; EXECUTE p");
+            let at = format!("{empty} @{}", text.find("''").unwrap() + 1);
             assert_eq!(
-                messages(
-                    engine,
-                    budget,
-                    &format!("PREPARE p AS {sql}; EXECUTE p; EXECUTE p"),
-                ),
-                [empty, "PREPARE", tag, tag],
+                messages(engine, budget, &text),
+                [at.as_str(), "PREPARE", tag, tag],
                 "{sql}"
             );
         }

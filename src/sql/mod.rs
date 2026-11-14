@@ -14115,9 +14115,14 @@ impl Engine {
                                     let streamable =
                                         immediate.is_none() && index_completion.is_none();
                                     let fetch_stream = if streamable {
+                                        // A prepared statement's stream
+                                        // restores its converted inputs.
                                         self.arm_result_stream(
                                             &statement,
-                                            !source_bindings.is_empty(),
+                                            matches!(
+                                                bound_inputs,
+                                                type_inputs::BoundInputs::Admitted(_)
+                                            ) && !source_bindings.is_empty(),
                                             txn.txid,
                                             text.len(),
                                             cursors,

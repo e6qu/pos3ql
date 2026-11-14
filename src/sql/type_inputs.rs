@@ -838,10 +838,16 @@ pub(crate) enum BoundInputs<'a> {
 }
 
 impl<'a> BoundInputs<'a> {
+    pub(crate) fn image(self) -> InputImage {
+        match self {
+            Self::Admitted(_) => InputImage::Admitted,
+            Self::Prepared(_) => InputImage::Prepared,
+        }
+    }
+
     pub(crate) fn decode(self, arena: &'a Arena) -> Result<&'a [Binding<'a>], SqlError> {
         match self {
-            Self::Admitted(bytes) => decode(bytes, arena),
-            Self::Prepared(bytes) => decode_session(bytes, arena),
+            Self::Admitted(bytes) | Self::Prepared(bytes) => self.image().decode(bytes, arena),
         }
     }
 
@@ -852,9 +858,55 @@ impl<'a> BoundInputs<'a> {
         storage: &crate::storage::Storage,
         txid: u32,
     ) -> Result<(), SqlError> {
+        self.image().validate(parser, storage, txid)
+    }
+}
+
+/// What an input map holds, which decides its encoding and the inputs a
+/// parser restored from it must have bound: see [`BoundInputs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputImage {
+    Admitted,
+    Prepared,
+}
+
+impl InputImage {
+    fn owner(self) -> Owner {
         match self {
-            Self::Admitted(_) => validate_restored(parser, storage, txid),
-            Self::Prepared(_) => validate_prepared(parser, storage, txid),
+            Self::Admitted => Owner::Durable,
+            Self::Prepared => Owner::Session,
+        }
+    }
+
+    pub(crate) fn encoded_len(self, bindings: &[Binding<'_>]) -> Result<usize, SqlError> {
+        encoded_len_for(bindings, self.owner())
+    }
+
+    pub(crate) fn encode_into(
+        self,
+        bindings: &[Binding<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, SqlError> {
+        encode_for(bindings, output, self.owner())
+    }
+
+    pub(crate) fn decode<'a>(
+        self,
+        bytes: &'a [u8],
+        arena: &'a Arena,
+    ) -> Result<&'a [Binding<'a>], SqlError> {
+        decode_for(bytes, arena, self.owner())
+    }
+
+    pub(crate) fn validate(
+        self,
+        parser: &super::parser::Parser<'_>,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        match self {
+            Self::Admitted => validate_restored(parser, storage, txid),
+            Self::Prepared => validate_prepared(parser, storage, txid),
         }
     }
 }

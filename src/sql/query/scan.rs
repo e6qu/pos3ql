@@ -1652,6 +1652,15 @@ fn spgist_supports_operator(
     }
 }
 
+/// Whether `operator` is one of the byte-wise `~<~` family that only the
+/// pattern operator classes index.
+fn is_pattern_operator(operator: BinaryOp) -> bool {
+    matches!(
+        operator,
+        BinaryOp::PatternLt | BinaryOp::PatternLtEq | BinaryOp::PatternGt | BinaryOp::PatternGtEq
+    )
+}
+
 fn operator_class_supports_knn(class: Option<crate::storage::IndexOperatorClass>) -> bool {
     use crate::sql::types::{GistOperatorClass, SpGistOperatorClass};
     matches!(
@@ -2363,7 +2372,14 @@ where
                     Some(crate::storage::IndexOperatorClass::SpGist(class)) => {
                         spgist_supports_operator(class, constraint.operator)
                     }
-                    _ => !gist && !gin && !spgist,
+                    // A btree family holds either the collation-aware
+                    // comparisons or the byte-wise pattern ones; `=` is in
+                    // both.
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                        constraint.operator == BinaryOp::Eq
+                            || class.is_pattern() == is_pattern_operator(constraint.operator)
+                    }
+                    _ => !gist && !gin && !spgist && !is_pattern_operator(constraint.operator),
                 };
             if let Some(equality) = set.equality.filter(|constraint| gist_supports(*constraint)) {
                 constraints[position] = Some(equality);

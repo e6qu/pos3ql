@@ -609,9 +609,15 @@ partition's index). `ALTER COLUMN ... TYPE` on a partitioned table keeps
 each partition's index name where PostgreSQL rebuilds them under new
 generated names (`pr_1_label_idx` after a rename). A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
-order and compare strings byte by byte, but the planner does not yet scan
-one for a `LIKE 'ab%'` prefix or the `~<~` family of operators, which
-PostgreSQL turns into an index range. A routine parameter or result written with `%TYPE` may name a
+order and compare strings byte by byte; the planner lets such a key serve
+`=` and no collation-aware comparison, and a default key no `~<~`-family
+operator, as PostgreSQL's operator families do. It does not yet turn a
+`LIKE 'ab%'` or `~ '^ab'` prefix into PostgreSQL's `~>=~`/`~<~` (or, under
+`C`, `>=`/`<`) index range with the pattern kept as a filter, nor scan a
+pattern-class key for an explicit `~<~`-family range: those keys get their
+own physical binding, whose range plans need PostgreSQL's prefix and
+histogram selectivity to choose its bitmap scan; `=` on a pattern-class key
+shows `Index Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). A PL/pgSQL assignment to a
 three-part name (`x.y.z := 1`, a labelled row variable's field) fails with
 `0A000`, where PostgreSQL assigns `label.row.field` or reports `"x.y.z" is

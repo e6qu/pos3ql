@@ -52,6 +52,7 @@ mod owner_role_inheritance;
 mod partition_ancestry;
 mod partition_column_recursion;
 mod partition_index_propagation;
+mod pattern_index_families;
 mod plpgsql_compile_diagnostics;
 mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;

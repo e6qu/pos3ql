@@ -10768,12 +10768,35 @@ fn require_role_attribute_authority(
     Ok(())
 }
 
+/// Role attributes after a statement's options, and whether its password
+/// was one PostgreSQL refuses to store: an empty string, or a verifier of
+/// one, which clears the password with a notice.
+struct AppliedRoleOptions {
+    attributes: crate::storage::RoleAttributes,
+    cleared_empty_password: bool,
+}
+
+impl AppliedRoleOptions {
+    /// PostgreSQL's notice for a cleared empty password, sent once the role
+    /// is changed.
+    fn notify(&self, responder: &mut Responder) -> Result<(), WireFull> {
+        if self.cleared_empty_password {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                "empty string is not a valid password, clearing password",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 fn apply_role_options(
     mut attributes: crate::storage::RoleAttributes,
     role_name: &str,
     password_encryption: crate::sql::guc::PasswordEncryption,
     options: &crate::sql::ast::RoleOptions<'_>,
-) -> Result<crate::storage::RoleAttributes, SqlError> {
+) -> Result<AppliedRoleOptions, SqlError> {
+    let mut cleared_empty_password = false;
     if let Some(value) = options.superuser {
         attributes.superuser = value;
     }
@@ -10806,7 +10829,22 @@ fn apply_role_options(
         attributes.connection_limit = value;
     }
     if let Some(password) = options.password {
-        attributes.password = if let Some(password) = password {
+        let empty = match password {
+            Some(crate::sql::ast::RolePasswordSpec::Plaintext(password)) => password.is_empty(),
+            Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier)) => {
+                crate::pg::auth::ScramServer::derive_with_salt(
+                    "",
+                    verifier.salt,
+                    verifier.iterations,
+                ) == verifier
+            }
+            Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(verifier)) => {
+                crate::storage::Md5Verifier::derive("", role_name) == Some(verifier)
+            }
+            None => false,
+        };
+        cleared_empty_password = empty;
+        attributes.password = if let Some(password) = password.filter(|_| !empty) {
             let credential = match password {
                 crate::sql::ast::RolePasswordSpec::Plaintext(password) => {
                     if password.len() > crate::storage::ROLE_PASSWORD_MAX {
@@ -10871,7 +10909,10 @@ fn apply_role_options(
         }
         attributes.valid_until = Some(value);
     }
-    Ok(attributes)
+    Ok(AppliedRoleOptions {
+        attributes,
+        cleared_empty_password,
+    })
 }
 
 pub struct CreateRoleRequest<'a> {
@@ -10898,15 +10939,16 @@ pub fn create_role(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let attributes = match apply_role_options(
+    let applied = match apply_role_options(
         crate::storage::RoleAttributes::ORDINARY,
         name.as_str(),
         guc.password_encryption(),
         request.options,
     ) {
-        Ok(attributes) => attributes,
+        Ok(applied) => applied,
         Err(error) => return sql_fail(error),
     };
+    let attributes = applied.attributes;
     if name.as_str().starts_with("pg_") {
         return sql_fail(reserved_role_name(
             name.as_str(),
@@ -10947,6 +10989,7 @@ pub fn create_role(
             "SYSID can no longer be specified",
         )?;
     }
+    applied.notify(responder)?;
     let current = storage
         .current_role_slot(txn.txid)
         .expect("CREATE ROLE privilege check resolved current role");
@@ -11167,15 +11210,16 @@ pub fn alter_role(
     if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
         return sql_fail(error);
     }
-    let attributes = match apply_role_options(
+    let applied = match apply_role_options(
         storage.role(slot).attributes_to(txn.txid),
         storage.role_name(slot, txn.txid).as_str(),
         guc.password_encryption(),
         options,
     ) {
-        Ok(attributes) => attributes,
+        Ok(applied) => applied,
         Err(error) => return sql_fail(error),
     };
+    let attributes = applied.attributes;
     let prior = match storage.alter_role(slot, attributes, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -11204,6 +11248,7 @@ pub fn alter_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
+    applied.notify(responder)?;
     if options.password.is_some()
         && matches!(
             attributes.password,
@@ -11625,6 +11670,11 @@ pub fn rename_role(
         }
     }
     let old_name = storage.role(slot).name_to(txn.txid);
+    // An MD5 verifier salts with the role name, so a rename clears it.
+    let md5_cleared = matches!(
+        storage.role(slot).attributes_to(txn.txid).password,
+        Some(crate::storage::RoleCredential::Md5(_))
+    );
     let prior = match storage.rename_role(slot, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -11650,6 +11700,12 @@ pub fn rename_role(
     ) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
+    }
+    if md5_cleared {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            "MD5 password cleared because of role rename",
+        )?;
     }
     responder.command_complete("ALTER ROLE")?;
     sql_ok()
@@ -12651,9 +12707,225 @@ fn privilege_mask(
     Ok(result)
 }
 
-fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
+/// The privileges among `requested` the current role may grant or revoke
+/// on `object`: those it holds grant options for, as PostgreSQL's
+/// `restrict_and_check_grant` narrows them. Holding no grant option and no
+/// privilege at all is the permission error.
+fn restricted_privileges(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    current: usize,
+    requested: crate::storage::PrivilegeSet,
+    txid: u32,
+) -> Result<crate::storage::PrivilegeSet, SqlError> {
+    use crate::storage::PrivilegeSet;
+    let bits = |set: PrivilegeSet| {
+        (0..16)
+            .map(|bit| PrivilegeSet(1 << bit))
+            .filter(move |bit| set.contains(*bit))
+    };
+    let mut available = PrivilegeSet::NONE;
+    for bit in bits(requested) {
+        if storage.has_object_grant_option(object, current, bit, txid) {
+            available = available.union(bit);
+        }
+    }
+    if available.0 == 0 && requested.0 != 0 {
+        let every = privilege_mask(
+            &[crate::sql::ast::PrivilegeSpec {
+                privilege: crate::sql::ast::Privilege::All,
+                columns: &[],
+            }],
+            object.class,
+            false,
+        )?;
+        let holds_any = bits(every).any(|bit| {
+            storage.has_object_privilege(object, current, bit, txid)
+                || storage.has_object_grant_option(object, current, bit, txid)
+        });
+        if !holds_any {
+            let (_, name) = storage.access_object_name(object);
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for {} {}",
+                privilege_object_noun(storage, object, txid),
+                name.as_str()
+            ));
+        }
+    }
+    Ok(PrivilegeSet(requested.0 & available.0))
+}
+
+/// PostgreSQL's warning when a GRANT, REVOKE or DROP OWNED changes fewer
+/// privileges on `target` (`"t"`, or `column "c" of relation "t"`) than it
+/// named; naming all privileges warns only when none change.
+fn warn_restricted_privileges(
+    is_grant: bool,
+    all_privileges: bool,
+    requested: crate::storage::PrivilegeSet,
+    allowed: crate::storage::PrivilegeSet,
+    target: core::fmt::Arguments<'_>,
+) -> Result<(), SqlError> {
+    let (code, prefix) = match (is_grant, allowed.0 == 0) {
+        (true, true) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+            "no privileges were granted for",
+        ),
+        (true, false) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+            "not all privileges were granted for",
+        ),
+        (false, true) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_REVOKED,
+            "no privileges could be revoked for",
+        ),
+        (false, false) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_REVOKED,
+            "not all privileges could be revoked for",
+        ),
+    };
+    if allowed.0 != 0 && (all_privileges || allowed.0 == requested.0) {
+        return Ok(());
+    }
+    crate::sql::eval::raise_eval_message(
+        crate::sql::eval::EvalMessageLevel::Warning,
+        code,
+        format_args!("{prefix} {target}"),
+    )
+}
+
+/// Receives a revoked column's name and its column-privilege target, which a
+/// system column has none of.
+type RevokedColumnVisitor<'v> =
+    dyn FnMut(&str, Option<crate::storage::ColumnPrivilegeTarget>) -> Result<(), SqlError> + 'v;
+
+/// The columns PostgreSQL revokes a relation's column privileges from with
+/// a relation-level REVOKE, in attribute order: the system columns of a
+/// relation that has them, then its columns.
+fn visit_revoked_relation_columns(
+    storage: &Storage,
+    relation: crate::storage::AccessObject,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut RevokedColumnVisitor<'_>,
+) -> Result<(), SqlError> {
     use crate::storage::AccessClass;
-    match class {
+    if relation.class != AccessClass::View {
+        for system in ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid"] {
+            visit(system, None)?;
+        }
+    }
+    match relation.class {
+        AccessClass::Table | AccessClass::MaterializedView => {
+            let table = match relation.class {
+                AccessClass::Table => relation.slot as usize,
+                _ => {
+                    let (schema, name) = storage.access_object_name_to(relation, txid);
+                    storage
+                        .find_table(schema.as_str(), name.as_str())
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "materialized view \"{}\" has no table row",
+                                name.as_str()
+                            )
+                        })?
+                }
+            };
+            let definition = (*storage.table_def(table, txid)).clone();
+            for (column, metadata) in definition.columns().iter().enumerate() {
+                visit(
+                    metadata.name.as_str(),
+                    crate::storage::ColumnPrivilegeTarget::new(relation, column as u16).ok(),
+                )?;
+            }
+        }
+        AccessClass::View => {
+            let view = storage.view(relation.slot as usize);
+            let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+            let count = super::catalog::describe_view(&view, txid, arena, &mut descriptions)?;
+            for (column, description) in descriptions[..count].iter().enumerate() {
+                visit(
+                    description.name,
+                    crate::storage::ColumnPrivilegeTarget::new(relation, column as u16).ok(),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a column warning needs the relation's grant authority and the revocation"
+)]
+/// The warnings of a relation-level REVOKE (or DROP OWNED) for each column,
+/// whose column privileges it revokes too: a column's grant options are the
+/// relation's and its own.
+fn warn_restricted_column_revocations(
+    storage: &Storage,
+    relation: crate::storage::AccessObject,
+    current: usize,
+    requested: crate::storage::PrivilegeSet,
+    relation_available: crate::storage::PrivilegeSet,
+    all_privileges: bool,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use crate::storage::{AccessClass, PrivilegeSet};
+    if !matches!(
+        relation.class,
+        AccessClass::Table | AccessClass::View | AccessClass::MaterializedView
+    ) {
+        return Ok(());
+    }
+    let column_requested = PrivilegeSet(
+        requested.0
+            & PrivilegeSet::SELECT
+                .union(PrivilegeSet::INSERT)
+                .union(PrivilegeSet::UPDATE)
+                .union(PrivilegeSet::REFERENCES)
+                .0,
+    );
+    if column_requested.0 == 0 || relation_available.contains(column_requested) {
+        return Ok(());
+    }
+    let (_, relation_name) = storage.access_object_name_to(relation, txid);
+    visit_revoked_relation_columns(storage, relation, txid, arena, &mut |name, target| {
+        let mut available = PrivilegeSet(column_requested.0 & relation_available.0);
+        if let Some(target) = target {
+            for bit in (0..16).map(|bit| PrivilegeSet(1 << bit)) {
+                if column_requested.contains(bit)
+                    && storage.has_column_grant_option(target, current, bit, txid)
+                {
+                    available = available.union(bit);
+                }
+            }
+        }
+        warn_restricted_privileges(
+            false,
+            all_privileges,
+            column_requested,
+            available,
+            format_args!(
+                "column \"{}\" of relation \"{}\"",
+                name,
+                relation_name.as_str()
+            ),
+        )
+    })
+}
+
+/// The object kind PostgreSQL's `aclcheck_error` names in a permission
+/// error.
+fn privilege_object_noun(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    txid: u32,
+) -> &'static str {
+    use crate::storage::AccessClass;
+    match object.class {
         AccessClass::Database => "database",
         AccessClass::Schema => "schema",
         AccessClass::Sequence => "sequence",
@@ -12662,6 +12934,17 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
         AccessClass::Language => "language",
         AccessClass::Tablespace => "tablespace",
+        AccessClass::ForeignDataWrapper => "foreign-data wrapper",
+        AccessClass::ForeignServer => "foreign server",
+        AccessClass::View => "view",
+        AccessClass::MaterializedView => "materialized view",
+        AccessClass::Table
+            if storage.table_def(usize::from(object.slot), txid).kind
+                == crate::storage::TableKind::Foreign =>
+        {
+            "foreign table"
+        }
+        AccessClass::Table => "table",
         _ => "relation",
     }
 }
@@ -13459,6 +13742,23 @@ fn drop_owned_privileges(
         privileges: column_queue_privileges,
     };
     let mut queue_count = 0usize;
+    // PostgreSQL revokes the roles' privileges as the current role: an
+    // object it cannot revoke anything on keeps them, with a warning.
+    let current = storage
+        .current_role_slot(txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+    let checked = arena
+        .alloc_slice_with(graph_capacity, |_| {
+            (
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: 0,
+                },
+                false,
+            )
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut checked_count = 0usize;
 
     for slot in 0..storage.acl_entry_count() {
         let entry = storage.acl_entry(slot);
@@ -13468,6 +13768,57 @@ fn drop_owned_privileges(
             || !storage.access_object_visible_to(entry.object, txn.txid)
             || (!roles.contains(&grantee) && !roles.contains(&grantor))
         {
+            continue;
+        }
+        let revocable = match checked[..checked_count]
+            .iter()
+            .find(|(object, _)| *object == entry.object)
+        {
+            Some((_, revocable)) => *revocable,
+            None => {
+                let every = privilege_mask(
+                    &[crate::sql::ast::PrivilegeSpec {
+                        privilege: crate::sql::ast::Privilege::All,
+                        columns: &[],
+                    }],
+                    entry.object.class,
+                    false,
+                )?;
+                let allowed =
+                    restricted_privileges(storage, entry.object, current, every, txn.txid)?;
+                if allowed.0 == 0 && every.0 != 0 {
+                    let (_, name) = storage.access_object_name_to(entry.object, txn.txid);
+                    warn_restricted_privileges(
+                        false,
+                        true,
+                        every,
+                        allowed,
+                        format_args!("\"{}\"", name.as_str()),
+                    )?;
+                    warn_restricted_column_revocations(
+                        storage,
+                        entry.object,
+                        current,
+                        every,
+                        allowed,
+                        true,
+                        txn.txid,
+                        arena,
+                    )?;
+                }
+                if checked_count == checked.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "privilege dependency graph exceeds {} entries",
+                        checked.len()
+                    ));
+                }
+                checked[checked_count] = (entry.object, allowed.0 != 0 || every.0 == 0);
+                checked_count += 1;
+                allowed.0 != 0 || every.0 == 0
+            }
+        };
+        if !revocable {
             continue;
         }
         let lost_options = record_acl_removal(storage, txn, slot)?;
@@ -13602,8 +13953,60 @@ fn drop_owned_privileges(
     Ok(())
 }
 
+/// `DROP OWNED`: PostgreSQL drops every object the roles own in this
+/// database as one deletion, so one report covers what it reaches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_owned(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    roles: &[&str],
+    cascade: bool,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+) -> Outcome {
+    let report = (|| {
+        let owned_roles = arena
+            .alloc_slice_with(roles.len(), |_| 0u16)
+            .map_err(|_| super::query::arena_full_pub())?;
+        let owned_role_count = resolve_owned_roles(storage, txn.txid, roles, owned_roles)?;
+        let owned_roles = &owned_roles[..owned_role_count];
+        let dependencies = crate::sql::catalog::shared_dependencies(storage, txn.txid, arena)?;
+        // Databases are not dropped with their owner (`pg_database` is 1262).
+        let owned = |dependency: &&crate::sql::catalog::SharedDependency| {
+            dependency.kind == b'o'
+                && dependency.database.is_none()
+                && dependency.class != 1262
+                && owned_roles.contains(&dependency.role)
+        };
+        let count = dependencies.iter().filter(owned).count();
+        let originals = arena
+            .alloc_slice_with(count, |_| ObjectAddress::new(0, 0, 0))
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (original, dependency) in originals.iter_mut().zip(dependencies.iter().filter(owned)) {
+            *original = ObjectAddress::new(dependency.class, dependency.object, dependency.sub);
+        }
+        dependency_report::report_drop(storage, txn.txid, originals, cascade, arena, responder)
+    })();
+    run_reported_drop(report, responder, |responder| {
+        drop_owned_objects(
+            storage,
+            wal,
+            txn,
+            scratch,
+            roles,
+            cascade,
+            arena,
+            seq_session,
+            responder,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_owned_objects(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -15250,6 +15653,11 @@ pub fn grant_privileges(
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
+    // Naming every privilege warns only when none can change.
+    let all_privileges = privileges.iter().any(|specification| {
+        specification.privilege == crate::sql::ast::Privilege::All
+            && specification.columns.is_empty()
+    });
     let current = super::eval::funcs::system::current_user_owned();
     let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -15277,20 +15685,25 @@ pub fn grant_privileges(
         if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
-        let requested = match privilege_mask(privileges, object.class, false) {
+        let named = match privilege_mask(privileges, object.class, false) {
             Ok(mask) => mask,
             Err(error) => return sql_fail(error),
         };
-        if requested.0 != 0
-            && !storage.has_object_grant_option(*object, grantor, requested, txn.txid)
-        {
-            let (_, name) = storage.access_object_name(*object);
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for {} {}",
-                privilege_object_noun(object.class),
-                name.as_str()
-            ));
+        let requested = match restricted_privileges(storage, *object, grantor, named, txn.txid) {
+            Ok(requested) => requested,
+            Err(error) => return sql_fail(error),
+        };
+        if named.0 != 0 {
+            let (_, name) = storage.access_object_name_to(*object, txn.txid);
+            if let Err(error) = warn_restricted_privileges(
+                true,
+                all_privileges,
+                named,
+                requested,
+                format_args!("\"{}\"", name.as_str()),
+            ) {
+                return sql_fail(error);
+            }
         }
         let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
@@ -15480,6 +15893,11 @@ pub fn revoke_privileges(
         roles: column_queue_roles,
         privileges: column_queue_privileges,
     };
+    // Naming every privilege warns only when none can change.
+    let all_privileges = privileges.iter().any(|specification| {
+        specification.privilege == crate::sql::ast::Privilege::All
+            && specification.columns.is_empty()
+    });
     let current = super::eval::funcs::system::current_user_owned();
     let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -15501,20 +15919,37 @@ pub fn revoke_privileges(
         if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
-        let requested = match privilege_mask(privileges, object.class, false) {
+        let named = match privilege_mask(privileges, object.class, false) {
             Ok(mask) => mask,
             Err(error) => return sql_fail(error),
         };
-        if requested.0 != 0
-            && !storage.has_object_grant_option(*object, grantor, requested, txn.txid)
-        {
-            let (_, name) = storage.access_object_name(*object);
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for {} {}",
-                privilege_object_noun(object.class),
-                name.as_str()
-            ));
+        let requested = match restricted_privileges(storage, *object, grantor, named, txn.txid) {
+            Ok(requested) => requested,
+            Err(error) => return sql_fail(error),
+        };
+        if named.0 != 0 {
+            let (_, name) = storage.access_object_name_to(*object, txn.txid);
+            if let Err(error) = warn_restricted_privileges(
+                false,
+                all_privileges,
+                named,
+                requested,
+                format_args!("\"{}\"", name.as_str()),
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = warn_restricted_column_revocations(
+                storage,
+                *object,
+                grantor,
+                named,
+                requested,
+                all_privileges,
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
         }
         let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
@@ -32631,6 +33066,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateRoutine(routine) => engine.execute_create_routine(
@@ -49051,6 +49487,10 @@ pub(crate) fn alter_operator_class(
     sql_ok()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the drop reports its dependents from the statement arena"
+)]
 pub(crate) fn drop_operator_classes(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -49058,6 +49498,7 @@ pub(crate) fn drop_operator_classes(
     names: &[crate::sql::ast::QualName<'_>],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -49090,8 +49531,29 @@ pub(crate) fn drop_operator_classes(
         ) {
             return sql_fail(error);
         }
-        if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot, cascade) {
-            return sql_fail(error);
+        // PostgreSQL reports every object the drop reaches in one notice,
+        // or refuses a RESTRICT drop with that report.
+        let report = dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &[ObjectAddress::new(
+                crate::sql::catalog::PG_OPCLASS_OID,
+                storage.operator_class(slot).oid(),
+                0,
+            )],
+            cascade,
+            arena,
+            responder,
+        );
+        match run_reported_drop(report, responder, |responder| {
+            if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot, cascade) {
+                return sql_fail(error);
+            }
+            responder.send_dependency_notice()?;
+            sql_ok()
+        })? {
+            Ok(()) => {}
+            Err(error) => return sql_fail(error),
         }
     }
     responder.command_complete("DROP OPERATOR CLASS")?;
@@ -53723,6 +54185,19 @@ pub fn create_view(
             crate::storage::RelationPersistence::Permanent
         }
     };
+    // PostgreSQL reports the inferred persistence before it places the view.
+    if inferred_temporary
+        && matches!(persistence, crate::storage::RelationPersistence::Temporary)
+        && matches!(
+            requested_persistence,
+            super::ast::RelationPersistence::Permanent
+        )
+    {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(128, "view \"{}\" will be a temporary view", name.name).as_str(),
+        )?;
+    }
     let schema = match if persistence == crate::storage::RelationPersistence::Temporary {
         if name.schema.is_some_and(|schema| schema != "pg_temp") {
             Err(sql_err!(
@@ -53821,18 +54296,6 @@ pub fn create_view(
                 Err(error) => return sql_fail(error),
             };
         }
-    }
-    if inferred_temporary
-        && matches!(persistence, crate::storage::RelationPersistence::Temporary)
-        && matches!(
-            requested_persistence,
-            super::ast::RelationPersistence::Permanent
-        )
-    {
-        responder.notice(
-            sqlstate::SUCCESSFUL_COMPLETION,
-            stack_format!(128, "view \"{}\" will be a temporary view", name.name).as_str(),
-        )?;
     }
     let mut creation_path = crate::util::StackStr::<128>::new();
     let _ = core::fmt::Write::write_str(&mut creation_path, raw_path);
@@ -68355,7 +68818,7 @@ pub fn create_statistics(
     {
         if if_not_exists {
             responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
+                sqlstate::DUPLICATE_OBJECT,
                 stack_format!(
                     160,
                     "statistics object \"{}\" already exists, skipping",
@@ -68793,15 +69256,37 @@ pub(crate) fn analyze_extended_statistics(
             }
             continue;
         }
-        if !selected_columns.is_empty()
-            && definition.keys_for(txn.txid).iter().any(|key| match key {
+        if !selected_columns.is_empty() {
+            let column_missing = definition.keys_for(txn.txid).iter().any(|key| match key {
                 ExtendedStatisticsKey::Column(column) => table_definition
                     .column_index(column.as_str())
                     .is_none_or(|column| !selected_columns.contains(&column)),
-                ExtendedStatisticsKey::Expression(_) => true,
-            })
-        {
-            continue;
+                ExtendedStatisticsKey::Expression(_) => false,
+            });
+            // PostgreSQL warns about an object whose columns the ANALYZE
+            // left out; it keeps its earlier statistics.
+            if column_missing {
+                let named = definition.definition_for(txn.txid);
+                crate::sql::eval::raise_eval_message(
+                    crate::sql::eval::EvalMessageLevel::Warning,
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    format_args!(
+                        "statistics object \"{}.{}\" could not be computed for relation \"{}.{}\"",
+                        named.schema.as_str(),
+                        named.name.as_str(),
+                        table_definition.schema.as_str(),
+                        table_definition.name.as_str()
+                    ),
+                )?;
+                continue;
+            }
+            if definition
+                .keys_for(txn.txid)
+                .iter()
+                .any(|key| matches!(key, ExtendedStatisticsKey::Expression(_)))
+            {
+                continue;
+            }
         }
         let analyzed_generation = storage.table(table).generation();
         arena.reset();
@@ -70076,7 +70561,7 @@ pub fn create_index(
                     Some(super::UtilityCommand::CreateIndexWithoutRestart);
             }
             responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
+                sqlstate::DUPLICATE_TABLE,
                 stack_format!(
                     128,
                     "relation \"{}\" already exists, skipping",
@@ -72523,48 +73008,60 @@ pub(crate) fn drop_access_method(
             .find(|(candidate, _)| *candidate == slot)
             .map(|(_, method)| method)
             .expect("resolved access method is visible");
-        while let Some((schema, table)) =
-            storage.access_method_table_dependency(method.oid(), txn.txid)
-        {
-            if !cascade {
-                return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop access method {} because other objects depend on it\nDETAIL:  table {} depends on access method {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
-                    name,
-                    table.as_str(),
-                    name
-                ));
+        // PostgreSQL reports every object the drop reaches in one notice,
+        // or refuses a RESTRICT drop with that report.
+        let report = dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &[ObjectAddress::new(
+                crate::sql::catalog::PG_AM_OID,
+                method.oid().get(),
+                0,
+            )],
+            cascade,
+            arena,
+            responder,
+        );
+        match run_reported_drop(report, responder, |responder| {
+            while let Some((schema, table)) =
+                storage.access_method_table_dependency(method.oid(), txn.txid)
+            {
+                let relation = QualName {
+                    schema: Some(schema.as_str()),
+                    name: table.as_str(),
+                };
+                let statement = DropTable {
+                    names: core::slice::from_ref(&relation),
+                    if_exists: false,
+                    cascade: true,
+                };
+                let outcome = responder.without_command_complete(|responder| {
+                    drop_table_kind_with_columns(
+                        storage,
+                        wal,
+                        txn,
+                        &statement,
+                        Some(crate::storage::TableKind::Local),
+                        "DROP TABLE",
+                        arena,
+                        RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        },
+                        responder,
+                    )
+                });
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return sql_fail(error),
+                    Err(error) => return Err(error),
+                }
             }
-            let relation = QualName {
-                schema: Some(schema.as_str()),
-                name: table.as_str(),
-            };
-            let statement = DropTable {
-                names: core::slice::from_ref(&relation),
-                if_exists: false,
-                cascade: true,
-            };
-            let outcome = responder.without_command_complete(|responder| {
-                drop_table_kind_with_columns(
-                    storage,
-                    wal,
-                    txn,
-                    &statement,
-                    Some(crate::storage::TableKind::Local),
-                    "DROP TABLE",
-                    arena,
-                    RowTypeColumnCascade {
-                        scratch: &mut *scratch,
-                        seq_session,
-                    },
-                    responder,
-                )
-            });
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return sql_fail(error),
-                Err(error) => return Err(error),
-            }
+            responder.send_dependency_notice()?;
+            sql_ok()
+        })? {
+            Ok(()) => {}
+            Err(error) => return sql_fail(error),
         }
         let comment = match storage.set_comment(
             crate::storage::CommentClass::AccessMethod,
@@ -93215,6 +93712,35 @@ fn alter_table_inner(
             let definition = storage.table_def(table, txn.txid);
             (definition.schema, definition.name)
         };
+        // PostgreSQL adds a column to each child once per parent that has
+        // it; every parent after the first merges into the child's column.
+        if position > 0 {
+            let merges = storage
+                .table_def(table, txn.txid)
+                .inheritance
+                .parents_ref()
+                .iter()
+                .filter(|parent| order[..position].contains(&usize::from(**parent)))
+                .count()
+                .saturating_sub(1);
+            for action in inherited_actions.as_slice() {
+                let AlterAction::AddColumn { definition, .. } = action else {
+                    continue;
+                };
+                for _ in 0..merges {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            192,
+                            "merging definition of column \"{}\" for child \"{}\"",
+                            definition.name,
+                            name.as_str()
+                        )
+                        .as_str(),
+                    )?;
+                }
+            }
+        }
         let inherited = AlterTable {
             table: QualName {
                 schema: Some(schema.as_str()),
@@ -94620,7 +95146,7 @@ fn alter_table_relation(
                 if new_def.column_index(c.name).is_some() {
                     if *if_not_exists {
                         responder.notice(
-                            sqlstate::SUCCESSFUL_COMPLETION,
+                            sqlstate::DUPLICATE_COLUMN,
                             stack_format!(
                                 160,
                                 "column \"{}\" of relation \"{}\" already exists, skipping",
@@ -95857,18 +96383,47 @@ fn alter_table_relation(
                         def.name.as_str()
                     ));
                 }
-                if named_key_columns(&new_def, name).is_some()
-                    && let Err(error) = drop_dependent_foreign_keys(
+                // PostgreSQL reports every object the constraint's drop
+                // reaches in one notice, or refuses with that report.
+                let report = match crate::sql::catalog::table_constraint_oid(
+                    storage,
+                    txn.txid,
+                    table_index,
+                    name,
+                ) {
+                    Some(oid) => dependency_report::report_drop(
                         storage,
-                        wal,
-                        txn,
-                        table_index,
-                        &mut new_def,
-                        name,
+                        txn.txid,
+                        &[ObjectAddress::new(
+                            crate::sql::catalog::PG_CONSTRAINT_OID,
+                            oid,
+                            0,
+                        )],
                         *cascade,
-                    )
-                {
-                    return sql_fail(error);
+                        arena,
+                        responder,
+                    ),
+                    None => Ok(None),
+                };
+                match run_reported_drop(report, responder, |responder| {
+                    if named_key_columns(&new_def, name).is_some()
+                        && let Err(error) = drop_dependent_foreign_keys(
+                            storage,
+                            wal,
+                            txn,
+                            table_index,
+                            &mut new_def,
+                            name,
+                            *cascade,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                    responder.send_dependency_notice()?;
+                    sql_ok()
+                })? {
+                    Ok(()) => {}
+                    Err(error) => return sql_fail(error),
                 }
                 if drop_named_constraint(&mut new_def, name) {
                     let name = match SqlName::parse(name) {

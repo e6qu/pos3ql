@@ -18053,80 +18053,132 @@ fn pg_publication_namespace<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+/// `pg_publication_rel`'s class OID.
+pub(crate) const PG_PUBLICATION_REL_OID: i32 = 6106;
+
+/// One table a publication lists explicitly, as a `pg_publication_rel` row:
+/// its row identity, its publication and table, and its column list.
+#[derive(Clone, Copy)]
+pub(crate) struct PublicationRelation {
+    pub(crate) oid: i32,
+    pub(crate) publication_slot: usize,
+    pub(crate) publication_oid: i32,
+    /// The table's position in its publication's list.
+    pub(crate) position: usize,
+    pub(crate) table: usize,
+    pub(crate) columns: crate::storage::ColumnSet,
+}
+
+/// Visits every `pg_publication_rel` row in catalog order. The rows are
+/// numbered in this order, so it is the one source of their identities.
+pub(crate) fn visit_publication_relations(
+    storage: &Storage,
+    txid: u32,
+    visit: &mut dyn FnMut(PublicationRelation) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mut count = 0i32;
+    for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
+        let definition = publication.definition_for(txid);
+        if definition.all_tables {
+            continue;
+        }
+        for (position, (member, columns)) in definition.tables[..definition.table_count]
+            .iter()
+            .zip(&definition.table_column_masks[..definition.table_count])
+            .enumerate()
+        {
+            visit(PublicationRelation {
+                oid: FIRST_USER_OID + 90_000 + count,
+                publication_slot: slot,
+                publication_oid: publication.oid(),
+                position,
+                table: usize::from(*member),
+                columns: *columns,
+            })?;
+            count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The `pg_publication_rel` row with identity `oid`.
+pub(crate) fn publication_relation_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<PublicationRelation>, SqlError> {
+    let mut found = None;
+    visit_publication_relations(storage, txid, &mut |relation| {
+        if relation.oid == oid {
+            found = Some(relation);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn pg_publication_rel<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_publication_rel", false);
-    let row_capacity = storage
-        .publications_with_slots_visible_to(txid)
-        .map(|(_, publication)| {
-            let definition = publication.definition_for(txid);
-            if definition.all_tables {
-                0
-            } else {
-                definition.table_count
-            }
-        })
-        .sum();
+    let mut row_capacity = 0usize;
+    visit_publication_relations(storage, txid, &mut |_| {
+        row_capacity += 1;
+        Ok(())
+    })?;
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
-        let definition = publication.definition_for(txid);
-        if definition.all_tables {
-            continue;
+    visit_publication_relations(storage, txid, &mut |relation| {
+        let publication = storage
+            .publication_at(relation.publication_slot)
+            .definition_for(txid);
+        let filter = publication.table_filters.get(relation.position);
+        let prqual = if filter.is_empty() {
+            Datum::Null
+        } else {
+            let rendered = stack_format!(66, "({filter})");
+            text(rendered.as_str(), arena)?
+        };
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_publication_rel exceeds {} rows",
+                rows.len()
+            ));
         }
-        for (index, (member, column_mask)) in definition.tables[..definition.table_count]
-            .iter()
-            .zip(&definition.table_column_masks[..definition.table_count])
-            .enumerate()
-        {
-            let filter = definition.table_filters.get(index);
-            let prqual = if filter.is_empty() {
-                Datum::Null
-            } else {
-                let rendered = stack_format!(66, "({filter})");
-                text(rendered.as_str(), arena)?
-            };
-            if count == rows.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pg_publication_rel exceeds {} rows",
-                    rows.len()
-                ));
-            }
-            let prattrs = if column_mask.is_empty() {
-                Datum::Null
-            } else {
-                let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
-                let mut attribute_count = 0usize;
-                for column in 0..crate::storage::MAX_COLUMNS {
-                    if column_mask.contains(column) {
-                        attributes[attribute_count] = column as u16;
-                        attribute_count += 1;
-                    }
+        let prattrs = if relation.columns.is_empty() {
+            Datum::Null
+        } else {
+            let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
+            let mut attribute_count = 0usize;
+            for column in 0..crate::storage::MAX_COLUMNS {
+                if relation.columns.contains(column) {
+                    attributes[attribute_count] = column as u16;
+                    attribute_count += 1;
                 }
-                int2vector(
-                    &attributes[..attribute_count],
-                    Some(&storage.table_def(usize::from(*member), txid)),
-                    arena,
-                )?
-            };
-            rows[count] = row(
-                &[
-                    Datum::Int4(6106),
-                    Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
-                    Datum::Int4(publication.oid()),
-                    Datum::Int4(user_table_oid(storage, *member as usize)),
-                    prqual,
-                    prattrs,
-                ],
+            }
+            int2vector(
+                &attributes[..attribute_count],
+                Some(&storage.table_def(relation.table, txid)),
                 arena,
-            )?;
-            count += 1;
-        }
-    }
+            )?
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(PG_PUBLICATION_REL_OID),
+                Datum::Int4(relation.oid),
+                Datum::Int4(relation.publication_oid),
+                Datum::Int4(user_table_oid(storage, relation.table)),
+                prqual,
+                prattrs,
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    })?;
     finish(definition, &rows[..count], arena)
 }
 

@@ -12,7 +12,14 @@ use crate::sql_err;
 use crate::storage::{RoutineKind, Storage};
 use crate::util::StackStr;
 
-pub(crate) const MAX_ADDRESS_PARTS: usize = crate::storage::MAX_DEFINITION_ITEMS;
+/// A routine's address lists every argument type, so the parts hold the
+/// larger of a definition's items and a routine's arguments.
+pub(crate) const MAX_ADDRESS_PARTS: usize =
+    if crate::storage::MAX_ROUTINE_ARGUMENTS > crate::storage::MAX_DEFINITION_ITEMS {
+        crate::storage::MAX_ROUTINE_ARGUMENTS
+    } else {
+        crate::storage::MAX_DEFINITION_ITEMS
+    };
 type EventIdentity = StackStr<8192>;
 type EventAddressPart = StackStr<512>;
 
@@ -3055,6 +3062,32 @@ fn existing_catalog_object(
         return default_acl_object(storage, txid, object_id)
             .filter(|_| sub_id == 0)
             .ok_or_else(|| catalog_lookup_failed(class_id, object_id));
+    }
+    if class_id == catalog::PG_PUBLICATION_REL_OID {
+        let relation = catalog::publication_relation_by_oid(storage, txid, object_id)?
+            .filter(|_| sub_id == 0)
+            .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+        let table = storage.table_def(relation.table, txid);
+        let publication = storage.publication_at(relation.publication_slot);
+        let mut identity = qualified(table.schema.as_str(), table.name.as_str())?;
+        write!(
+            identity,
+            " in publication {}",
+            identifier(publication.name_for(txid).as_str()).as_str()
+        )
+        .map_err(|_| graph_full())?;
+        if identity.is_truncated() {
+            return Err(graph_full());
+        }
+        return Ok(base_object(
+            class_id,
+            object_id,
+            "publication relation",
+            None,
+            None,
+            identity,
+            false,
+        ));
     }
     let reference = match class_id {
         catalog::PG_CLASS_OID => {

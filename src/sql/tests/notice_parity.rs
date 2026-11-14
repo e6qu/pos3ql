@@ -268,3 +268,116 @@ fn analysis_does_not_repeat_literal_input_notices() {
         }
     });
 }
+
+#[test]
+fn grants_without_grant_options_warn_like_postgresql() {
+    with_engine("notice-grant-options", |engine, budget| {
+        for sql in [
+            "CREATE ROLE rv1",
+            "CREATE ROLE rv2",
+            "CREATE TABLE rvt (id int)",
+            "GRANT SELECT ON rvt TO rv1, rv2",
+            "CREATE ROLE rv_none",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let revoked =
+            |target: &str| format!("WARNING 01006 no privileges could be revoked for {target}");
+        let mut expected = vec![revoked("\"rvt\"")];
+        for column in ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid", "id"] {
+            expected.push(revoked(&format!("column \"{column}\" of relation \"rvt\"")));
+        }
+        expected.push("REVOKE".to_owned());
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE rv1; REVOKE SELECT ON rvt FROM rv2; RESET ROLE",
+            )[1..expected.len() + 1],
+            expected[..]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE rv1; GRANT UPDATE ON rvt TO rv2; RESET ROLE"
+            )[1..3],
+            [
+                "WARNING 01007 no privileges were granted for \"rvt\"",
+                "GRANT"
+            ]
+        );
+        // A role with no privilege at all on the object is refused.
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "SET ROLE rv_none; GRANT SELECT ON rvt TO rv2; RESET ROLE"
+            )[1],
+            "ERROR 42501 permission denied for table rvt"
+        );
+        run_with(engine, budget, "RESET ROLE");
+    });
+}
+
+#[test]
+fn catalog_and_role_notices_match_postgresql() {
+    with_engine("notice-catalog-roles", |engine, budget| {
+        assert_eq!(
+            messages(engine, budget, "CREATE ROLE empty_password PASSWORD ''"),
+            [
+                "NOTICE 00000 empty string is not a valid password, clearing password",
+                "CREATE ROLE"
+            ]
+        );
+        run_with(
+            engine,
+            budget,
+            "CREATE ROLE md5_role PASSWORD 'md547fcb6615d41c53cd39822141eb05da2'",
+        );
+        assert_eq!(
+            messages(engine, budget, "ALTER ROLE md5_role RENAME TO md5_renamed"),
+            [
+                "NOTICE 00000 MD5 password cleared because of role rename",
+                "ALTER ROLE"
+            ]
+        );
+        for sql in [
+            "CREATE ACCESS METHOD dam TYPE TABLE HANDLER heap_tableam_handler",
+            "CREATE TABLE damt (id integer) USING dam",
+            "CREATE TABLE ppd (id integer PRIMARY KEY, discarded text, retained text)",
+            "CREATE PUBLICATION ppd_changes FOR TABLE ppd (id, retained)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            messages(engine, budget, "DROP ACCESS METHOD dam CASCADE"),
+            [
+                "NOTICE 00000 drop cascades to table damt",
+                "DROP ACCESS METHOD"
+            ]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "ALTER TABLE ppd DROP COLUMN retained CASCADE"
+            ),
+            [
+                "NOTICE 00000 drop cascades to publication of table ppd in publication ppd_changes",
+                "ALTER TABLE"
+            ]
+        );
+        assert_eq!(
+            messages(
+                engine,
+                budget,
+                "ALTER TABLE ppd ADD COLUMN IF NOT EXISTS id integer",
+            ),
+            [
+                "NOTICE 42701 column \"id\" of relation \"ppd\" already exists, skipping",
+                "ALTER TABLE"
+            ]
+        );
+    });
+}

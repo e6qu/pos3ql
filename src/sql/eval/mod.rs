@@ -667,6 +667,7 @@ pub mod sqlstate {
     pub const SERIALIZATION_FAILURE: &str = "40001";
     pub const SUCCESSFUL_COMPLETION: &str = "00000";
     pub const WARNING: &str = "01000";
+    pub const WARNING_PRIVILEGE_NOT_REVOKED: &str = "01006";
     pub const UNIQUE_VIOLATION: &str = "23505";
     pub const RAISE_EXCEPTION: &str = "P0001";
     pub const NO_DATA_FOUND: &str = "P0002";
@@ -2961,6 +2962,14 @@ pub trait CatalogAccess {
         _oid: i32,
         _arena: &'a crate::mem::arena::Arena,
     ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    /// The table OID and publication name of a visible `pg_publication_rel`
+    /// row.
+    fn publication_relation(
+        &self,
+        _oid: i32,
+    ) -> Result<Option<(i32, crate::storage::SqlName)>, SqlError> {
         Ok(None)
     }
     /// The name of a visible database.

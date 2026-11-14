@@ -22721,6 +22721,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateExtension {
@@ -26263,6 +26264,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let required_package = match self
                     .storage
                     .extension_package_for_version(required.as_str(), None)
@@ -26367,6 +26377,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let namespace = self
                     .storage
                     .extension(plan.extension)

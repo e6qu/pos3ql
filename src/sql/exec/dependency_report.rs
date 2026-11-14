@@ -584,6 +584,15 @@ pub(crate) fn report(
     }
     for target in walk.targets.iter().rev() {
         if target.flags & ORIGINAL != 0 {
+            // An executor of a drop with several originals (`DROP OWNED`)
+            // may name another original as its own dependent; the filter
+            // admits it, and the notice leaves it out as PostgreSQL does.
+            let mark = arena.mark();
+            if let Ok(description) = describe(storage, txid, target.object, arena) {
+                filter.insert(description);
+            }
+            // SAFETY: the filter copied the description.
+            unsafe { arena.rewind_to(mark) };
             continue;
         }
         let mark = arena.mark();

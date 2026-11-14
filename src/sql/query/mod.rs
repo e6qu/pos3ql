@@ -6296,6 +6296,24 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
 
+    fn publication_relation(
+        &self,
+        oid: i32,
+    ) -> Result<Option<(i32, crate::storage::SqlName)>, SqlError> {
+        Ok(
+            super::catalog::publication_relation_by_oid(self.storage, self.txid, oid)?.map(
+                |relation| {
+                    (
+                        super::catalog::user_table_oid(self.storage, relation.table),
+                        self.storage
+                            .publication_at(relation.publication_slot)
+                            .name_for(self.txid),
+                    )
+                },
+            ),
+        )
+    }
+
     fn user_mapping_description<'a>(
         &self,
         oid: i32,

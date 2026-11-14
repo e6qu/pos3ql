@@ -5290,10 +5290,22 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
         }
     }
     let column = |position: usize| match branch.items.get(position)? {
+        // A `VALUES` row's columns print bare, by their names.
+        item if branch.from.is_none() => Some((None, output_name(item)?)),
         SelectItem::Expr {
             expression: Expr::Column { qualifier, name },
             ..
-        } => Some((qualifier.or(relation)?, *name)),
+        } => match qualifier.or(relation) {
+            Some(qualifier) => Some((Some(qualifier), *name)),
+            // A `VALUES` list's columns print bare.
+            None if branch.from.as_ref().is_none_or(|from| {
+                from.joins.is_empty() && from.base.subquery.and_then(values_list).is_some()
+            }) =>
+            {
+                Some((None, *name))
+            }
+            None => None,
+        },
         _ => None,
     };
     let mut keys = PlanKeys {
@@ -5320,8 +5332,10 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
         if index != 0 {
             let _ = keys.plain.write_char(KEY_SEPARATOR);
         }
-        crate::sql::catalog::write_identifier(&mut keys.plain, qualifier);
-        let _ = keys.plain.write_char('.');
+        if let Some(qualifier) = qualifier {
+            crate::sql::catalog::write_identifier(&mut keys.plain, qualifier);
+            let _ = keys.plain.write_char('.');
+        }
         crate::sql::catalog::write_identifier(&mut keys.plain, name);
         if order.descending {
             let _ = write!(keys.plain, " DESC");

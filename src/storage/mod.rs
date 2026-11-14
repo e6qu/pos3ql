@@ -38625,11 +38625,25 @@ impl Storage {
             }
         }
         match_slot.or(default).ok_or_else(|| {
-            sql_err!(
+            let parent = self.table_def(parent_slot, txid);
+            let error = sql_err!(
                 sqlstate::CHECK_VIOLATION,
                 "no partition of relation \"{}\" found for row",
-                self.table_def(parent_slot, txid).name.as_str()
-            )
+                parent.name.as_str()
+            );
+            let Some(scheme) = parent.partition.scheme else {
+                return error;
+            };
+            let names = scheme.keys[..usize::from(scheme.n_keys)]
+                .iter()
+                .map(|key| parent.columns()[usize::from(*key)].name.as_str());
+            match crate::sql::exec::partition_key_detail(&mut { names }, &mut row.key_values()) {
+                Ok(detail) => crate::sql::error_position::with_detail(
+                    error,
+                    format_args!("{}", detail.as_str()),
+                ),
+                Err(error) => error,
+            }
         })
     }
 

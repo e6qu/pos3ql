@@ -136,6 +136,36 @@ fn write_key_description(
     let _ = detail.write_char(')');
 }
 
+/// `Partition key of the failing row contains (a, b) = (1, 2).`,
+/// PostgreSQL's detail for a row no partition accepts
+/// (`ExecBuildSlotPartitionKeyDescription`).
+pub(crate) fn partition_key_detail<'v>(
+    columns: &mut dyn Iterator<Item = &str>,
+    values: &mut dyn Iterator<Item = Datum<'v>>,
+) -> Result<DetailText, SqlError> {
+    use core::fmt::Write;
+    let mut detail = DetailText::new();
+    let _ = detail.write_str("Partition key of the failing row contains (");
+    for (index, column) in columns.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        let _ = detail.write_str(column);
+    }
+    let _ = detail.write_str(") = (");
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            let _ = detail.write_str(", ");
+        }
+        write_described_value(&mut detail, value);
+    }
+    let _ = detail.write_str(").");
+    if detail.is_truncated() {
+        return Err(detail_full());
+    }
+    Ok(detail)
+}
+
 /// A key description followed by `suffix`, such as ` already exists.`.
 pub(crate) fn key_detail<'v>(
     columns: &mut dyn Iterator<Item = &str>,

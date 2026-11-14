@@ -93586,6 +93586,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
                 command: session.transaction.command_id(),
             },
             None,
+            crate::sql::exec::DmlSelection::Qualified,
         )
     })
     .unwrap();

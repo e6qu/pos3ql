@@ -161,6 +161,31 @@ pub(crate) fn expression_contains_volatile(
     })
 }
 
+/// Whether qualifying a target row of `UPDATE` or `DELETE` can call a user
+/// routine or a volatile built-in: in its `WHERE`, its `FROM` or `USING`
+/// items, or the row-security policies that filter it. PostgreSQL qualifies
+/// each row just before changing it, so such calls interleave with the
+/// change's own calls, triggers and `RETURNING`; the write then qualifies
+/// its rows one at a time in its change loop. Other conditions select every
+/// row first, which no client can tell apart.
+pub(crate) fn dml_qualification_calls_routines(
+    where_clause: Option<&Expr<'_>>,
+    from: Option<&crate::sql::ast::FromClause<'_>>,
+    row_security: Option<RowSecurityPlan<'_>>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    let matches = |name: &str, arity: usize| {
+        crate::sql::ast::is_volatile_function(name)
+            || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+    };
+    where_clause.is_some_and(|condition| cte::expression_contains_function(condition, &matches))
+        || from.is_some_and(|from| cte::from_contains_function(from, &matches))
+        || row_security.is_some_and(|plan| {
+            plan.any_predicate(|condition| cte::expression_contains_function(condition, &matches))
+        })
+}
+
 pub(crate) fn stored_query_dependencies(
     sql: &str,
     storage: &Storage,
@@ -1792,6 +1817,32 @@ pub(crate) struct RoutineInvocationState {
     /// still restart after its main query has produced rows.
     reads_writes: Cell<bool>,
     inputs: input_progress::RoutineInputs,
+    /// Where each uncorrelated subquery the statement keeps the value of
+    /// (PostgreSQL's initPlan) first ran, keyed by its expression's address
+    /// and the count of earlier evaluations of that expression in the same
+    /// attempt (a `BETWEEN` operand keeps one value per copy).
+    initplans: RefCell<crate::mem::arena::RetainedList<InitPlanStart>>,
+    /// Each kept subquery's evaluations so far in the current attempt.
+    initplan_counts: RefCell<crate::mem::arena::RetainedList<InitPlanCount>>,
+    /// Numbers attempts, so [`Self::initplan_counts`] restart with each.
+    attempt: Cell<u64>,
+}
+
+/// The log positions at which an uncorrelated subquery's one evaluation
+/// started.
+#[derive(Clone, Copy)]
+pub(super) struct InitPlanStart {
+    node: usize,
+    occurrence: u32,
+    position: InvocationPosition,
+    replay: Option<super::sequence::StatementReplayStart>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InitPlanCount {
+    node: usize,
+    attempt: u64,
+    count: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1880,6 +1931,116 @@ pub(crate) fn without_routine_invocations<R>(execute: impl FnOnce() -> R) -> R {
 pub(crate) struct InvocationPosition {
     calls: usize,
     inputs: usize,
+}
+
+/// Runs the evaluation of the uncorrelated subquery `node` whose value the
+/// statement keeps for its later rows (PostgreSQL's initPlan). A write that
+/// stopped for a routine call continues at its unfinished row with the
+/// subquery's value not yet kept; when the subquery first ran at an earlier
+/// position of the log, its evaluation replays there, so it neither calls
+/// its routines again nor shifts the log positions of the calls after it.
+pub(crate) fn evaluate_initplan<T>(
+    node: *const (),
+    evaluate: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, arena)) = context else {
+            return evaluate();
+        };
+        invocations.require_arena(arena)?;
+        let key = node as usize;
+        let here = invocations.position();
+        let attempt = invocations.attempt.get();
+        let occurrence = {
+            let mut counts = invocations.initplan_counts.borrow_mut();
+            let found = counts
+                .with_mut_slice(arena, |counts| {
+                    counts
+                        .iter_mut()
+                        .find(|count| count.node == key)
+                        .map(|count| {
+                            if count.attempt != attempt {
+                                *count = InitPlanCount {
+                                    node: key,
+                                    attempt,
+                                    count: 0,
+                                };
+                            }
+                            let occurrence = count.count;
+                            count.count += 1;
+                            occurrence
+                        })
+                })
+                .map_err(|_| inactive_pending_call())?;
+            match found {
+                Some(occurrence) => occurrence,
+                None => {
+                    counts
+                        .push(
+                            arena,
+                            InitPlanCount {
+                                node: key,
+                                attempt,
+                                count: 1,
+                            },
+                        )
+                        .map_err(invocation_results::directory_error)?;
+                    0
+                }
+            }
+        };
+        let recorded = invocations
+            .initplans
+            .borrow()
+            .with_slice(arena, |starts| {
+                starts
+                    .iter()
+                    .find(|start| start.node == key && start.occurrence == occurrence)
+                    .copied()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        match recorded {
+            Some(start) if start.position != here => {
+                let resume = super::sequence::begin_replay_cursor()?;
+                invocations.seek(start.position)?;
+                super::sequence::rewind_replay_cursor(start.replay)?;
+                let result = evaluate();
+                invocations.seek(here)?;
+                super::sequence::rewind_replay_cursor(resume)?;
+                result
+            }
+            Some(_) => evaluate(),
+            None => {
+                let replay = super::sequence::begin_replay_cursor()?;
+                invocations
+                    .initplans
+                    .borrow_mut()
+                    .push(
+                        arena,
+                        InitPlanStart {
+                            node: key,
+                            occurrence,
+                            position: here,
+                            replay,
+                        },
+                    )
+                    .map_err(invocation_results::directory_error)?;
+                evaluate()
+            }
+        }
+    })
+}
+
+/// Forgets where the active log's kept subqueries first ran, when a write
+/// step that evaluated them finished and the next step's expressions may
+/// reuse their addresses.
+pub(crate) fn forget_initplans() {
+    with_active_routine_invocations(|context| {
+        if let Some((invocations, _)) = context {
+            invocations.initplans.borrow_mut().truncate(0);
+            invocations.initplan_counts.borrow_mut().truncate(0);
+        }
+    });
 }
 
 /// The active invocation log's position; `None` without a log.
@@ -2078,6 +2239,9 @@ impl RoutineInvocationState {
             writes_root: Cell::new(0),
             reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
+            initplans: RefCell::new(crate::mem::arena::RetainedList::new()),
+            initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
+            attempt: Cell::new(0),
         }
     }
 
@@ -2453,6 +2617,7 @@ impl RoutineInvocationState {
     pub(crate) fn begin_attempt(&self) {
         let first = self.first.get();
         self.next.set(first.calls);
+        self.attempt.set(self.attempt.get().wrapping_add(1));
         self.pending.set(None);
         self.pending_firing.set(None);
         self.inputs.seek(first.inputs);
@@ -11740,9 +11905,9 @@ fn check_select_constants_in<'a>(
 /// subexpressions replaced with their values (see
 /// [`super::eval::fold_constants`]), in the order PostgreSQL's planner
 /// preprocesses them: the target list with its `ORDER BY`, `GROUP BY` and
-/// `DISTINCT ON` entries, then `WHERE`, `HAVING`, `OFFSET` and `LIMIT`. A key
-/// written like a select item is that item's target entry and folds with it.
-/// Window specifications keep their constants, which only report errors.
+/// `DISTINCT ON` entries, then `WHERE`, `HAVING`, `OFFSET` and `LIMIT`. A key written like a select item is that
+/// item's target entry and folds with it. Window specifications keep their
+/// constants, which only report errors.
 pub fn fold_select_constants<'a>(
     statement: &'a Select<'a>,
     arena: &'a Arena,
@@ -11912,6 +12077,94 @@ pub(crate) fn fold_update_constants<'a>(
     }
     folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
     folded.where_clause = statement.where_clause.map(fold).transpose()?;
+    Ok(folded)
+}
+
+/// Whether an `INSERT` value assigns through a field or subscript target
+/// (`p.x`, `j['x']`): the parser's assignment calls (`__jsonb_subscript_set`
+/// and its kin) resolve against the target column when the row is written,
+/// so the value keeps its written form.
+fn assigns_through_indirection(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Call { name, .. } if name.starts_with("__")) {
+        return true;
+    }
+    let mut found = false;
+    walk_children(expression, &mut |child| {
+        found |= assigns_through_indirection(child);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    found
+}
+
+/// [`fold_select_constants`] for an `INSERT ... VALUES` about to write rows.
+/// One `VALUES` row is the target list, which folds before `RETURNING`;
+/// several rows form a `VALUES` list, which PostgreSQL's planner folds with
+/// the range table after `RETURNING`. An `INSERT ... SELECT` source folds
+/// when it runs.
+pub(crate) fn fold_insert_constants<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    let catalog = storage_catalog(storage, arena, txid);
+    let fold =
+        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let mut folded = *statement;
+    let fold_rows = || -> Result<&'a [&'a [&'a Expr<'a>]], SqlError> {
+        if statement.select.is_some() || statement.rows.is_empty() {
+            return Ok(statement.rows);
+        }
+        let rows = arena
+            .alloc_slice_copy(statement.rows)
+            .map_err(|_| arena_full())?;
+        let mut changed = false;
+        for row in rows.iter_mut() {
+            let values = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
+            for value in values.iter_mut() {
+                if !assigns_through_indirection(value) {
+                    let folded = fold(value)?;
+                    changed |= !core::ptr::eq(folded, *value);
+                    *value = folded;
+                }
+            }
+            *row = values;
+        }
+        Ok(if changed { rows } else { statement.rows })
+    };
+    let fold_returning = || -> Result<&'a [SelectItem<'a>], SqlError> {
+        let items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        let same = items
+            .iter()
+            .zip(statement.returning.items)
+            .all(|(new, old)| match (new, old) {
+                (
+                    SelectItem::Expr {
+                        expression: new, ..
+                    },
+                    SelectItem::Expr {
+                        expression: old, ..
+                    },
+                )
+                | (SelectItem::RecordStar(new), SelectItem::RecordStar(old)) => {
+                    core::ptr::eq(*new, *old)
+                }
+                _ => true,
+            });
+        Ok(if same {
+            statement.returning.items
+        } else {
+            items
+        })
+    };
+    if statement.rows.len() <= 1 {
+        folded.rows = fold_rows()?;
+        folded.returning.items = fold_returning()?;
+    } else {
+        folded.returning.items = fold_returning()?;
+        folded.rows = fold_rows()?;
+    }
     Ok(folded)
 }
 

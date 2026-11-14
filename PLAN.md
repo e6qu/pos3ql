@@ -486,23 +486,59 @@ call fails with `22P02`. A rule action that names its table's renamed column wit
 `NEW.` or `OLD.` fails the rename with `0A000`.
 The differential corpora compare notices, warnings and INFO messages with
 their statement positions. The planner folds constants as PostgreSQL's
-`eval_const_expressions` does: before a `SELECT`, `UPDATE` or `DELETE` reads
-a row, each constant subexpression that calls an immutable routine, converts
-a value or runs an operator's routine is evaluated once and replaced with its
-value, so `''::tsquery` in a query returning three rows sends its notice
-once, and a constant in an arm no row reaches still folds and reports its
-error. Folding gaps remain: aggregate arguments, window specifications,
-`INSERT` values, `MERGE`, join conditions and `FROM` function arguments are
-evaluated where they run; a parameter of a custom plan does not fold; a
-literal conversion in a prepared statement raises its notice at each
-`EXECUTE` where PostgreSQL raises it at `PREPARE`; a statement a routine runs
-folds at each run where PostgreSQL folds its cached plan once per session;
-and PostgreSQL's selectivity estimate, which evaluates a stable call compared
-with an indexed column once more while planning, is not modeled. `UPDATE`
-and `DELETE` evaluate every target row's `WHERE` before changing the first
-row, where PostgreSQL alternates them, so routine calls in the condition and
-in the change interleave their notices differently; matching needs the row
-selection to run lazily under the statement's command snapshot. Row order
+`eval_const_expressions` does: before a `SELECT`, `INSERT ... VALUES`,
+`UPDATE` or `DELETE` reads or writes a row, each constant subexpression that
+calls an immutable routine, converts a value or runs an operator's routine
+is evaluated once and replaced with its value, so `''::tsquery` in a query
+returning three rows sends its notice once, and a constant in an arm no row
+reaches still folds and reports its error. An `INSERT` folds its `VALUES`
+rows and `RETURNING` list before its statement triggers fire. Folding gaps
+remain: aggregate arguments, window specifications, `MERGE`,
+`ON CONFLICT DO UPDATE` and `FROM` subqueries are evaluated where they run;
+join conditions and `FROM` function arguments are evaluated where they run
+(a constant in a join condition already raises its notice once, but a
+`LATERAL` function's argument raises it for each outer row); folding them
+with the target list raised the notice a second time, because the join and
+function-scan executors evaluate the written conditions and arguments
+again, so both need to read the folded clause; a parameter of a custom plan does not fold; a literal conversion
+in a prepared statement raises its notice at each `EXECUTE` where
+PostgreSQL converts it once at `PREPARE` (parse analysis), which needs the
+prepared statement to keep every converted literal, not only the typed
+inputs it keeps today; a statement a routine runs folds at each run where
+PostgreSQL folds its cached plan once per session; and PostgreSQL's
+selectivity estimate, which evaluates a stable call compared with an indexed
+column once more while planning, is not modeled.
+`UPDATE` and `DELETE` whose conditions (`WHERE`, `FROM` or `USING` items, or
+row-security policies) call a user routine or a volatile built-in qualify
+each candidate row in their change loop, just before changing it, as
+PostgreSQL's executor does: the condition's notices interleave with the
+row's `SET` expressions, triggers and `RETURNING` list, and its calls see the
+rows the statement already changed. Candidates are every row the
+statement's command snapshot sees (through the condition's index when one
+answers it), so rows this command changed are never revisited, and each
+qualified row is locked there, with read committed's recheck of a row
+changed while waiting. Row progress records the candidate position, so a
+write resumed after a routine call or a wait neither qualifies earlier
+candidates again, whether they changed or failed, nor repeats their calls;
+an uncorrelated subquery the statement keeps (an initPlan) replays at the
+log position where it first ran. Conditions without such calls select and
+lock every row first, which no client can tell apart. Remaining gaps: a
+foreign table's rows are qualified before any change; PostgreSQL orders a
+condition's conjuncts by cost and evaluates leakproof ones before
+row-security conditions (`id < 4 AND f(id)` runs `id < 4` first), where
+conditions here run row-security policies first, then the condition left to
+right; a data-modifying `WITH` sub-statement runs ahead of the main
+statement (above); and a rule action's `NEW` row evaluates every `SET`
+expression of the original statement, where PostgreSQL's rewrite evaluates
+only those the action reads. A policy that a write's `UPDATE` (or `DELETE`)
+and `SELECT` commands share runs once per row, as PostgreSQL's
+`list_append_unique` keeps it; each command's restrictive policies run
+before the OR of its permissive ones, which stops at the first that passes.
+A row no partition accepts reports its partition key
+(`Partition key of the failing row contains (id) = (21).`); like the key
+details of unique violations, it is not withheld from a role without
+`SELECT` privilege or under row security as PostgreSQL withholds it.
+Row order
 without `ORDER BY` follows a model of PostgreSQL's access path rather than
 its cost-based plan: a query or data change on one table whose condition
 constrains an index's leading column takes rows in their first-insertion

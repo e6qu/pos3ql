@@ -4111,9 +4111,15 @@ impl<'h> DeferredSubquery<'h> {
         if let Some(saved) = self.cache.and_then(|cache| cache.get().saved) {
             return read_saved_subquery(saved, self.node, arena);
         }
-        let result = self
-            .executor
-            .evaluate(expression, arena, params, row, sequences)?;
+        let result = match self.cache {
+            Some(_) => super::query::evaluate_initplan(self.node, || {
+                self.executor
+                    .evaluate(expression, arena, params, row, sequences)
+            })?,
+            None => self
+                .executor
+                .evaluate(expression, arena, params, row, sequences)?,
+        };
         if let Some(cache) = self.cache {
             cache.set(DeferredSubqueryCache {
                 saved: Some(save_subquery_result(&result, self.owner)?),

@@ -141,6 +141,9 @@ pub(super) struct DmlRowImages<'arena> {
     /// The FROM row each selected target row of `UPDATE ... FROM` joined,
     /// keyed by the target row's `PhysicalRow::sort_key`.
     joined: ArenaList<'arena, ((usize, u64), super::query::JoinedFromRow<'arena>)>,
+    /// The FROM row the change loop's current row joined, when rows are
+    /// qualified one at a time as they change.
+    current_joined: Option<((usize, u64), super::query::JoinedFromRow<'arena>)>,
 }
 
 impl<'arena> DmlRowImages<'arena> {
@@ -149,7 +152,23 @@ impl<'arena> DmlRowImages<'arena> {
             rows: ArenaList::new(arena),
             tables: ArenaList::new(arena),
             joined: ArenaList::new(arena),
+            current_joined: None,
         }
+    }
+
+    /// The FROM row `row` joined when the change loop qualified it.
+    fn set_current_joined(
+        &mut self,
+        row: PhysicalRow,
+        joined: Option<super::query::JoinedFromRow<'arena>>,
+    ) {
+        self.current_joined = joined.map(|joined| (row.sort_key(), joined));
+    }
+
+    fn current_joined(&self, row: PhysicalRow) -> Option<super::query::JoinedFromRow<'arena>> {
+        self.current_joined
+            .filter(|(key, _)| *key == row.sort_key())
+            .map(|(_, joined)| joined)
     }
 
     fn push_joined(
@@ -172,6 +191,12 @@ impl<'arena> DmlRowImages<'arena> {
         row: PhysicalRow,
         joined: super::query::JoinedFromRow<'arena>,
     ) -> Result<(), SqlError> {
+        if let Some((key, current)) = self.current_joined.as_mut()
+            && *key == row.sort_key()
+        {
+            *current = joined;
+            return Ok(());
+        }
         let rows = self.joined.as_mut_slice().map_err(|_| arena_full())?;
         if let Ok(index) = rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key) {
             rows[index].1 = joined;
@@ -192,6 +217,9 @@ impl<'arena> DmlRowImages<'arena> {
 
     /// The joined row kept for `row`, when the selection joined one.
     fn joined_bytes(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
+        if let Some(current) = self.current_joined(row) {
+            return Some(current.bytes());
+        }
         let rows = self.joined.as_slice();
         rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
             .ok()
@@ -199,6 +227,9 @@ impl<'arena> DmlRowImages<'arena> {
     }
 
     fn joined(&self, row: PhysicalRow) -> Result<super::query::JoinedFromRow<'arena>, SqlError> {
+        if let Some(current) = self.current_joined(row) {
+            return Ok(current);
+        }
         let rows = self.joined.as_slice();
         rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
             .map(|index| rows[index].1)
@@ -430,10 +461,13 @@ fn dml_row_available(
             crate::storage::RowSelfChange::Original => true,
             crate::storage::RowSelfChange::SameCommand => false,
             crate::storage::RowSelfChange::TriggeredCommand => {
-                return Err(sql_err!(
-                    sqlstate::TRIGGERED_DATA_CHANGE_VIOLATION,
-                    "tuple to be {} was already modified by an operation triggered by the current command",
-                    action
+                return Err(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::TRIGGERED_DATA_CHANGE_VIOLATION,
+                        "tuple to be {} was already modified by an operation triggered by the current command",
+                        action
+                    ),
+                    "Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.",
                 ));
             }
         },
@@ -455,6 +489,115 @@ struct DmlRequalify<'q, 'a, Definition: crate::storage::DefinitionBacking> {
 }
 
 impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Definition> {
+    /// Whether the version of `row` the statement's snapshot sees meets the
+    /// statement's conditions, for a write that qualifies its rows in its
+    /// change loop: `Some` with the FROM row an `UPDATE ... FROM` or
+    /// `DELETE ... USING` joined it to (when the write keeps one), `None`
+    /// when the row does not qualify. Conditions read the statement's
+    /// command snapshot, as its row selection does.
+    #[allow(clippy::too_many_arguments)]
+    fn qualify(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        command: u32,
+        row: PhysicalRow,
+        layout: DmlTableLayout<'a>,
+        retains_joined: bool,
+        hash: Option<&super::query::TargetHash<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Option<Option<super::query::JoinedFromRow<'a>>>, SqlError> {
+        let (table, rowid, seen) = row.local_parts();
+        let _snapshot = storage.dml_expression_snapshot(command);
+        let mark = arena.mark();
+        let qualified = (|| {
+            let bytes = storage.row_bytes(table, rowid, seen, arena)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            layout.decode_logical(bytes, &mut values)?;
+            let Some(from) = self.from else {
+                return Ok(row_matches_values(
+                    storage,
+                    txid,
+                    Some(table),
+                    self.def,
+                    self.alias,
+                    &values,
+                    self.where_clause,
+                    arena,
+                    self.params,
+                    self.hooks,
+                    self.row_security,
+                    self.outer,
+                )?
+                .then_some(None));
+            };
+            let context = RowCtx {
+                table_oid: None,
+                def: crate::storage::RelationDefinition::from_definition(self.def),
+                values: &values[..self.def.n_columns],
+                alias: self.alias,
+            };
+            if let Some(plan) = self.row_security
+                && !super::query::row_security_passes(
+                    plan,
+                    &context,
+                    storage,
+                    txid,
+                    arena,
+                    self.params,
+                    self.hooks,
+                )?
+            {
+                return Ok(None);
+            }
+            let scope = self.outer.map(|outer| JoinedTriggerDmlScope {
+                row: &context,
+                outer,
+            });
+            let target: &dyn ColumnLookup<'_> = match scope.as_ref() {
+                Some(scope) => scope,
+                None => &context,
+            };
+            let hashed = target_hash_candidates(hash, storage, txid, context.values, arena)?;
+            if retains_joined {
+                return Ok(super::query::joined_from_match(
+                    storage,
+                    from,
+                    txid,
+                    self.where_clause,
+                    arena,
+                    self.params,
+                    target,
+                    None,
+                    hashed,
+                    arena,
+                )?
+                .map(Some));
+            }
+            Ok(super::query::first_from_match(
+                storage,
+                from,
+                txid,
+                self.where_clause,
+                &[],
+                arena,
+                self.params,
+                target,
+                &mut |_| Ok(()),
+                None,
+                None,
+                hashed,
+            )?
+            .then_some(None))
+        })();
+        if !matches!(qualified, Ok(Some(Some(_)))) {
+            // SAFETY: a rejected row, or one kept without a joined row,
+            // leaves no value of this evaluation behind.
+            unsafe { arena.rewind_to(mark) };
+        }
+        qualified
+    }
+
     /// The latest version's bytes when it still qualifies.
     #[allow(clippy::too_many_arguments)]
     fn latest(
@@ -613,11 +756,11 @@ struct RequalifiedRow<'a> {
     joined: Option<super::query::JoinedFromRow<'a>>,
 }
 
-/// Locks every selected row before any row changes, as PostgreSQL does. A
-/// row another transaction changed after the statement's snapshot fails the
-/// statement with `40001` under repeatable read and serializable; under read
-/// committed the statement continues with the row's latest version when it
-/// still meets the statement's conditions, and skips the row otherwise.
+/// Locks every selected row before any row changes. A row another
+/// transaction changed after the statement's snapshot fails the statement
+/// with `40001` under repeatable read and serializable; under read committed
+/// the statement continues with the row's latest version when it still meets
+/// the statement's conditions, and skips the row otherwise.
 #[allow(clippy::too_many_arguments)]
 fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
     storage: &Storage,
@@ -628,69 +771,84 @@ fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
     requalify: &DmlRequalify<'_, 'a, Definition>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    let repeatable = row_conflicts::uses_transaction_snapshot(txn.isolation);
     let mut kept = 0usize;
     for index in 0..scratch.len() {
         let row = scratch[index];
-        let PhysicalRow::Local {
-            table_index: table,
-            rowid,
-            home,
-        } = row
-        else {
-            scratch.as_mut_slice()[kept] = row;
-            kept += 1;
-            continue;
-        };
-        let locked = row_conflicts::lock_selected_row(
-            storage,
-            txn.txid,
-            table,
-            rowid,
-            home,
-            strength,
-            crate::sql::ast::LockWait::Wait,
-        )?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "data modification skipped a locked row"
-            )
-        })?;
-        let row = match locked {
-            row_conflicts::LockedVersion::Selected => Some(row),
-            row_conflicts::LockedVersion::Deleted if repeatable => {
-                return Err(row_conflicts::concurrent_change(true));
-            }
-            row_conflicts::LockedVersion::Updated(_) if repeatable => {
-                return Err(row_conflicts::concurrent_change(false));
-            }
-            row_conflicts::LockedVersion::Deleted => None,
-            row_conflicts::LockedVersion::Updated(latest) => {
-                let snapshot = latest.snapshot();
-                let layout = retained_rows.layout(table)?;
-                match requalify
-                    .latest(storage, txn.txid, layout, table, rowid, home, latest, arena)?
-                {
-                    Some(requalified) => {
-                        retained_rows.replace(table, rowid, requalified.bytes)?;
-                        let row = PhysicalRow::local(table, rowid, snapshot);
-                        if let Some(joined) = requalified.joined {
-                            retained_rows.replace_joined(row, joined)?;
-                        }
-                        Some(row)
-                    }
-                    None => None,
-                }
-            }
-        };
-        if let Some(row) = row {
+        if let Some(row) =
+            lock_selected_dml_row(storage, txn, row, retained_rows, strength, requalify, arena)?
+        {
             scratch.as_mut_slice()[kept] = row;
             kept += 1;
         }
     }
     scratch.truncate(kept);
     Ok(())
+}
+
+/// Locks one selected row, as [`lock_selected_dml_rows`] does: the row to
+/// change, at its latest version under read committed, or `None` when that
+/// version was deleted or no longer meets the statement's conditions.
+/// PostgreSQL locks each row as it changes it; a write that qualifies its
+/// rows in its change loop locks each qualified row there.
+#[allow(clippy::too_many_arguments)]
+fn lock_selected_dml_row<'a, Definition: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txn: &TxnState,
+    row: PhysicalRow,
+    retained_rows: &mut DmlRowImages<'a>,
+    strength: crate::sql::ast::LockStrength,
+    requalify: &DmlRequalify<'_, 'a, Definition>,
+    arena: &'a Arena,
+) -> Result<Option<PhysicalRow>, SqlError> {
+    let repeatable = row_conflicts::uses_transaction_snapshot(txn.isolation);
+    let PhysicalRow::Local {
+        table_index: table,
+        rowid,
+        home,
+    } = row
+    else {
+        return Ok(Some(row));
+    };
+    let locked = row_conflicts::lock_selected_row(
+        storage,
+        txn.txid,
+        table,
+        rowid,
+        home,
+        strength,
+        crate::sql::ast::LockWait::Wait,
+    )?
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "data modification skipped a locked row"
+        )
+    })?;
+    Ok(match locked {
+        row_conflicts::LockedVersion::Selected => Some(row),
+        row_conflicts::LockedVersion::Deleted if repeatable => {
+            return Err(row_conflicts::concurrent_change(true));
+        }
+        row_conflicts::LockedVersion::Updated(_) if repeatable => {
+            return Err(row_conflicts::concurrent_change(false));
+        }
+        row_conflicts::LockedVersion::Deleted => None,
+        row_conflicts::LockedVersion::Updated(latest) => {
+            let snapshot = latest.snapshot();
+            let layout = retained_rows.layout(table)?;
+            match requalify.latest(storage, txn.txid, layout, table, rowid, home, latest, arena)? {
+                Some(requalified) => {
+                    retained_rows.replace(table, rowid, requalified.bytes)?;
+                    let row = PhysicalRow::local(table, rowid, snapshot);
+                    if let Some(joined) = requalified.joined {
+                        retained_rows.replace_joined(row, joined)?;
+                    }
+                    Some(row)
+                }
+                None => None,
+            }
+        }
+    })
 }
 
 /// The role whose privileges and row-security policies authorize a DML
@@ -1614,7 +1772,7 @@ use constraints::{
     enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
     table_is_referenced,
 };
-pub(crate) use constraints::{coerce_domain_value, parse_defaults};
+pub(crate) use constraints::{coerce_domain_value, parse_defaults, partition_key_detail};
 pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
 
 #[derive(Clone, Copy)]
@@ -87224,6 +87382,29 @@ where
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_insert_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let refolded = !core::ptr::eq(folded.rows, statement.rows)
+        || !core::ptr::eq(folded.returning.items, statement.returning.items);
+    let statement = &folded;
+    // The conversions now apply to the folded rows.
+    let assignment_casts = match source {
+        InsertSource::Statement if refolded => match prepare_dml_assignment_casts(
+            &Stmt::Insert(*statement),
+            storage,
+            txn.txid,
+            arena,
+            transition,
+        ) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        },
+        _ => assignment_casts,
+    };
     let current_role = authorization_role;
     let insert_check = match super::query::plan_row_security(
         storage,
@@ -89402,18 +89583,57 @@ pub(crate) fn update<'a>(
     // A condition that reads no row of the statement runs once, before the
     // target scan, as PostgreSQL's one-time filter: when it fails, no row
     // is read and no other condition runs.
-    let selection_where = match super::query::rowless_one_time_filter_passes(
+    let (selection_where, lazy) = match super::query::rowless_one_time_filter_passes(
         statement.where_clause,
         arena,
         params,
         &hooks,
     ) {
-        Ok(true) => statement.where_clause,
-        Ok(false) => Some(&Expr::Bool(false)),
+        Ok(true) => (
+            statement.where_clause,
+            match qualifies_in_change_loop(
+                storage,
+                table_index,
+                statement.inheritance,
+                statement.where_clause,
+                statement.from,
+                row_security,
+                txn.txid,
+                arena,
+            ) {
+                Ok(lazy) => lazy,
+                Err(error) => return sql_fail(error),
+            },
+        ),
+        Ok(false) => (Some(&Expr::Bool(false)), false),
         Err(error) => return sql_fail(error),
+    };
+    let selection_command = txn.command_id();
+    let selection = if lazy {
+        DmlSelection::Candidates
+    } else {
+        DmlSelection::Qualified
     };
     // A resumed foreign selection continues without selecting again.
     let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let lazy_hash = match statement.from.filter(|_| lazy).map(|from| {
+        let _snapshot = storage.dml_expression_snapshot(selection_command);
+        super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            from,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        )?
+        .map(|plan| plan.build(storage, txn.txid, arena))
+        .transpose()
+    }) {
+        Some(Ok(hash)) => hash,
+        None => None,
+        Some(Err(error)) => return sql_fail(error),
+    };
     let collect = if let Some(selection) = resumed_selection {
         resumed_foreign_matches(
             storage,
@@ -89425,6 +89645,19 @@ pub(crate) fn update<'a>(
             arena,
             txn.txid,
             scratch,
+        )
+    } else if lazy && statement.from.is_some() {
+        collect_join_candidates(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            arena,
+            txn.txid,
+            scratch,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
         )
     } else if let Some(from) = statement.from {
         let target_hash = match super::query::target_hash_plan(
@@ -89499,6 +89732,7 @@ pub(crate) fn update<'a>(
                 command: txn.command_id(),
             },
             outer_lookup,
+            selection,
         )
     };
     let retained_rows = match collect {
@@ -89523,18 +89757,36 @@ pub(crate) fn update<'a>(
         sequences: Some(&lock_sequences),
     };
     // `FOR NO KEY UPDATE` strength until a row's new version shows whether it
-    // changes a key value (see `lock_key_change`).
-    if let Err(error) = lock_selected_dml_rows(
-        storage,
-        txn,
-        scratch,
-        &mut retained_rows,
-        crate::sql::ast::LockStrength::NoKeyUpdate,
-        &requalify,
-        arena,
-    ) {
+    // changes a key value (see `lock_key_change`). A write that qualifies
+    // its rows in its change loop locks each qualified row there.
+    if !lazy
+        && let Err(error) = lock_selected_dml_rows(
+            storage,
+            txn,
+            scratch,
+            &mut retained_rows,
+            crate::sql::ast::LockStrength::NoKeyUpdate,
+            &requalify,
+            arena,
+        )
+    {
         return sql_fail(error);
     }
+    let loop_qualification = lazy.then_some(LoopQualification {
+        def,
+        alias: statement.alias,
+        from: statement.from,
+        where_clause: statement.where_clause,
+        params,
+        subs: &subs,
+        row_security,
+        outer,
+        seq_session,
+        command: selection_command,
+        strength: crate::sql::ast::LockStrength::NoKeyUpdate,
+        retains_joined: true,
+        hash: lazy_hash.as_ref(),
+    });
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
 
@@ -89679,6 +89931,13 @@ pub(crate) fn update<'a>(
                 responder,
             ) {
                 return sql_fail(error);
+            }
+            if let Some(qualification) = &loop_qualification {
+                match qualification.qualify(storage, txn, scratch[i], &mut retained_rows, arena) {
+                    Ok(Some(row)) => scratch.as_mut_slice()[i] = row,
+                    Ok(None) => continue,
+                    Err(error) => return sql_fail(error),
+                }
             }
             match dml_row_available(storage, txn, scratch[i], "updated") {
                 Ok(true) => {}
@@ -90866,30 +91125,81 @@ pub(crate) fn delete<'a>(
     // A condition that reads no row of the statement runs once, before the
     // target scan, as PostgreSQL's one-time filter: when it fails, no row
     // is read and no other condition runs.
-    let selection_where = match super::query::rowless_one_time_filter_passes(
+    let (selection_where, lazy) = match super::query::rowless_one_time_filter_passes(
         statement.where_clause,
         arena,
         params,
         &hooks,
     ) {
-        Ok(true) => statement.where_clause,
-        Ok(false) => Some(&Expr::Bool(false)),
+        Ok(true) => (
+            statement.where_clause,
+            match qualifies_in_change_loop(
+                storage,
+                table_index,
+                statement.inheritance,
+                statement.where_clause,
+                statement.using,
+                row_security,
+                txn.txid,
+                arena,
+            ) {
+                Ok(lazy) => lazy,
+                Err(error) => return sql_fail(error),
+            },
+        ),
+        Ok(false) => (Some(&Expr::Bool(false)), false),
         Err(error) => return sql_fail(error),
+    };
+    let selection_command = txn.command_id();
+    let selection = if lazy {
+        DmlSelection::Candidates
+    } else {
+        DmlSelection::Qualified
+    };
+    let delete_capture = DmlCapture::Delete {
+        command: txn.command_id(),
+        returning: !statement.returning.is_empty(),
     };
     // A resumed foreign selection continues without selecting again.
     let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let lazy_hash = match statement.using.filter(|_| lazy).map(|using| {
+        let _snapshot = storage.dml_expression_snapshot(selection_command);
+        super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            using,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        )?
+        .map(|plan| plan.build(storage, txn.txid, arena))
+        .transpose()
+    }) {
+        Some(Ok(hash)) => hash,
+        None => None,
+        Some(Err(error)) => return sql_fail(error),
+    };
     let collect = if let Some(selection) = resumed_selection {
         resumed_foreign_matches(
             storage,
             table_index,
             selection,
-            DmlCapture::Delete {
-                command: txn.command_id(),
-                returning: !statement.returning.is_empty(),
-            },
+            delete_capture,
             arena,
             txn.txid,
             scratch,
+        )
+    } else if lazy && statement.using.is_some() {
+        collect_join_candidates(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            arena,
+            txn.txid,
+            scratch,
+            delete_capture,
         )
     } else if let Some(using) = statement.using {
         let target_hash = match super::query::target_hash_plan(
@@ -90962,11 +91272,9 @@ pub(crate) fn delete<'a>(
             &hooks,
             row_security,
             scratch,
-            DmlCapture::Delete {
-                command: txn.command_id(),
-                returning: !statement.returning.is_empty(),
-            },
+            delete_capture,
             outer_lookup,
+            selection,
         )
     };
     let retained_rows = match collect {
@@ -90986,17 +91294,36 @@ pub(crate) fn delete<'a>(
         outer,
         sequences: Some(&lock_sequences),
     };
-    if let Err(error) = lock_selected_dml_rows(
-        storage,
-        txn,
-        scratch,
-        &mut retained_rows,
-        crate::sql::ast::LockStrength::Update,
-        &requalify,
-        arena,
-    ) {
+    // A write that qualifies its rows in its change loop locks each
+    // qualified row there.
+    if !lazy
+        && let Err(error) = lock_selected_dml_rows(
+            storage,
+            txn,
+            scratch,
+            &mut retained_rows,
+            crate::sql::ast::LockStrength::Update,
+            &requalify,
+            arena,
+        )
+    {
         return sql_fail(error);
     }
+    let loop_qualification = lazy.then_some(LoopQualification {
+        def,
+        alias: statement.alias,
+        from: statement.using,
+        where_clause: statement.where_clause,
+        params,
+        subs: &subs,
+        row_security,
+        outer,
+        seq_session,
+        command: selection_command,
+        strength: crate::sql::ast::LockStrength::Update,
+        retains_joined: delete_capture.retains_joined(),
+        hash: lazy_hash.as_ref(),
+    });
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
     let (first_row, mut deleted, saved_transitions) = match progress.as_deref() {
@@ -91102,23 +91429,25 @@ pub(crate) fn delete<'a>(
                     statement.returning,
                     resumed.old,
                     resumed.new,
-                    match resumed.old.map(|old| {
-                        delete_returning_from(
-                            storage,
-                            txn,
-                            statement,
-                            def,
-                            old,
-                            &retained_rows,
-                            scratch[i],
-                            arena,
-                            params,
-                            seq_session,
-                        )
-                    }) {
-                        Some(Ok(joined)) => joined,
-                        None => None,
-                        Some(Err(error)) => return sql_fail(error),
+                    // The joined USING row the RETURNING stage read, saved
+                    // with it: the row is not qualified again.
+                    match (
+                        statement.using.filter(|_| !statement.returning.is_empty()),
+                        resumed.joined,
+                    ) {
+                        (Some(using), Some(values)) => Some(JoinedReturningValues {
+                            table: statement.table,
+                            alias: statement.alias,
+                            from: using,
+                            values,
+                        }),
+                        (None, _) => None,
+                        (Some(_), None) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "a resumed RETURNING row lost its joined row"
+                            ));
+                        }
                     },
                     arena,
                     params,
@@ -91142,6 +91471,13 @@ pub(crate) fn delete<'a>(
                 responder,
             ) {
                 return sql_fail(error);
+            }
+            if let Some(qualification) = &loop_qualification {
+                match qualification.qualify(storage, txn, scratch[i], &mut retained_rows, arena) {
+                    Ok(Some(row)) => scratch.as_mut_slice()[i] = row,
+                    Ok(None) => continue,
+                    Err(error) => return sql_fail(error),
+                }
             }
             match dml_row_available(storage, txn, scratch[i], "deleted") {
                 Ok(true) => {}
@@ -100533,6 +100869,186 @@ fn for_each_physical_row(
     Ok(())
 }
 
+/// Whether a write's row selection evaluates its conditions, or selects
+/// the candidate rows its change loop qualifies one at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DmlSelection {
+    Qualified,
+    Candidates,
+}
+
+/// Whether `UPDATE` or `DELETE` qualifies each candidate row in its change
+/// loop, just before changing it, as PostgreSQL's executor does: when its
+/// conditions can call routines (see
+/// [`super::query::dml_qualification_calls_routines`]). A foreign table's
+/// rows are selected, qualified, before any changes.
+#[allow(clippy::too_many_arguments)]
+fn qualifies_in_change_loop(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    where_clause: Option<&Expr<'_>>,
+    from: Option<&crate::sql::ast::FromClause<'_>>,
+    row_security: Option<super::query::RowSecurityPlan<'_>>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    Ok(super::query::dml_qualification_calls_routines(
+        where_clause,
+        from,
+        row_security,
+        storage,
+        txid,
+    ) && !dml_reaches_foreign_rows(storage, table_index, inheritance, txid, arena)?)
+}
+
+/// Whether the rows `UPDATE` or `DELETE` reaches include a foreign table's.
+fn dml_reaches_foreign_rows(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    Ok(
+        dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)?
+            .iter()
+            .any(|&leaf| storage.table_def(leaf, txid).kind == crate::storage::TableKind::Foreign),
+    )
+}
+
+/// The candidate target rows of `UPDATE ... FROM` or `DELETE ... USING`
+/// whose change loop qualifies each row: every row of the local leaves the
+/// statement's snapshot sees, in the order [`collect_join_matches`] reads
+/// them.
+#[allow(clippy::too_many_arguments)]
+fn collect_join_candidates<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    arena: &'a Arena,
+    txid: u32,
+    scratch: &mut DmlScratch,
+    capture: DmlCapture,
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
+    scratch.clear();
+    let mut images = DmlRowImages::new(arena);
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        storage.record_serializable_read(txid, leaf);
+        storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
+        images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+        let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
+        storage.for_each_row_state(
+            leaf,
+            &mut |rowid: u64, state: crate::storage::RowRead<'_>| {
+                let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                storage.record_relation_tuple_read(txid, leaf, None)?;
+                let snapshot = home.snapshot();
+                if capture_bytes {
+                    let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+                    images.push(leaf, rowid, bytes)?;
+                }
+                push_selected(scratch, PhysicalRow::local(leaf, rowid, snapshot))?;
+                Ok(core::ops::ControlFlow::Continue(()))
+            },
+        )?;
+    }
+    images.finish()
+}
+
+/// What the change loop of a write that qualifies its rows one at a time,
+/// as PostgreSQL does, needs to qualify and lock each candidate row.
+struct LoopQualification<'q, 'a, Definition: crate::storage::DefinitionBacking> {
+    def: &'q crate::storage::TableDefinition<Definition>,
+    alias: Option<&'q str>,
+    from: Option<&'a crate::sql::ast::FromClause<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &'q [Datum<'a>],
+    subs: &'q super::eval::SubqueryValues<'a, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
+    outer: Option<&'q dyn ColumnLookup<'a>>,
+    seq_session: &'q crate::sql::guc::SeqSession,
+    /// The command whose snapshot selected the candidates.
+    command: u32,
+    strength: crate::sql::ast::LockStrength,
+    retains_joined: bool,
+    hash: Option<&'q super::query::TargetHash<'a>>,
+}
+
+impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a, Definition> {
+    /// Qualifies the change loop's current candidate `row` and locks it:
+    /// the row to change (at its latest version under read committed), or
+    /// `None` when it does not qualify. The FROM row it joined becomes the
+    /// current one. Conditions evaluate with the statement's hooks, built
+    /// again over the storage the earlier rows changed.
+    fn qualify(
+        &self,
+        storage: &Storage,
+        txn: &TxnState,
+        row: PhysicalRow,
+        retained_rows: &mut DmlRowImages<'a>,
+        arena: &'a Arena,
+    ) -> Result<Option<PhysicalRow>, SqlError> {
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, self.seq_session, txn.txid);
+        let correlated = super::query::DmlSubqueries::new(storage, txn.txid, self.command);
+        let hooks = super::eval::EvalHooks {
+            group: None,
+            aggs: None,
+            subs: Some(self.subs),
+            subquery_executor: Some(&correlated),
+            windows: None,
+            catalog: Some(&catalog),
+            srf_index: None,
+            project_sets: None,
+            sequences: Some(&sequences),
+            merge_action: None,
+        };
+        let conditions = DmlRequalify {
+            def: self.def,
+            alias: self.alias,
+            from: self.from,
+            where_clause: self.where_clause,
+            params: self.params,
+            hooks: &hooks,
+            row_security: self.row_security,
+            outer: self.outer,
+            sequences: Some(&sequences),
+        };
+        let (table, _, _) = row.local_parts();
+        let layout = retained_rows.layout(table)?;
+        let qualified = conditions.qualify(
+            storage,
+            txn.txid,
+            self.command,
+            row,
+            layout,
+            self.retains_joined,
+            self.hash,
+            arena,
+        )?;
+        let Some(joined) = qualified else {
+            retained_rows.set_current_joined(row, None);
+            return Ok(None);
+        };
+        retained_rows.set_current_joined(row, joined);
+        lock_selected_dml_row(
+            storage,
+            txn,
+            row,
+            retained_rows,
+            self.strength,
+            &conditions,
+            arena,
+        )
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
@@ -100549,11 +101065,18 @@ pub(super) fn collect_matches<'a>(
     scratch: &mut DmlScratch,
     capture: DmlCapture,
     transition: Option<&dyn ColumnLookup<'a>>,
+    selection: DmlSelection,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     let def = (*storage.table_def(table_index, txid)).clone();
+    // Candidates reach rows through the condition's index as qualified rows
+    // do, in the same order; the change loop evaluates the condition.
+    let (condition, row_security) = match selection {
+        DmlSelection::Qualified => (where_clause, row_security),
+        DmlSelection::Candidates => (None, None),
+    };
     let indexed = if transition.is_none()
         && def.kind != crate::storage::TableKind::Foreign
         && !storage.relation_has_descendants(table_index, txid)
@@ -100602,7 +101125,7 @@ pub(super) fn collect_matches<'a>(
                         &def,
                         alias,
                         values,
-                        where_clause,
+                        condition,
                         arena,
                         params,
                         hooks,
@@ -100653,7 +101176,7 @@ pub(super) fn collect_matches<'a>(
                 loc,
                 capture_bytes,
                 layout,
-                where_clause,
+                condition,
                 arena,
                 params,
                 hooks,

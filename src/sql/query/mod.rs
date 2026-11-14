@@ -61,6 +61,7 @@ pub(crate) use plan::plan_time_bool;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
+pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, PaxReadDemand, pax_column_demand,

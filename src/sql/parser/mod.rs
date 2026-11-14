@@ -9090,6 +9090,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("conflict")?;
         let mut target = ArenaList::new(self.arena);
         let mut constraint = None;
+        let mut target_where = None;
         if self.eat_op("(")? {
             loop {
                 let start = self.peek_at;
@@ -9114,6 +9115,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            if self.eat_ident("where")? {
+                target_where = Some(self.expression(0)?);
+            }
         } else if self.eat_ident("on")? {
             // `ON CONFLICT ON CONSTRAINT name`.
             self.expect_ident("constraint")?;
@@ -9136,6 +9140,7 @@ impl<'a> Parser<'a> {
         Ok(Some(OnConflict {
             target: target.as_slice(),
             constraint,
+            target_where,
             update,
             update_where,
         }))

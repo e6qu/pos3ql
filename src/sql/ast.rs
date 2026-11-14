@@ -5337,6 +5337,9 @@ pub struct OnConflict<'a> {
     /// A named arbiter constraint (`ON CONFLICT ON CONSTRAINT name`); mutually
     /// exclusive with a column `target`.
     pub constraint: Option<&'a str>,
+    /// The inference `WHERE` after a column `target`, which selects partial
+    /// unique indexes whose predicate it implies.
+    pub target_where: Option<&'a Expr<'a>>,
     /// `None` = DO NOTHING; `Some` = DO UPDATE SET .... Assignments may
     /// reference the target row's columns and `excluded.<col>` (the proposed
     /// row).

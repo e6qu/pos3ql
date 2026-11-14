@@ -482,8 +482,11 @@ on the column, and reports `cannot drop column ...` where PostgreSQL, when
 inheritance children drop the column too, reports `cannot drop desired
 object(s) ...`. `ON CONFLICT DO NOTHING` without a target refuses a table
 with a deferrable unique or exclusion constraint with `55000` even for a row
-an earlier arbiter would skip, and an inference target with an index
-predicate (`ON CONFLICT (a) WHERE a > 0`) fails with `42601`. `pg_trigger` omits the internal
+an earlier arbiter would skip. An inference target's `WHERE` (`ON CONFLICT
+(a) WHERE a > 5`) selects a partial unique index through the same
+comparison-implication test the planner uses for partial index scans, which
+proves less than PostgreSQL's `predicate_implied_by` (no `OR`, `IN` or
+non-integer constant ranges). `pg_trigger` omits the internal
 `PK_ConstraintTrigger_*` and `Unique_ConstraintTrigger_*` rows of deferrable
 unique and exclusion keys; their rechecks do fire among the row's AFTER
 triggers in that name order. A statement's own catalog scans, including those through views, read the

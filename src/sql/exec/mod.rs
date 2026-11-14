@@ -6883,6 +6883,8 @@ enum Arbiter<'a> {
         expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
         n_columns: usize,
         nulls_not_distinct: bool,
+        /// A partial index's predicate: only rows it admits conflict.
+        predicate: Option<&'a Expr<'a>>,
     },
 }
 
@@ -6921,11 +6923,13 @@ impl<'a> Arbiter<'a> {
                 expressions,
                 n_columns,
                 nulls_not_distinct,
+                predicate,
             } => Self::Keys {
                 columns: remap_columns(physical, logical, &columns[..*n_columns])?,
                 expressions: *expressions,
                 n_columns: *n_columns,
                 nulls_not_distinct: *nulls_not_distinct,
+                predicate: *predicate,
             },
         })
     }
@@ -6994,6 +6998,79 @@ fn unique_arbiter_matches<Definition0: crate::storage::DefinitionBacking>(
     matched.then_some(false)
 }
 
+/// The partial unique index an `ON CONFLICT (...) WHERE ...` target infers:
+/// its keys are the target's columns and the target's `WHERE` implies its
+/// predicate, as PostgreSQL's `infer_arbiter_indexes` requires.
+fn partial_index_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<Definition0>,
+    oc: &super::ast::OnConflict<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<Arbiter<'a>>, SqlError> {
+    let Some(target_where) = oc.target_where else {
+        return Ok(None);
+    };
+    let Some(table) = storage.find_visible(def.schema.as_str(), def.name.as_str(), txid) else {
+        return Ok(None);
+    };
+    let table_definition = storage.table_def(table, txid);
+    for index in storage
+        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+        .filter(|index| index.mutable_for(txid).immediate)
+    {
+        let Some(source) = index.predicate else {
+            continue;
+        };
+        if index.n_cols != oc.target.len()
+            || index.expressions[..index.n_cols]
+                .iter()
+                .any(Option::is_some)
+            || !oc.target.iter().all(|target| {
+                target
+                    .column
+                    .and_then(|name| def.column_index(name))
+                    .is_some_and(|column| index.columns[..index.n_cols].contains(&(column as u16)))
+            })
+        {
+            continue;
+        }
+        let stored = crate::sql::parser::parse_expr(source.as_str(), arena).map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored index predicate does not parse"
+            )
+        })?;
+        let mut resolve = |expression: &Expr<'a>| match expression {
+            Expr::Column { name, .. } => def.column_index(name),
+            _ => None,
+        };
+        if !crate::sql::query::predicate_is_implied(
+            stored,
+            &[Some(target_where)],
+            &table_definition,
+            &mut resolve,
+        ) {
+            continue;
+        }
+        return Ok(Some(Arbiter::Keys {
+            columns: index.columns,
+            expressions: [None; crate::storage::MAX_INDEX_COLS],
+            n_columns: index.n_cols,
+            nulls_not_distinct: index.nulls_not_distinct,
+            predicate: Some(expression_bindings::bound_index_expression(
+                source.as_str(),
+                storage,
+                &index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?),
+        }));
+    }
+    Ok(None)
+}
+
 /// Resolves `ON CONSTRAINT name` to the named immediate UNIQUE/PRIMARY KEY.
 /// A unique index is inferable by its definition but is not a constraint.
 fn arbiter_by_name<Definition0: crate::storage::DefinitionBacking>(
@@ -7051,6 +7128,7 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     oc: &super::ast::OnConflict<'a>,
     txid: u32,
+    arena: &'a Arena,
 ) -> Result<Arbiter<'a>, SqlError> {
     if let Some(assignments) = oc.update {
         for (name, expression) in assignments {
@@ -7067,6 +7145,9 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if !oc.target.is_empty() {
+        if let Some(arbiter) = partial_index_arbiter(storage, def, oc, txid, arena)? {
+            return Ok(arbiter);
+        }
         if oc.target.iter().any(|target| target.column.is_none()) {
             for index in storage
                 .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
@@ -7094,6 +7175,7 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
                         expressions,
                         n_columns: index.n_cols,
                         nulls_not_distinct: index.nulls_not_distinct,
+                        predicate: None,
                     });
                 }
             }
@@ -7135,6 +7217,7 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
                 expressions,
                 n_columns: n,
                 nulls_not_distinct,
+                predicate: None,
             });
         }
         return Err(sql_err!(
@@ -7166,6 +7249,7 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
                 expressions: [None; crate::storage::MAX_INDEX_COLS],
                 n_columns: n,
                 nulls_not_distinct,
+                predicate: None,
             });
         }
         return Err(sql_err!(
@@ -7412,8 +7496,17 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                             expressions,
                             n_columns,
                             nulls_not_distinct,
+                            predicate,
                         } => {
-                            if expressions[..*n_columns].iter().all(Option::is_none) {
+                            if let Some(predicate) = predicate
+                                && !(crate::sql::exec::constraints::index_predicate_matches(
+                                    storage, txid, def, values, predicate, arena,
+                                )? && crate::sql::exec::constraints::index_predicate_matches(
+                                    storage, txid, def, &other, predicate, arena,
+                                )?)
+                            {
+                                Ok(false)
+                            } else if expressions[..*n_columns].iter().all(Option::is_none) {
                                 key_hit(&columns[..*n_columns], *nulls_not_distinct)
                             } else {
                                 let keys = crate::sql::exec::constraints::index_key_values(
@@ -58031,6 +58124,67 @@ fn require_static_catalog_comment_superuser(storage: &Storage, txid: u32) -> Res
     }
 }
 
+/// Runs a `CREATE TABLE AS` query into encoded rows in two passes: a dry
+/// count, then the materialization with live sequences.
+fn create_table_as_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    sql: &str,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum],
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let sel = crate::sql::parser::parse_query(sql, arena)?;
+    let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let sel = super::query::expand_ctes_exec(
+        sel,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        Some(&live_sequence),
+    )?;
+    let mut rows = 0usize;
+    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+    super::query::select_into_rows(
+        storage,
+        txid,
+        sel,
+        arena,
+        params,
+        None,
+        Some(&dry_sequence),
+        &mut |_| {
+            rows += 1;
+            Ok(())
+        },
+    )?;
+    let empty: &[u8] = &[];
+    let rows_bytes: &mut [&[u8]] = arena.alloc_slice_with(rows, |_| empty).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "CREATE TABLE AS result exceeds the statement arena"
+        )
+    })?;
+    let mut at = 0usize;
+    super::query::select_into_rows(
+        storage,
+        txid,
+        sel,
+        arena,
+        params,
+        None,
+        Some(&live_sequence),
+        &mut |vals| {
+            rows_bytes[at] = encode_projected_pub(vals, arena)?;
+            at += 1;
+            Ok(())
+        },
+    )?;
+    Ok(rows_bytes)
+}
+
 /// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's
 /// output schema, then populate it by running the query once.
 #[allow(clippy::too_many_arguments)]
@@ -58242,6 +58396,31 @@ pub fn create_table_as(
     if let Err(error) = def.attributes.initialize(def.n_columns) {
         return sql_fail(error);
     }
+    // CREATE TABLE AS runs its query before the table exists: its catalog
+    // reads see the catalog as the statement began, as PostgreSQL's snapshot
+    // does. A materialized view, like PostgreSQL's, is created first.
+    let mut computed: &[&[u8]] = &[];
+    if storage.relation_name_taken(def.schema.as_str(), def.name.as_str(), txn.txid) {
+        if if_not_exists {
+            responder.notice(
+                sqlstate::DUPLICATE_TABLE,
+                stack_format!(128, "relation \"{}\" already exists, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete(kind.ddl_tag())?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_TABLE,
+            "relation \"{}\" already exists",
+            name.name
+        ));
+    }
+    if with_data && !materialized {
+        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
+            Ok(rows) => rows,
+            Err(error) => return sql_fail(error),
+        };
+    }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def.clone(), txn.txid) {
         Ok(slot) => {
@@ -58290,73 +58469,16 @@ pub fn create_table_as(
         }
         Err(e) => return sql_fail(e),
     };
-    // Populate, unless WITH NO DATA. Two passes: materialize the query's rows
-    // into the arena (reading storage immutably), then store them (mutably) —
-    // the source could reference another table, so the phases must not overlap.
     let write_target = storage.select_table_definition(table_index, txn.txid).0;
     let mut count = 0u64;
-    if with_data {
-        let sel = match crate::sql::parser::parse_query(sql, arena) {
-            Ok(s) => s,
-            Err(e) => return sql_fail(e),
-        };
-        let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let sel = match super::query::expand_ctes_exec(
-            sel,
-            storage,
-            txn.txid,
-            arena,
-            params,
-            &[],
-            Some(&live_sequence),
-        ) {
-            Ok(select) => select,
+    if with_data && materialized {
+        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
+            Ok(rows) => rows,
             Err(error) => return sql_fail(error),
         };
-        let mut rows = 0usize;
-        let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-        if let Err(e) = super::query::select_into_rows(
-            storage,
-            txn.txid,
-            sel,
-            arena,
-            params,
-            None,
-            Some(&dry_sequence),
-            &mut |_| {
-                rows += 1;
-                Ok(())
-            },
-        ) {
-            return sql_fail(e);
-        }
-        let empty: &[u8] = &[];
-        let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
-            Ok(r) => r,
-            Err(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "CREATE TABLE AS result exceeds the statement arena"
-                ));
-            }
-        };
-        let mut at = 0usize;
-        if let Err(e) = super::query::select_into_rows(
-            storage,
-            txn.txid,
-            sel,
-            arena,
-            params,
-            None,
-            Some(&live_sequence),
-            &mut |vals| {
-                rows_bytes[at] = encode_projected_pub(vals, arena)?;
-                at += 1;
-                Ok(())
-            },
-        ) {
-            return sql_fail(e);
-        }
+    }
+    {
+        let rows_bytes = computed;
         for bytes in rows_bytes.iter() {
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
@@ -85410,7 +85532,7 @@ where
     // errors up front, independent of whether any row actually conflicts.
     let arbiter = match &statement.on_conflict {
         _ if def.kind == crate::storage::TableKind::Foreign => Arbiter::Any,
-        Some(oc) => match resolve_arbiter(storage, def, oc, txn.txid) {
+        Some(oc) => match resolve_arbiter(storage, def, oc, txn.txid, arena) {
             Ok(a) => a,
             Err(e) => return sql_fail(e),
         },

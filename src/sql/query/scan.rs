@@ -2107,7 +2107,7 @@ where
     }
 }
 
-fn predicate_is_implied<'a, Resolve>(
+pub(crate) fn predicate_is_implied<'a, Resolve>(
     required: &Expr<'_>,
     queries: &[Option<&'a Expr<'a>>],
     definition: &TableDef,

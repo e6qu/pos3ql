@@ -435,10 +435,13 @@ impl<D: Copy> ForeignCatalogEntry<D> {
         self.ddl_state.visible_to(txid)
     }
 
-    pub(crate) fn definition_for(&self, txid: u32) -> D {
-        self.pending
-            .filter(|pending| pending.txid == txid)
-            .map_or(self.definition, |pending| pending.definition)
+    /// The definition `txid` sees, borrowed: a lookup copies only the entry
+    /// it selects, not every fixed slot it passes.
+    pub(crate) fn definition_for(&self, txid: u32) -> &D {
+        match &self.pending {
+            Some(pending) if pending.txid == txid => &pending.definition,
+            _ => &self.definition,
+        }
     }
 
     pub(crate) fn pending_owner_other_than(&self, txid: u32) -> Option<u32> {
@@ -562,7 +565,7 @@ impl ForeignCatalog {
         {
             return true;
         }
-        entry.visible_to(txid) && identity_matches(entry.definition_for(txid))
+        entry.visible_to(txid) && identity_matches(*entry.definition_for(txid))
     }
 
     pub(crate) fn wrapper_capacity(&self) -> usize {
@@ -647,11 +650,10 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<(usize, ForeignDataWrapperDefinition)> {
         self.wrappers.iter().enumerate().find_map(|(slot, entry)| {
-            let definition = entry.definition_for(txid);
             (entry.database == database
                 && entry.visible_to(txid)
-                && definition.name.as_str() == name)
-                .then_some((slot, definition))
+                && entry.definition_for(txid).name.as_str() == name)
+                .then(|| (slot, *entry.definition_for(txid)))
         })
     }
 
@@ -662,7 +664,7 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<ForeignDataWrapperDefinition> {
         let entry = self.wrappers.get(slot)?;
-        (entry.database == database && entry.visible_to(txid)).then(|| entry.definition_for(txid))
+        (entry.database == database && entry.visible_to(txid)).then(|| *entry.definition_for(txid))
     }
 
     pub(crate) fn server(
@@ -672,11 +674,10 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<(usize, ForeignServerDefinition)> {
         self.servers.iter().enumerate().find_map(|(slot, entry)| {
-            let definition = entry.definition_for(txid);
             (entry.database == database
                 && entry.visible_to(txid)
-                && definition.name.as_str() == name)
-                .then_some((slot, definition))
+                && entry.definition_for(txid).name.as_str() == name)
+                .then(|| (slot, *entry.definition_for(txid)))
         })
     }
 
@@ -687,7 +688,7 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<ForeignServerDefinition> {
         let entry = self.servers.get(slot)?;
-        (entry.database == database && entry.visible_to(txid)).then(|| entry.definition_for(txid))
+        (entry.database == database && entry.visible_to(txid)).then(|| *entry.definition_for(txid))
     }
 
     pub(crate) fn mapping(
@@ -698,12 +699,11 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<(usize, UserMappingDefinition)> {
         self.mappings.iter().enumerate().find_map(|(slot, entry)| {
+            if entry.database != database || !entry.visible_to(txid) {
+                return None;
+            }
             let definition = entry.definition_for(txid);
-            (entry.database == database
-                && entry.visible_to(txid)
-                && definition.server == server
-                && definition.user == user)
-                .then_some((slot, definition))
+            (definition.server == server && definition.user == user).then_some((slot, *definition))
         })
     }
 
@@ -714,9 +714,10 @@ impl ForeignCatalog {
         txid: u32,
     ) -> Option<(usize, ForeignTableDefinition)> {
         self.tables.iter().enumerate().find_map(|(slot, entry)| {
-            let definition = entry.definition_for(txid);
-            (entry.database == database && entry.visible_to(txid) && definition.table == table)
-                .then_some((slot, definition))
+            (entry.database == database
+                && entry.visible_to(txid)
+                && entry.definition_for(txid).table == table)
+                .then(|| (slot, *entry.definition_for(txid)))
         })
     }
 
@@ -1107,7 +1108,7 @@ impl ForeignCatalog {
                     projected.key == Some(key(definition))
                 } else {
                     entry.visible_to(image.transaction)
-                        && key(entry.definition_for(image.transaction)) == key(definition)
+                        && key(*entry.definition_for(image.transaction)) == key(definition)
                 }
             })
         {
@@ -1167,14 +1168,15 @@ impl ForeignCatalog {
             entry.ddl_state = entry.ddl_state.drop_by(image.transaction);
             return Ok(PreparedForeignChange::Dropped);
         };
-        let prior_definition = (entry.definition_for(image.transaction) != definition).then(|| {
-            let prior = entry.pending;
-            entry.pending = Some(PendingForeignDefinition {
-                txid: image.transaction,
-                definition,
+        let prior_definition =
+            (*entry.definition_for(image.transaction) != definition).then(|| {
+                let prior = entry.pending;
+                entry.pending = Some(PendingForeignDefinition {
+                    txid: image.transaction,
+                    definition,
+                });
+                prior
             });
-            prior
-        });
         let prior_ownership = image
             .owner
             .filter(|owner| *owner != entry.ownership.owner_to(image.transaction))
@@ -1698,7 +1700,7 @@ impl ForeignCatalog {
     ) -> Option<(usize, ForeignServerDefinition)> {
         self.servers(database, txid).find_map(|(slot, entry)| {
             let definition = entry.definition_for(txid);
-            (definition.wrapper == wrapper).then_some((slot, definition))
+            (definition.wrapper == wrapper).then_some((slot, *definition))
         })
     }
 
@@ -1710,7 +1712,7 @@ impl ForeignCatalog {
     ) -> Option<(usize, UserMappingDefinition)> {
         self.mappings(database, txid).find_map(|(slot, entry)| {
             let definition = entry.definition_for(txid);
-            (definition.server == server).then_some((slot, definition))
+            (definition.server == server).then_some((slot, *definition))
         })
     }
 
@@ -1722,7 +1724,7 @@ impl ForeignCatalog {
     ) -> Option<(usize, ForeignTableDefinition)> {
         self.tables(database, txid).find_map(|(slot, entry)| {
             let definition = entry.definition_for(txid);
-            (definition.server == server).then_some((slot, definition))
+            (definition.server == server).then_some((slot, *definition))
         })
     }
 

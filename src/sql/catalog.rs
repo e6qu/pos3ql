@@ -8284,7 +8284,7 @@ fn foreign_table_visible(storage: &Storage, slot: usize, txid: u32) -> bool {
 
 fn foreign_mapping_options_visible(
     storage: &Storage,
-    mapping: crate::storage::foreign::UserMappingDefinition,
+    mapping: &crate::storage::foreign::UserMappingDefinition,
     txid: u32,
 ) -> bool {
     let Some(current) = storage.current_role_slot(txid) else {
@@ -22500,20 +22500,20 @@ fn pg_attribute<'a>(
                 slot: slot as u16,
             },
         };
+        let foreign_binding = storage.foreign_table(slot as u16, txid);
         for (i, c) in storage.table_def(slot, txid).columns().iter().enumerate() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
-            let foreign_column_options =
-                if let Some((_, binding)) = storage.foreign_table(slot as u16, txid) {
-                    let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
-                    for option in binding.column_options.options_for(i as u16) {
-                        options.restore_option(option.name.as_str(), option.value.as_str())?;
-                    }
-                    foreign_options_datum(&options, arena)?
-                } else {
-                    Datum::Null
-                };
+            let foreign_column_options = if let Some((_, binding)) = &foreign_binding {
+                let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+                for option in binding.column_options.options_for(i as u16) {
+                    options.restore_option(option.name.as_str(), option.value.as_str())?;
+                }
+                foreign_options_datum(&options, arena)?
+            } else {
+                Datum::Null
+            };
             inheritance_counts[n] = table_definition
                 .inheritance
                 .parents_ref()

@@ -8958,7 +8958,7 @@ impl Engine {
                         owner: entry.ownership.owner_to(txn.txid),
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Server => {
@@ -8969,7 +8969,7 @@ impl Engine {
                         owner: entry.ownership.owner_to(txn.txid),
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Mapping => {
@@ -8979,14 +8979,14 @@ impl Engine {
                         created_at: entry.created_at,
                         definition: entry
                             .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                            .then(|| *entry.definition_for(txn.txid)),
                     }
                 }
                 crate::storage::foreign::ForeignObjectClass::Table => {
                     let entry = self.storage.foreign_table_entry(slot as usize);
                     foreign_table_definition = entry
                         .visible_to(txn.txid)
-                        .then(|| entry.definition_for(txn.txid));
+                        .then(|| *entry.definition_for(txn.txid));
                     WalOp::SetForeignTable {
                         slot: slot as u16,
                         created_at: entry.created_at,

@@ -59616,8 +59616,19 @@ impl Storage {
         input: RoutineResult,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
+        // One lock over borrowed slots: index catalogs resolve every key's
+        // default class, and most of the fixed slots are empty.
+        let catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let database = current_database();
         let mut found = None;
-        for (slot, definition) in self.operator_classes_visible_to(txid) {
+        for (slot, class) in catalog.classes.iter().enumerate() {
+            if class.database != database || !class.visible_to(txid) {
+                continue;
+            }
+            let definition = class.definition_for(txid);
             if definition.default && definition.input == input && found.replace(slot).is_some() {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,

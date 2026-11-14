@@ -754,14 +754,21 @@ impl<'a> KeyedRows<'a> {
             }
             CatalogRowKey::Tuple => 0,
         };
+        // One row-wide buffer each, reused for every row.
+        let width = table.def.n_columns + table.hidden_columns;
+        let values = arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let selected = arena
+            .alloc_slice_with(key_count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         for row in table.rows {
-            if row.len() != table.def.n_columns + table.hidden_columns || row.len() > MAX_COLUMNS {
+            if row.len() != width || row.len() > MAX_COLUMNS {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "catalog row does not match its definition"
                 ));
             }
-            let mut values = [Datum::Null; MAX_COLUMNS];
             for (column, value) in row.iter().copied().enumerate() {
                 values[column] = if column < table.def.n_columns
                     && table.def.columns[column].ctype == ColType::Oid
@@ -775,11 +782,10 @@ impl<'a> KeyedRows<'a> {
             let key = match key {
                 CatalogRowKey::Tuple => bytes,
                 CatalogRowKey::Columns(_) => {
-                    let mut selected = [Datum::Null; MAX_COLUMNS];
                     for index in 0..key_count {
                         selected[index] = values[key_columns[index]];
                     }
-                    encode_projected_pub(&selected[..key_count], arena)?
+                    encode_projected_pub(selected, arena)?
                 }
             };
             let slot = output.slot(key);

@@ -22502,8 +22502,12 @@ fn pg_attribute<'a>(
                 slot: slot as u16,
             },
         };
-        let foreign_binding = storage.foreign_table(slot as u16, txid);
-        for (i, c) in storage.table_def(slot, txid).columns().iter().enumerate() {
+        let definition = storage.table_def(slot, txid);
+        // Only a foreign table has a binding; the lookup walks every one.
+        let foreign_binding = (definition.kind == crate::storage::TableKind::Foreign)
+            .then(|| storage.foreign_table(slot as u16, txid))
+            .flatten();
+        for (i, c) in definition.columns().iter().enumerate() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }

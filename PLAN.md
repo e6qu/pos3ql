@@ -126,12 +126,18 @@ is owned.
   its slot, and collects indexes and foreign keys in one walk, so a commit
   no longer looks every table up by name for each table; checkpoint
   maintenance reads a value index binding's fields in place instead of
-  copying it. A commit's cost still grows with the catalog: each table's
-  index lookup scans every index and each foreign key finds its parent by
-  name. Capturing only the rows the transaction's changes name would bound
-  every relation by the change (`configured_transaction_capacity_covers_
-  truncate_fanout_and_prepared_cold_recovery`, which commits 300 tables'
-  DDL, took 175 s in a local debug build before and 108 s after).
+  copying it. `pg_attribute` looks up a foreign table's binding only for a
+  foreign table, and keying a catalog's rows reuses one row-wide buffer
+  (`configured_transaction_capacity_covers_truncate_fanout_and_prepared_
+  cold_recovery`, which commits 300 tables' DDL, took 122 s in a local
+  debug build before and 95 s after). A commit's cost still grows with the
+  catalog: about four fifths of it is synthesizing each changed catalog
+  relation (`pg_depend`, `pg_attribute` and `pg_constraint` most), so
+  capturing only the rows the transaction's changes name, with each
+  synthesizer filtered to the touched relations and their key and
+  inheritance neighbours, would bound it by the change. Each table's index
+  lookup still scans every index, and each foreign key finds its parent by
+  name; in that commit profile they cost under five percent.
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the

@@ -90913,12 +90913,12 @@ pub(crate) fn update<'a>(
                 } => (table_index, 0, None, Some(tuple_id)),
             };
             // Referential actions retain the arena-owned old values across mutation.
-            let row_bytes = match (|| match (home, remote_tuple) {
+            let row_bytes = match match (home, remote_tuple) {
                 (Some(_), None) => retained_rows.bytes(row_table, rowid),
                 // The row as its locking scan read it.
                 (None, Some(tuple_id)) => retained_rows.bytes(row_table, tuple_id.sort_key()),
                 _ => unreachable!("DML row identity has one closed variant"),
-            })() {
+            } {
                 Ok(b) => b,
                 Err(error) => return sql_fail(error),
             };

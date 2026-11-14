@@ -31,6 +31,10 @@ pub(crate) const REMOTE_QUERY_BYTES: usize = 16_384;
 pub(crate) type RemoteText = StackStr<REMOTE_QUERY_BYTES>;
 
 /// Why a subexpression does not ship.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an error ends the walk once; boxing would allocate at run time"
+)]
 enum Stop {
     /// Outside the shapes postgres_fdw ships, or outside this module's model.
     Local,
@@ -307,14 +311,9 @@ impl<'t> Deparser<'t> {
             Expr::Int(_) => Ok(Shape::Literal(self.integer(expression).ok_or(Stop::Local)?)),
             Expr::Unary {
                 operator: UnaryOp::Neg,
-                operand,
+                operand: Expr::Int(_) | Expr::NumericLit(_),
                 ..
-            } => match operand {
-                Expr::Int(_) | Expr::NumericLit(_) => {
-                    Ok(Shape::Literal(self.integer(expression).ok_or(Stop::Local)?))
-                }
-                _ => Err(Stop::Local),
-            },
+            } => Ok(Shape::Literal(self.integer(expression).ok_or(Stop::Local)?)),
             Expr::Unary {
                 operator: UnaryOp::Not,
                 operand,
@@ -1443,19 +1442,11 @@ fn read_columns(
 ) -> Option<()> {
     let mut each = |child: &Expr<'_>| read_columns(deparser, child, columns);
     match expression {
-        Expr::Column { qualifier, name } => {
-            if qualifier.is_none_or(|qualifier| qualifier == deparser.exposed)
-                && let Some(column) = deparser.column(expression)
-            {
+        Expr::Column { .. } => {
+            // A name that is no column of the table is an output name, which
+            // its select-list item covers, or an error the query reports.
+            if let Some(column) = deparser.column(expression) {
                 columns.insert(column);
-            } else if qualifier.is_none()
-                && deparser
-                    .table
-                    .columns()
-                    .iter()
-                    .all(|c| c.name.as_str() != *name)
-            {
-                // An output name or a misspelling: the caller resolves it.
             }
             Some(())
         }
@@ -2056,14 +2047,13 @@ pub(crate) fn plan_modify_scan<'a>(
             let _ = modify.write_str("UPDATE ");
             deparser.write_relation(&mut modify);
             let _ = modify.write_str(" SET ");
-            let mut parameter = 2;
-            for column in (0..deparser.table.n_columns).filter(|&column| columns.contains(column)) {
+            let assigned = (0..deparser.table.n_columns).filter(|&column| columns.contains(column));
+            for (parameter, column) in (2..).zip(assigned) {
                 if parameter != 2 {
                     let _ = modify.write_str(", ");
                 }
                 deparser.write_column(&mut modify, column);
                 let _ = write!(modify, " = ${parameter}");
-                parameter += 1;
             }
         }
         None => {

@@ -8346,7 +8346,6 @@ impl<'a> Parser<'a> {
     /// PostgreSQL's `OptTypedTableElementList` of a partition, after its
     /// `(`: column options, which keep an empty type name, and table
     /// constraints.
-    #[expect(clippy::type_complexity, reason = "the two element lists")]
     fn partition_elements(
         &mut self,
         table: &'a str,

@@ -11977,9 +11977,13 @@ pub fn fold_select_constants<'a>(
     // the scan calls for each row to its left (any but the first FROM item,
     // outside the right of a RIGHT or FULL join) folds its arguments here
     // too; the others ran when the scope materialized them.
+    // `JSON_TABLE` and `XMLTABLE` carry their clauses as arguments, which
+    // their scans read as written.
     let lateral_call = |join: &crate::sql::ast::Join<'a>| {
         !join.kind.is_right_or_full()
             && (join.table.func_args.is_some() || join.table.rows_from.is_some())
+            && !(join.table.schema.is_none()
+                && matches!(join.table.table, "json_table" | "xmltable"))
     };
     if let Some(from) = statement.from
         && from

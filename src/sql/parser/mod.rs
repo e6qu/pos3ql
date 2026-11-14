@@ -12984,7 +12984,11 @@ mod tests {
             let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
                 panic!("empty password did not parse")
             };
-            assert_eq!(options.password, Some(None));
+            // Execution clears it with PostgreSQL's notice.
+            assert!(matches!(
+                options.password,
+                Some(Some(crate::sql::ast::RolePasswordSpec::Plaintext("")))
+            ));
         });
     }
 

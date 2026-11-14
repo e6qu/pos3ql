@@ -5561,9 +5561,12 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     context.load_plpgsql()?;
     // A trigger's OLD and NEW hold no virtual generated column's value, which
     // PostgreSQL computes only when a query reads the table. A BEFORE
-    // trigger's NEW is recomputed afterwards, so it is cleared in place.
+    // trigger's NEW holds no generated value at all: the write computes its
+    // stored ones afterwards, so they are cleared in place.
     let columns = definition.columns();
-    let (old, new) = if columns.iter().any(|column| column.default.is_virtual()) {
+    let (old, new) = if columns.iter().any(|column| {
+        column.default.is_virtual() || (before && new.is_some() && column.default.is_generated())
+    }) {
         let without_virtual = |values: &[Datum<'values>]| {
             let copied = context
                 .arena
@@ -5583,7 +5586,7 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         let new = match new {
             Some(values) if before => {
                 for (value, column) in values.iter_mut().zip(columns) {
-                    if column.default.is_virtual() {
+                    if column.default.is_generated() {
                         *value = Datum::Null;
                     }
                 }
@@ -10893,12 +10896,35 @@ fn require_role_attribute_authority(
     Ok(())
 }
 
+/// Role attributes after a statement's options, and whether its password
+/// was one PostgreSQL refuses to store: an empty string, or a verifier of
+/// one, which clears the password with a notice.
+struct AppliedRoleOptions {
+    attributes: crate::storage::RoleAttributes,
+    cleared_empty_password: bool,
+}
+
+impl AppliedRoleOptions {
+    /// PostgreSQL's notice for a cleared empty password, sent once the role
+    /// is changed.
+    fn notify(&self, responder: &mut Responder) -> Result<(), WireFull> {
+        if self.cleared_empty_password {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                "empty string is not a valid password, clearing password",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 fn apply_role_options(
     mut attributes: crate::storage::RoleAttributes,
     role_name: &str,
     password_encryption: crate::sql::guc::PasswordEncryption,
     options: &crate::sql::ast::RoleOptions<'_>,
-) -> Result<crate::storage::RoleAttributes, SqlError> {
+) -> Result<AppliedRoleOptions, SqlError> {
+    let mut cleared_empty_password = false;
     if let Some(value) = options.superuser {
         attributes.superuser = value;
     }
@@ -10931,7 +10957,22 @@ fn apply_role_options(
         attributes.connection_limit = value;
     }
     if let Some(password) = options.password {
-        attributes.password = if let Some(password) = password {
+        let empty = match password {
+            Some(crate::sql::ast::RolePasswordSpec::Plaintext(password)) => password.is_empty(),
+            Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier)) => {
+                crate::pg::auth::ScramServer::derive_with_salt(
+                    "",
+                    verifier.salt,
+                    verifier.iterations,
+                ) == verifier
+            }
+            Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(verifier)) => {
+                crate::storage::Md5Verifier::derive("", role_name) == Some(verifier)
+            }
+            None => false,
+        };
+        cleared_empty_password = empty;
+        attributes.password = if let Some(password) = password.filter(|_| !empty) {
             let credential = match password {
                 crate::sql::ast::RolePasswordSpec::Plaintext(password) => {
                     if password.len() > crate::storage::ROLE_PASSWORD_MAX {
@@ -10996,7 +11037,10 @@ fn apply_role_options(
         }
         attributes.valid_until = Some(value);
     }
-    Ok(attributes)
+    Ok(AppliedRoleOptions {
+        attributes,
+        cleared_empty_password,
+    })
 }
 
 pub struct CreateRoleRequest<'a> {
@@ -11023,15 +11067,16 @@ pub fn create_role(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let attributes = match apply_role_options(
+    let applied = match apply_role_options(
         crate::storage::RoleAttributes::ORDINARY,
         name.as_str(),
         guc.password_encryption(),
         request.options,
     ) {
-        Ok(attributes) => attributes,
+        Ok(applied) => applied,
         Err(error) => return sql_fail(error),
     };
+    let attributes = applied.attributes;
     if name.as_str().starts_with("pg_") {
         return sql_fail(reserved_role_name(
             name.as_str(),
@@ -11072,6 +11117,7 @@ pub fn create_role(
             "SYSID can no longer be specified",
         )?;
     }
+    applied.notify(responder)?;
     let current = storage
         .current_role_slot(txn.txid)
         .expect("CREATE ROLE privilege check resolved current role");
@@ -11292,15 +11338,16 @@ pub fn alter_role(
     if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
         return sql_fail(error);
     }
-    let attributes = match apply_role_options(
+    let applied = match apply_role_options(
         storage.role(slot).attributes_to(txn.txid),
         storage.role_name(slot, txn.txid).as_str(),
         guc.password_encryption(),
         options,
     ) {
-        Ok(attributes) => attributes,
+        Ok(applied) => applied,
         Err(error) => return sql_fail(error),
     };
+    let attributes = applied.attributes;
     let prior = match storage.alter_role(slot, attributes, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -11329,6 +11376,7 @@ pub fn alter_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
+    applied.notify(responder)?;
     if options.password.is_some()
         && matches!(
             attributes.password,
@@ -11750,6 +11798,11 @@ pub fn rename_role(
         }
     }
     let old_name = storage.role(slot).name_to(txn.txid);
+    // An MD5 verifier salts with the role name, so a rename clears it.
+    let md5_cleared = matches!(
+        storage.role(slot).attributes_to(txn.txid).password,
+        Some(crate::storage::RoleCredential::Md5(_))
+    );
     let prior = match storage.rename_role(slot, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
@@ -11775,6 +11828,12 @@ pub fn rename_role(
     ) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
+    }
+    if md5_cleared {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            "MD5 password cleared because of role rename",
+        )?;
     }
     responder.command_complete("ALTER ROLE")?;
     sql_ok()
@@ -12776,9 +12835,225 @@ fn privilege_mask(
     Ok(result)
 }
 
-fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
+/// The privileges among `requested` the current role may grant or revoke
+/// on `object`: those it holds grant options for, as PostgreSQL's
+/// `restrict_and_check_grant` narrows them. Holding no grant option and no
+/// privilege at all is the permission error.
+fn restricted_privileges(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    current: usize,
+    requested: crate::storage::PrivilegeSet,
+    txid: u32,
+) -> Result<crate::storage::PrivilegeSet, SqlError> {
+    use crate::storage::PrivilegeSet;
+    let bits = |set: PrivilegeSet| {
+        (0..16)
+            .map(|bit| PrivilegeSet(1 << bit))
+            .filter(move |bit| set.contains(*bit))
+    };
+    let mut available = PrivilegeSet::NONE;
+    for bit in bits(requested) {
+        if storage.has_object_grant_option(object, current, bit, txid) {
+            available = available.union(bit);
+        }
+    }
+    if available.0 == 0 && requested.0 != 0 {
+        let every = privilege_mask(
+            &[crate::sql::ast::PrivilegeSpec {
+                privilege: crate::sql::ast::Privilege::All,
+                columns: &[],
+            }],
+            object.class,
+            false,
+        )?;
+        let holds_any = bits(every).any(|bit| {
+            storage.has_object_privilege(object, current, bit, txid)
+                || storage.has_object_grant_option(object, current, bit, txid)
+        });
+        if !holds_any {
+            let (_, name) = storage.access_object_name(object);
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for {} {}",
+                privilege_object_noun(storage, object, txid),
+                name.as_str()
+            ));
+        }
+    }
+    Ok(PrivilegeSet(requested.0 & available.0))
+}
+
+/// PostgreSQL's warning when a GRANT, REVOKE or DROP OWNED changes fewer
+/// privileges on `target` (`"t"`, or `column "c" of relation "t"`) than it
+/// named; naming all privileges warns only when none change.
+fn warn_restricted_privileges(
+    is_grant: bool,
+    all_privileges: bool,
+    requested: crate::storage::PrivilegeSet,
+    allowed: crate::storage::PrivilegeSet,
+    target: core::fmt::Arguments<'_>,
+) -> Result<(), SqlError> {
+    let (code, prefix) = match (is_grant, allowed.0 == 0) {
+        (true, true) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+            "no privileges were granted for",
+        ),
+        (true, false) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+            "not all privileges were granted for",
+        ),
+        (false, true) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_REVOKED,
+            "no privileges could be revoked for",
+        ),
+        (false, false) => (
+            sqlstate::WARNING_PRIVILEGE_NOT_REVOKED,
+            "not all privileges could be revoked for",
+        ),
+    };
+    if allowed.0 != 0 && (all_privileges || allowed.0 == requested.0) {
+        return Ok(());
+    }
+    crate::sql::eval::raise_eval_message(
+        crate::sql::eval::EvalMessageLevel::Warning,
+        code,
+        format_args!("{prefix} {target}"),
+    )
+}
+
+/// Receives a revoked column's name and its column-privilege target, which a
+/// system column has none of.
+type RevokedColumnVisitor<'v> =
+    dyn FnMut(&str, Option<crate::storage::ColumnPrivilegeTarget>) -> Result<(), SqlError> + 'v;
+
+/// The columns PostgreSQL revokes a relation's column privileges from with
+/// a relation-level REVOKE, in attribute order: the system columns of a
+/// relation that has them, then its columns.
+fn visit_revoked_relation_columns(
+    storage: &Storage,
+    relation: crate::storage::AccessObject,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut RevokedColumnVisitor<'_>,
+) -> Result<(), SqlError> {
     use crate::storage::AccessClass;
-    match class {
+    if relation.class != AccessClass::View {
+        for system in ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid"] {
+            visit(system, None)?;
+        }
+    }
+    match relation.class {
+        AccessClass::Table | AccessClass::MaterializedView => {
+            let table = match relation.class {
+                AccessClass::Table => relation.slot as usize,
+                _ => {
+                    let (schema, name) = storage.access_object_name_to(relation, txid);
+                    storage
+                        .find_table(schema.as_str(), name.as_str())
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "materialized view \"{}\" has no table row",
+                                name.as_str()
+                            )
+                        })?
+                }
+            };
+            let definition = (*storage.table_def(table, txid)).clone();
+            for (column, metadata) in definition.columns().iter().enumerate() {
+                visit(
+                    metadata.name.as_str(),
+                    crate::storage::ColumnPrivilegeTarget::new(relation, column as u16).ok(),
+                )?;
+            }
+        }
+        AccessClass::View => {
+            let view = storage.view(relation.slot as usize);
+            let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+            let count = super::catalog::describe_view(&view, txid, arena, &mut descriptions)?;
+            for (column, description) in descriptions[..count].iter().enumerate() {
+                visit(
+                    description.name,
+                    crate::storage::ColumnPrivilegeTarget::new(relation, column as u16).ok(),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a column warning needs the relation's grant authority and the revocation"
+)]
+/// The warnings of a relation-level REVOKE (or DROP OWNED) for each column,
+/// whose column privileges it revokes too: a column's grant options are the
+/// relation's and its own.
+fn warn_restricted_column_revocations(
+    storage: &Storage,
+    relation: crate::storage::AccessObject,
+    current: usize,
+    requested: crate::storage::PrivilegeSet,
+    relation_available: crate::storage::PrivilegeSet,
+    all_privileges: bool,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use crate::storage::{AccessClass, PrivilegeSet};
+    if !matches!(
+        relation.class,
+        AccessClass::Table | AccessClass::View | AccessClass::MaterializedView
+    ) {
+        return Ok(());
+    }
+    let column_requested = PrivilegeSet(
+        requested.0
+            & PrivilegeSet::SELECT
+                .union(PrivilegeSet::INSERT)
+                .union(PrivilegeSet::UPDATE)
+                .union(PrivilegeSet::REFERENCES)
+                .0,
+    );
+    if column_requested.0 == 0 || relation_available.contains(column_requested) {
+        return Ok(());
+    }
+    let (_, relation_name) = storage.access_object_name_to(relation, txid);
+    visit_revoked_relation_columns(storage, relation, txid, arena, &mut |name, target| {
+        let mut available = PrivilegeSet(column_requested.0 & relation_available.0);
+        if let Some(target) = target {
+            for bit in (0..16).map(|bit| PrivilegeSet(1 << bit)) {
+                if column_requested.contains(bit)
+                    && storage.has_column_grant_option(target, current, bit, txid)
+                {
+                    available = available.union(bit);
+                }
+            }
+        }
+        warn_restricted_privileges(
+            false,
+            all_privileges,
+            column_requested,
+            available,
+            format_args!(
+                "column \"{}\" of relation \"{}\"",
+                name,
+                relation_name.as_str()
+            ),
+        )
+    })
+}
+
+/// The object kind PostgreSQL's `aclcheck_error` names in a permission
+/// error.
+fn privilege_object_noun(
+    storage: &Storage,
+    object: crate::storage::AccessObject,
+    txid: u32,
+) -> &'static str {
+    use crate::storage::AccessClass;
+    match object.class {
         AccessClass::Database => "database",
         AccessClass::Schema => "schema",
         AccessClass::Sequence => "sequence",
@@ -12787,6 +13062,17 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
         AccessClass::Language => "language",
         AccessClass::Tablespace => "tablespace",
+        AccessClass::ForeignDataWrapper => "foreign-data wrapper",
+        AccessClass::ForeignServer => "foreign server",
+        AccessClass::View => "view",
+        AccessClass::MaterializedView => "materialized view",
+        AccessClass::Table
+            if storage.table_def(usize::from(object.slot), txid).kind
+                == crate::storage::TableKind::Foreign =>
+        {
+            "foreign table"
+        }
+        AccessClass::Table => "table",
         _ => "relation",
     }
 }
@@ -13584,6 +13870,23 @@ fn drop_owned_privileges(
         privileges: column_queue_privileges,
     };
     let mut queue_count = 0usize;
+    // PostgreSQL revokes the roles' privileges as the current role: an
+    // object it cannot revoke anything on keeps them, with a warning.
+    let current = storage
+        .current_role_slot(txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+    let checked = arena
+        .alloc_slice_with(graph_capacity, |_| {
+            (
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Table,
+                    slot: 0,
+                },
+                false,
+            )
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut checked_count = 0usize;
 
     for slot in 0..storage.acl_entry_count() {
         let entry = storage.acl_entry(slot);
@@ -13593,6 +13896,57 @@ fn drop_owned_privileges(
             || !storage.access_object_visible_to(entry.object, txn.txid)
             || (!roles.contains(&grantee) && !roles.contains(&grantor))
         {
+            continue;
+        }
+        let revocable = match checked[..checked_count]
+            .iter()
+            .find(|(object, _)| *object == entry.object)
+        {
+            Some((_, revocable)) => *revocable,
+            None => {
+                let every = privilege_mask(
+                    &[crate::sql::ast::PrivilegeSpec {
+                        privilege: crate::sql::ast::Privilege::All,
+                        columns: &[],
+                    }],
+                    entry.object.class,
+                    false,
+                )?;
+                let allowed =
+                    restricted_privileges(storage, entry.object, current, every, txn.txid)?;
+                if allowed.0 == 0 && every.0 != 0 {
+                    let (_, name) = storage.access_object_name_to(entry.object, txn.txid);
+                    warn_restricted_privileges(
+                        false,
+                        true,
+                        every,
+                        allowed,
+                        format_args!("\"{}\"", name.as_str()),
+                    )?;
+                    warn_restricted_column_revocations(
+                        storage,
+                        entry.object,
+                        current,
+                        every,
+                        allowed,
+                        true,
+                        txn.txid,
+                        arena,
+                    )?;
+                }
+                if checked_count == checked.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "privilege dependency graph exceeds {} entries",
+                        checked.len()
+                    ));
+                }
+                checked[checked_count] = (entry.object, allowed.0 != 0 || every.0 == 0);
+                checked_count += 1;
+                allowed.0 != 0 || every.0 == 0
+            }
+        };
+        if !revocable {
             continue;
         }
         let lost_options = record_acl_removal(storage, txn, slot)?;
@@ -13727,8 +14081,60 @@ fn drop_owned_privileges(
     Ok(())
 }
 
+/// `DROP OWNED`: PostgreSQL drops every object the roles own in this
+/// database as one deletion, so one report covers what it reaches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_owned(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    roles: &[&str],
+    cascade: bool,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+) -> Outcome {
+    let report = (|| {
+        let owned_roles = arena
+            .alloc_slice_with(roles.len(), |_| 0u16)
+            .map_err(|_| super::query::arena_full_pub())?;
+        let owned_role_count = resolve_owned_roles(storage, txn.txid, roles, owned_roles)?;
+        let owned_roles = &owned_roles[..owned_role_count];
+        let dependencies = crate::sql::catalog::shared_dependencies(storage, txn.txid, arena)?;
+        // Databases are not dropped with their owner (`pg_database` is 1262).
+        let owned = |dependency: &&crate::sql::catalog::SharedDependency| {
+            dependency.kind == b'o'
+                && dependency.database.is_none()
+                && dependency.class != 1262
+                && owned_roles.contains(&dependency.role)
+        };
+        let count = dependencies.iter().filter(owned).count();
+        let originals = arena
+            .alloc_slice_with(count, |_| ObjectAddress::new(0, 0, 0))
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (original, dependency) in originals.iter_mut().zip(dependencies.iter().filter(owned)) {
+            *original = ObjectAddress::new(dependency.class, dependency.object, dependency.sub);
+        }
+        dependency_report::report_drop(storage, txn.txid, originals, cascade, arena, responder)
+    })();
+    run_reported_drop(report, responder, |responder| {
+        drop_owned_objects(
+            storage,
+            wal,
+            txn,
+            scratch,
+            roles,
+            cascade,
+            arena,
+            seq_session,
+            responder,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_owned_objects(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -15377,6 +15783,11 @@ pub fn grant_privileges(
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
+    // Naming every privilege warns only when none can change.
+    let all_privileges = privileges.iter().any(|specification| {
+        specification.privilege == crate::sql::ast::Privilege::All
+            && specification.columns.is_empty()
+    });
     let current = super::eval::funcs::system::current_user_owned();
     let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -15404,20 +15815,25 @@ pub fn grant_privileges(
         if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
-        let requested = match privilege_mask(privileges, object.class, false) {
+        let named = match privilege_mask(privileges, object.class, false) {
             Ok(mask) => mask,
             Err(error) => return sql_fail(error),
         };
-        if requested.0 != 0
-            && !storage.has_object_grant_option(*object, grantor, requested, txn.txid)
-        {
-            let (_, name) = storage.access_object_name(*object);
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for {} {}",
-                privilege_object_noun(object.class),
-                name.as_str()
-            ));
+        let requested = match restricted_privileges(storage, *object, grantor, named, txn.txid) {
+            Ok(requested) => requested,
+            Err(error) => return sql_fail(error),
+        };
+        if named.0 != 0 {
+            let (_, name) = storage.access_object_name_to(*object, txn.txid);
+            if let Err(error) = warn_restricted_privileges(
+                true,
+                all_privileges,
+                named,
+                requested,
+                format_args!("\"{}\"", name.as_str()),
+            ) {
+                return sql_fail(error);
+            }
         }
         let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
@@ -15607,6 +16023,11 @@ pub fn revoke_privileges(
         roles: column_queue_roles,
         privileges: column_queue_privileges,
     };
+    // Naming every privilege warns only when none can change.
+    let all_privileges = privileges.iter().any(|specification| {
+        specification.privilege == crate::sql::ast::Privilege::All
+            && specification.columns.is_empty()
+    });
     let current = super::eval::funcs::system::current_user_owned();
     let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -15628,20 +16049,37 @@ pub fn revoke_privileges(
         if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
             return sql_fail(error);
         }
-        let requested = match privilege_mask(privileges, object.class, false) {
+        let named = match privilege_mask(privileges, object.class, false) {
             Ok(mask) => mask,
             Err(error) => return sql_fail(error),
         };
-        if requested.0 != 0
-            && !storage.has_object_grant_option(*object, grantor, requested, txn.txid)
-        {
-            let (_, name) = storage.access_object_name(*object);
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for {} {}",
-                privilege_object_noun(object.class),
-                name.as_str()
-            ));
+        let requested = match restricted_privileges(storage, *object, grantor, named, txn.txid) {
+            Ok(requested) => requested,
+            Err(error) => return sql_fail(error),
+        };
+        if named.0 != 0 {
+            let (_, name) = storage.access_object_name_to(*object, txn.txid);
+            if let Err(error) = warn_restricted_privileges(
+                false,
+                all_privileges,
+                named,
+                requested,
+                format_args!("\"{}\"", name.as_str()),
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = warn_restricted_column_revocations(
+                storage,
+                *object,
+                grantor,
+                named,
+                requested,
+                all_privileges,
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
         }
         let acl_grantor = acl_grantor(storage, *object, grantor, txn.txid);
         for name in grantees {
@@ -18968,6 +19406,19 @@ pub fn create_subscription(
     ) {
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
+    }
+    if options.connect == crate::sql::ast::SubscriptionConnect::Deferred {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(StackStr::from_str(
+                "To initiate replication, you must manually create the replication slot, \
+                 enable the subscription, and refresh the subscription.",
+            )),
+        );
+        responder.warning(
+            sqlstate::WARNING,
+            "subscription was created, but is not connected",
+        )?;
     }
     Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
 }
@@ -30073,6 +30524,13 @@ where
             .flatten()
     }
 
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        let table = self.canonical(table);
+        self.transition_row(table)
+            .then(|| self.transition.whole_row_relation(table))
+            .flatten()
+    }
+
     fn whole_row_fields(
         &self,
         table: &str,
@@ -30268,7 +30726,11 @@ where
             return Some(self.locals[index].declared_type());
         }
         self.named(qualifier, name)
-            .map(|variable| variable.ctype)
+            .map(|variable| match (variable.ctype, variable.value) {
+                // A record variable has the type of the row it holds.
+                (ColType::Record, Datum::Composite { slot, .. }) => ColType::Composite(Some(slot)),
+                (ctype, _) => ctype,
+            })
             .or_else(|| {
                 self.record_index(qualifier, name)
                     .and_then(|index| match self.values[index] {
@@ -34551,7 +35013,7 @@ fn execute_static_rewritten_write<'a>(
     local_values: &mut [Datum<'a>],
     into: Option<PlpgsqlInto<'a>>,
     status: &mut TriggerExecutionStatus<'a>,
-    progress: Option<&mut RowProgress>,
+    mut progress: Option<&mut RowProgress>,
 ) -> Result<(), SqlError> {
     let arena = context.arena;
     let txid = context.txn.txid;
@@ -34577,11 +35039,11 @@ fn execute_static_rewritten_write<'a>(
     with_bound_parameter_types(bound.parameter_types, || {
         let mut returning =
             StaticReturning::new(context, locals, targets.definition, into, *statement)?;
-        let mut capture =
-            |_: &Storage,
-             _: u32,
-             _: &dyn crate::sql::eval::SequenceAccess,
-             values: &[Datum<'_>]| { returning.capture(values, arena) };
+        returning.resume(progress.as_deref(), arena)?;
+        let mut capture = StaticReturningSink {
+            returning: &mut returning,
+            arena,
+        };
         let result = execute_nested_data_modification(
             context,
             statement,
@@ -34589,8 +35051,9 @@ fn execute_static_rewritten_write<'a>(
             transition_relations,
             returns.then_some(&mut capture as &mut super::ReturningCapture<'_>),
             &mut status.pending_write,
-            progress,
+            progress.as_deref_mut(),
         );
+        returning.keep(progress, arena, &context.storage().row_work)?;
         match result {
             Ok(rows) => {
                 let width = returning.width;
@@ -35107,7 +35570,10 @@ fn coerce_plpgsql_local<'a>(
             let definition = storage.table_def(usize::from(slot), txid);
             let mut target_oids = [0; MAX_COLUMNS];
             for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
-                *oid = column.ctype.oid();
+                // A domain column keeps its domain, as the row type declares.
+                *oid = storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .unwrap_or(column.ctype.oid());
             }
             let value = fit_plpgsql_row(
                 value,
@@ -35154,6 +35620,28 @@ fn coerce_plpgsql_local<'a>(
                 arena,
                 Some(sequences),
             )?
+        }
+        // A record variable takes a named composite value with its row
+        // type, whose fields keep their declared (domain) types.
+        Some(PlpgsqlRecordShape::Dynamic) | None
+            if local.ctype == ColType::Record
+                && let Datum::Composite { slot, fields } = value =>
+        {
+            let definition = storage.require_row_type_definition(slot, txid)?;
+            let typed = arena
+                .alloc_slice_copy(fields)
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (field, declared) in typed.iter_mut().zip(definition.active_fields()) {
+                if let Some(oid) =
+                    storage.routine_type_oid(declared.ctype, declared.user_type, txid)
+                {
+                    field.type_oid = oid;
+                }
+            }
+            Datum::Composite {
+                slot,
+                fields: typed,
+            }
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
             plpgsql_conversion_input(
@@ -35299,7 +35787,10 @@ fn coerce_plpgsql_table_rowtype<'a>(
             name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
-            type_oid: column.ctype.oid(),
+            // A domain column keeps its domain, as the row type declares.
+            type_oid: storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .unwrap_or(column.ctype.oid()),
             type_mod: column.type_mod,
             value: coerce_assignment(
                 source.value,
@@ -39774,6 +40265,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Insert(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -39794,11 +40286,9 @@ fn execute_trigger_step_in<'a>(
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     insert(
                         storage,
@@ -39865,6 +40355,11 @@ fn execute_trigger_step_in<'a>(
                     return Ok(None);
                 }
                 leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -39996,6 +40491,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Update(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -40022,11 +40518,9 @@ fn execute_trigger_step_in<'a>(
                 })?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     update(
                         storage,
@@ -40084,7 +40578,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -40208,6 +40707,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Delete(statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -40234,11 +40734,9 @@ fn execute_trigger_step_in<'a>(
                 })?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     delete(
                         storage,
@@ -40295,7 +40793,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -40390,6 +40893,7 @@ fn execute_trigger_step_in<'a>(
                     into,
                     Stmt::Merge(*statement),
                 )?;
+                returning.resume(progress.as_deref(), context.arena)?;
                 let arena = context.arena;
                 let params = context.params;
                 let boundary = context.nested_write_boundary();
@@ -40409,11 +40913,9 @@ fn execute_trigger_step_in<'a>(
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
-                    let mut capture = |_: &Storage,
-                                       _: u32,
-                                       _: &dyn crate::sql::eval::SequenceAccess,
-                                       values: &[Datum<'_>]| {
-                        returning.capture(values, arena)
+                    let mut capture = StaticReturningSink {
+                        returning: &mut returning,
+                        arena,
                     };
                     merge(
                         storage,
@@ -40468,7 +40970,12 @@ fn execute_trigger_step_in<'a>(
                     )?;
                     return Ok(None);
                 }
-                leave_write_command(command, progress);
+                leave_write_command(command, progress.as_deref_mut());
+                returning.keep(
+                    progress.as_deref_mut(),
+                    context.arena,
+                    &context.storage().row_work,
+                )?;
                 match outcome {
                     Ok(Ok(())) => {
                         let rows = context
@@ -41583,6 +42090,9 @@ struct StaticReturning<'a> {
     rows: u64,
     /// The columns of the first returned row.
     width: usize,
+    /// The first returned row as the statement returned it, kept with an
+    /// interrupted attempt.
+    first: Option<&'a [Datum<'a>]>,
 }
 
 impl<'a> StaticReturning<'a> {
@@ -41630,11 +42140,53 @@ impl<'a> StaticReturning<'a> {
             selected: [Datum::Null; MAX_COLUMNS],
             rows: 0,
             width: 0,
+            first: None,
         })
+    }
+
+    /// Continues with the rows the earlier attempts of an interrupted write
+    /// returned.
+    fn resume(&mut self, progress: Option<&RowProgress>, arena: &'a Arena) -> Result<(), SqlError> {
+        let Some(row_progress::ResumedIntoRows { rows, first }) = progress
+            .map(|progress| progress.resumed_into_rows(arena))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        if let Some(first) = first {
+            self.capture(first, arena)?;
+        }
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// Keeps the returned rows with an interrupted write's unfinished row.
+    fn keep(
+        &self,
+        progress: Option<&mut RowProgress>,
+        arena: &Arena,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> Result<(), SqlError> {
+        match progress {
+            Some(progress) if self.into.is_some() => {
+                progress.keep_into_rows(self.rows, self.first, arena, pool)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
         if self.rows == 0 && self.into.is_some() {
+            let mut first = [Datum::Null; MAX_COLUMNS];
+            for (slot, value) in first.iter_mut().zip(values) {
+                *slot = detached_trigger_datum(*value, arena)?;
+            }
+            self.first = Some(
+                arena
+                    .alloc_slice_copy(&first[..values.len()])
+                    .map_err(|_| super::query::arena_full_pub())?,
+            );
             self.width = values.len();
             match self.record {
                 Some(fields) => {
@@ -41682,6 +42234,31 @@ impl<'a> StaticReturning<'a> {
             self.selected[0] = Datum::Record(row);
         }
         Ok(&self.selected[..into.targets.len()])
+    }
+}
+
+/// A static data change's RETURNING destination. With INTO it asks for two
+/// rows, as PL/pgSQL's executor call does: one to assign and one to prove
+/// the result is not a single row, so the change stops after its second
+/// returned row.
+struct StaticReturningSink<'s, 'a> {
+    returning: &'s mut StaticReturning<'a>,
+    arena: &'a Arena,
+}
+
+impl super::ReturningSink for StaticReturningSink<'_, '_> {
+    fn row(
+        &mut self,
+        _: &Storage,
+        _: u32,
+        _: &dyn crate::sql::eval::SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError> {
+        self.returning.capture(values, self.arena)
+    }
+
+    fn row_limit(&self) -> Option<u64> {
+        self.returning.into.map(|_| 2)
     }
 }
 
@@ -49632,7 +50209,10 @@ pub(crate) fn alter_operator_class(
     sql_ok()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the drop reports its dependents from the statement arena"
+)]
 pub(crate) fn drop_operator_classes(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -49685,7 +50265,9 @@ pub(crate) fn drop_operator_classes(
         )
     })();
     let outcome = run_reported_drop(report, responder, |responder| {
-        drop_operator_classes_reported(storage, wal, txn, names, if_exists, cascade, responder)
+        drop_operator_classes_reported(
+            storage, wal, txn, names, if_exists, cascade, arena, responder,
+        )
     });
     finish_expression_cascade(
         outcome,
@@ -49699,6 +50281,10 @@ pub(crate) fn drop_operator_classes(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the executor reports dependents from the statement arena"
+)]
 fn drop_operator_classes_reported(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -49706,6 +50292,7 @@ fn drop_operator_classes_reported(
     names: &[crate::sql::ast::QualName<'_>],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -49738,8 +50325,29 @@ fn drop_operator_classes_reported(
         ) {
             return sql_fail(error);
         }
-        if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot, cascade) {
-            return sql_fail(error);
+        // PostgreSQL reports every object the drop reaches in one notice,
+        // or refuses a RESTRICT drop with that report.
+        let report = dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &[ObjectAddress::new(
+                crate::sql::catalog::PG_OPCLASS_OID,
+                storage.operator_class(slot).oid(),
+                0,
+            )],
+            cascade,
+            arena,
+            responder,
+        );
+        match run_reported_drop(report, responder, |responder| {
+            if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot, cascade) {
+                return sql_fail(error);
+            }
+            responder.send_dependency_notice()?;
+            sql_ok()
+        })? {
+            Ok(()) => {}
+            Err(error) => return sql_fail(error),
         }
     }
     responder.command_complete("DROP OPERATOR CLASS")?;
@@ -54418,6 +55026,19 @@ pub fn create_view(
             crate::storage::RelationPersistence::Permanent
         }
     };
+    // PostgreSQL reports the inferred persistence before it places the view.
+    if inferred_temporary
+        && matches!(persistence, crate::storage::RelationPersistence::Temporary)
+        && matches!(
+            requested_persistence,
+            super::ast::RelationPersistence::Permanent
+        )
+    {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(128, "view \"{}\" will be a temporary view", name.name).as_str(),
+        )?;
+    }
     let schema = match if persistence == crate::storage::RelationPersistence::Temporary {
         if name.schema.is_some_and(|schema| schema != "pg_temp") {
             Err(sql_err!(
@@ -54516,18 +55137,6 @@ pub fn create_view(
                 Err(error) => return sql_fail(error),
             };
         }
-    }
-    if inferred_temporary
-        && matches!(persistence, crate::storage::RelationPersistence::Temporary)
-        && matches!(
-            requested_persistence,
-            super::ast::RelationPersistence::Permanent
-        )
-    {
-        responder.notice(
-            sqlstate::SUCCESSFUL_COMPLETION,
-            stack_format!(128, "view \"{}\" will be a temporary view", name.name).as_str(),
-        )?;
     }
     let mut creation_path = crate::util::StackStr::<128>::new();
     let _ = core::fmt::Write::write_str(&mut creation_path, raw_path);
@@ -69128,7 +69737,7 @@ pub fn create_statistics(
     {
         if if_not_exists {
             responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
+                sqlstate::DUPLICATE_OBJECT,
                 stack_format!(
                     160,
                     "statistics object \"{}\" already exists, skipping",
@@ -69566,15 +70175,37 @@ pub(crate) fn analyze_extended_statistics(
             }
             continue;
         }
-        if !selected_columns.is_empty()
-            && definition.keys_for(txn.txid).iter().any(|key| match key {
+        if !selected_columns.is_empty() {
+            let column_missing = definition.keys_for(txn.txid).iter().any(|key| match key {
                 ExtendedStatisticsKey::Column(column) => table_definition
                     .column_index(column.as_str())
                     .is_none_or(|column| !selected_columns.contains(&column)),
-                ExtendedStatisticsKey::Expression(_) => true,
-            })
-        {
-            continue;
+                ExtendedStatisticsKey::Expression(_) => false,
+            });
+            // PostgreSQL warns about an object whose columns the ANALYZE
+            // left out; it keeps its earlier statistics.
+            if column_missing {
+                let named = definition.definition_for(txn.txid);
+                crate::sql::eval::raise_eval_message(
+                    crate::sql::eval::EvalMessageLevel::Warning,
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    format_args!(
+                        "statistics object \"{}.{}\" could not be computed for relation \"{}.{}\"",
+                        named.schema.as_str(),
+                        named.name.as_str(),
+                        table_definition.schema.as_str(),
+                        table_definition.name.as_str()
+                    ),
+                )?;
+                continue;
+            }
+            if definition
+                .keys_for(txn.txid)
+                .iter()
+                .any(|key| matches!(key, ExtendedStatisticsKey::Expression(_)))
+            {
+                continue;
+            }
         }
         let analyzed_generation = storage.table(table).generation();
         arena.reset();
@@ -70849,7 +71480,7 @@ pub fn create_index(
                     Some(super::UtilityCommand::CreateIndexWithoutRestart);
             }
             responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
+                sqlstate::DUPLICATE_TABLE,
                 stack_format!(
                     128,
                     "relation \"{}\" already exists, skipping",
@@ -73296,48 +73927,60 @@ pub(crate) fn drop_access_method(
             .find(|(candidate, _)| *candidate == slot)
             .map(|(_, method)| method)
             .expect("resolved access method is visible");
-        while let Some((schema, table)) =
-            storage.access_method_table_dependency(method.oid(), txn.txid)
-        {
-            if !cascade {
-                return sql_fail(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop access method {} because other objects depend on it\nDETAIL:  table {} depends on access method {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
-                    name,
-                    table.as_str(),
-                    name
-                ));
+        // PostgreSQL reports every object the drop reaches in one notice,
+        // or refuses a RESTRICT drop with that report.
+        let report = dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &[ObjectAddress::new(
+                crate::sql::catalog::PG_AM_OID,
+                method.oid().get(),
+                0,
+            )],
+            cascade,
+            arena,
+            responder,
+        );
+        match run_reported_drop(report, responder, |responder| {
+            while let Some((schema, table)) =
+                storage.access_method_table_dependency(method.oid(), txn.txid)
+            {
+                let relation = QualName {
+                    schema: Some(schema.as_str()),
+                    name: table.as_str(),
+                };
+                let statement = DropTable {
+                    names: core::slice::from_ref(&relation),
+                    if_exists: false,
+                    cascade: true,
+                };
+                let outcome = responder.without_command_complete(|responder| {
+                    drop_table_kind_with_columns(
+                        storage,
+                        wal,
+                        txn,
+                        &statement,
+                        Some(crate::storage::TableKind::Local),
+                        "DROP TABLE",
+                        arena,
+                        RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        },
+                        responder,
+                    )
+                });
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return sql_fail(error),
+                    Err(error) => return Err(error),
+                }
             }
-            let relation = QualName {
-                schema: Some(schema.as_str()),
-                name: table.as_str(),
-            };
-            let statement = DropTable {
-                names: core::slice::from_ref(&relation),
-                if_exists: false,
-                cascade: true,
-            };
-            let outcome = responder.without_command_complete(|responder| {
-                drop_table_kind_with_columns(
-                    storage,
-                    wal,
-                    txn,
-                    &statement,
-                    Some(crate::storage::TableKind::Local),
-                    "DROP TABLE",
-                    arena,
-                    RowTypeColumnCascade {
-                        scratch: &mut *scratch,
-                        seq_session,
-                    },
-                    responder,
-                )
-            });
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return sql_fail(error),
-                Err(error) => return Err(error),
-            }
+            responder.send_dependency_notice()?;
+            sql_ok()
+        })? {
+            Ok(()) => {}
+            Err(error) => return sql_fail(error),
         }
         let comment = match storage.set_comment(
             crate::storage::CommentClass::AccessMethod,
@@ -82117,7 +82760,10 @@ fn merge_target<'a>(
     // unfinished row.
     let mut matched = false;
     let rows_outcome = (|| -> Outcome {
-        loop {
+        'rows: loop {
+            if returning_satisfied(&capture, affected_count) {
+                break;
+            }
             let by_source = source_index == source_rows.len();
             if by_source && !has_not_matched_by_source {
                 break;
@@ -82314,6 +82960,9 @@ fn merge_target<'a>(
             let resumed = core::mem::take(&mut resumed_match);
             matched = by_source || resumed.matched;
             for j in core::mem::take(&mut first_target)..n_target {
+                if returning_satisfied(&capture, affected_count) {
+                    break 'rows;
+                }
                 if core::mem::take(&mut resumed_lost_pair) == Some(j) {
                     run_not_matched!(source_index * stride + n_target + j);
                     continue;
@@ -83364,6 +84013,7 @@ fn merge_target<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, affected_count)),
     )
 }
 
@@ -85138,6 +85788,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                 };
                 (|| -> Outcome {
                     for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                        if returning_satisfied(&capture, affected) {
+                            break;
+                        }
                         match row_progress::start_row(
                             progress.as_deref_mut(),
                             row_index,
@@ -85260,6 +85913,9 @@ pub(crate) fn instead_of_view_dml<'a>(
                 let _values_loop = values_node.start();
                 (|| -> Outcome {
                     for (row_index, row) in insert.rows.iter().enumerate().skip(first) {
+                        if returning_satisfied(&capture, affected) {
+                            break;
+                        }
                         values_node.row();
                         match row_progress::start_row(
                             progress.as_deref_mut(),
@@ -85418,6 +86074,9 @@ pub(crate) fn instead_of_view_dml<'a>(
             };
             (|| -> Outcome {
                 for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    if returning_satisfied(&capture, affected) {
+                        break;
+                    }
                     match row_progress::start_row(
                         progress.as_deref_mut(),
                         row_index,
@@ -85694,6 +86353,9 @@ pub(crate) fn instead_of_view_dml<'a>(
             };
             (|| -> Outcome {
                 for (row_index, bytes) in rows.as_slice().iter().enumerate().skip(first) {
+                    if returning_satisfied(&capture, affected) {
+                        break;
+                    }
                     match row_progress::start_row(
                         progress.as_deref_mut(),
                         row_index,
@@ -86912,7 +87574,9 @@ where
                              index: usize,
                              bytes: &'a [u8],
                              mut stream: Option<&mut StreamedSource<'a>>,
-                             given: Option<&'a [Datum<'a>]>|
+                             given: Option<&'a [Datum<'a>]>,
+                             capture: &mut Option<&mut super::ReturningCapture<'_>>,
+                             inserted: &mut u64|
          -> Outcome {
             {
                 let streaming = stream.is_some();
@@ -86948,7 +87612,7 @@ where
                     progress.as_deref_mut(),
                     index,
                     None,
-                    inserted,
+                    *inserted,
                     row_progress::capture_lengths([
                         transition_capture.as_ref(),
                         conflict_transition_capture.as_ref(),
@@ -86977,7 +87641,7 @@ where
                             ChangedRow {
                                 index,
                                 row: None,
-                                changed: inserted,
+                                changed: *inserted,
                                 transitions: row_progress::capture_lengths([
                                     transition_capture.as_ref(),
                                     conflict_transition_capture.as_ref(),
@@ -86996,17 +87660,17 @@ where
                             arena,
                             params,
                             responder,
-                            &mut capture,
+                            capture,
                             seq_session,
                         )? {
-                            Ok(()) => inserted += 1,
+                            Ok(()) => *inserted += 1,
                             Err(error) => return sql_fail(error),
                         }
                         if given.is_some() {
                             return match row_progress::stop_after_row(
                                 progress.as_deref_mut(),
                                 index + 1,
-                                inserted,
+                                *inserted,
                                 row_progress::capture_lengths([
                                     transition_capture.as_ref(),
                                     conflict_transition_capture.as_ref(),
@@ -87183,14 +87847,14 @@ where
                     params,
                     services,
                     responder,
-                    &mut capture,
+                    capture,
                     transition_capture.as_mut(),
                     conflict_transition_capture.as_mut(),
                     conflict_outer,
                     progress.as_deref_mut(),
-                    (index, inserted),
+                    (index, *inserted),
                 )? {
-                    Ok(true) => inserted += 1,
+                    Ok(true) => *inserted += 1,
                     Ok(false) => {}
                     Err(error) => return sql_fail(error),
                 }
@@ -87200,7 +87864,7 @@ where
                 return match row_progress::stop_after_row(
                     progress.as_deref_mut(),
                     index + 1,
-                    inserted,
+                    *inserted,
                     row_progress::capture_lengths([
                         transition_capture.as_ref(),
                         conflict_transition_capture.as_ref(),
@@ -87238,11 +87902,27 @@ where
                     &[],
                     None,
                     Some(row),
+                    &mut capture,
+                    &mut inserted,
                 )
             })(),
             None => (|| -> Outcome {
                 for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
-                    match write_row(storage, txn, services, responder, index, bytes, None, None)? {
+                    if returning_satisfied(&capture, inserted) {
+                        break;
+                    }
+                    match write_row(
+                        storage,
+                        txn,
+                        services,
+                        responder,
+                        index,
+                        bytes,
+                        None,
+                        None,
+                        &mut capture,
+                        &mut inserted,
+                    )? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
                     }
@@ -87290,6 +87970,8 @@ where
                         &[],
                         Some(&mut *stream),
                         None,
+                        &mut capture,
+                        &mut inserted,
                     )? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
@@ -87298,6 +87980,11 @@ where
                         break;
                     }
                     index += 1;
+                    if returning_satisfied(&capture, inserted) {
+                        // The executor stops pulling source rows once its
+                        // destination has every row it asked for.
+                        break;
+                    }
                     // SAFETY: the row is written. What a write keeps across
                     // rows (transition rows, the invocation log) lives in the
                     // arena's persistent tail or outside the arena.
@@ -87353,6 +88040,7 @@ where
             } else {
                 write_completion::CompletionReply::Command
             },
+            write_completion::RowPhaseEnd::of(returning_satisfied(&capture, inserted)),
         );
     }
     if matches!(source, InsertSource::MaterializedSelect { .. }) {
@@ -87448,6 +88136,9 @@ where
     let _values_loop = values_node.start();
     let rows_outcome = (|| -> Outcome {
         for (index, row_exprs) in statement.rows.iter().enumerate().skip(first_row) {
+            if returning_satisfied(&capture, inserted) {
+                break;
+            }
             values_node.row();
             match row_progress::start_row(
                 progress.as_deref_mut(),
@@ -87703,6 +88394,7 @@ where
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, inserted)),
     )
 }
 
@@ -87713,6 +88405,19 @@ struct ChangedRow {
     row: Option<PhysicalRow>,
     changed: u64,
     transitions: row_progress::CaptureLengths,
+}
+
+/// Whether a nested data change that has returned `returned` rows (its
+/// processed-row count, counted across restarted attempts) has every row its
+/// RETURNING destination asked for, so it processes no further rows.
+pub(super) fn returning_satisfied(
+    capture: &Option<&mut super::ReturningCapture<'_>>,
+    returned: u64,
+) -> bool {
+    capture
+        .as_deref()
+        .and_then(super::ReturningSink::row_limit)
+        .is_some_and(|limit| returned >= limit)
 }
 
 /// Emits a changed row's `RETURNING` values. A routine call there ends the
@@ -88026,7 +88731,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     // A data-modifying CTE captures its RETURNING rows in memory instead of
     // streaming them to the client.
     if let Some(sink) = capture.as_deref_mut() {
-        if let Err(e) = sink(
+        if let Err(e) = sink.row(
             storage,
             txid,
             &super::sequence::SeqEval::new(storage, seq_session, txid),
@@ -88220,7 +88925,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if let Some(sink) = capture.as_deref_mut() {
-        match sink(
+        match sink.row(
             storage,
             txid,
             &super::sequence::SeqEval::new(storage, seq_session, txid),
@@ -88411,16 +89116,13 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let outer_lookup = outer;
-    let assignment_casts = match prepare_dml_assignment_casts(
-        &Stmt::Update(*statement),
-        storage,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(casts) => casts,
-        Err(error) => return sql_fail(error),
-    };
+    // Analysis resolves each assignment's conversion; the conversions the
+    // rows use are prepared again once constants fold.
+    if let Err(error) =
+        prepare_dml_assignment_casts(&Stmt::Update(*statement), storage, txn.txid, arena, outer)
+    {
+        return sql_fail(error);
+    }
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -88535,6 +89237,24 @@ pub(crate) fn update<'a>(
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_update_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = &folded;
+    // The conversions now apply to the folded assignments.
+    let assignment_casts = match prepare_dml_assignment_casts(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+        outer,
+    ) {
+        Ok(casts) => casts,
+        Err(error) => return sql_fail(error),
+    };
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -88885,6 +89605,9 @@ pub(crate) fn update<'a>(
 
     let rows_outcome = (|| -> Outcome {
         for i in first_row..scratch.len() {
+            if returning_satisfied(&capture, updated) {
+                break;
+            }
             let mut matched_from: &[Datum<'a>] = &[];
             let returning_from = statement.from.filter(|_| !statement.returning.is_empty());
             let resumed_returning = match progress
@@ -89852,6 +90575,7 @@ pub(crate) fn update<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, updated)),
     )
 }
 
@@ -90034,6 +90758,13 @@ pub(crate) fn delete<'a>(
     {
         return sql_fail(error);
     }
+    // PostgreSQL plans the statement, folding its constants, before its
+    // statement triggers fire.
+    let folded = match super::query::fold_delete_constants(statement, arena, storage, txn.txid) {
+        Ok(folded) => folded,
+        Err(error) => return sql_fail(error),
+    };
+    let statement = &folded;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
     let schema = &schema[..def.n_columns];
@@ -90337,6 +91068,9 @@ pub(crate) fn delete<'a>(
         .is_some();
     let rows_outcome = (|| -> Outcome {
         for i in first_row..scratch.len() {
+            if returning_satisfied(&capture, deleted) {
+                break;
+            }
             let resumed_returning = match progress
                 .as_deref_mut()
                 .map(|progress| progress.take_returning(i, arena))
@@ -90793,6 +91527,7 @@ pub(crate) fn delete<'a>(
         } else {
             write_completion::CompletionReply::Command
         },
+        write_completion::RowPhaseEnd::of(returning_satisfied(&capture, deleted)),
     )
 }
 
@@ -91729,10 +92464,22 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
             index.name_for(txn.txid).as_str()
         ));
     }
+    let index_relation_name = index.name_for(txn.txid);
     let constraint_name = match name {
         Some(name) => SqlName::parse(name)?,
-        None => index.name_for(txn.txid),
+        None => index_relation_name,
     };
+    if constraint_name.as_str() != index_relation_name.as_str() {
+        crate::sql::eval::raise_eval_message(
+            crate::sql::eval::EvalMessageLevel::Notice,
+            sqlstate::SUCCESSFUL_COMPLETION,
+            format_args!(
+                "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index \"{}\" to \"{}\"",
+                index_relation_name.as_str(),
+                constraint_name.as_str()
+            ),
+        )?;
+    }
     if crate::sql::exec::ddl::constraint_name_taken(new_definition, constraint_name.as_str()) {
         return Err(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
@@ -94788,6 +95535,35 @@ fn alter_table_inner(
             let definition = storage.table_def(table, txn.txid);
             (definition.schema, definition.name)
         };
+        // PostgreSQL adds a column to each child once per parent that has
+        // it; every parent after the first merges into the child's column.
+        if position > 0 {
+            let merges = storage
+                .table_def(table, txn.txid)
+                .inheritance
+                .parents_ref()
+                .iter()
+                .filter(|parent| order[..position].contains(&usize::from(**parent)))
+                .count()
+                .saturating_sub(1);
+            for action in inherited_actions.as_slice() {
+                let AlterAction::AddColumn { definition, .. } = action else {
+                    continue;
+                };
+                for _ in 0..merges {
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            192,
+                            "merging definition of column \"{}\" for child \"{}\"",
+                            definition.name,
+                            name.as_str()
+                        )
+                        .as_str(),
+                    )?;
+                }
+            }
+        }
         let inherited = AlterTable {
             table: QualName {
                 schema: Some(schema.as_str()),
@@ -96318,7 +97094,7 @@ fn alter_table_relation(
                 if new_def.column_index(c.name).is_some() {
                     if *if_not_exists {
                         responder.notice(
-                            sqlstate::SUCCESSFUL_COMPLETION,
+                            sqlstate::DUPLICATE_COLUMN,
                             stack_format!(
                                 160,
                                 "column \"{}\" of relation \"{}\" already exists, skipping",
@@ -96533,42 +97309,66 @@ fn alter_table_relation(
                         ));
                     }
                 }
-                if let Err(error) = exclusion_column_dependents(
-                    storage, txn.txid, &new_def, i, *cascade, arena, responder,
-                ) {
-                    return sql_fail(error);
-                }
-                if let Some(original_index) = original_index
-                    && let Err(error) = drop_column_foreign_keys(
+                // PostgreSQL reports every object the column's drop reaches
+                // in one notice, before the executors below drop them.
+                let report = match original_index {
+                    Some(original_index) => dependency_report::report_drop(
                         storage,
-                        wal,
-                        txn,
-                        table_index,
-                        &mut new_def,
-                        (original_index, i),
+                        txn.txid,
+                        &[ObjectAddress::new(
+                            super::catalog::PG_CLASS_OID,
+                            super::catalog::user_table_oid(storage, table_index),
+                            i32::from(def.attribute_number(original_index)),
+                        )],
                         *cascade,
                         arena,
                         responder,
-                    )
-                {
-                    return sql_fail(error);
-                }
-                if let Some(original_index) = original_index
-                    && let Err(error) = apply_column_drop_dependencies(
-                        storage,
-                        wal,
-                        txn,
-                        &mut *scratch,
-                        seq_session,
-                        table_index,
-                        original_index,
-                        original_column,
-                        *cascade,
-                        arena,
-                        responder,
-                    )
-                {
-                    return sql_fail(error);
+                    ),
+                    None => Ok(None),
+                };
+                match run_reported_drop(report, responder, |responder| {
+                    if let Err(error) = exclusion_column_dependents(
+                        storage, txn.txid, &new_def, i, *cascade, arena, responder,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Some(original_index) = original_index
+                        && let Err(error) = drop_column_foreign_keys(
+                            storage,
+                            wal,
+                            txn,
+                            table_index,
+                            &mut new_def,
+                            (original_index, i),
+                            *cascade,
+                            arena,
+                            responder,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                    if let Some(original_index) = original_index
+                        && let Err(error) = apply_column_drop_dependencies(
+                            storage,
+                            wal,
+                            txn,
+                            &mut *scratch,
+                            seq_session,
+                            table_index,
+                            original_index,
+                            original_column,
+                            *cascade,
+                            arena,
+                            responder,
+                        )
+                    {
+                        return sql_fail(error);
+                    }
+                    responder.send_dependency_notice()?;
+                    sql_ok()
+                })? {
+                    Ok(()) => {}
+                    Err(error) => return sql_fail(error),
                 }
                 let mut removed_constraints = [SqlName::EMPTY;
                     crate::storage::MAX_CHECKS
@@ -97543,38 +98343,70 @@ fn alter_table_relation(
                         def.name.as_str()
                     ));
                 }
-                if let Some(key_index) = key_index_identity(&new_def, name) {
-                    use crate::sql::catalog::dependencies::ObjectAddress;
-                    let original = crate::sql::catalog::table_constraint_oid(
+                // PostgreSQL reports every object the constraint's drop
+                // reaches in one notice, or refuses with that report.
+                let report = match crate::sql::catalog::table_constraint_oid(
+                    storage,
+                    txn.txid,
+                    table_index,
+                    name,
+                ) {
+                    Some(oid) => dependency_report::report_drop(
                         storage,
                         txn.txid,
-                        table_index,
-                        name,
-                    )
-                    .map_or(
-                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, key_index.oid(), 0),
-                        |constraint| {
-                            ObjectAddress::new(
-                                crate::sql::catalog::PG_CONSTRAINT_OID,
-                                constraint,
-                                0,
-                            )
-                        },
-                    );
-                    if let Err(error) = drop_dependent_foreign_keys(
-                        storage,
-                        wal,
-                        txn,
-                        table_index,
-                        &mut new_def,
-                        ForeignKeyDependency::Index(key_index),
-                        original,
+                        &[ObjectAddress::new(
+                            crate::sql::catalog::PG_CONSTRAINT_OID,
+                            oid,
+                            0,
+                        )],
                         *cascade,
                         arena,
                         responder,
-                    ) {
-                        return sql_fail(error);
+                    ),
+                    None => Ok(None),
+                };
+                match run_reported_drop(report, responder, |responder| {
+                    if let Some(key_index) = key_index_identity(&new_def, name) {
+                        let original = crate::sql::catalog::table_constraint_oid(
+                            storage,
+                            txn.txid,
+                            table_index,
+                            name,
+                        )
+                        .map_or(
+                            ObjectAddress::new(
+                                crate::sql::catalog::PG_CLASS_OID,
+                                key_index.oid(),
+                                0,
+                            ),
+                            |constraint| {
+                                ObjectAddress::new(
+                                    crate::sql::catalog::PG_CONSTRAINT_OID,
+                                    constraint,
+                                    0,
+                                )
+                            },
+                        );
+                        if let Err(error) = drop_dependent_foreign_keys(
+                            storage,
+                            wal,
+                            txn,
+                            table_index,
+                            &mut new_def,
+                            ForeignKeyDependency::Index(key_index),
+                            original,
+                            *cascade,
+                            arena,
+                            responder,
+                        ) {
+                            return sql_fail(error);
+                        }
                     }
+                    responder.send_dependency_notice()?;
+                    sql_ok()
+                })? {
+                    Ok(()) => {}
+                    Err(error) => return sql_fail(error),
                 }
                 if drop_named_constraint(&mut new_def, name) {
                     let name = match SqlName::parse(name) {
@@ -99649,6 +100481,58 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
     })
 }
 
+/// Visits a table's visible rows in the order a sequential `SELECT` reads
+/// them, as PostgreSQL's data changes read their target: routines they call
+/// observe earlier rows' changes in that order: saved rows by row identity,
+/// then heap rows by heap position. Only a table without saved row files
+/// keeps an order record for every row.
+fn for_each_physical_row(
+    storage: &Storage,
+    table: usize,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if storage.spill_generation_count(table) != 0 {
+        let scan = storage.captured_row_scan_in(table, txid, arena)?;
+        // The visitor never stops the scan early.
+        let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
+            visit(rowid, home)?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        return Ok(());
+    }
+    let count = storage.visible_row_count(table, txid)?;
+    let snapshot = storage.table_row_snapshot(table, Some(arena))?;
+    let ordered = arena
+        .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement row selection order exceeds the statement arena"
+            )
+        })?;
+    let mut fill = 0usize;
+    storage.for_each_row_state(table, &mut |rowid, state| {
+        if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
+            let slot = ordered.get_mut(fill).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible row count changed during a data change's scan"
+                )
+            })?;
+            *slot = Some(snapshot.retain(rowid, &home)?);
+            fill += 1;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    ordered[..fill].sort_unstable_by_key(|row| row.map(|row| row.sort_key()));
+    for row in ordered[..fill].iter().copied().flatten() {
+        visit(row.rowid(), row.read()?)?;
+    }
+    Ok(())
+}
+
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
@@ -99688,8 +100572,15 @@ pub(super) fn collect_matches<'a>(
     } else {
         None
     };
+    // A condition an index can answer reaches rows through their index
+    // entries, which keep an updated row's first position as its heap chain
+    // does in PostgreSQL: rows go in row identity order. Otherwise the rows
+    // go in a sequential scan's physical order, as a SELECT reads them.
+    let index_order = indexed.is_some()
+        || (def.kind != crate::storage::TableKind::Foreign
+            && super::query::dml_condition_reaches_index(storage, &def, alias, txid, where_clause));
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
-        // Each leaf's rows follow its physical order; leaves keep theirs.
+        // Each leaf's rows follow its own order; leaves keep theirs.
         let leaf_start = scratch.len();
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
@@ -99744,10 +100635,7 @@ pub(super) fn collect_matches<'a>(
         let scan =
             crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
         let _scan = scan.start();
-        let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
-            let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                return Ok(());
-            };
+        let mut visit = |rowid, loc: crate::storage::VisibleRowHome| {
             storage.record_relation_tuple_read(
                 txid,
                 leaf,
@@ -99792,21 +100680,25 @@ pub(super) fn collect_matches<'a>(
         };
         if let Some(access) = access {
             for &rowid in access.rowids() {
-                if let Some(state) = storage.row_state(leaf, rowid)? {
-                    visit(rowid, state)?;
+                if let Some(state) = storage.row_state(leaf, rowid)?
+                    && let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)?
+                {
+                    visit(rowid, home)?;
                 }
             }
-        } else {
+        } else if index_order {
             storage.for_each_row_state(leaf, &mut |rowid, state| {
-                visit(rowid, state)?;
+                if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+                    visit(rowid, home)?;
+                }
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
+        } else {
+            for_each_physical_row(storage, leaf, txid, arena, &mut visit)?;
         }
-        // DML RETURNING follows each leaf's physical row order. The row map
-        // is hash-addressed, so restore the monotonic row identity assigned
-        // when the heap image was first appended before locks and writes
-        // begin.
-        scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
+        if index_order {
+            scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
+        }
     }
     images.finish()
 }

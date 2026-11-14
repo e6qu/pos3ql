@@ -404,7 +404,10 @@ pub(super) fn merge_through_instead_triggers<'a>(
     let mut matched = false;
     let source_def = &source.def;
     let rows_outcome = (|| -> Outcome {
-        loop {
+        'rows: loop {
+            if super::returning_satisfied(&capture, affected_count) {
+                break;
+            }
             let by_source = source_index == source_rows.len();
             if by_source && !has_not_matched_by_source {
                 break;
@@ -424,6 +427,9 @@ pub(super) fn merge_through_instead_triggers<'a>(
             let source_values = (!by_source).then_some(sv);
             matched = by_source || core::mem::take(&mut resumed_match).matched;
             for j in core::mem::take(&mut first_pair)..=n_view {
+                if super::returning_satisfied(&capture, affected_count) {
+                    break 'rows;
+                }
                 let position = source_index * stride + j;
                 let not_matched_stage = j == n_view;
                 if not_matched_stage && (matched || by_source) {
@@ -837,12 +843,16 @@ pub(super) fn merge_through_instead_triggers<'a>(
         Ok(Ok(())) => {}
         outcome => return outcome,
     }
+    // A write its RETURNING destination stopped never reaches the end of its
+    // rows, so its AFTER STATEMENT triggers do not fire.
+    let stopped = super::returning_satisfied(&capture, affected_count);
     for event in [
         TriggerEvents::DELETE,
         TriggerEvents::UPDATE,
         TriggerEvents::INSERT,
     ] {
         if events & event != 0
+            && !stopped
             && let Err(error) = fire_statement_triggers_with_rows(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {

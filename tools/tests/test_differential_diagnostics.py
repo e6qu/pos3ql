@@ -64,6 +64,8 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "sqlstate", {},
                          input_diagnostics="sqlstate"), [{
             "source": "corpus.sql", "line": 54, "severity": "ERROR", "sqlstate": "2BP01",
+        }, {
+            "source": "corpus.sql", "line": 56, "severity": "NOTICE", "sqlstate": "00000",
         }])
 
     def test_non_utf8_bytes_and_unicode_line_characters_are_not_replaced(self):
@@ -105,7 +107,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
 
     def test_verbose_notice_and_detail_continuations_are_whole_records(self):
         stderr = (
-            "WARNING: startup warning\nHINT: warning detail\n"
+            "WARNING:  01000: startup warning\nHINT:  warning detail\n"
             "another warning detail\n"
             "psql:corpus.sql:10: NOTICE:  00000: drop cascades to 2 other objects\n"
             "DETAIL:  drop cascades to server lifetime_server\n"
@@ -119,11 +121,48 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
             "second primary line\nCONTEXT:  function example()\n"
         )
         records = DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {}, input_diagnostics="verbose")
-        self.assertEqual([record["line"] for record in records], [20, 30])
+        self.assertEqual([record["line"] for record in records], [None, 10, 20, 30])
+        self.assertEqual([record["severity"] for record in records],
+                         ["WARNING", "NOTICE", "ERROR", "ERROR"])
         self.assertEqual([record["message"] for record in records], [
+            "startup warning", "drop cascades to 2 other objects",
             "cannot drop type child", "  first primary line\nsecond primary line",
         ])
-        self.assertEqual([record["sqlstate"] for record in records], ["2BP01", "P0001"])
+        self.assertEqual([record["sqlstate"] for record in records],
+                         ["01000", "00000", "2BP01", "P0001"])
+
+    def test_notices_are_compared_like_errors_and_in_statement_order(self):
+        notice = (
+            "psql:corpus.sql:4: NOTICE:  00000: first\n"
+            "LOCATION:  exec_stmt_raise, pl_exec.c:3911\n"
+            "psql:corpus.sql:4: INFO:  00000: second\n"
+            "psql:corpus.sql:5: WARNING:  01000: third\n"
+        )
+        rendered = self.render_transcript(b"", notice, "verbose")
+        for changed in (
+            notice.replace("first", "changed"),
+            notice.replace("NOTICE:  00000", "NOTICE:  01000"),
+            notice.replace("NOTICE:", "WARNING:"),
+            notice.replace(":5: WARNING", ":6: WARNING"),
+            "psql:corpus.sql:4: INFO:  00000: second\n"
+            "psql:corpus.sql:4: NOTICE:  00000: first\n"
+            "psql:corpus.sql:5: WARNING:  01000: third\n",
+            notice.replace("psql:corpus.sql:5: WARNING:  01000: third\n", ""),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(rendered, self.render_transcript(b"", changed, "verbose"))
+        # Implementation locations are not part of the PostgreSQL contract.
+        self.assertEqual(rendered, self.render_transcript(
+            b"", notice.replace("pl_exec.c:3911", "elsewhere.rs:1"), "verbose"))
+        # SQLSTATE-only corpora still compare each notice's severity and state.
+        self.assertNotEqual(
+            self.render_transcript(b"", "psql:corpus.sql:4: NOTICE:  00000\n", "sqlstate"),
+            self.render_transcript(b"", "psql:corpus.sql:4: WARNING:  01000\n", "sqlstate"),
+        )
+        with self.assertRaises(ValueError):
+            DIAGNOSTICS.normalize_diagnostics(
+                "psql:corpus.sql:4: NOTICE:  missing state\n", "verbose", {},
+                input_diagnostics="verbose")
 
     def test_error_statement_and_primary_message_remain_comparison_inputs(self):
         first = "psql:corpus.sql:8: ERROR:  23505: duplicate value\n"

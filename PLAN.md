@@ -484,6 +484,31 @@ binding them follows the same dependency-list pattern. Renaming an enum value th
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`.
+The differential corpora compare notices, warnings and INFO messages with
+their statement positions. The planner folds constants as PostgreSQL's
+`eval_const_expressions` does: before a `SELECT`, `UPDATE` or `DELETE` reads
+a row, each constant subexpression that calls an immutable routine, converts
+a value or runs an operator's routine is evaluated once and replaced with its
+value, so `''::tsquery` in a query returning three rows sends its notice
+once, and a constant in an arm no row reaches still folds and reports its
+error. Folding gaps remain: aggregate arguments, window specifications,
+`INSERT` values, `MERGE`, join conditions and `FROM` function arguments are
+evaluated where they run; a parameter of a custom plan does not fold; a
+literal conversion in a prepared statement raises its notice at each
+`EXECUTE` where PostgreSQL raises it at `PREPARE`; a statement a routine runs
+folds at each run where PostgreSQL folds its cached plan once per session;
+and PostgreSQL's selectivity estimate, which evaluates a stable call compared
+with an indexed column once more while planning, is not modeled. `UPDATE`
+and `DELETE` evaluate every target row's `WHERE` before changing the first
+row, where PostgreSQL alternates them, so routine calls in the condition and
+in the change interleave their notices differently; matching needs the row
+selection to run lazily under the statement's command snapshot. Row order
+without `ORDER BY` follows a model of PostgreSQL's access path rather than
+its cost-based plan: a query or data change on one table whose condition
+constrains an index's leading column takes rows in their first-insertion
+order, as an index or bitmap scan reaches an updated row at its first
+position, and any other takes them in physical order. A table with saved row
+files read without index candidates keeps physical order.
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;

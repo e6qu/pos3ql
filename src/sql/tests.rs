@@ -46,6 +46,7 @@ mod joined_dml_returning;
 mod key_index_marks;
 mod key_preparation;
 mod nested_planner_inputs;
+mod notice_parity;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
@@ -73890,14 +73891,19 @@ fn psql_catalog_listing_contracts() {
         )),
         ["catalog_acl_owner"]
     );
+    // Holding the privilege without its grant option revokes nothing, with
+    // PostgreSQL's warning rather than an error.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE catalog_table_reader;
+         REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
+    );
+    let output = String::from_utf8_lossy(&output);
     assert!(
-        String::from_utf8_lossy(&run_with(
-            &mut engine,
-            &mut budget,
-            "SET ROLE catalog_table_reader;
-             REVOKE SELECT ON catalog_owner_table FROM catalog_table_reader",
-        ))
-        .contains("42501")
+        output.contains("no privileges could be revoked for \"catalog_owner_table\"")
+            && !output.contains("42501"),
+        "{output}"
     );
     run_with(&mut engine, &mut budget, "RESET ROLE");
     run_with(

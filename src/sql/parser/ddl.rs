@@ -4803,10 +4803,7 @@ impl<'a> Parser<'a> {
                 verifier,
             )));
         }
-        Ok(
-            (!password.is_empty())
-                .then_some(crate::sql::ast::RolePasswordSpec::Plaintext(password)),
-        )
+        Ok(Some(crate::sql::ast::RolePasswordSpec::Plaintext(password)))
     }
 
     /// PostgreSQL MD5 verifier input is the literal md5 prefix plus its

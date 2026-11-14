@@ -204,8 +204,40 @@ type StatementWith<'a> = (
     &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
 );
 
-type ReturningCapture<'a> = dyn for<'row> FnMut(&Storage, u32, &dyn SequenceAccess, &[Datum<'row>]) -> Result<(), SqlError>
-    + 'a;
+/// Where a nested data change's RETURNING rows go instead of the client.
+pub(crate) trait ReturningSink {
+    fn row(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        sequences: &dyn SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError>;
+
+    /// How many rows the sink asks for, as an executor run with a row
+    /// count: once the data change has returned that many rows it
+    /// processes no further rows and completes normally for the rows it has.
+    fn row_limit(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<F> ReturningSink for F
+where
+    F: for<'row> FnMut(&Storage, u32, &dyn SequenceAccess, &[Datum<'row>]) -> Result<(), SqlError>,
+{
+    fn row(
+        &mut self,
+        storage: &Storage,
+        txid: u32,
+        sequences: &dyn SequenceAccess,
+        values: &[Datum<'_>],
+    ) -> Result<(), SqlError> {
+        self(storage, txid, sequences, values)
+    }
+}
+
+type ReturningCapture<'a> = dyn ReturningSink + 'a;
 
 fn intrinsic_uuid_parameter_oids(
     written_name: &str,
@@ -17417,6 +17449,7 @@ impl Engine {
             return Ok(Err(error));
         }
         let capturing = capture.is_some();
+        let row_limit = capture.as_deref().and_then(ReturningSink::row_limit);
         let outcome = responder.without_command_complete(|responder| {
             Self::execute_data_modification_inner(
                 storage,
@@ -17440,16 +17473,20 @@ impl Engine {
         if outcome.is_err() {
             return Ok(outcome);
         }
-        if let Err(error) = exec::fire_view_statement_triggers(
-            storage,
-            txn,
-            arena,
-            &mut exec::TriggerServices::new(guc.seq_session(), cursors, row_buffers),
-            responder,
-            view,
-            statement,
-            false,
-        ) {
+        // A write its RETURNING destination stopped never reaches the end of
+        // its rows, so its AFTER STATEMENT triggers do not fire.
+        if row_limit.is_none_or(|limit| affected < limit)
+            && let Err(error) = exec::fire_view_statement_triggers(
+                storage,
+                txn,
+                arena,
+                &mut exec::TriggerServices::new(guc.seq_session(), cursors, row_buffers),
+                responder,
+                view,
+                statement,
+                false,
+            )
+        {
             return Ok(Err(error));
         }
         if capturing {
@@ -22838,6 +22875,7 @@ impl Engine {
         let _ = eval::take_diagnostic();
         if reset_workspace {
             eval::clear_eval_messages();
+            eval::clear_folded_notices();
             event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();
@@ -27080,6 +27118,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let required_package = match self
                     .storage
                     .extension_package_for_version(required.as_str(), None)
@@ -27184,6 +27231,15 @@ impl Engine {
                         required.as_str()
                     )));
                 }
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        128,
+                        "installing required extension \"{}\"",
+                        required.as_str()
+                    )
+                    .as_str(),
+                )?;
                 let namespace = self
                     .storage
                     .extension(plan.extension)

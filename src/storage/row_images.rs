@@ -121,6 +121,23 @@ enum CapturedRowKind {
 }
 
 impl CapturedRowRecord {
+    /// The record's place in a sequential scan, as
+    /// [`OrderedRowSnapshot::sort_key`] orders retained rows: saved rows by
+    /// row identity, then primary and secondary heap rows by heap position.
+    pub(super) fn physical_order(&self) -> (u8, u64, u32) {
+        match self.kind {
+            CapturedRowKind::CommittedSpilled
+            | CapturedRowKind::LookupSaved
+            | CapturedRowKind::Invisible => (0, self.rowid, 0),
+            CapturedRowKind::PendingPrimaryHeap | CapturedRowKind::CommittedPrimaryHeap => {
+                (1, 0, self.offset_or_member)
+            }
+            CapturedRowKind::PendingSecondaryHeap | CapturedRowKind::CommittedSecondaryHeap => {
+                (2, 0, self.offset_or_member)
+            }
+        }
+    }
+
     pub(super) const EMPTY: Self = Self {
         rowid: 0,
         version: 0,

@@ -3204,6 +3204,43 @@ pub(super) fn storage_catalog<'storage, 'workspace>(
     }
 }
 
+/// Runs `function_oid`, a user-defined operator's function, on two values
+/// under `collation`.
+pub(crate) fn execute_operator_function<'a>(
+    storage: &Storage,
+    txid: u32,
+    function_oid: i32,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    collation: super::ast::Collation,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let slot = storage
+        .routine_slot_by_oid(function_oid, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator function does not exist"
+            )
+        })?;
+    storage_catalog(storage, arena, txid)
+        .execute_routine(
+            slot,
+            &storage.routine_for(slot, txid),
+            &[left, right],
+            collation,
+            super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "operator function produced no scalar result"
+            )
+        })
+}
+
 pub(crate) fn execute_index_comparison<'a>(
     storage: &Storage,
     txid: u32,

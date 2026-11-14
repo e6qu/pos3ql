@@ -817,6 +817,7 @@ pub(super) fn dependencies<'a>(
         parent,
         referenced,
         parent_constraint,
+        exclusion_operators,
     ] = [
         "contype",
         "oid",
@@ -827,6 +828,7 @@ pub(super) fn dependencies<'a>(
         "confrelid",
         "confkey",
         "conparentid",
+        "conexclop",
     ]
     .map(|name| {
         definition
@@ -912,6 +914,25 @@ pub(super) fn dependencies<'a>(
                 0,
                 b'i',
             )?;
+            // `CreateConstraintEntry` records each exclusion operator; a
+            // built-in one is pinned.
+            if constraint_kind == b'x' {
+                let operators = super::view_rows::integers(values[exclusion_operators], arena)?;
+                for (position, &operator) in operators.iter().enumerate() {
+                    if operator >= crate::storage::FIRST_NORMAL_OBJECT_ID
+                        && !operators[..position].contains(&operator)
+                    {
+                        push(
+                            super::PG_CONSTRAINT_OID,
+                            oid,
+                            super::PG_OPERATOR_OID,
+                            operator,
+                            0,
+                            b'n',
+                        )?;
+                    }
+                }
+            }
             // PostgreSQL's `ConstraintSetParentConstraint`: a partition's
             // constraint goes with its parent's or with the partition.
             let parent = integer(values[parent_constraint])?;
@@ -1019,6 +1040,80 @@ pub(super) fn dependencies<'a>(
                                 i32::from(table.attribute_number(column)),
                                 b'a',
                             )?;
+                        }
+                    }
+                }
+                // `index_create` then records each key's collation and
+                // operator class, then what the expressions and predicate
+                // name; built-in objects are pinned.
+                for position in 0..index.n_cols {
+                    let collation = index.collations[position];
+                    if matches!(collation, crate::sql::ast::Collation::Catalog(_))
+                        && !index.collations[..position].contains(&collation)
+                    {
+                        push(
+                            super::PG_CLASS_OID,
+                            index.oid,
+                            super::PG_COLLATION_OID,
+                            collation.oid(),
+                            0,
+                            b'n',
+                        )?;
+                    }
+                }
+                for position in 0..index.n_cols {
+                    let class = index.resolved_operator_classes[position];
+                    if let Some(crate::storage::IndexOperatorClass::Catalog(class_oid)) = class
+                        && !index.resolved_operator_classes[..position].contains(&class)
+                    {
+                        push(
+                            super::PG_CLASS_OID,
+                            index.oid,
+                            super::PG_OPCLASS_OID,
+                            class_oid.get(),
+                            0,
+                            b'n',
+                        )?;
+                    }
+                }
+                if let Some(exclusion) = table
+                    .exclusions()
+                    .iter()
+                    .find(|exclusion| exclusion.name.as_str() == index.name.as_str())
+                {
+                    for predicate in [false, true] {
+                        let mut references =
+                            [(0, 0); crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES];
+                        let mut count = 0;
+                        for entry in table.expression_dependencies().iter().filter(|entry| {
+                            match entry.owner {
+                                crate::storage::ExpressionOwner::ExclusionKey(name, _) => {
+                                    !predicate && name == exclusion.name
+                                }
+                                crate::storage::ExpressionOwner::ExclusionPredicate(name) => {
+                                    predicate && name == exclusion.name
+                                }
+                                _ => false,
+                            }
+                        }) {
+                            let Ok(bound) = storage
+                                .rebound_stored_query_dependency(entry.dependency(), transaction)
+                            else {
+                                continue;
+                            };
+                            if let Some(reference) =
+                                super::dependencies::stored_reference(storage, transaction, &bound)
+                                    .filter(|(_, object)| {
+                                        *object >= crate::storage::FIRST_NORMAL_OBJECT_ID
+                                    })
+                                && !references[..count].contains(&reference)
+                            {
+                                references[count] = reference;
+                                count += 1;
+                            }
+                        }
+                        for (class, object) in &references[..count] {
+                            push(super::PG_CLASS_OID, index.oid, *class, *object, 0, b'n')?;
                         }
                     }
                 }

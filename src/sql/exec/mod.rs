@@ -2064,7 +2064,7 @@ fn create_table_kind(
     ) {
         return sql_fail(e);
     }
-    if let Err(e) = validate_partitioned_unique_keys(&def) {
+    if let Err(e) = validate_partitioned_unique_keys(storage, txn.txid, &def) {
         return sql_fail(e);
     }
     let creates_owned_sequences = !matches!(statement.partition, PartitionClause::Of { .. });
@@ -4282,6 +4282,8 @@ fn alter_foreign_table_as(
 }
 
 fn validate_partitioned_unique_keys<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     def: &crate::storage::TableDefinition<Definition0>,
 ) -> Result<(), SqlError> {
     let Some(crate::storage::PartitionScheme { keys, n_keys, .. }) = def.partition.scheme else {
@@ -4339,12 +4341,27 @@ fn validate_partitioned_unique_keys<Definition0: crate::storage::DefinitionBacki
                 if element != crate::storage::ExclusionElement::Column(key) {
                     continue;
                 }
-                if operator.binary() != crate::sql::ast::BinaryOp::Eq {
+                if operator.binary() != Some(crate::sql::ast::BinaryOp::Eq) {
+                    let name = match operator.builtin_sql() {
+                        Some(name) => SqlName::parse(name)?,
+                        None => {
+                            let slot = storage
+                                .operator_slot_by_oid(operator.oid(), txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_FUNCTION,
+                                        "cache lookup failed for operator {}",
+                                        operator.oid()
+                                    )
+                                })?;
+                            storage.operator_for(slot, txid).name
+                        }
+                    };
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "cannot match partition key to index on column \"{}\" using non-equal operator \"{}\"",
                         def.columns()[usize::from(key)].name.as_str(),
-                        operator.sql()
+                        name.as_str()
                     ));
                 }
                 matched = true;
@@ -4480,8 +4497,9 @@ fn build_partitioned_table_def(
             }
             for index in 0..def.n_exclusions {
                 let constraint = def.exclusions[index];
-                def.exclusions[index].name =
-                    ddl::auto_exclusion_name(storage, &def, &constraint, txid, None, arena)?;
+                let name = ddl::auto_exclusion_name(storage, &def, &constraint, txid, None, arena)?;
+                def.exclusions[index].name = name;
+                def.rename_exclusion_expression_owners(constraint.name, name);
             }
             let resolved_bound = resolve_partition_bound(
                 storage,
@@ -4835,6 +4853,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
         child.checks[child.n_checks] = *inherited;
         child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
+        child.copy_constraint_expression_dependencies(parent, inherited.name, inherited.name)?;
     }
     Ok(())
 }
@@ -6286,6 +6305,7 @@ fn copy_like_constraints(
                 copied.identity = None;
                 def.checks[def.n_checks] = copied;
                 def.n_checks += 1;
+                def.copy_constraint_expression_dependencies(&source, check.name, check.name)?;
             }
         }
         if like.indexes {
@@ -6340,6 +6360,11 @@ fn copy_like_constraints(
                     ddl::auto_exclusion_name(storage, def, &exclusion, txid, None, arena)?;
                 def.exclusions[def.n_exclusions] = exclusion;
                 def.n_exclusions += 1;
+                def.copy_constraint_expression_dependencies(
+                    &source,
+                    source_exclusion.name,
+                    exclusion.name,
+                )?;
             }
         }
     }
@@ -7388,16 +7413,8 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
         if !consulted {
             continue;
         }
-        let predicate = match &exclusion.predicate {
-            Some(text) => Some(crate::sql::parser::parse_expr(
-                arena
-                    .alloc_str(text.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?,
-                arena,
-            )?),
-            None => None,
-        };
-        let scan = constraints::ExclusionScan::new(exclusion, arena)?;
+        let predicate = constraints::exclusion_predicate(storage, txid, def, exclusion, arena)?;
+        let scan = constraints::ExclusionScan::new(exclusion, storage, txid, def, arena)?;
         let member = predicate.map_or(Ok(true), |predicate| {
             constraints::index_predicate_matches(storage, txid, def, values, predicate, arena)
         })?;
@@ -7422,7 +7439,10 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                 continue;
             }
             let other_keys = arbiter.scan.keys(storage, txid, def, other, arena)?;
-            if arbiter.scan.conflicts(&arbiter.keys, &other_keys, arena)? {
+            if arbiter
+                .scan
+                .conflicts(storage, txid, &arbiter.keys, &other_keys, arena)?
+            {
                 return Ok(true);
             }
         }
@@ -32759,9 +32779,12 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateRoutine(routine) => engine.execute_create_routine(
@@ -49103,7 +49126,74 @@ pub(crate) fn alter_operator_class(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_operator_classes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    names: &[crate::sql::ast::QualName<'_>],
+    if_exists: bool,
+    cascade: bool,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let report = (|| {
+        let originals = arena
+            .alloc_slice_with(names.len(), |_| DROPPED_NOTHING)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for name in names {
+            // The executor below reports a missing class or a non-owner.
+            let Some(slot) = storage.operator_class_slot_on_path(name.schema, name.name, txn.txid)
+            else {
+                return Ok(None);
+            };
+            let definition = storage.operator_class_for(slot, txn.txid);
+            if storage
+                .require_catalog_owner(
+                    definition.owner,
+                    txn.txid,
+                    "operator class",
+                    definition.name.as_str(),
+                )
+                .is_err()
+            {
+                return Ok(None);
+            }
+            originals[count] = ObjectAddress::new(
+                super::catalog::PG_OPCLASS_OID,
+                storage.operator_class(slot).oid(),
+                0,
+            );
+            count += 1;
+        }
+        dependency_report::report_drop(
+            storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        )
+    })();
+    let outcome = run_reported_drop(report, responder, |responder| {
+        drop_operator_classes_reported(storage, wal, txn, names, if_exists, cascade, responder)
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
+}
+
+fn drop_operator_classes_reported(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -60145,9 +60235,10 @@ pub(crate) fn drop_dangling_table_expressions(
             continue;
         }
         let (target, current) = storage.select_table_definition(table, txn.txid);
+        let txid = txn.txid;
         let dangling = |owner: ExpressionOwner| -> Result<bool, SqlError> {
             for dependency in current.expression_dependencies_of(owner) {
-                match storage.rebound_stored_query_dependency(dependency, txn.txid) {
+                match storage.rebound_stored_query_dependency(dependency, txid) {
                     Ok(_) => {}
                     Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => return Ok(true),
                     Err(error) => return Err(error),
@@ -60168,6 +60259,38 @@ pub(crate) fn drop_dangling_table_expressions(
             kept += 1;
         }
         replacement.n_checks = kept;
+        // An exclusion constraint goes with its index, which depends on what
+        // its elements and predicate name and on its operator classes, and
+        // with the user-defined operators it compares with.
+        let mut kept = 0;
+        for index in 0..replacement.n_exclusions {
+            let exclusion = replacement.exclusions[index];
+            let mut dangles = exclusion.options().iter().any(|options| {
+                matches!(
+                    options.resolved_class,
+                    Some(crate::storage::IndexOperatorClass::Catalog(oid))
+                        if storage.operator_class_slot_by_oid(oid, txid).is_none()
+                )
+            }) || exclusion.operators().iter().any(|operator| {
+                operator.binary().is_none()
+                    && storage.operator_slot_by_oid(operator.oid(), txid).is_none()
+            });
+            dangles |= dangling(ExpressionOwner::ExclusionPredicate(exclusion.name))?;
+            for position in 0..exclusion.len() {
+                dangles |= dangling(ExpressionOwner::ExclusionKey(
+                    exclusion.name,
+                    position as u8,
+                ))?;
+            }
+            if dangles {
+                txn.drop_constraint(table as u32, exclusion.name)?;
+                changed = true;
+                continue;
+            }
+            replacement.exclusions[kept] = exclusion;
+            kept += 1;
+        }
+        replacement.n_exclusions = kept;
         let mut generated = [SqlName::EMPTY; MAX_COLUMNS];
         let mut n_generated = 0;
         for column in &mut replacement.columns[..replacement.n_columns] {
@@ -91138,7 +91261,9 @@ fn rename_stored_constraint(def: &mut TableDefBuilder, from: &str, to: SqlName) 
         .iter_mut()
         .find(|constraint| constraint.name.as_str() == from)
     {
+        let from = constraint.name;
         constraint.name = to;
+        def.rename_exclusion_expression_owners(from, to);
         return true;
     }
     false
@@ -91485,7 +91610,7 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
         let result = (|| {
             let left = scan.keys(storage, transaction, new_def, a, arena)?;
             let right = scan.keys(storage, transaction, new_def, b, arena)?;
-            if scan.conflicts(&left, &right, arena)? {
+            if scan.conflicts(storage, transaction, &left, &right, arena)? {
                 return Err(constraints::index_build_exclusion_violation(
                     scan,
                     storage,
@@ -92370,6 +92495,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.checks[child.n_checks] = *constraint;
         child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
+        child.copy_constraint_expression_dependencies(parent, constraint.name, constraint.name)?;
     }
     for constraint in parent.fkeys() {
         let columns = remap_columns(child, parent, constraint.columns())?;
@@ -92432,6 +92558,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         )?;
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
+        child.copy_constraint_expression_dependencies(parent, constraint.name, inherited.name)?;
     }
     storage.prepare_inline_key_names(child, transaction, Some(child_slot))?;
     crate::storage::constraint_names::table(child)
@@ -96585,7 +96712,7 @@ fn alter_table_relation(
             }
         }
     }
-    if let Err(error) = validate_partitioned_unique_keys(&new_def) {
+    if let Err(error) = validate_partitioned_unique_keys(storage, txn.txid, &new_def) {
         return sql_fail(error);
     }
     if retyped_any {
@@ -96945,7 +97072,9 @@ fn alter_table_relation(
             Err(_) => return sql_fail(crate::sql::eval::arena_full()),
         };
         for (scan, exclusion) in exclusion_scans.iter_mut().zip(new_def.exclusions()) {
-            *scan = match constraints::ExclusionScan::new(exclusion, arena) {
+            *scan = match constraints::ExclusionScan::new(
+                exclusion, storage, txn.txid, &new_def, arena,
+            ) {
                 Ok(scan) => scan,
                 Err(error) => return sql_fail(error),
             };

@@ -22617,9 +22617,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateExtension {

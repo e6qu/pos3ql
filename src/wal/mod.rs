@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::sql::eval::SqlError;
-use crate::sql::types::{BtreeOperatorClass, ColType};
+use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ColumnStatistics, DefinitionBacking,
@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 23;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 24;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1237,8 +1237,10 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + exclusion
                 .elements()
                 .map(|element| match element {
-                    crate::storage::ExclusionElement::Column(_) => 7,
-                    crate::storage::ExclusionElement::Expression(text) => 7 + text.len(),
+                    crate::storage::ExclusionElement::Column(_) => 7 + EXCLUSION_KEY_OPTIONS_BYTES,
+                    crate::storage::ExclusionElement::Expression(text) => {
+                        7 + EXCLUSION_KEY_OPTIONS_BYTES + text.len()
+                    }
                 })
                 .sum::<usize>()
             + 2
@@ -1382,6 +1384,13 @@ pub(crate) fn expression_dependency_bytes(
         | crate::storage::ExpressionOwner::Column(owner) => writer.name(owner.as_str())?,
         crate::storage::ExpressionOwner::IndexKey(position) => writer.bytes(&[position])?,
         crate::storage::ExpressionOwner::IndexPredicate => {}
+        crate::storage::ExpressionOwner::ExclusionKey(owner, position) => {
+            writer.name(owner.as_str())?;
+            writer.bytes(&[position])?
+        }
+        crate::storage::ExpressionOwner::ExclusionPredicate(owner) => {
+            writer.name(owner.as_str())?
+        }
     }
     writer.bytes(&[entry.class as u8])?;
     writer.name(entry.identity.storage_key().as_str())?;
@@ -1390,6 +1399,48 @@ pub(crate) fn expression_dependency_bytes(
     writer.name(entry.referenced_schema.as_str())?;
     writer.name(entry.referenced_name.as_str())?;
     Some(writer.length)
+}
+
+/// One exclusion element's key options: the written and resolved operator
+/// classes, the key collation and a flag byte (descending, nulls first,
+/// explicit collation).
+pub(crate) const EXCLUSION_KEY_OPTIONS_BYTES: usize = 15;
+
+pub(crate) fn encode_exclusion_key_options(
+    options: &crate::storage::ExclusionKeyOptions,
+) -> [u8; EXCLUSION_KEY_OPTIONS_BYTES] {
+    let mut bytes = [0; EXCLUSION_KEY_OPTIONS_BYTES];
+    bytes[..5].copy_from_slice(&crate::storage::IndexOperatorClass::encode(options.class));
+    bytes[5..10].copy_from_slice(&crate::storage::IndexOperatorClass::encode(
+        options.resolved_class,
+    ));
+    bytes[10..14].copy_from_slice(&options.collation.code().to_le_bytes());
+    bytes[14] = u8::from(options.descending)
+        | (u8::from(options.nulls_first) << 1)
+        | (u8::from(options.explicit_collation) << 2);
+    bytes
+}
+
+pub(crate) fn decode_exclusion_key_options(
+    bytes: [u8; EXCLUSION_KEY_OPTIONS_BYTES],
+) -> Option<crate::storage::ExclusionKeyOptions> {
+    let class = crate::storage::IndexOperatorClass::decode(bytes[..5].try_into().ok()?)?;
+    let resolved_class = Some(crate::storage::IndexOperatorClass::decode(
+        bytes[5..10].try_into().ok()?,
+    )??);
+    let collation =
+        crate::sql::ast::Collation::from_code(u32::from_le_bytes(bytes[10..14].try_into().ok()?))?;
+    if bytes[14] & !0b111 != 0 {
+        return None;
+    }
+    Some(crate::storage::ExclusionKeyOptions {
+        class,
+        resolved_class,
+        collation,
+        explicit_collation: bytes[14] & 4 != 0,
+        descending: bytes[14] & 1 != 0,
+        nulls_first: bytes[14] & 2 != 0,
+    })
 }
 
 pub(crate) fn decode_expression_dependency(
@@ -1411,6 +1462,15 @@ pub(crate) fn decode_expression_dependency(
             crate::storage::ExpressionOwner::IndexKey(position)
         }
         4 => crate::storage::ExpressionOwner::IndexPredicate,
+        5 => {
+            let owner = SqlName::parse(stored_dependency_name(payload, at)?).ok()?;
+            let position = *payload.get(*at)?;
+            *at += 1;
+            crate::storage::ExpressionOwner::ExclusionKey(owner, position)
+        }
+        6 => crate::storage::ExpressionOwner::ExclusionPredicate(
+            SqlName::parse(stored_dependency_name(payload, at)?).ok()?,
+        ),
         _ => return None,
     };
     let class = DependencyClass::from_code(*payload.get(*at)?)?;
@@ -1571,8 +1631,13 @@ fn append_table_payload<B: DefinitionBacking>(
             exclusion.method.code(),
         ]);
         // Each element: tag 0 and a column position, or tag 1 and a
-        // length-prefixed canonical expression; then the operator OID.
-        for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+        // length-prefixed canonical expression; then the operator OID and
+        // the key options.
+        for ((element, operator), options) in exclusion
+            .elements()
+            .zip(exclusion.operators())
+            .zip(exclusion.options())
+        {
             match element {
                 crate::storage::ExclusionElement::Column(column) => {
                     ok &= buffer.append(&[0]);
@@ -1585,6 +1650,7 @@ fn append_table_payload<B: DefinitionBacking>(
                 }
             }
             ok &= buffer.append(&operator.oid().to_le_bytes());
+            ok &= buffer.append(&encode_exclusion_key_options(options));
         }
         let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
         ok &=
@@ -5981,57 +6047,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xa7]);
             for operator_class in &operator_classes[..*n_cols] {
-                ok &= match operator_class {
-                    None => buffer.append(&[0, 0, 0, 0, 0]),
-                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
-                        buffer.append(&[1, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Hash(class)) => {
-                        buffer.append(&[3, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Brin(class)) => {
-                        buffer.append(&[4, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Gist(class)) => {
-                        buffer.append(&[5, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Gin(class)) => {
-                        buffer.append(&[6, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::SpGist(class)) => {
-                        buffer.append(&[7, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
-                        buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
-                    }
-                };
+                ok &= buffer.append(&crate::storage::IndexOperatorClass::encode(*operator_class));
             }
             ok &= buffer.append(&[0xa9]);
             for operator_class in &resolved_operator_classes[..*n_cols] {
-                ok &= match operator_class {
-                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
-                        buffer.append(&[1, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Hash(class)) => {
-                        buffer.append(&[3, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Brin(class)) => {
-                        buffer.append(&[4, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Gist(class)) => {
-                        buffer.append(&[5, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Gin(class)) => {
-                        buffer.append(&[6, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::SpGist(class)) => {
-                        buffer.append(&[7, class.code(), 0, 0, 0])
-                    }
-                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
-                        buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
-                    }
-                    None => false,
-                };
+                ok &= operator_class.is_some()
+                    && buffer.append(&crate::storage::IndexOperatorClass::encode(*operator_class));
             }
             ok &= buffer.append(&[0xac]);
             for options in &operator_class_options[..*n_cols] {
@@ -8796,11 +8817,18 @@ fn decode_op_inner<'a>(
                         }
                         _ => return None,
                     };
-                    let operator = crate::storage::ExclusionOperator::from_oid(
+                    let operator = crate::storage::ExclusionOperator::from_stored(
                         i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
                     )?;
                     at += 4;
-                    exclusion.push(element, operator).ok()?;
+                    let options = decode_exclusion_key_options(
+                        payload
+                            .get(at..at + EXCLUSION_KEY_OPTIONS_BYTES)?
+                            .try_into()
+                            .ok()?,
+                    )?;
+                    at += EXCLUSION_KEY_OPTIONS_BYTES;
+                    exclusion.push(element, operator, options).ok()?;
                 }
                 let predicate_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
@@ -10258,40 +10286,10 @@ fn decode_op_inner<'a>(
             at += 1;
             let mut operator_classes = [None; MAX_INDEX_COLS];
             for operator_class in operator_classes.iter_mut().take(n_cols) {
-                let tag = *payload.get(at)?;
-                let value = payload.get(at + 1..at + 5)?;
+                *operator_class = crate::storage::IndexOperatorClass::decode(
+                    payload.get(at..at + 5)?.try_into().ok()?,
+                )?;
                 at += 5;
-                *operator_class = match tag {
-                    0 if value == [0, 0, 0, 0] => None,
-                    1 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::Btree(
-                            BtreeOperatorClass::from_code(value[0])?,
-                        ))
-                    }
-                    2 => Some(crate::storage::IndexOperatorClass::Catalog(
-                        crate::storage::OperatorClassOid::parse(i32::from_le_bytes(
-                            value.try_into().ok()?,
-                        ))?,
-                    )),
-                    3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
-                        crate::sql::types::HashOperatorClass::from_code(value[0])?,
-                    )),
-                    4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
-                        crate::sql::types::BrinOperatorClass::from_code(value[0])?,
-                    )),
-                    5 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gist(
-                        crate::sql::types::GistOperatorClass::from_code(value[0])?,
-                    )),
-                    6 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gin(
-                        crate::sql::types::GinOperatorClass::from_code(value[0])?,
-                    )),
-                    7 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::SpGist(
-                            crate::sql::types::SpGistOperatorClass::from_code(value[0])?,
-                        ))
-                    }
-                    _ => return None,
-                };
             }
             if *payload.get(at)? != 0xa9 {
                 return None;
@@ -10299,39 +10297,10 @@ fn decode_op_inner<'a>(
             at += 1;
             let mut resolved_operator_classes = [None; MAX_INDEX_COLS];
             for operator_class in resolved_operator_classes.iter_mut().take(n_cols) {
-                let tag = *payload.get(at)?;
-                let value = payload.get(at + 1..at + 5)?;
+                *operator_class = Some(crate::storage::IndexOperatorClass::decode(
+                    payload.get(at..at + 5)?.try_into().ok()?,
+                )??);
                 at += 5;
-                *operator_class = match tag {
-                    1 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::Btree(
-                            BtreeOperatorClass::from_code(value[0])?,
-                        ))
-                    }
-                    2 => Some(crate::storage::IndexOperatorClass::Catalog(
-                        crate::storage::OperatorClassOid::parse(i32::from_le_bytes(
-                            value.try_into().ok()?,
-                        ))?,
-                    )),
-                    3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
-                        crate::sql::types::HashOperatorClass::from_code(value[0])?,
-                    )),
-                    4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
-                        crate::sql::types::BrinOperatorClass::from_code(value[0])?,
-                    )),
-                    5 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gist(
-                        crate::sql::types::GistOperatorClass::from_code(value[0])?,
-                    )),
-                    6 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gin(
-                        crate::sql::types::GinOperatorClass::from_code(value[0])?,
-                    )),
-                    7 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::SpGist(
-                            crate::sql::types::SpGistOperatorClass::from_code(value[0])?,
-                        ))
-                    }
-                    _ => return None,
-                };
             }
             let mut operator_class_options =
                 [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
@@ -15649,6 +15618,15 @@ mod tests {
         dir.to_str().unwrap().to_string()
     }
 
+    fn sample_exclusion_options() -> crate::storage::ExclusionKeyOptions {
+        crate::storage::ExclusionKeyOptions {
+            resolved_class: Some(crate::storage::IndexOperatorClass::Gist(
+                crate::sql::types::GistOperatorClass::Range,
+            )),
+            ..crate::storage::ExclusionKeyOptions::DEFAULT
+        }
+    }
+
     fn sample_def() -> TableDefBuilder {
         let mut def = TableDefBuilder {
             name: SqlName::parse("t").unwrap(),
@@ -15736,12 +15714,26 @@ mod tests {
             .push(
                 crate::storage::ExclusionElement::Column(0),
                 crate::storage::ExclusionOperator::from_oid(3897).unwrap(),
+                sample_exclusion_options(),
             )
             .unwrap();
         exclusion
             .push(
                 crate::storage::ExclusionElement::Expression("int4range(id, id + 1, '[]')"),
-                crate::storage::ExclusionOperator::from_oid(3888).unwrap(),
+                crate::storage::ExclusionOperator::user(crate::storage::OPERATOR_OID_BASE + 9)
+                    .unwrap(),
+                crate::storage::ExclusionKeyOptions {
+                    class: Some(crate::storage::IndexOperatorClass::Btree(
+                        crate::sql::types::BtreeOperatorClass::TextPattern,
+                    )),
+                    resolved_class: Some(crate::storage::IndexOperatorClass::Btree(
+                        crate::sql::types::BtreeOperatorClass::TextPattern,
+                    )),
+                    collation: crate::sql::ast::Collation::Posix,
+                    explicit_collation: true,
+                    descending: true,
+                    nulls_first: false,
+                },
             )
             .unwrap();
         exclusion.predicate = Some(crate::util::StackStr::from_str("id > 0"));
@@ -16330,6 +16322,14 @@ mod tests {
                 crate::storage::ExclusionElement::Column(0),
                 crate::storage::ExclusionElement::Expression("int4range(id, id + 1, '[]')"),
             ]
+        );
+        assert_eq!(
+            restored.exclusions[0].options(),
+            sample_def().exclusions[0].options()
+        );
+        assert_eq!(
+            restored.exclusions[0].operators()[1].oid(),
+            crate::storage::OPERATOR_OID_BASE + 9
         );
         assert_eq!(
             (
@@ -17595,7 +17595,7 @@ mod tests {
                 (2, 0, false),
             ] {
                 let mut classes = [Some(crate::storage::IndexOperatorClass::Btree(
-                    BtreeOperatorClass::Int4,
+                    crate::sql::types::BtreeOperatorClass::Int4,
                 )); MAX_INDEX_COLS];
                 if missing {
                     classes[0] = None;
@@ -17653,10 +17653,10 @@ mod tests {
         let owner = crate::storage::CatalogPosition::new(7, 39).unwrap();
         let mut classes = [None; MAX_INDEX_COLS];
         classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
-            BtreeOperatorClass::Oid,
+            crate::sql::types::BtreeOperatorClass::Oid,
         ));
         classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
-            BtreeOperatorClass::Int4,
+            crate::sql::types::BtreeOperatorClass::Int4,
         ));
         let mut columns = [0; MAX_INDEX_COLS];
         columns[1] = 1;
@@ -17724,7 +17724,7 @@ mod tests {
             explicit_collations: [false; MAX_INDEX_COLS],
             operator_classes: [None; MAX_INDEX_COLS],
             resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Btree(
-                BtreeOperatorClass::Text,
+                crate::sql::types::BtreeOperatorClass::Text,
             )); MAX_INDEX_COLS],
             operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                 MAX_INDEX_COLS],

@@ -1,5 +1,6 @@
-//! The catalog objects a table's stored expressions (CHECK constraints and
-//! column defaults or generation expressions) were bound to when written.
+//! The catalog objects a table's stored expressions (CHECK constraints,
+//! column defaults or generation expressions, and exclusion constraint
+//! elements and predicates) were bound to when written.
 //!
 //! PostgreSQL stores these expressions as analyzed trees that name routines,
 //! operators and types by OID, so neither a later `search_path` nor a rename
@@ -29,6 +30,11 @@ pub(crate) enum ExpressionOwner {
     IndexKey(u8),
     /// An index's partial-index predicate.
     IndexPredicate,
+    /// An exclusion constraint's expression element, by constraint name and
+    /// element position.
+    ExclusionKey(SqlName, u8),
+    /// An exclusion constraint's predicate, by constraint name.
+    ExclusionPredicate(SqlName),
 }
 
 impl ExpressionOwner {
@@ -38,12 +44,17 @@ impl ExpressionOwner {
             Self::Column(_) => 2,
             Self::IndexKey(_) => 3,
             Self::IndexPredicate => 4,
+            Self::ExclusionKey(..) => 5,
+            Self::ExclusionPredicate(_) => 6,
         }
     }
 
     /// Whether a table definition, rather than an index, holds this owner.
     pub(crate) const fn belongs_to_table(self) -> bool {
-        matches!(self, Self::Check(_) | Self::Column(_))
+        matches!(
+            self,
+            Self::Check(_) | Self::Column(_) | Self::ExclusionKey(..) | Self::ExclusionPredicate(_)
+        )
     }
 }
 
@@ -184,7 +195,48 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     }
 }
 
+impl ExpressionOwner {
+    /// This owner moved to the copy `to` of the constraint it names: an
+    /// exclusion constraint's or CHECK constraint's; `None` for any other.
+    pub(crate) fn renamed_constraint(self, from: SqlName, to: SqlName) -> Option<Self> {
+        match self {
+            Self::Check(name) if name == from => Some(Self::Check(to)),
+            Self::ExclusionKey(name, position) if name == from => {
+                Some(Self::ExclusionKey(to, position))
+            }
+            Self::ExclusionPredicate(name) if name == from => Some(Self::ExclusionPredicate(to)),
+            _ => None,
+        }
+    }
+}
+
 impl super::TableDefBuilder {
+    /// Gives the constraint `to` of this definition the dependencies the
+    /// constraint `from` of `source` holds, as a copied (inherited, cloned
+    /// or `LIKE`-copied) constraint keeps what its expressions were bound to.
+    pub(crate) fn copy_constraint_expression_dependencies<B: super::DefinitionBacking>(
+        &mut self,
+        source: &super::TableDefinition<B>,
+        from: SqlName,
+        to: SqlName,
+    ) -> Result<(), SqlError> {
+        self.retain_expression_dependencies(|existing| {
+            existing.renamed_constraint(to, to).is_none()
+        });
+        for entry in source.expression_dependencies() {
+            let Some(owner) = entry.owner.renamed_constraint(from, to) else {
+                continue;
+            };
+            if self.n_expression_dependencies == MAX_TABLE_EXPRESSION_DEPENDENCIES {
+                return Err(too_many_expression_dependencies());
+            }
+            self.expression_dependencies[self.n_expression_dependencies] =
+                ExpressionDependency { owner, ..*entry };
+            self.n_expression_dependencies += 1;
+        }
+        Ok(())
+    }
+
     /// Replaces `owner`'s dependencies with `dependencies`.
     pub(crate) fn set_expression_dependencies(
         &mut self,
@@ -219,6 +271,22 @@ impl super::TableDefBuilder {
         self.n_expression_dependencies = kept;
     }
 
+    /// Moves an exclusion constraint's element and predicate dependencies to
+    /// its new name.
+    pub(crate) fn rename_exclusion_expression_owners(&mut self, from: SqlName, to: SqlName) {
+        for entry in &mut self.expression_dependencies[..self.n_expression_dependencies] {
+            entry.owner = match entry.owner {
+                ExpressionOwner::ExclusionKey(name, position) if name == from => {
+                    ExpressionOwner::ExclusionKey(to, position)
+                }
+                ExpressionOwner::ExclusionPredicate(name) if name == from => {
+                    ExpressionOwner::ExclusionPredicate(to)
+                }
+                owner => owner,
+            };
+        }
+    }
+
     /// Renames the owner of a CHECK constraint's or column's dependencies.
     pub(crate) fn rename_expression_owner(&mut self, from: ExpressionOwner, to: ExpressionOwner) {
         for entry in &mut self.expression_dependencies[..self.n_expression_dependencies] {
@@ -240,6 +308,20 @@ impl super::TableDefBuilder {
                 ExpressionOwner::Column(name) => self.columns[..self.n_columns]
                     .iter()
                     .any(|column| column.name == name && column.default.expression().is_some()),
+                ExpressionOwner::ExclusionKey(name, position) => self.exclusions
+                    [..self.n_exclusions]
+                    .iter()
+                    .any(|exclusion| {
+                        exclusion.name == name
+                            && matches!(
+                                (usize::from(position) < exclusion.len())
+                                    .then(|| exclusion.element(usize::from(position))),
+                                Some(super::ExclusionElement::Expression(_))
+                            )
+                    }),
+                ExpressionOwner::ExclusionPredicate(name) => self.exclusions[..self.n_exclusions]
+                    .iter()
+                    .any(|exclusion| exclusion.name == name && exclusion.predicate.is_some()),
                 ExpressionOwner::IndexKey(_) | ExpressionOwner::IndexPredicate => false,
             };
             if live {

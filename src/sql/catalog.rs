@@ -9902,15 +9902,21 @@ fn visit_indexes(
             // read back through `index_expression_source`.
             let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
             let mut expression_keys = [false; crate::storage::MAX_INDEX_COLS];
-            for (position, element) in exclusion.elements().enumerate() {
+            let mut descending = [false; crate::storage::MAX_INDEX_COLS];
+            let mut nulls_first = [false; crate::storage::MAX_INDEX_COLS];
+            for (position, (element, options)) in
+                exclusion.elements().zip(exclusion.options()).enumerate()
+            {
                 match element {
                     crate::storage::ExclusionElement::Column(column) => columns[position] = column,
                     crate::storage::ExclusionElement::Expression(_) => {
                         expression_keys[position] = true;
                     }
                 }
+                descending[position] = options.descending;
+                nulls_first[position] = options.nulls_first;
             }
-            visit(mk(
+            let mut info = mk(
                 exclusion
                     .index_identity
                     .expect("admitted exclusion index has an identity")
@@ -9918,8 +9924,8 @@ fn visit_indexes(
                 &columns[..exclusion.len()],
                 expression_keys,
                 &[],
-                [false; crate::storage::MAX_INDEX_COLS],
-                [false; crate::storage::MAX_INDEX_COLS],
+                descending,
+                nulls_first,
                 exclusion
                     .predicate
                     .map(|predicate| StackStr::from_str(predicate.as_str())),
@@ -9934,7 +9940,14 @@ fn visit_indexes(
                 Some(exclusion.method),
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
-            ));
+            );
+            for (position, options) in exclusion.options().iter().enumerate() {
+                info.collations[position] = options.collation;
+                info.explicit_collations[position] = options.explicit_collation;
+                info.operator_classes[position] = options.class;
+                info.resolved_operator_classes[position] = options.resolved_class;
+            }
+            visit(info);
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
@@ -10296,10 +10309,24 @@ fn bound_index_source<'a>(
     arena: &'a Arena,
 ) -> Result<&'a super::ast::Expr<'a>, SqlError> {
     if info.is_exclusion {
-        // An exclusion constraint keeps its predicate as name-resolved text;
-        // its index has no explicit definition to bind it through.
+        // An exclusion constraint's index keeps its expressions on the
+        // constraint, whose table holds what they were bound to.
+        let name = SqlName::parse(info.name.as_str())?;
+        let owner = match owner {
+            crate::storage::ExpressionOwner::IndexKey(position) => {
+                crate::storage::ExpressionOwner::ExclusionKey(name, position)
+            }
+            _ => crate::storage::ExpressionOwner::ExclusionPredicate(name),
+        };
         let source = arena.alloc_str(source).map_err(|_| arena_full())?;
-        return super::parser::parse_expr(source, arena);
+        return super::exec::expression_bindings::bind_table_expression(
+            super::parser::parse_expr(source, arena)?,
+            storage,
+            &storage.table_def(info.table_slot, txid),
+            owner,
+            txid,
+            arena,
+        );
     }
     let index = info_index(storage, info, txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
@@ -11256,6 +11283,47 @@ pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
             .flatten()
             == Some(slot),
     )
+}
+
+/// The name `pg_get_constraintdef` writes after an exclusion element's
+/// `WITH`, as `generate_operator_name` does: a built-in's bare name, a
+/// user-defined operator's bare name when it resolves alone and otherwise
+/// `OPERATOR(schema.name)`.
+pub(crate) fn exclusion_operator_name(
+    storage: &Storage,
+    txid: u32,
+    operator: crate::storage::ExclusionOperator,
+) -> Result<StackStr<160>, SqlError> {
+    use core::fmt::Write;
+    let mut text = StackStr::<160>::new();
+    if let Some(name) = operator.builtin_sql() {
+        let _ = text.write_str(name);
+        return Ok(text);
+    }
+    let slot = storage
+        .operator_slot_by_oid(operator.oid(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "cache lookup failed for operator {}",
+                operator.oid()
+            )
+        })?;
+    let definition = storage.operator_for(slot, txid);
+    if operator_oid_visibility(storage, txid, operator.oid()) == Some(true) {
+        let _ = text.write_str(definition.name.as_str());
+    } else {
+        let _ = text.write_str("OPERATOR(");
+        write_identifier(&mut text, definition.schema.as_str());
+        let _ = write!(text, ".{})", definition.name.as_str());
+    }
+    if text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "operator name exceeds its fixed reservation"
+        ));
+    }
+    Ok(text)
 }
 
 pub(crate) fn operator_class_oid_visibility(
@@ -15784,8 +15852,11 @@ pub fn constraint_def_text<'a>(
                 .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                 .expect("exclusion index has its constraint");
             let _ = write!(rendered, "EXCLUDE USING {} (", exclusion.method.name());
-            for (position, (element, operator)) in
-                exclusion.elements().zip(exclusion.operators()).enumerate()
+            for (position, ((element, operator), options)) in exclusion
+                .elements()
+                .zip(exclusion.operators())
+                .zip(exclusion.options())
+                .enumerate()
             {
                 if position != 0 {
                     let _ = rendered.write_str(", ");
@@ -15797,20 +15868,42 @@ pub fn constraint_def_text<'a>(
                     ),
                     crate::storage::ExclusionElement::Expression(text) => {
                         let source = arena.alloc_str(text).map_err(|_| arena_full())?;
-                        let expression = super::parser::parse_expr(source, arena)?;
+                        let expression = super::exec::expression_bindings::bind_table_expression(
+                            super::parser::parse_expr(source, arena)?,
+                            storage,
+                            &table,
+                            crate::storage::ExpressionOwner::ExclusionKey(
+                                exclusion.name,
+                                position as u8,
+                            ),
+                            txid,
+                            arena,
+                        )?;
                         let _ = rendered.write_str(index_expression_display(
                             storage, txid, &table, expression, source, pretty, arena,
                         )?);
                     }
                 }
-                let _ = write!(rendered, " WITH {}", operator.sql());
+                write_exclusion_key_options(&mut rendered, storage, txid, options);
+                let _ = write!(
+                    rendered,
+                    " WITH {}",
+                    exclusion_operator_name(storage, txid, *operator)?.as_str()
+                );
             }
             let _ = rendered.write_str(")");
             if let Some(predicate) = &exclusion.predicate {
                 let source = arena
                     .alloc_str(predicate.as_str())
                     .map_err(|_| arena_full())?;
-                let expression = super::parser::parse_expr(source, arena)?;
+                let expression = super::exec::expression_bindings::bind_table_expression(
+                    super::parser::parse_expr(source, arena)?,
+                    storage,
+                    &table,
+                    crate::storage::ExpressionOwner::ExclusionPredicate(exclusion.name),
+                    txid,
+                    arena,
+                )?;
                 let deparsed = deparse::deparse_expression(
                     &deparse::Context {
                         storage,
@@ -16193,6 +16286,62 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
         (SetNull, _) => " ON UPDATE SET NULL",
         (SetDefault, "DELETE") => " ON DELETE SET DEFAULT",
         (SetDefault, _) => " ON UPDATE SET DEFAULT",
+    }
+}
+
+/// An exclusion element's collation, operator class and ordering as
+/// `pg_get_indexdef_worker` prints them: a collation other than the key's
+/// own, a class other than the type's default, then `DESC` and a nulls
+/// order other than the direction's default.
+fn write_exclusion_key_options(
+    out: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    options: &crate::storage::ExclusionKeyOptions,
+) {
+    use crate::storage::IndexOperatorClass;
+    if options.explicit_collation {
+        let _ = out.write_str(" COLLATE ");
+        write_identifier(out, options.collation.name());
+    }
+    match options.class {
+        Some(IndexOperatorClass::Catalog(oid)) => {
+            if let Some(slot) = storage.operator_class_slot_by_oid(oid, txid) {
+                let definition = storage.operator_class_for(slot, txid);
+                if !definition.default {
+                    let _ = out.write_char(' ');
+                    if !storage.schema_is_on_path(definition.schema, txid) {
+                        write_identifier(out, definition.schema.as_str());
+                        let _ = out.write_char('.');
+                    }
+                    write_identifier(out, definition.name.as_str());
+                }
+            }
+        }
+        Some(class) => {
+            let name = match class {
+                IndexOperatorClass::Btree(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Hash(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Gist(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::SpGist(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Brin(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Gin(class) => (!class.is_default()).then(|| class.name()),
+                IndexOperatorClass::Catalog(_) => None,
+            };
+            if let Some(name) = name {
+                let _ = out.write_char(' ');
+                write_identifier(out, name);
+            }
+        }
+        None => {}
+    }
+    if options.descending {
+        let _ = out.write_str(" DESC");
+        if !options.nulls_first {
+            let _ = out.write_str(" NULLS LAST");
+        }
+    } else if options.nulls_first {
+        let _ = out.write_str(" NULLS FIRST");
     }
 }
 
@@ -21966,7 +22115,9 @@ fn index_collations<'a>(
     let mut values = [0_i32; crate::storage::MAX_INDEX_COLS];
     let table = storage.table_def(info.table_slot, txid);
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
-        let collation = if info.explicit_definition.is_some() {
+        // An explicit index and an exclusion constraint's index keep each
+        // key's collation.
+        let collation = if info.explicit_definition.is_some() || info.is_exclusion {
             info.collations[position]
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)

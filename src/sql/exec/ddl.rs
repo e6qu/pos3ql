@@ -1471,24 +1471,158 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
     Ok(())
 }
 
-/// The operator an exclusion constraint element compares `column` with, as
-/// PostgreSQL's `ComputeIndexAttrs` checks it: the column type's default
-/// operator class for `method`, then a commutative operator `written` of the
-/// class's operator family.
+/// How an exclusion element was written: its key options as parsed, or, when
+/// a stored constraint is rebuilt, the options it already holds.
+#[derive(Clone, Copy)]
+enum ExclusionKeySource<'k> {
+    Written(&'k crate::sql::ast::IndexColumn<'k>),
+    Stored(crate::storage::ExclusionKeyOptions),
+}
+
+/// The operator class `written` names for an exclusion element of type
+/// `type_oid` under `method`, as PostgreSQL's `ResolveOpClass` finds it.
+fn resolve_exclusion_class(
+    storage: &Storage,
+    written: crate::sql::ast::QualName<'_>,
+    input: crate::storage::RoutineResult,
+    type_oid: i32,
+    method: crate::sql::ast::IndexAccessMethod,
+    txid: u32,
+) -> Result<crate::storage::IndexOperatorClass, SqlError> {
+    use crate::storage::IndexOperatorClass;
+    let missing = || {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "operator class \"{}\" does not exist for access method \"{}\"",
+            written.name,
+            method.name()
+        )
+    };
+    let mismatch = || {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "operator class \"{}\" does not accept data type {}",
+            written.name,
+            crate::sql::catalog::format_type_oid(storage, txid, type_oid, -1).as_str()
+        )
+    };
+    if method == crate::sql::ast::IndexAccessMethod::Btree
+        && let Some(slot) = storage.operator_class_slot_on_path(written.schema, written.name, txid)
+    {
+        let definition = storage.operator_class_for(slot, txid);
+        if storage.routine_type_oid(definition.input.ctype, definition.input.user_type, txid)
+            != Some(type_oid)
+        {
+            return Err(mismatch());
+        }
+        let oid = crate::storage::OperatorClassOid::parse(storage.operator_class(slot).oid())
+            .expect("user operator-class OID is typed");
+        return Ok(IndexOperatorClass::Catalog(oid));
+    }
+    if written
+        .schema
+        .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+    {
+        return Err(missing());
+    }
+    let ctype = input.ctype;
+    let class = match method {
+        crate::sql::ast::IndexAccessMethod::Btree => {
+            crate::sql::types::BtreeOperatorClass::parse(written.name)
+                .map(|class| (class.accepts(ctype), IndexOperatorClass::Btree(class)))
+        }
+        crate::sql::ast::IndexAccessMethod::Hash => {
+            crate::sql::types::HashOperatorClass::parse(written.name)
+                .map(|class| (class.accepts(ctype), IndexOperatorClass::Hash(class)))
+        }
+        crate::sql::ast::IndexAccessMethod::Gist => {
+            crate::sql::types::GistOperatorClass::parse(written.name)
+                .map(|class| (class.accepts(ctype), IndexOperatorClass::Gist(class)))
+        }
+        crate::sql::ast::IndexAccessMethod::SpGist => {
+            crate::sql::types::SpGistOperatorClass::parse(written.name)
+                .map(|class| (class.accepts(ctype), IndexOperatorClass::SpGist(class)))
+        }
+        crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gin => None,
+    };
+    match class {
+        Some((true, class)) => Ok(class),
+        Some((false, _)) => Err(mismatch()),
+        None => Err(missing()),
+    }
+}
+
+/// The operator family of `class` and whether `operator` is one of its
+/// members, with the family's name for PostgreSQL's error.
+fn exclusion_family_membership(
+    storage: &Storage,
+    class: crate::storage::IndexOperatorClass,
+    method: crate::sql::ast::IndexAccessMethod,
+    operator: i32,
+    txid: u32,
+) -> Result<(bool, SqlName), SqlError> {
+    if let crate::storage::IndexOperatorClass::Catalog(oid) = class {
+        let slot = storage
+            .operator_class_slot_by_oid(oid, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "operator class does not exist"))?;
+        let definition = storage.operator_class_for(slot, txid);
+        let family_slot = storage
+            .operator_family_slot_by_oid(definition.family, txid)
+            .ok_or_else(|| {
+                sql_err!(sqlstate::UNDEFINED_OBJECT, "operator family does not exist")
+            })?;
+        let family = storage.operator_family_for(family_slot, txid);
+        let member = definition
+            .operators
+            .iter()
+            .chain(family.operators.iter())
+            .any(|member| member.used && member.operator == operator);
+        return Ok((member, family.name));
+    }
+    let Some((family, _)) = crate::sql::catalog::builtin_operator_class_family(class.oid()) else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "cache lookup failed for operator class {}",
+            class.oid()
+        ));
+    };
+    let name = crate::sql::catalog::builtin_operator_family(family).map_or("", |(_, name)| name);
+    Ok((
+        crate::sql::catalog::builtin_family_has_operator(family, method.oid(), operator),
+        SqlName::parse(name)?,
+    ))
+}
+
+/// The operator, operator class and collation of one exclusion element of
+/// type `type_oid`, checked in the order PostgreSQL's `ComputeIndexAttrs`
+/// checks them: the collation, the operator class, then a commutative
+/// operator named `written` from the class's operator family.
+#[allow(clippy::too_many_arguments)]
 fn exclusion_operator(
     storage: &Storage,
     element: crate::storage::RoutineResult,
     type_oid: i32,
-    key: Option<&crate::sql::ast::IndexColumn<'_>>,
+    natural_collation: crate::sql::ast::Collation,
+    key: ExclusionKeySource<'_>,
     method: crate::sql::ast::IndexAccessMethod,
-    written: &str,
+    (written_schema, written): (Option<&str>, &str),
     txid: u32,
-) -> Result<crate::storage::ExclusionOperator, SqlError> {
-    let collation = key.and_then(|key| key.collation);
-    let written_class = key.and_then(|key| key.operator_class);
-    let ordering_specified = key.is_some_and(|key| key.ordering_specified);
-    let nulls_order_specified = key.is_some_and(|key| key.nulls_order_specified);
+) -> Result<
+    (
+        crate::storage::ExclusionOperator,
+        crate::storage::ExclusionKeyOptions,
+    ),
+    SqlError,
+> {
     let type_name = |oid: i32| crate::sql::catalog::format_type_oid(storage, txid, oid, -1);
+    let mut options = crate::storage::ExclusionKeyOptions::DEFAULT;
+    let collation = match key {
+        ExclusionKeySource::Written(key) => key
+            .collation
+            .map(|collation| resolve_parsed_collation(storage, txid, collation))
+            .transpose()?,
+        ExclusionKeySource::Stored(stored) => stored.explicit_collation.then_some(stored.collation),
+    };
     if collation.is_some() && !element.ctype.is_collatable() {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -1496,74 +1630,123 @@ fn exclusion_operator(
             type_name(type_oid).as_str()
         ));
     }
-    let class = storage.resolve_index_operator_class(None, element, method, txid)?;
-    let Some((family, input)) = crate::sql::catalog::builtin_operator_class_family(class.oid())
-    else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "exclusion constraints over user-defined operator classes are not supported"
-        ));
+    // A collation equal to the key's own prints nothing, as PostgreSQL
+    // compares `indcollation` with the key's collation.
+    options.collation = collation.unwrap_or(natural_collation);
+    options.explicit_collation = options.collation != natural_collation;
+    let class = match key {
+        ExclusionKeySource::Written(key) => match key.operator_class {
+            Some(written_class) => {
+                if !key.operator_class_options.is_empty() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "operator class options in exclusion constraint elements are not supported"
+                    ));
+                }
+                let class = resolve_exclusion_class(
+                    storage,
+                    written_class,
+                    element,
+                    type_oid,
+                    method,
+                    txid,
+                )?;
+                options.class = Some(class);
+                class
+            }
+            None => storage.resolve_index_operator_class(None, element, method, txid)?,
+        },
+        ExclusionKeySource::Stored(stored) => {
+            options.class = stored.class;
+            storage.resolve_index_operator_class(stored.class, element, method, txid)?
+        }
     };
-    if collation.is_some() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "COLLATE in exclusion constraint elements is not supported"
-        ));
-    }
-    // Only the element type's default class is kept; naming it changes
-    // nothing PostgreSQL prints.
-    if let Some(written_class) = written_class {
-        let default_name = match class {
-            crate::storage::IndexOperatorClass::Gist(class) => Some(class.name()),
-            _ => None,
-        };
-        let schema_ok = written_class
-            .schema
-            .is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
-        if !schema_ok || default_name != Some(written_class.name) {
+    options.resolved_class = Some(class);
+    if let crate::storage::IndexOperatorClass::Catalog(oid) = class {
+        let slot = storage
+            .operator_class_slot_by_oid(oid, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "operator class does not exist"))?;
+        if storage
+            .operator_class_for(slot, txid)
+            .comparison_function()
+            .is_none()
+        {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "exclusion constraint operator class \"{}\" is not supported; only the element type's default class is",
-                written_class.name
+                sqlstate::UNDEFINED_OBJECT,
+                "missing support function 1 for index operator class"
             ));
         }
     }
-    if ordering_specified || nulls_order_specified {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "access method \"{}\" does not support {} options",
-            method.name(),
-            if ordering_specified {
-                "ASC/DESC"
-            } else {
-                "NULLS FIRST/LAST"
-            }
-        ));
+    let input = match crate::sql::catalog::builtin_operator_class_family(class.oid()) {
+        Some((_, input)) => input,
+        None => type_oid,
+    };
+    let builtin = written_schema
+        .is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+        .then(|| {
+            crate::sql::catalog::builtin_binary_operator(written, type_oid, type_oid)
+                .or_else(|| crate::sql::catalog::builtin_binary_operator(written, input, input))
+        })
+        .flatten();
+    let operator = match builtin {
+        Some(operator) => crate::storage::ExclusionOperator::from_oid(operator),
+        None => storage
+            .operator_slot_for_oids(
+                written_schema,
+                written,
+                Some(type_oid),
+                Some(type_oid),
+                txid,
+            )?
+            .and_then(|slot| crate::storage::ExclusionOperator::user(storage.operator(slot).oid())),
     }
-    let operator = crate::sql::catalog::builtin_binary_operator(written, type_oid, type_oid)
-        .or_else(|| crate::sql::catalog::builtin_binary_operator(written, input, input))
-        .ok_or_else(|| {
-            crate::sql::error_position::with_hint(
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "operator does not exist: {} {} {}",
-                    type_name(type_oid).as_str(),
-                    written,
-                    type_name(type_oid).as_str()
-                ),
-                "No operator matches the given name and argument types. You might need to add explicit type casts.",
-            )
-        })?;
-    let (_, left, right, commutator) = crate::sql::catalog::builtin_binary_operator_row(operator)
-        .expect("a found built-in operator has a row");
+    .ok_or_else(|| {
+        crate::sql::error_position::with_hint(
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                type_name(type_oid).as_str(),
+                written,
+                type_name(type_oid).as_str()
+            ),
+            "No operator matches the given name and argument types. You might need to add explicit type casts.",
+        )
+    })?;
+    // PostgreSQL formats the operator under a restricted search path, so a
+    // user-defined operator is always schema-qualified.
+    let (left, right, commutative, schema) =
+        match crate::sql::catalog::builtin_binary_operator_row(operator.oid()) {
+            Some((_, left, right, commutator)) => (left, right, commutator == operator.oid(), None),
+            None => {
+                let slot = storage
+                    .operator_slot_by_oid(operator.oid(), txid)
+                    .expect("a resolved user operator is visible");
+                let definition = storage.operator_for(slot, txid);
+                let argument = |argument: Option<crate::storage::RoutineResult>| {
+                    argument
+                        .and_then(|argument| {
+                            storage.routine_type_oid(argument.ctype, argument.user_type, txid)
+                        })
+                        .unwrap_or(type_oid)
+                };
+                (
+                    argument(definition.signature.left),
+                    argument(definition.signature.right),
+                    definition.commutator == Some(operator.oid()),
+                    Some(definition.schema),
+                )
+            }
+        };
     let signature = crate::stack_format!(
         600,
-        "{}({},{})",
+        "{}{}{}({},{})",
+        schema.as_ref().map_or("", |schema| schema.as_str()),
+        if schema.is_some() { "." } else { "" },
         written,
         type_name(left).as_str(),
         type_name(right).as_str()
     );
-    if commutator != operator {
+    if !commutative {
         crate::sql::eval::stash_diagnostic(
             Some(crate::util::StackStr::from_str(
                 "Only commutative operators can be used in exclusion constraints.",
@@ -1576,9 +1759,9 @@ fn exclusion_operator(
             signature.as_str()
         ));
     }
-    if !crate::sql::catalog::builtin_family_has_operator(family, method.oid(), operator) {
-        let family_name =
-            crate::sql::catalog::builtin_operator_family(family).map_or("", |(_, name)| name);
+    let (member, family_name) =
+        exclusion_family_membership(storage, class, method, operator.oid(), txid)?;
+    if !member {
         crate::sql::eval::stash_diagnostic(
             Some(crate::util::StackStr::from_str(
                 "The exclusion operator must be related to the index operator class for the constraint.",
@@ -1589,16 +1772,37 @@ fn exclusion_operator(
             sqlstate::WRONG_OBJECT_TYPE,
             "operator {} is not a member of operator family \"{}\"",
             signature.as_str(),
-            family_name
+            family_name.as_str()
         ));
     }
-    crate::storage::ExclusionOperator::from_oid(operator).ok_or_else(|| {
-        sql_err!(
+    let (ordering_specified, nulls_order_specified) = match key {
+        ExclusionKeySource::Written(key) => {
+            options.descending = key.descending;
+            options.nulls_first = key.nulls_first;
+            (key.ordering_specified, key.nulls_order_specified)
+        }
+        ExclusionKeySource::Stored(stored) => {
+            options.descending = stored.descending;
+            options.nulls_first = stored.nulls_first;
+            (false, false)
+        }
+    };
+    // Only an ordered access method accepts ordering options.
+    if method != crate::sql::ast::IndexAccessMethod::Btree
+        && (ordering_specified || nulls_order_specified)
+    {
+        return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "exclusion operator {} is not supported",
-            signature.as_str()
-        )
-    })
+            "access method \"{}\" does not support {} options",
+            method.name(),
+            if ordering_specified {
+                "ASC/DESC"
+            } else {
+                "NULLS FIRST/LAST"
+            }
+        ));
+    }
+    Ok((operator, options))
 }
 
 /// Applies each parsed table constraint to `def`: single-column PK/UNIQUE set
@@ -1919,9 +2123,9 @@ pub(super) fn attach_constraints(
                 }
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 for element in *elements {
-                    let (key, operator) =
+                    let (key, operator, options) =
                         resolve_exclusion_element(storage, def, *method, element, txid, arena)?;
-                    exclusion.push(key, operator)?;
+                    exclusion.push(key, operator, options)?;
                 }
                 if def.n_exclusions == crate::storage::MAX_EXCLUSIONS {
                     return Err(sql_err!(
@@ -1932,11 +2136,6 @@ pub(super) fn attach_constraints(
                 }
                 if let Some(expression) = predicate {
                     let _ = check_referenced_columns(expression, def)?;
-                }
-                if let Some(text) = predicate_text {
-                    super::expression_bindings::reject_unbound_exclusion_names(
-                        storage, def, text, txid, arena,
-                    )?;
                 }
                 exclusion.method = *method;
                 exclusion.timing = storage_timing(*timing);
@@ -1968,6 +2167,9 @@ pub(super) fn attach_constraints(
                 };
                 def.exclusions[def.n_exclusions] = exclusion;
                 def.n_exclusions += 1;
+                super::expression_bindings::capture_exclusion_expression_dependencies(
+                    storage, def, &exclusion, txid, arena,
+                )?;
             }
         }
     }
@@ -1989,6 +2191,7 @@ fn resolve_exclusion_element<'a>(
     (
         crate::storage::ExclusionElement<'a>,
         crate::storage::ExclusionOperator,
+        crate::storage::ExclusionKeyOptions,
     ),
     SqlError,
 > {
@@ -2014,7 +2217,7 @@ fn resolve_exclusion_element<'a>(
         })?),
         None => plain_column_reference(key.expression, def)?,
     };
-    let (stored, input, type_oid) = if let Some(column) = column {
+    let (stored, input, type_oid, natural) = if let Some(column) = column {
         let meta = def.columns()[column];
         let type_oid = crate::sql::catalog::catalog_column_type_oid(storage, &meta, txid)?;
         (
@@ -2024,31 +2227,39 @@ fn resolve_exclusion_element<'a>(
                 user_type: meta.user_type,
             },
             type_oid,
+            meta.collation,
         )
     } else {
         check_referenced_columns(key.expression, def)?;
         let (input, type_oid) =
             exclusion_expression_type(storage, def, key.expression, method, txid, arena)?;
+        let natural = super::constraints::index_key_collations(
+            storage,
+            txid,
+            def,
+            &[0],
+            &[Some(key.expression)],
+            arena,
+        )?[0];
         let text = stored_relation_expression(key.expression_text, def, arena)?;
-        super::expression_bindings::reject_unbound_exclusion_names(
-            storage, def, text, txid, arena,
-        )?;
         (
             crate::storage::ExclusionElement::Expression(text),
             input,
             type_oid,
+            natural,
         )
     };
-    let operator = exclusion_operator(
+    let (operator, options) = exclusion_operator(
         storage,
         input,
         type_oid,
-        Some(key),
+        natural,
+        ExclusionKeySource::Written(key),
         method,
-        element.operator,
+        (None, element.operator),
         txid,
     )?;
-    Ok((stored, operator))
+    Ok((stored, operator, options))
 }
 
 /// The type of an exclusion element expression over `def`, which must be
@@ -2098,8 +2309,13 @@ pub(crate) fn revalidate_exclusion(
     arena: &Arena,
 ) -> Result<crate::storage::ExclusionConstraint, SqlError> {
     let mut rebuilt = exclusion.without_elements();
-    for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
-        let (input, type_oid) = match element {
+    for (position, ((element, operator), stored)) in exclusion
+        .elements()
+        .zip(exclusion.operators())
+        .zip(exclusion.options())
+        .enumerate()
+    {
+        let (input, type_oid, natural) = match element {
             crate::storage::ExclusionElement::Column(column) => {
                 let meta = def.columns()[usize::from(column)];
                 (
@@ -2108,30 +2324,72 @@ pub(crate) fn revalidate_exclusion(
                         user_type: meta.user_type,
                     },
                     crate::sql::catalog::catalog_column_type_oid(storage, &meta, txid)?,
+                    meta.collation,
                 )
             }
             crate::storage::ExclusionElement::Expression(text) => {
                 let source = arena
                     .alloc_str(text)
                     .map_err(|_| crate::sql::eval::arena_full())?;
-                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                let expression = super::expression_bindings::bind_table_expression(
+                    crate::sql::parser::parse_expr(source, arena)?,
+                    storage,
+                    def,
+                    crate::storage::ExpressionOwner::ExclusionKey(exclusion.name, position as u8),
+                    txid,
+                    arena,
+                )?;
                 // The stored definition, not the statement, is analyzed.
-                exclusion_expression_type(storage, def, expression, exclusion.method, txid, arena)
-                    .inspect_err(|error| {
+                let (input, type_oid) = exclusion_expression_type(
+                    storage,
+                    def,
+                    expression,
+                    exclusion.method,
+                    txid,
+                    arena,
+                )
+                .inspect_err(|error| {
                     let _ = crate::sql::error_position::take_position(error);
-                })?
+                })?;
+                let natural = super::constraints::index_key_collations(
+                    storage,
+                    txid,
+                    def,
+                    &[0],
+                    &[Some(expression)],
+                    arena,
+                )?[0];
+                (input, type_oid, natural)
             }
         };
-        let operator = exclusion_operator(
+        let user;
+        let written = match operator.builtin_sql() {
+            Some(name) => (None, name),
+            None => {
+                let slot = storage
+                    .operator_slot_by_oid(operator.oid(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "cache lookup failed for operator {}",
+                            operator.oid()
+                        )
+                    })?;
+                user = storage.operator_for(slot, txid);
+                (Some(user.schema.as_str()), user.name.as_str())
+            }
+        };
+        let (operator, options) = exclusion_operator(
             storage,
             input,
             type_oid,
-            None,
+            natural,
+            ExclusionKeySource::Stored(*stored),
             exclusion.method,
-            operator.sql(),
+            written,
             txid,
         )?;
-        rebuilt.push(element, operator)?;
+        rebuilt.push(element, operator, options)?;
     }
     Ok(rebuilt)
 }

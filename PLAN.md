@@ -452,14 +452,12 @@ TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
 built-in and user-defined functions, `ROW(...)` and whole-row references;
 other expressions (subqueries, named-argument calls, `$n` parameters and
 array constructors outside a quantified comparison) are still printed as
-stored. CHECK constraints, column defaults and generation expressions, and
-index keys and predicates are bound to the routines, operators, types and
-collations they named when written (see
+stored. CHECK and exclusion constraints, column defaults and generation
+expressions, and index keys and predicates are bound to the routines,
+operators, types and collations they named when written (see
 [stored expressions](docs/architecture.md#stored-expressions)): a later
 search path, rename or schema move changes nothing, and dropping a named
-object reports and cascades to them. Exclusion constraint elements and
-predicates keep names as SQL text, so one that names a user-defined function,
-operator or type fails with `0A000`. Statistics expressions, trigger `WHEN`
+object reports and cascades to them. Statistics expressions, trigger `WHEN`
 conditions and domain constraints also keep routine and type names as SQL
 text, so renaming or moving a routine or type one of them names fails with
 `0A000`, as does renaming an enum value any stored expression casts to;
@@ -470,9 +468,12 @@ call fails with `22P02`. A rule action that names its table's renamed column wit
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;
-more fails with `54000`. An element may name the default operator class of
-its type (`range_ops`); another operator class or a `COLLATE` on a
-collatable element fails with `0A000`. `ALTER COLUMN ... TYPE` keeps the
+more fails with `54000`. An element may name any operator class of its
+access method that accepts its type, built-in (`text_pattern_ops`) or a
+user-defined btree class, a `COLLATE`, and, under btree, `DESC` and `NULLS
+FIRST/LAST`; its operator may be user-defined when the class's family holds
+it, and runs through the operator's function. Operator class options on an
+element fail with `0A000`. `ALTER COLUMN ... TYPE` keeps the
 OIDs of the key and exclusion indexes over the column, where PostgreSQL
 rebuilds them with new OIDs, so after it a row that violates two
 constraints can report the other one first. `DROP COLUMN` of a column an
@@ -588,8 +589,7 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
-marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
-GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
+marked `NO INHERIT` fails with `0A000`.
 `pg_constraint` omits the system catalogs' own not-null constraints.
 The built-in `postgres_fdw` extension's routines cannot be called directly
 (`0A000`): `postgres_fdw_get_connections` and `postgres_fdw_disconnect` need

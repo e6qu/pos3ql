@@ -577,10 +577,39 @@ pub(crate) struct ExclusionScan<'e, 'a> {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
     sources: [Option<&'a str>; crate::storage::MAX_INDEX_COLS],
+    /// Each element's collation: the one written, else the key's own.
+    collations: [crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS],
+    /// The function each user-defined operator runs.
+    functions: [i32; crate::storage::MAX_INDEX_COLS],
 }
 
 /// One row's element values under an exclusion constraint.
 pub(crate) type ExclusionKeys<'a> = [Datum<'a>; crate::storage::MAX_INDEX_COLS];
+
+/// The stored predicate of `exclusion`, a constraint of `def`, parsed and
+/// bound to the objects it was written against.
+pub(crate) fn exclusion_predicate<'a>(
+    storage: &Storage,
+    txid: u32,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some(predicate) = &exclusion.predicate else {
+        return Ok(None);
+    };
+    let source = arena
+        .alloc_str(predicate.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    Ok(Some(super::expression_bindings::bind_table_expression(
+        crate::sql::parser::parse_expr(source, arena)?,
+        storage,
+        def,
+        crate::storage::ExpressionOwner::ExclusionPredicate(exclusion.name),
+        txid,
+        arena,
+    )?))
+}
 
 impl<'e, 'a> ExclusionScan<'e, 'a> {
     /// A placeholder with no elements, for filling fixed storage.
@@ -589,17 +618,23 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expressions: [None; crate::storage::MAX_INDEX_COLS],
         sources: [None; crate::storage::MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+        functions: [0; crate::storage::MAX_INDEX_COLS],
     };
 
+    /// Binds each expression element of `exclusion`, a constraint of `def`,
+    /// to the objects it was written against and resolves what each
+    /// element compares with.
     pub(crate) fn new(
         exclusion: &'e crate::storage::ExclusionConstraint,
+        storage: &Storage,
+        txid: u32,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let mut scan = Self {
             exclusion,
-            columns: [0; crate::storage::MAX_INDEX_COLS],
-            expressions: [None; crate::storage::MAX_INDEX_COLS],
-            sources: [None; crate::storage::MAX_INDEX_COLS],
+            ..Self::EMPTY
         };
         for (position, element) in exclusion.elements().enumerate() {
             match element {
@@ -610,8 +645,45 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
                         .map_err(|_| crate::sql::eval::arena_full())?;
                     scan.sources[position] = Some(source);
                     scan.expressions[position] =
-                        Some(crate::sql::parser::parse_expr(source, arena)?);
+                        Some(super::expression_bindings::bind_table_expression(
+                            crate::sql::parser::parse_expr(source, arena)?,
+                            storage,
+                            def,
+                            crate::storage::ExpressionOwner::ExclusionKey(
+                                exclusion.name,
+                                position as u8,
+                            ),
+                            txid,
+                            arena,
+                        )?);
                 }
+            }
+        }
+        for (position, options) in exclusion.options().iter().enumerate() {
+            scan.collations[position] = options.collation;
+        }
+        for (position, operator) in exclusion.operators().iter().enumerate() {
+            if operator.binary().is_none() {
+                let slot = storage
+                    .operator_slot_by_oid(operator.oid(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "exclusion operator {} does not exist",
+                            operator.oid()
+                        )
+                    })?;
+                scan.functions[position] = storage
+                    .operator_for(slot, txid)
+                    .implementation
+                    .routine()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "exclusion operator {} has no function",
+                            operator.oid()
+                        )
+                    })?;
             }
         }
         Ok(scan)
@@ -641,20 +713,52 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
     /// Whether two rows' elements all conflict; a NULL element never does.
     pub(crate) fn conflicts(
         &self,
-        left: &ExclusionKeys<'_>,
-        right: &ExclusionKeys<'_>,
-        arena: &Arena,
+        storage: &Storage,
+        txid: u32,
+        left: &ExclusionKeys<'a>,
+        right: &ExclusionKeys<'a>,
+        arena: &'a Arena,
     ) -> Result<bool, SqlError> {
         for (position, operator) in self.exclusion.operators().iter().enumerate() {
-            if left[position].is_null() || right[position].is_null() {
+            let (left, right) = (left[position], right[position]);
+            if left.is_null() || right.is_null() {
                 return Ok(false);
             }
-            if !crate::sql::eval::exclusion_operator(
-                operator.binary(),
-                left[position],
-                right[position],
-                arena,
-            )? {
+            let conflict = match operator.binary() {
+                // A catalog collation may be nondeterministic, so equality
+                // asks the collation.
+                Some(
+                    binary @ (crate::sql::ast::BinaryOp::Eq | crate::sql::ast::BinaryOp::NotEq),
+                ) if matches!(
+                    self.collations[position],
+                    crate::sql::ast::Collation::Catalog(_)
+                ) =>
+                {
+                    let equal = crate::sql::eval::compare_datums_collated(
+                        storage,
+                        txid,
+                        self.collations[position],
+                        &left,
+                        &right,
+                    )?
+                    .is_eq();
+                    equal == (binary == crate::sql::ast::BinaryOp::Eq)
+                }
+                Some(binary) => crate::sql::eval::exclusion_operator(binary, left, right, arena)?,
+                None => matches!(
+                    crate::sql::query::execute_operator_function(
+                        storage,
+                        txid,
+                        self.functions[position],
+                        left,
+                        right,
+                        self.collations[position],
+                        arena,
+                    )?,
+                    Datum::Bool(true)
+                ),
+            };
+            if !conflict {
                 return Ok(false);
             }
         }
@@ -2395,13 +2499,8 @@ pub(crate) fn parse_checks<'a>(
         )?);
     }
     for (index, exclusion) in def.exclusions().iter().enumerate() {
-        if let Some(predicate) = &exclusion.predicate {
-            let source = arena
-                .alloc_str(predicate.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            out[crate::storage::MAX_CHECKS + index] =
-                Some(crate::sql::parser::parse_expr(source, arena)?);
-        }
+        out[crate::storage::MAX_CHECKS + index] =
+            exclusion_predicate(storage, txid, def, exclusion, arena)?;
     }
     Ok(out)
 }
@@ -2935,7 +3034,7 @@ fn enforce_exclusion_constraint_in<'a>(
     if !predicate_holds(values)? {
         return Ok(());
     }
-    let scan = ExclusionScan::new(exclusion, arena)?;
+    let scan = ExclusionScan::new(exclusion, storage, txid, def, arena)?;
     let keys = scan.keys(storage, txid, def, values, arena)?;
     // A NULL element conflicts with nothing.
     if keys[..exclusion.len()].iter().any(Datum::is_null) {
@@ -2962,7 +3061,7 @@ fn enforce_exclusion_constraint_in<'a>(
                 return Ok(false);
             }
             let other_keys = scan.keys(storage, txid, def, other, arena)?;
-            if !scan.conflicts(&keys, &other_keys, arena)? {
+            if !scan.conflicts(storage, txid, &keys, &other_keys, arena)? {
                 return Ok(false);
             }
             scan.stash_conflict(
@@ -3506,13 +3605,8 @@ pub(crate) fn validate_constraint_obligation(
     let Some(timing) = timing else {
         return Ok(None);
     };
-    let predicate = match exclusion.and_then(|constraint| constraint.predicate) {
-        Some(source) => {
-            let source = arena
-                .alloc_str(source.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            Some(crate::sql::parser::parse_expr(source, arena)?)
-        }
+    let predicate = match &exclusion {
+        Some(exclusion) => exclusion_predicate(storage, txid, &definition, exclusion, arena)?,
         None => None,
     };
     constraint_row_tables(storage, table_index, txid, |row_table| {

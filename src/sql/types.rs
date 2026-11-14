@@ -797,9 +797,40 @@ pub enum BtreeOperatorClass {
     Xid8,
     Money,
     Tid,
+    TextPattern,
+    VarcharPattern,
+    BpcharPattern,
 }
 
 impl BtreeOperatorClass {
+    /// Whether this class indexes `ctype`: its default class, or a pattern
+    /// class over a string type it is binary-compatible with.
+    pub const fn accepts(self, ctype: ColType) -> bool {
+        match self {
+            Self::TextPattern | Self::VarcharPattern => {
+                matches!(ctype, ColType::Text | ColType::Varchar)
+            }
+            Self::BpcharPattern => matches!(ctype, ColType::Bpchar),
+            _ => match Self::for_type(ctype) {
+                Some(class) => class as u8 == self as u8,
+                None => false,
+            },
+        }
+    }
+
+    /// Whether this is the default class of the type it indexes; the
+    /// pattern classes compare strings byte by byte instead of by collation.
+    pub const fn is_default(self) -> bool {
+        !self.is_pattern()
+    }
+
+    pub const fn is_pattern(self) -> bool {
+        matches!(
+            self,
+            Self::TextPattern | Self::VarcharPattern | Self::BpcharPattern
+        )
+    }
+
     pub const fn for_type(ctype: ColType) -> Option<Self> {
         use ColType::*;
         Some(match ctype {
@@ -889,6 +920,9 @@ impl BtreeOperatorClass {
             "tid_ops" => Self::Tid,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
+            "text_pattern_ops" => Self::TextPattern,
+            "varchar_pattern_ops" => Self::VarcharPattern,
+            "bpchar_pattern_ops" => Self::BpcharPattern,
             _ => return None,
         })
     }
@@ -931,6 +965,9 @@ impl BtreeOperatorClass {
             34 => Self::Xid8,
             35 => Self::Money,
             36 => Self::Tid,
+            37 => Self::TextPattern,
+            38 => Self::VarcharPattern,
+            39 => Self::BpcharPattern,
             _ => return None,
         })
     }
@@ -977,6 +1014,9 @@ impl BtreeOperatorClass {
             Self::Tid => "tid_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
+            Self::TextPattern => "text_pattern_ops",
+            Self::VarcharPattern => "varchar_pattern_ops",
+            Self::BpcharPattern => "bpchar_pattern_ops",
         }
     }
 
@@ -1018,6 +1058,9 @@ impl BtreeOperatorClass {
             Self::Tid => 10050,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
+            Self::TextPattern => 4217,
+            Self::VarcharPattern => 4218,
+            Self::BpcharPattern => 4219,
         }
     }
 }

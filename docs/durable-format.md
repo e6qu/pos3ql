@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v43` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v44` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -121,7 +121,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 23: version byte, ten-byte catalog
+- **Table definition payload** is version 24: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
   column's NOT NULL inheritance byte carries inheritability in bit 0 and
   PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
@@ -139,9 +139,15 @@ Other payload rules:
   positions and stamp after the validation code. Each exclusion constraint
   element is a tag byte, `0` with a two-byte column position or `1` with a
   two-byte length and that many bytes of canonical UTF-8 expression text,
-  then the four-byte operator OID. An unknown tag, invalid UTF-8, a span past
-  the record or more than 256 bytes of expression text in one constraint is
-  rejected. The definition ends with its
+  then the four-byte operator OID (a runnable built-in or a user-defined
+  operator) and fifteen bytes of key options: the written operator class
+  (five bytes: tag `0` none, `1` btree, `3` hash, `4` BRIN, `5` GiST, `6` GIN
+  or `7` SP-GiST with a built-in class code and three zero bytes, or `2` with
+  a four-byte user class OID), the resolved class (same form, never `0`), the
+  four-byte key collation code and a flag byte (bit 0 `DESC`, bit 1
+  `NULLS FIRST`, bit 2 collation written; other bits rejected). An unknown
+  tag, invalid UTF-8, a span past the record or more than 256 bytes of
+  expression text in one constraint is rejected. The definition ends with its
   [expression dependencies](#expression-dependencies).
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
@@ -193,7 +199,7 @@ inserts a missing writer.
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |
 | `constraint_identity POSITION CREATED_AT` | Table constraint identities in the [canonical order](#constraints-and-keys). |
 | `ukey` | Starts with the unique-key mode tag. |
-| `excl3` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl2` record are rejected. |
+| `excl4` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID and the journal's fifteen key-option bytes in hex, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl3` record are rejected. |
 | `dom7`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
@@ -398,15 +404,16 @@ the saved counter, or shared by distinct tables or domains in one database.
 
 ### Expression dependencies
 
-The objects a CHECK constraint, column default or generation expression, or
-index key or predicate was bound to when written. Table payloads append a
+The objects a CHECK constraint, exclusion constraint element or predicate,
+column default or generation expression, or index key or predicate was bound
+to when written. Table payloads append a
 one-byte count and the entries after the constraint identities; index journal
 records append marker `0xa7`, a one-byte count and the entries after the
 definition. Each entry:
 
 | Field | Encoding |
 |---|---|
-| Owner | `1` CHECK constraint, `2` column (each followed by a length-prefixed name), `3` index key (followed by its one-byte position), `4` index predicate |
+| Owner | `1` CHECK constraint, `2` column (each followed by a length-prefixed name), `3` index key (followed by its one-byte position), `4` index predicate, `5` exclusion element (a length-prefixed constraint name, then its one-byte position), `6` exclusion predicate (a length-prefixed constraint name) |
 | Class | One byte, as in stored-query dependencies |
 | Identity | Length-prefixed key as stored-query dependencies write it (routine, operator and text search configuration OIDs, type and collation identities) |
 | Names | Four length-prefixed names: current schema and name, then the spelling the expression used |

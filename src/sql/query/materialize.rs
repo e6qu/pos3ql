@@ -2095,25 +2095,36 @@ pub(crate) fn materialized_rows<'a>(
                 )?;
             }
         }
-        crate::mem::arena::try_stable_sort_via(
-            arena,
-            rows,
-            |a, b| {
-                compare_materialized_rows(
-                    storage,
-                    txid,
-                    &key_collations,
-                    statement,
-                    width,
-                    n_order,
-                    n_on,
-                    false,
-                    a,
-                    b,
-                )
-            },
-            |_| arena_full(),
-        )?;
+        // A limit directly over the sort bounds it: like PostgreSQL's,
+        // past twice the bound it keeps only a heap of the rows the limit
+        // returns.
+        let bound =
+            rank_window.filter(|&bound| !statement.distinct && n_on == 0 && rows.len() > bound * 2);
+        let compare = |a: &&[u8], b: &&[u8]| {
+            compare_materialized_rows(
+                storage,
+                txid,
+                &key_collations,
+                statement,
+                width,
+                n_order,
+                n_on,
+                false,
+                a,
+                b,
+            )
+        };
+        match bound {
+            Some(bound) => {
+                crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| {
+                    arena_full()
+                })?
+            }
+            None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
+        }
+        stages
+            .sort
+            .sorted(instrument::SortSpace::in_memory(rows, bound.is_some()));
     }
     // A sort under a DISTINCT returns every row it sorted.
     if stages.unique.measured() {
@@ -2601,8 +2612,9 @@ pub(crate) fn external_materialized_into<'a>(
     let stages = materialized_stages(limit != u64::MAX);
     let _stages = stages.start();
     let below_limit = stages.below_limit();
-    // A sort under a DISTINCT returns every row it sorted.
-    let sorted_rows = if stages.unique.measured() {
+    // A sort under a DISTINCT returns every row it sorted; one under row
+    // locks returns each row its locks read.
+    let sorted_rows = if stages.unique.measured() || stages.lock_rows.measured() {
         stages.sort
     } else {
         instrument::Node::NONE
@@ -2706,9 +2718,28 @@ pub(crate) fn external_materialized_into<'a>(
             &mut push,
         )?;
     }
+    // A limit directly over the sort bounds it, as in the in-memory path.
+    if statement.limit.is_some()
+        && limit != u64::MAX
+        && !statement.with_ties
+        && statement.locking.is_empty()
+        && !statement.distinct
+        && plan.n_on == 0
+        && plan.n_order > 0
+    {
+        sorter.keep_least(
+            offset.saturating_add(limit).min(usize::MAX as u64) as usize,
+            &mut compare,
+        )?;
+    }
     let run = storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("spill-attached block store")?;
+    if plan.n_keys != 0
+        && let Some(space) = sorter.space()
+    {
+        stages.sort.sorted(space);
+    }
     let Some(run) = run else {
         return Ok(0);
     };
@@ -3178,7 +3209,17 @@ pub(crate) fn materialized_rows_into<'a>(
             Ok(recheck.lock(storage, txid, row, rowids, arena)?.row(row))
         };
         // The Limit node reads one row past a WITH TIES window, which the
-        // LockRows node below it locks.
+        // LockRows node below it locks. The rows the preflight reads and
+        // locks are the ones PostgreSQL's nodes return.
+        let below_locks = [
+            stages.unique,
+            stages.sort,
+            stages.project_set,
+            stages.window,
+        ]
+        .into_iter()
+        .find(|node| node.measured())
+        .unwrap_or(instrument::Node::NONE);
         let mut preflight_accepted = 0u64;
         let mut preflight_emitted = 0u64;
         let mut preflight_boundary: Option<&[u8]> = None;
@@ -3186,14 +3227,17 @@ pub(crate) fn materialized_rows_into<'a>(
             if preflight_emitted >= limit && (!statement.with_ties || limit == 0) {
                 break;
             }
+            below_locks.row();
             let Some(row) = lock(row, rowids)? else {
                 continue;
             };
+            stages.lock_rows.row();
             if preflight_emitted >= limit && !tied(preflight_boundary, row)? {
                 break;
             }
             if preflight_accepted >= offset {
                 preflight_emitted += 1;
+                stages.limit.row();
                 if preflight_emitted == limit {
                     preflight_boundary = Some(row);
                 }

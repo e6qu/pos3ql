@@ -26,7 +26,7 @@ use crate::util::StackStr;
 
 mod rewrite;
 
-const MAX_EXPLAIN_STAGES: usize = 8;
+const MAX_EXPLAIN_STAGES: usize = 24;
 
 // A SELECT can expose one heap and one bitmap node per source plus every
 // operator stage. Composed set trees reserve the sum of their actual leaves,
@@ -126,6 +126,10 @@ enum QualLabel {
     IndexCond,
     RecheckCond,
     JoinFilter,
+    /// A `WindowAgg`'s window definition.
+    Window,
+    /// An incremental sort's keys its input is already sorted by.
+    PresortedKey,
 }
 
 impl QualLabel {
@@ -133,7 +137,12 @@ impl QualLabel {
     /// its filter.
     const fn rank(self) -> u8 {
         match self {
-            Self::OneTimeFilter | Self::HashCond | Self::IndexCond | Self::RecheckCond => 0,
+            Self::Window
+            | Self::PresortedKey
+            | Self::OneTimeFilter
+            | Self::HashCond
+            | Self::IndexCond
+            | Self::RecheckCond => 0,
             Self::JoinFilter => 1,
             Self::Filter => 2,
             Self::None => 3,
@@ -149,6 +158,8 @@ impl QualLabel {
             Self::IndexCond => "Index Cond",
             Self::RecheckCond => "Recheck Cond",
             Self::JoinFilter => "Join Filter",
+            Self::Window => "Window",
+            Self::PresortedKey => "Presorted Key",
         }
     }
 }
@@ -255,7 +266,11 @@ impl NodeActual {
             QualLabel::Filter => counters.filtered,
             QualLabel::JoinFilter => counters.join_filtered,
             QualLabel::IndexCond | QualLabel::RecheckCond => 0,
-            QualLabel::OneTimeFilter | QualLabel::HashCond | QualLabel::None => return None,
+            QualLabel::OneTimeFilter
+            | QualLabel::HashCond
+            | QualLabel::Window
+            | QualLabel::PresortedKey
+            | QualLabel::None => return None,
         };
         Some(removed as f64 / counters.loops as f64)
     }
@@ -268,7 +283,11 @@ impl QualLabel {
             Self::Filter => Some("Rows Removed by Filter"),
             Self::JoinFilter => Some("Rows Removed by Join Filter"),
             Self::IndexCond | Self::RecheckCond => Some("Rows Removed by Index Recheck"),
-            Self::OneTimeFilter | Self::HashCond | Self::None => None,
+            Self::OneTimeFilter
+            | Self::HashCond
+            | Self::Window
+            | Self::PresortedKey
+            | Self::None => None,
         }
     }
 }
@@ -407,6 +426,22 @@ impl<'a> Plan<'a> {
                 total_nanos: actual.elapsed_micros.saturating_mul(1_000),
                 ..NodeCounters::default()
             });
+        }
+        // A `Result` whose filter the planner folded to false returns no
+        // rows, once per row request of the node reading it.
+        if node.constant_false
+            && node.key.is_none()
+            && let Some(parent) = self.nodes[..index]
+                .iter()
+                .rposition(|parent| parent.depth + 1 == node.depth)
+        {
+            return match self.actual(parent, Some(actual)) {
+                NodeActual::Ran(counters) => NodeActual::Ran(NodeCounters {
+                    loops: counters.loops,
+                    ..NodeCounters::default()
+                }),
+                other => other,
+            };
         }
         let (Some(measured), Some(_)) = (self.measured, counters) else {
             return NodeActual::Unmeasured;
@@ -2595,42 +2630,13 @@ pub(super) fn plan_select<'a>(
         _ => false,
     };
 
-    if statement
+    // A condition the planner folds to false leaves no relation to scan:
+    // PostgreSQL runs the query's upper nodes over a `Result` that returns
+    // no rows.
+    let constant_false = statement
         .where_clause
         .and_then(|predicate| query::plan_time_bool(predicate, arena))
-        == Some(false)
-    {
-        // An aggregate without grouping still aggregates the empty input.
-        let aggregated = aggregate && statement.group_by.is_empty();
-        if aggregated {
-            plan.push(PlanNode {
-                name: StackStr::from_str("Aggregate"),
-                key: key(Role::Aggregate),
-                output,
-                rows: 1,
-                width,
-                ..PlanNode::EMPTY
-            })?;
-        }
-        plan.push(PlanNode {
-            name: StackStr::from_str("Result"),
-            // Only a query without FROM counts its `Result`.
-            key: if aggregated && scope.is_none() {
-                key(Role::Result)
-            } else {
-                None
-            },
-            depth: u8::from(aggregated),
-            output,
-            rows: 0,
-            width,
-            total_cost: 0.0,
-            constant_false: true,
-            ..PlanNode::EMPTY
-        })?;
-        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        return Ok(plan);
-    }
+        == Some(false);
 
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
@@ -2759,7 +2765,7 @@ pub(super) fn plan_select<'a>(
     } else {
         block
     };
-    if fromless {
+    if fromless && !constant_false {
         add_stage(
             &mut stages,
             &mut stage_count,
@@ -2798,7 +2804,7 @@ pub(super) fn plan_select<'a>(
         }
         Ok(true)
     };
-    if scope.as_ref().is_some_and(|scope| scope.n > 1) {
+    if scope.as_ref().is_some_and(|scope| scope.n > 1) && !constant_false {
         total_cost += estimated_rows as f64 * 0.01;
         add_stage(
             &mut stages,
@@ -2878,22 +2884,34 @@ pub(super) fn plan_select<'a>(
             ),
         )?;
     }
+    // The keys the rows leave the last window sorted by.
+    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] = &[];
     if has_window(statement) {
         total_cost += estimated_rows as f64 * 0.02;
-        add_stage(
-            &mut stages,
-            &mut stage_count,
-            PlanNode {
-                name: StackStr::from_str("WindowAgg"),
-                key: key(Role::Window),
-                total_cost,
-                rows: estimated_rows,
-                width,
-                object_requests,
-                cache_blocks,
-                ..PlanNode::EMPTY
-            },
+        let (nodes, sorted) = window_stages(
+            storage,
+            txid,
+            scope.as_ref(),
+            statement,
+            columns,
+            block,
+            arena,
         )?;
+        window_sorted = sorted;
+        for node in nodes {
+            add_stage(
+                &mut stages,
+                &mut stage_count,
+                PlanNode {
+                    total_cost,
+                    rows: estimated_rows,
+                    width,
+                    object_requests,
+                    cache_blocks,
+                    ..*node
+                },
+            )?;
+        }
     }
     if query::has_set_returning_items(statement.items, storage, txid) {
         add_stage(
@@ -2931,31 +2949,53 @@ pub(super) fn plan_select<'a>(
     } else {
         order_keys(statement, arena)?
     };
-    if !sorted_keys.is_empty() && ordered_index.is_none() {
+    // Rows a window leaves sorted by the query's keys need no sort, and
+    // ones sorted by a prefix of them only an incremental one.
+    let presorted = presorted_order_keys(statement, sorted_keys, window_sorted);
+    if !sorted_keys.is_empty()
+        && ordered_index.is_none()
+        && presorted.is_none_or(|presorted| presorted < sorted_keys.len())
+    {
         total_cost += estimated_rows as f64 * (estimated_rows.max(2) as f64).log2() * 0.0025;
-        add_stage(
-            &mut stages,
-            &mut stage_count,
-            PlanNode {
-                name: StackStr::from_str("Sort"),
-                key: key(Role::Sort),
-                keys: plan_keys(
-                    storage,
-                    txid,
-                    scope.as_ref(),
-                    statement,
-                    KeyLabel::Sort,
-                    sorted_keys,
-                    arena,
-                )?,
-                total_cost,
-                rows: estimated_rows,
-                width,
-                object_requests,
-                cache_blocks,
-                ..PlanNode::EMPTY
-            },
-        )?;
+        let presorted = presorted.unwrap_or(0);
+        let mut node = PlanNode {
+            name: StackStr::from_str(if presorted == 0 {
+                "Sort"
+            } else {
+                "Incremental Sort"
+            }),
+            key: key(Role::Sort),
+            keys: plan_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                KeyLabel::Sort,
+                sorted_keys,
+                arena,
+            )?,
+            total_cost,
+            rows: estimated_rows,
+            width,
+            object_requests,
+            cache_blocks,
+            ..PlanNode::EMPTY
+        };
+        if presorted != 0 {
+            let prefix = plan_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                KeyLabel::Sort,
+                &sorted_keys[..presorted],
+                arena,
+            )?;
+            node = node
+                .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+        }
+        add_stage(&mut stages, &mut stage_count, node)?;
     }
     let distinct_items = || -> Result<bool, SqlError> {
         if !statement.distinct_on.is_empty() {
@@ -3018,6 +3058,24 @@ pub(super) fn plan_select<'a>(
                     None => PlanKeys::NONE,
                 },
                 total_cost,
+                rows: estimated_rows,
+                width,
+                object_requests,
+                cache_blocks,
+                ..PlanNode::EMPTY
+            },
+        )?;
+    }
+    // A locking clause locks each row below the limit, as PostgreSQL's
+    // `LockRows` does; a query without FROM has no rows to lock.
+    if !statement.locking.is_empty() && !fromless {
+        add_stage(
+            &mut stages,
+            &mut stage_count,
+            PlanNode {
+                name: StackStr::from_str("LockRows"),
+                key: key(Role::LockRows),
+                total_cost: total_cost + estimated_rows as f64 * 0.01,
                 rows: estimated_rows,
                 width,
                 object_requests,
@@ -3258,6 +3316,34 @@ pub(super) fn plan_select<'a>(
             filters[..2].copy_from_slice(&quals.scan_filters);
         }
     }
+    if constant_false {
+        for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
+            plan.push(PlanNode {
+                depth: depth as u8,
+                output,
+                ..*stage
+            })?;
+        }
+        // An aggregate without grouping still aggregates the empty input;
+        // only a query without FROM counts its `Result`.
+        plan.push(PlanNode {
+            name: StackStr::from_str("Result"),
+            key: if aggregate && statement.group_by.is_empty() && scope.is_none() {
+                key(Role::Result)
+            } else {
+                None
+            },
+            depth: stage_count as u8,
+            output,
+            rows: 0,
+            width,
+            total_cost: 0.0,
+            constant_false: true,
+            ..PlanNode::EMPTY
+        })?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
         let mut stage = *stage;
         stage.depth = depth as u8;
@@ -3405,7 +3491,10 @@ pub(super) fn plan_select<'a>(
             let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
                 continue;
             };
+            // Locked rows carry their row identities out of the subquery,
+            // so PostgreSQL keeps its scan.
             let passes_through = from.joins.is_empty()
+                && body.locking.is_empty()
                 && statement
                     .items
                     .iter()
@@ -3426,6 +3515,394 @@ pub(super) fn plan_select<'a>(
     }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// A presorted key list as PostgreSQL prints it: its keys without their
+/// directions, which a sort's keys carry.
+fn presorted_text(keys: &PlanKeys, verbose: bool) -> Option<StackStr<512>> {
+    let (_, keys) = keys.shown(verbose)?;
+    let mut text = StackStr::new();
+    for (index, key) in keys.enumerate() {
+        if index != 0 {
+            let _ = write!(text, ", ");
+        }
+        let key = key
+            .split(" NULLS ")
+            .next()
+            .unwrap_or(key)
+            .trim_end_matches(" DESC");
+        let _ = write!(text, "{key}");
+    }
+    (!text.is_truncated()).then_some(text)
+}
+
+/// The expression an `ORDER BY` key sorts by: an output position or name
+/// stands for its select-list expression.
+fn order_key_expression<'e>(statement: &Select<'e>, key: &'e Expr<'e>) -> &'e Expr<'e> {
+    let item = match key {
+        Expr::Int(position) => usize::try_from(*position)
+            .ok()
+            .and_then(|position| statement.items.get(position.checked_sub(1)?)),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => statement.items.iter().find(
+            |item| matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name),
+        ),
+        _ => None,
+    };
+    match item {
+        Some(SelectItem::Expr { expression, .. }) => expression,
+        _ => key,
+    }
+}
+
+/// How many of the query's sort keys rows sorted by `sorted` already
+/// follow, when that is some: all of them needs no sort.
+fn presorted_order_keys(
+    statement: &Select<'_>,
+    keys: &[KeyItem<'_>],
+    sorted: &[crate::sql::ast::OrderBy<'_>],
+) -> Option<usize> {
+    let matched = keys
+        .iter()
+        .zip(sorted)
+        .take_while(|((key, order), held)| {
+            let (descending, nulls_first) = order.unwrap_or((false, false));
+            *order_key_expression(statement, key) == *held.expression
+                && held.descending == descending
+                && held.nulls_first == nulls_first
+        })
+        .count();
+    (matched != 0).then_some(matched)
+}
+
+/// PostgreSQL's window functions whose result does not depend on the frame,
+/// for which its planner evaluates the window `ROWS UNBOUNDED PRECEDING`.
+fn frame_independent(node: &Expr<'_>) -> bool {
+    let Expr::Call { name, .. } = node else {
+        return false;
+    };
+    [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+    ]
+    .iter()
+    .any(|function| name.eq_ignore_ascii_case(function))
+}
+
+/// A window definition as PostgreSQL's EXPLAIN prints it: `name AS
+/// (PARTITION BY ... ORDER BY ... frame)`, keys without their directions.
+#[expect(clippy::too_many_arguments, reason = "plan key context")]
+fn window_definition(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    name: &str,
+    spec: &crate::sql::ast::WindowSpec<'_>,
+    optimized_frame: bool,
+    verbose: bool,
+    arena: &Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    use crate::sql::ast::{FrameBound, FrameExclusion, FrameUnits};
+    let mut text = StackStr::<512>::new();
+    crate::sql::catalog::write_identifier(&mut text, name);
+    let _ = write!(text, " AS (");
+    let mut spaced = false;
+    let mut write_keys =
+        |text: &mut StackStr<512>, label: &str, items: &[KeyItem<'_>]| -> Result<bool, SqlError> {
+            if items.is_empty() {
+                return Ok(true);
+            }
+            let keys = plan_keys(
+                storage,
+                txid,
+                scope,
+                statement,
+                KeyLabel::Sort,
+                items,
+                arena,
+            )?;
+            let Some((_, keys)) = keys.shown(verbose) else {
+                return Ok(false);
+            };
+            if spaced {
+                let _ = write!(text, " ");
+            }
+            let _ = write!(text, "{label} ");
+            for (index, key) in keys.enumerate() {
+                if index != 0 {
+                    let _ = write!(text, ", ");
+                }
+                let _ = write!(text, "{key}");
+            }
+            spaced = true;
+            Ok(true)
+        };
+    let partition = arena
+        .alloc_slice_with(spec.partition_by.len(), |index| {
+            (spec.partition_by[index], None)
+        })
+        .map_err(|_| arena_full())?;
+    let order = arena
+        .alloc_slice_with(spec.order_by.len(), |index| {
+            (spec.order_by[index].expression, None)
+        })
+        .map_err(|_| arena_full())?;
+    if !write_keys(&mut text, "PARTITION BY", partition)?
+        || !write_keys(&mut text, "ORDER BY", order)?
+    {
+        return Ok(None);
+    }
+    let frame = if optimized_frame {
+        Some(crate::sql::ast::WindowFrame {
+            units: FrameUnits::Rows,
+            between: false,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
+            exclusion: FrameExclusion::NoOthers,
+        })
+    } else {
+        spec.frame
+    };
+    if let Some(frame) = frame {
+        if spaced {
+            let _ = write!(text, " ");
+        }
+        let _ = write!(
+            text,
+            "{}",
+            match frame.units {
+                FrameUnits::Rows => "ROWS",
+                FrameUnits::Range => "RANGE",
+                FrameUnits::Groups => "GROUPS",
+            }
+        );
+        if frame.between {
+            let _ = write!(text, " BETWEEN");
+        }
+        let context = crate::sql::catalog::deparse::Context {
+            storage,
+            txid,
+            table: None,
+            parameters: &[],
+            joined: &[],
+            pretty: false,
+            qualify: false,
+            bare: None,
+            domain_value: None,
+            folded: true,
+            arena,
+            dependencies: None,
+        };
+        let bound = |text: &mut StackStr<512>, bound: FrameBound<'_>| -> Result<bool, SqlError> {
+            let (offset, direction) = match bound {
+                FrameBound::UnboundedPreceding => {
+                    let _ = write!(text, " UNBOUNDED PRECEDING");
+                    return Ok(true);
+                }
+                FrameBound::UnboundedFollowing => {
+                    let _ = write!(text, " UNBOUNDED FOLLOWING");
+                    return Ok(true);
+                }
+                FrameBound::CurrentRow => {
+                    let _ = write!(text, " CURRENT ROW");
+                    return Ok(true);
+                }
+                FrameBound::Preceding(offset) => (offset, "PRECEDING"),
+                FrameBound::Following(offset) => (offset, "FOLLOWING"),
+            };
+            // The planner coerces a `ROWS` or `GROUPS` offset to bigint.
+            if frame.units != FrameUnits::Range
+                && let Expr::Int(value) = offset
+            {
+                let _ = write!(text, " '{value}'::bigint {direction}");
+                return Ok(true);
+            }
+            let mark = arena.mark();
+            let written = crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                offset,
+                crate::sql::catalog::deparse::Destination::Value,
+                arena,
+            )
+            .map(|part| {
+                part.map(|part| {
+                    let _ = write!(text, " {part} {direction}");
+                })
+                .is_some()
+            });
+            // SAFETY: the text was copied out of the arena.
+            unsafe { arena.rewind_to(mark) };
+            written
+        };
+        if !bound(&mut text, frame.start)? {
+            return Ok(None);
+        }
+        if frame.between {
+            let _ = write!(text, " AND");
+            if !bound(&mut text, frame.end)? {
+                return Ok(None);
+            }
+        }
+        let _ = write!(
+            text,
+            "{}",
+            match frame.exclusion {
+                FrameExclusion::NoOthers => "",
+                FrameExclusion::CurrentRow => " EXCLUDE CURRENT ROW",
+                FrameExclusion::Group => " EXCLUDE GROUP",
+                FrameExclusion::Ties => " EXCLUDE TIES",
+            }
+        );
+    }
+    let _ = write!(text, ")");
+    Ok((!text.is_truncated()).then_some(text))
+}
+
+/// The `WindowAgg` nodes of a query and the sorts of their inputs, bottom
+/// first, and the keys the last window leaves its rows sorted by. Each
+/// window clause sorts its input unless the rows already follow its keys,
+/// incrementally when they follow a prefix of them, as PostgreSQL plans.
+fn window_stages<'a, 'e>(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &'e Select<'e>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    block: BlockId,
+    arena: &'e Arena,
+) -> Result<(&'e [PlanNode], &'e [crate::sql::ast::OrderBy<'e>]), SqlError> {
+    let mut win_nodes = crate::mem::arena::ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            query::collect_windows(expression, &mut win_nodes, storage, txid, columns)?;
+        }
+    }
+    for order in statement.order_by {
+        query::collect_windows(order.expression, &mut win_nodes, storage, txid, columns)?;
+    }
+    let win_nodes = win_nodes.as_slice();
+    let windows = query::window_clauses(statement, win_nodes, arena)?;
+    let nodes = arena
+        .alloc_slice_with(windows.clauses.len() * 2, |_| PlanNode::EMPTY)
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = &[];
+    // Unnamed windows take the names `w1`, `w2`, ... the named ones leave.
+    let mut next_name = 1usize;
+    let last = windows.clauses.len().saturating_sub(1);
+    for (index, &(spec, name)) in windows.clauses.iter().enumerate() {
+        let position = u16::try_from(index).map_err(|_| arena_full())?;
+        let keys = query::window_sort_keys(spec, arena)?;
+        let held = keys.len() <= sorted.len() && *keys == sorted[..keys.len()];
+        if !keys.is_empty() && !held {
+            let presorted = keys
+                .iter()
+                .zip(sorted)
+                .take_while(|(key, held)| key == held)
+                .count();
+            let items = arena
+                .alloc_slice_with(keys.len(), |at| {
+                    (
+                        keys[at].expression,
+                        Some((keys[at].descending, keys[at].nulls_first)),
+                    )
+                })
+                .map_err(|_| arena_full())?;
+            let shown = plan_keys(
+                storage,
+                txid,
+                scope,
+                statement,
+                KeyLabel::Sort,
+                items,
+                arena,
+            )?;
+            let mut sort = PlanNode {
+                name: StackStr::from_str(if presorted == 0 {
+                    "Sort"
+                } else {
+                    "Incremental Sort"
+                }),
+                key: Some(NodeKey::new(block, Role::WindowSort(position))),
+                keys: shown,
+                ..PlanNode::EMPTY
+            };
+            if presorted != 0 {
+                let prefix = plan_keys(
+                    storage,
+                    txid,
+                    scope,
+                    statement,
+                    KeyLabel::Sort,
+                    &items[..presorted],
+                    arena,
+                )?;
+                sort = sort
+                    .with_qual(QualLabel::PresortedKey, presorted_text(&prefix, false))
+                    .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
+            }
+            nodes[count] = sort;
+            count += 1;
+            sorted = keys;
+        }
+        let mut generated: StackStr<16>;
+        let name = match name {
+            Some(name) => name,
+            None => loop {
+                generated = StackStr::new();
+                let _ = write!(generated, "w{next_name}");
+                next_name += 1;
+                if !windows
+                    .clauses
+                    .iter()
+                    .any(|(_, held)| *held == Some(generated.as_str()))
+                {
+                    break generated.as_str();
+                }
+            },
+        };
+        let optimized_frame = win_nodes
+            .iter()
+            .zip(windows.of_node)
+            .filter(|(_, clause)| **clause == index)
+            .all(|(node, _)| frame_independent(node));
+        let definition = |verbose| {
+            window_definition(
+                storage,
+                txid,
+                scope,
+                statement,
+                name,
+                spec,
+                optimized_frame,
+                verbose,
+                arena,
+            )
+        };
+        nodes[count] = PlanNode {
+            name: StackStr::from_str("WindowAgg"),
+            key: Some(NodeKey::new(
+                block,
+                if index == last {
+                    Role::Window
+                } else {
+                    Role::WindowAgg(position)
+                },
+            )),
+            ..PlanNode::EMPTY
+        }
+        .with_qual(QualLabel::Window, definition(false)?)
+        .with_verbose_qual(QualLabel::Window, definition(true)?);
+        count += 1;
+    }
+    Ok((&nodes[..count], sorted))
 }
 
 /// The plan of a derived table's own query.
@@ -4205,14 +4682,30 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
     let SetTree::Select(branch) = first else {
         return PlanKeys::NONE;
     };
-    let column_name = |position: usize| match branch.items.get(position)? {
+    // A set operation's range table holds its branches, so PostgreSQL
+    // prints each key as the first branch's column, qualified by its
+    // relation.
+    let relation = branch.from.as_ref().and_then(|from| {
+        (from.joins.is_empty() && from.base.subquery.is_none() && from.base.func_args.is_none())
+            .then(|| from.base.alias.unwrap_or(from.base.table))
+    });
+    fn output_name<'s>(item: &SelectItem<'s>) -> Option<&'s str> {
+        match item {
+            SelectItem::Expr {
+                alias: Some(alias), ..
+            } => Some(alias),
+            SelectItem::Expr {
+                expression: Expr::Column { name, .. },
+                alias: None,
+            } => Some(name),
+            _ => None,
+        }
+    }
+    let column = |position: usize| match branch.items.get(position)? {
         SelectItem::Expr {
-            alias: Some(alias), ..
-        } => Some(*alias),
-        SelectItem::Expr {
-            expression: Expr::Column { name, .. },
-            alias: None,
-        } => Some(*name),
+            expression: Expr::Column { qualifier, name },
+            ..
+        } => Some((qualifier.or(relation)?, *name)),
         _ => None,
     };
     let mut keys = PlanKeys {
@@ -4220,22 +4713,27 @@ fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
         ..PlanKeys::NONE
     };
     for (index, order) in query.order_by.iter().enumerate() {
-        let name = match order.expression {
+        let position = match order.expression {
             Expr::Int(position) => usize::try_from(*position)
                 .ok()
-                .and_then(|position| column_name(position.checked_sub(1)?)),
+                .and_then(|position| position.checked_sub(1)),
             Expr::Column {
                 qualifier: None,
                 name,
-            } => Some(*name),
+            } => branch
+                .items
+                .iter()
+                .position(|item| output_name(item).is_some_and(|output| output == *name)),
             _ => None,
         };
-        let Some(name) = name else {
+        let Some((qualifier, name)) = position.and_then(column) else {
             return PlanKeys::NONE;
         };
         if index != 0 {
             let _ = keys.plain.write_char(KEY_SEPARATOR);
         }
+        crate::sql::catalog::write_identifier(&mut keys.plain, qualifier);
+        let _ = keys.plain.write_char('.');
         crate::sql::catalog::write_identifier(&mut keys.plain, name);
         if order.descending {
             let _ = write!(keys.plain, " DESC");
@@ -4939,6 +5437,16 @@ fn hash_table(actual: NodeActual) -> Option<query::instrument::HashTable> {
     }
 }
 
+/// How a sort node sorted while `EXPLAIN ANALYZE` ran: the method and the
+/// space of the rows it held, which pos3ql measures in its own row
+/// encoding, not PostgreSQL's allocator.
+fn sort_space(actual: NodeActual) -> Option<query::instrument::SortSpace> {
+    match actual {
+        NodeActual::Ran(counters) => counters.sort,
+        NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
+    }
+}
+
 /// The count of rows `label`'s qualification of `node` removed, when
 /// PostgreSQL shows one.
 fn removed_count(
@@ -5007,6 +5515,20 @@ pub(super) fn visit_text_rows<E>(
             }
             emit(line.as_str())?;
         }
+        if let Some(space) = sort_space(node_actual).filter(|_| node.name.as_str() == "Sort") {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Sort Method: {}  {}: {}kB",
+                space.method.name(),
+                space.method.space_type(),
+                space.bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
         for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
             for _ in 0..property_indent(node.depth) {
@@ -5025,6 +5547,22 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
+        }
+        if let NodeActual::Ran(NodeCounters {
+            stored: Some(bytes),
+            ..
+        }) = node_actual
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Storage: Memory  Maximum Storage: {}kB",
+                bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
         }
         if let Some(table) = hash_table(node_actual) {
             let mut line = StackStr::<256>::new();
@@ -5772,6 +6310,11 @@ fn structured_node(
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);
     }
+    if let Some(space) = sort_space(node_actual).filter(|_| node.name.as_str() == "Sort") {
+        document.text("Sort Method", space.method.name());
+        document.number("Sort Space Used", space.bytes.div_ceil(1024));
+        document.text("Sort Space Type", space.method.space_type());
+    }
     if node.constant_false {
         document.text("One-Time Filter", "false");
     }
@@ -5783,10 +6326,22 @@ fn structured_node(
         document.number("Peak Memory Usage", table.bytes.div_ceil(1024));
     }
     for (label, text) in node.shown_qualifications(options.verbose) {
+        if label == QualLabel::PresortedKey {
+            document.list(label.text(), text.split(", "));
+            continue;
+        }
         document.text(label.text(), text);
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
         }
+    }
+    if let NodeActual::Ran(NodeCounters {
+        stored: Some(bytes),
+        ..
+    }) = node_actual
+    {
+        document.text("Storage", "Memory");
+        document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if let Some(actual) = actual {
         if options.buffers {

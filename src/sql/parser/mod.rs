@@ -3234,6 +3234,8 @@ impl<'a> Parser<'a> {
         let mut limit = None;
         let mut offset = None;
         let mut with_ties = false;
+        // Where `WITH TIES` starts, which PostgreSQL's error points at.
+        let mut ties_at = 0;
         let mut limit_all = false;
         loop {
             if limit.is_none() && !limit_all && self.eat_ident("limit")? {
@@ -3263,6 +3265,7 @@ impl<'a> Parser<'a> {
                         return Err(self.syntax_error_here());
                     }
                 }
+                ties_at = self.peek_at;
                 if self.eat_ident("with")? {
                     self.expect_ident("ties")?;
                     with_ties = true;
@@ -3274,7 +3277,13 @@ impl<'a> Parser<'a> {
             }
         }
         if with_ties && order_by.is_empty() {
-            return Err(self.err_here("WITH TIES cannot be specified without ORDER BY clause"));
+            return Err(ParseError {
+                cursor: Some(ties_at),
+                ..ParseError::new(
+                    ties_at,
+                    "WITH TIES cannot be specified without ORDER BY clause",
+                )
+            });
         }
         Ok((order_by, limit, offset, with_ties, limit_all))
     }

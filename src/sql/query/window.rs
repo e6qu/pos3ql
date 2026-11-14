@@ -1623,7 +1623,7 @@ fn cmp_order<'a>(
 
 /// One window's row order: its PARTITION BY keys ascending with NULLs last,
 /// then its ORDER BY keys, an exactly repeated key kept once.
-fn window_sort_keys<'a>(
+pub(crate) fn window_sort_keys<'a>(
     spec: &WindowSpec<'a>,
     arena: &'a Arena,
 ) -> Result<&'a [OrderBy<'a>], SqlError> {
@@ -1649,7 +1649,7 @@ fn window_sort_keys<'a>(
     Ok(&keys[..n])
 }
 
-fn window_spec<'a>(node: &'a Expr<'a>) -> Result<&'a WindowSpec<'a>, SqlError> {
+pub(crate) fn window_spec<'a>(node: &'a Expr<'a>) -> Result<&'a WindowSpec<'a>, SqlError> {
     match node {
         Expr::Call {
             over: Some(spec), ..
@@ -1668,7 +1668,7 @@ fn window_spec<'a>(node: &'a Expr<'a>) -> Result<&'a WindowSpec<'a>, SqlError> {
 /// leave in the last window's order, ties in the earlier windows' order.
 /// The `WINDOW` clause's definitions are numbered first, then inline
 /// specifications in select-list order.
-fn window_sort_chain<'a>(
+pub(crate) fn window_sort_chain<'a>(
     statement: &'a Select<'a>,
     win_nodes: &[&'a Expr<'a>],
     arena: &'a Arena,
@@ -1779,6 +1779,136 @@ fn window_sort_chain<'a>(
         }
     }
     Ok(chain)
+}
+
+/// Counts the work of the window clauses below the last and of the sorts of
+/// their inputs, each of which reads all `rows` once. Per window function,
+/// `measured` gives how its rows were sorted and the bytes of rows its
+/// window held; each clause reports its first function's.
+fn count_window_clauses<'a>(
+    statement: &'a Select<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    rows: u64,
+    measured: &[(instrument::SortSpace, usize)],
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let windows = window_clauses(statement, win_nodes, arena)?;
+    let last = windows.clauses.len().saturating_sub(1);
+    for index in 0..windows.clauses.len() {
+        let position = u16::try_from(index).unwrap_or(u16::MAX);
+        let Some(&(sorted, held)) = windows
+            .of_node
+            .iter()
+            .position(|&clause| clause == index)
+            .and_then(|node| measured.get(node))
+        else {
+            continue;
+        };
+        let sort = instrument::node(instrument::Role::WindowSort(position));
+        {
+            let _loop = sort.start();
+            sort.rows(rows);
+            sort.sorted(sorted);
+        }
+        let window = instrument::node(if index == last {
+            instrument::Role::Window
+        } else {
+            instrument::Role::WindowAgg(position)
+        });
+        window.stored(held);
+        if index != last {
+            let _loop = window.start();
+            window.rows(rows);
+        }
+    }
+    Ok(())
+}
+
+/// The windows of a query as PostgreSQL plans them: each window clause once,
+/// in evaluation order (the bottom `WindowAgg` first).
+pub(crate) struct WindowClauses<'a> {
+    /// Per clause, its specification and its name: the `WINDOW` clause's,
+    /// or none for an inline one.
+    pub(crate) clauses: &'a [(&'a WindowSpec<'a>, Option<&'a str>)],
+    /// Per window function of `win_nodes`, the clause computing it.
+    pub(crate) of_node: &'a [usize],
+}
+
+/// Groups `win_nodes` into PostgreSQL's window clauses. A call `OVER name`
+/// uses that `WINDOW` definition; an inline specification uses the first
+/// earlier definition (the `WINDOW` clause's first, then inline ones) that
+/// extends the same window and partitions, orders and frames rows alike.
+pub(crate) fn window_clauses<'a>(
+    statement: &'a Select<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<WindowClauses<'a>, SqlError> {
+    let chain = window_sort_chain(statement, win_nodes, arena)?;
+    // Every definition the parser keeps, in its order: the `WINDOW`
+    // clause's, then each new inline one.
+    let definitions = arena
+        .alloc_slice_with(statement.windows.len() + win_nodes.len(), |_| {
+            None::<(&WindowSpec<'a>, Option<&'a str>)>
+        })
+        .map_err(|_| arena_full())?;
+    for (slot, &spec) in definitions.iter_mut().zip(statement.windows) {
+        *slot = Some((spec, spec.name));
+    }
+    let mut defined = statement.windows.len();
+    let definition_of = arena
+        .alloc_slice_with(win_nodes.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    for (index, &node) in win_nodes.iter().enumerate() {
+        let spec = window_spec(node)?;
+        let found = definitions[..defined].iter().position(|definition| {
+            let (held, name) = definition.expect("defined");
+            match spec.name {
+                Some(wanted) => name == Some(wanted),
+                None => held.base == spec.base && *held == *spec,
+            }
+        });
+        definition_of[index] = match found {
+            Some(position) => position,
+            None => {
+                definitions[defined] = Some((spec, None));
+                defined += 1;
+                defined - 1
+            }
+        };
+    }
+    // The clauses in the order their first window function is evaluated.
+    let clause_of_definition = arena
+        .alloc_slice_with(defined, |_| None::<usize>)
+        .map_err(|_| arena_full())?;
+    let clauses = arena
+        .alloc_slice_with(win_nodes.len(), |_| {
+            None::<(&WindowSpec<'a>, Option<&'a str>)>
+        })
+        .map_err(|_| arena_full())?;
+    let of_node = arena
+        .alloc_slice_with(win_nodes.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for &node in chain {
+        let definition = definition_of[node];
+        let clause = match clause_of_definition[definition] {
+            Some(clause) => clause,
+            None => {
+                let (spec, name) = definitions[definition].expect("defined");
+                // A `WINDOW` definition keeps its name; the call's own
+                // specification holds the keys it was resolved with.
+                clauses[count] = Some((window_spec(win_nodes[node])?, name.or(spec.name)));
+                clause_of_definition[definition] = Some(count);
+                count += 1;
+                count - 1
+            }
+        };
+        of_node[node] = clause;
+    }
+    let clauses = arena
+        .alloc_slice_with(count, |index| clauses[index].expect("clause"))
+        .map_err(|_| arena_full())?;
+    Ok(WindowClauses { clauses, of_node })
 }
 
 /// Materializes the post-WHERE source rows, computes each window function, and
@@ -1933,6 +2063,23 @@ pub(crate) fn project_window_rows<'a>(
             },
             |_| arena_full(),
         )?;
+    }
+    if instrument::active() {
+        // Every window clause, and the sort of its input, reads each row
+        // once; the window holds the rows it read in memory.
+        let held = rows
+            .iter()
+            .fold(core::mem::size_of_val(rows), |bytes, row| {
+                bytes.saturating_add(core::mem::size_of_val(*row))
+            });
+        let sorted = instrument::SortSpace {
+            method: instrument::SortMethod::Quicksort,
+            bytes: held.saturating_add(core::mem::size_of_val(row_order)),
+        };
+        let measured = arena
+            .alloc_slice_with(win_nodes.len(), |_| (sorted, held))
+            .map_err(|_| arena_full())?;
+        count_window_clauses(statement, win_nodes, count as u64, measured, arena)?;
     }
 
     // Resolve ORDER BY (ordinals → select items).
@@ -2095,27 +2242,53 @@ impl<'a> WindowRows<'a> {
         storage: &Storage,
         txid: u32,
         order_by: &[OrderBy<'_>],
+        bound: Option<usize>,
+        sort: instrument::Node,
         arena: &'a Arena,
     ) -> Result<&'a [usize], SqlError> {
         let order = arena
             .alloc_slice_with(self.rows.len(), |i| i)
             .map_err(|_| arena_full())?;
         if !order_by.is_empty() {
-            crate::mem::arena::try_stable_sort_via(
-                arena,
-                order,
-                |&a, &b| {
-                    cmp_key_rows(
-                        storage,
-                        txid,
-                        self.collations,
-                        self.sort_keys[a],
-                        self.sort_keys[b],
-                        order_by,
-                    )
+            let compare = |&a: &usize, &b: &usize| {
+                cmp_key_rows(
+                    storage,
+                    txid,
+                    self.collations,
+                    self.sort_keys[a],
+                    self.sort_keys[b],
+                    order_by,
+                )
+            };
+            // Past twice its limit's bound the sort keeps only a heap of the
+            // rows the limit returns, as PostgreSQL's does.
+            let bound = bound.filter(|&bound| order.len() > bound * 2);
+            match bound {
+                Some(bound) => {
+                    crate::mem::arena::try_stable_top_n_via(arena, order, bound, compare, |_| {
+                        arena_full()
+                    })?
+                }
+                None => {
+                    crate::mem::arena::try_stable_sort_via(arena, order, compare, |_| arena_full())?
+                }
+            }
+            // The sorted positions and the rows and keys they order.
+            let bytes = self
+                .rows
+                .iter()
+                .chain(self.sort_keys)
+                .fold(core::mem::size_of_val(order), |bytes, row| {
+                    bytes.saturating_add(core::mem::size_of_val(*row))
+                });
+            sort.sorted(instrument::SortSpace {
+                method: if bound.is_some() {
+                    instrument::SortMethod::TopNHeapsort
+                } else {
+                    instrument::SortMethod::Quicksort
                 },
-                |_| arena_full(),
-            )?;
+                bytes,
+            });
         }
         Ok(order)
     }
@@ -2239,6 +2412,8 @@ pub(crate) fn external_window_into<'a>(
     offset: u64,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
+    let stages = super::materialize::materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Flat-row column offsets per table.
@@ -2280,6 +2455,20 @@ pub(crate) fn external_window_into<'a>(
         let pb = crate::sql::exec::decode_projected_pub(right, 0);
         compare_datums(&pa, &pb)
     };
+    // Per window function, how its rows were sorted and the most bytes of
+    // one partition it held, for `EXPLAIN ANALYZE`.
+    let measured = arena
+        .alloc_slice_with(win_nodes.len(), |_| {
+            (
+                instrument::SortSpace {
+                    method: instrument::SortMethod::Quicksort,
+                    bytes: 0,
+                },
+                0usize,
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let mut source_rows = 0u64;
     for (wi, &node) in win_nodes.iter().enumerate() {
         let Expr::Call {
             name: _,
@@ -2416,7 +2605,12 @@ pub(crate) fn external_window_into<'a>(
         let spec_run = storage
             .with_block_store(|blocks| spec_sorter.finish(blocks, &mut spec_compare))
             .expect("spill-attached block store")?;
+        if let Some(space) = spec_sorter.space() {
+            measured[wi].0 = space;
+        }
+        source_rows = position as u64;
         drop(spec_sorter);
+        let largest_partition = core::cell::Cell::new(0usize);
         // Stream the sorted run back partition by partition, computing each
         // partition's window values against a resident decoded copy (one
         // partition is the largest working set the arena ever holds here).
@@ -2444,6 +2638,14 @@ pub(crate) fn external_window_into<'a>(
                                         pos_of: &[i64],
                                         rank_of: &[i64]|
              -> Result<(), SqlError> {
+                largest_partition.set(
+                    largest_partition.get().max(
+                        rows.iter()
+                            .fold(core::mem::size_of_val(rows), |bytes, row| {
+                                bytes.saturating_add(core::mem::size_of_val(*row))
+                            }),
+                    ),
+                );
                 let out = compute_window(
                     storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
                 )?;
@@ -2571,6 +2773,10 @@ pub(crate) fn external_window_into<'a>(
                 unsafe { arena.rewind_to(mark) };
             }
         }
+        measured[wi].1 = largest_partition.get();
+    }
+    if instrument::active() {
+        count_window_clauses(statement, win_nodes, source_rows, measured, arena)?;
     }
     let win_run = storage
         .with_block_store(|blocks| win_sorter.finish(blocks, &mut win_compare))
@@ -2772,7 +2978,20 @@ pub(crate) fn external_window_into<'a>(
     let out_run = storage
         .with_block_store(|blocks| out_sorter.finish(blocks, &mut out_compare))
         .expect("spill-attached block store")?;
+    if !statement.order_by.is_empty()
+        && let Some(space) = out_sorter.space()
+    {
+        stages.sort.sorted(space);
+    }
     drop(out_sorter);
+    // A sort or distinct above the window reads every row it computes.
+    if stages.sort.measured() || stages.unique.measured() {
+        stages.window.rows(source_rows);
+    }
+    let below_limit = [stages.unique, stages.sort, stages.window]
+        .into_iter()
+        .find(|node| node.measured())
+        .unwrap_or(instrument::Node::NONE);
 
     // Stream the ordered run under DISTINCT / OFFSET / LIMIT.
     let Some(run) = out_run else {
@@ -2804,12 +3023,15 @@ pub(crate) fn external_window_into<'a>(
             };
             if duplicate {
                 true
-            } else if skipped < offset {
-                skipped += 1;
-                true
             } else if emitted >= limit {
                 false
+            } else if skipped < offset {
+                below_limit.row();
+                skipped += 1;
+                true
             } else {
+                below_limit.row();
+                stages.limit.row();
                 let mut output = [Datum::Null; MAX_PROJ];
                 for (column, value) in output.iter_mut().enumerate().take(width) {
                     *value = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
@@ -2935,7 +3157,14 @@ pub(crate) fn window_select<'a>(
         Err(e) => return sql_fail(e),
     };
     let proj_rows = rows.rows;
-    let order = match rows.ordered(storage, txid, statement.order_by, arena) {
+    let order = match rows.ordered(
+        storage,
+        txid,
+        statement.order_by,
+        super::group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct),
+        stages.sort,
+        arena,
+    ) {
         Ok(order) => order,
         Err(e) => return sql_fail(e),
     };

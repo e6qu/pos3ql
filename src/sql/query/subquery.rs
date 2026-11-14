@@ -4848,6 +4848,8 @@ fn run_set_subquery<'a>(
             sorted,
             outer_select.order_by,
             &columns[..n_cols],
+            None,
+            super::instrument::node(super::instrument::Role::Sort),
         )?;
         &*sorted
     };

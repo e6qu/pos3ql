@@ -1051,7 +1051,105 @@ pub fn try_stable_sort_via<T, E>(
     crate::util::try_sort_unstable_by(perm, |&a, &b| {
         Ok(cmp(&items[a as usize], &items[b as usize])?.then_with(|| a.cmp(&b)))
     })?;
-    // Apply the permutation by cycles: each element moves at most once.
+    apply_permutation(items, perm, visited);
+    Ok(())
+}
+
+/// Puts the `bound` least items of `items` first, in the order
+/// [`try_stable_sort_via`] gives them, and the others after them in their
+/// original order. Like PostgreSQL's top-N heapsort it keeps only a heap of
+/// the best `bound` items while it reads them; ties keep their original
+/// order, so the first `bound` items equal a stable sort's.
+pub fn try_stable_top_n_via<T, E>(
+    arena: &Arena,
+    items: &mut [T],
+    bound: usize,
+    mut cmp: impl FnMut(&T, &T) -> Result<core::cmp::Ordering, E>,
+    arena_full: impl FnOnce(ArenaFull) -> E,
+) -> Result<(), E> {
+    let n = items.len();
+    if bound >= n {
+        return try_stable_sort_via(arena, items, cmp, arena_full);
+    }
+    let (heap, perm, visited) = match arena.alloc_slice_with(bound, |_| 0u32).and_then(|heap| {
+        arena.alloc_slice_with(n, |i| i as u32).and_then(|perm| {
+            arena
+                .alloc_slice_with(n, |_| false)
+                .map(|visited| (heap, perm, visited))
+        })
+    }) {
+        Ok(staged) => staged,
+        Err(full) => return Err(arena_full(full)),
+    };
+    // A max-heap of the kept positions: its root is the worst kept item.
+    let mut after = |a: u32, b: u32| -> Result<bool, E> {
+        Ok(cmp(&items[a as usize], &items[b as usize])?
+            .then_with(|| a.cmp(&b))
+            .is_gt())
+    };
+    let mut kept = 0usize;
+    for position in 0..n as u32 {
+        if kept < bound {
+            heap[kept] = position;
+            let mut child = kept;
+            kept += 1;
+            while child > 0 {
+                let parent = (child - 1) / 2;
+                if !after(heap[child], heap[parent])? {
+                    break;
+                }
+                heap.swap(child, parent);
+                child = parent;
+            }
+            continue;
+        }
+        if bound == 0 || !after(heap[0], position)? {
+            continue;
+        }
+        heap[0] = position;
+        let mut parent = 0usize;
+        loop {
+            let left = parent * 2 + 1;
+            if left >= bound {
+                break;
+            }
+            let right = left + 1;
+            let larger = if right < bound && after(heap[right], heap[left])? {
+                right
+            } else {
+                left
+            };
+            if !after(heap[larger], heap[parent])? {
+                break;
+            }
+            heap.swap(parent, larger);
+            parent = larger;
+        }
+    }
+    crate::util::try_sort_unstable_by(heap, |&a, &b| {
+        Ok(cmp(&items[a as usize], &items[b as usize])?.then_with(|| a.cmp(&b)))
+    })?;
+    for &position in heap.iter() {
+        visited[position as usize] = true;
+    }
+    perm[..bound].copy_from_slice(heap);
+    let mut next = bound;
+    for position in 0..n {
+        if !visited[position] {
+            perm[next] = position as u32;
+            next += 1;
+        }
+    }
+    visited.fill(false);
+    apply_permutation(items, perm, visited);
+    Ok(())
+}
+
+/// Reorders `items` so that position `i` holds the item that was at
+/// `perm[i]`, following cycles so each item moves at most once; `visited`
+/// starts all false.
+fn apply_permutation<T>(items: &mut [T], perm: &[u32], visited: &mut [bool]) {
+    let n = items.len();
     for start in 0..n {
         if visited[start] || perm[start] as usize == start {
             visited[start] = true;
@@ -1071,7 +1169,6 @@ pub fn try_stable_sort_via<T, E>(
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1615,6 +1712,39 @@ mod tests {
             super::stable_sort_via(&arena, &mut b, |x, y| x.0.cmp(&y.0)).unwrap();
             assert_eq!(a, b, "n = {n}");
             arena.reset();
+        }
+    }
+
+    #[test]
+    fn stable_top_n_keeps_a_stable_sorts_prefix_and_every_item() {
+        let mut budget = crate::mem::budget::Budget::new(64 << 20);
+        let mut arena = super::Arena::new(&mut budget, "top-n", 16 << 20).unwrap();
+        for n in [0usize, 1, 2, 7, 33, 1000] {
+            for bound in [0usize, 1, 2, 5, n / 2, n, n + 3] {
+                let original: Vec<(u32, u32)> = (0..n as u32)
+                    .map(|i| (i.wrapping_mul(2_654_435_761) % 17, i))
+                    .collect();
+                let mut sorted = original.clone();
+                sorted.sort_by_key(|x| x.0);
+                let mut top = original.clone();
+                super::try_stable_top_n_via(
+                    &arena,
+                    &mut top,
+                    bound,
+                    |x, y| Ok::<_, ()>(x.0.cmp(&y.0)),
+                    |_| (),
+                )
+                .unwrap();
+                let kept = bound.min(n);
+                assert_eq!(top[..kept], sorted[..kept], "n = {n}, bound = {bound}");
+                let rest: Vec<_> = original
+                    .iter()
+                    .filter(|item| !top[..kept].contains(item))
+                    .copied()
+                    .collect();
+                assert_eq!(top[kept..], rest[..], "n = {n}, bound = {bound}");
+                arena.reset();
+            }
         }
     }
 

@@ -962,6 +962,7 @@ mod window;
 use window::{
     cmp_key_rows, external_window_into, project_window_rows, rewrite_grouped_windows, window_select,
 };
+pub(crate) use window::{window_clauses, window_sort_keys};
 
 /// Relation count handled by compact `u64` planner proofs. Wider joins execute
 /// exactly with arena-sized state and skip these optional access-path proofs.
@@ -13428,31 +13429,43 @@ pub(crate) fn constant_select_resumable<'a>(
                 }
             }
         }
-        let sorted = crate::mem::arena::try_stable_sort_via(
-            arena,
-            out_rows,
-            |a, b| {
-                for (j, ob) in statement.order_by.iter().enumerate() {
-                    let ordering = materialize::compare_ordered_key(
-                        storage,
-                        txid,
-                        order_collations[j],
-                        (ob.descending, ob.nulls_first),
-                        super::exec::ProjectedValue::column(a, width + j),
-                        super::exec::ProjectedValue::column(b, width + j),
-                    )?;
-                    if !ordering.is_eq() {
-                        return Ok(ordering);
-                    }
+        let compare = |a: &&[u8], b: &&[u8]| {
+            for (j, ob) in statement.order_by.iter().enumerate() {
+                let ordering = materialize::compare_ordered_key(
+                    storage,
+                    txid,
+                    order_collations[j],
+                    (ob.descending, ob.nulls_first),
+                    super::exec::ProjectedValue::column(a, width + j),
+                    super::exec::ProjectedValue::column(b, width + j),
+                )?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
                 }
-                Ok(core::cmp::Ordering::Equal)
-            },
-            |_| arena_full(),
-        );
+            }
+            Ok(core::cmp::Ordering::Equal)
+        };
+        // Past twice its limit's bound the sort keeps only a heap of the
+        // rows the limit returns, as PostgreSQL's does.
+        let bound = group::sort_bound(statement, limit, offset)
+            .filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
+        let sorted = match bound {
+            Some(bound) => {
+                crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
+                    arena_full()
+                })
+            }
+            None => {
+                crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())
+            }
+        };
         if let Err(error) = sorted {
             return sql_fail(error);
         }
         stages.sort.rows(out_rows.len() as u64);
+        stages
+            .sort
+            .sorted(instrument::SortSpace::in_memory(out_rows, bound.is_some()));
     }
 
     let start = (offset as usize).min(out_rows.len());
@@ -13709,6 +13722,13 @@ fn select_into_rows_mode<'a>(
                 rows_mut,
                 statement.order_by,
                 &cols[..n],
+                setops::set_sort_bound(
+                    statement.limit.is_some(),
+                    statement.with_ties,
+                    limit,
+                    offset,
+                ),
+                instrument::node(instrument::Role::Sort),
             )?;
             rows = rows_mut;
         }
@@ -13991,6 +14011,11 @@ fn select_into_rows_mode<'a>(
         };
         let stages = materialize::materialized_stages(statement.limit.is_some());
         let _stages = stages.start();
+        // PostgreSQL's Limit computes its bounds before reading its input.
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let (rows, width) = grouped_rows(
             storage,
             &scope,
@@ -14004,11 +14029,8 @@ fn select_into_rows_mode<'a>(
             outer_subs.correlated,
             outer,
             &stages,
+            group::sort_bound(statement, limit, offset),
         )?;
-        let offset =
-            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
-        let limit =
-            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
         let below_limit = stages.below_limit();
@@ -14323,7 +14345,14 @@ fn select_into_rows_mode<'a>(
         }
         let proj_rows = rows.rows;
         let count = proj_rows.len();
-        let order = rows.ordered(storage, txid, statement.order_by, arena)?;
+        let order = rows.ordered(
+            storage,
+            txid,
+            statement.order_by,
+            group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct),
+            instrument::node(instrument::Role::Sort),
+            arena,
+        )?;
         let start = (offset as usize).min(count);
         let n = ((count - start) as u64).min(limit) as usize;
         for &i in &order[start..start + n] {

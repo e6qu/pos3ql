@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 22;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 23;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1480,7 +1480,8 @@ fn append_table_payload<B: DefinitionBacking>(
             | (u8::from(c.user_type.is_some()) << 7);
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
-        ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+        // NOT NULL inheritability in bit 0, `attislocal` in bit 1.
+        ok &= buffer.append(&[u8::from(c.not_null_inheritable) | (u8::from(c.local) << 1)]);
         // The generation kind (`pg_attribute.attgenerated`), zero when none.
         ok &= buffer.append(&[c
             .default
@@ -8538,11 +8539,12 @@ fn decode_op_inner<'a>(
                 at += 2;
                 let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
                 at += 1;
-                let not_null_inheritable = match *payload.get(at)? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                };
+                let column_flags = *payload.get(at)?;
+                if column_flags & !3 != 0 {
+                    return None;
+                }
+                let not_null_inheritable = column_flags & 1 != 0;
+                let local = column_flags & 2 != 0;
                 at += 1;
                 let generation = match *payload.get(at)? {
                     0 => None,
@@ -8629,6 +8631,7 @@ fn decode_op_inner<'a>(
                     user_type,
                     statistics_target,
                     statistics_options,
+                    local,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -15671,6 +15674,7 @@ mod tests {
             user_type: None,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+            local: true,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -15693,6 +15697,7 @@ mod tests {
             user_type: None,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+            local: true,
         };
         def.has_toast = true;
         // Exercise every durable constraint state in one table record.

@@ -50,6 +50,7 @@ pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod partition_column_recursion;
 mod partition_index_propagation;
 mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;

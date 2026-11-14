@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v42` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v43` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -121,9 +121,12 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 22: version byte, ten-byte catalog
+- **Table definition payload** is version 23: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
-  column carries a generation-kind byte after its NOT NULL inheritance byte
+  column's NOT NULL inheritance byte carries inheritability in bit 0 and
+  PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
+  `col5` line carries the same byte. Each column carries a generation-kind
+  byte after its NOT NULL inheritance byte
   (0, or the `attgenerated` code `s` or `v`), which must agree with the
   generated flag. After its validation code, each foreign key stores four
   one-byte `tgenabled` codes (`O`, `R`, `A`, `D`) for its delete-action,

@@ -597,10 +597,9 @@ EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
 read-only virtual schema. A foreign key that references a partitioned table
 has only its own `pg_constraint` row: PostgreSQL also lists one clone per
 partition of the referenced table (`pc_a_fkey_1`, whose `conindid` is that
-partition's index). `ALTER TABLE` on a partitioned table does not carry
-`ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN` or `ALTER COLUMN ... TYPE` to its
-partitions, which keep their old columns (a later constraint added to the
-parent then fails with `40001` `partition is missing an inherited column`). A
+partition's index). `ALTER COLUMN ... TYPE` on a partitioned table keeps
+each partition's index name where PostgreSQL rebuilds them under new
+generated names (`pr_1_label_idx` after a rename). A
 btree index cannot use `text_pattern_ops` (`operator class
 "text_pattern_ops" does not exist for access method "btree"`, `42704`). A
 type name whose quoted schema contains a dot (`1::"no.pe".x`) is split at

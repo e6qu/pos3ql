@@ -22223,6 +22223,11 @@ fn pg_attribute<'a>(
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // `attinhcount` of each output row: how many direct parents, ordinary or
+    // partitioned, also have the column.
+    let inheritance_counts = arena
+        .alloc_slice_with(capacity, |_| 0i16)
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for attributes in builtin_rows.iter().filter(|attributes| {
         matches!(attributes[0], Datum::Oid(oid) if catalog_relation_name(oid as i32).is_some())
@@ -22266,6 +22271,24 @@ fn pg_attribute<'a>(
                 } else {
                     Datum::Null
                 };
+            inheritance_counts[n] = table_definition
+                .inheritance
+                .parents_ref()
+                .iter()
+                .map(|parent| usize::from(*parent))
+                .chain(
+                    table_definition
+                        .partition
+                        .attachment
+                        .map(|attachment| usize::from(attachment.parent)),
+                )
+                .filter(|parent| {
+                    storage
+                        .table_def(*parent, txid)
+                        .column_index(c.name.as_str())
+                        .is_some()
+                })
+                .count() as i16;
             out[n] = row(
                 &[
                     Datum::Int4(user_table_oid(storage, slot)),
@@ -22321,7 +22344,7 @@ fn pg_attribute<'a>(
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i32::from(table_definition.attribute_number(i))),
                     text("i", arena)?,
-                    Datum::Bool(true),
+                    Datum::Bool(c.local),
                     column_statistics_options_datum(c.statistics_options, arena)?,
                     foreign_column_options,
                     Datum::Bool(false),
@@ -22413,6 +22436,7 @@ fn pg_attribute<'a>(
                 user_type: field.user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
             out[n] = row(
                 &[
@@ -22653,7 +22677,10 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    for target in &mut out[dynamic_start..n] {
+    for (target, inheritance_count) in out[dynamic_start..n]
+        .iter_mut()
+        .zip(&inheritance_counts[dynamic_start..n])
+    {
         let source = *target;
         let smallint = |value: Datum<'a>| match value {
             Datum::Int4(value) => i16::try_from(value).map(Datum::Int2).map_err(|_| {
@@ -22725,7 +22752,7 @@ fn pg_attribute<'a>(
                 character(source[10])?,
                 source[14],
                 source[17],
-                Datum::Int2(0),
+                Datum::Int2(*inheritance_count),
                 source[8],
                 smallint(source[13])?,
                 source[22],
@@ -29727,6 +29754,7 @@ fn info_column_type_usage<'a>(
                 user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
             append(
                 view.schema_for(txid).as_str(),

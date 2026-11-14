@@ -2681,6 +2681,7 @@ fn finish_derived_definition<'a, 'd>(
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {

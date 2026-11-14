@@ -1541,6 +1541,9 @@ pub struct ColumnMeta {
     /// PostgreSQL's `attoptions` overrides for the local and inherited
     /// `ANALYZE` paths. This is a typed catalog value, never an option string.
     pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
+    /// PostgreSQL's `attislocal`: the table itself declares the column, as
+    /// opposed to receiving it only from an inheritance or partition parent.
+    pub local: bool,
 }
 
 // Recovery and copied execution schemas reserve at most 512 bytes per column.
@@ -1741,6 +1744,7 @@ impl ColumnMeta {
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     };
 }
 
@@ -60155,6 +60159,7 @@ pub(crate) mod tests {
                 user_type: None,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+                local: true,
             };
         }
         def

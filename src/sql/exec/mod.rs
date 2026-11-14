@@ -4433,6 +4433,10 @@ fn build_partitioned_table_def(
                 ddl::require_convertible_check(&parent_def, check, arena)?;
             }
             let mut def = TableDefBuilder::from_definition(&parent_def);
+            // A partition's columns all come from its parent.
+            for column in &mut def.columns[..def.n_columns] {
+                column.local = false;
+            }
             def.name = SqlName::parse(statement.name.name)?;
             def.schema = storage.creation_schema(
                 statement.name.schema,
@@ -4630,6 +4634,7 @@ fn build_inherited_table_def(
             inherited.auto_increment = false;
             inherited.is_identity = false;
             inherited.identity_always = false;
+            inherited.local = false;
             if let Some(existing) = definition.column_index(inherited.name.as_str()) {
                 let current = definition.columns[existing];
                 if current.ctype != inherited.ctype
@@ -4678,6 +4683,7 @@ fn build_inherited_table_def(
             }
             definition.columns[existing].primary |= column.primary;
             definition.columns[existing].unique |= column.unique;
+            definition.columns[existing].local = true;
             // PostgreSQL lets the child declaration supply an explicit default
             // while the inherited type identity remains fixed.
             if !matches!(column.default, crate::storage::ColumnDefault::None) {
@@ -58230,6 +58236,7 @@ pub fn create_table_as(
             user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+            local: true,
         };
     }
     if let Err(error) = def.attributes.initialize(def.n_columns) {
@@ -83729,6 +83736,7 @@ pub(crate) fn view_trigger_definition<'a>(
             user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+            local: true,
         };
     }
     Ok(crate::storage::TableDefView {
@@ -91456,18 +91464,64 @@ pub(crate) fn alter_table(
     )
 }
 
+/// Makes `column` a locally declared column of every direct ordinary child of
+/// `parent`, as PostgreSQL's `ALTER TABLE ONLY ... DROP COLUMN` does.
+fn mark_child_columns_local(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    parent: usize,
+    column: &str,
+) -> Result<(), SqlError> {
+    for child in 0..storage.table_count() {
+        if !storage.relation_visible_to_current_session(child, txn.txid)
+            || !storage
+                .table_def(child, txn.txid)
+                .inheritance
+                .contains(parent)
+        {
+            continue;
+        }
+        let (target, current) = storage.select_table_definition(child, txn.txid);
+        let Some(index) = current.column_index(column) else {
+            continue;
+        };
+        if current.columns()[index].local {
+            continue;
+        }
+        let mut next = TableDefBuilder::from_definition(&current);
+        next.columns[index].local = true;
+        stage_table_definition(storage, wal, txn, target, current, next)?;
+    }
+    Ok(())
+}
+
+/// Whether a direct parent, ordinary or partitioned, supplies the column
+/// `name` (PostgreSQL's `attinhcount > 0`): only an ALTER recursing from
+/// that parent may drop, rename or retype it.
+fn column_supplied_by_parent<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+    txid: u32,
+) -> bool {
+    definition
+        .inheritance
+        .parents_ref()
+        .iter()
+        .map(|parent| usize::from(*parent))
+        .chain(
+            definition
+                .partition
+                .attachment
+                .map(|attachment| usize::from(attachment.parent)),
+        )
+        .any(|parent| storage.table_def(parent, txid).column_index(name).is_some())
+}
+
 /// Identifies subcommands whose result is part of an ordinary child's physical
 /// definition. PostgreSQL lets `ONLY` retain parent-local defaults and NOT
 /// NULL state, but it cannot split a shared column or inherited CHECK shape.
-fn ordinary_inheritance_propagates<Definition0: crate::storage::DefinitionBacking>(
-    definition: &crate::storage::TableDefinition<Definition0>,
-    actions: &[AlterAction<'_>],
-) -> bool {
-    actions
-        .iter()
-        .any(|action| ordinary_inheritance_propagates_action(definition, action))
-}
-
 fn ordinary_inheritance_propagates_action<Definition0: crate::storage::DefinitionBacking>(
     definition: &crate::storage::TableDefinition<Definition0>,
     action: &AlterAction<'_>,
@@ -91481,7 +91535,9 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
         | AlterAction::DropNotNull { .. }
-        | AlterAction::SetNotNullInheritance { .. } => true,
+        | AlterAction::SetNotNullInheritance { .. }
+        | AlterAction::SetStatistics { .. }
+        | AlterAction::SetStorage { .. } => true,
         AlterAction::AlterConstraint {
             alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { .. },
             ..
@@ -91499,6 +91555,38 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
     }
 }
 
+/// PostgreSQL's refusals of a column change to only a partitioned table that
+/// has partitions.
+fn partitioned_only_error(actions: &[AlterAction<'_>]) -> Option<SqlError> {
+    actions.iter().find_map(|action| match action {
+        AlterAction::AddColumn { .. } => Some(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "column must be added to child tables too"
+        )),
+        AlterAction::RenameColumn { from, .. } => Some(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "inherited column \"{}\" must be renamed in child tables too",
+            from
+        )),
+        AlterAction::AlterColumnType { column, .. } => Some(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "type of inherited column \"{}\" must be changed in child tables too",
+            column
+        )),
+        AlterAction::DropColumn { .. } => {
+            crate::sql::eval::stash_diagnostic(
+                None,
+                Some(StackStr::from_str("Do not specify the ONLY keyword.")),
+            );
+            Some(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "cannot drop column from only the partitioned table when partitions exist"
+            ))
+        }
+        _ => None,
+    })
+}
+
 /// `ONLY` may retain parent-local defaults and NOT NULL state, but changing a
 /// shared column or CHECK without its children would make the inheritance
 /// layout contradictory.
@@ -91512,12 +91600,6 @@ fn ordinary_inheritance_only_error<Definition0: crate::storage::DefinitionBackin
                 return Some(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
                     "column must be added to child tables too"
-                ));
-            }
-            AlterAction::DropColumn { .. } => {
-                return Some(sql_err!(
-                    sqlstate::INVALID_TABLE_DEFINITION,
-                    "column must be dropped from child tables too"
                 ));
             }
             AlterAction::RenameColumn { from, .. } => {
@@ -92635,6 +92717,17 @@ fn alter_table_inheritance(
         ));
     } else {
         for column in 0..updated.n_columns {
+            let name = updated.columns[column].name;
+            if !updated.inheritance.parents_ref().iter().any(|slot| {
+                storage
+                    .table_def(usize::from(*slot), txn.txid)
+                    .column_index(name.as_str())
+                    .is_some()
+            }) {
+                updated.columns[column].local = true;
+            }
+        }
+        for column in 0..updated.n_columns {
             if updated.columns[column].not_null.is_local() {
                 continue;
             }
@@ -92924,6 +93017,10 @@ fn alter_partition_attachment(
                 return sql_fail(error);
             }
         }
+        // Every column of a partition comes from its parent.
+        for column in &mut new_def.columns[..new_def.n_columns] {
+            column.local = false;
+        }
         new_def.partition.attachment = Some(crate::storage::PartitionAttachment {
             parent: match u16::try_from(parent) {
                 Ok(parent) => parent,
@@ -92985,6 +93082,9 @@ fn alter_partition_attachment(
         let finish_detach = |definition: &mut crate::storage::TableDefBuilder,
                              retain_bound: bool| {
             definition.partition.attachment = None;
+            for column in &mut definition.columns[..definition.n_columns] {
+                column.local = true;
+            }
             definition.partition.detached_bound = retain_bound
                 .then(|| {
                     generated_constraint_name.map(|name| crate::storage::DetachedPartitionBound {
@@ -93339,41 +93439,43 @@ fn alter_table_inner(
     tag: &'static str,
     inheritance_scope: AlterInheritanceScope,
 ) -> Outcome {
-    let root =
+    let planned =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
-            Some(crate::storage::ResolvedRelation::Table(root))
-                if !statement.only
-                    && ordinary_inheritance_propagates(
-                        &storage.table_def(root, txn.txid),
-                        statement.actions,
-                    )
+            Some(crate::storage::ResolvedRelation::Table(root)) if !statement.only => {
+                let definition = storage.table_def(root, txn.txid);
+                let tree = if definition.partition.is_partitioned() {
+                    AlterTree::Partitions
+                } else {
+                    AlterTree::Inheritance
+                };
+                (statement
+                    .actions
+                    .iter()
+                    .any(|action| tree.propagates(&definition, action))
                     && (0..storage.table_count()).any(|child| {
                         storage.relation_visible_to_current_session(child, txn.txid)
-                            && storage
-                                .table_def(child, txn.txid)
-                                .inheritance
-                                .contains(root)
-                    }) =>
-            {
-                root
+                            && tree.is_parent(&storage.table_def(child, txn.txid), root)
+                    }))
+                .then_some((root, tree))
             }
-            _ => {
-                return alter_table_relation(
-                    storage,
-                    wal,
-                    txn,
-                    scratch,
-                    statement,
-                    arena,
-                    seq_session,
-                    responder,
-                    emit_completion,
-                    expected_kind,
-                    tag,
-                    inheritance_scope,
-                );
-            }
+            _ => None,
         };
+    let Some((root, tree)) = planned else {
+        return alter_table_relation(
+            storage,
+            wal,
+            txn,
+            scratch,
+            statement,
+            arena,
+            seq_session,
+            responder,
+            emit_completion,
+            expected_kind,
+            tag,
+            inheritance_scope,
+        );
+    };
     // One bounded parent-first plan replaces recursive ALTER frames. A diamond
     // reaches its shared descendant once, after both inherited parents change.
     let reachable = match arena.alloc_slice_with(storage.table_count(), |_| false) {
@@ -93386,12 +93488,9 @@ fn alter_table_inner(
         for child in 0..storage.table_count() {
             if !reachable[child]
                 && storage.relation_visible_to_current_session(child, txn.txid)
-                && storage
-                    .table_def(child, txn.txid)
-                    .inheritance
-                    .parents_ref()
-                    .iter()
-                    .any(|parent| reachable[usize::from(*parent)])
+                && tree
+                    .parents(&storage.table_def(child, txn.txid))
+                    .any(|parent| reachable[parent])
             {
                 reachable[child] = true;
                 changed = true;
@@ -93411,15 +93510,9 @@ fn alter_table_inner(
         let Some(child) = (0..storage.table_count()).find(|child| {
             reachable[*child]
                 && !order[..position].contains(child)
-                && storage
-                    .table_def(*child, txn.txid)
-                    .inheritance
-                    .parents_ref()
-                    .iter()
-                    .all(|parent| {
-                        !reachable[usize::from(*parent)]
-                            || order[..position].contains(&usize::from(*parent))
-                    })
+                && tree
+                    .parents(&storage.table_def(*child, txn.txid))
+                    .all(|parent| !reachable[parent] || order[..position].contains(&parent))
         }) else {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_OBJECT_DEFINITION,
@@ -93431,8 +93524,12 @@ fn alter_table_inner(
     let retained_definition = (*storage.table_def(root, txn.txid)).clone();
     let definition = &retained_definition;
     let mut inherited_actions = ArenaList::new(arena);
+    let mut root_rest = ArenaList::new(arena);
     for action in statement.actions {
-        if !ordinary_inheritance_propagates_action(definition, action) {
+        if !tree.propagates(definition, action) {
+            if root_rest.push(*action).is_err() {
+                return sql_fail(super::query::arena_full_pub());
+            }
             continue;
         }
         let inherited_action = match action {
@@ -93479,13 +93576,28 @@ fn alter_table_inner(
             only: false,
             actions: inherited_actions.as_slice(),
         };
+        // A partition tree changes columns on every level first; the root's
+        // other subcommands follow and reach partitions through constraint
+        // synchronization.
+        let root_columns = AlterTable {
+            actions: inherited_actions.as_slice(),
+            ..*statement
+        };
+        let root_statement = match tree {
+            AlterTree::Inheritance => statement,
+            AlterTree::Partitions => &root_columns,
+        };
         let mark = arena.mark();
         let outcome = alter_table_relation(
             storage,
             wal,
             txn,
             scratch,
-            if position == 0 { statement } else { &inherited },
+            if position == 0 {
+                root_statement
+            } else {
+                &inherited
+            },
             arena,
             seq_session,
             responder,
@@ -93511,10 +93623,94 @@ fn alter_table_inner(
             other => return other,
         }
     }
+    if tree == AlterTree::Partitions && !root_rest.as_slice().is_empty() {
+        let rest = AlterTable {
+            actions: root_rest.as_slice(),
+            ..*statement
+        };
+        match alter_table_relation(
+            storage,
+            wal,
+            txn,
+            scratch,
+            &rest,
+            arena,
+            seq_session,
+            responder,
+            false,
+            expected_kind,
+            tag,
+            inheritance_scope,
+        ) {
+            Ok(Ok(())) => {}
+            other => return other,
+        }
+    }
     if emit_completion {
         responder.command_complete(tag)?;
     }
     sql_ok()
+}
+
+/// The hierarchy an ALTER recurses through. PostgreSQL forbids mixing them:
+/// a partitioned table has no ordinary children and a partition no
+/// inheritance parents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlterTree {
+    Inheritance,
+    Partitions,
+}
+
+impl AlterTree {
+    fn parents<Definition0: crate::storage::DefinitionBacking>(
+        self,
+        child: &crate::storage::TableDefinition<Definition0>,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let ordinary = match self {
+            Self::Inheritance => child.inheritance.parents_ref(),
+            Self::Partitions => &[],
+        };
+        let partition = match self {
+            Self::Inheritance => None,
+            Self::Partitions => child.partition.attachment.map(|a| usize::from(a.parent)),
+        };
+        ordinary
+            .iter()
+            .map(|parent| usize::from(*parent))
+            .chain(partition)
+    }
+
+    fn is_parent<Definition0: crate::storage::DefinitionBacking>(
+        self,
+        child: &crate::storage::TableDefinition<Definition0>,
+        parent: usize,
+    ) -> bool {
+        self.parents(child).any(|candidate| candidate == parent)
+    }
+
+    /// PostgreSQL's ALTER recursion. A partition receives the column
+    /// subcommands here; constraint and NOT NULL changes reach it through
+    /// partition constraint synchronization.
+    fn propagates<Definition0: crate::storage::DefinitionBacking>(
+        self,
+        definition: &crate::storage::TableDefinition<Definition0>,
+        action: &AlterAction<'_>,
+    ) -> bool {
+        match self {
+            Self::Inheritance => ordinary_inheritance_propagates_action(definition, action),
+            Self::Partitions => matches!(
+                action,
+                AlterAction::AddColumn { .. }
+                    | AlterAction::DropColumn { .. }
+                    | AlterAction::RenameColumn { .. }
+                    | AlterAction::AlterColumnType { .. }
+                    | AlterAction::SetDefault { .. }
+                    | AlterAction::DropDefault { .. }
+                    | AlterAction::SetStatistics { .. }
+                    | AlterAction::SetStorage { .. }
+            ),
+        }
+    }
 }
 
 /// Every rewrite identity comes from this same retained byte source.
@@ -93826,6 +94022,17 @@ fn alter_table_relation(
     if has_ordinary_child
         && statement.only
         && let Some(error) = ordinary_inheritance_only_error(&def, statement.actions)
+    {
+        return sql_fail(error);
+    }
+    if statement.only
+        && def.partition.is_partitioned()
+        && (0..storage.table_count()).any(|candidate| {
+            storage.relation_visible_to_current_session(candidate, txn.txid)
+                && AlterTree::Partitions
+                    .is_parent(&storage.table_def(candidate, txn.txid), table_index)
+        })
+        && let Some(error) = partitioned_only_error(statement.actions)
     {
         return sql_fail(error);
     }
@@ -94354,7 +94561,6 @@ fn alter_table_relation(
                         return sql_fail(undefined_column(column));
                     };
                     if let Err(error) = ddl::validate_column_storage(
-                        new_def.columns[column].name.as_str(),
                         new_def.columns[column].ctype,
                         *policy,
                         new_def.columns[column].compression,
@@ -94378,7 +94584,6 @@ fn alter_table_relation(
                         return sql_fail(undefined_column(column));
                     };
                     if let Err(error) = ddl::validate_column_storage(
-                        new_def.columns[column].name.as_str(),
                         new_def.columns[column].ctype,
                         new_def.columns[column].storage,
                         *compression,
@@ -94724,7 +94929,6 @@ fn alter_table_relation(
                     return sql_fail(undefined_column(column));
                 };
                 if let Err(error) = ddl::validate_column_storage(
-                    new_def.columns[i].name.as_str(),
                     new_def.columns[i].ctype,
                     *policy,
                     new_def.columns[i].compression,
@@ -94747,7 +94951,6 @@ fn alter_table_relation(
                     return sql_fail(undefined_column(column));
                 };
                 if let Err(error) = ddl::validate_column_storage(
-                    new_def.columns[i].name.as_str(),
                     new_def.columns[i].ctype,
                     new_def.columns[i].storage,
                     *compression,
@@ -94841,6 +95044,15 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(from) else {
                     return sql_fail(undefined_column(from));
                 };
+                if inheritance_scope == AlterInheritanceScope::Direct
+                    && column_supplied_by_parent(storage, &def, from, txn.txid)
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot rename inherited column \"{}\"",
+                        from
+                    ));
+                }
                 if let Err(error) = crate::storage::reject_system_column_name(to) {
                     return sql_fail(error);
                 }
@@ -94871,6 +95083,14 @@ fn alter_table_relation(
                 definition: c,
                 if_not_exists,
             } => {
+                if inheritance_scope == AlterInheritanceScope::Direct
+                    && def.partition.attachment.is_some()
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot add column to a partition"
+                    ));
+                }
                 if let Err(error) = crate::storage::reject_system_column_name(c.name) {
                     return sql_fail(error);
                 }
@@ -94913,10 +95133,11 @@ fn alter_table_relation(
                 if let Err(error) = require_not_own_member(storage, txn.txid, table_index, &meta) {
                     return sql_fail(error);
                 }
-                if inheritance_scope == AlterInheritanceScope::Propagated
-                    && meta.not_null.is_required()
-                {
-                    meta.not_null = crate::storage::NotNullOrigin::Inherited;
+                if inheritance_scope == AlterInheritanceScope::Propagated {
+                    meta.local = false;
+                    if meta.not_null.is_required() {
+                        meta.not_null = crate::storage::NotNullOrigin::Inherited;
+                    }
                 }
                 if meta.auto_increment {
                     let index = new_def.n_columns;
@@ -95046,28 +95267,34 @@ fn alter_table_relation(
                     }
                     ColSource::FillDefault(_) => (new_def.columns()[i].name, None),
                 };
+                // A recursing drop keeps a child's column that the child
+                // declares itself or that another parent still supplies.
+                if inheritance_scope == AlterInheritanceScope::Propagated
+                    && (new_def.columns[i].local
+                        || column_supplied_by_parent(storage, &def, name, txn.txid))
+                {
+                    continue;
+                }
+                // `ONLY` leaves the direct children's copies as their own.
+                if statement.only
+                    && inheritance_scope == AlterInheritanceScope::Direct
+                    && let Err(error) =
+                        mark_child_columns_local(storage, wal, txn, table_index, name)
+                {
+                    return sql_fail(error);
+                }
                 // PostgreSQL's `ATExecDropColumn`: a column a parent supplies
                 // goes only with the parent's, and a partition key column
                 // cannot go at all.
                 if let Some(original_index) = original_index {
-                    let inherited = inheritance_scope == AlterInheritanceScope::Direct
-                        && def
-                            .inheritance
-                            .parents_ref()
-                            .iter()
-                            .map(|parent| usize::from(*parent))
-                            .chain(
-                                def.partition
-                                    .attachment
-                                    .map(|attachment| usize::from(attachment.parent)),
-                            )
-                            .any(|parent| {
-                                storage
-                                    .table_def(parent, txn.txid)
-                                    .column_index(original_column.as_str())
-                                    .is_some()
-                            });
-                    if inherited {
+                    if inheritance_scope == AlterInheritanceScope::Direct
+                        && column_supplied_by_parent(
+                            storage,
+                            &def,
+                            original_column.as_str(),
+                            txn.txid,
+                        )
+                    {
                         return sql_fail(sql_err!(
                             sqlstate::INVALID_TABLE_DEFINITION,
                             "cannot drop inherited column \"{}\"",
@@ -95634,6 +95861,27 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if inheritance_scope == AlterInheritanceScope::Direct
+                    && column_supplied_by_parent(storage, &def, column, txn.txid)
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot alter inherited column \"{}\"",
+                        column
+                    ));
+                }
+                if def.partition.scheme.is_some_and(|scheme| {
+                    def.column_index(column).is_some_and(|original| {
+                        scheme.keys[..usize::from(scheme.n_keys)].contains(&(original as u16))
+                    })
+                }) {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                        column,
+                        def.name.as_str()
+                    ));
+                }
                 if let Err(error) = require_row_type_unaltered(storage, txn.txid, table_index) {
                     return sql_fail(error);
                 }
@@ -100273,6 +100521,7 @@ fn coerce_composite_value_inner<'a>(
             user_type: field.user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+            local: true,
         };
         out.name = arena.alloc_str(field.name.as_str()).map_err(|_| {
             sql_err!(

@@ -245,6 +245,7 @@ fn empty_meta() -> ColumnMeta {
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     }
 }
 
@@ -489,7 +490,7 @@ pub(super) fn build_column(
         ));
     }
     let column_storage = c.storage.unwrap_or_else(|| default_column_storage(ctype));
-    validate_column_storage(c.name, ctype, column_storage, c.compression)?;
+    validate_column_storage(ctype, column_storage, c.compression)?;
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
@@ -512,6 +513,7 @@ pub(super) fn build_column(
         user_type,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
+        local: true,
     })
 }
 
@@ -524,7 +526,6 @@ pub(super) fn default_column_storage(ctype: ColType) -> crate::sql::ast::ColumnS
 /// accepted only for the type families PostgreSQL can TOAST; object blocks keep
 /// their independent provider-neutral codec.
 pub(super) fn validate_column_storage(
-    name: &str,
     ctype: ColType,
     storage: crate::sql::ast::ColumnStorage,
     compression: crate::sql::ast::ColumnCompression,
@@ -533,21 +534,15 @@ pub(super) fn validate_column_storage(
     if !toastable && storage != crate::sql::ast::ColumnStorage::Plain {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot set storage option to {} for column \"{}\"",
-            match storage {
-                crate::sql::ast::ColumnStorage::Plain => "PLAIN",
-                crate::sql::ast::ColumnStorage::External => "EXTERNAL",
-                crate::sql::ast::ColumnStorage::Extended => "EXTENDED",
-                crate::sql::ast::ColumnStorage::Main => "MAIN",
-            },
-            name
+            "column data type {} can only have storage PLAIN",
+            ctype.name()
         ));
     }
     if compression != crate::sql::ast::ColumnCompression::Default && !toastable {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "compression is not supported for column \"{}\"",
-            name
+            "column data type {} does not support compression",
+            ctype.name()
         ));
     }
     Ok(())

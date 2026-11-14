@@ -86,7 +86,7 @@ CREATE UNIQUE INDEX q_idx ON q (a);
 CREATE TABLE qc (a int REFERENCES q (a)) PARTITION BY LIST (a);
 CREATE TABLE qc1 PARTITION OF qc FOR VALUES IN (1);
 SELECT conrelid::regclass, conname, conindid::regclass, conparentid <> 0 FROM pg_constraint
-  WHERE confrelid = 'q'::regclass ORDER BY 1::text;
+  WHERE confrelid = 'q'::regclass ORDER BY conrelid::regclass::text;
 SELECT pg_describe_object(classid, objid, objsubid), pg_describe_object(refclassid, refobjid, refobjsubid), deptype
   FROM pg_depend WHERE classid = 'pg_constraint'::regclass
     AND objid IN (SELECT oid FROM pg_constraint WHERE confrelid = 'q'::regclass) ORDER BY 1, 2;
@@ -107,7 +107,7 @@ CREATE UNIQUE INDEX q_idx ON q (b);
 CREATE TABLE qc2 PARTITION OF qc FOR VALUES IN (2);
 ALTER TABLE qc ADD FOREIGN KEY (a) REFERENCES q (b);
 SELECT conrelid::regclass, conname, conindid::regclass FROM pg_constraint
-  WHERE confrelid = 'q'::regclass ORDER BY 1::text;
+  WHERE confrelid = 'q'::regclass ORDER BY conrelid::regclass::text;
 DROP TABLE q CASCADE;
 DROP TABLE qc, pc, pp, wc, w, t, u3, u2, u1;
 DROP TABLE c6, p6, d5, c5, p5, d4, c4, p4, child, parent;

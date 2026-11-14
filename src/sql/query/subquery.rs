@@ -2328,6 +2328,13 @@ fn select_correlated<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
+    // Its own `WITH` queries are FROM items of the query: read through their
+    // queries, which may name outer columns themselves.
+    let select = if select.with.is_empty() {
+        select
+    } else {
+        super::expand_ctes(select, storage, txid, arena)?
+    };
     let scope = select
         .from
         .as_ref()

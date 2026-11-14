@@ -819,13 +819,20 @@ already uses prints as `t_1`. A statement's `WITH` query that PostgreSQL
 does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
 `NOT MATERIALIZED`, volatile, recursive or data-modifying) is its top node's
 `CTE name` InitPlan, numbered before the query's subqueries and read by
-`CTE Scan` nodes without a `Materialize`; a recursive one is a `Recursive
+`CTE Scan` nodes without a `Materialize`; a derived table's or subquery's
+own `WITH` list follows the same rule as that query's InitPlans, and a
+subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive
 Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
 figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
 its whole query where PostgreSQL pulls only the rows read, a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
-plan block), a `WITH` inside a subquery is still merged into it, and a recursive term's
+plan block), an `IN` over a subquery with its own `WITH` list stays a
+subplan where PostgreSQL pulls it up into a semi join, a join condition
+over a derived table whose `WITH` query PostgreSQL reads directly names the
+derived table (`s.a` for `c.a`), `EXPLAIN` of a `LATERAL` item or a
+subquery's derived table reading an outer column fails with `42P01`, a
+and a recursive term's
 join is planned as a nested loop with conditions naming the relations
 before their `_1` renaming. When a derived table or `CTE Scan` joins a
 stored relation of equal size, PostgreSQL's cost tie may pick the other

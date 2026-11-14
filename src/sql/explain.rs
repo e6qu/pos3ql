@@ -2420,20 +2420,43 @@ fn projected_shape<'a>(
     arena: &'a Arena,
 ) -> Result<(u32, StackStr<256>), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+    // A subquery's list may read the stored relation of the query level
+    // around it.
+    let enclosing = (SUBLINK_DEPTH.with(core::cell::Cell::get) != 0)
+        .then(|| {
+            OUTER_RELATIONS.with(|outer| {
+                let outer = outer.borrow();
+                outer.0[..outer.1].last().copied()
+            })
+        })
+        .flatten();
+    let enclosing_def = enclosing.map(|(_, slot)| storage.table_def(slot, txid));
+    let enclosing_cols =
+        enclosing
+            .as_ref()
+            .zip(enclosing_def.as_ref())
+            .map(|((name, _), definition)| crate::sql::exec::AliasedDefCols {
+                definition: crate::storage::RelationDefinition::from_definition(definition),
+                alias: Some(name.as_str()),
+                output_aliases: &[],
+            });
     let count = match scope {
         Some(scope) => query::describe_scope_items(
             statement.items,
             scope,
-            None,
+            enclosing_cols
+                .as_ref()
+                .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
             storage,
             txid,
             arena,
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?,
-        None => query::describe_catalog_items(
+        None => query::describe_catalog_items_as(
             statement.items,
-            None,
+            enclosing_cols.as_ref().map(|columns| columns.definition),
+            enclosing.as_ref().map(|(name, _)| name.as_str()),
             storage,
             txid,
             arena,
@@ -3179,7 +3202,18 @@ pub(super) fn plan_select<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    plan_select_with_ctes(storage, txid, statement, &[], block, arena)
+    if statement.with.is_empty() {
+        return plan_select_with_ctes(storage, txid, statement, &[], block, arena);
+    }
+    // A query's own `WITH` list follows the statement's rule
+    // (`SS_process_ctes`) at every query level: a query run once is an
+    // InitPlan of the query's top node, the others are inlined.
+    let (select, ctes) = query::expand_ctes_for_plan(statement, storage, txid, arena)?;
+    let prior = CTE_PLANS.with(|planned| planned.replace(planned.get() || !ctes.is_empty()));
+    let plan = plan_ctes(storage, txid, ctes, block, arena)
+        .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, block, arena));
+    CTE_PLANS.with(|planned| planned.set(prior));
+    plan
 }
 
 /// [`plan_select`] for a query whose `WITH` queries `ctes` run once, as
@@ -3403,7 +3437,7 @@ fn plan_sublinks<'a>(
 fn plan_ctes<'a>(
     storage: &Storage,
     txid: u32,
-    ctes: &[query::PlannedCte<'a>],
+    ctes: &[query::PlannedCte<'_>],
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<&'a [Sublink<'a>], SqlError> {
@@ -3433,7 +3467,7 @@ fn plan_ctes<'a>(
                 number,
                 origin: SublinkOrigin::Items,
                 nodes: &plan.nodes[..plan.count],
-                cte: Some(cte.name),
+                cte: Some(arena.alloc_str(cte.name).map_err(|_| arena_full())?),
             })
             .map_err(|_| arena_full())?;
     }
@@ -5948,14 +5982,7 @@ fn plan_derived_body<'a>(
             block,
             arena,
         ),
-        None if body.with.is_empty() => plan_select(storage, txid, body, block, arena),
-        None => plan_select(
-            storage,
-            txid,
-            query::expand_ctes(body, storage, txid, arena)?,
-            block,
-            arena,
-        ),
+        None => plan_select(storage, txid, body, block, arena),
     }
 }
 

@@ -777,3 +777,61 @@ fn verbose_prints_each_nodes_target_list() {
         ]
     );
 }
+
+#[test]
+fn nested_with_queries_follow_the_run_once_rule() {
+    let (mut session, mut engine) = setup("nested_with_queries_follow_the_run_once_rule");
+    let costs = "COSTS OFF";
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (WITH c AS MATERIALIZED (SELECT * FROM pn_t) SELECT * FROM c) s"
+        ),
+        ["CTE Scan on c", "  CTE c", "    ->  Seq Scan on pn_t"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (WITH c AS (SELECT * FROM pn_t) SELECT * FROM c) s"
+        ),
+        ["Seq Scan on pn_t"]
+    );
+    // A subquery reading only its own WITH query is uncorrelated.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT (WITH c AS MATERIALIZED (SELECT max(a) m FROM pn_t) SELECT m FROM c) \
+             FROM pn_u LIMIT 1"
+        ),
+        [
+            "Limit",
+            "  InitPlan 2",
+            "    ->  CTE Scan on c",
+            "          CTE c",
+            "            ->  Aggregate",
+            "                  ->  Seq Scan on pn_t",
+            "  ->  Seq Scan on pn_u",
+        ]
+    );
+    // A subquery's list reads the query level around it.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT (SELECT pn_u.a + count(*) FROM pn_t) FROM pn_u"
+        ),
+        [
+            "Seq Scan on pn_u",
+            "  SubPlan 1",
+            "    ->  Aggregate",
+            "          ->  Seq Scan on pn_t",
+        ]
+    );
+}

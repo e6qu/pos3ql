@@ -86115,11 +86115,12 @@ where
         Ok(folded) => folded,
         Err(error) => return sql_fail(error),
     };
+    let refolded = !core::ptr::eq(folded.rows, statement.rows)
+        || !core::ptr::eq(folded.returning.items, statement.returning.items);
     let statement = &folded;
     // The conversions now apply to the folded rows.
     let assignment_casts = match source {
-        InsertSource::MaterializedSelect { .. } => assignment_casts,
-        InsertSource::Statement => match prepare_dml_assignment_casts(
+        InsertSource::Statement if refolded => match prepare_dml_assignment_casts(
             &Stmt::Insert(*statement),
             storage,
             txn.txid,
@@ -86129,6 +86130,7 @@ where
             Ok(casts) => casts,
             Err(error) => return sql_fail(error),
         },
+        _ => assignment_casts,
     };
     let current_role = authorization_role;
     let insert_check = match super::query::plan_row_security(

@@ -11553,6 +11553,23 @@ pub(crate) fn fold_update_constants<'a>(
     Ok(folded)
 }
 
+/// Whether an `INSERT` value assigns through a field or subscript target
+/// (`p.x`, `j['x']`): the parser's assignment calls (`__jsonb_subscript_set`
+/// and its kin) resolve against the target column when the row is written,
+/// so the value keeps its written form.
+fn assigns_through_indirection(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Call { name, .. } if name.starts_with("__")) {
+        return true;
+    }
+    let mut found = false;
+    walk_children(expression, &mut |child| {
+        found |= assigns_through_indirection(child);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    found
+}
+
 /// [`fold_select_constants`] for an `INSERT ... VALUES` about to write rows.
 /// One `VALUES` row is the target list, which folds before `RETURNING`;
 /// several rows form a `VALUES` list, which PostgreSQL's planner folds with
@@ -11575,20 +11592,50 @@ pub(crate) fn fold_insert_constants<'a>(
         let rows = arena
             .alloc_slice_copy(statement.rows)
             .map_err(|_| arena_full())?;
+        let mut changed = false;
         for row in rows.iter_mut() {
             let values = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
             for value in values.iter_mut() {
-                *value = fold(value)?;
+                if !assigns_through_indirection(value) {
+                    let folded = fold(value)?;
+                    changed |= !core::ptr::eq(folded, *value);
+                    *value = folded;
+                }
             }
             *row = values;
         }
-        Ok(rows)
+        Ok(if changed { rows } else { statement.rows })
+    };
+    let fold_returning = || -> Result<&'a [SelectItem<'a>], SqlError> {
+        let items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        let same = items
+            .iter()
+            .zip(statement.returning.items)
+            .all(|(new, old)| match (new, old) {
+                (
+                    SelectItem::Expr {
+                        expression: new, ..
+                    },
+                    SelectItem::Expr {
+                        expression: old, ..
+                    },
+                )
+                | (SelectItem::RecordStar(new), SelectItem::RecordStar(old)) => {
+                    core::ptr::eq(*new, *old)
+                }
+                _ => true,
+            });
+        Ok(if same {
+            statement.returning.items
+        } else {
+            items
+        })
     };
     if statement.rows.len() <= 1 {
         folded.rows = fold_rows()?;
-        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        folded.returning.items = fold_returning()?;
     } else {
-        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        folded.returning.items = fold_returning()?;
         folded.rows = fold_rows()?;
     }
     Ok(folded)

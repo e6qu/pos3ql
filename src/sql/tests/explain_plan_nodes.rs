@@ -535,3 +535,67 @@ fn explain_plans_the_folded_statement() {
         );
     }
 }
+
+#[test]
+fn offset_zero_subqueries_keep_their_boundary_without_a_limit() {
+    let (mut session, mut engine) = setup("offset_zero_subqueries");
+    let costs = "COSTS OFF";
+    // `limit_needed`: OFFSET 0 and LIMIT NULL leave no `Limit`.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u OFFSET 0"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u LIMIT NULL"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    // The subquery is not pulled up, and its trivial `Subquery Scan` is
+    // removed, so the join's condition reads the subquery's own columns.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (SELECT * FROM pn_u OFFSET 0) x, \
+             (SELECT * FROM pn_u v OFFSET 0) y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (pn_u.a < v.a)",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Materialize",
+            "        ->  Seq Scan on pn_u v"
+        ]
+    );
+    // A condition the subquery cannot take stays on its scan.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (SELECT * FROM pn_u OFFSET 0) x WHERE x.a > 3"
+        ),
+        [
+            "Subquery Scan on x",
+            "  Filter: (x.a > 3)",
+            "  ->  Seq Scan on pn_u"
+        ]
+    );
+    let rows = data_rows(&session.success(
+        &mut engine,
+        "SELECT count(*) FROM (SELECT * FROM pn_u OFFSET 0) x, \
+         (SELECT * FROM pn_u OFFSET 0) y WHERE x.a < y.a",
+        true,
+    ));
+    assert_eq!(rows, ["190"]);
+}

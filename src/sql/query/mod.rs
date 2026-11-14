@@ -161,6 +161,17 @@ pub(crate) fn expression_contains_volatile(
     })
 }
 
+/// Whether `expression` calls a user-defined routine (outside subqueries).
+pub(crate) fn expression_calls_user_routine(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    cte::expression_contains_function(expression, &|name, arity| {
+        storage.has_non_aggregate_routine_candidate(name, arity, txid)
+    })
+}
+
 /// Whether qualifying a target row of `UPDATE` or `DELETE` can call a user
 /// routine or a volatile built-in: in its `WHERE`, its `FROM` or `USING`
 /// items, or the row-security policies that filter it. PostgreSQL qualifies
@@ -978,11 +989,13 @@ use subquery::{
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
+    enter_sublink_of, subquery_node_correlated, type_witness, walk_children,
+};
+pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
     uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
-pub(crate) use subquery::{subquery_node_correlated, type_witness, walk_children};
 
 mod window;
 use window::{

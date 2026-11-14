@@ -7215,7 +7215,7 @@ fn eval_full_unpositioned<'a>(
                     | Expr::InSubquery { .. }
                     | Expr::QuantifiedSubquery { .. }
             )
-            .then(super::query::input_progress::enter_body);
+            .then(super::query::input_progress::enter_subquery_body);
             let value = materialize_acl_value(
                 eval_full_inner(expression, arena, params, row, hooks)?,
                 hooks,
@@ -7521,8 +7521,7 @@ fn eval_full_inner<'a>(
             hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
-        let sublink =
-            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let sublink = crate::sql::query::enter_sublink_of(expression);
         let evaluated = deferred.evaluate(expression, arena, params, outer, hooks.sequences);
         drop(sublink);
         let values = match evaluated? {
@@ -7591,8 +7590,7 @@ fn eval_full_inner<'a>(
             hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
-        let sublink =
-            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Sublink);
+        let sublink = crate::sql::query::enter_sublink_of(expression);
         let result = executor.evaluate(expression, arena, params, outer, hooks.sequences);
         drop(sublink);
         let result = result?;

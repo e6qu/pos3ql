@@ -2920,17 +2920,18 @@ fn plan_sublinks<'a>(
                 true
             });
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        let inner = plan_select(storage, txid, select, block.child(Segment::Sublink), arena);
+        let inner = plan_select(
+            storage,
+            txid,
+            select,
+            block.child(Segment::Sublink(core::ptr::from_ref(select) as usize as u64)),
+            arena,
+        );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
         if pushed {
             OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
         }
         let Plan { nodes, count, .. } = inner?;
-        // Execution does not count a subquery's operators per subplan yet,
-        // so `EXPLAIN ANALYZE` prints no figures for them.
-        for node in &mut nodes[..count] {
-            node.key = None;
-        }
         let nodes: &'a [PlanNode] = &nodes[..count];
         let number = match register_subplan(select, correlated)? {
             crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
@@ -2986,7 +2987,8 @@ fn attach_subplans<'a>(
         let at = match (sublink.kind, sublink.origin) {
             (SubplanKind::InitPlan, _) => None,
             (SubplanKind::SubPlan, SublinkOrigin::Having) => find(Role::Aggregate),
-            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::Aggregate)
+            (SubplanKind::SubPlan, SublinkOrigin::Items) => find(Role::SortedProjection)
+                .or_else(|| find(Role::Aggregate))
                 .or_else(|| find(Role::Result))
                 .or_else(scan),
             (SubplanKind::SubPlan, SublinkOrigin::Where) => scan(),
@@ -3573,6 +3575,23 @@ fn plan_pulled_select<'a>(
                 .with_verbose_qual(QualLabel::PresortedKey, presorted_text(&prefix, true));
         }
         add_stage(&mut stages, &mut stage_count, node)?;
+        if postpones_select_list(storage, txid, statement) {
+            add_stage(
+                &mut stages,
+                &mut stage_count,
+                PlanNode {
+                    name: StackStr::from_str("Result"),
+                    key: key(Role::SortedProjection),
+                    total_cost,
+                    rows: estimated_rows,
+                    width,
+                    object_requests,
+                    cache_blocks,
+                    passthrough: true,
+                    ..PlanNode::EMPTY
+                },
+            )?;
+        }
     }
     let distinct_items = || -> Result<bool, SqlError> {
         if !statement.distinct_on.is_empty() {
@@ -4141,6 +4160,41 @@ fn presorted_text(keys: &PlanKeys, verbose: bool) -> Option<StackStr<512>> {
 
 /// The expression an `ORDER BY` key sorts by: an output position or name
 /// stands for its select-list expression.
+/// PostgreSQL's `make_sort_input_target`: whether the query evaluates its
+/// select list after its sort, from a `Result` above it, because a column
+/// that is not a sort key calls a volatile function, or, under a `LIMIT`,
+/// is expensive (a user routine or a correlated subplan).
+fn postpones_select_list(storage: &Storage, txid: u32, statement: &Select<'_>) -> bool {
+    if statement.distinct || !statement.distinct_on.is_empty() {
+        return false;
+    }
+    statement.items.iter().any(|item| {
+        let SelectItem::Expr { expression, .. } = item else {
+            return false;
+        };
+        let sorted = statement
+            .order_by
+            .iter()
+            .any(|key| order_key_expression(statement, key.expression) == *expression);
+        if sorted {
+            return false;
+        }
+        if query::expression_contains_volatile(expression, storage, txid, false) {
+            return true;
+        }
+        let mut subplan = false;
+        visit_sublinks(expression, &mut |node| {
+            subplan |= sublink_query(node)
+                .and_then(|select| registered_sublink(core::ptr::from_ref(select).cast()))
+                .is_some_and(|plan| {
+                    matches!(plan, crate::sql::catalog::deparse::SublinkPlan::SubPlan(_))
+                });
+        });
+        statement.limit.is_some()
+            && (subplan || query::expression_calls_user_routine(expression, storage, txid))
+    })
+}
+
 fn order_key_expression<'e>(statement: &Select<'e>, key: &'e Expr<'e>) -> &'e Expr<'e> {
     let item = match key {
         Expr::Int(position) => usize::try_from(*position)

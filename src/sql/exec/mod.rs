@@ -103896,6 +103896,14 @@ pub(super) fn collect_matches<'a>(
         txid,
         arena,
     )?;
+    // A row an UPDATE moves can land in a leaf pruning left out, whose
+    // layout its change reads.
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        if !leaves.contains(&leaf) {
+            let physical = (*storage.table_def(leaf, txid)).clone();
+            images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+        }
+    }
     for &leaf in leaves {
         let member = target_member(leaf);
         let _member = member.start();

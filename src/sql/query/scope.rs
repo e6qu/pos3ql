@@ -620,6 +620,10 @@ pub struct QueryScope<'d> {
     /// as the plan consumes rows. `derived` is `Some` (empty) for it, as for
     /// an external run: a marker, not the rows.
     pub(crate) foreign_streams: &'d mut [Option<crate::sql::foreign::ForeignStream<'d>>],
+    /// A recursive `WITH` query that is its query's only FROM item: the
+    /// scan runs it a step at a time as it reads (`derived` holds an empty
+    /// placeholder), so a reader that stops early stops the recursion.
+    pub(crate) recursive: &'d mut [Option<super::RecursiveCteQuery<'d>>],
     /// Whether the FROM item being added is the query's only one, so a
     /// foreign table there streams instead of being read whole first.
     sole_source: bool,
@@ -1192,7 +1196,7 @@ pub(crate) struct ScopeSource {
 /// Type-only lookup over FROM items already registered in a scope. Table
 /// functions are implicitly lateral in PostgreSQL, so their output definition
 /// may depend on a preceding column before a concrete row has been bound.
-struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
+pub(crate) struct ScopeTypes<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 
 /// Schema construction can inspect a caller's columns without retaining values
 /// whose lifetime belongs to that caller's row scratch.
@@ -1523,6 +1527,9 @@ impl<'d> QueryScope<'d> {
         let external_runs = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let recursive = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let foreign_streams = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
@@ -1569,6 +1576,7 @@ impl<'d> QueryScope<'d> {
             derived,
             external_runs,
             foreign_streams,
+            recursive,
             sole_source: false,
             lateral,
             func_scalar,
@@ -2342,12 +2350,19 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, def_reference);
         let materialize = read.is_some();
-        self.derived[self.n] = Some(if materialize {
-            m.read_rows(arena, read)?
+        if let (true, crate::sql::ast::MaterializedCteSource::Recursive(query)) =
+            (materialize && self.sole_source, m.source)
+        {
+            self.derived[self.n] = Some(&[]);
+            self.recursive[self.n] = Some(query);
         } else {
-            &[]
-        });
-        self.external_runs[self.n] = if materialize { m.external_run() } else { None };
+            self.derived[self.n] = Some(if materialize {
+                m.read_rows(arena, read)?
+            } else {
+                &[]
+            });
+            self.external_runs[self.n] = if materialize { m.external_run() } else { None };
+        }
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())
@@ -2528,7 +2543,7 @@ impl<'d> QueryScope<'d> {
         let sub = if sub.with.is_empty() {
             sub
         } else {
-            super::expand_ctes_exec(sub, storage, txid, arena, params, &[], sequences)?
+            super::expand_ctes_exec(sub, storage, txid, arena, params, &[])?
         };
         let rows: &'a [&'a [u8]];
         let external_run;

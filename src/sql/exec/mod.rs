@@ -25966,11 +25966,6 @@ fn expand_plpgsql_with<'a>(
     if query.with.is_empty() {
         return Ok(query);
     }
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     super::query::expand_enclosed_ctes_exec(
         query,
         context.storage(),
@@ -25978,7 +25973,6 @@ fn expand_plpgsql_with<'a>(
         context.arena,
         context.params,
         &[],
-        Some(&sequences),
         Some(scope),
     )
 }
@@ -26084,11 +26078,6 @@ fn bind_plpgsql_write_ctes<'a>(
     } else {
         run_nested_dml_ctes(context, with.ctes, main, &[], false)?
     };
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     let expanded = super::query::expand_dml_ctes(
         with.statement,
         with.ctes,
@@ -26097,7 +26086,6 @@ fn bind_plpgsql_write_ctes<'a>(
         context.arena,
         context.params,
         materialized,
-        Some(&sequences),
     )?;
     let statement = match TriggerDml::from_statement(expanded) {
         Some(
@@ -26141,11 +26129,6 @@ fn run_nested_dml_ctes<'a>(
         {
             continue;
         }
-        let sequences = crate::sql::sequence::SeqEval::new(
-            context.storage(),
-            context.seq_session(),
-            context.txn.txid,
-        );
         let (statement, mut relation) = super::analyze_dml_cte(
             context.storage(),
             with,
@@ -26154,7 +26137,6 @@ fn run_nested_dml_ctes<'a>(
             context.txn.txid,
             arena,
             context.params,
-            &sequences,
         )?;
         let mut rows = ArenaList::new(arena);
         let mut capture = |_: &Storage,
@@ -32128,15 +32110,7 @@ where
     let select = if select.with.is_empty() {
         select
     } else {
-        super::query::expand_ctes_exec(
-            select,
-            storage,
-            txid,
-            query_arena,
-            execution.params,
-            &[],
-            Some(&live),
-        )?
+        super::query::expand_ctes_exec(select, storage, txid, query_arena, execution.params, &[])?
     };
     super::query::select_into_rows_recycling(
         storage,
@@ -34054,11 +34028,6 @@ fn execute_nested_write<'a>(
         Stmt::Merge(_) => {
             let arena = context.arena;
             let params = arguments;
-            let sequence = crate::sql::sequence::SeqEval::new(
-                context.storage(),
-                context.seq_session(),
-                context.txn.txid,
-            );
             let Stmt::Merge(statement) = super::query::expand_dml_ctes(
                 statement,
                 &[],
@@ -34067,7 +34036,6 @@ fn execute_nested_write<'a>(
                 arena,
                 params,
                 &[],
-                Some(&sequence),
             )?
             else {
                 unreachable!("MERGE source expansion keeps its statement kind");
@@ -42458,11 +42426,6 @@ fn execute_trigger_step_in<'a>(
                         .alloc(super::ast::Stmt::Merge(*statement))
                         .map_err(|_| super::query::arena_full_pub())?,
                 };
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                );
                 let Stmt::Merge(statement) = super::query::expand_dml_ctes(
                     statement,
                     &[],
@@ -42471,7 +42434,6 @@ fn execute_trigger_step_in<'a>(
                     context.arena,
                     context.params,
                     &[],
-                    Some(&sequence),
                 )?
                 else {
                     unreachable!("MERGE source expansion keeps its statement kind");
@@ -52800,7 +52762,6 @@ pub(crate) fn check_sql_routine_result(
                     dependencies,
                     arena,
                     &[],
-                    None,
                 )?,
                 None => statement,
             };
@@ -59057,7 +59018,6 @@ fn stored_rule_definition<'a>(
             dependencies.view(),
             arena,
             crate::sql::eval::NO_PARAMS,
-            None,
             rule_owner,
             &condition_columns.names[..condition_columns.count],
             &transition_values[..condition_columns.count],
@@ -61002,15 +60962,7 @@ fn create_table_as_rows<'a>(
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let sel = crate::sql::parser::parse_query(sql, arena)?;
     let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
-    let sel = super::query::expand_ctes_exec(
-        sel,
-        storage,
-        txid,
-        arena,
-        params,
-        &[],
-        Some(&live_sequence),
-    )?;
+    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
     let mut rows = 0usize;
     let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
     super::query::select_into_rows(
@@ -61553,7 +61505,6 @@ pub fn refresh_materialized_view(
         dependencies.view(),
         arena,
         params,
-        Some(&live_sequence),
     ) {
         Ok(select) => select,
         Err(error) => return sql_fail(error),
@@ -81614,7 +81565,7 @@ fn copy_out_rows(
     }
     begin_copy_out(&fmt, &names[..n], responder).map_err(&mut wire)?;
     let sel = crate::sql::parser::parse_query(sql, arena)?;
-    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[], seq)?;
+    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
     let fmt = &fmt;
     let mut count = 0u64;
     super::query::select_into_rows(storage, txid, sel, arena, params, None, seq, &mut |vals| {

@@ -712,3 +712,73 @@ fn correlated_scalar_subquery_analyses_once_per_statement() {
     assert!(few > 0);
     assert_eq!(many, few);
 }
+
+/// A recursive `WITH` query runs only as far as its readers read it, in
+/// local and object-store (external run) mode, so one that only a `LIMIT`
+/// ends returns its rows. Expected values were read from PostgreSQL 18.6.
+#[test]
+fn recursive_with_queries_run_as_far_as_they_are_read() {
+    for object_store in [false, true] {
+        let name = format!("recursive-reads-{object_store}");
+        let mut config = test_config(&name);
+        if object_store {
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+        let mut b = test_engine_budget(&config, 1 << 29);
+        let mut e = Engine::new(&config, &mut b).unwrap();
+        let mut t = TxnState::new_with_config(&mut b, &config).unwrap();
+        let mut check = |sql: &str, expected: &[&str]| {
+            assert_eq!(
+                rows(&mut e, &mut b, &mut t, sql),
+                expected,
+                "{sql} (object store {object_store})"
+            );
+        };
+        let endless = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t)";
+        check(
+            &format!("{endless} SELECT n FROM t LIMIT 3"),
+            &["1", "2", "3"],
+        );
+        check(
+            &format!("{endless} SELECT n FROM t WHERE n % 3 = 0 LIMIT 2"),
+            &["3", "6"],
+        );
+        check(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + 1 FROM t) \
+             SELECT n FROM t LIMIT 2 OFFSET 2",
+            &["3", "4"],
+        );
+        check(
+            &format!("{endless} SELECT (SELECT n FROM t LIMIT 1 OFFSET 7)"),
+            &["8"],
+        );
+        check(
+            &format!("{endless} SELECT * FROM (SELECT n FROM t LIMIT 2) s"),
+            &["1", "2"],
+        );
+        check(
+            &format!("{endless} SELECT EXISTS (SELECT 1 FROM t WHERE n > 3)"),
+            &["t"],
+        );
+        check(
+            "WITH RECURSIVE t(n, p) AS (SELECT 1, ARRAY[1] UNION ALL \
+             SELECT n + 1, p || (n + 1) FROM t) CYCLE n SET c USING q \
+             SELECT n, c FROM t LIMIT 2",
+            &["1|f", "2|f"],
+        );
+        // A reader that reads it all runs it to its end; readers share it.
+        check(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 4) \
+             SELECT n, (SELECT count(*) FROM t) FROM t",
+            &["1|4", "2|4", "3|4", "4|4"],
+        );
+        check(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT (n + 1) % 4 FROM t) \
+             SELECT n FROM t",
+            &["1", "2", "3", "0"],
+        );
+    }
+}

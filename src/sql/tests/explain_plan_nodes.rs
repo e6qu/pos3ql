@@ -860,3 +860,145 @@ fn renamed_relations_print_their_new_names_in_conditions() {
         ]
     );
 }
+
+#[test]
+fn lateral_items_plan_with_their_outer_columns() {
+    let (mut session, mut engine) = setup("lateral_items_plan_with_their_outer_columns");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT * FROM pn_u, LATERAL (SELECT pn_u.a + 1 AS z OFFSET 0) s"
+        ),
+        ["Nested Loop", "  ->  Seq Scan on pn_u", "  ->  Result"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT * FROM pn_u, LATERAL (SELECT * FROM (SELECT b FROM pn_t \
+             WHERE pn_t.a = pn_u.a) d OFFSET 0) s"
+        ),
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Seq Scan on pn_t",
+            "        Filter: (a = pn_u.a)",
+        ]
+    );
+}
+
+#[test]
+fn explain_execute_shows_custom_and_generic_plans() {
+    let (mut session, mut engine) = setup("explain_execute_shows_custom_and_generic_plans");
+    session.success(
+        &mut engine,
+        "PREPARE pn_q(int, text) AS SELECT b FROM pn_t WHERE b > $1 AND $2 = 'x'",
+        true,
+    );
+    let mut explain = |sql: &str| {
+        data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {sql}"), true))
+    };
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'x')"),
+        ["Seq Scan on pn_t", "  Filter: (b > 98)"]
+    );
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'y')"),
+        ["Result", "  One-Time Filter: false"]
+    );
+    session.success(
+        &mut engine,
+        "SET plan_cache_mode = force_generic_plan",
+        true,
+    );
+    let mut explain = |sql: &str| {
+        data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {sql}"), true))
+    };
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'x')"),
+        [
+            "Result",
+            "  One-Time Filter: ($2 = 'x'::text)",
+            "  ->  Seq Scan on pn_t",
+            "        Filter: (b > $1)",
+        ]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT generic_plans, custom_plans FROM pg_prepared_statements",
+            true
+        )),
+        ["1|2"]
+    );
+}
+
+#[test]
+fn writing_with_queries_are_init_plans_of_any_main_statement() {
+    let (mut session, mut engine) =
+        setup("writing_with_queries_are_init_plans_of_any_main_statement");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "WITH w AS (DELETE FROM pn_t RETURNING *) INSERT INTO pn_t SELECT * FROM w"
+        ),
+        [
+            "Insert on pn_t",
+            "  CTE w",
+            "    ->  Delete on pn_t pn_t_1",
+            "          ->  Seq Scan on pn_t pn_t_1",
+            "  ->  CTE Scan on w",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "VERBOSE, COSTS OFF",
+            "WITH w AS (UPDATE pn_t SET b = 3 RETURNING a) SELECT * FROM w"
+        ),
+        [
+            "CTE Scan on w",
+            "  Output: w.a",
+            "  CTE w",
+            "    ->  Update on public.pn_t",
+            "          Output: pn_t.a",
+            "          ->  Seq Scan on public.pn_t",
+            "                Output: 3, pn_t.ctid",
+        ]
+    );
+}
+
+#[test]
+fn in_subqueries_with_inlined_with_queries_pull_up() {
+    let (mut session, mut engine) = setup("in_subqueries_with_inlined_with_queries_pull_up");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT b FROM pn_t WHERE b IN (WITH c AS (SELECT a FROM pn_u) SELECT a FROM c)"
+        ),
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (pn_t.b = pn_u.a)",
+            "  ->  Seq Scan on pn_t",
+            "  ->  Hash",
+            "        ->  Seq Scan on pn_u",
+        ]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT b FROM pn_t WHERE b IN \
+             (WITH c AS (SELECT a FROM pn_u WHERE a > 15) SELECT a FROM c) ORDER BY b",
+            true
+        )),
+        ["16", "17", "18", "19", "20"]
+    );
+}

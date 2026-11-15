@@ -4841,6 +4841,57 @@ pub(super) fn constant_evaluation(
     }
 }
 
+thread_local! {
+    /// The parameter values of the custom plan being planned, if any.
+    static CUSTOM_PLAN_PARAMETERS: core::cell::Cell<(*const Datum<'static>, usize)> =
+        const { core::cell::Cell::new((core::ptr::null(), 0)) };
+}
+
+struct CustomPlanScope((*const Datum<'static>, usize));
+
+impl Drop for CustomPlanScope {
+    fn drop(&mut self) {
+        CUSTOM_PLAN_PARAMETERS.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Plans `run` as a custom plan of a prepared statement (`BuildCachedPlan`
+/// with `boundParams`): planner folding replaces each `$n` with its value
+/// in `values`, so conditions on it fold and print as constants.
+pub(crate) fn with_custom_plan_parameters<R>(values: &[Datum<'_>], run: impl FnOnce() -> R) -> R {
+    let current = (values.as_ptr().cast::<Datum<'static>>(), values.len());
+    let _scope = CustomPlanScope(CUSTOM_PLAN_PARAMETERS.with(|slot| slot.replace(current)));
+    run()
+}
+
+/// Whether a custom plan being planned binds `$index` to a value, which
+/// makes it a planner constant.
+pub(crate) fn custom_plan_binds(index: u32) -> bool {
+    let (_, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
+    index >= 1 && (index as usize) <= len
+}
+
+/// The custom plan's parameter values, or none outside one.
+fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
+    let (values, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
+    if values.is_null() {
+        return NO_PARAMS;
+    }
+    // SAFETY: as in `custom_plan_parameter`; the slice is read only while
+    // folding within the installing scope.
+    unsafe { core::slice::from_raw_parts(values.cast::<Datum<'v>>(), len) }
+}
+
+/// The custom plan's value of `$index`, read only within the scope that
+/// installed it; [`folded_literal`] copies it before the scope ends.
+fn custom_plan_parameter<'v>(index: u32) -> Option<Datum<'v>> {
+    let index = index.checked_sub(1)? as usize;
+    let (values, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
+    // SAFETY: `with_custom_plan_parameters` keeps the slice alive while it
+    // is installed and restores the prior slice before returning.
+    (index < len).then(|| unsafe { *values.add(index).cast::<Datum<'v>>() })
+}
+
 /// How [`fold`] treats the constant subexpressions it evaluates.
 #[derive(Clone, Copy)]
 struct Folding<'c> {
@@ -4885,6 +4936,27 @@ fn fold<'a>(
 ) -> Result<(&'a Expr<'a>, Option<bool>), SqlError> {
     use super::ast::BinaryOp;
     let catalog = folding.catalog;
+    // A custom plan's parameter is its bound value (`PARAM_FLAG_CONST`).
+    if let Expr::Param(index) = expression
+        && let Some(value) = custom_plan_parameter(*index)
+    {
+        let known = match value {
+            Datum::Bool(known) => Some(known),
+            _ => None,
+        };
+        if !folding.replace {
+            return Ok((expression, known));
+        }
+        let Some(type_oid) = super::exec::bound_parameter_type_oid(*index) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "custom plan parameter ${} has no type",
+                index
+            ));
+        };
+        let literal = folded_literal(expression, value, type_oid, arena)?;
+        return Ok((literal, known));
+    }
     let evaluation = constant_evaluation(expression, catalog)?;
     if evaluation != Some(ExpressionEvaluation::Runtime) {
         let hooks = EvalHooks {
@@ -4895,10 +4967,11 @@ fn fold<'a>(
         // statement would: with the catalog's routine definitions, whose
         // strictness a folded built-in follows.
         let evaluate = || {
+            let params = custom_plan_parameters();
             if evaluation == Some(ExpressionEvaluation::Immutable) || folding.replace {
-                eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks)
+                eval_full(expression, arena, params, &NoColumns, &hooks)
             } else {
-                eval(expression, arena, NO_PARAMS, &NoColumns)
+                eval(expression, arena, params, &NoColumns)
             }
         };
         let messages = eval_message_mark();

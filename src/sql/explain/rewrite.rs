@@ -272,10 +272,13 @@ pub(super) fn pulled_up(
         && select.with.is_empty()
         && select.set_body.is_none()
         && select.locking.is_empty()
-        && select
-            .items
-            .iter()
-            .all(|item| matches!(item, SelectItem::Expr { .. }))
+        // Parse analysis expanded `*` into the columns it names.
+        && select.items.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Expr { .. } | SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)
+            )
+        })
         && !selects_aggregate(select, storage, txid, arena)?)
 }
 
@@ -1191,7 +1194,10 @@ pub(super) fn insert_source_plan<'a>(
     // Execution runs the source in its own block.
     let source = block.child(Segment::Source);
     let (plan, wrapper) = if select.set_body.is_some() {
-        (plan_derived(storage, txid, select, source, arena)?, None)
+        (
+            plan_derived(storage, txid, select, None, source, arena)?,
+            None,
+        )
     } else if pulled_up(storage, txid, select, arena)?
         // PostgreSQL's `is_simple_subquery` keeps a source whose select
         // list calls a volatile function as a subquery.
@@ -1208,18 +1214,22 @@ pub(super) fn insert_source_plan<'a>(
                         storage,
                         txid,
                         body,
+                        None,
                         source.child(Segment::Derived(0)),
                         arena,
                     )?,
                     (!passes).then_some(alias),
                 )
             }
-            None => (plan_select(storage, txid, select, source, arena)?, None),
+            None => (
+                plan_select(storage, txid, select, None, source, arena)?,
+                None,
+            ),
         }
     } else {
         let passes = passes_columns(storage, txid, insert, select, None, arena)?;
         (
-            plan_derived(storage, txid, select, source, arena)?,
+            plan_derived(storage, txid, select, None, source, arena)?,
             (!passes).then_some("*SELECT*"),
         )
     };

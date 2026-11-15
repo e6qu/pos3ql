@@ -6530,6 +6530,7 @@ pub(crate) fn derived_key_plan<'a>(
     let build_table = order[depth];
     if scope.derived[build_table].is_none()
         || scope.external_runs[build_table].is_some()
+        || scope.recursive[build_table].is_some()
         || scope.foreign_streams[build_table].is_some()
         || scope.lateral[build_table]
     {
@@ -9122,6 +9123,61 @@ fn scan_source_mode<'a>(
                             return Ok(false);
                         }
                     }
+                }
+            }
+        } else if let Some(recursive) = scope.recursive[order[depth]] {
+            // Run the recursive query only as far as this scan reads it.
+            let read = super::DeferredCteRead {
+                storage,
+                txid,
+                params,
+                sequences: hooks.sequences,
+                outer,
+            };
+            let mut index = 0usize;
+            let mut chunk = 0usize;
+            while let Some(rows) = recursive.chunk(chunk, arena, read)? {
+                chunk += 1;
+                let run = match rows {
+                    super::RecursiveChunk::Inline(rows) => {
+                        for bytes in rows {
+                            check_timeout()?;
+                            let this = index;
+                            index += 1;
+                            let keep_scanning =
+                                recycled(arena, recycle_rows, retain_match, || {
+                                    visit_candidate!(this, BoundRow::Encoded(bytes), None)
+                                })?;
+                            if !keep_scanning {
+                                return Ok(false);
+                            }
+                        }
+                        continue;
+                    }
+                    super::RecursiveChunk::External(run) => run,
+                };
+                let mut reader = storage.external_run_reader()?;
+                storage
+                    .with_block_store(|blocks| reader.start(blocks, run))
+                    .expect("external run has a block store")?;
+                loop {
+                    let keep_scanning = {
+                        let Some(bytes) = reader.row() else { break };
+                        check_timeout()?;
+                        let this = index;
+                        index += 1;
+                        recycled(arena, recycle_rows, retain_match, || {
+                            // The cursor replaces its row buffer on advance.
+                            let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                            visit_candidate!(this, BoundRow::Encoded(owned), None)
+                        })
+                    }?;
+                    if !keep_scanning {
+                        return Ok(false);
+                    }
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("external run has a block store")?;
                 }
             }
         } else if let Some(run) = scope.external_runs[order[depth]] {

@@ -456,6 +456,14 @@ impl PlannerValues {
         self.0[planner_index(name).expect("planner method switch")] != 0.0
     }
 
+    pub(super) fn plan_cache_mode(&self) -> PlanCacheMode {
+        match self.0[planner_index("plan_cache_mode").expect("plan_cache_mode setting")] as u8 {
+            0 => PlanCacheMode::Auto,
+            1 => PlanCacheMode::ForceGenericPlan,
+            _ => PlanCacheMode::ForceCustomPlan,
+        }
+    }
+
     pub(super) fn methods(&self) -> PlannerMethods {
         PlannerMethods {
             seqscan: self.flag("enable_seqscan"),
@@ -496,6 +504,15 @@ impl PlannerKind {
             Self::Enum(..) => "enum",
         }
     }
+}
+
+/// `plan_cache_mode`: how a prepared statement chooses between custom and
+/// generic plans.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlanCacheMode {
+    Auto,
+    ForceGenericPlan,
+    ForceCustomPlan,
 }
 
 /// The plan methods a session allows, for the planner choices pos3ql has.

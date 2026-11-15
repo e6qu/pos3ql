@@ -850,22 +850,39 @@ relation; a relation a subquery reads again under a name the statement
 already uses prints as `t_1`. A statement's `WITH` query that PostgreSQL
 does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
 `NOT MATERIALIZED`, volatile, recursive or data-modifying) is its top node's
-`CTE name` InitPlan, numbered before the query's subqueries and read by
+`CTE name` InitPlan, also when the statement is a set operation or a write
+(whose columns then print qualified), numbered before the query's subqueries and read by
 `CTE Scan` nodes without a `Materialize`; a derived table's or subquery's
 own `WITH` list follows the same rule as that query's InitPlans, and a
 subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive
 Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
-figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
-its whole query where PostgreSQL pulls only the rows read (so a recursive
-`WITH` query that only a `LIMIT` ends fails with `54000` once its rows
-exceed the statement arena, where PostgreSQL returns the limited rows), a
+figures per iteration. A recursive `WITH` query runs an iteration at a
+time as its readers pull rows, so one that only a `LIMIT` ends returns the
+limited rows, and a subquery's `LIMIT` without `ORDER BY` stops its scan
+once it has its rows. Still differing: an ordinary `WITH` query PostgreSQL
+runs once still runs whole when first read, and a recursive one read by a
+join, or by a recursive term that reads only part of an iteration, runs an
+iteration at a time where PostgreSQL pulls single rows; `ANALYZE` prints no
+`Storage:` lines for `CTE Scan` and `Recursive Union`; a `CTE Scan` in a
+scalar subquery's `InitPlan` prints `never executed`; a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
-plan block), an `IN` over a subquery with its own `WITH` list stays a
-subplan where PostgreSQL pulls it up into a semi join, a join condition
+plan block), an `IN` over a subquery with its own `WITH` list pulls
+up into a semi join once the `WITH` queries it inlines are substituted, but
+one whose `WITH` query runs once (`MATERIALIZED`, or read twice by a set
+operation) stays a subplan where PostgreSQL joins its `CTE Scan` or set
+operation, a join condition
 over a derived table whose `WITH` query PostgreSQL reads directly names the
-derived table (`s.a` for `c.a`), `EXPLAIN` of a `LATERAL` item or a
-subquery's derived table reading an outer column fails with `42P01`. A
+derived table (`s.a` for `c.a`), `EXPLAIN` plans a `LATERAL` item and a
+subquery's derived table with the columns to their left and of the
+enclosing queries in scope, keeping no `Materialize` copy of a `LATERAL`
+subquery; still differing there: a simple subquery that reads such
+columns is not pulled up into its query (PostgreSQL merges it, so its
+`Subquery Scan` or `Result` disappears and its conditions join the
+query's), a single-relation query keeps a `Subquery Scan` PostgreSQL
+removes as trivial when the query only aggregates or returns its columns
+(`trivial_subqueryscan`), and a `LATERAL` subquery's own `Filter` on its
+output is not printed. A
 subplan's relation renamed after one of the
 statement's (`r_1`, `e1_1`) prints its new name in its query block's
 conditions and lists. When a derived table or `CTE Scan` joins a
@@ -984,9 +1001,14 @@ hashed locally (as PostgreSQL's costs choose) with its scan's `Output`
 listing only the read columns; a window's and an upper node's `Output` lines
 print the window and grouped columns by name; a grouped scan read through a
 view or subquery prints unqualified columns; `RETURNING ctid` of a foreign
-table fails with `42703`; and `EXPLAIN EXECUTE` plans a prepared statement
-with its parameters unbound, so a condition on `$1` neither ships nor
-prints. A select list or `ORDER BY` with a subquery reads every column. A
+table fails with `42703`; and a condition on a prepared statement's
+parameter does not ship: `EXPLAIN EXECUTE` prints it as a local `Filter`,
+with the argument's value in a custom plan and `$1` in a generic one, where
+PostgreSQL sends the value or `$1::integer`. A prepared statement takes
+custom plans for its first five executions and its generic plan after
+them, as `choose_custom_plan` does under `plan_cache_mode = auto`, without
+PostgreSQL's comparison of the generic plan's cost with the custom plans'
+average. A select list or `ORDER BY` with a subquery reads every column. A
 query whose only FROM item is a foreign table, a scalar or `EXISTS` subquery
 over one, and a foreign partition or inheritance child read its cursor one
 `FETCH` batch at a time as the plan consumes rows, and close it as soon as

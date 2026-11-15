@@ -1049,14 +1049,16 @@ impl<'a> RelationTargets<'a> {
     }
 
     /// The lists of a write whose `RETURNING` list may name the old and new
-    /// rows (`returning`), which print qualified while the target's own
-    /// columns print bare.
+    /// rows (`returning`), which print qualified. The target's own columns
+    /// print bare in an `UPDATE` or `DELETE` and qualified in an `INSERT`
+    /// (`qualify_target`), as PostgreSQL prints them.
     pub(super) fn returning_scope(
         storage: &'a Storage,
         txid: u32,
         table: &'a TableDef,
         exposed: &'a str,
         returning: Returning<'a>,
+        qualify_target: bool,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         let rows = [
@@ -1074,7 +1076,7 @@ impl<'a> RelationTargets<'a> {
             exposed,
             joined,
             true,
-            Some(exposed),
+            (!qualify_target).then_some(exposed),
             arena,
         ))
     }
@@ -1221,8 +1223,7 @@ impl<'a> RelationTargets<'a> {
             else {
                 continue;
             };
-            let Some(entry) = self.entry(value, Destination::Assignment(column.ctype.oid()))?
-            else {
+            let Some(entry) = self.entry(value, Destination::Coerced(column.ctype.oid()))? else {
                 return Ok(None);
             };
             entries.push(entry).map_err(|_| arena_full())?;
@@ -1257,8 +1258,7 @@ impl<'a> RelationTargets<'a> {
         }
         let mut entries = ArenaList::new(self.arena);
         for (value, column) in row.iter().zip(definitions) {
-            let Some(entry) = self.entry(value, Destination::Assignment(column.ctype.oid()))?
-            else {
+            let Some(entry) = self.entry(value, Destination::Coerced(column.ctype.oid()))? else {
                 return Ok(None);
             };
             entries.push(entry).map_err(|_| arena_full())?;

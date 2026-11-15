@@ -34,6 +34,10 @@ pub(crate) enum Destination {
     Condition,
     /// A value of its own type, such as a select-list item.
     Value,
+    /// Coerced to this type by the planner, which prints the coercion as
+    /// EXPLAIN's target lists do: a folded constant (`'7'::bigint`), else a
+    /// cast of any other type.
+    Coerced(i32),
 }
 
 pub(crate) struct Context<'s> {
@@ -287,6 +291,7 @@ pub(crate) fn deparse_expression<'a>(
         Destination::Assignment(target) => context.assigned(expression, target, &mut output)?,
         Destination::Condition => context.write(expression, Some(oid::BOOL), &mut output)?,
         Destination::Value => context.write(expression, None, &mut output)?,
+        Destination::Coerced(target) => context.write(expression, Some(target), &mut output)?,
     }
     Ok(output.supported.then(|| output.text.as_str()))
 }

@@ -5758,7 +5758,7 @@ fn foreign_modification<'a>(
     };
     let table = storage.table_def(slot, txid);
     let lists = targets::RelationTargets::returning_scope(
-        storage, txid, &table, exposed, returning, arena,
+        storage, txid, &table, exposed, returning, false, arena,
     )?;
     plan.nodes[0].set_output(lists.returning(returning)?);
     let scan = |name: &str| PlanNode {
@@ -7433,6 +7433,7 @@ pub(super) fn plan_modification<'a>(
                 &definition,
                 insert.alias.unwrap_or(target.name),
                 insert.returning,
+                true,
                 arena,
             )?;
             plan.nodes[0].set_output(lists.returning(insert.returning)?);
@@ -7585,7 +7586,7 @@ fn modification_outputs(
     let mark = arena.mark();
     let result = (|| {
         let lists = targets::RelationTargets::returning_scope(
-            storage, txid, definition, exposed, returning, arena,
+            storage, txid, definition, exposed, returning, false, arena,
         )?;
         Ok((
             lists.returning(returning)?,

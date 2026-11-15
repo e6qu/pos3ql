@@ -1105,7 +1105,11 @@ static DOUBLE_POW5_SPLIT: [[u64; 2]; 326] = [
     [2850236603241744433, 111253692925360069],
 ];
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

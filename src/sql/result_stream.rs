@@ -322,6 +322,7 @@ impl Engine {
         sql: &str,
         params: &[Datum],
         parameter_types: &[i32],
+        inputs: type_inputs::BoundInputs<'_>,
         owner: type_input_plans::Owner,
         deadline: i64,
         txn: &mut TxnState,
@@ -373,10 +374,22 @@ impl Engine {
             } else {
                 sql
             };
+            // A prepared statement's converted literals bind its stream.
+            let bindings = if copy {
+                &[]
+            } else {
+                inputs.decode(&self.work)?
+            };
             query
-                .bind(query_text, params, &[], &[], owner, |parser| {
-                    type_inputs::validate_restored(parser, &self.storage, txid)
-                })
+                .bind(
+                    query_text,
+                    params,
+                    &[],
+                    bindings,
+                    inputs.image(),
+                    owner,
+                    |parser| inputs.validate(parser, &self.storage, txid),
+                )
                 .map_err(stream_capacity)?;
             self.storage.set_read_snapshot(source_snapshot);
             responder.set_render(guc.render());

@@ -206,6 +206,9 @@ struct Prepared {
     plan: u64,
     planner_ready: bool,
     kind: crate::sql::ProtocolStatement,
+    /// Whether Parse analyzed the statement, so its input map also holds the
+    /// built-in literals that analysis converted.
+    analyzed: bool,
 }
 
 impl Prepared {
@@ -218,8 +221,13 @@ impl Prepared {
         &self.data.readable()[self.query_len..self.query_len + self.oid_bytes]
     }
 
-    fn type_inputs(&self) -> &[u8] {
-        &self.data.readable()[self.query_len + self.oid_bytes..]
+    fn type_inputs(&self) -> crate::sql::type_inputs::BoundInputs<'_> {
+        let bytes = &self.data.readable()[self.query_len + self.oid_bytes..];
+        if self.analyzed {
+            crate::sql::type_inputs::BoundInputs::Prepared(bytes)
+        } else {
+            crate::sql::type_inputs::BoundInputs::Admitted(bytes)
+        }
     }
 }
 
@@ -628,6 +636,7 @@ impl Conn {
                 plan: 0,
                 planner_ready: false,
                 kind: crate::sql::ProtocolStatement::Utility,
+                analyzed: false,
             });
         }
         let mut portals = Vec::with_capacity(config.max_portals);
@@ -699,6 +708,7 @@ impl Conn {
                 budget,
                 config.txn_rows,
                 config.copy_transition_bytes,
+                config.foreign_send_bytes,
             )?,
             prepared,
             portals,
@@ -3359,7 +3369,7 @@ impl Conn {
                             arena: &self.arena,
                         },
                         &mut responder,
-                        &self.copy_transition_scratch,
+                        &mut self.copy_transition_scratch,
                         if extended {
                             crate::sql::CopyFinishMode::Statement
                         } else {
@@ -3519,23 +3529,17 @@ impl Conn {
                     "cannot insert multiple commands into a prepared statement",
                 );
             }
-            (parser.max_param(), statement_kind)
+            // A declared type beyond the highest `$n` the text uses still
+            // declares a parameter, as PostgreSQL's Parse keeps it.
+            ((parser.max_param() as usize).max(n_types), statement_kind)
         };
-        if n_params as usize > MAX_BIND_PARAMS {
+        if n_params > MAX_BIND_PARAMS {
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 crate::stack_format!(96, "too many parameters (the limit is {})", MAX_BIND_PARAMS)
                     .as_str(),
-            );
-        }
-        if n_types > n_params as usize {
-            return ext_err(
-                &mut self.send,
-                &mut self.phase,
-                sqlstate::PROTOCOL_VIOLATION,
-                "Parse message supplies more parameter types than the statement uses",
             );
         }
         if let Err(error) =
@@ -3665,16 +3669,24 @@ impl Conn {
         };
         // PostgreSQL fixes every parameter type at Parse and reports one it
         // cannot determine (`42P18`) there; Bind and Describe reuse the types.
-        let param_oid_bytes = match engine
+        // Its parse analysis then converts the statement's literals.
+        let analyzed = engine
             .infer_param_types(
                 query,
                 &self.arena,
                 &self.txn,
-                n_params as usize,
+                n_params,
                 param_oid_bytes,
-                bound_inputs,
+                crate::sql::type_inputs::BoundInputs::Admitted(bound_inputs),
             )
             .and_then(|oids| {
+                let inputs = engine.analyze_protocol_statement(
+                    query,
+                    &self.arena,
+                    &self.txn,
+                    oids,
+                    bound_inputs,
+                )?;
                 let bytes = self
                     .arena
                     .alloc_slice_with(oids.len() * 4, |_| 0u8)
@@ -3682,9 +3694,10 @@ impl Conn {
                 for (target, oid) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(oids.iter()) {
                     *target = oid.to_be_bytes();
                 }
-                Ok(&*bytes)
-            }) {
-            Ok(bytes) => bytes,
+                Ok((&*bytes, inputs))
+            });
+        let (param_oid_bytes, bound_inputs) = match analyzed {
+            Ok(analyzed) => analyzed,
             Err(error) => {
                 self.sqlprep.clear_request_type_inputs();
                 if self.txn.is_explicit() {
@@ -3708,6 +3721,10 @@ impl Conn {
                 entry.plan,
             ));
         entry.data.clear();
+        let (analyzed, bound_inputs) = match bound_inputs {
+            crate::sql::type_inputs::BoundInputs::Admitted(bytes) => (false, bytes),
+            crate::sql::type_inputs::BoundInputs::Prepared(bytes) => (true, bytes),
+        };
         if query
             .len()
             .saturating_add(param_oid_bytes.len())
@@ -3743,6 +3760,7 @@ impl Conn {
         entry.plan = plan;
         entry.planner_ready = false;
         entry.kind = statement_kind;
+        entry.analyzed = analyzed;
         self.sqlprep.clear_request_type_inputs();
         if name.is_empty()
             && let Some(prior) = unnamed
@@ -4463,6 +4481,7 @@ impl Conn {
                                 text,
                                 params,
                                 param_oids,
+                                prepared.type_inputs(),
                                 pending.owner,
                                 pending.deadline,
                                 &mut self.txn,
@@ -5140,6 +5159,7 @@ impl Conn {
                     source,
                     &[],
                     &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                     pending.owner,
                     pending.deadline,
                     &mut self.txn,
@@ -7097,18 +7117,34 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
     Step::Continue
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 #[path = "conn/bind_inputs_tests.rs"]
 mod bind_inputs_tests;
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 #[path = "conn/result_output_tests.rs"]
 mod result_output_tests;
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 #[path = "conn/sleep_tests.rs"]
 mod sleep_tests;
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 
@@ -11060,7 +11096,7 @@ mod tests {
             Ok(_) => panic!("connection accepted an incomplete startup reservation"),
             Err(error) => error,
         };
-        assert_eq!(error.what, "copy_transition_bytes");
+        assert_eq!(error.what, "copy_foreign_bytes");
         assert_eq!(error.requested, error.remaining + 1);
     }
 

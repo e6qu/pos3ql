@@ -1784,7 +1784,7 @@ impl SequenceAccess for SeqEval<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
@@ -3050,6 +3050,7 @@ mod tests {
                     &[crate::sql::types::Datum::Null],
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Cursor(1),
                     |_| Ok(()),
                 )
@@ -3117,6 +3118,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Cursor(1),
                     |_| Ok(()),
                 )

@@ -2328,6 +2328,13 @@ fn select_correlated<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
+    // Its own `WITH` queries are FROM items of the query: read through their
+    // queries, which may name outer columns themselves.
+    let select = if select.with.is_empty() {
+        select
+    } else {
+        super::expand_ctes(select, storage, txid, arena)?
+    };
     let scope = select
         .from
         .as_ref()
@@ -4713,34 +4720,47 @@ fn run_subquery<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
+    // Without ORDER BY, LIMIT ends the scan once its rows are read, as
+    // PostgreSQL's Limit stops pulling from the plan below it.
+    let stop_after = if select.order_by.is_empty() && select.limit.is_some() {
+        let offset =
+            crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
+        Some(offset.saturating_add(limit))
+    } else {
+        None
+    };
     let mut vals = ArenaList::new(arena);
     let mut keys = ArenaList::new(arena);
-    scan_source_with_pax_columns(
-        storage,
-        &scope,
-        from,
-        txid,
-        select.where_clause,
-        arena,
-        params,
-        &hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            let chained_row = Chained { inner: row, outer };
-            let value = eval_full(item, arena, params, &chained_row, &hooks)?;
-            vals.push(value).map_err(|_| arena_full())?;
-            for o in select.order_by.iter() {
-                // A positional `ORDER BY 1` sorts by the single output column.
-                let key = match o.expression {
-                    Expr::Int(_) => value,
-                    e => eval_full(e, arena, params, &chained_row, &hooks)?,
-                };
-                keys.push(key).map_err(|_| arena_full())?;
-            }
-            Ok(true)
-        },
-    )?;
+    // `LIMIT 0` reads no row.
+    if stop_after != Some(0) {
+        scan_source_with_pax_columns(
+            storage,
+            &scope,
+            from,
+            txid,
+            select.where_clause,
+            arena,
+            params,
+            &hooks,
+            outer,
+            pax_columns,
+            &mut |row| {
+                let chained_row = Chained { inner: row, outer };
+                let value = eval_full(item, arena, params, &chained_row, &hooks)?;
+                vals.push(value).map_err(|_| arena_full())?;
+                for o in select.order_by.iter() {
+                    // A positional `ORDER BY 1` sorts by the single output column.
+                    let key = match o.expression {
+                        Expr::Int(_) => value,
+                        e => eval_full(e, arena, params, &chained_row, &hooks)?,
+                    };
+                    keys.push(key).map_err(|_| arena_full())?;
+                }
+                Ok(stop_after.is_none_or(|stop| (vals.len() as u64) < stop))
+            },
+        )?;
+    }
 
     let count = vals.len();
     let vals = vals.as_slice();

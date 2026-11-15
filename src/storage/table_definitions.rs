@@ -13,7 +13,7 @@ use super::table_names::{
     DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope, TableNames,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 use super::TableDefBuilder;
 use super::{
     CatalogDdlState, DatabaseOid, MAX_COLUMNS, Ownership, PendingTableDef, PendingTableDefSlot,
@@ -1004,7 +1004,7 @@ impl<'a> PendingDefinitionRead<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::super::{ColumnMeta, MAX_COLUMNS, SqlName};
     use super::*;

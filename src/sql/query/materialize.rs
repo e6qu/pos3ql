@@ -449,6 +449,20 @@ fn encode_materialized_row<'a>(
     layout: &MaterializedLayout<'_>,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
+    encode_materialized_row_in(scope, row, projected, keys, layout, true, arena)
+}
+
+/// [`encode_materialized_row`] into the persistent tail, or the arena's
+/// front when the caller rewinds it after copying the row out.
+fn encode_materialized_row_in<'a>(
+    scope: &QueryScope<'a>,
+    row: &JoinRow<'_, 'a, '_>,
+    projected: &[Datum<'a>],
+    keys: &[Datum<'a>],
+    layout: &MaterializedLayout<'_>,
+    persistent: bool,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
     let value = |index| {
         materialized_value_at(
             scope,
@@ -463,9 +477,12 @@ fn encode_materialized_row<'a>(
         )
     };
     let row_bytes = crate::sql::exec::projected_row_len_by(layout.stored_width, value)?;
-    let output = arena
-        .alloc_persistent_slice_with(row_bytes, |_| 0u8)
-        .map_err(|_| arena_full())?;
+    let output = if persistent {
+        arena.alloc_persistent_slice_with(row_bytes, |_| 0u8)
+    } else {
+        arena.alloc_slice_with(row_bytes, |_| 0u8)
+    }
+    .map_err(|_| arena_full())?;
     let len = crate::sql::exec::encode_projected_by_into(layout.stored_width, value, output)?;
     Ok(&output[..len])
 }
@@ -1075,6 +1092,13 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "a locked row changed on the nullable side of a full join"
+                    ));
+                }
+                // A locking query keeps its subqueries in place.
+                crate::sql::ast::JoinKind::Semi | crate::sql::ast::JoinKind::Anti => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a locking query joined a pulled-up subquery"
                     ));
                 }
             }
@@ -1933,6 +1957,7 @@ pub(crate) fn materialized_rows<'a>(
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
     rank_window: Option<usize>,
+    lock_window: Option<u64>,
     stages: &instrument::Stages,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
@@ -1995,6 +2020,23 @@ pub(crate) fn materialized_rows<'a>(
 
     let stored_width = width + n_keys + n_raw + n_identities;
     let mut rows = ArenaList::new_persistent(arena);
+    // Rows read in scan order under a limit are locked as the scan returns
+    // them, and the scan stops once the limit has its rows, as PostgreSQL's
+    // `LockRows` pulls only the rows its `Limit` reads.
+    let mut lock_pass = match lock_window {
+        Some(window) => Some((
+            LockedRowRecheck::new(
+                storage, txid, statement, scope, from, correlated, base, params, hooks, outer,
+                arena,
+            )?,
+            arena
+                .alloc_slice_with(scope.n, |_| None)
+                .map_err(|_| arena_full())?,
+            window,
+        )),
+        None => None,
+    };
+    let mut locked = 0u64;
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
     let mut encode = |row: &JoinRow<'_, 'a, '_>| {
@@ -2033,11 +2075,29 @@ pub(crate) fn materialized_rows<'a>(
                     },
                     arena,
                 )?;
+                let output = match lock_pass.as_mut() {
+                    Some((recheck, rowids, _)) => {
+                        decode_source_rowids(output, identities_at, n_identities, rowids)?;
+                        match recheck
+                            .lock(storage, txid, output, rowids, arena)?
+                            .row(output)
+                        {
+                            Some(row) => {
+                                locked += 1;
+                                row
+                            }
+                            None => return Ok(()),
+                        }
+                    }
+                    None => output,
+                };
                 rows.push(output).map_err(|_| arena_full())?;
                 Ok(())
             },
         )?;
-        Ok(true)
+        Ok(lock_pass
+            .as_ref()
+            .is_none_or(|(_, _, window)| locked < *window))
     };
     if let Some(indexed) = ordered_candidates.as_ref() {
         scan_source_recycling_with_indexed_candidates(
@@ -2638,6 +2698,22 @@ pub(crate) fn external_materialized_into<'a>(
             right,
         )
     };
+    // As in memory: rows read in scan order under a limit are locked as the
+    // scan returns them, and the scan stops at the limit.
+    let mut lock_pass = match locked_scan_window(statement, limit, offset) {
+        Some(window) => Some((
+            LockedRowRecheck::new(
+                storage, txid, statement, scope, from, correlated, base, params, hooks, outer,
+                arena,
+            )?,
+            arena
+                .alloc_slice_with(scope.n, |_| None)
+                .map_err(|_| arena_full())?,
+            window,
+        )),
+        None => None,
+    };
+    let mut locked = 0u64;
     let mut push = |row: &JoinRow<'_, 'a, '_>| {
         let mark = arena.mark();
         let result = for_each_materialized_projection(
@@ -2661,6 +2737,37 @@ pub(crate) fn external_materialized_into<'a>(
             plan.has_srf,
             outer,
             &mut |row, projected, keys| {
+                if let Some((recheck, rowids, _)) = lock_pass.as_mut() {
+                    // Copied into the external run before the rewind below.
+                    let encoded = encode_materialized_row_in(
+                        scope,
+                        row,
+                        projected,
+                        keys,
+                        &MaterializedLayout {
+                            width: plan.width,
+                            n_keys: plan.n_keys,
+                            identities_at: plan.identities_at,
+                            stored_width: plan.width + plan.n_keys + plan.n_raw + plan.n_identities,
+                            raw_columns: plan.raw_columns.as_ref(),
+                        },
+                        false,
+                        arena,
+                    )?;
+                    decode_source_rowids(encoded, plan.identities_at, plan.n_identities, rowids)?;
+                    let Some(encoded) = recheck
+                        .lock(storage, txid, encoded, rowids, arena)?
+                        .row(encoded)
+                    else {
+                        return Ok(());
+                    };
+                    locked += 1;
+                    return storage
+                        .with_block_store(|blocks| {
+                            sorter.push_encoded(blocks, encoded, &mut compare)
+                        })
+                        .expect("spill-attached block store");
+                }
                 storage
                     .with_block_store(|blocks| {
                         sorter.push_projected_by(
@@ -2689,7 +2796,9 @@ pub(crate) fn external_materialized_into<'a>(
         // external run before the callback returned; none escapes.
         unsafe { arena.rewind_to(mark) };
         result?;
-        Ok(true)
+        Ok(lock_pass
+            .as_ref()
+            .is_none_or(|(_, _, window)| locked < *window))
     };
     if let Some(indexed) = ordered_candidates.as_ref() {
         scan_source_recycling_with_indexed_candidates(
@@ -3036,6 +3145,19 @@ pub(crate) fn extend_ties(
     Ok(end)
 }
 
+/// The rows a locking query returning rows in scan order locks before its
+/// scan stops: its `OFFSET` and `LIMIT` window. None when the rows are
+/// sorted, deduplicated or expanded first, or no limit bounds them.
+pub(crate) fn locked_scan_window(statement: &Select<'_>, limit: u64, offset: u64) -> Option<u64> {
+    (!statement.locking.is_empty()
+        && statement.order_by.is_empty()
+        && !statement.distinct
+        && statement.distinct_on.is_empty()
+        && !statement.with_ties
+        && limit != u64::MAX)
+        .then(|| offset.saturating_add(limit))
+}
+
 /// The stages of a materialized query that `EXPLAIN ANALYZE` counts. A
 /// `LIMIT` stops PostgreSQL's `Unique` early, after fewer sorted rows than
 /// the deduplication before the sort reads, so that sort is not counted.
@@ -3090,6 +3212,7 @@ pub(crate) fn materialized_select<'a>(
             && !statement.with_ties
             && statement.locking.is_empty())
         .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+        locked_scan_window(statement, limit, offset),
         &stages,
     ) {
         Ok(x) => x,

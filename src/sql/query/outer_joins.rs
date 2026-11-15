@@ -94,7 +94,10 @@ pub(crate) fn reduce_outer_joins<'a>(
         // nothing passes through a full join.
         upper = match kind {
             JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Right => upper | own,
-            JoinKind::Left => upper,
+            // A semi join drops the left rows its condition matches nothing
+            // for; an anti join returns exactly those.
+            JoinKind::Semi => upper | (own & left),
+            JoinKind::Left | JoinKind::Anti => upper,
             JoinKind::Full => 0,
         };
     }

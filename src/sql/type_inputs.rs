@@ -828,6 +828,89 @@ fn validate_image_for(bytes: &[u8], owner: Owner) -> Result<usize, SqlError> {
     Ok(count)
 }
 
+/// A statement's bound input map and what it holds. Admission binds only
+/// array domain inputs; a prepared statement whose parse analysis ran also
+/// holds the built-in literals it converted, as PostgreSQL's analysis does.
+#[derive(Clone, Copy)]
+pub(crate) enum BoundInputs<'a> {
+    Admitted(&'a [u8]),
+    Prepared(&'a [u8]),
+}
+
+impl<'a> BoundInputs<'a> {
+    pub(crate) fn image(self) -> InputImage {
+        match self {
+            Self::Admitted(_) => InputImage::Admitted,
+            Self::Prepared(_) => InputImage::Prepared,
+        }
+    }
+
+    pub(crate) fn decode(self, arena: &'a Arena) -> Result<&'a [Binding<'a>], SqlError> {
+        match self {
+            Self::Admitted(bytes) | Self::Prepared(bytes) => self.image().decode(bytes, arena),
+        }
+    }
+
+    /// Checks that a parser restored from this map bound every input it must.
+    pub(crate) fn validate(
+        self,
+        parser: &super::parser::Parser<'_>,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        self.image().validate(parser, storage, txid)
+    }
+}
+
+/// What an input map holds, which decides its encoding and the inputs a
+/// parser restored from it must have bound: see [`BoundInputs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputImage {
+    Admitted,
+    Prepared,
+}
+
+impl InputImage {
+    fn owner(self) -> Owner {
+        match self {
+            Self::Admitted => Owner::Durable,
+            Self::Prepared => Owner::Session,
+        }
+    }
+
+    pub(crate) fn encoded_len(self, bindings: &[Binding<'_>]) -> Result<usize, SqlError> {
+        encoded_len_for(bindings, self.owner())
+    }
+
+    pub(crate) fn encode_into(
+        self,
+        bindings: &[Binding<'_>],
+        output: &mut [u8],
+    ) -> Result<usize, SqlError> {
+        encode_for(bindings, output, self.owner())
+    }
+
+    pub(crate) fn decode<'a>(
+        self,
+        bytes: &'a [u8],
+        arena: &'a Arena,
+    ) -> Result<&'a [Binding<'a>], SqlError> {
+        decode_for(bytes, arena, self.owner())
+    }
+
+    pub(crate) fn validate(
+        self,
+        parser: &super::parser::Parser<'_>,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        match self {
+            Self::Admitted => validate_restored(parser, storage, txid),
+            Self::Prepared => validate_prepared(parser, storage, txid),
+        }
+    }
+}
+
 /// Validate the complete image before invoking any consumer. Catalog recovery
 /// can inspect source/type identities without reserving temporary descriptors.
 pub(crate) fn visit<'a>(
@@ -1047,7 +1130,7 @@ pub(crate) fn value<'a>(encoded: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>
     Ok(output[0])
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

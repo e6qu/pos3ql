@@ -164,10 +164,16 @@ pub(crate) fn walk<'a>(
 ) -> Result<DependencyWalk<'a>, SqlError> {
     let mut edge_count = 0usize;
     let mark = arena.mark();
-    for_each_dependency(storage, txid, arena, &mut |_| {
-        edge_count += 1;
-        Ok(())
-    })?;
+    for_each_dependency(
+        storage,
+        txid,
+        crate::sql::catalog_snapshot::TableSelection::All,
+        arena,
+        &mut |_| {
+            edge_count += 1;
+            Ok(())
+        },
+    )?;
     // SAFETY: the counting pass keeps no reference into its temporaries.
     unsafe { arena.rewind_to(mark) };
     let edges = arena
@@ -179,11 +185,17 @@ pub(crate) fn walk<'a>(
         .map_err(|_| table_full())?;
     let edges_mark = arena.mark();
     let mut filled = 0usize;
-    for_each_dependency(storage, txid, arena, &mut |edge| {
-        *edges.get_mut(filled).ok_or_else(table_full)? = edge;
-        filled += 1;
-        Ok(())
-    })?;
+    for_each_dependency(
+        storage,
+        txid,
+        crate::sql::catalog_snapshot::TableSelection::All,
+        arena,
+        &mut |edge| {
+            *edges.get_mut(filled).ok_or_else(table_full)? = edge;
+            filled += 1;
+            Ok(())
+        },
+    )?;
     // SAFETY: the edges were copied into memory allocated before the mark.
     unsafe { arena.rewind_to(edges_mark) };
     let edges = &edges[..filled];

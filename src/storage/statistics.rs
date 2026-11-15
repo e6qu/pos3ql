@@ -957,6 +957,12 @@ impl Storage {
     }
 
     /// Estimates consult metadata and resident counts without object I/O.
+    /// Whether the table's planning estimate comes from collected
+    /// statistics rather than its resident row count.
+    pub(crate) fn has_planning_statistics(&self, table_slot: usize) -> bool {
+        self.tables[table_slot].statistics.read().committed.valid
+    }
+
     pub(crate) fn planning_row_estimate(&self, table_slot: usize) -> u64 {
         let table = &self.tables[table_slot];
         let resident_rows = table.rows.len() as u64;
@@ -1135,7 +1141,11 @@ impl Storage {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::storage::{ColType, ColumnStatistics, DatabaseOid};

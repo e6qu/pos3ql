@@ -321,7 +321,11 @@ impl Storage {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::super::tests::{test_budget, test_config};
     use super::super::{
@@ -699,7 +703,11 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod oid_identity_tests {
     use super::*;
     use crate::sql::types::{ArrElem, ColType, oid};

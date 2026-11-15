@@ -216,7 +216,11 @@ pub fn hash_bytea_extended(value: &[u8], seed: i64) -> i64 {
     ((u64::from(high) << 32) | u64::from(low)) as i64
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

@@ -1427,7 +1427,7 @@ impl Engine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod parameter_tests {
     use super::*;
     use crate::{mem::budget::Budget, sql::types::Datum};

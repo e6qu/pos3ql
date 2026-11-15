@@ -1983,7 +1983,11 @@ impl ForeignCatalog {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod prepared_tests {
     use super::*;
 

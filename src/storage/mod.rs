@@ -38,7 +38,11 @@ mod partition_triggers;
 pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
 mod prepared_catalog;
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod prepared_catalog_tests;
 mod prepared_foreign;
 use parameter_acls::ParameterAclGrantIdentity;
@@ -139,6 +143,7 @@ mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
+pub(crate) use table_names::VisibleTableNames;
 mod table_publication;
 mod type_contracts;
 mod type_creation;
@@ -170,7 +175,7 @@ mod prepared_objects;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod heap_relocation;
 mod row_heap;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(crate) use heap_relocation::HeapRelocationEntry;
 pub(crate) use heap_relocation::HeapRelocationWorkspace;
 pub(crate) use row_cleanup::{
@@ -3550,31 +3555,7 @@ pub(crate) fn partition_bound_matches(
         (PartitionStrategy::Hash, PartitionBound::Hash { modulus, remainder }) => {
             let mut hash = 0u64;
             for index in 0..usize::from(n_keys) {
-                let value = key(index)?;
-                let part = match value {
-                    crate::sql::types::Datum::Null => 0,
-                    crate::sql::types::Datum::Int2(value) => {
-                        postgres_hash_uint32_extended(value as i32 as u32)
-                    }
-                    crate::sql::types::Datum::Int4(value) => {
-                        postgres_hash_uint32_extended(value as u32)
-                    }
-                    crate::sql::types::Datum::Int8(value) => {
-                        let low = value as u32;
-                        let high = (value >> 32) as u32;
-                        postgres_hash_uint32_extended(low ^ if value >= 0 { high } else { !high })
-                    }
-                    _ => {
-                        return Err(sql_err!(
-                            crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                            "non-integer HASH partition key reached routing"
-                        ));
-                    }
-                };
-                hash ^= part
-                    .wrapping_add(0x49a0_f4dd_15e5_a8e3)
-                    .wrapping_add(hash << 54)
-                    .wrapping_add(hash >> 7);
+                hash = partition_hash_combine(hash, key(index)?)?;
             }
             Ok(hash % u64::from(modulus) == u64::from(remainder))
         }
@@ -3582,51 +3563,126 @@ pub(crate) fn partition_bound_matches(
     }
 }
 
-fn postgres_hash_uint32_extended(value: u32) -> u64 {
-    fn mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
-        a = a.wrapping_sub(c);
-        a ^= c.rotate_left(4);
-        c = c.wrapping_add(b);
-        b = b.wrapping_sub(a);
-        b ^= a.rotate_left(6);
-        a = a.wrapping_add(c);
-        c = c.wrapping_sub(b);
-        c ^= b.rotate_left(8);
-        b = b.wrapping_add(a);
-        a = a.wrapping_sub(c);
-        a ^= c.rotate_left(16);
-        c = c.wrapping_add(b);
-        b = b.wrapping_sub(a);
-        b ^= a.rotate_left(19);
-        a = a.wrapping_add(c);
-        c = c.wrapping_sub(b);
-        c ^= b.rotate_left(4);
-        b = b.wrapping_add(a);
-        (a, b, c)
+/// `compute_partition_hash_value`'s step: a key's seeded hash combined into
+/// the row's (`hash_combine64`); a null key is skipped.
+pub(crate) fn partition_hash_combine(
+    hash: u64,
+    value: crate::sql::types::Datum<'_>,
+) -> Result<u64, SqlError> {
+    if value.is_null() {
+        return Ok(hash);
     }
-    let initial = 0x9e37_79b9u32.wrapping_add(4).wrapping_add(3_923_095);
-    let seed = 0x7a5b_2236_7996_dcfd_u64;
-    let (mut a, mut b, mut c) = mix(
-        initial.wrapping_add((seed >> 32) as u32),
-        initial.wrapping_add(seed as u32),
-        initial,
-    );
-    a = a.wrapping_add(value);
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(14));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(11));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(25));
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(16));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(4));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(14));
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(24));
-    (u64::from(b) << 32) | u64::from(c)
+    let part = partition_hash_extended(value)?;
+    Ok(hash
+        ^ part
+            .wrapping_add(0x49a0_f4dd_15e5_a8e3)
+            .wrapping_add(hash << 54)
+            .wrapping_add(hash >> 7))
+}
+
+/// `HASH_PARTITION_SEED`, which every partition key's hash is seeded with.
+const HASH_PARTITION_SEED: i64 = 0x7a5b_2236_7996_dcfd;
+
+/// A partition key value's seeded hash, as its type's default hash operator
+/// class computes it (`hashint4extended`, `hashtextextended`, ...); a null
+/// adds nothing. The key types `partition_hash_supported` admits.
+fn partition_hash_extended(value: crate::sql::types::Datum<'_>) -> Result<u64, SqlError> {
+    use crate::sql::identity::{hash_bytea_extended, hash_int64_input, hash_uint32_extended};
+    use crate::sql::types::Datum;
+    let seed = HASH_PARTITION_SEED;
+    Ok(match value {
+        Datum::Null => 0,
+        Datum::Int2(value) => hash_uint32_extended(value as i32 as u32, seed),
+        Datum::Int4(value) | Datum::Date(value) => hash_uint32_extended(value as u32, seed),
+        Datum::Int8(value)
+        | Datum::Timestamp(value)
+        | Datum::Timestamptz(value)
+        | Datum::Time(value) => hash_uint32_extended(hash_int64_input(value), seed),
+        Datum::Oid(value) => hash_uint32_extended(value, seed),
+        // `bool_ops` hashes the value as a `char`.
+        Datum::Bool(value) => hash_uint32_extended(u32::from(value), seed),
+        Datum::Char(value) => hash_uint32_extended((value as i8 as i32) as u32, seed),
+        Datum::Text(value) => hash_bytea_extended(value.as_bytes(), seed) as u64,
+        // `hashbpcharextended` ignores trailing spaces.
+        Datum::Bpchar(value) => {
+            hash_bytea_extended(value.trim_end_matches(' ').as_bytes(), seed) as u64
+        }
+        Datum::Bytea(value) => hash_bytea_extended(value, seed) as u64,
+        Datum::Uuid(value) => hash_bytea_extended(&value, seed) as u64,
+        Datum::Numeric(value) => numeric_hash_extended(&value, seed),
+        Datum::Float4(value) => float8_hash_extended(f64::from(value), seed),
+        Datum::Float8(value) => float8_hash_extended(value, seed),
+        _ => {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "a HASH partition key of an unsupported type reached routing"
+            ));
+        }
+    })
+}
+
+/// `hash_numeric_extended`: the base-10000 digits between the first and last
+/// nonzero ones in native byte order, the weight mixed in by XOR; NaN and
+/// the infinities hash to the seed and zero to the seed minus one.
+fn numeric_hash_extended(value: &crate::sql::numeric::Numeric<'_>, seed: i64) -> u64 {
+    use crate::sql::numeric::Sign;
+    if matches!(value.sign, Sign::NaN | Sign::PosInf | Sign::NegInf) {
+        return seed as u64;
+    }
+    let count = value.ndigits();
+    let first = (0..count).find(|&at| value.digit(at) != 0);
+    let Some(first) = first else {
+        return seed.wrapping_sub(1) as u64;
+    };
+    let last = (0..count)
+        .rev()
+        .find(|&at| value.digit(at) != 0)
+        .expect("a nonzero digit exists");
+    let mut bytes = [0u8; 2 * crate::sql::numeric::MAX_NDIGITS];
+    for (at, index) in (first..=last).enumerate() {
+        bytes[2 * at..2 * at + 2].copy_from_slice(&value.digit(index).to_ne_bytes());
+    }
+    let weight = i32::from(value.weight) - first as i32;
+    let hashed = crate::sql::identity::hash_bytea_extended(&bytes[..2 * (last - first + 1)], seed);
+    (hashed as u64) ^ (weight as i64 as u64)
+}
+
+/// `hashfloat8extended`: zero (of either sign) hashes to the seed, and every
+/// NaN alike.
+fn float8_hash_extended(value: f64, seed: i64) -> u64 {
+    if value == 0.0 {
+        return seed as u64;
+    }
+    let value = if value.is_nan() { f64::NAN } else { value };
+    crate::sql::identity::hash_bytea_extended(&value.to_ne_bytes(), seed) as u64
+}
+
+/// The partition key types whose default hash operator class routing
+/// computes: PostgreSQL's integer, text, `bool`, `"char"`, `oid`, float,
+/// `numeric`, date and time, `bytea` and `uuid` hash functions.
+pub(crate) fn partition_hash_supported(ctype: crate::sql::types::ColType) -> bool {
+    use crate::sql::types::ColType;
+    matches!(
+        ctype,
+        ColType::Int2
+            | ColType::Int4
+            | ColType::Int8
+            | ColType::Text
+            | ColType::Varchar
+            | ColType::Bpchar
+            | ColType::Bool
+            | ColType::Char
+            | ColType::Oid
+            | ColType::Float4
+            | ColType::Float8
+            | ColType::Numeric
+            | ColType::Date
+            | ColType::Timestamp
+            | ColType::Timestamptz
+            | ColType::Time
+            | ColType::Bytea
+            | ColType::Uuid
+    )
 }
 
 /// A heap-issued location. Relocation invalidates detached locations even
@@ -17769,6 +17825,38 @@ impl Iterator for DatabaseIter<'_> {
     }
 }
 
+/// One transaction's explicit table indexes grouped by table slot, in index
+/// slot order within each table.
+pub(crate) struct TableIndexes<'a> {
+    starts: &'a [u32],
+    slots: &'a [u32],
+    transaction: u32,
+}
+
+impl TableIndexes<'_> {
+    pub(crate) fn for_table<'s>(
+        &'s self,
+        storage: &'s Storage,
+        table: usize,
+    ) -> impl Iterator<Item = IndexDef> + 's {
+        let identity = storage.tables[table].identity();
+        let selected = storage.catalog_object_identity(
+            catalog_sources::CatalogObjectSlot::Table(table),
+            identity.database,
+            identity.created_at,
+        );
+        self.slots[self.starts[table] as usize..self.starts[table + 1] as usize]
+            .iter()
+            .map(|&slot| storage.index(slot as usize))
+            .filter(move |index| {
+                index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == selected)
+            })
+            .filter_map(move |index| storage.project_index_binding(index, self.transaction))
+    }
+}
+
 struct IndexIter<'a, F = fn(&IndexDef) -> bool> {
     catalog: &'a Mutex<FixedVec<IndexDef>>,
     next_slot: usize,
@@ -17884,6 +17972,8 @@ impl Iterator for MatviewIter<'_> {
 
 pub struct Storage {
     transaction_mode: crate::config::TransactionMode,
+    #[cfg(test)]
+    pub(crate) catalog_capture_cross_check: bool,
     catalog_history: std::sync::Arc<CatalogHistory>,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
@@ -24323,6 +24413,8 @@ impl Storage {
             transaction_capacity * table_capacity,
         )?;
         let storage = Self {
+            #[cfg(test)]
+            catalog_capture_cross_check: config.catalog_capture_cross_check,
             heap,
             tables,
             table_creation: Mutex::new(()),
@@ -42918,6 +43010,42 @@ impl Storage {
         self.find_table_name(table_names::TableNameScope::Transaction(txid), schema, name)
     }
 
+    /// Every table `find_visible` can return for `txid`, keyed by its schema
+    /// and name, so a pass resolving many stored names (foreign-key parents)
+    /// reads each table definition once instead of scanning per lookup.
+    pub(crate) fn visible_table_names<'a>(
+        &self,
+        txid: u32,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<table_names::VisibleTableNames<'a>, SqlError> {
+        let database = current_database();
+        let scope = table_names::TableNameScope::Transaction(txid);
+        let count = self.table_count();
+        let capacity = count
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(crate::sql::eval::arena_full)?
+            .max(8);
+        let slots = arena
+            .alloc_slice_with(capacity, |_| table_names::VisibleTableNames::EMPTY)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let mut names = table_names::VisibleTableNames::new(slots, txid);
+        for slot in 0..count {
+            let definition = self.table_def(slot, txid);
+            let identity = definition.identity();
+            if identity.database == database && scope.visible(identity.existence) {
+                // The lowest slot wins, as in `find_visible`'s ascending scan.
+                names.insert_first(
+                    self,
+                    slot,
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                );
+            }
+        }
+        Ok(names)
+    }
+
     fn find_table_name(
         &self,
         scope: table_names::TableNameScope,
@@ -50087,6 +50215,17 @@ impl Storage {
         Ok(found)
     }
 
+    /// The schema of the first visible user routine named `name` in the
+    /// current database, in catalog order.
+    pub(crate) fn visible_routine_schema(&self, name: &str, txid: u32) -> Option<SqlName> {
+        self.routine_entries().find_map(|(_, routine)| {
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name)
+                .then(|| routine.schema_for(txid))
+        })
+    }
+
     /// Whether a visible user routine of any schema with this name is volatile.
     pub(crate) fn has_volatile_routine_named(&self, name: &str, txid: u32) -> bool {
         self.routine_entries().any(|(slot, routine)| {
@@ -53458,6 +53597,59 @@ impl Storage {
         self.indexes_for_selected(Some(slot), txid)
     }
 
+    /// The explicit indexes of each table `include` selects, visible to
+    /// `txid`, grouped by table in one pass over the index catalog: the same
+    /// rows `indexes_for_slot` yields, for a pass that visits every table.
+    pub(crate) fn table_indexes<'a>(
+        &self,
+        txid: u32,
+        include: impl Fn(usize) -> bool,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<TableIndexes<'a>, SqlError> {
+        let full = |_| crate::sql::eval::arena_full();
+        let count = self.table_count();
+        let database = current_database();
+        let starts = arena.alloc_slice_with(count + 1, |_| 0u32).map_err(full)?;
+        let catalog = self.index_catalog();
+        let owner = |index: &IndexDef| {
+            let binding = index.table_binding?;
+            let catalog_sources::CatalogObjectSlot::Table(table) = binding.source.slot() else {
+                return None;
+            };
+            // The binding's table identity is compared after the catalog
+            // lock is released, in `for_table`.
+            (table < count
+                && index.database == database
+                && matches!(index.relation, IndexRelationSource::Table)
+                && include(table)
+                && index.visible_to(txid))
+            .then_some(table)
+        };
+        for index in catalog.iter() {
+            if let Some(table) = owner(index) {
+                starts[table + 1] += 1;
+            }
+        }
+        for table in 0..count {
+            starts[table + 1] += starts[table];
+        }
+        let slots = arena
+            .alloc_slice_with(starts[count] as usize, |_| 0u32)
+            .map_err(full)?;
+        let next = arena.alloc_slice_copy(&starts[..count]).map_err(full)?;
+        for (slot, index) in catalog.iter().enumerate() {
+            if let Some(table) = owner(index) {
+                slots[next[table] as usize] = slot as u32;
+                next[table] += 1;
+            }
+        }
+        Ok(TableIndexes {
+            starts,
+            slots,
+            transaction: txid,
+        })
+    }
+
     fn indexes_for_selected(
         &self,
         slot: Option<usize>,
@@ -53471,15 +53663,14 @@ impl Storage {
                 identity.created_at,
             )
         });
+        // The table test runs first and before the iterator copies a
+        // definition: a catalog pass asks this of every table.
         self.matching_indexes(move |x| {
-            x.database == current_database()
+            x.table_binding
+                .is_some_and(|binding| Some(binding.source) == selected)
+                && x.database == current_database()
                 && x.visible_to(txid)
                 && matches!(x.relation, IndexRelationSource::Table)
-        })
-        .filter(move |(_, index)| {
-            index
-                .table_binding
-                .is_some_and(|binding| Some(binding.source) == selected)
         })
         .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }
@@ -53643,6 +53834,16 @@ impl Storage {
 
     fn index(&self, slot: usize) -> IndexDef {
         self.index_catalog()[slot]
+    }
+
+    /// The table slot an index is bound to, whether or not the index or the
+    /// table is visible: a dropped index keeps its binding until released.
+    pub(crate) fn index_bound_table_slot(&self, slot: usize) -> Option<usize> {
+        let binding = self.index_catalog()[slot].table_binding?;
+        match binding.source.slot() {
+            catalog_sources::CatalogObjectSlot::Table(table) => Some(table),
+            _ => None,
+        }
     }
 
     fn matching_indexes<F: Fn(&IndexDef) -> bool>(&self, accept: F) -> IndexIter<'_, F> {
@@ -60685,7 +60886,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(crate) mod tests {
     use super::*;
 
@@ -60807,8 +61008,16 @@ pub(crate) mod tests {
     include!("native_tests.rs");
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod table_name_tests;
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod startup_budget;

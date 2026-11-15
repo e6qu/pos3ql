@@ -540,7 +540,11 @@ impl CachedArrayElement {
 const _: [(); 6] = [(); core::mem::size_of::<CachedArrayElement>()];
 const _: () = assert!(CachedArrayElement::END <= 1 << 48);
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

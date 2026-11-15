@@ -635,7 +635,11 @@ impl TableCommentIdentity {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
     use super::super::{CatalogDdlState, RuleTarget, comment_stackstr};

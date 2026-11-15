@@ -251,7 +251,8 @@ pub struct Config {
     /// Fixed receive buffer for postgres_fdw queries.
     pub foreign_receive_bytes: usize,
     /// Fixed send buffer for postgres_fdw queries; it also bounds the values
-    /// one `batch_size` INSERT batch queues.
+    /// one `batch_size` INSERT batch queues, and sizes each connection's COPY
+    /// FROM queue for foreign tables.
     pub foreign_send_bytes: usize,
     /// Additional roots for postgres_fdw TLS.
     pub foreign_tls_ca_file: String,
@@ -438,6 +439,10 @@ pub struct Config {
     pub collation_scratch_bytes: usize,
     #[cfg(test)]
     pub(crate) test_data_dir_cleanup: Option<std::sync::Arc<TestDataDirCleanup>>,
+    /// Test builds repeat each commit's reached-table catalog capture over
+    /// every table and fail on any difference.
+    #[cfg(test)]
+    pub(crate) catalog_capture_cross_check: bool,
 }
 
 #[cfg(test)]
@@ -630,6 +635,8 @@ impl Config {
             collation_scratch_bytes: 256 * KIB,
             #[cfg(test)]
             test_data_dir_cleanup: None,
+            #[cfg(test)]
+            catalog_capture_cross_check: true,
         }
     }
 
@@ -2352,7 +2359,11 @@ fn parse_count(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("invalid count '{value}'"))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

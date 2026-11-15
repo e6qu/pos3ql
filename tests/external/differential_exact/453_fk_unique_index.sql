@@ -33,7 +33,7 @@ CREATE TABLE c3a (a int REFERENCES p3 (a));
 CREATE TABLE c3b (a int, FOREIGN KEY (a, a) REFERENCES p3 (a, a));
 CREATE TABLE c3b (a int, FOREIGN KEY (a) REFERENCES p3 (a, b));
 SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
-  WHERE confrelid = 'p3'::regclass ORDER BY 1::text;
+  WHERE confrelid = 'p3'::regclass ORDER BY conrelid::regclass::text;
 -- Column order and NULLS NOT DISTINCT do not matter; the oldest index wins.
 CREATE TABLE p4 (a int, b int);
 CREATE UNIQUE INDEX p4_ba ON p4 (b, a) NULLS NOT DISTINCT;
@@ -51,7 +51,7 @@ CREATE UNIQUE INDEX p6_idx ON p6 (a);
 ALTER TABLE p6 ADD CONSTRAINT p6_uq UNIQUE (a);
 CREATE TABLE c6 (a int REFERENCES p6 (a));
 SELECT conrelid::regclass, conindid::regclass FROM pg_constraint
-  WHERE conrelid IN ('c5'::regclass, 'c6'::regclass) ORDER BY 1::text;
+  WHERE conrelid IN ('c5'::regclass, 'c6'::regclass) ORDER BY conrelid::regclass::text;
 -- A key without referenced columns still uses the primary key.
 CREATE TABLE r (a int UNIQUE, b int PRIMARY KEY);
 CREATE UNIQUE INDEX r_b ON r (b);
@@ -66,7 +66,7 @@ CREATE UNIQUE INDEX s3_a ON s3 (a);
 ALTER TABLE s3 ADD CONSTRAINT s3_u UNIQUE (a), ADD CONSTRAINT s3_fk FOREIGN KEY (b) REFERENCES s3 (a);
 SELECT conrelid::regclass, conname, conindid::regclass FROM pg_constraint
   WHERE contype = 'f' AND conrelid IN ('s1'::regclass, 's2'::regclass, 's3'::regclass)
-  ORDER BY 1::text, 2;
+  ORDER BY conrelid::regclass::text, 2;
 -- The index is checked before privileges and the column counts.
 CREATE TABLE np (a int, b int);
 CREATE TABLE nc (a int, FOREIGN KEY (a) REFERENCES np (a, b));

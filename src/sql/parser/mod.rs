@@ -3339,6 +3339,31 @@ impl<'a> Parser<'a> {
             }
         }
         let order_by = order.as_slice();
+        let (limit, offset, with_ties, limit_all) = self.select_limit(order_by)?;
+        Ok((order_by, limit, offset, with_ties, limit_all))
+    }
+
+    /// Trailing ORDER BY, then LIMIT / OFFSET and row-locking clauses in
+    /// either order, as PostgreSQL's `select_no_parens` accepts them.
+    fn order_limit_locking(
+        &mut self,
+    ) -> Result<(OrderLimit<'a>, &'a [LockClause<'a>]), ParseError> {
+        let ordered = self.order_limit()?;
+        let locking = self.locking_clauses()?;
+        let (order_by, limit, offset, _, limit_all) = ordered;
+        if locking.is_empty() || limit.is_some() || offset.is_some() || limit_all {
+            return Ok((ordered, locking));
+        }
+        let (limit, offset, with_ties, limit_all) = self.select_limit(order_by)?;
+        Ok(((order_by, limit, offset, with_ties, limit_all), locking))
+    }
+
+    /// LIMIT, OFFSET and FETCH, in either order (`select_limit`).
+    #[allow(clippy::type_complexity)]
+    fn select_limit(
+        &mut self,
+        order_by: &[OrderBy<'a>],
+    ) -> Result<(Option<&'a Expr<'a>>, Option<&'a Expr<'a>>, bool, bool), ParseError> {
         // LIMIT and OFFSET accept either order, as in PostgreSQL.
         let mut limit = None;
         let mut offset = None;
@@ -3394,7 +3419,7 @@ impl<'a> Parser<'a> {
                 )
             });
         }
-        Ok((order_by, limit, offset, with_ties, limit_all))
+        Ok((limit, offset, with_ties, limit_all))
     }
 
     /// Parses ASC, DESC, or PostgreSQL's ordering-operator spelling shared by
@@ -3472,9 +3497,8 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
-        // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
-        let locking = self.locking_clauses()?;
+        let ((order_by, limit, offset, with_ties, limit_all), locking) =
+            self.order_limit_locking()?;
         self.allow_into = saved_allow;
         self.windows = enclosing_windows;
         if let SetTree::Select(s) = body {
@@ -3774,8 +3798,8 @@ impl<'a> Parser<'a> {
         let saved_into = self.into_clause.take();
         self.allow_into = true;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
-        let locking = self.locking_clauses()?;
+        let ((order_by, limit, offset, with_ties, limit_all), locking) =
+            self.order_limit_locking()?;
         let stmt_end = self.peek_at;
         self.allow_into = saved_allow;
         let into = self.into_clause.take();
@@ -8648,8 +8672,8 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union_after(first)?;
-        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
-        let locking = self.locking_clauses()?;
+        let ((order_by, limit, offset, with_ties, limit_all), locking) =
+            self.order_limit_locking()?;
         self.allow_into = saved_allow;
         self.windows = enclosing_windows;
         Ok(Select {
@@ -11518,7 +11542,11 @@ impl<'a> Parser<'a> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::Budget;
@@ -11559,6 +11587,29 @@ mod tests {
             let mut p = Parser::new(text, &arena).unwrap();
             f(&mut p)
         })
+    }
+
+    #[test]
+    fn locking_clauses_and_limits_come_in_either_order() {
+        for text in [
+            "SELECT a FROM t ORDER BY a FOR UPDATE LIMIT 2 OFFSET 1",
+            "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1 FOR UPDATE",
+        ] {
+            with_parser(text, |parser| {
+                let Stmt::Select(select) = parser.statement().unwrap() else {
+                    panic!("a SELECT");
+                };
+                assert_eq!(select.locking.len(), 1);
+                assert!(matches!(select.limit, Some(Expr::Int(2))));
+                assert!(matches!(select.offset, Some(Expr::Int(1))));
+                assert_eq!(parser.peeked, Tok::Eof);
+            });
+        }
+        // A locking clause cannot follow the LIMIT after a locking clause.
+        with_parser("SELECT a FROM t FOR UPDATE LIMIT 1 FOR SHARE", |parser| {
+            let parsed = parser.statement();
+            assert!(parsed.is_err() || parser.peeked != Tok::Eof);
+        });
     }
 
     #[test]
@@ -11964,7 +12015,7 @@ mod tests {
                     panic!()
                 };
                 assert!(
-                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to }, .. } if from.len() == 1 && to.len() == 1)
+                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to, .. }, .. } if from.len() == 1 && to.len() == 1)
                 );
                 let Stmt::CreateTable(default) = p.next_stmt().unwrap().unwrap() else {
                     panic!()
@@ -11972,7 +12023,7 @@ mod tests {
                 assert!(matches!(
                     default.partition,
                     PartitionClause::Of {
-                        bound: PartitionBound::Default,
+                        bound: PartitionBound::Default { .. },
                         ..
                     }
                 ));
@@ -15026,7 +15077,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod source_position_tests {
     use super::*;
 

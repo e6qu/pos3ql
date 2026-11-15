@@ -1108,6 +1108,29 @@ cur.execute("SELECT count(*) FROM pg_stat_database_conflicts WHERE datname=curre
 assert cur.fetchone() == (1,)
 print("backend activity/control boundaries ok", admin_pid)
 
+# Parse analysis converts a prepared statement's literals once: the input
+# notice comes back from Parse at the literal's position, later executions of
+# the prepared statement raise none, and an input error fails Parse.
+literal_notices = []
+conn.add_notice_handler(
+    lambda diagnostic: literal_notices.append(
+        (diagnostic.message_primary, diagnostic.statement_position)
+    )
+)
+for _ in range(3):
+    cur.execute("SELECT %s::int, ''::tsquery", (1,), prepare=True)
+    assert cur.fetchone() == (1, "")
+assert literal_notices == [
+    ('text-search query doesn\'t contain lexemes: ""', "17")
+], literal_notices
+try:
+    cur.execute("SELECT %s::int WHERE 2 = 'abc'", (1,), prepare=True)
+    raise AssertionError("a literal's input error must fail Parse")
+except psycopg.errors.InvalidTextRepresentation as error:
+    assert error.diag.message_primary == 'invalid input syntax for type integer: "abc"'
+    assert error.diag.statement_position == "26"
+print("prepared literal conversion at Parse ok")
+
 conn.close()
 observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)

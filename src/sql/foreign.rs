@@ -189,7 +189,26 @@ pub(super) fn decode_foreign_field<'a>(
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    let declared = storage.declared_column_type(&table.columns()[column], txid)?;
+    decode_remote_field(
+        storage,
+        &table.columns()[column],
+        raw,
+        txid,
+        arena,
+        sequences,
+    )
+}
+
+/// A remote text field read into the local column `definition`.
+fn decode_remote_field<'a>(
+    storage: &Storage,
+    definition: &crate::storage::ColumnMeta,
+    raw: Option<&'a [u8]>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    let declared = storage.declared_column_type(definition, txid)?;
     let value = match raw {
         Some(raw) => super::exec::decode_text_input(
             storage,
@@ -210,14 +229,7 @@ pub(super) fn decode_foreign_field<'a>(
     if value.is_null() {
         return Ok(value);
     }
-    super::exec::coerce(
-        value,
-        &table.columns()[column],
-        storage,
-        txid,
-        arena,
-        sequences,
-    )
+    super::exec::coerce(value, definition, storage, txid, arena, sequences)
 }
 
 fn poll_client(
@@ -1272,6 +1284,17 @@ fn scan_cursor(
     fields: usize,
     visit: &mut dyn FnMut(crate::pg::replication_client::SqlDataRow<'_>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let cursor = declare_cursor(storage, lease, query)?;
+    while fetch_batch(storage, lease, cursor, query, fetch_size, fields, visit)? {}
+    close_cursor(storage, lease, cursor)
+}
+
+/// `DECLARE cN CURSOR FOR query`, returning `N`.
+fn declare_cursor(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    query: &str,
+) -> Result<u32, SqlError> {
     let cursor = storage.foreign_client(lease)?.next_cursor_number();
     let mut declare = StackStr::<16_448>::new();
     let _ = write!(declare, "DECLARE c{cursor} CURSOR FOR\n{query}");
@@ -1289,47 +1312,367 @@ fn scan_cursor(
             _ => Err(unexpected_response("DECLARE")),
         },
     )?;
+    Ok(cursor)
+}
+
+/// One `FETCH fetch_size FROM cN`; whether a full batch came back, so more
+/// rows may follow.
+fn fetch_batch(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    cursor: u32,
+    query: &str,
+    fetch_size: i32,
+    fields: usize,
+    visit: &mut dyn FnMut(crate::pg::replication_client::SqlDataRow<'_>) -> Result<(), SqlError>,
+) -> Result<bool, SqlError> {
     let mut fetch = StackStr::<64>::new();
     let _ = write!(fetch, "FETCH {fetch_size} FROM c{cursor}");
-    loop {
-        let mut rows = 0i64;
-        exchange(
-            storage,
-            lease,
-            fetch.as_str(),
-            None,
-            query,
-            &mut |event| match event {
-                SqlEvent::RowDescription { fields: received } if received as usize != fields => {
-                    Err(sql_err!(
+    let mut rows = 0i64;
+    exchange(
+        storage,
+        lease,
+        fetch.as_str(),
+        None,
+        query,
+        &mut |event| match event {
+            SqlEvent::RowDescription { fields: received } if received as usize != fields => {
+                Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "foreign scan returned {} columns, expected {}",
+                    received,
+                    fields
+                ))
+            }
+            SqlEvent::RowDescription { .. } | SqlEvent::CommandComplete { .. } => Ok(()),
+            SqlEvent::DataRow(row) => {
+                if row.columns().len() != fields {
+                    return Err(sql_err!(
                         sqlstate::PROTOCOL_VIOLATION,
-                        "foreign scan returned {} columns, expected {}",
-                        received,
-                        fields
-                    ))
+                        "foreign scan returned an invalid row shape"
+                    ));
                 }
-                SqlEvent::RowDescription { .. } | SqlEvent::CommandComplete { .. } => Ok(()),
-                SqlEvent::DataRow(row) => {
-                    if row.columns().len() != fields {
-                        return Err(sql_err!(
-                            sqlstate::PROTOCOL_VIOLATION,
-                            "foreign scan returned an invalid row shape"
-                        ));
-                    }
-                    rows += 1;
-                    visit(row)
-                }
-                _ => Err(unexpected_response("FETCH")),
-            },
-        )?;
-        if rows < i64::from(fetch_size) {
-            break;
-        }
-    }
+                rows += 1;
+                visit(row)
+            }
+            _ => Err(unexpected_response("FETCH")),
+        },
+    )?;
+    Ok(rows >= i64::from(fetch_size))
+}
+
+fn close_cursor(
+    storage: &Storage,
+    lease: ForeignSessionLease,
+    cursor: u32,
+) -> Result<(), SqlError> {
     let mut close = StackStr::<32>::new();
     let _ = write!(close, "CLOSE c{cursor}");
     command(storage, lease, close.as_str(), "CLOSE CURSOR")?;
     Ok(())
+}
+
+/// A foreign table a plan reads through its own remote cursor, and the rows
+/// fetched so far, which a rescan of the same source (a window's second
+/// pass) reads again instead of scanning the server twice.
+/// What a pushed remote query returns.
+#[derive(Clone, Copy)]
+pub(crate) enum RemoteColumns<'a> {
+    /// These columns of the table, in table order; the others read `NULL`.
+    Table(ColumnSet),
+    /// A grouped relation's columns, one per remote target.
+    Upper(&'a [crate::storage::ColumnMeta]),
+}
+
+impl RemoteColumns<'_> {
+    fn fields(&self) -> usize {
+        match self {
+            Self::Table(fetched) => (fetched.count_ones() as usize).max(1),
+            Self::Upper(columns) => columns.len(),
+        }
+    }
+}
+
+/// Encodes one remote row as the local scan reads it.
+fn decode_remote_row<'a>(
+    storage: &Storage,
+    table: &TableDef,
+    shape: RemoteColumns<'_>,
+    remote_row: &crate::pg::replication_client::SqlDataRow<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<&'a [u8], SqlError> {
+    let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+    let mut fields = remote_row.columns().iter();
+    let width = match shape {
+        RemoteColumns::Table(fetched) => {
+            for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                if fetched.contains(column) {
+                    let raw = *fields
+                        .next()
+                        .expect("row shape checked against the fetched columns");
+                    *value =
+                        decode_foreign_field(storage, table, column, raw, txid, arena, sequences)?;
+                }
+            }
+            table.n_columns
+        }
+        RemoteColumns::Upper(columns) => {
+            for (definition, value) in columns.iter().zip(values.iter_mut()) {
+                let raw = *fields
+                    .next()
+                    .expect("row shape checked against the remote targets");
+                *value = decode_remote_field(storage, definition, raw, txid, arena, sequences)?;
+            }
+            columns.len()
+        }
+    };
+    super::exec::encode_projected_pub(&values[..width], arena)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ForeignStream<'a> {
+    pub(crate) table_slot: usize,
+    /// The remote query a pushed plan built and the columns it returns;
+    /// `None` reads every column.
+    pub(crate) pushed: Option<(&'a str, RemoteColumns<'a>)>,
+    state: crate::mem::arena::ArenaHandle<StreamState<'a>>,
+    owner: &'a Arena,
+}
+
+#[derive(Clone, Copy)]
+struct StreamState<'a> {
+    /// Fetched rows, in the owner's durable tail so per-row rewinds keep them.
+    rows: *mut &'a [u8],
+    len: usize,
+    capacity: usize,
+    started: bool,
+    /// The open cursor, until its last batch arrives or the plan stops.
+    cursor: Option<(ForeignSessionLease, u32)>,
+    /// The plan stopped before the last batch and the cursor was closed.
+    truncated: bool,
+    /// The scan's number in the statement log that keeps rows across
+    /// attempts, when the statement has one.
+    ordinal: Option<u32>,
+}
+
+impl<'a> ForeignStream<'a> {
+    pub(crate) fn new(
+        table_slot: usize,
+        pushed: Option<(&'a str, RemoteColumns<'a>)>,
+        owner: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let state = owner
+            .retain(StreamState {
+                rows: core::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+                started: false,
+                cursor: None,
+                truncated: false,
+                ordinal: None,
+            })
+            .map_err(|_| super::eval::arena_full())?;
+        Ok(Self {
+            table_slot,
+            pushed,
+            state,
+            owner,
+        })
+    }
+
+    fn state(&self) -> Result<StreamState<'a>, SqlError> {
+        self.owner
+            .retained(self.state)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "foreign scan state is stale"))
+    }
+
+    fn set_state(&self, state: StreamState<'a>) -> Result<(), SqlError> {
+        if self.owner.replace_retained(self.state, state) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign scan state is stale"
+            ))
+        }
+    }
+
+    /// Keeps `bytes` as the next fetched row.
+    fn push(&self, bytes: &[u8]) -> Result<(), SqlError> {
+        let mut state = self.state()?;
+        let full = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "foreign scan rows exceed statement memory"
+            )
+        };
+        let bytes: &'a [u8] = self
+            .owner
+            .alloc_persistent_slice_with(bytes.len(), |at| bytes[at])
+            .map_err(|_| full())?;
+        if state.len == state.capacity {
+            const EMPTY: &[u8] = &[];
+            let capacity = if state.capacity == 0 {
+                8
+            } else {
+                state.capacity * 2
+            };
+            let grown = self
+                .owner
+                .alloc_persistent_slice_with(capacity, |_| EMPTY)
+                .map_err(|_| full())?;
+            if state.len != 0 {
+                // SAFETY: `rows` holds `len` initialized entries in the tail.
+                let kept = unsafe { core::slice::from_raw_parts(state.rows, state.len) };
+                grown[..state.len].copy_from_slice(kept);
+            }
+            state.rows = grown.as_mut_ptr();
+            state.capacity = capacity;
+        }
+        // SAFETY: `len < capacity` entries of `rows` are allocated.
+        unsafe { state.rows.add(state.len).write(bytes) };
+        state.len += 1;
+        self.set_state(state)
+    }
+
+    fn row(&self, index: usize) -> Result<Option<&'a [u8]>, SqlError> {
+        let state = self.state()?;
+        // SAFETY: entries below `len` were written by `push`.
+        Ok((index < state.len).then(|| unsafe { *state.rows.add(index) }))
+    }
+}
+
+/// A remote cursor a statement's scan left open, kept in the statement log.
+#[derive(Clone, Copy)]
+pub(crate) struct KeptForeignScan {
+    /// The scan's place among the foreign scans of an attempt.
+    pub(crate) ordinal: u32,
+    /// The open cursor, until its last batch arrives or the plan stops.
+    pub(crate) cursor: Option<(ForeignSessionLease, u32)>,
+}
+
+/// Streams a foreign table's rows (as [`materialize`] encodes them) to
+/// `visit`, as postgres_fdw's executor reads its cursor: `DECLARE` at the
+/// first row the plan needs, one `FETCH fetch_size` batch whenever the rows
+/// fetched so far are consumed, and `CLOSE` after the last batch or as soon
+/// as the plan stops reading.
+///
+/// A statement that restarts attempts after routine calls keeps each scan's
+/// fetched rows and open cursor in its invocation log: a later attempt reads
+/// the kept rows again and continues the same cursor, so remote rows, their
+/// volatile values and the remote commands are those of one scan.
+pub(crate) fn stream_rows<'a>(
+    storage: &'a Storage,
+    stream: &ForeignStream<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    visit: &mut dyn FnMut(&'a [u8]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    let remote = RemoteTable::open(storage, stream.table_slot, txid)?;
+    let mut query = StackStr::<16_384>::new();
+    let table = &remote.table;
+    let shape = match stream.pushed {
+        Some((sql, shape)) => {
+            let _ = query.write_str(sql);
+            shape
+        }
+        None => {
+            remote.write_select(&mut query);
+            RemoteColumns::Table(ColumnSet::all(table.n_columns))
+        }
+    };
+    checked(&query, "query")?;
+    let fields = shape.fields();
+    let fetch_size = remote.fetch_size();
+    let mut index = 0usize;
+    loop {
+        while let Some(bytes) = stream.row(index)? {
+            index += 1;
+            if !visit(bytes)? {
+                let mut state = stream.state()?;
+                if let Some((lease, cursor)) = state.cursor {
+                    // The plan needs no more rows: postgres_fdw closes the
+                    // cursor when its scan ends.
+                    close_cursor(storage, lease, cursor)?;
+                    if let Some(ordinal) = state.ordinal {
+                        crate::sql::query::set_foreign_scan_cursor(ordinal, None)?;
+                    }
+                    state.cursor = None;
+                    state.truncated = true;
+                    stream.set_state(state)?;
+                }
+                return Ok(false);
+            }
+        }
+        let mut state = stream.state()?;
+        if !state.started {
+            state.started = true;
+            match crate::sql::query::begin_foreign_scan()? {
+                crate::sql::query::ForeignScanStart::Kept(scan) => {
+                    // The rows an earlier attempt fetched, in their order.
+                    state.ordinal = Some(scan.ordinal);
+                    state.cursor = scan.cursor;
+                    stream.set_state(state)?;
+                    let mut kept = 0usize;
+                    while let Some(bytes) =
+                        crate::sql::query::kept_foreign_row(scan.ordinal, kept, arena)?
+                    {
+                        kept += 1;
+                        stream.push(bytes)?;
+                    }
+                }
+                start => {
+                    let lease = enter_session(storage, txid, &remote.server)?;
+                    let cursor = declare_cursor(storage, lease, query.as_str())?;
+                    if let crate::sql::query::ForeignScanStart::New(ordinal) = start {
+                        crate::sql::query::set_foreign_scan_cursor(ordinal, Some((lease, cursor)))?;
+                        state.ordinal = Some(ordinal);
+                    }
+                    state.cursor = Some((lease, cursor));
+                    stream.set_state(state)?;
+                }
+            }
+            continue;
+        }
+        let Some((lease, cursor)) = state.cursor else {
+            if state.truncated {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign scan was read again past the rows its closed cursor fetched"
+                ));
+            }
+            return Ok(true);
+        };
+        let ordinal = state.ordinal;
+        let more = fetch_batch(
+            storage,
+            lease,
+            cursor,
+            query.as_str(),
+            fetch_size,
+            fields,
+            &mut |remote_row| {
+                let encoded =
+                    decode_remote_row(storage, table, shape, &remote_row, txid, arena, sequences)?;
+                if let Some(ordinal) = ordinal {
+                    crate::sql::query::keep_foreign_row(ordinal, encoded)?;
+                }
+                stream.push(encoded)
+            },
+        )?;
+        if !more {
+            close_cursor(storage, lease, cursor)?;
+            if let Some(ordinal) = ordinal {
+                crate::sql::query::set_foreign_scan_cursor(ordinal, None)?;
+            }
+            let mut state = stream.state()?;
+            state.cursor = None;
+            stream.set_state(state)?;
+        }
+    }
 }
 
 /// Appends one arena-owned row to an arena-grown array.
@@ -1371,19 +1714,18 @@ pub(crate) fn materialize<'a>(
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let mut query = StackStr::<16_384>::new();
     let table = &remote.table;
-    let fetched = match pushed {
+    let shape = match pushed {
         Some(plan) => {
             debug_assert_eq!(plan.table_slot, table_slot);
             let _ = query.write_str(plan.sql);
-            plan.fetched
+            plan.remote_columns()
         }
         None => {
             remote.write_select(&mut query);
-            ColumnSet::all(table.n_columns)
+            RemoteColumns::Table(ColumnSet::all(table.n_columns))
         }
     };
     checked(&query, "query")?;
-    let fetched_count = fetched.count_ones() as usize;
     let mut rows: *mut &[u8] = core::ptr::null_mut();
     let mut row_count = 0usize;
     let mut row_capacity = 0usize;
@@ -1393,20 +1735,10 @@ pub(crate) fn materialize<'a>(
         lease,
         query.as_str(),
         remote.fetch_size(),
-        fetched_count.max(1),
+        shape.fields(),
         &mut |remote_row| {
-            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-            let mut fields = remote_row.columns().iter();
-            for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
-                if fetched.contains(column) {
-                    let raw = *fields
-                        .next()
-                        .expect("row shape checked against the fetched columns");
-                    *value =
-                        decode_foreign_field(storage, table, column, raw, txid, arena, sequences)?;
-                }
-            }
-            let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+            let encoded =
+                decode_remote_row(storage, table, shape, &remote_row, txid, arena, sequences)?;
             push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)
         },
     )?;
@@ -1429,14 +1761,29 @@ pub(crate) fn direct_modify_sql<'a>(
     inheritance: crate::sql::ast::RelationInheritance,
     assignments: Option<&[(&str, &'a crate::sql::ast::Expr<'a>)]>,
     predicate: Option<&'a crate::sql::ast::Expr<'a>>,
+    returned: ColumnSet,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let table = storage.table_def(table_slot, txid);
+    // `make_modifytable`: a row trigger for the statement's event or a
+    // stored generated column needs each row here; statement triggers fire
+    // around the remote statement.
+    let event = if assignments.is_some() {
+        crate::sql::ast::TriggerEvents::UPDATE
+    } else {
+        crate::sql::ast::TriggerEvents::DELETE
+    };
     if table.kind != crate::storage::TableKind::Foreign
         || storage
             .triggers_for_table(table_slot, txid)
-            .next()
-            .is_some()
+            .any(|(_, trigger)| {
+                matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                    && trigger.events.contains(event)
+            })
+        || table
+            .columns()
+            .iter()
+            .any(|column| column.default.generation() == Some(crate::storage::Generation::Stored))
         || table.row_level_security.enabled
         || inheritance == crate::sql::ast::RelationInheritance::Descendants
             && storage.relation_has_descendants(table_slot, txid)
@@ -1448,13 +1795,14 @@ pub(crate) fn direct_modify_sql<'a>(
     };
     let deparser = deparse::Deparser {
         table: &table,
+        grouped: false,
         foreign: &foreign,
         exposed,
         arena,
         storage,
         txid,
     };
-    deparse::direct_modify_sql(&deparser, assignments, predicate, arena)
+    deparse::direct_modify_sql(&deparser, assignments, predicate, returned, arena)
 }
 
 /// The row-by-row plan of an `UPDATE` (with its `updated` columns) or
@@ -1483,6 +1831,7 @@ pub(crate) fn modify_scan<'a>(
     };
     let deparser = deparse::Deparser {
         table: &table,
+        grouped: false,
         foreign: &foreign,
         exposed,
         arena,
@@ -1492,16 +1841,28 @@ pub(crate) fn modify_scan<'a>(
     deparse::plan_modify_scan(&deparser, updated, predicate, returned, whole_old, arena).map(Some)
 }
 
-/// Runs a direct `UPDATE` or `DELETE` and returns the rows its tag reports.
-pub(crate) fn direct_modify(
+/// Runs a direct `UPDATE` or `DELETE` as postgres_fdw's `execute_dml_stmt`
+/// does: the rows its tag reports and, when the command carries a
+/// `RETURNING` list of the `returned` columns, the rows the server returned,
+/// encoded in table order with the other columns `NULL`. The whole result
+/// arrives before the local `RETURNING` projection reads it.
+pub(crate) fn direct_modify<'a>(
     storage: &Storage,
     table_slot: usize,
     txid: u32,
     sql: &str,
-) -> Result<u64, SqlError> {
+    returned: ColumnSet,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(u64, &'a [&'a [u8]]), SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let table = &remote.table;
     let lease = enter_session(storage, txid, &remote.server)?;
-    let mut rows = None;
+    let expected = returned.count_ones() as usize;
+    let mut changed = None;
+    let mut rows: *mut &[u8] = core::ptr::null_mut();
+    let mut row_count = 0usize;
+    let mut row_capacity = 0usize;
     exchange(
         storage,
         lease,
@@ -1509,16 +1870,50 @@ pub(crate) fn direct_modify(
         Some(&[]),
         sql,
         &mut |event| match event {
+            SqlEvent::RowDescription { fields } if expected != 0 && fields as usize == expected => {
+                Ok(())
+            }
+            SqlEvent::DataRow(row) if expected != 0 && row.columns().len() == expected => {
+                let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                let mut fields = row.columns().iter();
+                for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
+                    if returned.contains(column) {
+                        let raw = *fields.next().expect("row shape checked");
+                        *value = decode_foreign_field(
+                            storage, table, column, raw, txid, arena, sequences,
+                        )?;
+                    }
+                }
+                let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
+                push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)
+            }
             SqlEvent::CommandComplete { tag }
                 if tag.starts_with("UPDATE ") || tag.starts_with("DELETE ") =>
             {
-                rows = Some(tag_rows(tag)?);
+                changed = Some(tag_rows(tag)?);
                 Ok(())
             }
             _ => Err(unexpected_response(sql)),
         },
     )?;
-    rows.ok_or_else(|| unexpected_response(sql))
+    let changed = changed.ok_or_else(|| unexpected_response(sql))?;
+    if expected != 0 && changed != row_count as u64 {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "foreign command reported {} rows but returned {}",
+            changed,
+            row_count
+        ));
+    }
+    Ok((
+        changed,
+        if row_count == 0 {
+            &[]
+        } else {
+            // SAFETY: `push_row` wrote `row_count` entries at `rows`.
+            unsafe { core::slice::from_raw_parts(rows, row_count) }
+        },
+    ))
 }
 
 /// Visits the remote rows of an UPDATE or DELETE target with their parsed
@@ -1876,6 +2271,78 @@ impl<'a> ForeignInsertBatches<'a> {
         core::mem::take(&mut self.skipped)
     }
 
+    /// The queued rows as one encoded row per target table (its slot, batch
+    /// size, `ON CONFLICT DO NOTHING`, row count and Bind fields), to keep
+    /// across a pause of the statement.
+    pub(crate) fn save<'out>(&self, arena: &'out Arena) -> Result<&'out [&'out [u8]], SqlError> {
+        let mut targets = crate::mem::arena::ArenaList::new(arena);
+        for pending in self
+            .pending
+            .iter()
+            .flatten()
+            .filter(|pending| pending.rows != 0)
+        {
+            let encoded = super::exec::encode_projected_pub(
+                &[
+                    Datum::Int8(pending.table as i64),
+                    Datum::Int8(pending.batch_size as i64),
+                    Datum::Bool(pending.on_conflict_do_nothing),
+                    Datum::Int8(pending.rows as i64),
+                    Datum::Bytea(&pending.buffer[..pending.used]),
+                ],
+                arena,
+            )?;
+            targets
+                .push(encoded)
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        Ok(targets.as_slice())
+    }
+
+    /// Queues again the rows [`Self::save`] kept.
+    pub(crate) fn restore(
+        &mut self,
+        storage: &Storage,
+        targets: &[&[u8]],
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        for (index, encoded) in targets.iter().enumerate() {
+            let field = |column| super::exec::decode_projected_col_record(encoded, column, arena);
+            let (
+                Datum::Int8(table),
+                Datum::Int8(batch_size),
+                Datum::Bool(on_conflict_do_nothing),
+                Datum::Int8(rows),
+                Datum::Bytea(fields),
+            ) = (field(0)?, field(1)?, field(2)?, field(3)?, field(4)?)
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "kept foreign INSERT batch has an invalid shape"
+                ));
+            };
+            let slot = self.pending.get_mut(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "kept foreign INSERT batches overflow"
+                )
+            })?;
+            let buffer = arena
+                .alloc_persistent_slice_with(storage.foreign_send_capacity(), |_| 0u8)
+                .map_err(|_| super::eval::arena_full())?;
+            buffer[..fields.len()].copy_from_slice(fields);
+            *slot = Some(PendingInsert {
+                table: table as usize,
+                batch_size: batch_size as usize,
+                on_conflict_do_nothing,
+                rows: rows as usize,
+                buffer,
+                used: fields.len(),
+            });
+        }
+        Ok(())
+    }
+
     /// Queues one row, or inserts it at once when the table does not batch.
     /// Returns whether the row counts as inserted now: a queued row counts
     /// until its batch reports otherwise.
@@ -2009,85 +2476,171 @@ impl<'a> ForeignInsertBatches<'a> {
             .expect("a flushed batch target exists");
         let rows = core::mem::take(&mut pending.rows);
         let used = core::mem::take(&mut pending.used);
-        let remote = RemoteTable::open(storage, pending.table, txid)?;
-        let per_row = remote
-            .table
-            .columns()
-            .iter()
-            .filter(|column| !column.default.is_generated())
-            .count();
-        let count = rows * per_row;
-        let parameters = arena
-            .alloc_slice_with(count, |_| None::<&[u8]>)
-            .map_err(|_| super::eval::arena_full())?;
-        let mut at = 0;
-        for parameter in parameters.iter_mut() {
-            let length = i32::from_be_bytes(
-                pending.buffer[at..at + 4]
-                    .try_into()
-                    .expect("a queued value has its length"),
-            );
-            at += 4;
-            if length >= 0 {
-                let end = at + length as usize;
-                *parameter = Some(&pending.buffer[at..end]);
-                at = end;
-            }
-        }
-        debug_assert_eq!(at, used);
-        let mut single = StackStr::<16_384>::new();
-        write_insert(
-            &mut single,
-            &remote,
-            1,
-            pending.on_conflict_do_nothing,
-            ColumnSet::EMPTY,
-        );
-        checked(&single, "INSERT query")?;
-        let capacity =
-            single.as_str().len() + rows * (per_row * 9 + remote.table.n_columns * 9 + 4);
-        let mut query = FixedText {
-            buffer: arena
-                .alloc_slice_with(capacity, |_| 0u8)
-                .map_err(|_| super::eval::arena_full())?,
-            len: 0,
-            truncated: false,
-        };
-        write_insert(
-            &mut query,
-            &remote,
+        let inserted = send_insert_batch(
+            storage,
+            txid,
+            pending.table,
+            &pending.buffer[..used],
             rows,
             pending.on_conflict_do_nothing,
-            ColumnSet::EMPTY,
-        );
-        if query.truncated {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "foreign batched INSERT query exceeds its buffer"
-            ));
-        }
-        let query = core::str::from_utf8(&query.buffer[..query.len])
-            .expect("the INSERT text is written from strings");
-        let lease = enter_session(storage, txid, &remote.server)?;
-        let mut inserted = None;
-        exchange(
-            storage,
-            lease,
-            query,
-            Some(&*parameters),
-            query,
-            &mut |event| match event {
-                SqlEvent::CommandComplete { tag } if tag.starts_with("INSERT ") => {
-                    inserted = Some(tag_rows(tag)?);
-                    Ok(())
-                }
-                _ => Err(unexpected_response("INSERT")),
-            },
+            arena,
         )?;
-        let inserted = inserted.ok_or_else(|| unexpected_response("INSERT"))?;
         self.skipped += (rows as u64).saturating_sub(inserted);
         Ok(())
     }
+}
+
+/// The rows postgres_fdw sends in one remote INSERT of a COPY FROM into
+/// `table_slot` (`GetForeignModifyBatchSize`): 1 when a BEFORE or AFTER row
+/// INSERT trigger is on it, else its `batch_size`, at most as many rows as
+/// fit 65535 parameters.
+pub(crate) fn copy_batch_size(
+    storage: &Storage,
+    table_slot: usize,
+    txid: u32,
+    row_triggers: bool,
+) -> Result<usize, SqlError> {
+    let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let parameters = remote
+        .table
+        .columns()
+        .iter()
+        .filter(|column| !column.default.is_generated())
+        .count();
+    if row_triggers || parameters == 0 {
+        return Ok(1);
+    }
+    Ok(usize::try_from(remote.batch_size())
+        .unwrap_or(1)
+        .min(MAX_QUERY_PARAMETERS / parameters))
+}
+
+/// One row's INSERT values as Bind fields: a big-endian length (-1 for
+/// NULL), then the text, for every column but the generated ones.
+pub(crate) fn insert_fields<'a>(
+    storage: &Storage,
+    table_slot: usize,
+    txid: u32,
+    values: &[Datum<'_>],
+    render: crate::sql::guc::RenderContext,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let definition = storage.table_def(table_slot, txid);
+    let mut texts = [None::<&[u8]>; crate::storage::MAX_COLUMNS];
+    let mut length = 0usize;
+    let mut count = 0usize;
+    for (value, column) in values.iter().zip(definition.columns()) {
+        if column.default.is_generated() {
+            continue;
+        }
+        let text = Responder::datum_wire_text(value, render, arena)?;
+        length += 4 + text.map_or(0, <[u8]>::len);
+        texts[count] = text;
+        count += 1;
+    }
+    let fields = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut at = 0usize;
+    for text in &texts[..count] {
+        let field_length = text.map_or(-1, |text| text.len() as i32);
+        fields[at..at + 4].copy_from_slice(&field_length.to_be_bytes());
+        at += 4;
+        if let Some(text) = text {
+            fields[at..at + text.len()].copy_from_slice(text);
+            at += text.len();
+        }
+    }
+    Ok(fields)
+}
+
+/// postgres_fdw's `execute_foreign_modify` for a batch: one INSERT with a
+/// VALUES row per queued row, whose Bind fields `fields` holds in row order;
+/// returns the rows its command tag counts.
+pub(crate) fn send_insert_batch(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    fields: &[u8],
+    rows: usize,
+    on_conflict_do_nothing: bool,
+    arena: &Arena,
+) -> Result<u64, SqlError> {
+    let remote = RemoteTable::open(storage, table_slot, txid)?;
+    let per_row = remote
+        .table
+        .columns()
+        .iter()
+        .filter(|column| !column.default.is_generated())
+        .count();
+    let count = rows * per_row;
+    let parameters = arena
+        .alloc_slice_with(count, |_| None::<&[u8]>)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut at = 0;
+    for parameter in parameters.iter_mut() {
+        let length = i32::from_be_bytes(
+            fields[at..at + 4]
+                .try_into()
+                .expect("a queued value has its length"),
+        );
+        at += 4;
+        if length >= 0 {
+            let end = at + length as usize;
+            *parameter = Some(&fields[at..end]);
+            at = end;
+        }
+    }
+    debug_assert_eq!(at, fields.len());
+    let mut single = StackStr::<16_384>::new();
+    write_insert(
+        &mut single,
+        &remote,
+        1,
+        on_conflict_do_nothing,
+        ColumnSet::EMPTY,
+    );
+    checked(&single, "INSERT query")?;
+    let capacity = single.as_str().len() + rows * (per_row * 9 + remote.table.n_columns * 9 + 4);
+    let mut query = FixedText {
+        buffer: arena
+            .alloc_slice_with(capacity, |_| 0u8)
+            .map_err(|_| super::eval::arena_full())?,
+        len: 0,
+        truncated: false,
+    };
+    write_insert(
+        &mut query,
+        &remote,
+        rows,
+        on_conflict_do_nothing,
+        ColumnSet::EMPTY,
+    );
+    if query.truncated {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "foreign batched INSERT query exceeds its buffer"
+        ));
+    }
+    let query = core::str::from_utf8(&query.buffer[..query.len])
+        .expect("the INSERT text is written from strings");
+    let lease = enter_session(storage, txid, &remote.server)?;
+    let mut inserted = None;
+    exchange(
+        storage,
+        lease,
+        query,
+        Some(&*parameters),
+        query,
+        &mut |event| match event {
+            SqlEvent::CommandComplete { tag } if tag.starts_with("INSERT ") => {
+                inserted = Some(tag_rows(tag)?);
+                Ok(())
+            }
+            _ => Err(unexpected_response("INSERT")),
+        },
+    )?;
+    inserted.ok_or_else(|| unexpected_response("INSERT"))
 }
 
 /// Runs one row's remote `UPDATE` or `DELETE` and merges the columns its
@@ -2173,6 +2726,7 @@ fn child_modify_sql<'a>(
 ) -> Result<&'a str, SqlError> {
     let deparser = deparse::Deparser {
         table: &remote.table,
+        grouped: false,
         foreign: &remote.foreign,
         exposed: remote.table.name.as_str(),
         arena,
@@ -2230,7 +2784,10 @@ pub(crate) fn update_row<'data>(
     let mut parameters = [None; crate::storage::MAX_COLUMNS + 1];
     parameters[0] = Some(identity.as_str().as_bytes());
     let mut count = 1;
-    for column in (0..remote.table.n_columns).filter(|&column| target_columns.contains(column)) {
+    // A generated column is set to DEFAULT and takes no parameter.
+    for column in (0..remote.table.n_columns).filter(|&column| {
+        target_columns.contains(column) && !remote.table.columns()[column].default.is_generated()
+    }) {
         parameters[count] = Responder::datum_wire_text(&values[column], render, arena)?;
         count += 1;
     }
@@ -2547,7 +3104,11 @@ pub(crate) fn native_rows<'a>(
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::RemoteTupleId;
     use crate::util::StackStr;

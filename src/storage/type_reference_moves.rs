@@ -3,7 +3,7 @@
 use core::mem::{align_of, size_of};
 use {crate::mem::mutex::Mutex, crate::mem::mutex::MutexGuard};
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 use super::DatabaseOid;
 use super::row_ownership::{LockWait, try_mutex};
 use super::table_definitions::TableIdentity;
@@ -717,7 +717,7 @@ impl TypeReferenceMove {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
     use super::super::{

@@ -356,6 +356,7 @@ impl SubscriptionApply {
                 budget,
                 config.txn_rows,
                 config.copy_transition_bytes,
+                config.foreign_send_bytes,
             )?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,
@@ -650,7 +651,7 @@ impl SubscriptionApply {
                 &mut responder,
                 crate::sql::SubscriptionCopyWorkspace::new(
                     &mut worker.arena,
-                    &worker.copy_transition_scratch,
+                    &mut worker.copy_transition_scratch,
                 ),
             );
             worker.copy_transition_scratch.clear();

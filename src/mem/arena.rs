@@ -1171,7 +1171,7 @@ fn apply_permutation<T>(items: &mut [T], perm: &[u32], visited: &mut [bool]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     #[test]
     fn scoped_encoded_outputs_compact_overlapping_bytes_and_preserve_durable_effects() {

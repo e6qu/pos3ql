@@ -199,6 +199,161 @@ impl CatalogSnapshotRelation {
     }
 }
 
+/// The user tables whose catalog rows a synthesis materializes.
+///
+/// A commit-time capture compares only the rows its changes can reach;
+/// every other synthesis materializes all tables. Lookups that resolve one
+/// table's row through another (a foreign key's parent, a partition's
+/// parent) still read the complete catalog, so a selected table's row is
+/// always exactly its unselected row.
+#[derive(Clone, Copy)]
+pub(crate) enum TableSelection<'a> {
+    All,
+    /// Indexed by table slot.
+    Reached(&'a [bool]),
+    /// One table's rows, for a lookup about that table.
+    Table(usize),
+}
+
+impl TableSelection<'_> {
+    pub(crate) fn includes(self, slot: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Reached(tables) => tables[slot],
+            Self::Table(table) => slot == table,
+        }
+    }
+}
+
+/// The table one catalog change is about, or `None` when the change edits
+/// objects that are not owned by one table, which selects every table.
+fn changed_table(storage: &crate::storage::Storage, change: &super::txn::DdlUndo) -> Option<usize> {
+    use super::txn::DdlUndo::*;
+    match change {
+        Created(slot) => Some(*slot as usize),
+        Dropped(change) => Some(change.slot()),
+        TableAltered(change) => Some(change.table()),
+        IndexCreated(slot)
+        | IndexDropped(slot)
+        | IndexRenamed { slot, .. }
+        | IndexAltered { slot, .. } => storage.index_bound_table_slot(*slot as usize),
+        TriggerCreated(slot) | TriggerDropped(slot) | TriggerAltered { slot, .. } => {
+            match storage.trigger(*slot as usize).target {
+                crate::storage::TriggerTarget::Table(table) => Some(usize::from(table)),
+                crate::storage::TriggerTarget::View(_) => None,
+            }
+        }
+        PolicyCreated(slot) | PolicyDropped(slot) | PolicyAltered { slot, .. } => {
+            Some(usize::from(storage.policy(*slot as usize).table))
+        }
+        StatisticsCreated(slot)
+        | StatisticsDropped(slot)
+        | StatisticsAltered { slot, .. }
+        | StatisticsKeysAltered { slot, .. } => Some(usize::from(
+            storage.extended_statistics(*slot as usize).table,
+        )),
+        _ => None,
+    }
+}
+
+/// The one place a capture decides which tables' rows it compares.
+///
+/// A table change can edit rows of the tables related to it: its partition
+/// or inheritance family (attached partitions, cloned keys, triggers and
+/// indexes) and the tables one foreign key away in either direction (a
+/// parent's `relhastriggers` and RI triggers, a child's key and its clones),
+/// together with those tables' families. Both the committed and the
+/// transaction's catalog contribute relations, so a relation the
+/// transaction removed still selects its former neighbours.
+pub(crate) fn reached_tables<'a>(
+    storage: &crate::storage::Storage,
+    transaction: &super::txn::TxnState,
+    arena: &'a Arena,
+) -> Result<TableSelection<'a>, SqlError> {
+    let count = storage.table_count();
+    let changed = arena
+        .alloc_slice_with(count, |_| false)
+        .map_err(|_| arena_full())?;
+    for change in transaction.ddl() {
+        match changed_table(storage, change) {
+            Some(slot) if slot < count => changed[slot] = true,
+            _ => return Ok(TableSelection::All),
+        }
+    }
+    let views = [0, transaction.txid];
+    // Each table's family is the union-find class of its partition and
+    // inheritance parents.
+    let family = arena
+        .alloc_slice_with(count, |slot| slot as u32)
+        .map_err(|_| arena_full())?;
+    fn root(family: &mut [u32], mut slot: usize) -> usize {
+        while family[slot] as usize != slot {
+            let parent = family[slot] as usize;
+            family[slot] = family[parent];
+            slot = parent;
+        }
+        slot
+    }
+    for txid in views {
+        for slot in 0..count {
+            if !storage.table_slot_visible_to(slot, txid) {
+                continue;
+            }
+            let definition = storage.table_def(slot, txid);
+            let parents = definition
+                .partition
+                .attachment
+                .map(|attachment| attachment.parent)
+                .into_iter()
+                .chain(definition.inheritance.parents_ref().iter().copied());
+            for parent in parents {
+                let parent = usize::from(parent);
+                if parent < count {
+                    let (left, right) = (root(family, slot), root(family, parent));
+                    family[left.max(right)] = left.min(right) as u32;
+                }
+            }
+        }
+    }
+    let selected = arena
+        .alloc_slice_with(count, |_| false)
+        .map_err(|_| arena_full())?;
+    for slot in 0..count {
+        if changed[slot] {
+            selected[root(family, slot)] = true;
+        }
+    }
+    let reached = arena.alloc_slice_copy(selected).map_err(|_| arena_full())?;
+    for txid in views {
+        let mark = arena.mark();
+        let names = storage.visible_table_names(txid, arena)?;
+        for slot in 0..count {
+            if !storage.table_slot_visible_to(slot, txid) {
+                continue;
+            }
+            for key in storage.table_def(slot, txid).fkeys() {
+                let Some(parent) =
+                    names.find(storage, key.parent_schema.as_str(), key.parent.as_str())
+                else {
+                    continue;
+                };
+                let (child, parent) = (root(family, slot), root(family, parent));
+                if selected[child] || selected[parent] {
+                    reached[child] = true;
+                    reached[parent] = true;
+                }
+            }
+        }
+        // SAFETY: the name map, now unused, is the only allocation since
+        // the mark.
+        unsafe { arena.rewind_to(mark) };
+    }
+    for slot in 0..count {
+        changed[slot] = reached[root(family, slot)];
+    }
+    Ok(TableSelection::Reached(changed))
+}
+
 fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
     use super::txn::DdlUndo::*;
     match change {
@@ -469,6 +624,9 @@ pub(crate) fn capture_transaction(
     let Some(mut batch) = storage.reserve_catalog_history(transaction.txid, publication)? else {
         return Ok(None);
     };
+    let outer = arena.mark();
+    let tables = reached_tables(storage, transaction, arena)?;
+    let database = storage.current_database_oid();
     for relation in super::catalog_snapshot_keys::RELATIONS {
         if !transaction
             .ddl()
@@ -479,39 +637,35 @@ pub(crate) fn capture_transaction(
         }
         let mark = arena.mark();
         let result = (|| {
-            let committed = super::catalog::synthesize_current(
-                storage,
-                Some("pg_catalog"),
-                relation.name,
-                0,
-                super::catalog::Materialization::History,
-                arena,
-            )?;
-            let private = super::catalog::synthesize_current(
-                storage,
-                Some("pg_catalog"),
-                relation.name,
-                transaction.txid,
-                super::catalog::Materialization::History,
-                arena,
-            )?;
-            capture_rows(
-                relation.identity(storage.current_database_oid()),
+            let images = relation_images(storage, transaction.txid, relation.name, tables, arena)?;
+            let row_state = |key: &[u8], source| {
+                super::catalog::catalog_row_state(
+                    storage,
+                    match source {
+                        CatalogImageSource::Committed => 0,
+                        CatalogImageSource::Private => transaction.txid,
+                    },
+                    relation.name,
+                    key,
+                )
+            };
+            #[cfg(test)]
+            if storage.catalog_capture_cross_check && matches!(tables, TableSelection::Reached(_)) {
+                let all = relation_images(
+                    storage,
+                    transaction.txid,
+                    relation.name,
+                    TableSelection::All,
+                    arena,
+                )?;
+                cross_check_reached_rows(relation, &images, &all, &row_state, arena)?;
+            }
+            diff_rows(
                 relation.key,
-                &committed,
-                &private,
-                &mut batch,
-                |key, source| {
-                    super::catalog::catalog_row_state(
-                        storage,
-                        match source {
-                            CatalogImageSource::Committed => 0,
-                            CatalogImageSource::Private => transaction.txid,
-                        },
-                        relation.name,
-                        key,
-                    )
-                },
+                &images[0],
+                &images[1],
+                &mut |key, before| batch.record(relation.identity(database), key, before),
+                &row_state,
                 arena,
             )
         })();
@@ -527,10 +681,16 @@ pub(crate) fn capture_transaction(
             ),
         })?;
     }
+    // SAFETY: the table selection is the only allocation kept since the mark.
+    unsafe { arena.rewind_to(outer) };
     Ok(batch.has_rows().then_some(batch))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod key_definitions {
     use super::*;
     use crate::mem::budget::Budget;
@@ -853,6 +1013,7 @@ impl<'a> KeyedRows<'a> {
 
 /// Store only keys whose committed row will change. Unrelated catalog rows
 /// do not consume history bytes or overwrite another transaction's history.
+#[cfg(test)]
 pub(crate) fn capture_rows(
     relation: CatalogRelationIdentity,
     key: CatalogRowKey<'_>,
@@ -860,6 +1021,52 @@ pub(crate) fn capture_rows(
     private: &SynthTable<'_>,
     batch: &mut CatalogHistoryBatch,
     row_state: impl Fn(&[u8], CatalogImageSource) -> Result<CatalogRowState, SqlError>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    diff_rows(
+        key,
+        committed,
+        private,
+        &mut |key, before| batch.record(relation, key, before),
+        &row_state,
+        arena,
+    )
+}
+
+/// The committed and transaction images of one catalog over `tables`.
+fn relation_images<'a>(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    name: &'a str,
+    tables: TableSelection<'_>,
+    arena: &'a Arena,
+) -> Result<[SynthTable<'a>; 2], SqlError> {
+    let image = |txid| {
+        super::catalog::synthesize_current(
+            storage,
+            Some("pg_catalog"),
+            name,
+            txid,
+            super::catalog::Materialization::History(tables),
+            arena,
+        )
+    };
+    Ok([image(0)?, image(txid)?])
+}
+
+/// Receives one changed row's key and committed before-image.
+type RowSink<'r> = dyn FnMut(&[u8], Option<CatalogRowImage<'_>>) -> Result<(), SqlError> + 'r;
+/// A catalog row's history state in the committed or the transaction image.
+type RowStates<'r> = dyn Fn(&[u8], CatalogImageSource) -> Result<CatalogRowState, SqlError> + 'r;
+
+/// Passes each changed row's key and committed before-image (none for a
+/// row the transaction added) to `record`.
+fn diff_rows(
+    key: CatalogRowKey<'_>,
+    committed: &SynthTable<'_>,
+    private: &SynthTable<'_>,
+    record: &mut RowSink<'_>,
+    row_state: &RowStates<'_>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let committed = KeyedRows::from_catalog(committed, key, arena)?;
@@ -874,13 +1081,82 @@ pub(crate) fn capture_rows(
             if let Some(image) = &mut before {
                 image.root = row_state(row.key, CatalogImageSource::Committed)?.root;
             }
-            batch.record(relation, row.key, before)?;
+            record(row.key, before)?;
         }
     }
     for row in private.iter() {
         if committed.get(row.key).is_none() {
-            batch.record(relation, row.key, None)?;
+            record(row.key, None)?;
         }
+    }
+    Ok(())
+}
+
+/// Test builds compare every reached-table capture with the capture over all
+/// tables, so a relation that `reached_tables` misses fails the change that
+/// edits it rather than losing a before-image.
+#[cfg(test)]
+fn cross_check_reached_rows<'a>(
+    relation: &CatalogSnapshotRelation,
+    reached: &[SynthTable<'_>; 2],
+    all: &[SynthTable<'_>; 2],
+    row_state: &RowStates<'_>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    type Changed<'a> = (&'a [u8], Option<&'a [u8]>, Option<NonZeroU64>, u32);
+    let collect = |images: &[SynthTable<'_>; 2]| -> Result<&'a mut [Changed<'a>], SqlError> {
+        let mut count = 0usize;
+        diff_rows(
+            relation.key,
+            &images[0],
+            &images[1],
+            &mut |_, _| {
+                count += 1;
+                Ok(())
+            },
+            row_state,
+            arena,
+        )?;
+        let rows = arena
+            .alloc_slice_with(count, |_| (&[] as &[u8], None, None, 0))
+            .map_err(|_| arena_full())?;
+        let mut filled = 0usize;
+        diff_rows(
+            relation.key,
+            &images[0],
+            &images[1],
+            &mut |key, before| {
+                rows[filled] = (
+                    arena.alloc_slice_copy(key).map_err(|_| arena_full())?,
+                    before
+                        .map(|image| arena.alloc_slice_copy(image.bytes))
+                        .transpose()
+                        .map_err(|_| arena_full())?
+                        .map(|bytes| &*bytes),
+                    before.and_then(|image| image.root),
+                    before.map_or(0, |image| image.count.get()),
+                );
+                filled += 1;
+                Ok(())
+            },
+            row_state,
+            arena,
+        )?;
+        rows.sort_unstable();
+        Ok(rows)
+    };
+    let reached = collect(reached)?;
+    let all = collect(all)?;
+    if reached != all {
+        let missing = all.iter().filter(|row| !reached.contains(row)).count();
+        let extra = reached.iter().filter(|row| !all.contains(row)).count();
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "reached-table capture of {} differs from the full capture: {} rows missing, {} rows extra",
+            relation.name,
+            missing,
+            extra
+        ));
     }
     Ok(())
 }
@@ -1044,7 +1320,7 @@ pub(crate) fn restore_rows<'a>(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

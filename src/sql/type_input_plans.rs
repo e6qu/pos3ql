@@ -1010,7 +1010,7 @@ pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::lease_pool::{LeasePool, Purpose};

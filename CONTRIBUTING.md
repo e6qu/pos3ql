@@ -136,7 +136,7 @@ they add no callable functions.
 
 | Workflow | File | Gates |
 |---|---|---|
-| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, fixture-number, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 12 library shards (`tools/test-lib-shard.sh N-of-12`); native build, test (call contracts and boundaries in separate jobs) and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `sql-exec`, `storage`, `storage-definitions`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
+| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, fixture-number, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 12 library shards (`tools/test-lib-shard.sh N-of-12`); native build, two library test suite builds with their partition guard, test (call contracts and boundaries in separate jobs) and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `sql-exec`, `storage`, `storage-definitions`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
 | Differential | `differential.yml` | One release binary, then sharded PostgreSQL comparisons, vendored SQLLogicTest and regression slices, generated queries and external execution paths (`tests/external/ci_diff.sh`) |
 | Drivers | `drivers.yml` | pgJDBC, pgx, node-postgres, psycopg2, and SQLAlchemy/Alembic with both psycopg2 and psycopg 3, against PostgreSQL and pos3ql (`tests/external/ci_drivers.sh`) |
 | coverage | `coverage.yml` | Instrumented library and external shards (`tools/coverage.sh`), crash torture, merged 70% line floor (`tools/coverage-merge.py 70`) |
@@ -167,11 +167,20 @@ temporary validation workflows before the final head.
 - Bound debug data and split compilation rather than adding time. Native arm64
   jobs use the `native-ci` profile (debug assertions, overflow checks and line
   backtraces, without full variable debug data). `native-test-build` compiles
-  only the library test executable that the native test jobs run with the full
-  native filter lists; `native-build` compiles every other `--all-targets`
-  target on its own runner. The library test compile peaks near 7 GB of
-  compiler memory, all of a hosted macOS arm64 runner, so no job compiles both
-  library units at once and macOS uses one Cargo job; Linux arm64 uses four.
+  only the library test executables that the native test jobs run with the
+  full native filter lists; `native-build` compiles every other
+  `--all-targets` target on its own runner. One test executable holding every
+  library test peaks at 8 GB of compiler memory, more than a hosted macOS
+  arm64 runner has, so the library tests form two suites built in separate
+  jobs: `cargo test --lib --features sql-fixture-suite` (the SQL fixtures in
+  `sql::tests`) and `--features unit-suite` (every other library test). Each
+  native test job runs its filters against both executables. A build
+  without either feature runs the complete set; the `library-test-suites`
+  job checks with `tools/check-lib-test-suites.py` that the two suites
+  together run every test exactly once. A new test module outside
+  `sql::tests` adds `not(feature = "sql-fixture-suite")` to its `cfg(test)`.
+  No job compiles both library units at once and macOS uses one Cargo job;
+  Linux arm64 uses four.
   The artifact helper checks revision, target, length and SHA-256, and
   restores `RUST_MIN_STACK` from the checked-in Cargo configuration.
 - Coverage builds and runs use the `coverage` profile (release with
@@ -291,7 +300,7 @@ capacity, rollback, failure cleanup, WAL/checkpoint and empty-cache recovery.
   execution timeout.
 - Keep compiler and per-test progress visible through cancellation. Native
   builds retain `native-build-progress-<target>-<revision>` and
-  `native-test-build-progress-<target>-<revision>` (Cargo progress and
+  `native-test-build-progress-<target>-<suite>-<revision>` (Cargo progress and
   timings); coverage library shards stream compiler output and each test's
   progress so the last running test is visible.
 - Native crashes need thread backtraces; a retry or longer deadline is not a

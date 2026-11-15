@@ -14,9 +14,10 @@
 
 use core::fmt::Write as _;
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{
     BinaryOp, Expr, LockStrength, OrderBy, RelationInheritance, Select, SelectItem, UnaryOp,
+    WindowSpec,
 };
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::types::{ColType, Datum, oid};
@@ -197,6 +198,9 @@ pub(crate) struct Deparser<'t> {
     /// Resolves the built-in functions a condition calls.
     pub(crate) storage: &'t Storage,
     pub(crate) txid: u32,
+    /// Writing the grouped relation's expressions, where the built-in
+    /// aggregates ship (`foreign_grouping_ok`).
+    pub(crate) grouped: bool,
 }
 
 impl<'t> Deparser<'t> {
@@ -347,6 +351,10 @@ impl<'t> Deparser<'t> {
                     plain: false,
                 })
             }
+            Expr::Call { .. } if self.grouped && expression.is_aggregate() => Ok(Shape::Value {
+                type_oid: self.aggregate(expression)?,
+                plain: false,
+            }),
             Expr::Call { .. } => Ok(Shape::Value {
                 type_oid: self.call(expression)?.result_oid,
                 plain: false,
@@ -585,6 +593,12 @@ impl<'t> Deparser<'t> {
             | Expr::Match {
                 operand, pattern, ..
             } => 2 + self.cost(operand)? + self.cost(pattern)?,
+            // The aggregate node computes an aggregate; a qualification
+            // reads it as a value.
+            Expr::Call { .. } if self.grouped && expression.is_aggregate() => {
+                self.aggregate(expression)?;
+                0
+            }
             Expr::Call { args, .. } => {
                 let signature = self.call(expression)?;
                 let mut total = (signature.catalog.cost * 2.0).round() as u32;
@@ -641,6 +655,137 @@ impl<'t> Deparser<'t> {
             ),
             _ => None,
         })
+    }
+
+    /// A built-in aggregate `is_foreign_expr` ships, and its result type:
+    /// shippable arguments, `DISTINCT`, `ORDER BY` keys and `FILTER`.
+    fn aggregate(&self, expression: &Expr<'_>) -> Shipped<i32> {
+        let Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
+            name,
+            args,
+            argument_names: [],
+            variadic: false,
+            star,
+            order_by,
+            over: None,
+            filter,
+            ..
+        } = expression
+        else {
+            return Err(Stop::Local);
+        };
+        let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+        let mut types = [oid::UNKNOWN; 2];
+        if args.len() > types.len() {
+            return Err(Stop::Local);
+        }
+        for (target, argument) in types.iter_mut().zip(*args) {
+            *target = match self.shape(argument)? {
+                Shape::Value { type_oid, .. } => operator_type(type_oid),
+                // Only `string_agg`'s delimiter may be a constant.
+                Shape::Literal(Literal::Unknown(_)) if name == "string_agg" => oid::UNKNOWN,
+                Shape::Literal(_) => return Err(Stop::Local),
+            };
+        }
+        let result = match (name, *star, &types[..args.len()]) {
+            ("count", true, []) | ("count", false, [_]) => oid::INT8,
+            ("sum", false, [oid::INT2 | oid::INT4]) => oid::INT8,
+            ("sum", false, [oid::INT8 | oid::NUMERIC]) => oid::NUMERIC,
+            ("sum", false, [argument @ (oid::FLOAT4 | oid::FLOAT8)]) => *argument,
+            ("avg", false, [oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC]) => oid::NUMERIC,
+            ("avg", false, [oid::FLOAT4 | oid::FLOAT8]) => oid::FLOAT8,
+            (
+                "min" | "max",
+                false,
+                [
+                    argument @ (oid::INT2
+                    | oid::INT4
+                    | oid::INT8
+                    | oid::NUMERIC
+                    | oid::FLOAT4
+                    | oid::FLOAT8
+                    | oid::TEXT
+                    | oid::BPCHAR
+                    | oid::DATE
+                    | oid::TIMESTAMP
+                    | oid::TIMESTAMPTZ),
+                ],
+            ) => *argument,
+            ("bool_and" | "bool_or" | "every", false, [oid::BOOL]) => oid::BOOL,
+            ("string_agg", false, [oid::TEXT, oid::TEXT | oid::UNKNOWN]) => oid::TEXT,
+            _ => return Err(Stop::Local),
+        };
+        for key in *order_by {
+            match self.shape(key.expression)? {
+                Shape::Value { .. } => {}
+                Shape::Literal(_) => return Err(Stop::Local),
+            }
+        }
+        if let Some(filter) = filter {
+            self.boolean_operand(filter)?;
+        }
+        Ok(result)
+    }
+
+    /// `deparseAggref`: `name([DISTINCT] arguments [ORDER BY ...])` and its
+    /// `FILTER (WHERE ...)`.
+    fn write_aggregate(
+        &self,
+        output: &mut impl core::fmt::Write,
+        expression: &Expr<'_>,
+    ) -> Shipped<()> {
+        self.aggregate(expression)?;
+        let Expr::Call {
+            name,
+            args,
+            star,
+            distinct,
+            order_by,
+            filter,
+            ..
+        } = expression
+        else {
+            return Err(Stop::Local);
+        };
+        let _ = write!(
+            output,
+            "{}(",
+            name.strip_prefix("pg_catalog.").unwrap_or(name)
+        );
+        if *distinct {
+            let _ = output.write_str("DISTINCT ");
+        }
+        if *star {
+            let _ = output.write_char('*');
+        }
+        for (index, argument) in args.iter().enumerate() {
+            if index != 0 {
+                let _ = output.write_str(", ");
+            }
+            match self.shape(argument)? {
+                Shape::Literal(literal) => self.write_constant(
+                    output,
+                    &Constant {
+                        literal,
+                        type_oid: oid::TEXT,
+                        show: 0,
+                    },
+                )?,
+                Shape::Value { .. } => self.write(output, argument)?,
+            }
+        }
+        for (index, key) in order_by.iter().enumerate() {
+            let _ = output.write_str(if index == 0 { " ORDER BY " } else { ", " });
+            self.write(output, key.expression)?;
+            write_direction(output, key);
+        }
+        if let Some(filter) = filter {
+            let _ = output.write_str(") FILTER (WHERE ");
+            self.write(output, filter)?;
+        }
+        let _ = output.write_char(')');
+        Ok(())
     }
 
     fn boolean_operand(&self, expression: &Expr<'_>) -> Shipped<()> {
@@ -977,6 +1122,9 @@ impl<'t> Deparser<'t> {
                     let _ = output.write_char(')');
                 }
                 Ok(())
+            }
+            Expr::Call { .. } if self.grouped && expression.is_aggregate() => {
+                self.write_aggregate(output, expression)
             }
             Expr::Call { args, .. } => {
                 let signature = self.call(expression)?;
@@ -1323,6 +1471,16 @@ impl<'t> Deparser<'t> {
     }
 }
 
+/// `appendOrderBySuffix` for a key with the type's default operators.
+fn write_direction(output: &mut impl core::fmt::Write, key: &OrderBy<'_>) {
+    let _ = output.write_str(if key.descending { " DESC" } else { " ASC" });
+    let _ = output.write_str(if key.nulls_first {
+        " NULLS FIRST"
+    } else {
+        " NULLS LAST"
+    });
+}
+
 /// A constant the planner bound, as the literal it was written as.
 fn unbound<'e>(expression: &'e Expr<'e>) -> &'e Expr<'e> {
     match expression {
@@ -1581,17 +1739,48 @@ pub(crate) struct ForeignSelectPlan<'a> {
     pub table_slot: usize,
     /// The columns the remote query returns, in table order.
     pub fetched: ColumnSet,
-    /// The table columns `ORDER BY` keys name, in key order, which the scan
-    /// returns for the sort whether or not the remote query applies it.
-    pub sort_columns: &'a [usize],
+    /// The `ORDER BY` keys, positions and output names resolved, which the
+    /// scan returns for the sort whether or not the remote query applies it.
+    pub sort_keys: &'a [OrderBy<'a>],
+    /// The order the remote rows arrive in for DISTINCT or a window, which
+    /// the local plan reads without sorting.
+    pub presorted: &'a [OrderBy<'a>],
     /// The conditions evaluated locally after the rows arrive.
     pub local_where: Option<&'a Expr<'a>>,
     pub order_pushed: bool,
     pub limit_pushed: bool,
     pub sql: &'a str,
+    /// The grouped relation the remote query computes, when the query's
+    /// grouping and aggregates ship.
+    pub upper: Option<ForeignUpper<'a>>,
+}
+
+/// postgres_fdw's grouped relation (`Aggregate on (...)`), built as
+/// `foreign_grouping_ok` builds it: the remote query groups and aggregates,
+/// and its target list (`fdw_scan_tlist`) fills one local column each.
+pub(crate) struct ForeignUpper<'a> {
+    /// The targets the select list does not read, in order: the `ORDER BY`
+    /// and `GROUP BY` keys it lacks, which the scan's output lists after it.
+    pub resjunk: &'a [&'a Expr<'a>],
+    /// The relation the remote rows fill, one column per target: a grouped
+    /// table column keeps its definition, any other target is named
+    /// `?targetN?` with the type it computes.
+    pub columns: &'a [crate::storage::ColumnMeta],
+    /// The statement the executor runs over the remote rows: the select
+    /// list read from those columns, and the `LIMIT` the remote query
+    /// leaves.
+    pub local: &'a Select<'a>,
 }
 
 impl<'a> ForeignSelectPlan<'a> {
+    /// What the remote query returns.
+    pub(crate) fn remote_columns(&self) -> super::RemoteColumns<'a> {
+        match &self.upper {
+            Some(upper) => super::RemoteColumns::Upper(upper.columns),
+            None => super::RemoteColumns::Table(self.fetched),
+        }
+    }
+
     /// The statement the local executor runs over the remote rows: without
     /// the conditions, order and limit the remote query applies.
     pub(crate) fn local_statement(
@@ -1599,6 +1788,9 @@ impl<'a> ForeignSelectPlan<'a> {
         statement: &'a Select<'a>,
         arena: &'a Arena,
     ) -> Result<&'a Select<'a>, SqlError> {
+        if let Some(upper) = &self.upper {
+            return Ok(upper.local);
+        }
         let mut local = *statement;
         local.where_clause = self.local_where;
         // `WITH TIES` reads the order to find the ties it keeps.
@@ -1682,35 +1874,96 @@ pub(crate) fn remote_conditions<'a, const N: usize>(
     Ok(&kept[..kept_count])
 }
 
-/// The ORDER BY key's table column, through an output position or name.
-fn order_column(
-    deparser: &Deparser<'_>,
-    statement: &Select<'_>,
-    key: &OrderBy<'_>,
-) -> Option<usize> {
+/// The expression an ORDER BY key sorts by: a select-list item through its
+/// position or output name, else the key itself.
+fn order_expression<'a>(statement: &Select<'a>, key: &'a Expr<'a>) -> &'a Expr<'a> {
     let item = |index: usize| match statement.items.get(index) {
-        Some(SelectItem::Expr { expression, .. }) => deparser.column(expression),
+        Some(SelectItem::Expr { expression, .. }) => Some(*expression),
         _ => None,
     };
-    match key.expression {
+    let named = match key {
         Expr::Int(position) => usize::try_from(*position)
-            .ok()?
-            .checked_sub(1)
+            .ok()
+            .and_then(|position| position.checked_sub(1))
             .and_then(item),
         Expr::Column {
             qualifier: None,
             name,
-        } => {
-            let named = statement.items.iter().position(|candidate| {
+        } => statement
+            .items
+            .iter()
+            .position(|candidate| {
                 matches!(candidate, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
-            });
-            match named {
-                Some(index) => item(index),
-                None => deparser.column(key.expression),
+            })
+            .and_then(item),
+        _ => None,
+    };
+    named.unwrap_or(key)
+}
+
+/// The query's ORDER BY keys with their expressions resolved.
+fn resolved_order<'a>(
+    statement: &Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [OrderBy<'a>], SqlError> {
+    arena
+        .alloc_slice_with(statement.order_by.len(), |index| {
+            let key = statement.order_by[index];
+            OrderBy {
+                expression: order_expression(statement, key.expression),
+                ..key
+            }
+        })
+        .map(|keys| &*keys)
+        .map_err(|_| arena_full())
+}
+
+/// The order a DISTINCT query reads its rows in: its ORDER BY keys, then
+/// the remaining distinct expressions ascending. `None` when a star leaves
+/// the distinct expressions unknown here.
+fn distinct_keys<'a>(
+    deparser: &Deparser<'_>,
+    statement: &Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a [OrderBy<'a>]>, SqlError> {
+    let ordered = resolved_order(statement, arena)?;
+    let mut keys = ArenaList::new(arena);
+    for &key in ordered {
+        keys.push(key).map_err(|_| arena_full())?;
+    }
+    let mut distinct = ArenaList::new(arena);
+    if statement.distinct_on.is_empty() {
+        for item in statement.items {
+            match item {
+                SelectItem::Expr { expression, .. } => {
+                    distinct.push(*expression).map_err(|_| arena_full())?
+                }
+                _ => return Ok(None),
             }
         }
-        expression => deparser.column(expression),
+    } else {
+        for &key in statement.distinct_on {
+            distinct
+                .push(order_expression(statement, key))
+                .map_err(|_| arena_full())?;
+        }
     }
+    for &expression in distinct.as_slice() {
+        let present = keys.as_slice().iter().any(|key: &OrderBy<'_>| {
+            *key.expression == *expression
+                || deparser.column(key.expression).is_some()
+                    && deparser.column(key.expression) == deparser.column(expression)
+        });
+        if !present {
+            keys.push(OrderBy {
+                expression,
+                descending: false,
+                nulls_first: false,
+            })
+            .map_err(|_| arena_full())?;
+        }
+    }
+    Ok(Some(keys.as_slice()))
 }
 
 /// Plans the remote scan of `statement` when it reads exactly one foreign
@@ -1757,13 +2010,432 @@ pub(crate) fn plan_select<'a>(
     };
     let deparser = Deparser {
         table: &table,
+        grouped: false,
         foreign: &foreign,
         exposed: base.alias.unwrap_or(base.table),
         arena,
         storage,
         txid,
     };
+    if let Some(upper) = plan_upper(&deparser, slot, statement, arena)? {
+        return Ok(Some(upper));
+    }
     plan_with(&deparser, slot, statement, arena).map(Some)
+}
+
+/// Whether `expression` holds an aggregate call outside a subquery.
+fn has_aggregate(expression: &Expr<'_>) -> Result<bool, SqlError> {
+    let mut found = false;
+    crate::sql::query::walk_expression_tree(expression, &mut |node| {
+        found |= node.is_aggregate_use();
+    })?;
+    Ok(found)
+}
+
+/// Whether `expression` reads a window function, which runs after grouping.
+fn has_window_call(expression: &Expr<'_>) -> Result<bool, SqlError> {
+    let mut found = false;
+    crate::sql::query::walk_expression_tree(expression, &mut |node| {
+        found |= matches!(node, Expr::Call { over: Some(_), .. });
+    })?;
+    Ok(found)
+}
+
+/// The grouped remote scan of a query of one foreign table
+/// (`add_foreign_grouping_paths`, then `add_foreign_ordered_paths` and
+/// `add_foreign_final_paths`), when the whole select list, every `GROUP BY`
+/// key, `HAVING` condition and `ORDER BY` key ships, and the `WHERE` ships
+/// whole. `None` leaves grouping local.
+///
+/// With a `LIMIT` over `GROUP BY` PostgreSQL's costs prefer grouping the
+/// remotely sorted rows here unless the order is by an aggregate, and an
+/// aggregate without `GROUP BY` keeps its `LIMIT` local.
+fn plan_upper<'a>(
+    table_deparser: &Deparser<'_>,
+    slot: usize,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<ForeignSelectPlan<'a>>, SqlError> {
+    let deparser = Deparser {
+        grouped: true,
+        ..*table_deparser
+    };
+    let deparser = &deparser;
+    let mut aggregated = !statement.group_by.is_empty() || statement.having.is_some();
+    for item in statement.items {
+        match item {
+            SelectItem::Expr { expression, .. } => {
+                if expression.contains_subquery() || has_window_call(expression)? {
+                    return Ok(None);
+                }
+                aggregated |= has_aggregate(expression)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+                return Ok(None);
+            }
+        }
+    }
+    for key in statement.order_by {
+        if key.expression.contains_subquery() || has_window_call(key.expression)? {
+            return Ok(None);
+        }
+        aggregated |= has_aggregate(key.expression)?;
+    }
+    if !aggregated
+        || !statement.grouping_sets.is_empty()
+        || !statement.windows.is_empty()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || statement.with_ties
+        || statement.where_clause.is_some_and(Expr::contains_subquery)
+        || statement.having.is_some_and(Expr::contains_subquery)
+        || statement.group_by.iter().any(|key| key.contains_subquery())
+    {
+        return Ok(None);
+    }
+    // Without GROUP BY, aggregates that are all `min` or `max` of one
+    // argument read the first row of an ordered scan (`preprocess_minmax_aggregates`),
+    // which PostgreSQL's costs prefer.
+    if statement.group_by.is_empty() && statement.having.is_none() {
+        let mut minmax_only = true;
+        let mut any = false;
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                crate::sql::query::walk_expression_tree(expression, &mut |node| {
+                    if node.is_aggregate_use() {
+                        any = true;
+                        minmax_only &= matches!(
+                            node,
+                            Expr::Call {
+                                name: "min" | "max" | "pg_catalog.min" | "pg_catalog.max",
+                                args: [_],
+                                distinct: false,
+                                order_by: [],
+                                filter: None,
+                                ..
+                            }
+                        );
+                    }
+                })?;
+            }
+        }
+        if any && minmax_only {
+            return Ok(None);
+        }
+    }
+    // The planner moves a HAVING condition without aggregates or volatile
+    // calls into WHERE when the query has GROUP BY.
+    let having = conjuncts(statement.having, arena)?;
+    let mut moved = statement.where_clause;
+    let mut kept_having = ArenaList::new(arena);
+    for &condition in having {
+        if !statement.group_by.is_empty()
+            && !has_aggregate(condition)?
+            && condition.contains_volatile_function().is_none()
+        {
+            moved = Some(match moved {
+                Some(earlier) => arena
+                    .alloc(Expr::Binary {
+                        operator: BinaryOp::And,
+                        left: earlier,
+                        right: condition,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    })
+                    .map_err(|_| arena_full())?,
+                None => condition,
+            });
+        } else {
+            kept_having.push(condition).map_err(|_| arena_full())?;
+        }
+    }
+    let mut remote_where = RemoteText::new();
+    if !remote_conditions(table_deparser, moved, &mut remote_where, arena)?.is_empty() {
+        return Ok(None);
+    }
+    // The same expression, a table column however it is qualified.
+    let same =
+        |left: &Expr<'_>, right: &Expr<'_>| match (deparser.column(left), deparser.column(right)) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => unbound(left) == unbound(right),
+            _ => false,
+        };
+    // A select-list position or output name, as GROUP BY and ORDER BY
+    // resolve a bare key.
+    let item_expression = |key: &'a Expr<'a>| -> &'a Expr<'a> {
+        let item = |index: usize| match statement.items.get(index) {
+            Some(SelectItem::Expr { expression, .. }) => Some(*expression),
+            _ => None,
+        };
+        let named = match key {
+            Expr::Int(position) => usize::try_from(*position)
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .and_then(item),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if deparser.column(key).is_none() => statement
+                .items
+                .iter()
+                .position(|candidate| {
+                    matches!(candidate, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
+                })
+                .and_then(item),
+            _ => None,
+        };
+        named.unwrap_or(key)
+    };
+    let mut targets = ArenaList::new(arena);
+    // The target each GROUP BY key names (`ressortgroupref`).
+    let group_targets = arena
+        .alloc_slice_with(statement.group_by.len(), |_| usize::MAX)
+        .map_err(|_| arena_full())?;
+    let mut probe = RemoteText::new();
+    let mut ships = |expression: &Expr<'_>| -> Result<bool, SqlError> {
+        probe.clear();
+        deparser.try_write(&mut probe, expression)
+    };
+    // The query's target list: the select list, then the ORDER BY keys and
+    // GROUP BY keys it lacks, each found among the earlier entries first.
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
+            unreachable!("stars declined above")
+        };
+        let grouping = statement
+            .group_by
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| group_targets[*at] == usize::MAX)
+            .find(|(_, key)| same(item_expression(key), expression))
+            .map(|(at, _)| at);
+        if !ships(expression)? {
+            return Ok(None);
+        }
+        match grouping {
+            Some(at) => {
+                group_targets[at] = targets.len();
+                // Every key equal to this one names the same entry.
+                for (other, key) in statement.group_by.iter().enumerate() {
+                    if group_targets[other] == usize::MAX && same(item_expression(key), expression)
+                    {
+                        group_targets[other] = targets.len();
+                    }
+                }
+                targets.push(*expression).map_err(|_| arena_full())?;
+            }
+            None if targets
+                .as_slice()
+                .iter()
+                .any(|target| same(target, expression)) => {}
+            None => targets.push(*expression).map_err(|_| arena_full())?,
+        }
+    }
+    let mut order_targets = ArenaList::new(arena);
+    for key in statement.order_by {
+        let expression = item_expression(key.expression);
+        let at = match targets
+            .as_slice()
+            .iter()
+            .position(|target| same(target, expression))
+        {
+            Some(at) => at,
+            None => {
+                if !ships(expression)? {
+                    return Ok(None);
+                }
+                targets.push(expression).map_err(|_| arena_full())?;
+                targets.len() - 1
+            }
+        };
+        order_targets.push(at).map_err(|_| arena_full())?;
+    }
+    for (at, key) in statement.group_by.iter().enumerate() {
+        if group_targets[at] != usize::MAX {
+            continue;
+        }
+        let expression = item_expression(key);
+        let found = targets
+            .as_slice()
+            .iter()
+            .position(|target| same(target, expression));
+        group_targets[at] = match found {
+            Some(found) => found,
+            None => {
+                if !ships(expression)? {
+                    return Ok(None);
+                }
+                targets.push(expression).map_err(|_| arena_full())?;
+                targets.len() - 1
+            }
+        };
+    }
+    let mut remote_having = RemoteText::new();
+    for (index, &condition) in kept_having.as_slice().iter().enumerate() {
+        let separator = if index == 0 { " HAVING " } else { " AND " };
+        if !deparser.try_write_condition(&mut remote_having, condition, separator)? {
+            return Ok(None);
+        }
+    }
+    // LIMIT and OFFSET: grouped rows with an order by aggregate ship them;
+    // the order by grouping keys or none groups sorted rows here instead.
+    let limited = statement.limit.is_some() || statement.offset.is_some();
+    let mut limit_text = RemoteText::new();
+    let limit_pushed = limited && !statement.group_by.is_empty();
+    if limit_pushed {
+        let by_aggregate = {
+            let mut any = false;
+            for &at in order_targets.as_slice().iter() {
+                any |= has_aggregate(targets.as_slice()[at])?;
+            }
+            any
+        };
+        if !by_aggregate {
+            return Ok(None);
+        }
+        for (keyword, count) in [(" LIMIT ", statement.limit), (" OFFSET ", statement.offset)] {
+            if let Some(count) = count {
+                let _ = limit_text.write_str(keyword);
+                match deparser.try_write_count(&mut limit_text, count) {
+                    Ok(()) => {}
+                    Err(Stop::Local) => return Ok(None),
+                    Err(Stop::Error(error)) => return Err(error),
+                }
+            }
+        }
+    }
+    let mut sql = RemoteText::new();
+    let _ = sql.write_str("SELECT ");
+    for (index, target) in targets.as_slice().iter().enumerate() {
+        if index != 0 {
+            let _ = sql.write_str(", ");
+        }
+        if !deparser.try_write(&mut sql, target)? {
+            return Ok(None);
+        }
+    }
+    let _ = sql.write_str(" FROM ");
+    deparser.write_relation(&mut sql);
+    let _ = sql.write_str(remote_where.as_str());
+    for (index, &at) in group_targets.iter().enumerate() {
+        let _ = write!(
+            sql,
+            "{}{}",
+            if index == 0 { " GROUP BY " } else { ", " },
+            at + 1
+        );
+    }
+    let _ = sql.write_str(remote_having.as_str());
+    for (index, (&at, key)) in order_targets
+        .as_slice()
+        .iter()
+        .zip(statement.order_by)
+        .enumerate()
+    {
+        let _ = sql.write_str(if index == 0 { " ORDER BY " } else { ", " });
+        if !deparser.try_write(&mut sql, targets.as_slice()[at])? {
+            return Ok(None);
+        }
+        write_direction(&mut sql, key);
+    }
+    let _ = sql.write_str(limit_text.as_str());
+    if sql.is_truncated() || remote_where.is_truncated() || remote_having.is_truncated() {
+        return Err(query_too_long());
+    }
+    // The local relation: one column per target.
+    let targets = targets.as_slice();
+    let mut columns = ArenaList::new(arena);
+    for (index, target) in targets.iter().enumerate() {
+        columns
+            .push(match deparser.column(target) {
+                Some(column) => table_deparser.table.columns()[column],
+                None => {
+                    let type_oid = match deparser.shape(target) {
+                        Ok(Shape::Value { type_oid, .. }) => type_oid,
+                        Ok(Shape::Literal(_)) | Err(Stop::Local) => return Ok(None),
+                        Err(Stop::Error(error)) => return Err(error),
+                    };
+                    let ctype = crate::sql::exec::coltype_of_oid(type_oid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a shipped grouped target has no modeled type"
+                        )
+                    })?;
+                    let mut name = StackStr::<24>::new();
+                    let _ = write!(name, "?target{}?", index + 1);
+                    crate::storage::ColumnMeta {
+                        name: crate::storage::SqlName::parse(name.as_str())?,
+                        ctype,
+                        type_mod: -1,
+                        ..crate::storage::ColumnMeta::EMPTY
+                    }
+                }
+            })
+            .map_err(|_| arena_full())?;
+    }
+    let columns = columns.as_slice();
+    // The select list reads its targets, under its own output names.
+    let exposed: &'a str = arena
+        .alloc_str(deparser.exposed)
+        .map_err(|_| arena_full())?;
+    let items = arena
+        .alloc_slice_with(statement.items.len(), |_| statement.items[0])
+        .map_err(|_| arena_full())?;
+    for (index, item) in statement.items.iter().enumerate() {
+        let SelectItem::Expr { expression, alias } = item else {
+            unreachable!("stars declined above")
+        };
+        let at = targets
+            .iter()
+            .position(|target| same(target, expression))
+            .expect("every select item is a target");
+        let reference = arena
+            .alloc(Expr::Column {
+                qualifier: Some(exposed),
+                name: columns[at].name.as_str(),
+            })
+            .map_err(|_| arena_full())?;
+        items[index] = SelectItem::Expr {
+            expression: reference,
+            alias: Some(alias.unwrap_or_else(|| crate::sql::exec::derived_name(expression))),
+        };
+    }
+    let mut resjunk = ArenaList::new(arena);
+    for &target in targets {
+        let read = statement.items.iter().any(
+            |item| matches!(item, SelectItem::Expr { expression, .. } if same(target, expression)),
+        );
+        if !read {
+            resjunk.push(target).map_err(|_| arena_full())?;
+        }
+    }
+    let local = arena
+        .alloc(Select {
+            items,
+            where_clause: None,
+            group_by: &[],
+            having: None,
+            order_by: &[],
+            limit: if limit_pushed { None } else { statement.limit },
+            offset: if limit_pushed { None } else { statement.offset },
+            ..*statement
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Some(ForeignSelectPlan {
+        table_slot: slot,
+        fetched: ColumnSet::from_low_word(0),
+        sort_keys: &[],
+        presorted: &[],
+        local_where: None,
+        order_pushed: !statement.order_by.is_empty(),
+        limit_pushed,
+        sql: arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+        upper: Some(ForeignUpper {
+            resjunk: resjunk.as_slice(),
+            columns,
+            local,
+        }),
+    }))
 }
 
 fn plan_with<'a>(
@@ -1815,56 +2487,87 @@ fn plan_with<'a>(
             read!(key.expression);
         }
     }
+    let mut aggregated = false;
+    let mut window: Option<&WindowSpec<'a>> = None;
+    let mut windows_differ = false;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            aggregated |= has_aggregate(expression)?;
+            crate::sql::query::walk_expression_tree(expression, &mut |node| {
+                if let Expr::Call {
+                    over: Some(spec), ..
+                } = node
+                {
+                    match window {
+                        Some(first) => windows_differ |= first != *spec,
+                        None => window = Some(spec),
+                    }
+                }
+            })?;
+        }
+    }
+    let distinct = statement.distinct || !statement.distinct_on.is_empty();
     let grouped = !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
         || !statement.windows.is_empty()
-        || statement.distinct
-        || !statement.distinct_on.is_empty();
-    // ORDER BY ships when every key is a column of the table.
-    let mut ordered = ColumnSet::from_low_word(0);
-    let sort_columns = arena
-        .alloc_slice_with(statement.order_by.len(), |_| 0usize)
-        .map_err(|_| arena_full())?;
-    let mut sort_count = 0;
-    let mut order_text = RemoteText::new();
-    let mut order_pushed = !statement.order_by.is_empty() && !grouped && simple_items;
-    for (index, key) in statement.order_by.iter().enumerate() {
-        let column = order_column(deparser, statement, key);
-        if let Some(column) = column
-            && !sort_columns[..sort_count].contains(&column)
-        {
-            sort_columns[sort_count] = column;
-            sort_count += 1;
+        || window.is_some()
+        || distinct;
+    // The order the remote rows arrive in (`query_pathkeys`): the query's
+    // ORDER BY when the rows are final, else the order DISTINCT or the one
+    // window clause reads its rows in, which the local plan then needs no
+    // sort for. DISTINCT without ORDER BY and with a WHERE clause is hashed
+    // instead, as PostgreSQL's costs choose.
+    let keys: Option<(&'a [OrderBy<'a>], bool)> = if aggregated
+        || !statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.having.is_some()
+        || !statement.windows.is_empty()
+        || windows_differ
+    {
+        None
+    } else if let Some(spec) = window {
+        (statement.order_by.is_empty() && !distinct && spec.base.is_none())
+            .then(|| crate::sql::query::window_sort_keys(spec, arena).map(|keys| (keys, false)))
+            .transpose()?
+    } else if distinct {
+        if statement.order_by.is_empty() && statement.where_clause.is_some() {
+            None
+        } else {
+            distinct_keys(deparser, statement, arena)?.map(|keys| (keys, false))
         }
-        match column {
-            Some(column) if order_pushed && deparser.column_type(column).is_ok() => {
-                ordered.insert(column);
-                let _ = order_text.write_str(if index == 0 { " ORDER BY " } else { ", " });
-                deparser.write_column(&mut order_text, column);
-                let _ = order_text.write_str(if key.descending { " DESC" } else { " ASC" });
-                let _ = order_text.write_str(if key.nulls_first {
-                    " NULLS FIRST"
-                } else {
-                    " NULLS LAST"
-                });
+    } else if !statement.order_by.is_empty() && simple_items {
+        Some((resolved_order(statement, arena)?, true))
+    } else {
+        None
+    };
+    // The ORDER BY keys, which the scan returns for the sort whether or not
+    // the remote query applies it.
+    let sort_keys = resolved_order(statement, arena)?;
+    for key in sort_keys {
+        read!(key.expression);
+    }
+    let mut order_text = RemoteText::new();
+    let mut order_shipped = keys.is_some();
+    if let Some((keys, _)) = keys {
+        for (index, key) in keys.iter().enumerate() {
+            let _ = order_text.write_str(if index == 0 { " ORDER BY " } else { ", " });
+            if !deparser.try_write(&mut order_text, key.expression)? {
+                order_shipped = false;
+                break;
             }
-            Some(column) => {
-                order_pushed = false;
-                fetched.insert(column);
-            }
-            None => {
-                order_pushed = false;
-                read!(key.expression);
-            }
+            write_direction(&mut order_text, key);
+            read!(key.expression);
         }
     }
-    if !order_pushed {
+    if !order_shipped {
         order_text.clear();
     }
-    for column in (0..deparser.table.n_columns).filter(|&column| ordered.contains(column)) {
-        fetched.insert(column);
-    }
+    let order_pushed = order_shipped && keys.is_some_and(|(_, final_order)| final_order);
+    let presorted: &'a [OrderBy<'a>] = match keys {
+        Some((keys, false)) if order_shipped => keys,
+        _ => &[],
+    };
     // A locked row is copied whole, as a foreign table's row mark is.
     if whole || !statement.locking.is_empty() {
         fetched = all;
@@ -1914,23 +2617,27 @@ fn plan_with<'a>(
     Ok(ForeignSelectPlan {
         table_slot: slot,
         fetched,
-        sort_columns: &sort_columns[..sort_count],
+        sort_keys,
+        presorted,
         local_where: conjoin(kept, arena)?,
         order_pushed,
         limit_pushed,
         sql: arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+        upper: None,
     })
 }
 
 /// postgres_fdw's direct modification (`postgresPlanDirectModify`): an
 /// `UPDATE` (with `assignments`) or `DELETE` of one foreign table sent as one
 /// remote statement, when every condition and assigned value ships and no
-/// local trigger or generated column needs the rows. `None` when it does not
-/// apply.
+/// local trigger or generated column needs the rows. `returned` lists the
+/// columns the local `RETURNING` list reads, which `deparseReturningList`
+/// appends. `None` when it does not apply.
 pub(crate) fn direct_modify_sql<'a>(
     deparser: &Deparser<'_>,
     assignments: Option<&[(&str, &'a Expr<'a>)]>,
     predicate: Option<&'a Expr<'a>>,
+    returned: ColumnSet,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut conditions = RemoteText::new();
@@ -1981,6 +2688,10 @@ pub(crate) fn direct_modify_sql<'a>(
         }
     }
     let _ = sql.write_str(conditions.as_str());
+    if !returned.is_empty() {
+        let _ = sql.write_str(" RETURNING ");
+        deparser.write_target_list(&mut sql, returned);
+    }
     if sql.is_truncated() || conditions.is_truncated() {
         return Err(query_too_long());
     }
@@ -2048,13 +2759,26 @@ pub(crate) fn plan_modify_scan<'a>(
             let _ = modify.write_str("UPDATE ");
             deparser.write_relation(&mut modify);
             let _ = modify.write_str(" SET ");
-            let assigned = (0..deparser.table.n_columns).filter(|&column| columns.contains(column));
-            for (parameter, column) in (2..).zip(assigned) {
-                if parameter != 2 {
+            // `deparseUpdateSql` over the updated columns and the stored
+            // generated columns that depend on them, in column order; a
+            // generated column is set to DEFAULT.
+            let generated = dependent_generated_columns(deparser.table, columns, arena)?;
+            let mut parameter = 2;
+            let mut first = true;
+            for column in (0..deparser.table.n_columns)
+                .filter(|&column| columns.contains(column) || generated.contains(column))
+            {
+                if !first {
                     let _ = modify.write_str(", ");
                 }
+                first = false;
                 deparser.write_column(&mut modify, column);
-                let _ = write!(modify, " = ${parameter}");
+                if deparser.table.columns()[column].default.is_generated() {
+                    let _ = modify.write_str(" = DEFAULT");
+                } else {
+                    let _ = write!(modify, " = ${parameter}");
+                    parameter += 1;
+                }
             }
         }
         None => {
@@ -2079,7 +2803,58 @@ pub(crate) fn plan_modify_scan<'a>(
     })
 }
 
-#[cfg(test)]
+/// `get_dependent_generated_columns`: the stored generated columns whose
+/// expressions read a column of `updated`.
+fn dependent_generated_columns(
+    table: &crate::storage::TableDef,
+    updated: ColumnSet,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let mut dependent = ColumnSet::EMPTY;
+    for (index, column) in table.columns().iter().enumerate() {
+        let crate::storage::ColumnDefault::Generated {
+            expression,
+            kind: crate::storage::Generation::Stored,
+        } = &column.default
+        else {
+            continue;
+        };
+        let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena).map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored generation expression does not parse"
+            )
+        })?;
+        if expression_reads(parsed, table, updated)? {
+            dependent.insert(index);
+        }
+    }
+    Ok(dependent)
+}
+
+fn expression_reads(
+    expression: &Expr<'_>,
+    table: &crate::storage::TableDef,
+    columns: ColumnSet,
+) -> Result<bool, SqlError> {
+    if let Expr::Column { name, .. } = expression
+        && table
+            .column_index(name)
+            .is_some_and(|index| columns.contains(index))
+    {
+        return Ok(true);
+    }
+    let mut found = false;
+    crate::sql::query::walk_children(expression, &mut |child| {
+        if !found {
+            found = expression_reads(child, table, columns)?;
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

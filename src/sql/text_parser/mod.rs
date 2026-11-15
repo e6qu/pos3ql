@@ -416,7 +416,11 @@ fn special(c: u32) -> bool {
         || tables::STRANGE_LETTERS.binary_search(&c).is_ok()
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

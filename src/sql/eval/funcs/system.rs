@@ -1252,6 +1252,7 @@ pub(crate) fn dispatch<'a>(
                 | "brin_desummarize_range"
                 | "pg_get_constraintdef"
                 | "pg_get_partkeydef"
+                | "pg_get_partition_constraintdef"
                 | "pg_get_functiondef"
                 | "pg_get_triggerdef"
                 | "pg_get_function_arguments"
@@ -2649,6 +2650,20 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(cat
                     .partition_key_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_get_partition_constraintdef" => {
+                arity(1)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .partition_constraint_def(oid, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

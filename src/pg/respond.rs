@@ -1086,6 +1086,7 @@ impl<'b> Responder<'b> {
             if self.render_context().min_message_level.allows(level) {
                 let sqlstate = pending.sqlstate;
                 let message = pending.message;
+                let cursor = pending.position.and_then(CursorPosition::from_position);
                 let diagnostic = pending.detail.map(|detail| crate::sql::eval::Diagnostic {
                     detail: Some(crate::util::StackStr::from_str(detail)),
                     hint: None,
@@ -1098,7 +1099,7 @@ impl<'b> Responder<'b> {
                         sqlstate.as_str(),
                         message.as_str(),
                         diagnostic.as_ref(),
-                        None,
+                        cursor,
                     )
                 })?;
             }
@@ -2271,6 +2272,8 @@ impl<'b> Responder<'b> {
             self.held_command_complete = Some(held);
             return Ok(());
         }
+        // Queued notices precede the completion, which must end the output.
+        self.send_eval_messages()?;
         let start = self.mark();
         self.control(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_COMMAND_COMPLETE);
@@ -2754,7 +2757,11 @@ impl<'b> Responder<'b> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     fn message_kinds(mut bytes: &[u8], out: &mut [u8]) -> usize {
         let mut count = 0;

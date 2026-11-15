@@ -187,7 +187,11 @@ pub(crate) fn decompress(input: &[u8], output: &mut [u8]) -> Option<usize> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

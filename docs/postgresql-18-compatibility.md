@@ -1298,9 +1298,15 @@ its connections once no transaction uses them. Unlike PostgreSQL, the number
 of open connections across all clients is fixed by `max_foreign_sessions`
 (default 16); opening one more fails with `53300 foreign connection cache is
 full`. Scans read through a cursor `fetch_size` rows (default 100) at a time,
-and an INSERT on a table with `batch_size` sends its rows in multi-row remote
-INSERTs, each batch's values limited to `foreign_send_bytes` (`54000` beyond
-it).
+fetching the next batch only when the query needs more rows: `SELECT * FROM
+remote_orders WHERE note LIKE '%x%' LIMIT 1` reads one batch and closes the
+cursor. A query that joins a foreign table with other tables, a SQL cursor and
+a PL/pgSQL `FOR` loop still read every batch first. An INSERT on a table with
+`batch_size` sends its rows in multi-row remote INSERTs, each batch's values
+limited to `foreign_send_bytes` (`54000` beyond it). `COPY ... FROM` does the
+same when its buffer of up to 1000 rows or 64 KB of input fills and at the
+end of the data, as PostgreSQL does; each client connection reserves that
+buffer, `foreign_send_bytes` of values, at startup.
 
 A query that reads one foreign table sends the server the work postgres_fdw
 would: only the columns it needs, the `WHERE` conditions built from built-in

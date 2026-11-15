@@ -2348,7 +2348,7 @@ fn plan_upper<'a>(
     for (index, target) in targets.iter().enumerate() {
         columns
             .push(match deparser.column(target) {
-                Some(column) => table_deparser.table.columns()[column].clone(),
+                Some(column) => table_deparser.table.columns()[column],
                 None => {
                     let type_oid = match deparser.shape(target) {
                         Ok(Shape::Value { type_oid, .. }) => type_oid,

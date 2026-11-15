@@ -4680,6 +4680,7 @@ fn window_definition(
 /// first, and the keys the last window leaves its rows sorted by. Each
 /// window clause sorts its input unless the rows already follow its keys,
 /// incrementally when they follow a prefix of them, as PostgreSQL plans.
+#[expect(clippy::too_many_arguments, reason = "the window plan's context")]
 fn window_stages<'e>(
     storage: &Storage,
     txid: u32,

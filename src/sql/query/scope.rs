@@ -2443,9 +2443,7 @@ impl<'d> QueryScope<'d> {
                                 crate::sql::foreign::RemoteColumns::Upper(columns) => {
                                     crate::sql::foreign::RemoteColumns::Upper(
                                         arena
-                                            .alloc_slice_with(columns.len(), |at| {
-                                                columns[at].clone()
-                                            })
+                                            .alloc_slice_with(columns.len(), |at| columns[at])
                                             .map_err(|_| arena_full())?,
                                     )
                                 }

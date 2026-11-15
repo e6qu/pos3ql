@@ -3875,12 +3875,11 @@ fn plan_pulled_select<'a>(
     if let Some(pushed) = &foreign_scan
         && pushed.upper.is_some()
     {
-        // A query pulled up from a view or subquery has more range table
-        // entries than its one relation, so its output qualifies columns.
-        let qualified = written
-            .from
-            .as_ref()
-            .is_some_and(|from| from.base.subquery.is_some());
+        // A query pulled up from a view or subquery, or planned as one, has
+        // more range table entries than its one relation, so its output
+        // qualifies columns (`show_plan_tlist`).
+        let qualified =
+            shares_range_table(statement) || nested_block() || pulled_relations(written);
         let mut plan =
             foreign_upper_plan(storage, txid, statement, pushed, qualified, block, arena)?;
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -5147,6 +5146,7 @@ fn plan_pulled_select<'a>(
             // which a subquery's own plan outputs in order; a query of the
             // one relation projects its own select list.
             let passes_through = body.locking.is_empty()
+                && !has_resjunk_targets(body)
                 && (!from.joins.is_empty()
                     || statement
                         .items
@@ -6181,6 +6181,66 @@ fn plan_derived_body<'a>(
 /// under its `Subquery Scan`. PostgreSQL drops a scan that neither filters
 /// nor reshapes the rows (`SELECT * FROM (...) s`) and runs the derived
 /// plan in its place.
+/// Whether a query's target list holds entries its select list lacks
+/// (`resjunk`): `ORDER BY`, `GROUP BY`, `DISTINCT ON` or window keys that
+/// are not output columns. A subquery whose plan returns them keeps its
+/// `Subquery Scan` (`trivial_subqueryscan`).
+fn has_resjunk_targets(body: &Select<'_>) -> bool {
+    let listed = |key: &Expr<'_>| {
+        match key {
+        Expr::Int(position) => usize::try_from(*position)
+            .is_ok_and(|position| position >= 1 && position <= body.items.len()),
+        key => body.items.iter().any(|item| match item {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                matches!(key, Expr::Column { .. })
+            }
+            SelectItem::Expr { expression, alias } => {
+                **expression == *key
+                    || matches!(
+                        (key, expression),
+                        (Expr::Column { qualifier: None, name }, _) if alias.is_some_and(|alias| alias == *name)
+                    )
+                    || matches!(
+                        (key, expression),
+                        (Expr::Column { name, .. }, Expr::Column { name: listed, .. }) if name == listed
+                    )
+            }
+            SelectItem::RecordStar(_) => false,
+        }),
+    }
+    };
+    let window_keys = |spec: &crate::sql::ast::WindowSpec<'_>| {
+        spec.partition_by.iter().all(|key| listed(key))
+            && spec.order_by.iter().all(|key| listed(key.expression))
+    };
+    let mut inline_listed = true;
+    for item in body.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            // A walk that fails leaves the scan in place, as a resjunk
+            // entry would.
+            let mut keys_listed = true;
+            let walked = query::walk_expression_tree(expression, &mut |node| {
+                if let Expr::Call {
+                    over: Some(spec), ..
+                } = node
+                {
+                    keys_listed &= window_keys(spec);
+                }
+            });
+            inline_listed &= keys_listed && walked.is_ok();
+        }
+    }
+    !(inline_listed
+        && body.windows.iter().all(|spec| window_keys(spec))
+        && body
+            .order_by
+            .iter()
+            .map(|key| key.expression)
+            .chain(body.group_by.iter().copied())
+            .chain(body.distinct_on.iter().copied())
+            .all(listed))
+}
+
 fn with_derived_plan<'a>(
     plan: Plan<'a>,
     name: &str,

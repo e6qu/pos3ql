@@ -5983,10 +5983,15 @@ fn foreign_scan_node(
 ) -> Result<(), SqlError> {
     scan.name = StackStr::from_str("Foreign Scan");
     scan.remote_sql = remote_sql_text(pushed.sql)?;
+    // Under a local aggregate or window the scan returns what those nodes
+    // read, as any relation scan there does.
+    if aggregate || has_window(statement) {
+        return Ok(());
+    }
     let table = storage.table_def(pushed.table_slot, txid);
     scan.set_output(
         targets::RelationTargets::new(storage, txid, &table, scope.names[0], false, arena)?
-            .foreign_scan(statement, pushed.sort_keys, aggregate)?,
+            .foreign_scan(statement, pushed.sort_keys)?,
     );
     Ok(())
 }

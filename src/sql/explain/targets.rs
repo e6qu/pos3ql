@@ -526,13 +526,22 @@ impl<'a> BlockTargets<'a> {
             let at = keyed(&mut targets, key, false)?;
             mark(&mut targets, at, &|target| target.labelled = true);
         }
-        for call in window_calls {
-            let Expr::Call {
-                over: Some(spec), ..
-            } = call
-            else {
-                continue;
-            };
+        // The `WINDOW` clause's definitions, used or not, then the inline
+        // specifications (`transformWindowDefinitions` over `p_windowdefs`).
+        let specs = statement.windows.iter().copied().chain(
+            window_calls.iter().filter_map(|call| match call {
+                Expr::Call {
+                    over: Some(spec), ..
+                } => Some(*spec),
+                _ => None,
+            }),
+        );
+        for spec in specs {
+            // Only the keys of a window some call uses partition or order
+            // the window input (`make_window_input_target`).
+            let active = window_calls.iter().any(
+                |call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec),
+            );
             for key in spec
                 .partition_by
                 .iter()
@@ -542,7 +551,7 @@ impl<'a> BlockTargets<'a> {
                 let at = keyed(&mut targets, key, false)?;
                 mark(&mut targets, at, &|target| {
                     target.labelled = true;
-                    target.window = true;
+                    target.window |= active;
                 });
             }
         }
@@ -1500,20 +1509,18 @@ impl<'a> RelationTargets<'a> {
                     .all(|(named, column)| *named == column.name.as_str())
     }
 
-    /// postgres_fdw's scan of the base relation: the select list (none
-    /// under a local aggregate, which reads the columns by name), the sort
+    /// postgres_fdw's scan of the base relation: the select list, the sort
     /// keys it does not project, then the whole row a locking clause copies.
     pub(super) fn foreign_scan(
         &self,
         statement: &Select<'_>,
         sort_keys: &[crate::sql::ast::OrderBy<'_>],
-        aggregate: bool,
     ) -> Result<Option<Output>, SqlError> {
         let mut entries = ArenaList::new(self.arena);
         let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
             entries.push(entry).map_err(|_| arena_full())
         };
-        for item in statement.items.iter().filter(|_| !aggregate) {
+        for item in statement.items {
             match item {
                 SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                     for column in 0..self.table.columns().len() {
@@ -1529,16 +1536,30 @@ impl<'a> RelationTargets<'a> {
             }
         }
         let exposed = self.exposed;
-        for key in sort_keys {
+        // The sort keys, then the `WINDOW` definitions' keys, which no
+        // window reads here (a used window keeps the general scan target).
+        let window_keys = statement.windows.iter().flat_map(|spec| {
+            spec.partition_by
+                .iter()
+                .copied()
+                .chain(spec.order_by.iter().map(|order| order.expression))
+        });
+        let keys = sort_keys.iter().map(|key| key.expression).chain(window_keys);
+        let mut listed = ArenaList::new(self.arena);
+        for key in keys {
+            if listed.as_slice().iter().any(|&earlier: &&Expr<'_>| *earlier == *key) {
+                continue;
+            }
+            listed.push(key).map_err(|_| arena_full())?;
             let projected = statement.items.iter().any(|item| match item {
-                SelectItem::Wildcard(_) => matches!(key.expression, Expr::Column { .. }),
-                SelectItem::TableWildcard(qualifier) => match key.expression {
+                SelectItem::Wildcard(_) => matches!(key, Expr::Column { .. }),
+                SelectItem::TableWildcard(qualifier) => match key {
                     Expr::Column {
                         qualifier: held, ..
                     } => held.is_none_or(|q| q == *qualifier),
                     _ => false,
                 },
-                SelectItem::Expr { expression, .. } => match (expression, key.expression) {
+                SelectItem::Expr { expression, .. } => match (expression, key) {
                     (
                         Expr::Column {
                             qualifier,
@@ -1555,7 +1576,7 @@ impl<'a> RelationTargets<'a> {
             if projected {
                 continue;
             }
-            let entry = match key.expression {
+            let entry = match key {
                 Expr::Column { name, .. } if self.table.column_index(name).is_some() => {
                     let column = self.table.column_index(name).expect("checked above");
                     self.column(column, None)?

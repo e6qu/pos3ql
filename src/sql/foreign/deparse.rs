@@ -2479,6 +2479,8 @@ fn plan_with<'a>(
     {
         read!(expression);
     }
+    // Every `WINDOW` definition's expressions are resjunk targets, used or
+    // not.
     for window in statement.windows {
         for expression in window.partition_by {
             read!(expression);
@@ -2510,7 +2512,6 @@ fn plan_with<'a>(
     let grouped = !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
-        || !statement.windows.is_empty()
         || window.is_some()
         || distinct;
     // The order the remote rows arrive in (`query_pathkeys`): the query's
@@ -2522,7 +2523,6 @@ fn plan_with<'a>(
         || !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
         || statement.having.is_some()
-        || !statement.windows.is_empty()
         || windows_differ
     {
         None

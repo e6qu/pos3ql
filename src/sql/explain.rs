@@ -3354,7 +3354,8 @@ fn plan_select_with_ctes<'a>(
             .map_err(|_| arena_full())?
     };
     let plan = plan_pulled_select(storage, txid, statement, pulled, outer, block, arena)?;
-    attach_subplans(plan, pulled, block, sublinks, arena)
+    let relations = pulled.from.as_ref().map_or(0, |from| from.joins.len() + 1);
+    attach_subplans(plan, relations, block, sublinks, arena)
 }
 
 /// Where a query reads a subquery, which decides the node that runs it.
@@ -3699,7 +3700,7 @@ fn plan_recursive_union<'a>(
 /// of the node evaluating the expression that reads it.
 fn attach_subplans<'a>(
     plan: Plan<'a>,
-    statement: &Select<'_>,
+    relations: usize,
     block: BlockId,
     sublinks: &[Sublink<'a>],
     arena: &'a Arena,
@@ -3713,10 +3714,6 @@ fn attach_subplans<'a>(
             .iter()
             .position(|node| node.key == Some(NodeKey::new(block, role)))
     };
-    let relations = statement
-        .from
-        .as_ref()
-        .map_or(0, |from| from.joins.len() + 1);
     let scan = || {
         if relations == 1 {
             find(Role::Scan(0))
@@ -7733,8 +7730,16 @@ fn modification_outputs(
     let exposed = alias.unwrap_or(definition.name.as_str());
     let mark = arena.mark();
     let result = (|| {
+        // The target's columns print qualified when the statement's range
+        // table holds other relations: a `WITH` query run as its own plan.
         let lists = targets::RelationTargets::returning_scope(
-            storage, txid, definition, exposed, returning, false, arena,
+            storage,
+            txid,
+            definition,
+            exposed,
+            returning,
+            CTE_PLANS.with(core::cell::Cell::get),
+            arena,
         )?;
         Ok((
             lists.returning(returning)?,
@@ -8176,6 +8181,24 @@ pub(super) fn plan_statement<'a>(
             CTE_PLANS.with(|planned| planned.set(prior));
             plan
         }
+        Stmt::SetQuery(set_query) if !set_query.with.is_empty() => {
+            // The statement's `WITH` queries PostgreSQL runs once are
+            // InitPlans of its top node (`SS_process_ctes`).
+            let wrapper = query::wrap_set_tree_with(set_query.with, set_query.body, arena)?;
+            let (expanded, ctes) = query::expand_ctes_for_plan(wrapper, storage, txid, arena)?;
+            let planned = SetQuery {
+                with: &[],
+                body: expanded.set_body.expect("the wrapper keeps its set body"),
+                ..*set_query
+            };
+            let prior = CTE_PLANS.with(|planned| planned.replace(!ctes.is_empty()));
+            let plan = plan_ctes(storage, txid, ctes, None, block, arena).and_then(|ctes| {
+                let plan = plan_set_query(storage, txid, &planned, None, block, arena)?;
+                attach_subplans(plan, 0, block, ctes, arena)
+            });
+            CTE_PLANS.with(|planned| planned.set(prior));
+            plan
+        }
         Stmt::SetQuery(set_query) => {
             let body = query::expand_set_tree(
                 set_query.with,
@@ -8211,7 +8234,25 @@ pub(super) fn plan_statement<'a>(
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
             plan_modification(storage, txid, statement, block, arena)
         }
-        Stmt::With { statement, .. } => plan_modification(storage, txid, statement, block, arena),
+        Stmt::With { ctes, statement } => {
+            // The `WITH` queries PostgreSQL runs once are InitPlans of the
+            // write's top node (`SS_process_ctes`); the write reads them by
+            // `CTE Scan`.
+            let (statement, planned) =
+                query::expand_dml_ctes_for_plan(statement, ctes, storage, txid, arena)?;
+            let statement = if storage.has_any_view() {
+                rewrite::pull_up_sources(storage, txid, statement, arena)?
+            } else {
+                statement
+            };
+            let prior = CTE_PLANS.with(|cte_plans| cte_plans.replace(!planned.is_empty()));
+            let plan = plan_ctes(storage, txid, planned, None, block, arena).and_then(|ctes| {
+                let plan = plan_modification(storage, txid, statement, block, arena)?;
+                attach_subplans(plan, 0, block, ctes, arena)
+            });
+            CTE_PLANS.with(|cte_plans| cte_plans.set(prior));
+            plan
+        }
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "EXPLAIN does not support this statement type"

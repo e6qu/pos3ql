@@ -935,3 +935,41 @@ fn explain_execute_shows_custom_and_generic_plans() {
         ["1|2"]
     );
 }
+
+#[test]
+fn writing_with_queries_are_init_plans_of_any_main_statement() {
+    let (mut session, mut engine) =
+        setup("writing_with_queries_are_init_plans_of_any_main_statement");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "WITH w AS (DELETE FROM pn_t RETURNING *) INSERT INTO pn_t SELECT * FROM w"
+        ),
+        [
+            "Insert on pn_t",
+            "  CTE w",
+            "    ->  Delete on pn_t pn_t_1",
+            "          ->  Seq Scan on pn_t pn_t_1",
+            "  ->  CTE Scan on w",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "VERBOSE, COSTS OFF",
+            "WITH w AS (UPDATE pn_t SET b = 3 RETURNING a) SELECT * FROM w"
+        ),
+        [
+            "CTE Scan on w",
+            "  Output: w.a",
+            "  CTE w",
+            "    ->  Update on public.pn_t",
+            "          Output: pn_t.a",
+            "          ->  Seq Scan on public.pn_t",
+            "                Output: 3, pn_t.ctid",
+        ]
+    );
+}

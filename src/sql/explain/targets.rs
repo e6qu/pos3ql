@@ -1238,9 +1238,21 @@ impl<'a> RelationTargets<'a> {
             };
             entries.push(entry).map_err(|_| arena_full())?;
         }
+        let ctid = match self.target_qualifier() {
+            Some(qualifier) => {
+                let mut name = StackStr::<96>::new();
+                crate::sql::catalog::write_identifier(&mut name, qualifier);
+                let _ = name.write_str(".ctid");
+                &*self
+                    .arena
+                    .alloc_str(name.as_str())
+                    .map_err(|_| arena_full())?
+            }
+            None => "ctid",
+        };
         entries
             .push(Entry {
-                text: "ctid",
+                text: ctid,
                 var: true,
                 referenced: false,
             })

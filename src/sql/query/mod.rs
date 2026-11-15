@@ -126,7 +126,9 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
-pub(crate) use cte::{PlannedCte, PlannedCteQuery, expand_ctes_for_plan};
+pub(crate) use cte::{
+    PlannedCte, PlannedCteQuery, expand_ctes_for_plan, expand_dml_ctes_for_plan, wrap_set_tree_with,
+};
 pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;

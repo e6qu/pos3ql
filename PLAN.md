@@ -850,7 +850,8 @@ relation; a relation a subquery reads again under a name the statement
 already uses prints as `t_1`. A statement's `WITH` query that PostgreSQL
 does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
 `NOT MATERIALIZED`, volatile, recursive or data-modifying) is its top node's
-`CTE name` InitPlan, numbered before the query's subqueries and read by
+`CTE name` InitPlan, also when the statement is a set operation or a write
+(whose columns then print qualified), numbered before the query's subqueries and read by
 `CTE Scan` nodes without a `Materialize`; a derived table's or subquery's
 own `WITH` list follows the same rule as that query's InitPlans, and a
 subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive

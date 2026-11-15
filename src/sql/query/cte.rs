@@ -697,6 +697,54 @@ pub(crate) fn expand_dml_ctes_schema<'a>(
     )
 }
 
+/// [`expand_ctes_for_plan`] for a data-modifying main statement and its
+/// `WITH` list: the statement bound to the queries it reads, and the queries
+/// PostgreSQL plans on their own (`SS_process_ctes`).
+pub(crate) fn expand_dml_ctes_for_plan<'a>(
+    statement: &'a Stmt<'a>,
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(&'a Stmt<'a>, &'a [PlannedCte<'a>]), SqlError> {
+    let references = |name: &str| statement_references(statement, name);
+    let mut planned = PlannedCtes {
+        root_references: &references,
+        list: ArenaList::new(arena),
+    };
+    let expanded = with_schema_context(
+        with,
+        storage,
+        txid,
+        None,
+        None,
+        0,
+        ViewReader::Session,
+        arena,
+        None,
+        Some(&mut planned),
+        |context| {
+            let statement = match statement {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a WITH main statement kind is invalid"
+                    ));
+                }
+            };
+            Ok(&*arena.alloc(statement).map_err(|_| arena_full())?)
+        },
+    )?;
+    Ok((
+        expanded,
+        &*planned.list.into_mut_slice().map_err(|_| arena_full())?,
+    ))
+}
+
 /// Expand stored-view sources for metadata-only DML target/source lookup.
 pub(crate) fn expand_from_schema<'a>(
     from: &'a FromClause<'a>,
@@ -5324,7 +5372,7 @@ pub(super) fn expand_stored_set_tree_exec<'a>(
 /// A synthetic Select carrying `with` and the tree as its set body, so the
 /// Select-level CTE/view expansion (which already rewrites `set_body`)
 /// applies to a whole set-operation query.
-fn wrap_set_tree_with<'a>(
+pub(crate) fn wrap_set_tree_with<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
     arena: &'a Arena,

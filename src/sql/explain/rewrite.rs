@@ -272,10 +272,13 @@ pub(super) fn pulled_up(
         && select.with.is_empty()
         && select.set_body.is_none()
         && select.locking.is_empty()
-        && select
-            .items
-            .iter()
-            .all(|item| matches!(item, SelectItem::Expr { .. }))
+        // Parse analysis expanded `*` into the columns it names.
+        && select.items.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Expr { .. } | SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)
+            )
+        })
         && !selects_aggregate(select, storage, txid, arena)?)
 }
 

@@ -766,6 +766,20 @@ pub struct RenderContext {
     pub extra_float_digits: i8,
 }
 
+impl RenderContext {
+    /// postgres_fdw's `set_transmission_modes`: values sent to a foreign
+    /// server print with `DateStyle = ISO`, `IntervalStyle = postgres` and
+    /// `extra_float_digits = 3`, which its remote session reads back
+    /// exactly. A `timestamptz` prints its UTC offset, so the zone it
+    /// prints in does not change the value.
+    pub(crate) fn transmission() -> Self {
+        RenderContext {
+            extra_float_digits: 3,
+            ..RenderContext::default()
+        }
+    }
+}
+
 impl Default for RenderContext {
     fn default() -> Self {
         RenderContext {

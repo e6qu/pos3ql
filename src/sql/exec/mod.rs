@@ -79308,7 +79308,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     target,
                     txn.txid,
                     &values[..physical.n_columns],
-                    responder.render_context(),
                     arena,
                 )?;
                 inserted.foreign.push(target, fields)?;
@@ -79330,7 +79329,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                         on_conflict_do_nothing: false,
                         retrieved,
                         ctid: &mut None,
-                        render: responder.render_context(),
                         before_row_triggers: false,
                     },
                     arena,
@@ -86579,7 +86577,6 @@ where
                         on_conflict_do_nothing: statement.on_conflict.is_some(),
                         retrieved,
                         ctid: &mut remote_ctid,
-                        render: responder.render_context(),
                         before_row_triggers,
                     },
                     arena,
@@ -92743,7 +92740,6 @@ pub(crate) fn update<'a>(
                             },
                             |plan| plan.returned,
                         ),
-                        render: responder.render_context(),
                     },
                     planned,
                     arena,

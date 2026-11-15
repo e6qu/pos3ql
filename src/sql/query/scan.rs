@@ -9174,6 +9174,9 @@ fn scan_source_mode<'a>(
                 txid,
                 arena,
                 hooks.sequences,
+                &mut |expression| {
+                    crate::sql::eval::eval_full(expression, arena, params, &NoColumns, hooks)
+                },
                 &mut |bytes| {
                     check_timeout()?;
                     let this = index;
@@ -9395,7 +9398,6 @@ fn scan_source_mode<'a>(
                                 own,
                                 arena,
                             )?
-                            .map(|plan| (plan.sql, plan.remote_columns()))
                         } else {
                             None
                         };
@@ -9406,8 +9408,9 @@ fn scan_source_mode<'a>(
                             physical,
                             arena,
                             recycle_rows,
-                            hooks.sequences,
-                            pushed,
+                            params,
+                            hooks,
+                            pushed.as_ref(),
                             &mut visit,
                         )? {
                             return Ok(false);
@@ -10010,7 +10013,8 @@ fn scan_source_mode<'a>(
                     physical,
                     arena,
                     true,
-                    None,
+                    params,
+                    hooks,
                     None,
                     &mut |_, _| {
                         total += 1;
@@ -10255,7 +10259,8 @@ fn scan_source_mode<'a>(
                         physical,
                         arena,
                         recycle_rows,
-                        hooks.sequences,
+                        params,
+                        hooks,
                         None,
                         &mut |rowid, physical_values| {
                             check_timeout()?;
@@ -10513,18 +10518,27 @@ fn for_each_member_row<'a>(
     physical: &crate::storage::TableDef,
     arena: &'a Arena,
     recycle_rows: bool,
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-    pushed: Option<(&'a str, crate::sql::foreign::RemoteColumns<'a>)>,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'a>>,
     visit: &mut MemberRowVisitor<'_, 'a>,
 ) -> Result<bool, SqlError> {
     if physical.kind == crate::storage::TableKind::Foreign {
-        let stream = crate::sql::foreign::ForeignStream::new(leaf, pushed, arena)?;
+        let stream = crate::sql::foreign::ForeignStream::new(
+            leaf,
+            pushed.map(|plan| (plan.sql, plan.remote_columns())),
+            pushed.map_or(&[][..], |plan| plan.params),
+            arena,
+        )?;
         return crate::sql::foreign::stream_rows(
             storage,
             &stream,
             txid,
             arena,
-            sequences,
+            hooks.sequences,
+            &mut |expression| {
+                crate::sql::eval::eval_full(expression, arena, params, &NoColumns, hooks)
+            },
             &mut |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 let width = crate::sql::exec::decode_projected_row_into(bytes, arena, &mut values)?;

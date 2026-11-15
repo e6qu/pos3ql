@@ -2088,7 +2088,7 @@ impl<'d> QueryScope<'d> {
         params: &[Datum<'a>],
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
-        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
+        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.sole_source = from.joins.is_empty();
@@ -2384,7 +2384,7 @@ impl<'d> QueryScope<'d> {
         sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
         catalog_scan: crate::sql::catalog_snapshot::CatalogScan,
-        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
+        pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'a>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -2466,6 +2466,7 @@ impl<'d> QueryScope<'d> {
                 if self.sole_source && !tref.lateral {
                     // The only FROM item: the plan reads it as the remote
                     // cursor returns batches.
+                    let pushed_plan = pushed;
                     let pushed = match pushed {
                         Some(plan) => Some((
                             arena.alloc_str(plan.sql).map_err(|_| arena_full())?,
@@ -2484,11 +2485,18 @@ impl<'d> QueryScope<'d> {
                         )),
                         None => None,
                     };
+                    let params = pushed_plan.map_or(&[][..], |plan| plan.params);
                     self.foreign_streams[source] = Some(crate::sql::foreign::ForeignStream::new(
-                        slot, pushed, arena,
+                        slot, pushed, params, arena,
                     )?);
                     self.derived[source] = Some(&[]);
                     return Ok(());
+                }
+                if pushed.is_some_and(|plan| !plan.params.is_empty()) {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a foreign query with parameters is read only as a stream"
+                    ));
                 }
                 let rows = crate::sql::foreign::materialize(
                     storage, slot, txid, arena, sequences, pushed,

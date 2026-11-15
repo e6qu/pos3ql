@@ -69,6 +69,10 @@ enum Literal<'e> {
     Decimal(&'e str, bool),
     /// A quoted literal cast to a built-in type.
     Typed(&'e str, i32),
+    /// A constant computed by the plan, of its type: a custom plan's
+    /// statement parameter (`PARAM_FLAG_CONST`), an expression the planner
+    /// folded over one, or a number cast to a type.
+    Bound(&'e Expr<'e>, i32),
 }
 
 /// What a shippable subexpression is, before it is written.
@@ -207,6 +211,106 @@ pub(crate) struct Deparser<'t> {
     /// Writing the grouped relation's expressions, where the built-in
     /// aggregates ship (`foreign_grouping_ok`).
     pub(crate) grouped: bool,
+    /// The parameters a scan's remote query reads (`params_list`), when
+    /// parameters and InitPlan values may ship.
+    pub(crate) params: Option<&'t RemoteParams>,
+}
+
+/// The most parameters one remote query sends.
+pub(crate) const MAX_REMOTE_PARAMS: usize = 64;
+
+/// What a remote query parameter carries: a statement parameter `$n`
+/// (`PARAM_EXTERN`) or the value of an uncorrelated scalar subquery the
+/// local plan runs as an InitPlan (`PARAM_EXEC`), identified by its node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParamKey {
+    External(u32),
+    InitPlan(usize),
+}
+
+/// postgres_fdw's `params_list`: the values a remote query reads as `$1`,
+/// `$2`, ... in the order its text first names them, each sent once.
+pub(crate) struct RemoteParams {
+    entries: [core::cell::Cell<Option<(ParamKey, i32)>>; MAX_REMOTE_PARAMS],
+    count: core::cell::Cell<usize>,
+}
+
+impl RemoteParams {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [const { core::cell::Cell::new(None) }; MAX_REMOTE_PARAMS],
+            count: core::cell::Cell::new(0),
+        }
+    }
+
+    /// How many parameters the text written so far names.
+    pub(crate) fn mark(&self) -> usize {
+        self.count.get()
+    }
+
+    /// Forgets the parameters named after `mark`, whose text was discarded.
+    pub(crate) fn reset(&self, mark: usize) {
+        self.count.set(mark.min(self.count.get()));
+    }
+
+    /// The 1-based number of `key`, added when the text names it first.
+    fn number(&self, key: ParamKey, type_oid: i32) -> Shipped<usize> {
+        let count = self.count.get();
+        if let Some(at) = self.entries[..count]
+            .iter()
+            .position(|entry| entry.get().is_some_and(|(held, _)| held == key))
+        {
+            return Ok(at + 1);
+        }
+        if count == MAX_REMOTE_PARAMS {
+            return Err(Stop::Error(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a foreign query reads more than {} parameters",
+                MAX_REMOTE_PARAMS
+            )));
+        }
+        self.entries[count].set(Some((key, type_oid)));
+        self.count.set(count + 1);
+        Ok(count + 1)
+    }
+
+    /// The nodes that compute each parameter, in number order, found among
+    /// the expressions the remote query was written from.
+    fn nodes<'a>(
+        &self,
+        roots: &[&'a Expr<'a>],
+        arena: &'a Arena,
+    ) -> Result<&'a [&'a Expr<'a>], SqlError> {
+        let count = self.count.get();
+        let nodes = arena
+            .alloc_slice_with(count, |_| &Expr::Null)
+            .map_err(|_| arena_full())?;
+        for (at, entry) in self.entries[..count].iter().enumerate() {
+            let (key, _) = entry.get().expect("counted entries are set");
+            let mut found = None;
+            for &root in roots {
+                crate::sql::query::walk_expression_tree(root, &mut |node| {
+                    let matches = match (key, node) {
+                        (ParamKey::External(index), Expr::Param(held)) => index == *held,
+                        (ParamKey::InitPlan(address), Expr::Subquery(_)) => {
+                            core::ptr::from_ref(node) as usize == address
+                        }
+                        _ => false,
+                    };
+                    if matches && found.is_none() {
+                        found = Some(node);
+                    }
+                })?;
+            }
+            nodes[at] = found.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a foreign query parameter has no source expression"
+                )
+            })?;
+        }
+        Ok(nodes)
+    }
 }
 
 impl<'t> Deparser<'t> {
@@ -293,6 +397,26 @@ impl<'t> Deparser<'t> {
                 }
                 Literal::Typed(text, ctype.oid())
             }
+            // A number cast to a type is a constant of it (`5::bigint`).
+            cast @ Expr::Cast {
+                operand:
+                    Expr::Int(_)
+                    | Expr::NumericLit(_)
+                    | Expr::Unary {
+                        operator: UnaryOp::Neg,
+                        operand: Expr::Int(_) | Expr::NumericLit(_),
+                        ..
+                    },
+                type_name,
+                type_mod: -1,
+                ..
+            } => {
+                let ctype = ColType::from_sql_name(type_name)?;
+                if !modeled_type(ctype) {
+                    return None;
+                }
+                Literal::Bound(cast, ctype.oid())
+            }
             _ => return None,
         })
     }
@@ -303,6 +427,9 @@ impl<'t> Deparser<'t> {
     /// `AND`/`OR`/`NOT`; `IS [NOT] NULL`; `[NOT] IN` over constants;
     /// `[NOT] [I]LIKE` without `ESCAPE`; and the POSIX regex operators.
     fn shape<'e>(&self, expression: &'e Expr<'e>) -> Shipped<Shape<'e>> {
+        if let Some(shape) = self.param_shape(expression)? {
+            return Ok(shape);
+        }
         let expression = unbound(expression);
         if let Some(column) = self.column(expression) {
             return Ok(Shape::Value {
@@ -389,6 +516,134 @@ impl<'t> Deparser<'t> {
         }
     }
 
+    /// A statement parameter or InitPlan value the remote query reads as a
+    /// parameter (`is_foreign_param`), and its type: one of a modeled type
+    /// without a modifier, which `printRemoteParam` writes as `$n::type`.
+    fn remote_param(&self, expression: &Expr<'_>) -> Shipped<Option<(ParamKey, i32)>> {
+        if self.params.is_none() || self.grouped {
+            return Ok(None);
+        }
+        let (key, type_oid) = match unbound(expression) {
+            Expr::Param(index) => (
+                ParamKey::External(*index),
+                crate::sql::exec::bound_parameter_type_oid(*index).ok_or(Stop::Local)?,
+            ),
+            node @ Expr::Subquery(_) => {
+                if crate::sql::query::subquery_node_correlated(
+                    node,
+                    self.storage,
+                    self.txid,
+                    self.arena,
+                )? {
+                    return Err(Stop::Local);
+                }
+                let type_oid = crate::sql::query::subquery_expression_type(
+                    node,
+                    self.storage,
+                    self.txid,
+                    self.arena,
+                    &crate::sql::eval::NoColumns,
+                )?
+                .ok_or(Stop::Local)?;
+                // An InitPlan's value has its subquery's type modifier,
+                // which these types may carry.
+                if matches!(
+                    type_oid,
+                    oid::NUMERIC
+                        | oid::VARCHAR
+                        | oid::BPCHAR
+                        | oid::TIMESTAMP
+                        | oid::TIMESTAMPTZ
+                        | oid::TIME
+                        | oid::INTERVAL
+                ) {
+                    return Err(Stop::Local);
+                }
+                (
+                    ParamKey::InitPlan(core::ptr::from_ref(node) as usize),
+                    type_oid,
+                )
+            }
+            _ => return Ok(None),
+        };
+        match crate::sql::exec::coltype_of_oid(type_oid) {
+            Some(ctype) if modeled_type(ctype) => Ok(Some((key, type_oid))),
+            _ => Err(Stop::Local),
+        }
+    }
+
+    /// A parameter's shape: a custom plan's bound value is a constant
+    /// (`PARAM_FLAG_CONST`), any other remote parameter a value.
+    fn param_shape<'e>(&self, expression: &'e Expr<'e>) -> Shipped<Option<Shape<'e>>> {
+        if self.params.is_none() || self.grouped {
+            return Ok(None);
+        }
+        let constant = match expression {
+            Expr::Param(index) if crate::sql::eval::custom_plan_binds(*index) => Some((
+                crate::sql::exec::bound_parameter_type_oid(*index).ok_or(Stop::Local)?,
+                -1,
+            )),
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(_),
+                type_oid,
+                type_mod,
+                source,
+                ..
+            } if reads_custom_parameter(source)? => Some((*type_oid, *type_mod)),
+            _ => None,
+        };
+        if let Some((type_oid, type_mod)) = constant {
+            if type_mod >= 0
+                || !crate::sql::exec::coltype_of_oid(type_oid).is_some_and(modeled_type)
+            {
+                return Err(Stop::Local);
+            }
+            return Ok(Some(Shape::Literal(
+                match self.bound_value(expression)? {
+                    Datum::Null => Literal::Null,
+                    _ => Literal::Bound(expression, type_oid),
+                },
+            )));
+        }
+        Ok(self
+            .remote_param(expression)?
+            .map(|(_, type_oid)| Shape::Value {
+                type_oid,
+                plain: false,
+            }))
+    }
+
+    /// The value of a constant the plan computes.
+    fn bound_value<'v>(&'v self, node: &'v Expr<'v>) -> Shipped<Datum<'v>> {
+        match node {
+            Expr::Param(index) => {
+                Ok(crate::sql::eval::custom_plan_parameter(*index).ok_or(Stop::Local)?)
+            }
+            node => Ok(crate::sql::eval::eval_full(
+                node,
+                self.arena,
+                &[],
+                &crate::sql::eval::NoColumns,
+                &crate::sql::eval::NO_HOOKS,
+            )?),
+        }
+    }
+
+    /// Whether `expression` is a value the remote query reads as a
+    /// parameter, which the planner treats as a constant.
+    fn is_param(&self, expression: &Expr<'_>) -> bool {
+        matches!(self.param_shape(expression), Ok(Some(_)))
+    }
+
+    /// Whether `expression` reads a column of the table.
+    fn reads_column(&self, expression: &Expr<'_>) -> Result<bool, SqlError> {
+        let mut reads = false;
+        crate::sql::query::walk_expression_tree(expression, &mut |node| {
+            reads |= self.column(node).is_some();
+        })?;
+        Ok(reads)
+    }
+
     /// An integer or decimal literal, negated or not.
     fn integer<'e>(&self, expression: &'e Expr<'e>) -> Option<Literal<'e>> {
         let (negative, operand) = match unbound(expression) {
@@ -446,7 +701,7 @@ impl<'t> Deparser<'t> {
                 }
             }
             Literal::Decimal(..) => oid::NUMERIC,
-            Literal::Typed(_, type_oid) => type_oid,
+            Literal::Typed(_, type_oid) | Literal::Bound(_, type_oid) => type_oid,
         }
     }
 
@@ -530,7 +785,10 @@ impl<'t> Deparser<'t> {
     /// each implicit cast of a value one, and an array comparison half its
     /// elements.
     fn cost(&self, expression: &Expr<'_>) -> Shipped<u32> {
-        if self.column(expression).is_some() || Self::literal(expression).is_some() {
+        if self.column(expression).is_some()
+            || Self::literal(expression).is_some()
+            || self.is_param(expression)
+        {
             return Ok(0);
         }
         let value_cast = |value: &Expr<'_>, target: i32| -> Shipped<u32> {
@@ -647,6 +905,22 @@ impl<'t> Deparser<'t> {
         }
         Ok(match (self.shape(left), self.shape(right)) {
             (Ok(Shape::Literal(Literal::Null)), _) | (_, Ok(Shape::Literal(Literal::Null))) => None,
+            // A parameter is the class's constant, which the regenerated
+            // equality reads second.
+            (Ok(Shape::Value { .. }), Ok(Shape::Value { .. }))
+                if self.is_param(left) && !self.is_param(right) =>
+            {
+                Some(
+                    arena
+                        .alloc(Expr::Binary {
+                            source_position: condition.source_position(),
+                            operator: BinaryOp::Eq,
+                            left: right,
+                            right: left,
+                        })
+                        .map_err(|_| arena_full())?,
+                )
+            }
             (Ok(Shape::Value { .. }), Ok(Shape::Value { .. }))
             | (Ok(Shape::Value { .. }), Ok(Shape::Literal(_))) => Some(condition),
             (Ok(Shape::Literal(_)), Ok(Shape::Value { .. })) => Some(
@@ -828,13 +1102,13 @@ impl<'t> Deparser<'t> {
                 oid::FLOAT8 => Ok(oid::FLOAT8),
                 _ => Err(Stop::Local),
             },
-            Literal::Typed(_, type_oid)
+            Literal::Typed(_, type_oid) | Literal::Bound(_, type_oid)
                 if type_oid == partner
                     || integer_rank(type_oid).is_some() && integer_rank(partner).is_some() =>
             {
                 Ok(type_oid)
             }
-            Literal::Bool(_) | Literal::Typed(..) => Err(Stop::Local),
+            Literal::Bool(_) | Literal::Typed(..) | Literal::Bound(..) => Err(Stop::Local),
         }
     }
 
@@ -948,6 +1222,21 @@ impl<'t> Deparser<'t> {
         if matches!(type_oid, oid::VARCHAR | oid::BPCHAR | oid::FLOAT4) || list.is_empty() {
             return Err(Stop::Local);
         }
+        // A list of parameters is an `ARRAY[...]` of them, which ships when
+        // each has the operand's type.
+        let value_param = |item: &Expr<'_>| {
+            self.is_param(item) && matches!(self.shape(item), Ok(Shape::Value { .. }))
+        };
+        if list.len() > 1 && list.iter().any(|item| value_param(item)) {
+            for item in list {
+                match self.shape(item)? {
+                    Shape::Value { type_oid: held, .. }
+                        if value_param(item) && held == type_oid => {}
+                    _ => return Err(Stop::Local),
+                }
+            }
+            return Ok(type_oid);
+        }
         let mut element = type_oid;
         for item in list {
             let Shape::Literal(literal) = self.shape(item)? else {
@@ -968,7 +1257,7 @@ impl<'t> Deparser<'t> {
         }
         match self.shape(pattern)? {
             Shape::Literal(Literal::Unknown(_)) => Ok(()),
-            Shape::Literal(Literal::Typed(_, oid::TEXT)) => Ok(()),
+            Shape::Literal(Literal::Typed(_, oid::TEXT) | Literal::Bound(_, oid::TEXT)) => Ok(()),
             Shape::Value { type_oid, .. } if operator_type(type_oid) == oid::TEXT => Ok(()),
             _ => Err(Stop::Local),
         }
@@ -993,6 +1282,19 @@ impl<'t> Deparser<'t> {
                     write_type_name(output, type_oid)?;
                 }
                 return Ok(());
+            }
+            Literal::Bound(node, held) => {
+                let ctype = crate::sql::exec::coltype_of_oid(type_oid).ok_or(Stop::Local)?;
+                let mut value = self.bound_value(node)?;
+                if held != type_oid {
+                    value = crate::sql::eval::cast_to(value, ctype, self.arena)
+                        .map_err(|_| Stop::Local)?;
+                }
+                let text = self
+                    .arena
+                    .alloc_str_display(value)
+                    .map_err(|_| arena_full())?;
+                return Self::write_constant_text(output, text, type_oid, show);
             }
             other => other,
         };
@@ -1087,6 +1389,13 @@ impl<'t> Deparser<'t> {
             self.column_type(column)?;
             self.write_column(output, column);
             return Ok(());
+        }
+        // `printRemoteParam`.
+        if let (Some((key, type_oid)), Some(params)) = (self.remote_param(expression)?, self.params)
+        {
+            let number = params.number(key, type_oid)?;
+            let _ = write!(output, "${number}::");
+            return write_type_name(output, type_oid);
         }
         match expression {
             Expr::Unary {
@@ -1223,6 +1532,25 @@ impl<'t> Deparser<'t> {
                     let _ = output.write_char(')');
                     return Ok(());
                 }
+                // `deparseArrayExpr`.
+                if self.is_param(list[0]) && matches!(self.shape(list[0]), Ok(Shape::Value { .. }))
+                {
+                    let _ = output.write_char('(');
+                    self.write(output, operand)?;
+                    let _ = output.write_str(if *negated {
+                        " <> ALL (ARRAY["
+                    } else {
+                        " = ANY (ARRAY["
+                    });
+                    for (index, item) in list.iter().enumerate() {
+                        if index != 0 {
+                            let _ = output.write_str(", ");
+                        }
+                        self.write(output, item)?;
+                    }
+                    let _ = output.write_str("]))");
+                    return Ok(());
+                }
                 let element_type = crate::sql::exec::coltype_of_oid(element).ok_or(Stop::Local)?;
                 let mut array = StackStr::<{ REMOTE_QUERY_BYTES / 2 }>::new();
                 let _ = array.write_char('{');
@@ -1241,10 +1569,12 @@ impl<'t> Deparser<'t> {
                         other => other,
                     };
                     let mut digits = StackStr::<128>::new();
-                    let source = source_text(source, &mut digits)?;
-                    let value =
-                        crate::sql::eval::cast_to(Datum::Text(source), element_type, self.arena)
-                            .map_err(|_| Stop::Local)?;
+                    let value = match source {
+                        Literal::Bound(node, _) => self.bound_value(node)?,
+                        source => Datum::Text(source_text(source, &mut digits)?),
+                    };
+                    let value = crate::sql::eval::cast_to(value, element_type, self.arena)
+                        .map_err(|_| Stop::Local)?;
                     let text = self
                         .arena
                         .alloc_str_display(value)
@@ -1350,6 +1680,7 @@ impl<'t> Deparser<'t> {
         expression: &Expr<'_>,
     ) -> Result<bool, SqlError> {
         let mark = output.len();
+        let named = self.param_mark();
         let shipped = self.shape(expression).and_then(|shape| match shape {
             Shape::Value { .. } => self.write(output, expression),
             Shape::Literal(_) => Err(Stop::Local),
@@ -1363,9 +1694,22 @@ impl<'t> Deparser<'t> {
             }
             Err(Stop::Local) => {
                 output.truncate(mark);
+                self.param_reset(named);
                 Ok(false)
             }
             Err(Stop::Error(error)) => Err(error),
+        }
+    }
+
+    /// How many parameters the text written so far names.
+    pub(crate) fn param_mark(&self) -> usize {
+        self.params.map_or(0, RemoteParams::mark)
+    }
+
+    /// Forgets the parameters named by text written after `mark`.
+    pub(crate) fn param_reset(&self, mark: usize) {
+        if let Some(params) = self.params {
+            params.reset(mark);
         }
     }
 
@@ -1510,7 +1854,12 @@ impl<'t> Deparser<'t> {
         let literal = match expression {
             Expr::Int(_) | Expr::Unary { .. } => self.integer(expression).ok_or(Stop::Local)?,
             Expr::Null => Literal::Null,
-            _ => return Err(Stop::Local),
+            // A parameter count stays local (`add_foreign_final_paths`
+            // ships only a constant one); a custom plan's is a constant.
+            _ => match self.param_shape(expression)? {
+                Some(Shape::Literal(literal @ (Literal::Null | Literal::Bound(..)))) => literal,
+                _ => return Err(Stop::Local),
+            },
         };
         if matches!(literal, Literal::Decimal(..)) {
             return Err(Stop::Local);
@@ -1534,6 +1883,16 @@ fn write_direction(output: &mut impl core::fmt::Write, key: &OrderBy<'_>) {
     } else {
         " NULLS LAST"
     });
+}
+
+/// Whether a folded expression read a custom plan's parameter, whose value
+/// PostgreSQL's plan holds instead of the expression.
+fn reads_custom_parameter(expression: &Expr<'_>) -> Result<bool, SqlError> {
+    let mut reads = false;
+    crate::sql::query::walk_expression_tree(expression, &mut |node| {
+        reads |= matches!(node, Expr::Param(index) if crate::sql::eval::custom_plan_binds(*index));
+    })?;
+    Ok(reads)
 }
 
 /// A constant the planner bound, as the literal it was written as.
@@ -1563,6 +1922,8 @@ fn source_text<'s>(literal: Literal<'s>, digits: &'s mut StackStr<128>) -> Shipp
             }
             Ok(digits.as_str())
         }
+        // Its callers print the value itself.
+        Literal::Bound(..) => Err(Stop::Local),
     }
 }
 
@@ -1675,6 +2036,7 @@ fn read_columns(
         | Expr::RoutineParam { .. }
         | Expr::DefaultMarker
         | Expr::RecursiveState { .. } => Some(()),
+        Expr::Subquery(_) if deparser.is_param(expression) => Some(()),
         Expr::WholeRow(_)
         | Expr::SchemaColumn { .. }
         | Expr::Subquery(_)
@@ -1784,9 +2146,25 @@ fn read_columns(
 }
 
 /// Whether an expression calls a routine or reads a subquery, either of
-/// which may make the query grouped or set-returning.
-fn calls(expression: &Expr<'_>) -> bool {
-    expression.find_function(&|_, _| true).is_some() || expression.contains_subquery()
+/// which may make the query grouped or set-returning; a subquery the plan
+/// runs as an InitPlan reads one value and does neither.
+fn calls_beyond_params(deparser: &Deparser<'_>, expression: &Expr<'_>) -> Result<bool, SqlError> {
+    if expression.find_function(&|_, _| true).is_some() {
+        return Ok(true);
+    }
+    let mut other = false;
+    crate::sql::query::walk_expression_tree(expression, &mut |node| {
+        other |= matches!(
+            node,
+            Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+                | Expr::Exists(_)
+                | Expr::ArraySubquery(_)
+        ) && !deparser.is_param(node);
+    })?;
+    Ok(other)
 }
 
 /// The remote scan of a `SELECT` reading one foreign table.
@@ -1805,6 +2183,9 @@ pub(crate) struct ForeignSelectPlan<'a> {
     pub order_pushed: bool,
     pub limit_pushed: bool,
     pub sql: &'a str,
+    /// The expressions whose values the remote query reads as `$1`, `$2`,
+    /// ...: statement parameters and InitPlan subqueries.
+    pub params: &'a [&'a Expr<'a>],
     /// The grouped relation the remote query computes, when the query's
     /// grouping and aggregates ship.
     pub upper: Option<ForeignUpper<'a>>,
@@ -1892,7 +2273,13 @@ pub(crate) fn remote_conditions<'a, const N: usize>(
     let mut probe = RemoteText::new();
     for &condition in conditions {
         probe.clear();
-        if deparser.try_write_condition(&mut probe, condition, "")? {
+        // A condition that reads no column of the table is a pseudoconstant
+        // the plan evaluates once, not a scan qualification.
+        let named = deparser.param_mark();
+        let ships = deparser.try_write_condition(&mut probe, condition, "")?
+            && (named == deparser.param_mark() || deparser.reads_column(condition)?);
+        deparser.param_reset(named);
+        if ships {
             let (written, equivalence) = match deparser.equivalence(condition, arena)? {
                 Some(regenerated) => (regenerated, true),
                 None => (condition, false),
@@ -1934,6 +2321,51 @@ pub(crate) fn remote_conditions<'a, const N: usize>(
         }
     }
     Ok(&kept[..kept_count])
+}
+
+/// The table columns the top-level `WHERE` conditions equate with a
+/// constant or parameter, which PostgreSQL's equivalence classes fix.
+fn constant_columns(
+    deparser: &Deparser<'_>,
+    predicate: Option<&Expr<'_>>,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let mut fixed = ColumnSet::from_low_word(0);
+    let Some(predicate) = predicate else {
+        return Ok(fixed);
+    };
+    for &condition in conjuncts(Some(predicate), arena)? {
+        let (left, right) = match condition {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => (*left, *right),
+            Expr::InList {
+                operand,
+                list: [item],
+                negated: false,
+            } => (*operand, *item),
+            _ => continue,
+        };
+        let constant = |side: &Expr<'_>| {
+            !matches!(unbound(side), Expr::Null | Expr::Bool(_))
+                && (matches!(deparser.shape(side), Ok(Shape::Literal(_)))
+                    || deparser.is_param(side))
+        };
+        for (column, other) in [(left, right), (right, left)] {
+            if let Some(column) = deparser.column(column)
+                && constant(other)
+                && deparser
+                    .column_type(column)
+                    .is_ok_and(|type_oid| type_oid != oid::BOOL)
+            {
+                fixed.insert(column);
+            }
+        }
+    }
+    Ok(fixed)
 }
 
 /// The expression an ORDER BY key sorts by: a select-list item through its
@@ -2070,6 +2502,7 @@ pub(crate) fn plan_select<'a>(
     let Some((_, foreign)) = storage.foreign_table(slot as u16, txid) else {
         return Ok(None);
     };
+    let params = RemoteParams::new();
     let deparser = Deparser {
         table: &table,
         grouped: false,
@@ -2078,6 +2511,7 @@ pub(crate) fn plan_select<'a>(
         arena,
         storage,
         txid,
+        params: Some(&params),
     };
     if let Some(upper) = plan_upper(&deparser, slot, statement, arena)? {
         return Ok(Some(upper));
@@ -2198,6 +2632,7 @@ pub(crate) fn minmax_subquery<'a>(
         arena,
         storage,
         txid,
+        params: None,
     };
     // The one aggregate, as many times as the select list repeats it.
     let mut found: Option<&'a Expr<'a>> = None;
@@ -2450,6 +2885,7 @@ fn plan_upper<'a>(
 ) -> Result<Option<ForeignSelectPlan<'a>>, SqlError> {
     let deparser = Deparser {
         grouped: true,
+        params: None,
         ..*table_deparser
     };
     let deparser = &deparser;
@@ -2973,6 +3409,7 @@ fn plan_upper<'a>(
         order_pushed,
         limit_pushed,
         sql: arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+        params: &[],
         upper: Some(ForeignUpper {
             output: output.as_slice(),
             targets,
@@ -3020,7 +3457,7 @@ fn plan_with<'a>(
         match item {
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => whole = true,
             SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
-                simple_items &= !calls(expression);
+                simple_items &= !calls_beyond_params(deparser, expression)?;
                 whole |= read_columns(deparser, expression, &mut fetched).is_none();
             }
         }
@@ -3083,6 +3520,7 @@ fn plan_with<'a>(
     // window clause reads its rows in, which the local plan then needs no
     // sort for. DISTINCT without ORDER BY and with a WHERE clause is hashed
     // instead, as PostgreSQL's costs choose.
+    let mut order_redundant = false;
     let keys: Option<(&'a [OrderBy<'a>], bool)> = if aggregated
         || !statement.group_by.is_empty()
         || !statement.grouping_sets.is_empty()
@@ -3101,7 +3539,26 @@ fn plan_with<'a>(
             distinct_keys(deparser, statement, arena)?.map(|keys| (keys, false))
         }
     } else if !statement.order_by.is_empty() && simple_items {
-        Some((resolved_order(statement, arena)?, true))
+        // A key a `WHERE` equality fixes to a constant orders nothing (its
+        // pathkey is redundant); with none left the rows need no order, and
+        // the `LIMIT` stays local (`qp_is_pushdown_safe`).
+        let fixed = constant_columns(deparser, statement.where_clause, arena)?;
+        let ordered = resolved_order(statement, arena)?;
+        let mut kept = ArenaList::new(arena);
+        for &key in ordered {
+            if !deparser
+                .column(key.expression)
+                .is_some_and(|column| fixed.contains(column))
+            {
+                kept.push(key).map_err(|_| arena_full())?;
+            }
+        }
+        if kept.as_slice().is_empty() && !statement.with_ties {
+            order_redundant = true;
+            None
+        } else {
+            Some((kept.as_slice(), true))
+        }
     } else {
         None
     };
@@ -3113,6 +3570,7 @@ fn plan_with<'a>(
     }
     let mut order_text = RemoteText::new();
     let mut order_shipped = keys.is_some();
+    let order_params = deparser.param_mark();
     if let Some((keys, _)) = keys {
         for (index, key) in keys.iter().enumerate() {
             let _ = order_text.write_str(if index == 0 { " ORDER BY " } else { ", " });
@@ -3124,10 +3582,22 @@ fn plan_with<'a>(
             read!(key.expression);
         }
     }
+    // Without a LIMIT, the remote order is a path whose cost competes with
+    // a local Sort of the unordered rows (`add_path`).
+    if order_shipped
+        && keys.is_some_and(|(_, final_order)| final_order)
+        && statement.limit.is_none()
+        && statement.offset.is_none()
+        && local_sort_cheaper(deparser, statement, kept, sort_keys, arena)?
+    {
+        order_shipped = false;
+    }
     if !order_shipped {
         order_text.clear();
+        deparser.param_reset(order_params);
     }
-    let order_pushed = order_shipped && keys.is_some_and(|(_, final_order)| final_order);
+    let order_pushed =
+        order_redundant || order_shipped && keys.is_some_and(|(_, final_order)| final_order);
     let presorted: &'a [OrderBy<'a>] = match keys {
         Some((keys, false)) if order_shipped => keys,
         _ => &[],
@@ -3138,12 +3608,14 @@ fn plan_with<'a>(
     }
     // LIMIT and OFFSET ship when the remote rows are the final rows.
     let mut limit_text = RemoteText::new();
+    let limit_params = deparser.param_mark();
     let limit_pushed = (statement.limit.is_some() || statement.offset.is_some())
         && !statement.minmax_subquery
         && kept.is_empty()
         && !grouped
         && simple_items
         && !statement.with_ties
+        && !order_redundant
         && (statement.order_by.is_empty() || order_pushed)
         && {
             let mut ships = true;
@@ -3161,6 +3633,7 @@ fn plan_with<'a>(
         };
     if !limit_pushed {
         limit_text.clear();
+        deparser.param_reset(limit_params);
     }
     let mut sql = RemoteText::new();
     let _ = sql.write_str("SELECT ");
@@ -3188,11 +3661,367 @@ fn plan_with<'a>(
         order_pushed,
         limit_pushed,
         sql: arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?,
+        params: match deparser.params {
+            Some(params) => {
+                let mut roots = ArenaList::new(arena);
+                for root in statement
+                    .where_clause
+                    .into_iter()
+                    .chain(statement.limit)
+                    .chain(statement.offset)
+                    .chain(
+                        keys.into_iter()
+                            .flat_map(|(keys, _)| keys.iter().map(|key| key.expression)),
+                    )
+                {
+                    roots.push(root).map_err(|_| arena_full())?;
+                }
+                params.nodes(roots.as_slice(), arena)?
+            }
+            None => &[],
+        },
         upper: None,
     })
 }
 
-/// What a foreign write's remote `RETURNING` list returns
+/// PostgreSQL's planner and postgres_fdw cost constants (`costsize.h`,
+/// `postgres_fdw.c`), at their defaults.
+const SEQ_PAGE_COST: f64 = 1.0;
+const CPU_TUPLE_COST: f64 = 0.01;
+const CPU_OPERATOR_COST: f64 = 0.0025;
+const FDW_STARTUP_COST: f64 = 100.0;
+const FDW_TUPLE_COST: f64 = 0.2;
+const DEFAULT_FDW_SORT_MULTIPLIER: f64 = 1.2;
+const STD_FUZZ_FACTOR: f64 = 1.01;
+const DEFAULT_EQ_SEL: f64 = 0.005;
+const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+const DEFAULT_RANGE_INEQ_SEL: f64 = 0.005;
+const DEFAULT_UNK_SEL: f64 = 0.005;
+const DEFAULT_NOT_UNK_SEL: f64 = 1.0 - DEFAULT_UNK_SEL;
+/// `work_mem`'s default, in bytes: a larger sort spills, which this model
+/// does not cost.
+const WORK_MEM_BYTES: f64 = 4.0 * 1024.0 * 1024.0;
+
+/// `get_typavgwidth` of a column.
+fn average_width(column: &crate::storage::ColumnMeta) -> Option<f64> {
+    let maximum = |type_mod: i32| -> Option<i32> {
+        match column.ctype {
+            ColType::Varchar | ColType::Bpchar if type_mod > 4 => Some((type_mod - 4) * 4 + 4),
+            ColType::Numeric if type_mod >= 4 => {
+                let precision = ((type_mod - 4) >> 16) & 0xffff;
+                Some(8 + (precision + 6) / 4 * 2)
+            }
+            _ => None,
+        }
+    };
+    Some(f64::from(match column.ctype {
+        ColType::Bool => 1,
+        ColType::Int2 => 2,
+        ColType::Int4 | ColType::Float4 | ColType::Date => 4,
+        ColType::Int8
+        | ColType::Float8
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Time => 8,
+        ColType::Interval | ColType::Uuid => 16,
+        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Numeric => {
+            match maximum(column.type_mod) {
+                Some(width) if column.ctype == ColType::Bpchar => width,
+                Some(width) if width <= 32 => width,
+                Some(width) if width < 1000 => 32 + (width - 32) / 2,
+                Some(_) => 32 + (1000 - 32) / 2,
+                None => 32,
+            }
+        }
+        _ => return None,
+    }))
+}
+
+/// `clamp_row_est`.
+fn clamp_rows(rows: f64) -> f64 {
+    if rows <= 1.0 { 1.0 } else { rows.round() }
+}
+
+impl Deparser<'_> {
+    /// `clause_selectivity` of a condition over a never-analyzed table, with
+    /// the default estimates `selfuncs.c` uses without statistics; `None`
+    /// for a shape this model does not cover.
+    fn selectivity(&self, condition: &Expr<'_>, arena: &Arena) -> Result<Option<f64>, SqlError> {
+        let boolean = |expression: &Expr<'_>| {
+            matches!(
+                self.shape(expression),
+                Ok(Shape::Value {
+                    type_oid: oid::BOOL,
+                    ..
+                })
+            )
+        };
+        let null = |expression: &Expr<'_>| matches!(unbound(expression), Expr::Null);
+        Ok(match unbound(condition) {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                ..
+            } => return self.conjunction_selectivity(conjuncts(Some(condition), arena)?, arena),
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => match (
+                self.selectivity(left, arena)?,
+                self.selectivity(right, arena)?,
+            ) {
+                (Some(left), Some(right)) => Some(left + right - left * right),
+                _ => None,
+            },
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand,
+                ..
+            } => self
+                .selectivity(operand, arena)?
+                .map(|selectivity| 1.0 - selectivity),
+            Expr::Binary {
+                operator: BinaryOp::Eq | BinaryOp::NotEq,
+                left,
+                right,
+                ..
+            } if null(left) || null(right) => None,
+            Expr::Binary {
+                operator: operator @ (BinaryOp::Eq | BinaryOp::NotEq),
+                left,
+                right,
+                ..
+            } => {
+                // A boolean has two distinct values.
+                let equal = if boolean(left) || boolean(right) {
+                    0.5
+                } else {
+                    DEFAULT_EQ_SEL
+                };
+                Some(if *operator == BinaryOp::Eq {
+                    equal
+                } else {
+                    1.0 - equal
+                })
+            }
+            Expr::Binary {
+                operator: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+                ..
+            } => Some(DEFAULT_INEQ_SEL),
+            Expr::IsNull { negated, .. } => Some(if *negated {
+                DEFAULT_NOT_UNK_SEL
+            } else {
+                DEFAULT_UNK_SEL
+            }),
+            Expr::InList {
+                operand,
+                list,
+                negated,
+            } => {
+                let equal = if boolean(operand) {
+                    0.5
+                } else {
+                    DEFAULT_EQ_SEL
+                };
+                // `scalararraysel`: a NULL element matches nothing.
+                let items = list.iter().filter(|item| !null(item)).count() as f64;
+                if list.len() == 1 {
+                    Some(match (*negated, items == 1.0) {
+                        (false, true) => equal,
+                        (true, true) => 1.0 - equal,
+                        _ => return Ok(None),
+                    })
+                } else if *negated {
+                    if items < list.len() as f64 {
+                        Some(0.0)
+                    } else {
+                        let disjoint = 1.0 - items * equal;
+                        Some(if (0.0..=1.0).contains(&disjoint) {
+                            disjoint
+                        } else {
+                            (1.0 - equal).powf(items)
+                        })
+                    }
+                } else {
+                    let disjoint = items * equal;
+                    Some(if (0.0..=1.0).contains(&disjoint) {
+                        disjoint
+                    } else {
+                        1.0 - (1.0 - equal).powf(items)
+                    })
+                }
+            }
+            expression if self.column(expression).is_some() && boolean(expression) => Some(0.5),
+            _ => None,
+        })
+    }
+
+    /// `clauselist_selectivity` of AND-ed conditions: the product, with an
+    /// upper and a lower bound on the same expression paired as a range
+    /// (`addRangeClause`), which defaults to `DEFAULT_RANGE_INEQ_SEL`.
+    fn conjunction_selectivity(
+        &self,
+        conditions: &[&Expr<'_>],
+        arena: &Arena,
+    ) -> Result<Option<f64>, SqlError> {
+        let constant = |expression: &Expr<'_>| {
+            matches!(self.shape(expression), Ok(Shape::Literal(_))) || self.is_param(expression)
+        };
+        // (bounded expression, has lower, has upper)
+        let mut ranges: [(Option<&Expr<'_>>, bool, bool); 32] = [(None, false, false); 32];
+        let mut range_count = 0;
+        let mut product = 1.0;
+        for &condition in conditions {
+            let bound = match unbound(condition) {
+                Expr::Binary {
+                    operator:
+                        operator @ (BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq),
+                    left,
+                    right,
+                    ..
+                } if constant(right) && !constant(left) => {
+                    Some((*left, matches!(operator, BinaryOp::Gt | BinaryOp::GtEq)))
+                }
+                Expr::Binary {
+                    operator:
+                        operator @ (BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq),
+                    left,
+                    right,
+                    ..
+                } if constant(left) && !constant(right) => {
+                    Some((*right, matches!(operator, BinaryOp::Lt | BinaryOp::LtEq)))
+                }
+                _ => None,
+            };
+            if let Some((bounded, lower)) = bound {
+                let at = match ranges[..range_count]
+                    .iter()
+                    .position(|(held, ..)| held.is_some_and(|held| *held == *bounded))
+                {
+                    Some(at) => at,
+                    None if range_count < ranges.len() => {
+                        ranges[range_count].0 = Some(bounded);
+                        range_count += 1;
+                        range_count - 1
+                    }
+                    None => return Ok(None),
+                };
+                if lower {
+                    ranges[at].1 = true;
+                } else {
+                    ranges[at].2 = true;
+                }
+                continue;
+            }
+            match self.selectivity(condition, arena)? {
+                Some(selectivity) => product *= selectivity,
+                None => return Ok(None),
+            }
+        }
+        for &(_, lower, upper) in &ranges[..range_count] {
+            product *= if lower && upper {
+                DEFAULT_RANGE_INEQ_SEL
+            } else {
+                DEFAULT_INEQ_SEL
+            };
+        }
+        Ok(Some(product))
+    }
+}
+
+/// Whether PostgreSQL's planner sorts a foreign scan's rows locally rather
+/// than taking postgres_fdw's ordered path, for a query without `LIMIT`:
+/// `estimate_path_cost_size` without remote estimates prices a remote sort
+/// at 1.2 times the scan's run cost, `cost_sort` the local one, and
+/// `add_path` keeps the ordered path unless it costs more than the sorted
+/// one by its fuzz factor. A never-analyzed table is ten pages of rows as
+/// wide as the columns the query reads. `false` when a condition's
+/// selectivity is outside this model, which keeps the remote order.
+fn local_sort_cheaper(
+    deparser: &Deparser<'_>,
+    statement: &Select<'_>,
+    kept: &[&Expr<'_>],
+    sort_keys: &[OrderBy<'_>],
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    // The columns the scan returns above it.
+    let mut needed = ColumnSet::from_low_word(0);
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                needed = ColumnSet::all(deparser.table.n_columns)
+            }
+            SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
+                if read_columns(deparser, expression, &mut needed).is_none() {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    for key in sort_keys {
+        if read_columns(deparser, key.expression, &mut needed).is_none() {
+            return Ok(false);
+        }
+    }
+    let mut width = 0.0;
+    for (column, definition) in deparser.table.columns().iter().enumerate() {
+        if needed.contains(column) {
+            match average_width(definition) {
+                Some(column_width) => width += column_width,
+                None => return Ok(false),
+            }
+        }
+    }
+    // `10 * BLCKSZ / (width + MAXALIGN(SizeofHeapTupleHeader))`.
+    let tuples = (81_920.0 / (width + 24.0)).floor();
+    // Pseudoconstant conditions gate the scan and do not restrict it.
+    let all = conjuncts(statement.where_clause, arena)?;
+    let mut restricting = ArenaList::new(arena);
+    let mut cost_units = 0.0;
+    let columns = crate::sql::exec::AliasedDefCols {
+        definition: crate::storage::RelationDefinition::from_definition(deparser.table),
+        alias: (deparser.exposed != deparser.table.name.as_str()).then_some(deparser.exposed),
+        output_aliases: &[],
+        remote_ctid: false,
+    };
+    for &condition in all {
+        if deparser.reads_column(condition)? {
+            restricting.push(condition).map_err(|_| arena_full())?;
+            cost_units += crate::sql::query::qual_cost(
+                condition,
+                &columns,
+                deparser.storage,
+                deparser.txid,
+                arena,
+            );
+        }
+    }
+    let (Some(selectivity), Some(local)) = (
+        deparser.conjunction_selectivity(restricting.as_slice(), arena)?,
+        deparser.conjunction_selectivity(kept, arena)?,
+    ) else {
+        return Ok(false);
+    };
+    let rows = clamp_rows(tuples * selectivity);
+    let retrieved = clamp_rows(rows / local).min(tuples);
+    let run =
+        SEQ_PAGE_COST * 10.0 + (CPU_TUPLE_COST + cost_units * CPU_OPERATOR_COST / 2.0) * tuples;
+    let transfer = FDW_STARTUP_COST + (FDW_TUPLE_COST + CPU_TUPLE_COST) * retrieved;
+    let ordered = DEFAULT_FDW_SORT_MULTIPLIER * run + transfer;
+    let sort_rows = rows.max(2.0);
+    // `relation_byte_size`: MAXALIGN(width) plus the tuple header.
+    if sort_rows * ((width / 8.0).ceil() * 8.0 + 24.0) > WORK_MEM_BYTES {
+        return Ok(false);
+    }
+    let sorted = run
+        + transfer
+        + 2.0 * CPU_OPERATOR_COST * sort_rows * sort_rows.log2()
+        + CPU_OPERATOR_COST * sort_rows;
+    Ok(ordered > sorted * STD_FUZZ_FACTOR)
+}
+
+/// What a foreign write's `RETURNING` list returns
 /// (`deparseReturningList`): the columns the local statement reads, in table
 /// order, then the remote row's `ctid` when the statement reads it.
 #[derive(Clone, Copy, PartialEq, Eq)]

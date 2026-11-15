@@ -263,6 +263,7 @@ impl<'a> BlockTargets<'a> {
             bare: None,
             domain_value: None,
             sublinks: Some(&super::registered_sublink),
+            references: None,
             folded: true,
             arena,
             dependencies: None,
@@ -528,20 +529,22 @@ impl<'a> BlockTargets<'a> {
         }
         // The `WINDOW` clause's definitions, used or not, then the inline
         // specifications (`transformWindowDefinitions` over `p_windowdefs`).
-        let specs = statement.windows.iter().copied().chain(
-            window_calls.iter().filter_map(|call| match call {
+        let specs = statement
+            .windows
+            .iter()
+            .copied()
+            .chain(window_calls.iter().filter_map(|call| match call {
                 Expr::Call {
                     over: Some(spec), ..
                 } => Some(*spec),
                 _ => None,
-            }),
-        );
+            }));
         for spec in specs {
             // Only the keys of a window some call uses partition or order
             // the window input (`make_window_input_target`).
-            let active = window_calls.iter().any(
-                |call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec),
-            );
+            let active = window_calls
+                .iter()
+                .any(|call| matches!(call, Expr::Call { over: Some(used), .. } if **used == *spec));
             for key in spec
                 .partition_by
                 .iter()
@@ -1113,6 +1116,7 @@ impl<'a> RelationTargets<'a> {
                 bare,
                 domain_value: None,
                 sublinks: Some(&super::registered_sublink),
+                references: None,
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1544,10 +1548,17 @@ impl<'a> RelationTargets<'a> {
                 .copied()
                 .chain(spec.order_by.iter().map(|order| order.expression))
         });
-        let keys = sort_keys.iter().map(|key| key.expression).chain(window_keys);
+        let keys = sort_keys
+            .iter()
+            .map(|key| key.expression)
+            .chain(window_keys);
         let mut listed = ArenaList::new(self.arena);
         for key in keys {
-            if listed.as_slice().iter().any(|&earlier: &&Expr<'_>| *earlier == *key) {
+            if listed
+                .as_slice()
+                .iter()
+                .any(|&earlier: &&Expr<'_>| *earlier == *key)
+            {
                 continue;
             }
             listed.push(key).map_err(|_| arena_full())?;
@@ -1594,31 +1605,70 @@ impl<'a> RelationTargets<'a> {
         render(entries.as_slice()).map(Some)
     }
 
-    /// postgres_fdw's scan of a grouped relation: each select-list
-    /// expression, then the keys it lacks (`resjunk`), read from the remote
-    /// target list (`fdw_scan_tlist`), so any but a plain column prints in
-    /// parentheses.
+    /// postgres_fdw's scan of a grouped relation and the nodes above it:
+    /// the grouping target the scan returns, read from the remote target
+    /// list (`fdw_scan_tlist`) by reference where it holds the expression
+    /// and computed over those references otherwise, then the same list as
+    /// a node above reads it.
     pub(super) fn foreign_upper(
         &self,
-        statement: &Select<'_>,
-        resjunk: &[&Expr<'_>],
-    ) -> Result<Option<Output>, SqlError> {
-        let mut entries = ArenaList::new(self.arena);
-        let items = statement.items.iter().map(|item| match item {
-            SelectItem::Expr { expression, .. } => Ok(*expression),
-            _ => Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "a grouped foreign scan has a star in its select list"
-            )),
-        });
-        for expression in items.chain(resjunk.iter().map(|&target| Ok(target))) {
-            let Some(entry) = self.entry(expression?, Destination::Value)? else {
+        upper: &crate::sql::foreign::deparse::ForeignUpper<'_>,
+    ) -> Result<Option<(Output, Output)>, SqlError> {
+        let mut scan = ArenaList::new(self.arena);
+        let mut above = ArenaList::new(self.arena);
+        for &expression in upper.output {
+            let Some(entry) = self.upper_entry(upper, expression, Destination::Value)? else {
                 return Ok(None);
             };
-            entries
+            scan.push(entry).map_err(|_| arena_full())?;
+            above
                 .push(entry.referenced(self.arena)?)
                 .map_err(|_| arena_full())?;
         }
-        render(entries.as_slice()).map(Some)
+        Ok(Some((render(scan.as_slice())?, render(above.as_slice())?)))
+    }
+
+    /// `expression` over a grouped scan's remote targets as the scan
+    /// computes it and as a node above reads it.
+    pub(super) fn upper_text(
+        &self,
+        upper: &crate::sql::foreign::deparse::ForeignUpper<'_>,
+        expression: &Expr<'_>,
+        destination: Destination,
+    ) -> Result<Option<(&'a str, &'a str)>, SqlError> {
+        let Some(entry) = self.upper_entry(upper, expression, destination)? else {
+            return Ok(None);
+        };
+        Ok(Some((entry.text, entry.referenced(self.arena)?.text)))
+    }
+
+    /// `expression` over a grouped scan's remote targets, which print as
+    /// references; a column or a constant prints as itself.
+    fn upper_entry(
+        &self,
+        upper: &crate::sql::foreign::deparse::ForeignUpper<'_>,
+        expression: &Expr<'_>,
+        destination: Destination,
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let read = |node: &Expr<'_>| {
+            crate::sql::foreign::deparse::reads_remote_target(upper.targets, node)
+        };
+        let context = Context {
+            references: Some(&read),
+            ..self.context
+        };
+        let text = crate::sql::catalog::deparse::deparse_expression(
+            &context,
+            expression,
+            destination,
+            self.arena,
+        )?;
+        let plain = matches!(expression, Expr::Column { .. })
+            || crate::sql::foreign::deparse::is_constant(expression);
+        Ok(text.map(|text| Entry {
+            text,
+            var: plain,
+            referenced: read(expression),
+        }))
     }
 }

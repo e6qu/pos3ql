@@ -85,8 +85,10 @@ struct PlanNode {
     /// subplan two columns past its parent's children.
     shift: u8,
     /// The relations a postgres_fdw scan of a join or grouped relation
-    /// covers (`Aggregate on (public.t)`), which every format prints.
+    /// covers (`Aggregate on (public.t)`), which every format prints:
+    /// schema-qualified under `VERBOSE`, by name otherwise.
     relations: StackStr<256>,
+    plain_relations: StackStr<256>,
     /// The query a postgres_fdw node sends, which `VERBOSE` prints.
     remote_sql: StackStr<REMOTE_SQL_BYTES>,
     /// The rows a postgres_fdw INSERT sends per remote command.
@@ -253,6 +255,15 @@ impl PlanNode {
         self.keys.verbose = requalified(&self.keys.verbose, old, new);
     }
 
+    /// The `Relations` property as printed with or without `VERBOSE`.
+    fn shown_relations(&self, verbose: bool) -> &str {
+        if verbose {
+            self.relations.as_str()
+        } else {
+            self.plain_relations.as_str()
+        }
+    }
+
     /// The name the query exposes the node's relation under.
     fn exposed_name(&self) -> &str {
         if self.alias.as_str().is_empty() {
@@ -337,6 +348,7 @@ impl PlanNode {
         subplan: None,
         shift: 0,
         relations: StackStr::new(),
+        plain_relations: StackStr::new(),
         output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
@@ -1431,6 +1443,7 @@ fn join_quals<'a>(
         qualify: true,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         bare: None,
     };
@@ -1566,6 +1579,7 @@ fn outer_hash_quals<'a>(
         bare: None,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
     };
     let Some(hash_cond) = deparse_qual(&context, &hash_conds[..hash_count], arena)? else {
@@ -1622,6 +1636,7 @@ fn one_time_filter(
         bare: None,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         arena,
         dependencies: None,
@@ -1673,6 +1688,7 @@ fn scan_filters<'a>(
                     bare: None,
                     domain_value: None,
                     sublinks: Some(&registered_sublink),
+                    references: None,
                     folded: true,
                     arena,
                     dependencies: None,
@@ -1701,6 +1717,7 @@ fn scan_filters<'a>(
                 bare: Some(exposed),
                 domain_value: None,
                 sublinks: Some(&registered_sublink),
+                references: None,
                 folded: true,
                 arena,
                 dependencies: None,
@@ -1949,6 +1966,7 @@ fn outer_join_quals<'a>(
         bare: None,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         arena,
         dependencies: None,
@@ -1996,6 +2014,7 @@ fn joined_index_conditions<'a>(
         bare: None,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         arena,
         dependencies: None,
@@ -2060,6 +2079,7 @@ fn having_filter<'a>(
         qualify: verbose || relations > 1,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         bare: None,
     };
@@ -2153,6 +2173,7 @@ fn derived_relation_filter<'a>(
         qualify: verbose || names == DerivedNames::Qualified,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         bare: None,
     };
@@ -2398,6 +2419,7 @@ fn single_relation_quals<'a>(
         qualify: verbose,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         bare: (outer_count != 0 && !verbose).then_some(exposed),
     };
@@ -3276,6 +3298,7 @@ fn scan_node<'a>(
         subplan: None,
         shift: 0,
         relations: StackStr::new(),
+        plain_relations: StackStr::new(),
         output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
@@ -5210,6 +5233,7 @@ fn function_call(
         bare: None,
         domain_value: None,
         sublinks: Some(&registered_sublink),
+        references: None,
         folded: true,
         arena,
         dependencies: None,
@@ -5534,6 +5558,7 @@ fn window_definition(
             bare: None,
             domain_value: None,
             sublinks: Some(&registered_sublink),
+            references: None,
             folded: true,
             arena,
             dependencies: None,
@@ -5899,9 +5924,10 @@ fn foreign_modification<'a>(
 }
 
 /// The plan of a query whose grouping postgres_fdw ships: the `Foreign
-/// Scan` of the grouped relation (`Aggregate on (...)`) under the `Limit`
-/// the remote query leaves. Its output reads each select-list expression
-/// from the remote target list, which prints it in parentheses.
+/// Scan` of the grouped relation (`Aggregate on (...)`), filtered by the
+/// `HAVING` conditions that stay local, under the `Sort` and `Limit` the
+/// remote query leaves. Its output reads each remote target by reference,
+/// which prints it in parentheses.
 fn foreign_upper_plan<'a>(
     storage: &Storage,
     txid: u32,
@@ -5922,26 +5948,41 @@ fn foreign_upper_plan<'a>(
         .upper
         .as_ref()
         .expect("a grouped plan has its relation");
-    let output = targets::RelationTargets::new(storage, txid, &table, exposed, qualified, arena)?
-        .foreign_upper(statement, upper.resjunk)?;
-    let mut relations = StackStr::<256>::new();
-    let _ = relations.write_str("Aggregate on (");
-    crate::sql::catalog::write_identifier(&mut relations, table.schema.as_str());
-    let _ = relations.write_char('.');
-    crate::sql::catalog::write_identifier(&mut relations, table.name.as_str());
-    if exposed != table.name.as_str() {
-        let _ = relations.write_char(' ');
-        crate::sql::catalog::write_identifier(&mut relations, exposed);
-    }
-    let _ = relations.write_char(')');
-    if relations.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "EXPLAIN relation list exceeds 256 bytes"
-        ));
-    }
+    let plain = targets::RelationTargets::new(storage, txid, &table, exposed, qualified, arena)?;
+    // `VERBOSE` prefixes the columns of conditions and keys.
+    let prefixed = targets::RelationTargets::new(storage, txid, &table, exposed, true, arena)?;
+    let (output, above) = match plain.foreign_upper(upper)? {
+        Some((output, above)) => (Some(output), Some(above)),
+        None => (None, None),
+    };
+    // `postgresExplainForeignScan`: the relation schema-qualified under
+    // `VERBOSE`, then the name the query gives it when that differs.
+    let relations_text = |schema: bool| -> Result<StackStr<256>, SqlError> {
+        let mut relations = StackStr::<256>::new();
+        let _ = relations.write_str("Aggregate on (");
+        if schema {
+            crate::sql::catalog::write_identifier(&mut relations, table.schema.as_str());
+            let _ = relations.write_char('.');
+        }
+        crate::sql::catalog::write_identifier(&mut relations, table.name.as_str());
+        if exposed != table.name.as_str() {
+            let _ = relations.write_char(' ');
+            crate::sql::catalog::write_identifier(&mut relations, exposed);
+        }
+        let _ = relations.write_char(')');
+        if relations.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN relation list exceeds 256 bytes"
+            ));
+        }
+        Ok(relations)
+    };
+    let (relations, plain_relations) = (relations_text(true)?, relations_text(false)?);
     let limited = !pushed.limit_pushed && (statement.limit.is_some() || statement.offset.is_some());
-    let mut plan = Plan::new(arena, 2)?;
+    let sorted = !upper.local_order.is_empty();
+    let mut plan = Plan::new(arena, 3)?;
+    let mut depth = 0u8;
     if limited {
         let mut limit = PlanNode {
             name: StackStr::from_str("Limit"),
@@ -5950,22 +5991,107 @@ fn foreign_upper_plan<'a>(
             rows: 1,
             ..PlanNode::EMPTY
         };
-        limit.set_output(output);
+        limit.set_output(above);
         plan.push(limit)?;
+        depth += 1;
+    }
+    if sorted {
+        let mut sort = PlanNode {
+            name: StackStr::from_str("Sort"),
+            key: Some(NodeKey::new(block, Role::Sort)),
+            depth,
+            total_cost: 100.0,
+            rows: 1,
+            ..PlanNode::EMPTY
+        };
+        sort.set_output(above);
+        match foreign_upper_sort_keys(&plain, &prefixed, upper)? {
+            Some(keys) => sort.keys = keys,
+            None => sort.output_unprintable = true,
+        }
+        plan.push(sort)?;
+        depth += 1;
     }
     let mut scan = PlanNode {
         name: StackStr::from_str("Foreign Scan"),
         key: Some(NodeKey::new(block, Role::Scan(0))),
-        depth: u8::from(limited),
+        depth,
         total_cost: 100.0,
         rows: 1,
         relations,
+        plain_relations,
         remote_sql: remote_sql_text(pushed.sql)?,
         ..PlanNode::EMPTY
     };
     scan.set_output(output);
+    if let Some(condition) = upper.local_having {
+        let text = |targets: &targets::RelationTargets<'_>| -> Result<_, SqlError> {
+            Ok(targets
+                .upper_text(
+                    upper,
+                    condition,
+                    crate::sql::catalog::deparse::Destination::Condition,
+                )?
+                .map(|(text, _)| StackStr::<512>::from_str(text)))
+        };
+        let (shown, verbose) = (text(&plain)?, text(&prefixed)?);
+        if shown.is_none() || verbose.is_none() {
+            scan.output_unprintable = true;
+        }
+        scan = scan
+            .with_qual(QualLabel::Filter, shown)
+            .with_verbose_qual(QualLabel::Filter, verbose);
+    }
     plan.push(scan)?;
     Ok(plan)
+}
+
+/// The `Sort Key` of a sort above a grouped foreign scan: each key as the
+/// sort reads it from the scan's output.
+fn foreign_upper_sort_keys(
+    plain: &targets::RelationTargets<'_>,
+    prefixed: &targets::RelationTargets<'_>,
+    upper: &crate::sql::foreign::deparse::ForeignUpper<'_>,
+) -> Result<Option<PlanKeys>, SqlError> {
+    let mut keys = PlanKeys {
+        label: KeyLabel::Sort,
+        ..PlanKeys::NONE
+    };
+    for (index, order) in upper.local_order.iter().enumerate() {
+        for (targets, text) in [(plain, &mut keys.plain), (prefixed, &mut keys.verbose)] {
+            let Some((_, key)) = targets.upper_text(
+                upper,
+                order.expression,
+                crate::sql::catalog::deparse::Destination::Value,
+            )?
+            else {
+                return Ok(None);
+            };
+            if index != 0 {
+                let _ = text.write_char(KEY_SEPARATOR);
+            }
+            let _ = text.write_str(key);
+            if order.descending {
+                let _ = text.write_str(" DESC");
+            }
+            match (order.descending, order.nulls_first) {
+                (false, true) => {
+                    let _ = text.write_str(" NULLS FIRST");
+                }
+                (true, false) => {
+                    let _ = text.write_str(" NULLS LAST");
+                }
+                _ => {}
+            }
+        }
+    }
+    if keys.plain.is_truncated() || keys.verbose.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN sort keys exceed 256 bytes"
+        ));
+    }
+    Ok(Some(keys))
 }
 
 /// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output
@@ -6156,6 +6282,7 @@ fn plan_keys(
             bare: None,
             domain_value: None,
             sublinks: Some(&registered_sublink),
+            references: None,
             folded: true,
             arena,
             dependencies: None,
@@ -6532,6 +6659,7 @@ fn physical_scan_node(
         subplan: None,
         shift: 0,
         relations: StackStr::new(),
+        plain_relations: StackStr::new(),
         output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
@@ -6693,6 +6821,7 @@ fn push_set_tree(
                 subplan: None,
                 shift: 0,
                 relations: StackStr::new(),
+                plain_relations: StackStr::new(),
                 output_unprintable: left.output_unprintable,
                 remote_sql: StackStr::new(),
                 batch_size: None,
@@ -7143,6 +7272,7 @@ pub(super) fn plan_modification<'a>(
         subplan: None,
         shift: 0,
         relations: StackStr::new(),
+        plain_relations: StackStr::new(),
         output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
@@ -7327,6 +7457,7 @@ pub(super) fn plan_modification<'a>(
                 bare: None,
                 domain_value: None,
                 sublinks: Some(&registered_sublink),
+                references: None,
                 folded: true,
                 arena,
                 dependencies: None,
@@ -7921,7 +8052,7 @@ pub(super) fn visit_text_rows<E>(
             for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
             }
-            let _ = write!(line, "Relations: {}", node.relations.as_str());
+            let _ = write!(line, "Relations: {}", node.shown_relations(options.verbose));
             emit(line.as_str())?;
         }
         if options.verbose && !node.remote_sql.is_empty() {
@@ -8765,7 +8896,7 @@ fn structured_node(
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if !node.relations.is_empty() {
-        document.text("Relations", node.relations.as_str());
+        document.text("Relations", node.shown_relations(options.verbose));
     }
     if options.verbose && !node.remote_sql.is_empty() {
         document.text("Remote SQL", node.remote_sql.as_str());

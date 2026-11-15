@@ -78,6 +78,14 @@ SELECT count(*), sum(q), bool_and(flag), every(id > 0) FROM ft;
 SELECT count(*) FROM ft WHERE id > 1000;
 SELECT id % 4 AS k, count(*) FROM ft GROUP BY k HAVING sum(id) > 30 ORDER BY sum(id);
 SELECT count(*) FROM ft GROUP BY note ORDER BY 1 LIMIT 1;
+-- A grouped query ships the aggregates of what it computes here: a constant
+-- or a star ships, a volatile expression or HAVING condition is evaluated
+-- over the remote groups, and an order only this side computes sorts them.
+:e SELECT s % 3, 'k', count(*) * 2 + random() * 0, sum(q) FROM ft GROUP BY s % 3 HAVING sum(id) > random() * 0 ORDER BY 1;
+SELECT s % 3, 'k', count(*) * 2 + random() * 0, sum(q) FROM ft GROUP BY s % 3 HAVING sum(id) > random() * 0 ORDER BY 1;
+SELECT flag, count(*) FROM ft GROUP BY flag HAVING max(id) > 19 + random() * 0;
+SELECT c, count(*) FROM ft GROUP BY c ORDER BY count(*) * (1 + random() * 0), c LIMIT 3;
+SELECT * FROM app GROUP BY name;
 
 -- The order the plan reads rows in ships: expression keys, DISTINCT's
 -- order and a window's.

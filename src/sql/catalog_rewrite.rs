@@ -522,6 +522,7 @@ pub(super) fn rule_definition<'a>(
                     qualify: false,
                     domain_value: None,
                     sublinks: None,
+                    references: None,
                     folded: false,
                     bare: None,
                 },

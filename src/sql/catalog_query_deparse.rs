@@ -238,6 +238,7 @@ impl<'r> Writer<'r> {
             qualify: self.qualify || nested || own != 1,
             domain_value: None,
             sublinks: None,
+            references: None,
             folded: false,
             bare: None,
         }

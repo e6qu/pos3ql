@@ -1,4 +1,5 @@
-//! COPY keeps inserted values needed by statement triggers across messages.
+//! COPY keeps, across its data messages, the inserted values its statement
+//! triggers need and the rows it queued for batched foreign INSERTs.
 
 use crate::config::Config;
 use crate::mem::FixedBuf;
@@ -18,6 +19,74 @@ struct EncodedRow {
 pub(crate) struct CopyTransitionRows {
     rows: FixedVec<EncodedRow>,
     bytes: FixedBuf,
+    /// Rows waiting for the buffering window's flush to send them in
+    /// `batch_size` remote INSERTs.
+    pub(super) foreign: CopyForeignRows,
+}
+
+/// One COPY row queued for a foreign table: its values as Bind fields (a
+/// big-endian length, -1 for NULL, then the text) in `CopyForeignRows::bytes`.
+#[derive(Clone, Copy)]
+pub(super) struct QueuedForeignRow {
+    pub(super) table: usize,
+    offset: usize,
+    length: usize,
+}
+
+/// The foreign rows of COPY FROM's buffering window (postgres_fdw's
+/// `ExecForeignBatchInsert` under `CopyMultiInsertBufferFlush`): at most
+/// [`super::copy_batch::MAX_BUFFERED_TUPLES`] rows, in a byte queue of
+/// `foreign_send_bytes` reserved at startup.
+pub(crate) struct CopyForeignRows {
+    rows: FixedVec<QueuedForeignRow>,
+    bytes: FixedBuf,
+}
+
+impl CopyForeignRows {
+    const fn budget_bytes(foreign_bytes: usize) -> usize {
+        (super::copy_batch::MAX_BUFFERED_TUPLES * core::mem::size_of::<QueuedForeignRow>())
+            .saturating_add(foreign_bytes)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(super) fn rows(&self) -> &[QueuedForeignRow] {
+        self.rows.as_slice()
+    }
+
+    pub(super) fn fields(&self, row: QueuedForeignRow) -> &[u8] {
+        &self.bytes.readable()[row.offset..row.offset + row.length]
+    }
+
+    /// Queues `fields` for `table`.
+    pub(super) fn push(&mut self, table: usize, fields: &[u8]) -> Result<(), SqlError> {
+        let offset = self.bytes.len();
+        if self.rows.len() == self.rows.capacity() || fields.len() > self.bytes.capacity() - offset
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "COPY rows queued for foreign tables exceed foreign_send_bytes ({})",
+                self.bytes.capacity()
+            ));
+        }
+        self.bytes.writable()[..fields.len()].copy_from_slice(fields);
+        self.bytes.advance(fields.len());
+        self.rows
+            .push(QueuedForeignRow {
+                table,
+                offset,
+                length: fields.len(),
+            })
+            .expect("capacity checked before copying");
+        Ok(())
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.rows.clear();
+        self.bytes.clear();
+    }
 }
 
 impl CopyTransitionRows {
@@ -26,18 +95,33 @@ impl CopyTransitionRows {
             .txn_rows
             .saturating_mul(core::mem::size_of::<EncodedRow>())
             .saturating_add(config.copy_transition_bytes)
+            .saturating_add(CopyForeignRows::budget_bytes(config.foreign_send_bytes))
     }
 
-    pub(crate) fn new(budget: &mut Budget, rows: usize, bytes: usize) -> Result<Self, BudgetError> {
+    pub(crate) fn new(
+        budget: &mut Budget,
+        rows: usize,
+        bytes: usize,
+        foreign_bytes: usize,
+    ) -> Result<Self, BudgetError> {
         Ok(Self {
             rows: FixedVec::new(budget, "copy_transition_rows", rows)?,
             bytes: FixedBuf::new(budget, "copy_transition_bytes", bytes)?,
+            foreign: CopyForeignRows {
+                rows: FixedVec::new(
+                    budget,
+                    "copy_foreign_rows",
+                    super::copy_batch::MAX_BUFFERED_TUPLES,
+                )?,
+                bytes: FixedBuf::new(budget, "copy_foreign_bytes", foreign_bytes)?,
+            },
         })
     }
 
     pub(crate) fn clear(&mut self) {
         self.rows.clear();
         self.bytes.clear();
+        self.foreign.clear();
     }
 
     #[cfg(test)]
@@ -87,7 +171,11 @@ impl CopyTransitionRows {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::sql::types::ColType;
@@ -110,9 +198,9 @@ mod tests {
         assert_eq!(config.copy_transition_bytes, 73);
         let required = CopyTransitionRows::budget_bytes(&config);
         let mut short = Budget::new(required - 1);
-        assert!(CopyTransitionRows::new(&mut short, 3, 73).is_err());
+        assert!(CopyTransitionRows::new(&mut short, 3, 73, config.foreign_send_bytes).is_err());
         let mut exact = Budget::new(required);
-        let rows = CopyTransitionRows::new(&mut exact, 3, 73).unwrap();
+        let rows = CopyTransitionRows::new(&mut exact, 3, 73, config.foreign_send_bytes).unwrap();
         assert_eq!(exact.remaining(), 0);
         assert_eq!(rows.capacity(), 3);
         assert_eq!(rows.bytes.capacity(), 73);
@@ -130,9 +218,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_foreign_rows_queue_in_their_startup_buffer_and_fail_named() {
+        let mut budget = Budget::new(
+            core::mem::size_of::<EncodedRow>() + 16 + CopyForeignRows::budget_bytes(10),
+        );
+        let mut rows = CopyTransitionRows::new(&mut budget, 1, 16, 10).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        crate::mem::guard::forbid_alloc(|| {
+            rows.foreign.push(3, b"\0\0\0\x01a").unwrap();
+            let error = rows.foreign.push(4, b"\0\0\0\x02bb").unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("foreign_send_bytes (10)"));
+        });
+        let queued = rows.foreign.rows()[0];
+        assert_eq!(queued.table, 3);
+        assert_eq!(rows.foreign.fields(queued), b"\0\0\0\x01a");
+        rows.clear();
+        assert!(rows.foreign.is_empty());
+    }
+
+    #[test]
     fn copy_transition_values_own_bytes_and_retry_without_growing() {
-        let mut budget = Budget::new(96);
-        let mut rows = CopyTransitionRows::new(&mut budget, 2, 64).unwrap();
+        let mut budget = Budget::new(96 + CopyForeignRows::budget_bytes(16));
+        let mut rows = CopyTransitionRows::new(&mut budget, 2, 64, 16).unwrap();
         let mut input = *b"first";
         crate::mem::guard::forbid_alloc(|| {
             rows.capture(&[

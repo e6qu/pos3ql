@@ -994,11 +994,15 @@ impl CursorPool {
         txid: u32,
     ) -> Result<(), SqlError> {
         let owner = self.plan_owner(at)?;
-        self.slots[at]
-            .query
-            .bind(sql, params, locals, inputs, owner, |parser| {
-                super::type_inputs::validate_restored(parser, storage, txid)
-            })
+        self.slots[at].query.bind(
+            sql,
+            params,
+            locals,
+            inputs,
+            super::type_inputs::InputImage::Admitted,
+            owner,
+            |parser| super::type_inputs::validate_restored(parser, storage, txid),
+        )
     }
 
     pub(crate) fn execution_parts(
@@ -2073,7 +2077,7 @@ impl CursorPool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
 
@@ -2166,7 +2170,15 @@ mod ownership_tests {
             assert!(!pool.opening_query_bound(at));
             pool.slots[at]
                 .query
-                .bind("SELECT 1", &[], &[], &[], owner, |_| Ok(()))
+                .bind(
+                    "SELECT 1",
+                    &[],
+                    &[],
+                    &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
+                    owner,
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert!(pool.opening_query_bound(at));
             let retained = pool.slots[at]
@@ -2396,7 +2408,11 @@ mod ownership_tests {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

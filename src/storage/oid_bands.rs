@@ -269,7 +269,7 @@ const fn check_registry() {
 
 const _: () = check_registry();
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

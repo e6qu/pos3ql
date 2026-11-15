@@ -8,6 +8,8 @@ pub(crate) enum RetainedListError {
     Storage(ArenaSliceError),
 }
 
+/// A handle and length: copying it names the same entries.
+#[derive(Clone, Copy)]
 pub(crate) struct RetainedList<T: Copy + 'static> {
     entries: Option<ArenaSliceHandle<T>>,
     len: usize,
@@ -96,7 +98,7 @@ impl<T: Copy + 'static> RetainedList<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

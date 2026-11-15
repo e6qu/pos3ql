@@ -265,7 +265,11 @@ pub(crate) fn key_operators(referencing: ColType, referenced: ColType) -> [i32; 
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

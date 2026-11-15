@@ -4115,7 +4115,11 @@ fn log_subscription_client_error(
     crate::logging::error("subscription_client", message.as_str().trim_end());
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use std::io::Read;
     use std::net::TcpStream;

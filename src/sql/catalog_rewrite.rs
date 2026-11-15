@@ -126,10 +126,10 @@ fn matview_rule_row<'a>(
 pub(super) fn current<'a>(
     storage: &Storage,
     transaction: u32,
-    purpose: Materialization,
+    purpose: Materialization<'_>,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let bodies = matches!(purpose, Materialization::History);
+    let bodies = matches!(purpose, Materialization::History(_));
     let hidden = if bodies { PRIVATE_COLUMNS } else { &[] };
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), hidden, arena)?;
@@ -167,7 +167,14 @@ pub(super) fn selected<'a>(
         transaction,
         scan,
         arena,
-        |at| current(storage, at, Materialization::History, arena),
+        |at| {
+            current(
+                storage,
+                at,
+                Materialization::History(crate::sql::catalog_snapshot::TableSelection::All),
+                arena,
+            )
+        },
     )?;
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), &[], arena)?;
@@ -286,7 +293,14 @@ pub(super) fn view_definition<'a>(
             transaction,
             CatalogScan::Index,
             arena,
-            |at| current(storage, at, Materialization::History, arena),
+            |at| {
+                current(
+                    storage,
+                    at,
+                    Materialization::History(crate::sql::catalog_snapshot::TableSelection::All),
+                    arena,
+                )
+            },
         )?;
         let mut matching = retained.rows.iter().copied().filter(|values| {
             values[2] == Datum::Oid(oid as u32) && values[1] == Datum::Text("_RETURN")

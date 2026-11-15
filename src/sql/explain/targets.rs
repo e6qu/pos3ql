@@ -14,12 +14,12 @@
 use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
-use crate::sql::ast::{Expr, Select, SelectItem};
+use crate::sql::ast::{Expr, Returning, Select, SelectItem};
 use crate::sql::catalog::deparse::{Column, Columns, Context, Destination, Joined};
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::query::{self, QueryScope, ResolvedColumn};
 use crate::sql_err;
-use crate::storage::Storage;
+use crate::storage::{Storage, TableDef};
 use crate::util::StackStr;
 
 /// The longest `Output:` list a node holds.
@@ -1013,5 +1013,591 @@ fn conjuncts<'l, 'e: 'l>(
             conjuncts(right, out)
         }
         _ => out.push(condition).map_err(|_| arena_full()),
+    }
+}
+
+/// The target lists of nodes that read one relation outside a block's join
+/// tree: a foreign scan's (postgres_fdw's base or grouped relation), a
+/// write's `RETURNING` list and the row its scan hands the write. Each
+/// list is `None` when an entry is outside the deparser's coverage, which
+/// marks its node's output unprintable.
+pub(super) struct RelationTargets<'a> {
+    context: Context<'a>,
+    table: &'a TableDef,
+    exposed: &'a str,
+    arena: &'a Arena,
+}
+
+impl<'a> RelationTargets<'a> {
+    /// The lists over `table`, scanned as `exposed`. `qualify` is
+    /// `show_plan_tlist`'s prefixing rule: the range table holds more than
+    /// this relation.
+    pub(super) fn new(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        qualify: bool,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let joined = arena
+            .alloc_slice_with(1, |_| Joined::new(exposed, table))
+            .map_err(|_| arena_full())?;
+        Ok(Self::with_joined(
+            storage, txid, table, exposed, joined, qualify, None, arena,
+        ))
+    }
+
+    /// The lists of a write whose `RETURNING` list may name the old and new
+    /// rows (`returning`), which print qualified. The target's own columns
+    /// print bare in an `UPDATE` or `DELETE` and qualified in an `INSERT`
+    /// (`qualify_target`), as PostgreSQL prints them.
+    pub(super) fn returning_scope(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        returning: Returning<'a>,
+        qualify_target: bool,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let rows = [
+            Joined::new(exposed, table),
+            Joined::rule_row(returning.old_name(), table),
+            Joined::rule_row(returning.new_name(), table),
+        ];
+        let joined = arena
+            .alloc_slice_with(rows.len(), |at| rows[at])
+            .map_err(|_| arena_full())?;
+        Ok(Self::with_joined(
+            storage,
+            txid,
+            table,
+            exposed,
+            joined,
+            true,
+            (!qualify_target).then_some(exposed),
+            arena,
+        ))
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "the deparse context")]
+    fn with_joined(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        joined: &'a [Joined<'a>],
+        qualify: bool,
+        bare: Option<&'a str>,
+        arena: &'a Arena,
+    ) -> Self {
+        Self {
+            context: Context {
+                storage,
+                txid,
+                table: Some(table),
+                parameters: &[],
+                joined,
+                pretty: false,
+                qualify,
+                bare,
+                domain_value: None,
+                sublinks: Some(&super::registered_sublink),
+                folded: true,
+                arena,
+                dependencies: None,
+            },
+            table,
+            exposed,
+            arena,
+        }
+    }
+
+    /// `expression` as an entry, `None` outside the deparser's coverage.
+    fn entry(
+        &self,
+        expression: &Expr<'_>,
+        destination: Destination,
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let text = crate::sql::catalog::deparse::deparse_expression(
+            &self.context,
+            expression,
+            destination,
+            self.arena,
+        )?;
+        Ok(text.map(|text| Entry {
+            text,
+            var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
+            referenced: false,
+        }))
+    }
+
+    /// Column `index` of the relation, prefixed by `qualifier`.
+    fn column(&self, index: usize, qualifier: Option<&str>) -> Result<Entry<'a>, SqlError> {
+        let mut name = StackStr::<160>::new();
+        if let Some(qualifier) = qualifier {
+            crate::sql::catalog::write_identifier(&mut name, qualifier);
+            let _ = name.write_char('.');
+        }
+        crate::sql::catalog::write_identifier(&mut name, self.table.columns()[index].name.as_str());
+        Ok(Entry {
+            text: self
+                .arena
+                .alloc_str(name.as_str())
+                .map_err(|_| arena_full())?,
+            var: true,
+            referenced: false,
+        })
+    }
+
+    /// The relation's whole row as a locked foreign scan returns it
+    /// (`ROW_MARK_COPY`): `t.*`.
+    fn whole_row(&self) -> Result<Entry<'a>, SqlError> {
+        let mut name = StackStr::<80>::new();
+        crate::sql::catalog::write_identifier(&mut name, self.exposed);
+        let _ = name.write_str(".*");
+        Ok(Entry {
+            text: self
+                .arena
+                .alloc_str(name.as_str())
+                .map_err(|_| arena_full())?,
+            var: true,
+            referenced: false,
+        })
+    }
+
+    /// The prefix the target's own columns print with: the exposed name in
+    /// an `INSERT`, none in an `UPDATE` or `DELETE` (`returning_scope`).
+    fn target_qualifier(&self) -> Option<&'a str> {
+        self.context.bare.is_none().then_some(self.exposed)
+    }
+
+    /// A write's `RETURNING` list (built by [`Self::returning_scope`]).
+    pub(super) fn returning(&self, returning: Returning<'_>) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
+            entries.push(entry).map_err(|_| arena_full())
+        };
+        for item in returning.items {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    for column in 0..self.table.columns().len() {
+                        push(&mut entries, self.column(column, self.target_qualifier())?)?;
+                    }
+                }
+                SelectItem::TableWildcard(qualifier) => {
+                    let image = [returning.old_name(), returning.new_name()].contains(qualifier);
+                    let qualifier = if image {
+                        Some(*qualifier)
+                    } else {
+                        self.target_qualifier()
+                    };
+                    for column in 0..self.table.columns().len() {
+                        push(&mut entries, self.column(column, qualifier)?)?;
+                    }
+                }
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    let Some(entry) = self.entry(expression, Destination::Value)? else {
+                        return Ok(None);
+                    };
+                    push(&mut entries, entry)?;
+                }
+            }
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// The row an `UPDATE` or `DELETE` scan hands its write: the new values
+    /// of the assigned columns in column order as the planner projects them
+    /// (`rewriteTargetListIU`), the row identity `ctid`, then, when
+    /// `whole_row`, the old row a foreign write reads (`t.*`). `alias` is
+    /// the name the statement gives the target.
+    pub(super) fn modified_row(
+        &self,
+        assignments: &[(&str, &'a Expr<'a>)],
+        alias: Option<&str>,
+        whole_row: bool,
+    ) -> Result<Option<Output>, SqlError> {
+        if assignments
+            .iter()
+            .any(|(target, _)| self.table.column_index(target).is_none())
+        {
+            return Ok(None);
+        }
+        let mut entries = ArenaList::new(self.arena);
+        for column in self.table.columns() {
+            let Some(&(_, value)) = assignments
+                .iter()
+                .find(|(target, _)| *target == column.name.as_str())
+            else {
+                continue;
+            };
+            let Some(entry) = self.assigned(column, value, alias)? else {
+                return Ok(None);
+            };
+            entries.push(entry).map_err(|_| arena_full())?;
+        }
+        entries
+            .push(Entry {
+                text: "ctid",
+                var: true,
+                referenced: false,
+            })
+            .map_err(|_| arena_full())?;
+        if whole_row {
+            entries.push(self.whole_row()?).map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// The planned form of one column's new value: a `DEFAULT` is the
+    /// column's default expression (a null of its type when it has none), a
+    /// constant the planner folds to the column's type prints that constant,
+    /// and an element or slice assignment prints `column[...] := value`.
+    fn assigned(
+        &self,
+        column: &crate::storage::ColumnMeta,
+        value: &'a Expr<'a>,
+        alias: Option<&str>,
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let arena = self.arena;
+        let target = column.ctype.oid();
+        let value = match value {
+            Expr::DefaultMarker => match column.default.expression() {
+                None => return self.entry(&Expr::Null, Destination::Assignment(target)),
+                Some(source) => {
+                    let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                    crate::sql::parser::parse_expr(source, arena)?
+                }
+            },
+            Expr::Call { name, args, .. }
+                if matches!(
+                    *name,
+                    "__jsonb_subscript_set" | "__array_subscript_set" | "__assign_path"
+                ) =>
+            {
+                return self.assigned_path(column, name, args);
+            }
+            value => value,
+        };
+        // The planner folds a constant expression, coerced to the column's
+        // type. Analysis already converted a cast or typed literal to a
+        // bound value.
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(self.table),
+            alias,
+            output_aliases: &[],
+        };
+        let bound = matches!(
+            value,
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(_),
+                ..
+            }
+        );
+        if bound
+            || crate::sql::exec::folds_to_constant(value)
+                && !matches!(value, Expr::Str(_) | Expr::Null)
+                && crate::sql::exec::infer_type_res(value, &columns)
+                    .is_ok_and(|(oid, _)| oid != crate::sql::types::oid::UNKNOWN)
+        {
+            let evaluated = crate::sql::eval::eval_full(
+                value,
+                arena,
+                &[],
+                &crate::sql::eval::NoColumns,
+                &crate::sql::eval::NO_HOOKS,
+            )?;
+            // An assignment enforces the column's modifier (`varchar(3)`).
+            let folded = crate::sql::exec::apply_typmod(
+                crate::sql::eval::cast_to(evaluated, column.ctype, arena)?,
+                column.ctype,
+                column.type_mod,
+                arena,
+            )?;
+            let length = crate::sql::exec::projected_row_len(&[folded])?;
+            let encoded = arena
+                .alloc_slice_with(length, |_| 0u8)
+                .map_err(|_| arena_full())?;
+            crate::sql::exec::encode_projected_into(&[folded], encoded)?;
+            let constant = arena
+                .alloc(Expr::BoundLiteral {
+                    value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                    type_oid: target,
+                    type_mod: -1,
+                    collation: None,
+                    source: value,
+                })
+                .map_err(|_| arena_full())?;
+            return self.entry(constant, Destination::Value);
+        }
+        self.entry(value, Destination::Assignment(target))
+    }
+
+    /// `column[i] := value` or `column[i:j] := value`, as PostgreSQL prints a
+    /// subscripted assignment (a `SubscriptingRef` with an assigned value).
+    /// An assignment through a composite field is not covered.
+    fn assigned_path(
+        &self,
+        column: &crate::storage::ColumnMeta,
+        name: &str,
+        args: &[&'a Expr<'a>],
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let crate::sql::types::ColType::Array(element) = column.ctype else {
+            return Ok(None);
+        };
+        // The parser's three assignment forms: element subscripts only, a
+        // subscript list holding a slice, and a path through fields.
+        let (base, value, kinds, operands): (&Expr<'_>, &Expr<'_>, &str, &[&Expr<'_>]) =
+            match (name, args) {
+                ("__jsonb_subscript_set", [base, value, operands @ ..]) if operands.len() <= 6 => {
+                    (base, value, &"eeeeee"[..operands.len()], operands)
+                }
+                ("__array_subscript_set", [base, value, Expr::Str(kinds), operands @ ..])
+                | ("__assign_path", [base, value, _, Expr::Str(kinds), operands @ ..]) => {
+                    (base, value, kinds, operands)
+                }
+                _ => return Ok(None),
+            };
+        if !kinds.bytes().all(|kind| matches!(kind, b'e' | b's'))
+            || operands.len()
+                != kinds
+                    .bytes()
+                    .map(|kind| 1 + usize::from(kind == b's'))
+                    .sum::<usize>()
+        {
+            return Ok(None);
+        }
+        let Some(base) = self.entry(base, Destination::Value)? else {
+            return Ok(None);
+        };
+        let mut text = Output::new();
+        let _ = text.write_str(base.text);
+        let mut operand = operands.iter();
+        for kind in kinds.bytes() {
+            let _ = text.write_str("[");
+            for (index, bound) in operand
+                .by_ref()
+                .take(1 + usize::from(kind == b's'))
+                .enumerate()
+            {
+                let Some(bound) =
+                    self.entry(bound, Destination::Assignment(crate::sql::types::oid::INT4))?
+                else {
+                    return Ok(None);
+                };
+                if index != 0 {
+                    let _ = text.write_str(":");
+                }
+                let _ = text.write_str(bound.text);
+            }
+            let _ = text.write_str("]");
+        }
+        let target = if kinds.contains('s') {
+            column.ctype.oid()
+        } else {
+            element.element_oid()
+        };
+        let Some(value) = self.entry(value, Destination::Assignment(target))? else {
+            return Ok(None);
+        };
+        let _ = write!(text, " := {}", value.text);
+        let text = checked(text)?;
+        Ok(Some(Entry {
+            text: self
+                .arena
+                .alloc_str(text.as_str())
+                .map_err(|_| arena_full())?,
+            var: false,
+            referenced: false,
+        }))
+    }
+
+    /// A one-row `INSERT`'s `Result`: each column's value in column order as
+    /// the planner projects it, a column the row omits taking its
+    /// `DEFAULT`. A defaulted identity, serial or generated column is not
+    /// covered.
+    pub(super) fn inserted_row(
+        &self,
+        columns: &[&str],
+        row: &[&'a Expr<'a>],
+    ) -> Result<Option<Output>, SqlError> {
+        let definitions = self.table.columns();
+        let expected = if columns.is_empty() {
+            definitions.len()
+        } else {
+            columns.len()
+        };
+        if row.len() != expected {
+            return Ok(None);
+        }
+        let mut entries = ArenaList::new(self.arena);
+        for (index, column) in definitions.iter().enumerate() {
+            let value = if columns.is_empty() {
+                Some(row[index])
+            } else {
+                columns
+                    .iter()
+                    .position(|named| *named == column.name.as_str())
+                    .map(|at| row[at])
+            };
+            let value = value.unwrap_or(&Expr::DefaultMarker);
+            if matches!(value, Expr::DefaultMarker)
+                && (column.is_identity
+                    || column.auto_increment
+                    || matches!(
+                        column.default,
+                        crate::storage::ColumnDefault::Generated { .. }
+                    ))
+            {
+                return Ok(None);
+            }
+            let Some(entry) = self.assigned(column, value, None)? else {
+                return Ok(None);
+            };
+            entries.push(entry).map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// A several-row `INSERT`'s `Values Scan`: its columns, each a column
+    /// of the `*VALUES*` list. Only rows naming every column in order
+    /// without `DEFAULT` are covered.
+    pub(super) fn values_scan(
+        &self,
+        columns: &[&str],
+        rows: &[&[&Expr<'_>]],
+    ) -> Result<Option<Output>, SqlError> {
+        let definitions = self.table.columns();
+        if !self.covers(columns)
+            || rows.iter().any(|row| {
+                row.len() != definitions.len()
+                    || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+            })
+        {
+            return Ok(None);
+        }
+        let mut output = Output::new();
+        for column in 1..=definitions.len() {
+            if column > 1 {
+                let _ = output.write_str(", ");
+            }
+            let _ = write!(output, "\"*VALUES*\".column{column}");
+        }
+        checked(output).map(Some)
+    }
+
+    /// Whether an `INSERT`'s column list names every column in order (an
+    /// empty one does).
+    fn covers(&self, columns: &[&str]) -> bool {
+        let definitions = self.table.columns();
+        columns.is_empty()
+            || columns.len() == definitions.len()
+                && columns
+                    .iter()
+                    .zip(definitions)
+                    .all(|(named, column)| *named == column.name.as_str())
+    }
+
+    /// postgres_fdw's scan of the base relation: the select list (none
+    /// under a local aggregate, which reads the columns by name), the sort
+    /// keys it does not project, then the whole row a locking clause copies.
+    pub(super) fn foreign_scan(
+        &self,
+        statement: &Select<'_>,
+        sort_keys: &[crate::sql::ast::OrderBy<'_>],
+        aggregate: bool,
+    ) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
+            entries.push(entry).map_err(|_| arena_full())
+        };
+        for item in statement.items.iter().filter(|_| !aggregate) {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                    for column in 0..self.table.columns().len() {
+                        push(&mut entries, self.column(column, None)?)?;
+                    }
+                }
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    let Some(entry) = self.entry(expression, Destination::Value)? else {
+                        return Ok(None);
+                    };
+                    push(&mut entries, entry)?;
+                }
+            }
+        }
+        let exposed = self.exposed;
+        for key in sort_keys {
+            let projected = statement.items.iter().any(|item| match item {
+                SelectItem::Wildcard(_) => matches!(key.expression, Expr::Column { .. }),
+                SelectItem::TableWildcard(qualifier) => match key.expression {
+                    Expr::Column {
+                        qualifier: held, ..
+                    } => held.is_none_or(|q| q == *qualifier),
+                    _ => false,
+                },
+                SelectItem::Expr { expression, .. } => match (expression, key.expression) {
+                    (
+                        Expr::Column {
+                            qualifier,
+                            name: projected,
+                        },
+                        Expr::Column { name, .. },
+                    ) => {
+                        projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed)
+                    }
+                    (expression, key) => **expression == *key,
+                },
+                SelectItem::RecordStar(_) => false,
+            });
+            if projected {
+                continue;
+            }
+            let entry = match key.expression {
+                Expr::Column { name, .. } if self.table.column_index(name).is_some() => {
+                    let column = self.table.column_index(name).expect("checked above");
+                    self.column(column, None)?
+                }
+                expression => match self.entry(expression, Destination::Value)? {
+                    Some(entry) => entry,
+                    None => return Ok(None),
+                },
+            };
+            push(&mut entries, entry)?;
+        }
+        if !statement.locking.is_empty() {
+            push(&mut entries, self.whole_row()?)?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// postgres_fdw's scan of a grouped relation: each select-list
+    /// expression, then the keys it lacks (`resjunk`), read from the remote
+    /// target list (`fdw_scan_tlist`), so any but a plain column prints in
+    /// parentheses.
+    pub(super) fn foreign_upper(
+        &self,
+        statement: &Select<'_>,
+        resjunk: &[&Expr<'_>],
+    ) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let items = statement.items.iter().map(|item| match item {
+            SelectItem::Expr { expression, .. } => Ok(*expression),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a grouped foreign scan has a star in its select list"
+            )),
+        });
+        for expression in items.chain(resjunk.iter().map(|&target| Ok(target))) {
+            let Some(entry) = self.entry(expression?, Destination::Value)? else {
+                return Ok(None);
+            };
+            entries
+                .push(entry.referenced(self.arena)?)
+                .map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
     }
 }

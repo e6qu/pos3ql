@@ -441,7 +441,7 @@ fn execute_unrecorded(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
     use crate::sql::datetime::test_clock;

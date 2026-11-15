@@ -215,5 +215,5 @@ fn too_large() -> SqlError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests;

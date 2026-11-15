@@ -142,16 +142,16 @@ fn unknown_literal<'a>(
     kind: Literal,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let (Expr::Str(_), Datum::Text(text)) = (expression, value) else {
+    let (Expr::Str(literal), Datum::Text(text)) = (expression, value) else {
         return Ok(value);
     };
-    Ok(match kind {
-        Literal::Vector => Datum::TsVector(full_text::restore_vector(full_text::canonical_vector(
-            text, arena,
-        )?)),
-        Literal::Query => Datum::TsQuery(full_text::restore_query(full_text::canonical_query(
-            text, arena,
-        )?)),
+    let target = match kind {
+        Literal::Vector => crate::sql::types::ColType::TsVector,
+        Literal::Query => crate::sql::types::ColType::TsQuery,
+    };
+    // The type's input function runs on the literal, raising its notices.
+    super::super::with_input_subject(literal, || {
+        super::super::cast_to(Datum::Text(text), target, arena)
     })
 }
 
@@ -657,7 +657,8 @@ pub(crate) fn dispatch<'a>(
             }
             "numnode" => {
                 arity(name, args.len(), 1..=1)?;
-                match eval_full(args[0], arena, params, row, hooks)? {
+                let query = eval_full(args[0], arena, params, row, hooks)?;
+                match unknown_literal(args[0], query, Literal::Query, arena)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::TsQuery(query) => Ok(Datum::Int4(full_text::query_node_count(
                         query.as_str(),
@@ -672,7 +673,8 @@ pub(crate) fn dispatch<'a>(
             }
             "querytree" => {
                 arity(name, args.len(), 1..=1)?;
-                match eval_full(args[0], arena, params, row, hooks)? {
+                let query = eval_full(args[0], arena, params, row, hooks)?;
+                match unknown_literal(args[0], query, Literal::Query, arena)? {
                     Datum::Null => Ok(Datum::Null),
                     Datum::TsQuery(query) => {
                         Ok(Datum::Text(full_text::query_tree(query.as_str(), arena)?))

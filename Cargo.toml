@@ -33,6 +33,12 @@ webpki-roots = "0.26"
 # Limit Miri test discovery to ownership modules; native tests stay complete.
 miri-ownership = []
 checkpoint-profile = []
+# The library tests form two suites, each built as its own test executable so
+# that no compiler process holds both: `sql-fixture-suite` selects the SQL
+# fixtures (`sql::tests`) and `unit-suite` every other library test. Without
+# either, `cargo test --lib` builds and runs the complete set.
+sql-fixture-suite = []
+unit-suite = []
 
 [profile.release]
 panic = "abort"

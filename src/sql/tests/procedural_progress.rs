@@ -1933,7 +1933,7 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
                         &mut described,
                         crate::pg::respond::ResultFmt::ALL_TEXT,
                     ),
-                    &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                 )
                 .unwrap();
             assert!(!accepted, "{query}");

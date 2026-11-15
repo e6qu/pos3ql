@@ -564,7 +564,7 @@ pub(super) fn release_committed_history_through(
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::storage::{ColumnSet, RowHome};

@@ -1012,6 +1012,43 @@ impl RowProgress {
         Ok(())
     }
 
+    /// Keeps the foreign rows a batched INSERT queued, one encoded row per
+    /// target table, as its row state with the unfinished row, so the next
+    /// attempt queues them again: postgres_fdw sends them when a batch
+    /// fills or the statement ends, never because the statement paused.
+    pub(super) fn keep_foreign_batches(
+        &mut self,
+        targets: &[&[u8]],
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if self.running.is_none() {
+            return Ok(());
+        }
+        self.state = Some(transition_rows::SavedTransitionRows::capture(
+            TransitionRows {
+                old: targets,
+                new: &[],
+            },
+            pool,
+        )?);
+        Ok(())
+    }
+
+    /// The foreign rows [`Self::keep_foreign_batches`] kept.
+    pub(super) fn resumed_foreign_batches<'out>(
+        &'out self,
+        arena: &'out Arena,
+    ) -> Result<&'out [&'out [u8]], SqlError> {
+        match self
+            .resume
+            .as_ref()
+            .and_then(|resume| resume.state.as_ref())
+        {
+            Some(saved) => Ok(saved.restore(arena)?.old),
+            None => Ok(&[]),
+        }
+    }
+
     /// Keeps a PL/pgSQL `INTO` destination's returned-row count and first
     /// row with the interrupted row, so the next attempt's destination
     /// continues with the rows the earlier attempts returned. Without an

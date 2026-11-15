@@ -7,7 +7,7 @@
 //! without fetching a row; every candidate is still checked against the
 //! authoritative MVCC row identity by the storage layer.
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 use super::navigation::SpatialBounds;
 use super::navigation::{
     INTERVAL_DATA_BYTES, NavigationCursor, NavigationCursorStep, NavigationKind, NavigationSummary,
@@ -1394,7 +1394,11 @@ fn walk_data(
     Ok(())
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

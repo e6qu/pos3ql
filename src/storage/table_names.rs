@@ -223,3 +223,73 @@ impl DerefMut for IdentityWrite<'_> {
         &mut self.state.identity
     }
 }
+
+/// The visible tables of one transaction keyed by schema and name: an
+/// open-addressed table of slots in caller-provided arena space.
+pub(crate) struct VisibleTableNames<'a> {
+    slots: &'a mut [u32],
+    transaction: u32,
+}
+
+impl<'a> VisibleTableNames<'a> {
+    pub(crate) const EMPTY: u32 = u32::MAX;
+
+    pub(super) fn new(slots: &'a mut [u32], transaction: u32) -> Self {
+        debug_assert!(slots.len().is_power_of_two());
+        Self { slots, transaction }
+    }
+
+    fn start(&self, schema: &str, name: &str) -> usize {
+        use core::hash::Hasher;
+        let mut hash = crate::mem::fixed_map::Fnv1aHasher::default();
+        hash.write(schema.as_bytes());
+        hash.write_u8(0);
+        hash.write(name.as_bytes());
+        hash.finish() as usize & (self.slots.len() - 1)
+    }
+
+    /// Records `slot` unless a lower slot already holds the name.
+    pub(super) fn insert_first(
+        &mut self,
+        storage: &super::Storage,
+        slot: usize,
+        schema: &str,
+        name: &str,
+    ) {
+        let mask = self.slots.len() - 1;
+        let mut at = self.start(schema, name);
+        loop {
+            match self.slots[at] {
+                Self::EMPTY => {
+                    self.slots[at] = u32::try_from(slot).expect("table slots fit u32");
+                    return;
+                }
+                existing => {
+                    let definition = storage.table_def(existing as usize, self.transaction);
+                    if definition.schema.as_str() == schema && definition.name.as_str() == name {
+                        return;
+                    }
+                }
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// The slot `Storage::find_visible` returns for this name.
+    pub(crate) fn find(&self, storage: &super::Storage, schema: &str, name: &str) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut at = self.start(schema, name);
+        loop {
+            match self.slots[at] {
+                Self::EMPTY => return None,
+                existing => {
+                    let definition = storage.table_def(existing as usize, self.transaction);
+                    if definition.schema.as_str() == schema && definition.name.as_str() == name {
+                        return Some(existing as usize);
+                    }
+                }
+            }
+            at = (at + 1) & mask;
+        }
+    }
+}

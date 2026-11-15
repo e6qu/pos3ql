@@ -11542,7 +11542,11 @@ impl<'a> Parser<'a> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::Budget;
@@ -12011,7 +12015,7 @@ mod tests {
                     panic!()
                 };
                 assert!(
-                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to }, .. } if from.len() == 1 && to.len() == 1)
+                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to, .. }, .. } if from.len() == 1 && to.len() == 1)
                 );
                 let Stmt::CreateTable(default) = p.next_stmt().unwrap().unwrap() else {
                     panic!()
@@ -12019,7 +12023,7 @@ mod tests {
                 assert!(matches!(
                     default.partition,
                     PartitionClause::Of {
-                        bound: PartitionBound::Default,
+                        bound: PartitionBound::Default { .. },
                         ..
                     }
                 ));
@@ -15073,7 +15077,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod source_position_tests {
     use super::*;
 

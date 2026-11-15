@@ -37,7 +37,7 @@ pub(crate) use retained::{
     stream_query, union_all_leaves,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod routine_contract_tests;
 
 mod setops;
@@ -1847,6 +1847,190 @@ pub(crate) struct RoutineInvocationState {
     initplan_counts: RefCell<crate::mem::arena::RetainedList<InitPlanCount>>,
     /// Numbers attempts, so [`Self::initplan_counts`] restart with each.
     attempt: Cell<u64>,
+    /// The foreign scans the statement ran and their rows, kept in the
+    /// statement arena from the first foreign scan on.
+    foreign: Cell<Option<crate::mem::arena::ArenaHandle<ForeignScanLog>>>,
+}
+
+/// What a statement keeps of its foreign scans across attempts.
+#[derive(Clone, Copy)]
+pub(super) struct ForeignScanLog {
+    /// The scans, by their place among an attempt's foreign scans, with the
+    /// remote cursor each left open.
+    scans: crate::mem::arena::RetainedList<crate::sql::foreign::KeptForeignScan>,
+    /// Every row those scans fetched, tagged with its scan, in fetch order.
+    rows: crate::mem::arena::RetainedList<KeptForeignRow>,
+    /// The attempt and count of foreign scans it started so far.
+    attempt: u64,
+    count: u32,
+}
+
+impl RoutineInvocationState {
+    fn foreign_log(&self, arena: &Arena) -> Result<ForeignScanLog, SqlError> {
+        match self.foreign.get() {
+            Some(handle) => arena.retained(handle).ok_or_else(inactive_pending_call),
+            None => Ok(ForeignScanLog {
+                scans: crate::mem::arena::RetainedList::new(),
+                rows: crate::mem::arena::RetainedList::new(),
+                attempt: 0,
+                count: 0,
+            }),
+        }
+    }
+
+    fn set_foreign_log(&self, arena: &Arena, log: ForeignScanLog) -> Result<(), SqlError> {
+        match self.foreign.get() {
+            Some(handle) if arena.replace_retained(handle, log) => Ok(()),
+            Some(_) => Err(inactive_pending_call()),
+            None => {
+                let handle = arena.retain(log).map_err(|_| foreign_log_error())?;
+                self.foreign.set(Some(handle));
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A fetched foreign row a statement keeps for its later attempts.
+#[derive(Clone, Copy)]
+pub(super) struct KeptForeignRow {
+    scan: u32,
+    bytes: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+}
+
+/// Where a foreign scan starts in the active statement.
+#[derive(Clone, Copy)]
+pub(crate) enum ForeignScanStart {
+    /// No statement log keeps foreign rows (the statement cannot restart).
+    Untracked,
+    /// The first time this attempt reaches the scan with this number.
+    New(u32),
+    /// An earlier attempt ran this scan: its kept rows come first.
+    Kept(crate::sql::foreign::KeptForeignScan),
+}
+
+fn foreign_log_error() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "kept foreign scan rows exceed statement memory"
+    )
+}
+
+/// Numbers the next foreign scan of the active statement's attempt and
+/// returns what an earlier attempt left of it.
+pub(crate) fn begin_foreign_scan() -> Result<ForeignScanStart, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(ForeignScanStart::Untracked);
+        };
+        let attempt = calls.attempt.get();
+        let mut log = calls.foreign_log(arena)?;
+        let ordinal = if log.attempt == attempt { log.count } else { 0 };
+        log.attempt = attempt;
+        log.count = ordinal + 1;
+        calls.set_foreign_log(arena, log)?;
+        let kept = log
+            .scans
+            .with_slice(arena, |scans| {
+                scans.iter().find(|scan| scan.ordinal == ordinal).copied()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        Ok(match kept {
+            Some(scan) => ForeignScanStart::Kept(scan),
+            None => ForeignScanStart::New(ordinal),
+        })
+    })
+}
+
+/// Records scan `ordinal`'s open cursor, or that it has none left.
+pub(crate) fn set_foreign_scan_cursor(
+    ordinal: u32,
+    cursor: Option<(crate::storage::ForeignSessionLease, u32)>,
+) -> Result<(), SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(());
+        };
+        let mut log = calls.foreign_log(arena)?;
+        let updated = log
+            .scans
+            .with_mut_slice(arena, |scans| {
+                scans
+                    .iter_mut()
+                    .find(|scan| scan.ordinal == ordinal)
+                    .map(|scan| scan.cursor = cursor)
+                    .is_some()
+            })
+            .map_err(|_| inactive_pending_call())?;
+        if !updated {
+            log.scans
+                .push(
+                    arena,
+                    crate::sql::foreign::KeptForeignScan { ordinal, cursor },
+                )
+                .map_err(|_| foreign_log_error())?;
+        }
+        calls.set_foreign_log(arena, log)
+    })
+}
+
+/// Keeps one fetched row of scan `ordinal` for later attempts.
+pub(crate) fn keep_foreign_row(ordinal: u32, bytes: &[u8]) -> Result<(), SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(());
+        };
+        let handle = arena
+            .retain_slice_with(bytes.len(), |at| bytes[at])
+            .map_err(|_| foreign_log_error())?;
+        let bytes = arena
+            .freeze_retained_slice(handle)
+            .map_err(|_| inactive_pending_call())?;
+        let mut log = calls.foreign_log(arena)?;
+        log.rows
+            .push(
+                arena,
+                KeptForeignRow {
+                    scan: ordinal,
+                    bytes,
+                },
+            )
+            .map_err(|_| foreign_log_error())?;
+        calls.set_foreign_log(arena, log)
+    })
+}
+
+/// Row `index` of the rows scan `ordinal` kept, copied into `output`.
+pub(crate) fn kept_foreign_row(
+    ordinal: u32,
+    index: usize,
+    output: &Arena,
+) -> Result<Option<&[u8]>, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((calls, arena)) = context else {
+            return Ok(None);
+        };
+        let handle = calls
+            .foreign_log(arena)?
+            .rows
+            .with_slice(arena, |rows| {
+                rows.iter()
+                    .filter(|row| row.scan == ordinal)
+                    .nth(index)
+                    .map(|row| row.bytes)
+            })
+            .map_err(|_| inactive_pending_call())?;
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let bytes = arena
+            .retained_slice(handle)
+            .map_err(|_| inactive_pending_call())?;
+        output
+            .alloc_slice_copy(bytes)
+            .map(|bytes| Some(&*bytes))
+            .map_err(|_| arena_full())
+    })
 }
 
 /// The log positions at which an uncorrelated subquery's one evaluation
@@ -2263,6 +2447,7 @@ impl RoutineInvocationState {
             initplans: RefCell::new(crate::mem::arena::RetainedList::new()),
             initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
             attempt: Cell::new(0),
+            foreign: Cell::new(None),
         }
     }
 
@@ -7119,6 +7304,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::partition_key_def_text(self.storage, self.txid, oid, arena)
+    }
+    fn partition_constraint_def<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::partition_constraint_def_text(self.storage, self.txid, oid, arena)
+    }
+    fn satisfies_hash_partition(
+        &self,
+        oid: i32,
+        modulus: i32,
+        remainder: i32,
+        types: &[i32],
+        values: &[Datum<'_>],
+    ) -> Result<bool, SqlError> {
+        super::catalog::satisfies_hash_partition(
+            self.storage,
+            self.txid,
+            oid,
+            modulus,
+            remainder,
+            types,
+            values,
+        )
     }
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::relname_text(self.storage, self.txid, oid, arena)
@@ -13599,7 +13809,20 @@ pub(crate) fn analyse_fromless_select<'a>(
         txid,
         arena,
     };
+    // Analysis converts the literal operands of the target list, then of
+    // the condition.
+    let infer = |other: &'a Expr<'a>| {
+        super::exec::infer_type_res(other, &columns)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check_literal_operands_typed(expression, &infer, storage, txid, arena)?;
+        }
+    }
     if let Some(condition) = statement.where_clause {
+        check_literal_operands_typed(condition, &infer, storage, txid, arena)?;
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
     check_fromless_keys(statement, &columns, storage, txid, arena)
@@ -18108,7 +18331,7 @@ pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeC
 }
 
 /// Visits `expression` and every expression below it, subqueries excepted.
-fn walk_expression_tree<'a>(
+pub(crate) fn walk_expression_tree<'a>(
     expression: &'a Expr<'a>,
     visit: &mut dyn FnMut(&'a Expr<'a>),
 ) -> Result<(), SqlError> {

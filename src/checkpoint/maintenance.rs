@@ -321,7 +321,7 @@ impl MetadataIo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(super) mod tests {
     use super::*;
     use std::io::{Read, Write};

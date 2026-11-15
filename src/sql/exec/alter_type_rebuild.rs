@@ -407,19 +407,27 @@ pub(super) fn rebuild_retyped_dependents(
         })
         .map_err(|_| arena_full())?;
     let mut dependents = ArenaList::new(arena);
-    for_each_dependency(storage, txid, arena, &mut |edge| {
-        if edge.referenced.class != crate::sql::catalog::PG_CLASS_OID || edge.referenced.sub == 0 {
-            return Ok(());
-        }
-        if let Some(ordinal) = columns.iter().position(|&(position, attribute)| {
-            table_oids[position] == edge.referenced.object && attribute == edge.referenced.sub
-        }) {
-            dependents
-                .push((ordinal, edge.dependent))
-                .map_err(|_| arena_full())?;
-        }
-        Ok(())
-    })?;
+    for_each_dependency(
+        storage,
+        txid,
+        crate::sql::catalog_snapshot::TableSelection::All,
+        arena,
+        &mut |edge| {
+            if edge.referenced.class != crate::sql::catalog::PG_CLASS_OID
+                || edge.referenced.sub == 0
+            {
+                return Ok(());
+            }
+            if let Some(ordinal) = columns.iter().position(|&(position, attribute)| {
+                table_oids[position] == edge.referenced.object && attribute == edge.referenced.sub
+            }) {
+                dependents
+                    .push((ordinal, edge.dependent))
+                    .map_err(|_| arena_full())?;
+            }
+            Ok(())
+        },
+    )?;
     // `pg_depend`'s scan of one column returns its dependents in creation
     // order.
     let dependents = dependents.as_mut_slice().map_err(|_| arena_full())?;

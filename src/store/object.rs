@@ -1217,7 +1217,11 @@ impl BlockStore for OwnedObjectStore {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use std::io::Read;
     use std::io::Write;

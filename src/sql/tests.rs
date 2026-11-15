@@ -18,6 +18,7 @@ mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
+mod catalog_capture_selection;
 mod catalog_identity_lookup;
 mod catalog_join_probes;
 mod catalog_join_work;
@@ -15900,7 +15901,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
                     &transaction,
                     2,
                     &[],
-                    &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                 )
                 .unwrap();
             assert_eq!(
@@ -18544,7 +18545,7 @@ fn finish_copy(
 }
 
 fn copy_transition_scratch(budget: &mut Budget) -> crate::sql::exec::CopyTransitionRows {
-    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10).unwrap()
+    crate::sql::exec::CopyTransitionRows::new(budget, 1024, 256 << 10, 64 << 10).unwrap()
 }
 
 fn run_with_arena_bytes(
@@ -19549,6 +19550,9 @@ fn truncate_fanout_releases_definition_images_before_statement_triggers() {
 fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
     const TABLES: usize = 300;
     let mut config = test_config("truncate-fanout-prepared-cold-recovery");
+    // Measures capacity, not capture selection: every other test repeats
+    // each reached-table catalog capture over all tables.
+    config.catalog_capture_cross_check = false;
     config.max_catalog_versions_per_object = 1;
     config.max_tables = TABLES;
     config.max_indexes = TABLES;
@@ -20070,7 +20074,7 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
                 None,
                 &GucState::new(),
                 &mut responder,
-                &[],
+                crate::sql::type_inputs::BoundInputs::Admitted(&[]),
             )
             .unwrap()
     };
@@ -28857,7 +28861,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [enum_oid, domain_oid]);
@@ -28868,7 +28872,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
@@ -28882,7 +28886,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             3,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
@@ -28895,7 +28899,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
@@ -28906,7 +28910,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
@@ -28917,7 +28921,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
@@ -28928,7 +28932,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(
@@ -29297,7 +29301,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
     let inferred = engine
-        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[], &[])
+        .infer_param_types(
+            "SELECT $1::record",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
+        )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
@@ -31770,6 +31781,70 @@ fn multi_column_hash_partition_keys_match_postgresql_integer_hashing() {
 }
 
 #[test]
+fn hash_partition_keys_of_text_and_numeric_route_as_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE text_hash (k text, n numeric) PARTITION BY HASH (k); \
+         CREATE TABLE text_hash0 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 0); \
+         CREATE TABLE text_hash1 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 1); \
+         CREATE TABLE text_hash2 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 2); \
+         INSERT INTO text_hash (k) VALUES ('key1'), ('key3'), ('key5'), (''), (NULL); \
+         SELECT tableoid::regclass, coalesce(k, 'null') FROM text_hash ORDER BY 2; \
+         SELECT satisfies_hash_partition('text_hash'::regclass, 3, 1, 'key3'::text), \
+           satisfies_hash_partition('text_hash'::regclass, 3, 2, 'key3'::text)",
+    );
+    let (mut engine, mut budget) = test_engine();
+    let numeric = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE numeric_hash (n numeric) PARTITION BY HASH (n); \
+         CREATE TABLE numeric_hash0 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 0); \
+         CREATE TABLE numeric_hash1 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 1); \
+         CREATE TABLE numeric_hash2 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 2); \
+         CREATE TABLE numeric_hash3 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 3); \
+         CREATE TABLE numeric_hash4 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 4); \
+         INSERT INTO numeric_hash VALUES (0), (1.000), (100000000), (2111.1102), ('Infinity'), ('NaN'); \
+         SELECT tableoid::regclass, n FROM numeric_hash ORDER BY n",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "text_hash2|",
+            "text_hash0|key1",
+            "text_hash1|key3",
+            "text_hash2|key5",
+            "text_hash0|null",
+            "t|f",
+        ]
+    );
+    assert_eq!(
+        data_rows(&numeric),
+        [
+            "numeric_hash2|0",
+            "numeric_hash0|1.000",
+            "numeric_hash1|2111.1102",
+            "numeric_hash3|100000000",
+            "numeric_hash3|Infinity",
+            "numeric_hash3|NaN",
+        ]
+    );
+    let refused = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_hash (i interval) PARTITION BY HASH (i)",
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains(
+            "HASH partitioning is not supported for partition key column \"i\" of type interval"
+        ),
+        "{}",
+        String::from_utf8_lossy(&refused)
+    );
+}
+
+#[test]
 fn subpartitioned_tables_route_through_every_typed_level() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -32455,7 +32530,42 @@ fn partition_creation_rejects_overlapping_typed_bounds() {
          CREATE TABLE partitions_overlap PARTITION OF partitions FOR VALUES FROM (5) TO (15)",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("would overlap partition"),
+        String::from_utf8_lossy(&output).contains(
+            "partition \"partitions_overlap\" would overlap partition \"partitions_first\""
+        ),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn partition_constraint_definitions_follow_generate_partition_qual() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE qual_root (a int, b text) PARTITION BY RANGE (a); \
+         CREATE TABLE qual_low PARTITION OF qual_root FOR VALUES FROM (MINVALUE) TO (-5); \
+         CREATE TABLE qual_mid PARTITION OF qual_root FOR VALUES FROM (1) TO (10) \
+           PARTITION BY LIST (b); \
+         CREATE TABLE qual_mid_xy PARTITION OF qual_mid FOR VALUES IN ('x', 'y', 'x'); \
+         CREATE TABLE qual_mid_rest PARTITION OF qual_mid DEFAULT; \
+         CREATE TABLE qual_rest PARTITION OF qual_root DEFAULT; \
+         SELECT pg_get_partition_constraintdef(oid) FROM pg_class \
+          WHERE relname LIKE 'qual%' ORDER BY relname",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "((a IS NOT NULL) AND (a < '-5'::integer))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10) AND (NOT ((b IS NOT NULL) \
+             AND (b = ANY (ARRAY['x'::text, 'y'::text])))))",
+            "((a IS NOT NULL) AND (a >= 1) AND (a < 10) AND (b IS NOT NULL) \
+             AND (b = ANY (ARRAY['x'::text, 'y'::text])))",
+            "(NOT ((a IS NOT NULL) AND ((a < '-5'::integer) OR ((a >= 1) AND (a < 10)))))",
+            "NULL",
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -56193,7 +56303,7 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(
@@ -94360,7 +94470,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     Some(&session.cursors),
                     &session.guc,
                     &mut responder,
-                    &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                 ))
                 .unwrap()
             );
@@ -98231,7 +98341,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                             arena: &reader.arena,
                         },
                         &mut Responder::new(&mut send),
-                        &transition,
+                        &mut transition,
                         CopyFinishMode::ImplicitTransaction,
                     )
                     .unwrap();

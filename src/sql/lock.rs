@@ -1200,7 +1200,7 @@ fn pair_conflicts(left: u8, right: u8) -> bool {
     left == 1 || right == 1 || matches!((left, right), (2, 2) | (2, 4) | (4, 2))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

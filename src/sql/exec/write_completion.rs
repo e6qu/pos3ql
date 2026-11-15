@@ -1033,7 +1033,7 @@ pub(super) fn has_statement_triggers(
         .is_some())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
 

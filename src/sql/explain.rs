@@ -55,6 +55,9 @@ struct PlanNode {
     /// The name the query gives the relation, when it differs from it.
     alias: StackStr<96>,
     output: targets::Output,
+    /// The node's target list is outside the deparser's coverage:
+    /// `VERBOSE` rejects the plan rather than print a wrong `Output:`.
+    output_unprintable: bool,
     depth: u8,
     startup_cost: f64,
     total_cost: f64,
@@ -81,6 +84,9 @@ struct PlanNode {
     /// The subplans this node is nested in: PostgreSQL indents each
     /// subplan two columns past its parent's children.
     shift: u8,
+    /// The relations a postgres_fdw scan of a join or grouped relation
+    /// covers (`Aggregate on (public.t)`), which every format prints.
+    relations: StackStr<256>,
     /// The query a postgres_fdw node sends, which `VERBOSE` prints.
     remote_sql: StackStr<REMOTE_SQL_BYTES>,
     /// The rows a postgres_fdw INSERT sends per remote command.
@@ -302,6 +308,13 @@ impl PlanNode {
         shown.into_iter().take(count)
     }
 
+    /// Sets the node's target list; `None` (outside the deparser's
+    /// coverage) leaves it unprintable.
+    fn set_output(&mut self, output: Option<targets::Output>) {
+        self.output_unprintable = output.is_none();
+        self.output = output.unwrap_or_default();
+    }
+
     const EMPTY: Self = Self {
         name: StackStr::new(),
         bitmap_index: StackStr::new(),
@@ -323,6 +336,8 @@ impl PlanNode {
         schema: StackStr::new(),
         subplan: None,
         shift: 0,
+        relations: StackStr::new(),
+        output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -2170,6 +2185,70 @@ fn select_security_quals<'a>(
     }
 }
 
+/// The row-security quals an `UPDATE` or `DELETE` adds to its target's scan:
+/// its own command's policies, then, when it reads the target's columns, the
+/// `SELECT` policies, as PostgreSQL's `get_row_security_policies` lists them.
+fn write_security_quals<'a>(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    slot: usize,
+    definition: &crate::storage::TableDef,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let (command, alias, condition, assignments, returning) = match statement {
+        Stmt::Update(update) => (
+            crate::storage::PolicyCommandKind::Update,
+            update.alias,
+            update.where_clause,
+            update.assignments,
+            update.returning,
+        ),
+        Stmt::Delete(delete) => (
+            crate::storage::PolicyCommandKind::Delete,
+            delete.alias,
+            delete.where_clause,
+            &[][..],
+            delete.returning,
+        ),
+        _ => return Ok(&[]),
+    };
+    let Some(role) = storage.current_role_slot(txid) else {
+        return Ok(&[]);
+    };
+    let policies = |command| {
+        query::plan_row_security(
+            storage,
+            slot,
+            role,
+            command,
+            query::RowSecurityExpression::Using,
+            txid,
+            arena,
+        )
+    };
+    let own = policies(command)?;
+    let reads = crate::sql::exec::write_target_reads(
+        definition,
+        alias,
+        condition,
+        assignments,
+        returning,
+        storage,
+        txid,
+        arena,
+    )?;
+    let select = if reads.is_empty() {
+        None
+    } else {
+        policies(crate::storage::PolicyCommandKind::Select)?
+    };
+    match query::conjoin_row_security(own, select) {
+        Some(plan) => plan.security_quals(arena),
+        None => Ok(&[]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn single_relation_quals<'a>(
     storage: &Storage,
@@ -3185,6 +3264,8 @@ fn scan_node<'a>(
         schema,
         subplan: None,
         shift: 0,
+        relations: StackStr::new(),
+        output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -3451,6 +3532,7 @@ fn plan_sublinks<'a>(
                         rows: nodes[0].rows,
                         width: nodes[0].width,
                         output: nodes[0].output,
+                        output_unprintable: nodes[0].output_unprintable,
                         ..PlanNode::EMPTY
                     },
                     _ => PlanNode {
@@ -3816,6 +3898,20 @@ fn plan_pulled_select<'a>(
     // A query of one foreign table plans what execution sends: the local
     // plan covers what the remote query leaves.
     let foreign_scan = crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena)?;
+    if let Some(pushed) = &foreign_scan
+        && pushed.upper.is_some()
+    {
+        // A query pulled up from a view or subquery has more range table
+        // entries than its one relation, so its output qualifies columns.
+        let qualified = written
+            .from
+            .as_ref()
+            .is_some_and(|from| from.base.subquery.is_some());
+        let mut plan =
+            foreign_upper_plan(storage, txid, statement, pushed, qualified, block, arena)?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     let statement = match &foreign_scan {
         Some(pushed) => pushed.local_statement(statement, arena)?,
         None => statement,
@@ -4173,8 +4269,10 @@ fn plan_pulled_select<'a>(
             ),
         )?;
     }
-    // The keys the rows leave the last window sorted by.
-    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] = &[];
+    // The keys the rows leave the last window sorted by; a foreign scan's
+    // rows arrive in the order its remote query applies.
+    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] =
+        foreign_scan.as_ref().map_or(&[], |pushed| pushed.presorted);
     // Each window clause's name, as its `WindowAgg` prints it.
     let mut window_names: &[&str] = &[];
     if has_window(statement) {
@@ -4185,6 +4283,7 @@ fn plan_pulled_select<'a>(
             scope.as_ref(),
             statement,
             columns,
+            window_sorted,
             block,
             arena,
         )?;
@@ -4343,7 +4442,10 @@ fn plan_pulled_select<'a>(
             // Without an ordering PostgreSQL hashes the distinct rows.
             PlanNode {
                 name: StackStr::from_str(
-                    if statement.order_by.is_empty() && statement.distinct_on.is_empty() {
+                    if statement.order_by.is_empty()
+                        && statement.distinct_on.is_empty()
+                        && window_sorted.is_empty()
+                    {
                         "HashAggregate"
                     } else {
                         "Unique"
@@ -4354,6 +4456,7 @@ fn plan_pulled_select<'a>(
                     statement.order_by.is_empty()
                         && statement.distinct_on.is_empty()
                         && statement.group_by.is_empty()
+                        && window_sorted.is_empty()
                 }) {
                     Some(keys) => plan_keys(
                         storage,
@@ -5005,6 +5108,7 @@ fn plan_pulled_select<'a>(
                         object_requests: scan.object_requests,
                         cache_blocks: scan.cache_blocks,
                         output: scan.output,
+                        output_unprintable: scan.output_unprintable,
                         ..PlanNode::EMPTY
                     })?;
                     scan.depth += 1;
@@ -5020,6 +5124,7 @@ fn plan_pulled_select<'a>(
                     for node in plan.nodes[..plan.count].iter_mut() {
                         if node.name.as_str() == "Limit" {
                             node.output = scan.output;
+                            node.output_unprintable = scan.output_unprintable;
                         }
                     }
                 }
@@ -5580,14 +5685,16 @@ type WindowStages<'e> = (
 /// The `WindowAgg` nodes of a query and the sorts of their inputs, bottom
 /// first, the keys the last window leaves its rows sorted by, and each
 /// window clause's name. Each window clause sorts its input unless the rows
-/// already follow its keys, incrementally when they follow a prefix of
-/// them, as PostgreSQL plans.
+/// (`presorted` on entry) already follow its keys, incrementally when they
+/// follow a prefix of them, as PostgreSQL plans.
+#[expect(clippy::too_many_arguments, reason = "the window plan's context")]
 fn window_stages<'e>(
     storage: &Storage,
     txid: u32,
     scope: Option<&QueryScope<'_>>,
     statement: &'e Select<'e>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
+    presorted: &'e [crate::sql::ast::OrderBy<'e>],
     block: BlockId,
     arena: &'e Arena,
 ) -> Result<WindowStages<'e>, SqlError> {
@@ -5606,7 +5713,7 @@ fn window_stages<'e>(
         .alloc_slice_with(windows.clauses.len() * 2, |_| PlanNode::EMPTY)
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = &[];
+    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = presorted;
     let names = arena
         .alloc_slice_with(windows.clauses.len(), |_| "")
         .map_err(|_| arena_full())?;
@@ -5722,70 +5829,6 @@ fn window_stages<'e>(
     Ok((&nodes[..count], sorted, names))
 }
 
-/// A one-row INSERT's `Result` target list: each column's value as the
-/// planner coerced it, when the row names every column without `DEFAULT`.
-fn inserted_row_output(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    insert: &crate::sql::ast::Insert<'_>,
-    arena: &Arena,
-) -> Result<StackStr<256>, SqlError> {
-    let mut output = StackStr::new();
-    let table = storage.table_def(slot, txid);
-    let [row] = insert.rows else {
-        return Ok(output);
-    };
-    if row.len() != table.n_columns
-        || !insert.columns.is_empty()
-            && insert
-                .columns
-                .iter()
-                .zip(table.columns())
-                .any(|(named, column)| *named != column.name.as_str())
-        || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
-    {
-        return Ok(output);
-    }
-    let context = crate::sql::catalog::deparse::Context {
-        storage,
-        txid,
-        arena,
-        dependencies: None,
-        table: None,
-        parameters: &[],
-        joined: &[],
-        pretty: false,
-        qualify: false,
-        domain_value: None,
-        folded: true,
-        bare: None,
-        sublinks: Some(&registered_sublink),
-    };
-    for (value, column) in row.iter().zip(table.columns()) {
-        let Some(text) = crate::sql::catalog::deparse::deparse_expression(
-            &context,
-            value,
-            crate::sql::catalog::deparse::Destination::Assignment(column.ctype.oid()),
-            arena,
-        )?
-        else {
-            return Ok(StackStr::new());
-        };
-        if !output.is_empty() {
-            let _ = output.write_str(", ");
-        }
-        let _ = output.write_str(text);
-    }
-    if output.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "EXPLAIN output column list exceeds 256 bytes"
-        ));
-    }
-    Ok(output)
-}
-
 /// The plan of a foreign UPDATE or DELETE, as postgres_fdw's: one `Foreign
 /// Update`/`Foreign Delete` node when the statement ships whole, else the
 /// command each row runs above the scan that locks the rows. `false` hands
@@ -5832,8 +5875,10 @@ fn foreign_modification<'a>(
         return Ok(false);
     }
     let exposed = alias.unwrap_or(table_name);
-    let direct = if returning.items.is_empty() {
-        crate::sql::foreign::direct_modify_sql(
+    let direct = match crate::sql::exec::foreign_direct_returned(
+        storage, txid, slot, returning, alias, arena,
+    )? {
+        Some(returned) => crate::sql::foreign::direct_modify_sql(
             storage,
             slot,
             txid,
@@ -5841,11 +5886,16 @@ fn foreign_modification<'a>(
             inheritance,
             assignments,
             predicate,
+            returned,
             arena,
-        )?
-    } else {
-        None
+        )?,
+        None => None,
     };
+    let table = storage.table_def(slot, txid);
+    let lists = targets::RelationTargets::returning_scope(
+        storage, txid, &table, exposed, returning, false, arena,
+    )?;
+    plan.nodes[0].set_output(lists.returning(returning)?);
     let scan = |name: &str| PlanNode {
         name: StackStr::from_str(name),
         relation: target_node.relation,
@@ -5864,16 +5914,20 @@ fn foreign_modification<'a>(
         plan.push(node)?;
         return Ok(true);
     }
-    let table = storage.table_def(slot, txid);
     let mut updated = crate::storage::ColumnSet::EMPTY;
     for (name, _) in assignments.unwrap_or(&[]) {
         if let Some(column) = table.column_index(name) {
             updated.insert(column);
         }
     }
-    let triggers = storage.triggers_for_table(slot, txid).next().is_some();
+    let event = if assignments.is_some() {
+        crate::sql::ast::TriggerEvents::UPDATE
+    } else {
+        crate::sql::ast::TriggerEvents::DELETE
+    };
+    let triggers = crate::sql::exec::foreign_row_trigger(storage, slot, txid, event, None);
     let returned = crate::sql::exec::foreign_modify_returned(
-        storage, txid, slot, returning, alias, false, arena,
+        storage, txid, slot, event, returning, alias, false, arena,
     )?;
     let Some(planned) = crate::sql::foreign::modify_scan(
         storage,
@@ -5894,63 +5948,11 @@ fn foreign_modification<'a>(
     node.remote_sql = remote_sql_text(planned.scan_sql)?;
     // The new values in column order, the row identity, then the old row an
     // UPDATE (or a trigger) needs.
-    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, &table)];
-    let context = crate::sql::catalog::deparse::Context {
-        storage,
-        txid,
-        arena,
-        dependencies: None,
-        table: Some(&table),
-        parameters: &[],
-        joined: &joined,
-        pretty: false,
-        qualify: false,
-        domain_value: None,
-        folded: true,
-        bare: None,
-        sublinks: Some(&registered_sublink),
-    };
-    for definition in table.columns() {
-        let Some(&(_, value)) = assignments
-            .unwrap_or(&[])
-            .iter()
-            .find(|(name, _)| *name == definition.name.as_str())
-        else {
-            continue;
-        };
-        let text = crate::sql::catalog::deparse::deparse_expression(
-            &context,
-            value,
-            crate::sql::catalog::deparse::Destination::Assignment(definition.ctype.oid()),
-            arena,
-        )?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "EXPLAIN cannot print the value assigned to column \"{}\"",
-                definition.name.as_str()
-            )
-        })?;
-        if !node.output.is_empty() {
-            let _ = node.output.write_str(", ");
-        }
-        let _ = node.output.write_str(text);
-    }
-    if !node.output.is_empty() {
-        let _ = node.output.write_str(", ");
-    }
-    let _ = node.output.write_str("ctid");
-    if assignments.is_some() || triggers {
-        let _ = node.output.write_str(", ");
-        crate::sql::catalog::write_identifier(&mut node.output, exposed);
-        let _ = node.output.write_str(".*");
-    }
-    if node.output.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "EXPLAIN output column list exceeds 256 bytes"
-        ));
-    }
+    node.set_output(lists.modified_row(
+        assignments.unwrap_or(&[]),
+        alias,
+        assignments.is_some() || triggers,
+    )?);
     let (_, filter) = single_relation_quals(
         storage,
         txid,
@@ -5965,6 +5967,76 @@ fn foreign_modification<'a>(
     node = node.with_qual(QualLabel::Filter, filter);
     plan.push(node)?;
     Ok(true)
+}
+
+/// The plan of a query whose grouping postgres_fdw ships: the `Foreign
+/// Scan` of the grouped relation (`Aggregate on (...)`) under the `Limit`
+/// the remote query leaves. Its output reads each select-list expression
+/// from the remote target list, which prints it in parentheses.
+fn foreign_upper_plan<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    pushed: &crate::sql::foreign::deparse::ForeignSelectPlan<'_>,
+    qualified: bool,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let table = storage.table_def(pushed.table_slot, txid);
+    let base = &statement
+        .from
+        .as_ref()
+        .expect("a pushed scan reads a FROM item")
+        .base;
+    let exposed = base.alias.unwrap_or(base.table);
+    let upper = pushed
+        .upper
+        .as_ref()
+        .expect("a grouped plan has its relation");
+    let output = targets::RelationTargets::new(storage, txid, &table, exposed, qualified, arena)?
+        .foreign_upper(statement, upper.resjunk)?;
+    let mut relations = StackStr::<256>::new();
+    let _ = relations.write_str("Aggregate on (");
+    crate::sql::catalog::write_identifier(&mut relations, table.schema.as_str());
+    let _ = relations.write_char('.');
+    crate::sql::catalog::write_identifier(&mut relations, table.name.as_str());
+    if exposed != table.name.as_str() {
+        let _ = relations.write_char(' ');
+        crate::sql::catalog::write_identifier(&mut relations, exposed);
+    }
+    let _ = relations.write_char(')');
+    if relations.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN relation list exceeds 256 bytes"
+        ));
+    }
+    let limited = !pushed.limit_pushed && (statement.limit.is_some() || statement.offset.is_some());
+    let mut plan = Plan::new(arena, 2)?;
+    if limited {
+        let mut limit = PlanNode {
+            name: StackStr::from_str("Limit"),
+            key: Some(NodeKey::new(block, Role::Limit)),
+            total_cost: 100.0,
+            rows: 1,
+            ..PlanNode::EMPTY
+        };
+        limit.set_output(output);
+        plan.push(limit)?;
+    }
+    let mut scan = PlanNode {
+        name: StackStr::from_str("Foreign Scan"),
+        key: Some(NodeKey::new(block, Role::Scan(0))),
+        depth: u8::from(limited),
+        total_cost: 100.0,
+        rows: 1,
+        relations,
+        remote_sql: remote_sql_text(pushed.sql)?,
+        ..PlanNode::EMPTY
+    };
+    scan.set_output(output);
+    plan.push(scan)?;
+    Ok(plan)
 }
 
 /// postgres_fdw's `Foreign Scan` of a query's one foreign table: its output
@@ -5983,86 +6055,10 @@ fn foreign_scan_node(
     scan.name = StackStr::from_str("Foreign Scan");
     scan.remote_sql = remote_sql_text(pushed.sql)?;
     let table = storage.table_def(pushed.table_slot, txid);
-    let exposed = scope.names[0];
-    // The scan's target list: each output expression as `VERBOSE` prints a
-    // single relation's, which the described column names approximate only
-    // for bare columns.
-    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, &table)];
-    let context = crate::sql::catalog::deparse::Context {
-        storage,
-        txid,
-        arena,
-        dependencies: None,
-        table: Some(&table),
-        parameters: &[],
-        joined: &joined,
-        pretty: false,
-        qualify: false,
-        domain_value: None,
-        folded: true,
-        bare: None,
-        sublinks: Some(&registered_sublink),
-    };
-    let mut output = targets::Output::new();
-    for item in statement.items.iter().filter(|_| !aggregate) {
-        match item {
-            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
-                for column in table.columns() {
-                    if !output.is_empty() {
-                        let _ = output.write_str(", ");
-                    }
-                    crate::sql::catalog::write_identifier(&mut output, column.name.as_str());
-                }
-            }
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                let Some(text) = crate::sql::catalog::deparse::deparse_expression(
-                    &context,
-                    expression,
-                    crate::sql::catalog::deparse::Destination::Value,
-                    arena,
-                )?
-                else {
-                    output = scan.output;
-                    break;
-                };
-                if !output.is_empty() {
-                    let _ = output.write_str(", ");
-                }
-                let _ = output.write_str(text);
-            }
-        }
-    }
-    scan.output = output;
-    for &column in pushed.sort_columns {
-        let name = table.columns()[column].name.as_str();
-        let projected = statement.items.iter().any(|item| match item {
-            SelectItem::Wildcard(_) => true,
-            SelectItem::TableWildcard(qualifier) => *qualifier == exposed,
-            SelectItem::Expr {
-                expression:
-                    Expr::Column {
-                        qualifier,
-                        name: projected,
-                    },
-                ..
-            } => *projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed),
-            _ => false,
-        });
-        if !projected {
-            if !scan.output.is_empty() {
-                let _ = scan.output.write_str(", ");
-            }
-            crate::sql::catalog::write_identifier(&mut scan.output, name);
-        }
-    }
-    // `ROW_MARK_COPY` keeps the whole row of a locked foreign table.
-    if !statement.locking.is_empty() {
-        if !scan.output.is_empty() {
-            let _ = scan.output.write_str(", ");
-        }
-        crate::sql::catalog::write_identifier(&mut scan.output, exposed);
-        let _ = scan.output.write_str(".*");
-    }
+    scan.set_output(
+        targets::RelationTargets::new(storage, txid, &table, scope.names[0], false, arena)?
+            .foreign_scan(statement, pushed.sort_keys, aggregate)?,
+    );
     Ok(())
 }
 
@@ -6604,6 +6600,8 @@ fn physical_scan_node(
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
         subplan: None,
         shift: 0,
+        relations: StackStr::new(),
+        output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -6767,6 +6765,8 @@ fn push_set_tree(
                 schema: StackStr::new(),
                 subplan: None,
                 shift: 0,
+                relations: StackStr::new(),
+                output_unprintable: left.output_unprintable,
                 remote_sql: StackStr::new(),
                 batch_size: None,
                 passthrough: false,
@@ -6777,6 +6777,7 @@ fn push_set_tree(
                 input.rows = left.rows.saturating_add(right.rows);
                 input.width = node.width;
                 input.output = node.output;
+                input.output_unprintable = node.output_unprintable;
                 input.total_cost = left.total_cost + right.total_cost;
             }
             Ok(node)
@@ -7216,6 +7217,8 @@ pub(super) fn plan_modification<'a>(
             .unwrap_or_default(),
         subplan: None,
         shift: 0,
+        relations: StackStr::new(),
+        output_unprintable: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -7511,10 +7514,18 @@ pub(super) fn plan_modification<'a>(
                 arena,
             )?;
         }
+        // A joined write's lists qualify each relation's columns, which
+        // this plan does not model.
+        plan.nodes[0].set_output(None);
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
     let child = if let (Some(select), Stmt::Insert(insert)) = (source, statement) {
+        // Its `RETURNING` list over a range table of the target and the
+        // source is not modelled.
+        if !insert.returning.is_empty() {
+            plan.nodes[0].set_output(None);
+        }
         // The source query's range table entries join the INSERT's.
         let source_plan = in_nested_block(|| {
             rewrite::insert_source_plan(storage, txid, insert, select, block, arena)
@@ -7541,9 +7552,10 @@ pub(super) fn plan_modification<'a>(
         statement,
         relation_slot(storage, txid, target.schema, target.name),
     ) {
-        // An INSERT into a view its INSTEAD OF trigger handles reads its rows.
+        // An INSERT into a view its INSTEAD OF trigger handles reads its rows,
+        // whose list over the view's columns is not modelled.
         let several = insert.rows.len() > 1;
-        let child = PlanNode {
+        let mut child = PlanNode {
             name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
             alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
             key: Some(NodeKey::new(block, Role::Values)),
@@ -7553,21 +7565,28 @@ pub(super) fn plan_modification<'a>(
             total_cost: 0.01,
             ..PlanNode::EMPTY
         };
+        child.set_output(None);
         plan.push(child)?;
         child
     } else if let Some(slot) = relation_slot(storage, txid, target.schema, target.name) {
         let child = if let Stmt::Insert(insert) = statement {
             // Several rows are scanned from their VALUES list.
             let several = insert.rows.len() > 1;
-            PlanNode {
+            let definition = storage.table_def(slot, txid);
+            let lists = targets::RelationTargets::returning_scope(
+                storage,
+                txid,
+                &definition,
+                insert.alias.unwrap_or(target.name),
+                insert.returning,
+                true,
+                arena,
+            )?;
+            plan.nodes[0].set_output(lists.returning(insert.returning)?);
+            let mut values = PlanNode {
                 name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
                 alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
                 key: Some(NodeKey::new(block, Role::Values)),
-                output: if several {
-                    StackStr::new()
-                } else {
-                    widened(inserted_row_output(storage, txid, slot, insert, arena)?)
-                },
                 depth: 1,
                 rows: match statement {
                     Stmt::Insert(insert) => insert.rows.len() as u64,
@@ -7579,7 +7598,13 @@ pub(super) fn plan_modification<'a>(
                     .max(1),
                 total_cost: 0.01,
                 ..PlanNode::EMPTY
-            }
+            };
+            values.set_output(if several {
+                lists.values_scan(insert.columns, insert.rows)?
+            } else {
+                lists.inserted_row(insert.columns, insert.rows[0])?
+            });
+            values
         } else if !joined && predicate.is_some_and(|predicate| qual_false(predicate, arena)) {
             // A condition the planner folds to false leaves no row to
             // change: the write reads a `Result` that returns none.
@@ -7627,13 +7652,15 @@ pub(super) fn plan_modification<'a>(
             scan.alias = target_node.alias;
             scan.key = Some(NodeKey::new(block, Role::Scan(0)));
             let definition = storage.table_def(slot, txid);
+            let security =
+                write_security_quals(storage, statement, slot, &definition, txid, arena)?;
             let (index_cond, filter) = single_relation_quals(
                 storage,
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 false,
                 arena,
@@ -7644,21 +7671,15 @@ pub(super) fn plan_modification<'a>(
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 true,
                 arena,
             )?;
-            let (returned, read) = modification_outputs(
-                storage,
-                txid,
-                statement,
-                &definition,
-                alias.unwrap_or(target.name),
-                arena,
-            )?;
-            plan.nodes[0].output = returned;
-            scan.output = read;
+            let (returned, read) =
+                modification_outputs(storage, txid, statement, &definition, slot, alias, arena)?;
+            plan.nodes[0].set_output(returned);
+            scan.set_output(read);
             scan.with_qual(QualLabel::IndexCond, index_cond)
                 .with_qual(QualLabel::Filter, filter)
                 .with_verbose_qual(QualLabel::IndexCond, verbose_index_cond)
@@ -7686,113 +7707,43 @@ pub(super) fn plan_modification<'a>(
     Ok(plan)
 }
 
-/// The target lists `VERBOSE` prints for a one-table `UPDATE` or `DELETE`:
-/// the `RETURNING` list on the write's node, and on its scan the new values
-/// of the assigned columns in column order (`rewriteTargetListIU`) followed
-/// by the row identity `ctid`. Lists outside the deparser's coverage are
-/// left out.
+/// The target lists `VERBOSE` prints for a one-table write: the
+/// `RETURNING` list on the write's node, and on an `UPDATE` or `DELETE`
+/// scan the new values of the assigned columns in column order
+/// (`rewriteTargetListIU`) followed by the row identity `ctid`. `None` for
+/// a list outside the deparser's coverage, as are `MERGE`'s and those of a
+/// table with descendants, whose children PostgreSQL scans each.
 fn modification_outputs(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
     definition: &crate::storage::TableDef,
-    exposed: &str,
+    slot: usize,
+    alias: Option<&str>,
     arena: &Arena,
-) -> Result<(targets::Output, targets::Output), SqlError> {
-    let (assignments, returning): (&[(&str, &Expr<'_>)], &[SelectItem<'_>]) = match statement {
-        Stmt::Update(update) => (update.assignments, update.returning.items),
-        Stmt::Delete(delete) => (&[], delete.returning.items),
-        _ => return Ok((targets::Output::new(), targets::Output::new())),
+) -> Result<(Option<targets::Output>, Option<targets::Output>), SqlError> {
+    let (assignments, returning): (&[(&str, &Expr<'_>)], _) = match statement {
+        Stmt::Update(update) => (update.assignments, update.returning),
+        Stmt::Delete(delete) => (&[], delete.returning),
+        _ => return Ok((None, None)),
     };
-    let joined = [crate::sql::catalog::deparse::Joined::new(
-        exposed, definition,
-    )];
-    let context = crate::sql::catalog::deparse::Context {
-        storage,
-        txid,
-        table: None,
-        parameters: &[],
-        joined: &joined,
-        pretty: false,
-        qualify: false,
-        bare: None,
-        domain_value: None,
-        sublinks: Some(&registered_sublink),
-        folded: true,
-        arena,
-        dependencies: None,
-    };
-    let mark = arena.mark();
-    let result = (|| -> Result<(targets::Output, targets::Output), SqlError> {
-        let deparse =
-            |expression: &Expr<'_>, into: &mut targets::Output| -> Result<bool, SqlError> {
-                let Some(text) = crate::sql::catalog::deparse::deparse_expression(
-                    &context,
-                    expression,
-                    crate::sql::catalog::deparse::Destination::Value,
-                    arena,
-                )?
-                else {
-                    return Ok(false);
-                };
-                if !into.is_empty() {
-                    let _ = into.write_str(", ");
-                }
-                let _ = into.write_str(text);
-                Ok(true)
-            };
-        let mut returned = targets::Output::new();
-        for item in returning {
-            let written = match item {
-                SelectItem::Wildcard(_) => {
-                    for column in definition.columns() {
-                        if !returned.is_empty() {
-                            let _ = returned.write_str(", ");
-                        }
-                        crate::sql::catalog::write_identifier(&mut returned, column.name.as_str());
-                    }
-                    true
-                }
-                SelectItem::Expr { expression, .. } => deparse(expression, &mut returned)?,
-                SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => false,
-            };
-            if !written {
-                returned = targets::Output::new();
-                break;
-            }
-        }
-        let mut read = targets::Output::new();
-        for column in 0..definition.columns().len() {
-            let name = definition.columns()[column].name.as_str();
-            if let Some((_, value)) = assignments.iter().find(|(target, _)| *target == name)
-                && !deparse(value, &mut read)?
-            {
-                return Ok((returned, targets::Output::new()));
-            }
-        }
-        if assignments
-            .iter()
-            .any(|(target, _)| definition.column_index(target).is_none())
-        {
-            return Ok((returned, targets::Output::new()));
-        }
-        if !read.is_empty() {
-            let _ = read.write_str(", ");
-        }
-        let _ = read.write_str("ctid");
-        Ok((returned, read))
-    })();
-    // SAFETY: the texts were copied out of the arena.
-    unsafe { arena.rewind_to(mark) };
-    let (returned, read) = result?;
-    if returned.is_truncated() || read.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "EXPLAIN output column list exceeds {} bytes",
-            targets::OUTPUT_BYTES
-        ));
+    if storage.relation_has_descendants(slot, txid) {
+        return Ok((None, None));
     }
-    Ok((returned, read))
+    let exposed = alias.unwrap_or(definition.name.as_str());
+    let mark = arena.mark();
+    let result = (|| {
+        let lists = targets::RelationTargets::returning_scope(
+            storage, txid, definition, exposed, returning, false, arena,
+        )?;
+        Ok((
+            lists.returning(returning)?,
+            lists.modified_row(assignments, alias, false)?,
+        ))
+    })();
+    // SAFETY: the lists were copied out of the arena.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// The column a node's property lines (`Filter:`, `Output:`) start at: two
@@ -8039,6 +7990,14 @@ pub(super) fn visit_text_rows<E>(
                 "Storage: Memory  Maximum Storage: {}kB",
                 bytes.div_ceil(1024)
             );
+            emit(line.as_str())?;
+        }
+        if !node.relations.is_empty() {
+            let mut line = StackStr::<512>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Relations: {}", node.relations.as_str());
             emit(line.as_str())?;
         }
         if options.verbose && !node.remote_sql.is_empty() {
@@ -8882,6 +8841,9 @@ fn structured_node(
         document.text("Storage", "Memory");
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
+    if !node.relations.is_empty() {
+        document.text("Relations", node.relations.as_str());
+    }
     if options.verbose && !node.remote_sql.is_empty() {
         document.text("Remote SQL", node.remote_sql.as_str());
     }
@@ -9018,6 +8980,36 @@ fn render_document<'a>(
     document.finish()
 }
 
+/// Rejects a `VERBOSE` plan holding a target list outside the deparser's
+/// coverage rather than print a wrong `Output:`.
+fn verbose_printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+    if !options.verbose {
+        return Ok(());
+    }
+    match plan.nodes[..plan.count]
+        .iter()
+        .find(|node| node.output_unprintable)
+    {
+        Some(node) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN VERBOSE cannot print the output list of node \"{}\"",
+            node.name.as_str()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// [`verbose_printable`] for each query a rule produces.
+fn rewritten_printable(
+    queries: &[RewrittenQuery<'_>],
+    options: ExplainOptions,
+) -> Result<(), SqlError> {
+    queries.iter().try_for_each(|query| match query {
+        RewrittenQuery::Planned(plan) => verbose_printable(plan, options),
+        RewrittenQuery::Notify => Ok(()),
+    })
+}
+
 pub(super) fn visit_plan_rows(
     plan: &Plan<'_>,
     options: ExplainOptions,
@@ -9026,6 +9018,7 @@ pub(super) fn visit_plan_rows(
     arena: &Arena,
     mut emit: impl FnMut(&str) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    verbose_printable(plan, options)?;
     if options.format == ExplainFormat::Text {
         return visit_text_rows(plan, options, actual, settings, |line| emit(line));
     }
@@ -9164,6 +9157,9 @@ pub(super) fn emit_rewritten(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
+    if let Err(error) = rewritten_printable(queries, options) {
+        return Ok(Err(error));
+    }
     responder.row_description(&[result_column(options.format)])?;
     if let Err(error) = visit_rewritten_rows(queries, options, actual, settings, arena, |line| {
         responder.data_row(&[Datum::Text(line)])
@@ -9183,6 +9179,9 @@ pub(super) fn visit_rewritten_rows<E>(
     arena: &Arena,
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<Result<(), SqlError>, E> {
+    if let Err(error) = rewritten_printable(queries, options) {
+        return Ok(Err(error));
+    }
     let last = queries.len().saturating_sub(1);
     let query_actual = |index: usize| {
         actual.map(|actual| {
@@ -9252,6 +9251,9 @@ pub(super) fn emit_plan(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
+    if let Err(error) = verbose_printable(plan, options) {
+        return Ok(Err(error));
+    }
     if options.format == ExplainFormat::Text {
         emit_text(plan, options, actual, settings, responder)?;
         return Ok(Ok(()));
@@ -9266,7 +9268,11 @@ pub(super) fn emit_plan(
     Ok(Ok(()))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::{PlanNode, object_request_cost, structured_node_name};
     use crate::store::BlockIoStats;

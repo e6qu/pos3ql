@@ -176,7 +176,7 @@ pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod control_identity_tests;
 
 /// A PostgreSQL SQLSTATE that has already passed the protocol's five-byte
@@ -415,12 +415,45 @@ pub struct EvalMessage {
     pub sqlstate: SqlState,
     pub message: StackStr<MAX_EVAL_MESSAGE_BYTES>,
     pub detail: Option<&'static str>,
+    /// The one-based character position in the client's statement of the
+    /// literal whose input function raised the message.
+    pub position: Option<usize>,
 }
 
 struct PendingEvalMessages {
     messages: [Option<EvalMessage>; MAX_PENDING_EVAL_MESSAGES],
     head: usize,
     len: usize,
+}
+
+std::thread_local! {
+    static INPUT_SUBJECT: core::cell::Cell<Option<(*const u8, usize)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Runs `convert`, the input function of the statement's literal `subject`,
+/// so the notices and warnings it raises point at the literal, as
+/// PostgreSQL's parser position callback positions them.
+pub(crate) fn with_input_subject<R>(subject: &str, convert: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(*const u8, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INPUT_SUBJECT.with(|subject| subject.set(self.0));
+        }
+    }
+    let _restore = Restore(
+        INPUT_SUBJECT.with(|active| active.replace(Some((subject.as_ptr(), subject.len())))),
+    );
+    convert()
+}
+
+fn input_subject_position() -> Option<usize> {
+    let (start, length) = INPUT_SUBJECT.with(core::cell::Cell::get)?;
+    // SAFETY: `with_input_subject` borrows the subject until it restores
+    // the previous one, and this runs within that call.
+    let subject =
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(start, length)) };
+    crate::sql::error_position::client_position(subject)
 }
 
 std::thread_local! {
@@ -482,6 +515,7 @@ fn queue_eval_message(
             sqlstate: SqlState::from(sqlstate),
             message: text,
             detail,
+            position: input_subject_position(),
         });
         pending.len += 1;
         Ok(())
@@ -3328,6 +3362,31 @@ pub trait CatalogAccess {
             "partition ancestry requires catalog access"
         ))
     }
+    /// `satisfies_hash_partition` over evaluated key values of `types`.
+    fn satisfies_hash_partition(
+        &self,
+        _oid: i32,
+        _modulus: i32,
+        _remainder: i32,
+        _types: &[i32],
+        _values: &[Datum<'_>],
+    ) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "satisfies_hash_partition requires catalog access"
+        ))
+    }
+    /// A partition's implicit constraint, as `pg_get_partition_constraintdef`.
+    fn partition_constraint_def<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "partition constraints require catalog access"
+        ))
+    }
     /// The executable `RANGE|LIST|HASH (...)` clause for a partitioned table.
     fn partition_key_def<'a>(
         &self,
@@ -5720,16 +5779,29 @@ fn eval_binary_expression<'a>(
         }
         return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
     }
-    Ok(eval_binary_values(
-        expression,
-        left,
-        right,
-        comparison_collation,
-        arena,
-        row,
-        hooks,
-    )?
-    .value)
+    let (left_operand, right_operand) = (expression.left, expression.right);
+    let evaluate = || {
+        eval_binary_values(
+            expression,
+            left,
+            right,
+            comparison_collation,
+            arena,
+            row,
+            hooks,
+        )
+    };
+    // An untyped literal operand converts to the other operand's type, whose
+    // input function runs on the literal.
+    let value = match (left_operand, right_operand) {
+        (Expr::Str(literal), other) | (other, Expr::Str(literal))
+            if !matches!(other, Expr::Str(_)) =>
+        {
+            with_input_subject(literal, evaluate)?
+        }
+        _ => evaluate()?,
+    };
+    Ok(value.value)
 }
 
 /// PostgreSQL checks `EXECUTE` on the function behind every built-in
@@ -8141,7 +8213,10 @@ fn eval_full_inner<'a>(
                 )
                 .error());
             }
-            let v = cast(v, type_name, arena)?;
+            let v = match operand {
+                Expr::Str(subject) => with_input_subject(subject, || cast(v, type_name, arena))?,
+                _ => cast(v, type_name, arena)?,
+            };
             let v = if let Some(target) = ColType::from_sql_name(type_name)
                 && matches!(target, ColType::AclItem | ColType::Array(ArrElem::AclItem))
                 && !v.is_null()
@@ -11990,6 +12065,53 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
+        "satisfies_hash_partition" => {
+            if args.len() < 4 || args.len() > 3 + crate::storage::MAX_PARTITION_KEYS {
+                return undefined_function(written_name, args, row, hooks);
+            }
+            let mut fixed = [Datum::Null; 3];
+            for (value, argument) in fixed.iter_mut().zip(args) {
+                *value = eval_full(argument, arena, params, row, hooks)?;
+            }
+            if fixed.iter().any(Datum::is_null) {
+                return Ok(Datum::Bool(false));
+            }
+            let parent = match cast_to(fixed[0], ColType::Oid, arena)? {
+                Datum::Oid(parent) => parent as i32,
+                _ => unreachable!("validated oid conversion"),
+            };
+            let integer = |value: Datum<'_>| match cast_to(value, ColType::Int4, arena)? {
+                Datum::Int4(value) => Ok(value),
+                _ => unreachable!("validated int4 conversion"),
+            };
+            let (modulus, remainder) = (integer(fixed[1])?, integer(fixed[2])?);
+            let keys = &args[3..];
+            let mut types = [0i32; crate::storage::MAX_PARTITION_KEYS];
+            let mut values = [Datum::Null; crate::storage::MAX_PARTITION_KEYS];
+            let columns = RuntimeColumnTypes {
+                row,
+                catalog: hooks.catalog,
+            };
+            for (index, argument) in keys.iter().enumerate() {
+                types[index] = crate::sql::exec::infer_routine_argument_oid(argument, &columns)?;
+                values[index] = eval_full(argument, arena, params, row, hooks)?;
+            }
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "satisfies_hash_partition requires catalog access"
+                )
+            })?;
+            catalog
+                .satisfies_hash_partition(
+                    parent,
+                    modulus,
+                    remainder,
+                    &types[..keys.len()],
+                    &values[..keys.len()],
+                )
+                .map(Datum::Bool)
+        }
         "pg_get_sequence_data" => {
             arity(1)?;
             let Some(oid) = sequence_data_oid(eval_full(args[0], arena, params, row, hooks)?)?
@@ -15194,7 +15316,11 @@ pub(crate) fn arena_full() -> SqlError {
     )
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

@@ -764,7 +764,7 @@ impl From<RowHome> for RowByteRead {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

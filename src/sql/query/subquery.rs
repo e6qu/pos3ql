@@ -4720,18 +4720,23 @@ fn run_subquery<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    // `ExecLimit` evaluates its bounds before reading its input, and an
-    // unsorted input stops once the rows the limit returns are read.
-    let offset =
-        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
-    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
-    let wanted = (n_keys == 0).then(|| (offset as u64).saturating_add(limit));
+    // Without ORDER BY, LIMIT ends the scan once its rows are read, as
+    // PostgreSQL's Limit stops pulling from the plan below it.
+    let stop_after = if select.order_by.is_empty() && select.limit.is_some() {
+        let offset =
+            crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
+        Some(offset.saturating_add(limit))
+    } else {
+        None
+    };
     let stages = super::instrument::Stages::current();
     let _limit_loop = stages.limit.start();
     let _sort_loop = (n_keys > 0).then(|| stages.sort.start());
     let mut vals = ArenaList::new(arena);
     let mut keys = ArenaList::new(arena);
-    if wanted != Some(0) {
+    // `LIMIT 0` reads no row.
+    if stop_after != Some(0) {
         scan_source_with_pax_columns(
             storage,
             &scope,
@@ -4755,7 +4760,7 @@ fn run_subquery<'a>(
                     };
                     keys.push(key).map_err(|_| arena_full())?;
                 }
-                Ok(wanted.is_none_or(|wanted| (vals.len() as u64) < wanted))
+                Ok(stop_after.is_none_or(|stop| (vals.len() as u64) < stop))
             },
         )?;
     }
@@ -4798,6 +4803,9 @@ fn run_subquery<'a>(
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
+    let offset =
+        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
     if n_keys > 0 {

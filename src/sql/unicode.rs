@@ -451,7 +451,11 @@ pub(crate) fn unistr<'a>(input: &str, arena: &'a Arena) -> Result<&'a str, SqlEr
     Ok(unsafe { core::str::from_utf8_unchecked(&output[..target]) })
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

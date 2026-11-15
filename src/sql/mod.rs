@@ -23653,7 +23653,7 @@ impl Engine {
                             if custom_plan {
                                 eval::with_custom_plan_parameters(prepared_params, plan)
                             } else {
-                                plan()
+                                eval::with_generic_plan_parameters(prepared_params, plan)
                             }
                         });
                         match plan {

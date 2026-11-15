@@ -7697,132 +7697,6 @@ fn scan_source_mode<'a>(
         }
     }
 
-    fn exact_partition_leaf<'a>(
-        storage: &Storage,
-        scope: &QueryScope<'a>,
-        source: usize,
-        predicate: Option<&'a Expr<'a>>,
-        arena: &'a Arena,
-        params: &[Datum<'a>],
-        hooks: &EvalHooks<'_, 'a>,
-        txid: u32,
-    ) -> Result<Option<usize>, SqlError> {
-        let root = scope.slots[source];
-        if !storage.table_def(root, txid).partition.is_partitioned() {
-            return Ok(None);
-        }
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        let mut known = [false; MAX_COLUMNS];
-        fn collect<'a>(
-            expression: &'a Expr<'a>,
-            storage: &Storage,
-            scope: &QueryScope<'a>,
-            source: usize,
-            arena: &'a Arena,
-            params: &[Datum<'a>],
-            hooks: &EvalHooks<'_, 'a>,
-            txid: u32,
-            values: &mut [Datum<'a>; MAX_COLUMNS],
-            known: &mut [bool; MAX_COLUMNS],
-        ) -> Result<(), SqlError> {
-            if let Expr::Binary {
-                operator: BinaryOp::And,
-                left,
-                right,
-                ..
-            } = expression
-            {
-                collect(
-                    left, storage, scope, source, arena, params, hooks, txid, values, known,
-                )?;
-                return collect(
-                    right, storage, scope, source, arena, params, hooks, txid, values, known,
-                );
-            }
-            let Expr::Binary {
-                operator: BinaryOp::Eq,
-                left,
-                right,
-                ..
-            } = expression
-            else {
-                return Ok(());
-            };
-            let mut bind = |column: &'a Expr<'a>,
-                            constant: &'a Expr<'a>|
-             -> Result<bool, SqlError> {
-                let Expr::Column { qualifier, name } = column else {
-                    return Ok(false);
-                };
-                if !constant.is_constant(false) || constant.contains_call() {
-                    return Ok(false);
-                }
-                let Ok(ResolvedColumn::Table(table, index)) = scope.find_column(*qualifier, name)
-                else {
-                    return Ok(false);
-                };
-                if table != source {
-                    return Ok(false);
-                }
-                let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
-                values[index] = crate::sql::exec::coerce(
-                    raw,
-                    &storage.table_def(scope.slots[source], txid).columns[index],
-                    storage,
-                    txid,
-                    arena,
-                    hooks.sequences,
-                )?;
-                known[index] = true;
-                Ok(true)
-            };
-            if !bind(left, right)? {
-                let _ = bind(right, left)?;
-            }
-            Ok(())
-        }
-        if let Some(predicate) = predicate {
-            collect(
-                predicate,
-                storage,
-                scope,
-                source,
-                arena,
-                params,
-                hooks,
-                txid,
-                &mut values,
-                &mut known,
-            )?;
-        }
-        let definition = scope
-            .defs
-            .stored(source)
-            .expect("physical source has a definition");
-        let row = crate::storage::PartitionRow::new(definition, &values[..definition.n_columns])?;
-        let mut current = root;
-        loop {
-            let Some(scheme) = storage.table_def(current, txid).partition.scheme else {
-                return (current != root)
-                    .then_some(current)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "partition pruning lost its root scheme"
-                        )
-                    })
-                    .map(Some);
-            };
-            let keys = row.keys(&storage.table_def(current, txid), scheme)?;
-            if !keys.all_known(&known) {
-                return Ok(None);
-            }
-            current = match storage.partition_child_target(current, keys, txid) {
-                Ok(child) => child,
-                Err(_) => return Ok(None),
-            };
-        }
-    }
     // Assemble a JoinRow from the currently bound row bytes. Physical rows
     // are heap-encoded (fixed schema); derived rows are self-describing.
     fn assemble<'s, 'v, 'd>(
@@ -9372,20 +9246,36 @@ fn scan_source_mode<'a>(
             if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
                 && storage.relation_has_descendants(slot, txid)
             {
-                let leaves = if let Some(leaf) = exact_partition_leaf(
-                    storage,
-                    scope,
-                    order[depth],
+                // The members executor pruning keeps, with every value this
+                // scan knows, as the plan's members name them.
+                let table = order[depth];
+                let conditions = super::partition_prune::scan_conditions(
+                    from,
                     where_clause,
+                    table,
+                    arena,
+                )?;
+                let values = super::partition_prune::ScanValues {
+                    storage,
+                    txid,
+                    relation: super::partition_prune::ScanRelation::From { scope, table },
                     arena,
                     params,
                     hooks,
-                    txid,
-                )? {
-                    &*arena.alloc_slice_copy(&[leaf]).map_err(|_| arena_full())?
-                } else {
-                    crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?
                 };
+                let leaves = super::partition_prune::members(
+                    storage,
+                    txid,
+                    slot,
+                    conditions,
+                    &values,
+                    super::partition_prune::PruneStage::Scan,
+                    arena,
+                )?
+                .leaves;
+                let append = instrument::node(instrument::Role::Scan(
+                    u16::try_from(table).unwrap_or(u16::MAX),
+                ));
                 let mut index = 0usize;
                 let mut aborted = false;
                 let definitions = storage.table_definition_images();
@@ -9394,6 +9284,14 @@ fn scan_source_mode<'a>(
                     .stored(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in leaves {
+                    // Each member's scan counts its share of the `Append`'s
+                    // rows while it runs.
+                    let member = instrument::node(instrument::Role::Member(
+                        u16::try_from(table).unwrap_or(u16::MAX),
+                        u32::try_from(leaf).unwrap_or(u32::MAX),
+                    ));
+                    let _member_loop = member.start();
+                    let _member_counts = MemberCounts::new(append, member);
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let foreign = physical.kind == crate::storage::TableKind::Foreign;
                     // PostgreSQL keeps no scan statistics for foreign tables.
@@ -10458,4 +10356,35 @@ fn scan_source_mode<'a>(
         }
     }
     Ok(())
+}
+
+/// Moves the rows an `Append` counts while one member's scan runs to that
+/// member's node, when it is dropped at the scan's end.
+struct MemberCounts {
+    append: instrument::Node,
+    member: instrument::Node,
+    before: (u64, u64),
+}
+
+impl MemberCounts {
+    fn new(append: instrument::Node, member: instrument::Node) -> Self {
+        Self {
+            append,
+            member,
+            before: append.counted(),
+        }
+    }
+}
+
+impl Drop for MemberCounts {
+    fn drop(&mut self) {
+        if !self.member.measured() {
+            return;
+        }
+        let (rows, filtered) = self.append.counted();
+        self.member.add_counted(
+            rows.saturating_sub(self.before.0),
+            filtered.saturating_sub(self.before.1),
+        );
+    }
 }

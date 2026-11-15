@@ -103590,6 +103590,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
         let layout = retained_rows.layout(table)?;
         crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0))
             .checkpoint();
+        target_member(table).checkpoint();
         let qualified = conditions.qualify(
             storage,
             txn.txid,
@@ -103605,8 +103606,10 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
         if qualified.is_some() {
             scan.row();
+            target_member(table).row();
         } else {
             scan.filtered();
+            target_member(table).filtered();
         }
         let Some(joined) = qualified else {
             retained_rows.set_current_joined(row, None);
@@ -103623,6 +103626,59 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             arena,
         )
     }
+}
+
+/// The `EXPLAIN ANALYZE` node of the scan of a write target's member `leaf`.
+fn target_member(leaf: usize) -> crate::sql::query::instrument::Node {
+    crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Member(
+        0,
+        u32::try_from(leaf).unwrap_or(u32::MAX),
+    ))
+}
+
+/// The leaves a one-table `UPDATE` or `DELETE` reads: the members of its
+/// partitioned or inheritance target that pruning and constraint exclusion
+/// keep under its `WHERE`, with every value its execution knows.
+#[allow(clippy::too_many_arguments)]
+fn dml_pruned_leaves<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    use crate::sql::query::partition_prune;
+    if inheritance == crate::sql::ast::RelationInheritance::Only
+        || !partition_prune::expands(storage, table_index, txid)
+    {
+        return dml_leaf_slots_for(storage, table_index, inheritance, txid, arena);
+    }
+    let values = partition_prune::ScanValues {
+        storage,
+        txid,
+        relation: partition_prune::ScanRelation::Target {
+            columns: def.columns(),
+            name: alias.unwrap_or(def.name.as_str()),
+        },
+        arena,
+        params,
+        hooks,
+    };
+    Ok(partition_prune::members(
+        storage,
+        txid,
+        table_index,
+        partition_prune::conjuncts(where_clause, arena)?,
+        &values,
+        partition_prune::PruneStage::Scan,
+        arena,
+    )?
+    .leaves)
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
@@ -103679,7 +103735,26 @@ pub(super) fn collect_matches<'a>(
     let index_order = indexed.is_some()
         || (def.kind != crate::storage::TableKind::Foreign
             && super::query::dml_condition_reaches_index(storage, &def, alias, txid, where_clause));
-    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+    // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
+    // visible row it matched or its filter removed, and each member's share
+    // when the target is a partitioned table or inheritance tree.
+    let scan = crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
+    let _scan = scan.start();
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        &def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        txid,
+        arena,
+    )?;
+    for &leaf in leaves {
+        let member = target_member(leaf);
+        let _member = member.start();
         // Each leaf's rows follow its own order; leaves keep theirs.
         let leaf_start = scratch.len();
         let physical = (*storage.table_def(leaf, txid)).clone();
@@ -103732,11 +103807,6 @@ pub(super) fn collect_matches<'a>(
         }
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        // The write's scan of its target, as EXPLAIN ANALYZE counts it:
-        // each visible row it matched or its filter removed.
-        let scan =
-            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
-        let _scan = scan.start();
         let mut visit = |rowid, loc: crate::storage::VisibleRowHome| {
             storage.record_relation_tuple_read(
                 txid,
@@ -103777,9 +103847,11 @@ pub(super) fn collect_matches<'a>(
                 // A candidate counts when the change loop qualifies it.
                 if selection == DmlSelection::Qualified {
                     scan.row();
+                    member.row();
                 }
             } else {
                 scan.filtered();
+                member.filtered();
             }
             Ok::<(), SqlError>(())
         };

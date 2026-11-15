@@ -1218,6 +1218,7 @@ impl<'a> RelationTargets<'a> {
         assignments: &[(&str, &'a Expr<'a>)],
         alias: Option<&str>,
         whole_row: bool,
+        tableoid: bool,
     ) -> Result<Option<Output>, SqlError> {
         if assignments
             .iter()
@@ -1238,24 +1239,32 @@ impl<'a> RelationTargets<'a> {
             };
             entries.push(entry).map_err(|_| arena_full())?;
         }
-        let ctid = match self.target_qualifier() {
-            Some(qualifier) => {
-                let mut name = StackStr::<96>::new();
-                crate::sql::catalog::write_identifier(&mut name, qualifier);
-                let _ = name.write_str(".ctid");
-                self.arena
-                    .alloc_str(name.as_str())
-                    .map_err(|_| arena_full())?
+        // A member of a partitioned or inheritance target names its own
+        // relation by `tableoid` before the row identity.
+        for (column, wanted) in [("tableoid", tableoid), ("ctid", true)] {
+            if !wanted {
+                continue;
             }
-            None => "ctid",
-        };
-        entries
-            .push(Entry {
-                text: ctid,
-                var: true,
-                referenced: false,
-            })
-            .map_err(|_| arena_full())?;
+            let text = match self.target_qualifier() {
+                Some(qualifier) => {
+                    let mut name = StackStr::<96>::new();
+                    crate::sql::catalog::write_identifier(&mut name, qualifier);
+                    let _ = name.write_char('.');
+                    let _ = name.write_str(column);
+                    self.arena
+                        .alloc_str(name.as_str())
+                        .map_err(|_| arena_full())?
+                }
+                None => column,
+            };
+            entries
+                .push(Entry {
+                    text,
+                    var: true,
+                    referenced: false,
+                })
+                .map_err(|_| arena_full())?;
+        }
         if whole_row {
             entries.push(self.whole_row()?).map_err(|_| arena_full())?;
         }

@@ -58,6 +58,7 @@ mod materialize;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
+pub(crate) mod partition_prune;
 mod scan;
 pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
 pub(crate) use scan::Chained;

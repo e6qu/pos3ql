@@ -952,14 +952,28 @@ immutable operators and functions over modeled built-in types, constants and
 reads its rows in (`ORDER BY` keys that are shippable expressions, the order
 `DISTINCT` reads its rows in under a `Unique` node, and the one window
 clause's partition and order keys), and `LIMIT`/`OFFSET` when nothing stays
-local. A grouped query of one foreign table whose select list, `GROUP BY`
-keys, `HAVING` conditions (a `HAVING` condition without aggregates moves to
-`WHERE`) and `ORDER BY` keys all ship and whose `WHERE` ships whole is one
-`Foreign Scan` of the grouped relation (`Relations: Aggregate on
-(public.t)`), with `count`, `sum`, `avg`, `min`, `max`, `bool_and`,
-`bool_or`, `every` and `string_agg` (`DISTINCT`, `FILTER`, ordered
-arguments) shipped, `GROUP BY` by target position, and its `LIMIT` shipped
-when the order is by an aggregate (`differential_exact/507`, `509`).
+local. A grouped query of one foreign table whose `GROUP BY` keys ship and
+whose `WHERE` ships whole (a `HAVING` condition without aggregates moves to
+`WHERE`) is one `Foreign Scan` of the grouped relation (`Relations: Aggregate
+on (public.t)`, schema-qualified under `VERBOSE`), with `count`, `sum`,
+`avg`, `min`, `max`, `bool_and`, `bool_or`, `every` and `string_agg`
+(`DISTINCT`, `FILTER`, ordered arguments) shipped, `GROUP BY` by target
+position, and its `LIMIT` shipped when the order is by an aggregate
+(`differential_exact/507`, `509`). As `foreign_grouping_ok` does, a
+select-list constant or star ships, any other expression that does not ship
+is computed over the remote groups from the aggregates it reads (a volatile
+one under `ORDER BY` after them, as `make_sort_input_target` postpones it), a
+`HAVING` condition that does not ship filters the groups (`Filter:`), and an
+order only this side computes, or by an aggregate over filtered groups
+without a `LIMIT`, sorts them above the scan; read through a view or
+subquery its columns print qualified (`differential_exact/580`, `582`). A
+lone `min` or `max` of a shippable argument without `GROUP BY` reads the
+first row of the remote scan ordered by it with its nulls excluded, in an
+InitPlan under a `Result`, as `preprocess_minmax_aggregates` plans it; two or
+more ship as one grouped scan (`differential_exact/583`). A foreign scan
+under a window or a local aggregate returns the window's input or the whole
+row, as a table scan does, and a `WINDOW` definition's keys are read whether
+or not a window uses them (`differential_exact/581`).
 Direct `UPDATE`/`DELETE` (with statement triggers firing around the remote
 statement; a row trigger for its event or a stored generated column keeps it
 row by row) ships the columns its `RETURNING` list reads and projects that
@@ -971,19 +985,26 @@ VERBOSE` prints the write node's `RETURNING` output (`differential_exact/506`),
 with their plans, in `tests/external/foreign-pushdown.sql` and
 `differential_exact/504`. Remaining differences: joins of foreign tables on
 the same server (`foreign_join_ok`) are not shipped, since PostgreSQL ships
-them only where its cost estimates prefer the remote join; a subquery's
-value is not sent as a parameter (`$1::integer` with an `InitPlan`); a
-`COLLATE` clause keeps an order or condition local, but its key prints as
-written rather than as PostgreSQL's relabeled column; a grouped query whose
-select list, `HAVING` or `ORDER BY` only partly ships, whose select list
-holds a constant or a star, or that has `DISTINCT` or a window over its
-groups, groups locally; `min`/`max`-only aggregates
-without `GROUP BY` group locally where PostgreSQL reads an ordered `LIMIT 1`
-scan in an `InitPlan`; `DISTINCT` with a `WHERE` clause and no `ORDER BY` is
-hashed locally (as PostgreSQL's costs choose) with its scan's `Output`
-listing only the read columns; a window's and an upper node's `Output` lines
-print the window and grouped columns by name; a grouped scan read through a
-view or subquery prints unqualified columns; `RETURNING ctid` of a foreign
+them only where its cost estimates prefer the remote join, and a join of a
+foreign table prints its scan as a `Seq Scan` under a hash join where
+PostgreSQL merge-joins sorted foreign scans; a subquery's value is not sent
+as a parameter (`$1::integer` with an `InitPlan`); a `COLLATE` clause keeps
+an order or condition local, but its key prints as written rather than as
+PostgreSQL's relabeled column (also for tables); a grouped query with
+`DISTINCT` or a window over its groups groups locally; a grouped query with a
+`LIMIT` whose remote order is by grouping keys, or none, groups locally where
+PostgreSQL's costs may still ship it over filtered groups (it ships `HAVING
+sum(id) > random() ORDER BY a LIMIT 3` but not the same over `avg(n)`), and
+a local `GROUP BY` under a `LIMIT` hashes where PostgreSQL groups the
+remotely sorted rows; a postponed volatile expression over groups sorted
+here declines the remote grouping; a view or subquery output the outer
+query does not read is computed where PostgreSQL replaces it with a typed
+`NULL` (`remove_unused_subquery_outputs`, also for tables); `DISTINCT` with
+a `WHERE` clause and no `ORDER BY` is hashed locally (as PostgreSQL's costs
+choose) with its scan's `Output` listing only the read columns; a refused
+connection reports `HV000` with the transport error where PostgreSQL
+reports `08001` `could not connect to server` with libpq's detail;
+`RETURNING ctid` of a foreign
 table fails with `42703`; and `EXPLAIN EXECUTE` plans a prepared statement
 with its parameters unbound, so a condition on `$1` neither ships nor
 prints. A select list or `ORDER BY` with a subquery reads every column. A

@@ -2350,19 +2350,23 @@ fn expanded_items<'a>(
 /// quoted, numeric, boolean or `NULL` literal, a negated number, or a
 /// quoted literal cast to a type.
 pub(crate) fn is_constant(expression: &Expr<'_>) -> bool {
-    match unbound(expression) {
-        Expr::Int(_) | Expr::NumericLit(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
-        Expr::Unary {
-            operator: UnaryOp::Neg,
-            operand: Expr::Int(_) | Expr::NumericLit(_),
-            ..
-        } => true,
-        Expr::Cast {
-            operand: Expr::Str(_),
-            ..
-        } => true,
-        _ => false,
-    }
+    matches!(
+        unbound(expression),
+        Expr::Int(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Unary {
+                operator: UnaryOp::Neg,
+                operand: Expr::Int(_) | Expr::NumericLit(_),
+                ..
+            }
+            | Expr::Cast {
+                operand: Expr::Str(_),
+                ..
+            }
+    )
 }
 
 /// Whether `node` is one of a grouped scan's remote `targets`, which a node

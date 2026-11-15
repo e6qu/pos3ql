@@ -7919,6 +7919,31 @@ pub(super) fn visit_text_rows<E>(
                 emit(line.as_str())?;
             }
         }
+        // `show_incremental_sort_info`.
+        if let NodeActual::Ran(NodeCounters {
+            incremental: Some(groups),
+            ..
+        }) = node_actual
+            && groups.full.count > 0
+        {
+            for (label, kind) in [("Full-sort", groups.full), ("Pre-sorted", groups.presorted)] {
+                if kind.count == 0 {
+                    continue;
+                }
+                let mut line = StackStr::<256>::new();
+                for _ in 0..node_indent(node) {
+                    let _ = write!(line, " ");
+                }
+                let _ = write!(
+                    line,
+                    "{label} Groups: {}  Sort Method: quicksort  Average Memory: {}kB  Peak Memory: {}kB",
+                    kind.count,
+                    (kind.total_bytes / kind.count as usize).div_ceil(1024),
+                    kind.peak_bytes.div_ceil(1024)
+                );
+                emit(line.as_str())?;
+            }
+        }
         if let NodeActual::Ran(NodeCounters {
             stored: Some(bytes),
             ..
@@ -8739,6 +8764,32 @@ fn structured_node(
         document.text(label.text(), text);
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
+        }
+    }
+    if let NodeActual::Ran(NodeCounters {
+        incremental: Some(groups),
+        ..
+    }) = node_actual
+        && groups.full.count > 0
+    {
+        for (label, kind) in [
+            ("Full-sort Groups", groups.full),
+            ("Pre-sorted Groups", groups.presorted),
+        ] {
+            if kind.count == 0 {
+                continue;
+            }
+            document.open_group("Incremental Sort Groups", Some(label), true);
+            document.number("Group Count", kind.count);
+            document.list("Sort Methods Used", core::iter::once("quicksort"));
+            document.open_group("Sort Space", Some("Sort Space Memory"), true);
+            document.number(
+                "Average Sort Space Used",
+                (kind.total_bytes / kind.count as usize).div_ceil(1024),
+            );
+            document.number("Peak Sort Space Used", kind.peak_bytes.div_ceil(1024));
+            document.close_group("Sort Space", true);
+            document.close_group("Incremental Sort Groups", true);
         }
     }
     if let NodeActual::Ran(NodeCounters {

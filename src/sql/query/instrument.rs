@@ -157,6 +157,170 @@ pub(crate) struct NodeCounters {
     pub(crate) sort: Option<SortSpace>,
     /// The most bytes of rows a window node held in memory.
     pub(crate) stored: Option<usize>,
+    /// An incremental sort's batches, when it sorted.
+    pub(crate) incremental: Option<IncrementalGroups>,
+}
+
+/// The batches of one kind an incremental sort sorted: their count and the
+/// bytes of rows they held, summed and at most.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct SortGroups {
+    pub(crate) count: u64,
+    pub(crate) total_bytes: usize,
+    pub(crate) peak_bytes: usize,
+}
+
+impl SortGroups {
+    fn add(&mut self, bytes: usize) {
+        self.count += 1;
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.peak_bytes = self.peak_bytes.max(bytes);
+    }
+}
+
+/// An incremental sort's full-sort and presorted-prefix batches.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct IncrementalGroups {
+    pub(crate) full: SortGroups,
+    pub(crate) presorted: SortGroups,
+}
+
+/// PostgreSQL's incremental sort (`nodeIncrementalSort.c`) batching, over
+/// rows that arrive ordered by the presorted keys, with no bound: it
+/// collects at least 32 rows and then the rest of the last one's prefix
+/// group into a full sort, and once a full sort passes 64 rows sorts each
+/// further prefix group on its own (`switchToPresortedPrefixMode`).
+pub(crate) struct IncrementalSortBatches {
+    groups: IncrementalGroups,
+    /// The prefix group of the latest row.
+    group: u64,
+    started: bool,
+    state: BatchState,
+    /// The full sort being loaded: each row's prefix group and bytes.
+    batch_groups: [u64; FULL_SORT_LIMIT],
+    batch_bytes: [usize; FULL_SORT_LIMIT],
+    batch_rows: usize,
+}
+
+const MIN_GROUP: usize = 32;
+/// A full sort past `2 * MIN_GROUP` rows switches to presorted mode.
+const FULL_SORT_LIMIT: usize = 2 * MIN_GROUP + 1;
+
+#[derive(Clone, Copy)]
+enum BatchState {
+    /// Loading a full sort; past `MIN_GROUP` rows it takes only rows of
+    /// the prefix group of its `MIN_GROUP`th row.
+    Full { pivot: Option<u64> },
+    /// Loading the rest of prefix group `group` into a prefix sort.
+    Prefix { group: u64, bytes: usize },
+}
+
+impl IncrementalSortBatches {
+    pub(crate) const fn new() -> Self {
+        const NONE: SortGroups = SortGroups {
+            count: 0,
+            total_bytes: 0,
+            peak_bytes: 0,
+        };
+        Self {
+            groups: IncrementalGroups {
+                full: NONE,
+                presorted: NONE,
+            },
+            group: 0,
+            started: false,
+            state: BatchState::Full { pivot: None },
+            batch_groups: [0; FULL_SORT_LIMIT],
+            batch_bytes: [0; FULL_SORT_LIMIT],
+            batch_rows: 0,
+        }
+    }
+
+    /// The next input row: whether its presorted keys differ from the
+    /// previous row's, and its bytes.
+    pub(crate) fn push(&mut self, new_group: bool, bytes: usize) {
+        if new_group && self.started {
+            self.group += 1;
+        }
+        self.started = true;
+        let group = self.group;
+        match self.state {
+            BatchState::Prefix {
+                group: held,
+                bytes: held_bytes,
+            } => {
+                if group == held {
+                    self.state = BatchState::Prefix {
+                        group: held,
+                        bytes: held_bytes.saturating_add(bytes),
+                    };
+                    return;
+                }
+                self.groups.presorted.add(held_bytes);
+                self.start_full(group, bytes);
+            }
+            BatchState::Full { pivot } => {
+                if self.batch_rows >= MIN_GROUP && pivot.is_some_and(|pivot| pivot != group) {
+                    self.finish_full();
+                    self.start_full(group, bytes);
+                    return;
+                }
+                self.batch_groups[self.batch_rows] = group;
+                self.batch_bytes[self.batch_rows] = bytes;
+                self.batch_rows += 1;
+                if self.batch_rows == MIN_GROUP {
+                    self.state = BatchState::Full { pivot: Some(group) };
+                }
+                if self.batch_rows == FULL_SORT_LIMIT {
+                    self.finish_full();
+                    self.switch_to_prefix();
+                }
+            }
+        }
+    }
+
+    /// The batches, once every row was pushed.
+    pub(crate) fn finish(mut self) -> IncrementalGroups {
+        match self.state {
+            BatchState::Full { .. } => self.finish_full(),
+            BatchState::Prefix { bytes, .. } => self.groups.presorted.add(bytes),
+        }
+        self.groups
+    }
+
+    fn start_full(&mut self, group: u64, bytes: usize) {
+        self.batch_groups[0] = group;
+        self.batch_bytes[0] = bytes;
+        self.batch_rows = 1;
+        self.state = BatchState::Full { pivot: None };
+    }
+
+    fn finish_full(&mut self) {
+        let bytes = self.batch_bytes[..self.batch_rows]
+            .iter()
+            .fold(0usize, |total, bytes| total.saturating_add(*bytes));
+        self.groups.full.add(bytes);
+    }
+
+    /// Sorts each prefix group of the full sort on its own; the last one
+    /// continues in the input.
+    fn switch_to_prefix(&mut self) {
+        let mut at = 0usize;
+        loop {
+            let group = self.batch_groups[at];
+            let mut bytes = 0usize;
+            while at < self.batch_rows && self.batch_groups[at] == group {
+                bytes = bytes.saturating_add(self.batch_bytes[at]);
+                at += 1;
+            }
+            if at == self.batch_rows {
+                self.batch_rows = 0;
+                self.state = BatchState::Prefix { group, bytes };
+                return;
+            }
+            self.groups.presorted.add(bytes);
+        }
+    }
 }
 
 /// How a sort ordered its rows, under PostgreSQL's names.
@@ -255,6 +419,7 @@ impl Slot {
                 hash: None,
                 sort: None,
                 stored: None,
+                incremental: None,
             },
             open: 0,
             started: None,
@@ -560,6 +725,11 @@ impl Node {
                 .map_or(table.bytes, |held| held.bytes.max(table.bytes));
             slot.counters.hash = Some(HashTable { bytes, ..table });
         });
+    }
+
+    /// Records the batches an incremental sort sorted.
+    pub(crate) fn incremental_sorted(self, groups: IncrementalGroups) {
+        self.with(|slot, _| slot.counters.incremental = Some(groups));
     }
 
     /// Records a sort the node ran; across rescans PostgreSQL reports the
@@ -910,6 +1080,26 @@ mod tests {
         });
         let counters = slots[0].counters();
         assert_eq!((counters.loops, counters.rows), (1, 3));
+    }
+
+    fn batches(groups: &[usize]) -> (u64, u64) {
+        let mut batches = IncrementalSortBatches::new();
+        for &size in groups {
+            for row in 0..size {
+                batches.push(row == 0, 1);
+            }
+        }
+        let groups = batches.finish();
+        (groups.full.count, groups.presorted.count)
+    }
+
+    #[test]
+    fn incremental_sort_batches_follow_postgresql() {
+        assert_eq!(batches(&[50, 50, 50, 50]), (4, 0));
+        assert_eq!(batches(&[10, 30, 260, 10]), (3, 1));
+        // A full sort that passes 64 rows sorts its leading groups apart.
+        assert_eq!(batches(&[40, 30, 100]), (2, 2));
+        assert_eq!(batches(&[]), (1, 0));
     }
 
     #[test]

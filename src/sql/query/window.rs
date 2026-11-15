@@ -2243,6 +2243,7 @@ impl<'a> WindowRows<'a> {
         txid: u32,
         order_by: &[OrderBy<'_>],
         bound: Option<usize>,
+        presorted: usize,
         sort: instrument::Node,
         arena: &'a Arena,
     ) -> Result<&'a [usize], SqlError> {
@@ -2289,9 +2290,82 @@ impl<'a> WindowRows<'a> {
                 },
                 bytes,
             });
+            // Rows already ordered by a prefix of the keys sort as
+            // PostgreSQL's incremental sort batches them.
+            if presorted != 0 && presorted < order_by.len() && bound.is_none() && sort.measured() {
+                let prefix = &order_by[..presorted];
+                let mut batches = instrument::IncrementalSortBatches::new();
+                for at in 0..self.rows.len() {
+                    let new_group = at != 0
+                        && !cmp_key_rows(
+                            storage,
+                            txid,
+                            self.collations,
+                            self.sort_keys[at - 1],
+                            self.sort_keys[at],
+                            prefix,
+                        )?
+                        .is_eq();
+                    batches.push(
+                        new_group,
+                        core::mem::size_of::<usize>()
+                            + core::mem::size_of_val(self.rows[at])
+                            + core::mem::size_of_val(self.sort_keys[at]),
+                    );
+                }
+                let groups = batches.finish();
+                sort.incremental_sorted(groups);
+            }
         }
         Ok(order)
     }
+}
+
+/// How many leading `ORDER BY` keys the window rows already follow: the
+/// keys of the last window clause that sorted its input, as the planner
+/// plans an incremental sort over them (`presorted_order_keys` in EXPLAIN).
+pub(crate) fn presorted_order_prefix<'a>(
+    statement: &'a Select<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let windows = window_clauses(statement, win_nodes, arena)?;
+    let mut sorted: &[OrderBy<'a>] = &[];
+    for &(spec, _) in windows.clauses {
+        let keys = window_sort_keys(spec, arena)?;
+        let held = keys.len() <= sorted.len() && *keys == sorted[..keys.len()];
+        if !keys.is_empty() && !held {
+            sorted = keys;
+        }
+    }
+    let resolved = |key: &'a Expr<'a>| -> &'a Expr<'a> {
+        let item = match key {
+            Expr::Int(position) => usize::try_from(*position)
+                .ok()
+                .and_then(|position| statement.items.get(position.checked_sub(1)?)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => statement.items.iter().find(
+                |item| matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name),
+            ),
+            _ => None,
+        };
+        match item {
+            Some(SelectItem::Expr { expression, .. }) => expression,
+            _ => key,
+        }
+    };
+    Ok(statement
+        .order_by
+        .iter()
+        .zip(sorted)
+        .take_while(|(key, held)| {
+            *resolved(key.expression) == *held.expression
+                && held.descending == key.descending
+                && held.nulls_first == key.nulls_first
+        })
+        .count())
 }
 
 /// Compares two encoded rows' first `n` columns under SQL equality and order,
@@ -3015,6 +3089,16 @@ pub(crate) fn external_window_into<'a>(
         .expect("spill-attached block store")?;
     let mut emitted = 0u64;
     let mut skipped = 0u64;
+    // Rows already ordered by a prefix of the keys sort as PostgreSQL's
+    // incremental sort batches them; the sorted run keeps their prefix
+    // groups in input order.
+    let presorted = presorted_order_prefix(statement, win_nodes, arena)?;
+    let mut batches = (presorted != 0
+        && presorted < statement.order_by.len()
+        && !statement.distinct
+        && super::group::sort_bound(statement, limit, offset).is_none()
+        && stages.sort.measured())
+    .then(instrument::IncrementalSortBatches::new);
     loop {
         let keep_scanning = {
             let Some(context) = out_reader.context() else {
@@ -3026,6 +3110,22 @@ pub(crate) fn external_window_into<'a>(
                 boundary: _,
                 output: _,
             } = context;
+            if let Some(batches) = batches.as_mut() {
+                let new_group = match previous {
+                    Some(prior) => !compare_encoded_order(
+                        storage,
+                        txid,
+                        &statement_order_collations[..presorted],
+                        prior,
+                        row,
+                        width,
+                        &statement.order_by[..presorted],
+                    )?
+                    .is_eq(),
+                    None => false,
+                };
+                batches.push(new_group, core::mem::size_of::<usize>() + row.len());
+            }
             let duplicate = match previous {
                 Some(prior) if statement.distinct => {
                     crate::sql::exec::compare_projected_prefix(storage, txid, row, prior, width)?
@@ -3062,6 +3162,9 @@ pub(crate) fn external_window_into<'a>(
         storage
             .with_block_store(|blocks| out_reader.advance(blocks))
             .expect("spill-attached block store")?;
+    }
+    if let Some(batches) = batches {
+        stages.sort.incremental_sorted(batches.finish());
     }
     Ok(emitted)
 }
@@ -3174,6 +3277,10 @@ pub(crate) fn window_select<'a>(
         txid,
         statement.order_by,
         super::group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct),
+        match presorted_order_prefix(statement, win_nodes, arena) {
+            Ok(presorted) => presorted,
+            Err(e) => return sql_fail(e),
+        },
         stages.sort,
         arena,
     ) {

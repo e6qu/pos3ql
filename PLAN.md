@@ -757,7 +757,10 @@ evaluation order, named `w1`, `w2`, ... when unnamed and printing its
 gives windows of frame-independent functions), over a `Sort` of its input
 or an `Incremental Sort` when the rows already follow a prefix of its keys;
 a query `ORDER BY` the last window's rows follow needs no sort. Under
-`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own. A
+`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own, and
+the query's `Incremental Sort` over a window prints its `Full-sort Groups`
+and `Pre-sorted Groups` lines, batched as `nodeIncrementalSort.c` batches
+its input (the memory figures pos3ql's own). A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated
@@ -837,8 +840,8 @@ statement's (`r_1`, `e1_1`) prints its new name in its query block's
 conditions and lists. When a derived table or `CTE Scan` joins a
 stored relation of equal size, PostgreSQL's cost tie may pick the other
 outer or hashed side. Not yet shown: row
-subqueries as subplans, a correlated subquery of a join, an incremental
-sort's `ANALYZE` group lines,
+subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
+group lines of a window's own incremental sort or of one under a `LIMIT`,
 `VERBOSE` output lists of a joined `UPDATE` or `DELETE`, an `INSERT`'s
 `VALUES` rows, a `RETURNING` list naming `OLD` or `NEW`, a `(record).*`
 item, a sort below a postponed select list (whose input PostgreSQL

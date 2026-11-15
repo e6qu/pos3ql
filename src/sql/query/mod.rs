@@ -15178,6 +15178,7 @@ fn select_into_rows_mode<'a>(
             txid,
             statement.order_by,
             group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct),
+            window::presorted_order_prefix(statement, win_nodes.as_slice(), arena)?,
             instrument::node(instrument::Role::Sort),
             arena,
         )?;

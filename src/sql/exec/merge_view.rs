@@ -469,6 +469,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         match emit_merge_progress_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: position,
                                 row: None,
                                 changed: affected_count,
@@ -601,6 +602,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                         match emit_merge_progress_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: position,
                                 row: None,
                                 changed: affected_count,
@@ -780,6 +782,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     match emit_merge_progress_returning(
                         progress.as_deref_mut(),
                         ChangedRow {
+                            remote_ctid: None,
                             index: position,
                             row: None,
                             changed: affected_count,

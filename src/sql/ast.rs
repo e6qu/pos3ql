@@ -3261,6 +3261,10 @@ pub struct Select<'a> {
     pub locking: &'a [LockClause<'a>],
     /// How the query was written where execution no longer needs it.
     pub written: WrittenQuery<'a>,
+    /// The subquery `preprocess_minmax_aggregates` builds for a `min` or
+    /// `max` aggregate: its `LIMIT 1` runs over the ordered path the
+    /// planner built by hand, so postgres_fdw does not ship it.
+    pub minmax_subquery: bool,
 }
 
 /// The written form of a query level that its executable fields expand,
@@ -3317,6 +3321,7 @@ impl Select<'_> {
         set_body: None,
         locking: &[],
         written: WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
 }
 

@@ -214,7 +214,14 @@ fi
 # POS3QL_EXTRA_CONF appends config lines — the forced-spill mode runs the
 # same corpora with a deliberately tiny memtable over a real bucket, so
 # every query also exercises the spill/checkpoint/read-back path.
-cargo build --release -q || { bad build; exit 1; }
+# POS3QL_BIN names the server to test (coverage passes its instrumented
+# build); without it the suite builds and tests the release binary.
+if [[ -n ${POS3QL_BIN:-} ]]; then
+  [[ -x $POS3QL_BIN ]] || { bad "POS3QL_BIN is not executable: $POS3QL_BIN"; exit 1; }
+else
+  cargo build --release -q || { bad build; exit 1; }
+  POS3QL_BIN=./target/release/pos3ql
+fi
 cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
@@ -249,7 +256,7 @@ if nc -z 127.0.0.1 "$P3_PORT" 2>/dev/null; then
   exit 1
 fi
 
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+"$POS3QL_BIN" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
 for _ in {1..50}; do
@@ -413,7 +420,7 @@ restart_pos3ql_clean() {
   kill "$P3_PID" 2>/dev/null
   wait "$P3_PID" 2>/dev/null
   rm -rf "$WORK/p3data"
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+  "$POS3QL_BIN" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
   P3_PID=$!
   for _ in {1..50}; do
     "$PSQL" -h 127.0.0.1 -p "$P3_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && return
@@ -599,7 +606,7 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   else
     cp "$WORK/p3.conf" "$SLT_CONF"
   fi
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$SLT_CONF" > "$WORK/p3.log" 2>&1 &
+  "$POS3QL_BIN" --config "$SLT_CONF" > "$WORK/p3.log" 2>&1 &
   P3_PID=$!
   P3_READY=0
   for _ in {1..50}; do

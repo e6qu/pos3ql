@@ -1,0 +1,21 @@
+-- An inheritance parent is scanned with its children under an Append, the
+-- parent itself as its first member; constraint exclusion drops a child
+-- whose CHECK constraint contradicts the scan's conditions. ONLY scans the
+-- parent alone.
+CREATE TABLE ip604 (a int, v int);
+CREATE TABLE ip604_1 (CHECK (a < 10)) INHERITS (ip604);
+CREATE TABLE ip604_2 (CHECK (a >= 10)) INHERITS (ip604);
+INSERT INTO ip604 VALUES (1, 1);
+INSERT INTO ip604_1 VALUES (2, 2), (3, 3);
+INSERT INTO ip604_2 VALUES (12, 12);
+EXPLAIN (COSTS OFF) SELECT * FROM ip604;
+EXPLAIN (COSTS OFF) SELECT * FROM ip604 WHERE a = 15;
+EXPLAIN (COSTS OFF) SELECT * FROM ip604 WHERE a = 3 AND a = 4;
+EXPLAIN (COSTS OFF) SELECT * FROM ONLY ip604;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM ip604 WHERE v > 1;
+EXPLAIN (COSTS OFF) DELETE FROM ip604;
+EXPLAIN (COSTS OFF) DELETE FROM ip604 WHERE a < 5;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ip604 WHERE a = 3;
+EXPLAIN (VERBOSE, COSTS OFF) DELETE FROM ip604 WHERE a = 3;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM ip604 WHERE v > 1;
+SELECT * FROM ip604 ORDER BY a;

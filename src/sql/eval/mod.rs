@@ -4864,6 +4864,40 @@ pub(crate) fn with_custom_plan_parameters<R>(values: &[Datum<'_>], run: impl FnO
     run()
 }
 
+thread_local! {
+    /// The argument values of the generic plan being explained, if any.
+    static GENERIC_PLAN_PARAMETERS: core::cell::Cell<(*const Datum<'static>, usize)> =
+        const { core::cell::Cell::new((core::ptr::null(), 0)) };
+}
+
+struct GenericPlanScope((*const Datum<'static>, usize));
+
+impl Drop for GenericPlanScope {
+    fn drop(&mut self) {
+        GENERIC_PLAN_PARAMETERS.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Plans `run` as the generic plan of a prepared statement explained with
+/// the arguments `values`, which its executor startup reads to prune
+/// partitions (`ExecInitNode`'s initial pruning) while the plan keeps `$n`.
+pub(crate) fn with_generic_plan_parameters<R>(values: &[Datum<'_>], run: impl FnOnce() -> R) -> R {
+    let current = (values.as_ptr().cast::<Datum<'static>>(), values.len());
+    let _scope = GenericPlanScope(GENERIC_PLAN_PARAMETERS.with(|slot| slot.replace(current)));
+    run()
+}
+
+/// The arguments of the generic plan being explained, or none.
+pub(crate) fn generic_plan_parameters<'v>() -> &'v [Datum<'v>] {
+    let (values, len) = GENERIC_PLAN_PARAMETERS.with(core::cell::Cell::get);
+    if values.is_null() {
+        return NO_PARAMS;
+    }
+    // SAFETY: `with_generic_plan_parameters` keeps the slice alive while it
+    // is installed; planning copies what it keeps before the scope ends.
+    unsafe { core::slice::from_raw_parts(values.cast::<Datum<'v>>(), len) }
+}
+
 /// Whether a custom plan being planned binds `$index` to a value, which
 /// makes it a planner constant.
 pub(crate) fn custom_plan_binds(index: u32) -> bool {

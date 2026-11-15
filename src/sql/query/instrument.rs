@@ -82,8 +82,12 @@ impl BlockId {
 /// A node's role in its query block.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Role {
-    /// The scan of the FROM position.
+    /// The scan of the FROM position: of its relation, or the `Append` of
+    /// the members of its partitioned table or inheritance tree.
     Scan(u16),
+    /// The scan of one member of the partitioned table or inheritance tree
+    /// at the FROM position, by the member's storage slot.
+    Member(u16, u32),
     /// The join adding the relation at this join-order depth (from 1).
     Join(u16),
     /// The hash table built from the FROM position.
@@ -692,6 +696,22 @@ impl Node {
         let mut loops = 0;
         self.with(|slot, _| loops = slot.counters.loops);
         loops
+    }
+
+    /// The rows the node returned and its `Filter` removed so far.
+    pub(crate) fn counted(self) -> (u64, u64) {
+        let mut counted = (0, 0);
+        self.with(|slot, _| counted = (slot.counters.rows, slot.counters.filtered));
+        counted
+    }
+
+    /// Adds rows another node returned and removed while this one ran in
+    /// it: a member scan's share of its `Append`'s counts.
+    pub(crate) fn add_counted(self, rows: u64, filtered: u64) {
+        self.rows(rows);
+        self.with(|slot, _| {
+            slot.counters.filtered = slot.counters.filtered.saturating_add(filtered)
+        });
     }
 
     /// Counts one row the node returned.

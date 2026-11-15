@@ -36,6 +36,7 @@ pub(crate) enum Destination {
     Value,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Context<'s> {
     pub storage: &'s Storage,
     pub txid: u32,
@@ -67,6 +68,10 @@ pub(crate) struct Context<'s> {
     /// EXPLAIN's names for the subqueries the planner runs as subplans, by
     /// the address of their query.
     pub sublinks: Option<&'s dyn Fn(*const ()) -> Option<SublinkPlan>>,
+    /// EXPLAIN's references to targets a lower plan node computes: an
+    /// expression this names prints in parentheses, as ruleutils prints a
+    /// non-Var target read through `OUTER_VAR` or `INDEX_VAR`.
+    pub references: Option<&'s dyn Fn(&Expr<'_>) -> bool>,
 }
 
 /// How EXPLAIN refers to a subquery its plan runs separately.
@@ -316,6 +321,7 @@ pub(crate) fn column_constant<'a>(
         domain_value: None,
         folded: false,
         sublinks: None,
+        references: None,
     };
     let type_oid = super::catalog_column_type_oid(storage, column, txid)?;
     let type_mod = super::catalog_column_type_mod(column);
@@ -893,6 +899,25 @@ impl Context<'_> {
         })
     }
 
+    /// For a comparison of a boolean expression with a boolean constant,
+    /// the expression and the constant.
+    fn boolean_equality<'e>(
+        &self,
+        left: &'e Expr<'e>,
+        right: &'e Expr<'e>,
+    ) -> Result<Option<(&'e Expr<'e>, bool)>, SqlError> {
+        let constant = |side: &Expr<'_>| match side {
+            Expr::Bool(value) => Some(*value),
+            _ => None,
+        };
+        let (tested, value) = match (constant(left), constant(right)) {
+            (None, Some(value)) => (left, value),
+            (Some(value), None) => (right, value),
+            _ => return Ok(None),
+        };
+        Ok((self.type_of(tested)? == Some(oid::BOOL)).then_some((tested, value)))
+    }
+
     /// Operand types after PostgreSQL's operator resolution, `None` only when
     /// both sides are unknown literals.
     fn operand_types(
@@ -1222,6 +1247,19 @@ impl Context<'_> {
     }
 
     fn bare(&self, expression: &Expr<'_>, output: &mut Output<'_>) -> Result<(), SqlError> {
+        if let Some(references) = self.references
+            && references(expression)
+        {
+            // The lower node computes the expression; its own inputs are no
+            // references here.
+            let computed = Context {
+                references: None,
+                ..*self
+            };
+            output.push("(")?;
+            computed.bare(expression, output)?;
+            return output.push(")");
+        }
         match expression {
             Expr::Int(value) => {
                 let text = crate::stack_format!(24, "{}", value);
@@ -1430,6 +1468,25 @@ impl Context<'_> {
             Expr::Unary {
                 operator, operand, ..
             } => self.prefix(*operator, operand, output),
+            Expr::Binary {
+                operator: operator @ (BinaryOp::Eq | BinaryOp::NotEq),
+                left,
+                right,
+                ..
+            } if self.folded
+                && let Some((tested, value)) = self.boolean_equality(left, right)? =>
+            {
+                // The planner's `simplify_boolean_equality`: `b = true` is
+                // `b`, and `b = false` is `NOT b`.
+                if value == (*operator == BinaryOp::Eq) {
+                    self.bare(tested, output)
+                } else {
+                    self.open(output)?;
+                    output.push("NOT ")?;
+                    self.wrapped(tested, Some(Some(oid::BOOL)), Parent::Not, true, output)?;
+                    self.close(output)
+                }
+            }
             Expr::Binary {
                 operator,
                 left,
@@ -2838,6 +2895,7 @@ pub(crate) fn rule_action_definition<'a>(
         qualify: true,
         domain_value: None,
         sublinks: None,
+        references: None,
         folded: false,
         bare: None,
     };

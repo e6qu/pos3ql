@@ -21813,6 +21813,7 @@ impl Engine {
             | crate::storage::RoutineCallSelection::WrongKind { .. }
             | crate::storage::RoutineCallSelection::Absent) => {
                 let columns = exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],
@@ -23653,7 +23654,7 @@ impl Engine {
                             if custom_plan {
                                 eval::with_custom_plan_parameters(prepared_params, plan)
                             } else {
-                                plan()
+                                eval::with_generic_plan_parameters(prepared_params, plan)
                             }
                         });
                         match plan {

@@ -495,6 +495,7 @@ fn order_dml_condition<'a, Definition: crate::storage::DefinitionBacking>(
         definition: crate::storage::RelationDefinition::from_definition(def),
         alias,
         output_aliases: &[],
+        remote_ctid: false,
     };
     let ordered = super::query::order_qual(condition, &columns, storage, txid, arena)?;
     let mut conjuncts = [ordered; super::query::MAX_CONJUNCTS];
@@ -1127,6 +1128,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             definition: self.def,
             alias: self.alias,
             output_aliases: &[],
+            remote_ctid: false,
         }
         .column_type_mod(qualifier, name)
     }
@@ -1156,6 +1158,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             definition: self.def,
             alias: self.alias,
             output_aliases: &[],
+            remote_ctid: false,
         }
         .resolve_column_type(qualifier, name)
     }
@@ -1273,6 +1276,8 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 struct ReturningLookup<'d, 'v> {
     definition: crate::storage::RelationDefinition<'d>,
     target_alias: Option<&'d str>,
+    /// The `ctid` a foreign target's remote `RETURNING` list sent for the row.
+    remote_ctid: Option<crate::sql::types::Tid>,
     /// The `tableoid` of the changed row's table; `None` for a view's row.
     table_oid: Option<u32>,
     current: &'v [Datum<'v>],
@@ -1283,6 +1288,21 @@ struct ReturningLookup<'d, 'v> {
 }
 
 impl<'v> ReturningLookup<'_, 'v> {
+    /// The remote `ctid` when `qualifier.name` reads it.
+    fn remote_ctid(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::Tid> {
+        (name == "ctid"
+            && self.definition.column_index(name).is_none()
+            && qualifier.is_none_or(|qualifier| {
+                crate::sql::eval::qualifier_answers_target(
+                    self.definition,
+                    self.target_alias,
+                    qualifier,
+                )
+            }))
+        .then_some(self.remote_ctid)
+        .flatten()
+    }
+
     fn image(&self, qualifier: &str) -> Option<Option<&[Datum<'v>]>> {
         if qualifier == self.old_name {
             Some(self.old)
@@ -1348,6 +1368,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
             definition: self.definition,
             alias: self.target_alias,
             output_aliases: &aliases,
+            remote_ctid: false,
         }
         .column_type_mod(qualifier, name)
     }
@@ -1370,6 +1391,9 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        if let Some(tid) = self.remote_ctid(qualifier, name) {
+            return Ok(Datum::Tid(tid));
+        }
         if let Some(qualifier) = qualifier
             && let Some(image) = self.image(qualifier)
         {
@@ -1409,6 +1433,9 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if self.remote_ctid(qualifier, name).is_some() {
+            return Some(ColType::Tid);
+        }
         if qualifier.is_some_and(|qualifier| self.image(qualifier).is_some()) {
             if self.table_oid.is_some()
                 && name == "tableoid"
@@ -24203,6 +24230,7 @@ fn execute_atomic_procedure_call<'a>(
         crate::storage::RoutineCallSelection::Stored(slot) => slot,
         failure => {
             let columns = CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -46159,6 +46187,7 @@ fn validate_policy_definition(
     use core::fmt::Write as _;
     let table_def = storage.table_def(table, txid);
     let aggregate_columns = CatalogCols {
+        remote_ctid: false,
         definition: Some(crate::storage::RelationDefinition::from_definition(
             &table_def,
         )),
@@ -58732,6 +58761,7 @@ fn stored_rule_definition<'a>(
         used_old: core::cell::Cell::new(false),
         used_new: core::cell::Cell::new(false),
         catalog: CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -69908,6 +69938,7 @@ fn rewrite_table_column_reference<
     // Types resolve against the catalog: a user routine's result type is
     // not known to the table's column list alone.
     let types = |definition| CatalogCols {
+        remote_ctid: false,
         definition: Some(definition),
         alias: None,
         output_aliases: &[],
@@ -77492,6 +77523,7 @@ impl CopyFilter {
         // read: its functions resolve and its literals run their inputs.
         let mark = arena.mark();
         let columns = CatalogCols {
+            remote_ctid: false,
             definition: Some(crate::storage::RelationDefinition::from_definition(def)),
             alias: None,
             output_aliases: &[],
@@ -79281,10 +79313,13 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 )?;
                 inserted.foreign.push(target, fields)?;
             } else if foreign {
-                let retrieved = if foreign_insert_has_after_row_trigger(storage, target, txn.txid) {
-                    ColumnSet::all(physical.n_columns)
-                } else {
-                    ColumnSet::EMPTY
+                let retrieved = crate::sql::foreign::deparse::RemoteReturning {
+                    columns: if foreign_insert_has_after_row_trigger(storage, target, txn.txid) {
+                        ColumnSet::all(physical.n_columns)
+                    } else {
+                        ColumnSet::EMPTY
+                    },
+                    ctid: false,
                 };
                 if !crate::sql::foreign::insert_row(
                     storage,
@@ -79294,6 +79329,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                         values: &mut values[..physical.n_columns],
                         on_conflict_do_nothing: false,
                         retrieved,
+                        ctid: &mut None,
                         render: responder.render_context(),
                         before_row_triggers: false,
                     },
@@ -83526,6 +83562,7 @@ fn merge_source<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     // Keep temporary source descriptions by value. Retaining full copies here
     // would consume the fixed statement arena before selecting source rows.
@@ -84450,6 +84487,7 @@ fn merge_target<'a>(
                                 match emit_merge_progress_returning(
                                     progress.as_deref_mut(),
                                     ChangedRow {
+                                        remote_ctid: None,
                                         index: position,
                                         row: None,
                                         changed: affected_count,
@@ -84551,6 +84589,7 @@ fn merge_target<'a>(
                                                 match emit_merge_progress_returning(
                                                     progress.as_deref_mut(),
                                                     ChangedRow {
+                                                        remote_ctid: None,
                                                         index: position,
                                                         row: None,
                                                         changed: affected_count,
@@ -84646,6 +84685,7 @@ fn merge_target<'a>(
                         match emit_merge_progress_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: position,
                                 row: selected_rows[j],
                                 changed: affected_count,
@@ -84974,6 +85014,7 @@ fn merge_target<'a>(
                                     match emit_merge_progress_returning(
                                         progress.as_deref_mut(),
                                         ChangedRow {
+                                            remote_ctid: None,
                                             index: position,
                                             row: selected_rows[j],
                                             changed: affected_count,
@@ -85467,6 +85508,7 @@ fn merge_target<'a>(
                                     match emit_merge_progress_returning(
                                         progress.as_deref_mut(),
                                         ChangedRow {
+                                            remote_ctid: None,
                                             index: position,
                                             row: selected_rows[j],
                                             changed: affected_count,
@@ -86446,6 +86488,7 @@ where
                             if let Err(error) = emit_row_returning(
                                 progress.as_deref_mut(),
                                 ChangedRow {
+                                    remote_ctid: None,
                                     index: position.0,
                                     row: None,
                                     changed: position.1,
@@ -86507,6 +86550,8 @@ where
             ) {
                 return Ok(Err(error));
             }
+            // The stored remote row's `ctid`, when RETURNING reads it.
+            let mut remote_ctid = None;
             if definition.kind == crate::storage::TableKind::Foreign {
                 // A rollback cannot undo a remote row change.
                 if let Some(progress) = progress.as_deref_mut() {
@@ -86533,6 +86578,7 @@ where
                         values: &mut values[..definition.n_columns],
                         on_conflict_do_nothing: statement.on_conflict.is_some(),
                         retrieved,
+                        ctid: &mut remote_ctid,
                         render: responder.render_context(),
                         before_row_triggers,
                     },
@@ -86592,6 +86638,7 @@ where
                     && let Err(error) = emit_row_returning(
                         progress,
                         ChangedRow {
+                            remote_ctid: remote_ctid.map(|ctid| ctid.tid()),
                             index: position.0,
                             row: None,
                             changed: position.1,
@@ -87403,6 +87450,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 match emit_row_returning(
                                     progress.as_deref_mut(),
                                     ChangedRow {
+                                        remote_ctid: None,
                                         index: row_index,
                                         row: None,
                                         changed: affected,
@@ -87476,6 +87524,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             &mut capture,
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: row_index,
                                 row: None,
                                 changed: affected,
@@ -87530,6 +87579,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 match emit_row_returning(
                                     progress.as_deref_mut(),
                                     ChangedRow {
+                                        remote_ctid: None,
                                         index: row_index,
                                         row: None,
                                         changed: affected,
@@ -87622,6 +87672,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             &mut capture,
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: row_index,
                                 row: None,
                                 changed: affected,
@@ -87695,6 +87746,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             match emit_row_returning(
                                 progress.as_deref_mut(),
                                 ChangedRow {
+                                    remote_ctid: None,
                                     index: row_index,
                                     row: None,
                                     changed: affected,
@@ -87890,6 +87942,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         match emit_row_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: row_index,
                                 row: None,
                                 changed: affected,
@@ -87978,6 +88031,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             match emit_row_returning(
                                 progress.as_deref_mut(),
                                 ChangedRow {
+                                    remote_ctid: None,
                                     index: row_index,
                                     row: None,
                                     changed: affected,
@@ -88096,6 +88150,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         match emit_row_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index: row_index,
                                 row: None,
                                 changed: affected,
@@ -89304,6 +89359,7 @@ where
                         match emit_row_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
+                                remote_ctid: None,
                                 index,
                                 row: None,
                                 changed: *inserted,
@@ -89843,6 +89899,7 @@ where
                     match emit_row_returning(
                         progress.as_deref_mut(),
                         ChangedRow {
+                            remote_ctid: None,
                             index,
                             row: None,
                             changed: inserted,
@@ -90100,6 +90157,8 @@ struct ChangedRow {
     row: Option<PhysicalRow>,
     changed: u64,
     transitions: row_progress::CaptureLengths,
+    /// The `ctid` a foreign write's remote `RETURNING` list sent.
+    remote_ctid: Option<crate::sql::types::Tid>,
 }
 
 /// Whether a nested data change that has returned `returned` rows (its
@@ -90168,6 +90227,7 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
         def,
         alias,
         table_oid,
+        position.remote_ctid,
         current,
         returning,
         old,
@@ -90224,6 +90284,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
     table_oid: Option<u32>,
+    remote_ctid: Option<crate::sql::types::Tid>,
     current: &[Datum],
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
@@ -90240,6 +90301,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     let context = ReturningLookup {
         definition: crate::storage::RelationDefinition::from_definition(def),
         target_alias: alias,
+        remote_ctid,
         table_oid,
         current,
         old_name: returning.old_name(),
@@ -90891,13 +90953,52 @@ pub(crate) fn foreign_modify_returned(
     alias: Option<&str>,
     every_column: bool,
     arena: &Arena,
-) -> Result<ColumnSet, SqlError> {
+) -> Result<crate::sql::foreign::deparse::RemoteReturning, SqlError> {
     let definition = storage.table_def(table, txid);
+    let ctid = returning_reads_remote_ctid(returning, &definition, alias)?;
     if every_column || foreign_row_trigger(storage, table, txid, event, Some(TriggerTiming::After))
     {
-        return Ok(ColumnSet::all(definition.n_columns));
+        return Ok(crate::sql::foreign::deparse::RemoteReturning {
+            columns: ColumnSet::all(definition.n_columns),
+            ctid,
+        });
     }
-    returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)
+    Ok(crate::sql::foreign::deparse::RemoteReturning {
+        columns: returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)?,
+        ctid,
+    })
+}
+
+/// Whether a foreign write's `RETURNING` list reads the remote row's `ctid`
+/// (unqualified or through the target's name), which `deparseReturningList`
+/// then asks the server for.
+fn returning_reads_remote_ctid<Definition0: crate::storage::DefinitionBacking>(
+    returning: crate::sql::ast::Returning<'_>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+) -> Result<bool, SqlError> {
+    if definition.column_index("ctid").is_some() {
+        return Ok(false);
+    }
+    let mut reads = false;
+    for item in returning.items {
+        if let SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } = item {
+            super::query::walk_expression_tree(expression, &mut |node| {
+                reads |= matches!(
+                    node,
+                    Expr::Column { qualifier, name: "ctid" }
+                        if qualifier.is_none_or(|qualifier| {
+                            crate::sql::eval::qualifier_answers_target(
+                                crate::storage::RelationDefinition::from_definition(definition),
+                                alias,
+                                qualifier,
+                            )
+                        })
+                );
+            })?;
+        }
+    }
+    Ok(reads)
 }
 
 /// The columns a direct foreign `UPDATE` or `DELETE` returns for its local
@@ -90911,7 +91012,7 @@ pub(crate) fn foreign_direct_returned(
     returning: crate::sql::ast::Returning<'_>,
     alias: Option<&str>,
     arena: &Arena,
-) -> Result<Option<ColumnSet>, SqlError> {
+) -> Result<Option<crate::sql::foreign::deparse::RemoteReturning>, SqlError> {
     let definition = storage.table_def(table, txid);
     let images = [returning.old_name(), returning.new_name()];
     let names_image = |expression: &Expr<'_>| match expression {
@@ -90942,7 +91043,10 @@ pub(crate) fn foreign_direct_returned(
             return Ok(None);
         }
     }
-    returning_dml_target_columns(returning, &definition, alias, storage, txid, arena).map(Some)
+    Ok(Some(crate::sql::foreign::deparse::RemoteReturning {
+        columns: returning_dml_target_columns(returning, &definition, alias, storage, txid, arena)?,
+        ctid: returning_reads_remote_ctid(returning, &definition, alias)?,
+    }))
 }
 
 /// The result of a direct foreign `UPDATE` (`updated`) or `DELETE`: the rows
@@ -90950,6 +91054,8 @@ pub(crate) fn foreign_direct_returned(
 struct DirectRows<'a> {
     changed: u64,
     rows: &'a [&'a [u8]],
+    /// Each returned row's remote `ctid`, when the `RETURNING` list reads it.
+    ctids: &'a [crate::sql::foreign::RemoteTupleId],
     updated: bool,
 }
 
@@ -91023,6 +91129,7 @@ fn emit_direct_returning(
             def,
             alias,
             table_oid,
+            direct.ctids.get(emitted as usize).map(|ctid| ctid.tid()),
             row,
             returning,
             old,
@@ -91089,9 +91196,13 @@ fn foreign_insert_retrieved<Definition0: crate::storage::DefinitionBacking>(
     statement: &Insert<'_>,
     view_check: Option<ViewCheck<'_>>,
     arena: &Arena,
-) -> Result<ColumnSet, SqlError> {
+) -> Result<crate::sql::foreign::deparse::RemoteReturning, SqlError> {
+    let ctid = returning_reads_remote_ctid(statement.returning, logical, statement.alias)?;
     if foreign_insert_has_after_row_trigger(storage, leaf, txid) {
-        return Ok(ColumnSet::all(storage.table_def(leaf, txid).n_columns));
+        return Ok(crate::sql::foreign::deparse::RemoteReturning {
+            columns: ColumnSet::all(storage.table_def(leaf, txid).n_columns),
+            ctid,
+        });
     }
     let mut columns = returning_dml_target_columns(
         statement.returning,
@@ -91104,7 +91215,10 @@ fn foreign_insert_retrieved<Definition0: crate::storage::DefinitionBacking>(
     for (_, filter) in view_check.map_or(&[][..], |check| check.checks) {
         columns |= expression_dml_target_columns(filter, logical, None, storage, txid, arena)?;
     }
-    Ok(mapping.map_or(columns, |mapping| mapping.column_set(columns)))
+    Ok(crate::sql::foreign::deparse::RemoteReturning {
+        columns: mapping.map_or(columns, |mapping| mapping.column_set(columns)),
+        ctid,
+    })
 }
 
 /// The columns of its target an `UPDATE` or `DELETE` reads: its condition's,
@@ -91440,7 +91554,11 @@ pub(crate) fn update<'a>(
             })
             .transpose()
     }) {
-        Ok(Some((updated, returned_rows))) => {
+        Ok(Some(crate::sql::foreign::DirectModified {
+            changed: updated,
+            rows: returned_rows,
+            ctids,
+        })) => {
             let stopped = match emit_direct_returning(
                 storage,
                 txn,
@@ -91451,6 +91569,7 @@ pub(crate) fn update<'a>(
                 DirectRows {
                     changed: updated,
                     rows: returned_rows,
+                    ctids,
                     updated: true,
                 },
                 arena,
@@ -91664,6 +91783,7 @@ pub(crate) fn update<'a>(
                 definition: crate::storage::RelationDefinition::from_definition(def),
                 alias: statement.alias,
                 output_aliases: &[],
+                remote_ctid: false,
             },
             storage,
             txn.txid,
@@ -92010,6 +92130,7 @@ pub(crate) fn update<'a>(
                 match emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
+                        remote_ctid: None,
                         index: i,
                         row: Some(scratch[i]),
                         changed: updated,
@@ -92615,8 +92736,13 @@ pub(crate) fn update<'a>(
                         tuple_id,
                         target_columns: remote_targets,
                         values: &mut new_physical[..row_schema.len()],
-                        returned: planned
-                            .map_or(ColumnSet::all(row_schema.len()), |plan| plan.returned),
+                        returned: planned.map_or(
+                            crate::sql::foreign::deparse::RemoteReturning {
+                                columns: ColumnSet::all(row_schema.len()),
+                                ctid: false,
+                            },
+                            |plan| plan.returned,
+                        ),
                         render: responder.render_context(),
                     },
                     planned,
@@ -92627,7 +92753,7 @@ pub(crate) fn update<'a>(
                         coercion_txid,
                     )),
                 ) {
-                    Ok(changed) => changed,
+                    Ok(change) => change,
                     Err(error) => return sql_fail(error),
                 };
                 // A rollback cannot undo a remote row change.
@@ -92635,9 +92761,10 @@ pub(crate) fn update<'a>(
                     progress.forbid_restart();
                 }
                 // postgres_fdw skips a row its remote command did not change.
-                if !changed {
+                if !changed.changed {
                     continue;
                 }
+                let remote_ctid = changed.ctid.map(|ctid| ctid.tid());
                 let mut new_values = [Datum::Null; MAX_COLUMNS];
                 row_layout.project(&new_physical, &mut new_values);
                 if let Err(error) = fire_partition_row_triggers(
@@ -92673,6 +92800,7 @@ pub(crate) fn update<'a>(
                     && let Err(error) = emit_row_returning(
                         progress.as_deref_mut(),
                         ChangedRow {
+                            remote_ctid,
                             index: i,
                             row: Some(scratch[i]),
                             changed: updated,
@@ -92852,6 +92980,7 @@ pub(crate) fn update<'a>(
                 && let Err(error) = emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
+                        remote_ctid: None,
                         index: i,
                         row: Some(scratch[i]),
                         changed: updated,
@@ -93209,7 +93338,11 @@ pub(crate) fn delete<'a>(
             })
             .transpose()
     }) {
-        Ok(Some((deleted, returned_rows))) => {
+        Ok(Some(crate::sql::foreign::DirectModified {
+            changed: deleted,
+            rows: returned_rows,
+            ctids,
+        })) => {
             let stopped = match emit_direct_returning(
                 storage,
                 txn,
@@ -93220,6 +93353,7 @@ pub(crate) fn delete<'a>(
                 DirectRows {
                     changed: deleted,
                     rows: returned_rows,
+                    ctids,
                     updated: false,
                 },
                 arena,
@@ -93411,6 +93545,7 @@ pub(crate) fn delete<'a>(
                 definition: crate::storage::RelationDefinition::from_definition(def),
                 alias: statement.alias,
                 output_aliases: &[],
+                remote_ctid: false,
             },
             storage,
             txn.txid,
@@ -93724,6 +93859,7 @@ pub(crate) fn delete<'a>(
                 match emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
+                        remote_ctid: None,
                         index: i,
                         row: Some(scratch[i]),
                         changed: deleted,
@@ -93865,7 +94001,13 @@ pub(crate) fn delete<'a>(
                     txn.txid,
                     tuple_id,
                     &mut old_physical[..width],
-                    planned.map_or(ColumnSet::all(width), |plan| plan.returned),
+                    planned.map_or(
+                        crate::sql::foreign::deparse::RemoteReturning {
+                            columns: ColumnSet::all(width),
+                            ctid: false,
+                        },
+                        |plan| plan.returned,
+                    ),
                     planned,
                     arena,
                     Some(&crate::sql::sequence::SeqEval::new(
@@ -93879,11 +94021,11 @@ pub(crate) fn delete<'a>(
                     progress.forbid_restart();
                 }
                 // postgres_fdw skips a row its remote command did not delete.
-                match deleted_row {
-                    Ok(true) => {}
-                    Ok(false) => continue,
+                let remote_ctid = match deleted_row {
+                    Ok(change) if change.changed => change.ctid.map(|ctid| ctid.tid()),
+                    Ok(_) => continue,
                     Err(error) => return sql_fail(error),
-                }
+                };
                 let mut old_transition = [Datum::Null; MAX_COLUMNS];
                 foreign_layout.project(&old_physical, &mut old_transition);
                 if let Err(error) = fire_partition_row_triggers(
@@ -93913,6 +94055,7 @@ pub(crate) fn delete<'a>(
                     && let Err(error) = emit_row_returning(
                         progress.as_deref_mut(),
                         ChangedRow {
+                            remote_ctid,
                             index: i,
                             row: Some(scratch[i]),
                             changed: deleted,
@@ -94068,6 +94211,7 @@ pub(crate) fn delete<'a>(
                 && let Err(error) = emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
+                        remote_ctid: None,
                         index: i,
                         row: Some(scratch[i]),
                         changed: deleted,
@@ -103590,6 +103734,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
         let layout = retained_rows.layout(table)?;
         crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0))
             .checkpoint();
+        target_member(table).checkpoint();
         let qualified = conditions.qualify(
             storage,
             txn.txid,
@@ -103605,8 +103750,10 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
         if qualified.is_some() {
             scan.row();
+            target_member(table).row();
         } else {
             scan.filtered();
+            target_member(table).filtered();
         }
         let Some(joined) = qualified else {
             retained_rows.set_current_joined(row, None);
@@ -103623,6 +103770,59 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
             arena,
         )
     }
+}
+
+/// The `EXPLAIN ANALYZE` node of the scan of a write target's member `leaf`.
+fn target_member(leaf: usize) -> crate::sql::query::instrument::Node {
+    crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Member(
+        0,
+        u32::try_from(leaf).unwrap_or(u32::MAX),
+    ))
+}
+
+/// The leaves a one-table `UPDATE` or `DELETE` reads: the members of its
+/// partitioned or inheritance target that pruning and constraint exclusion
+/// keep under its `WHERE`, with every value its execution knows.
+#[allow(clippy::too_many_arguments)]
+fn dml_pruned_leaves<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    use crate::sql::query::partition_prune;
+    if inheritance == crate::sql::ast::RelationInheritance::Only
+        || !partition_prune::expands(storage, table_index, txid)
+    {
+        return dml_leaf_slots_for(storage, table_index, inheritance, txid, arena);
+    }
+    let values = partition_prune::ScanValues {
+        storage,
+        txid,
+        relation: partition_prune::ScanRelation::Target {
+            columns: def.columns(),
+            name: alias.unwrap_or(def.name.as_str()),
+        },
+        arena,
+        params,
+        hooks,
+    };
+    Ok(partition_prune::members(
+        storage,
+        txid,
+        table_index,
+        partition_prune::conjuncts(where_clause, arena)?,
+        &values,
+        partition_prune::PruneStage::Scan,
+        arena,
+    )?
+    .leaves)
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
@@ -103679,7 +103879,34 @@ pub(super) fn collect_matches<'a>(
     let index_order = indexed.is_some()
         || (def.kind != crate::storage::TableKind::Foreign
             && super::query::dml_condition_reaches_index(storage, &def, alias, txid, where_clause));
+    // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
+    // visible row it matched or its filter removed, and each member's share
+    // when the target is a partitioned table or inheritance tree.
+    let scan = crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
+    let _scan = scan.start();
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        &def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        txid,
+        arena,
+    )?;
+    // A row an UPDATE moves can land in a leaf pruning left out, whose
+    // layout its change reads.
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        if !leaves.contains(&leaf) {
+            let physical = (*storage.table_def(leaf, txid)).clone();
+            images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+        }
+    }
+    for &leaf in leaves {
+        let member = target_member(leaf);
+        let _member = member.start();
         // Each leaf's rows follow its own order; leaves keep theirs.
         let leaf_start = scratch.len();
         let physical = (*storage.table_def(leaf, txid)).clone();
@@ -103732,11 +103959,6 @@ pub(super) fn collect_matches<'a>(
         }
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
-        // The write's scan of its target, as EXPLAIN ANALYZE counts it:
-        // each visible row it matched or its filter removed.
-        let scan =
-            crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Scan(0));
-        let _scan = scan.start();
         let mut visit = |rowid, loc: crate::storage::VisibleRowHome| {
             storage.record_relation_tuple_read(
                 txid,
@@ -103777,9 +103999,11 @@ pub(super) fn collect_matches<'a>(
                 // A candidate counts when the change loop qualifies it.
                 if selection == DmlSelection::Qualified {
                     scan.row();
+                    member.row();
                 }
             } else {
                 scan.filtered();
+                member.filtered();
             }
             Ok::<(), SqlError>(())
         };

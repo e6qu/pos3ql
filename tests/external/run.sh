@@ -130,7 +130,7 @@ start_pos3ql() { # <config> <log> <port>
     bad "port $port is already in use (stale pos3ql from an earlier run?) — kill it first"
     exit 1
   fi
-  "${POS3QL_BIN:-./target/release/pos3ql}" --config "$conf" >> "$log" 2>&1 &
+  "$POS3QL_BIN" --config "$conf" >> "$log" 2>&1 &
   START_PID=$!
   for _ in {1..50}; do
     "$PSQL" -h 127.0.0.1 -p "$port" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
@@ -200,9 +200,18 @@ trap cleanup EXIT
 step "toolchain versions"
 "$PSQL" --version || { bad "psql missing"; exit 1; }
 
-step "build pos3ql (release)"
-cargo build --release -q || { bad "build"; exit 1; }
-ok "build"
+# POS3QL_BIN names the server to test (coverage passes its instrumented
+# build); without it the suite builds and tests the release binary.
+if [[ -n ${POS3QL_BIN:-} ]]; then
+  step "use the supplied pos3ql binary"
+  [[ -x $POS3QL_BIN ]] || { bad "POS3QL_BIN is not executable: $POS3QL_BIN"; exit 1; }
+  ok "binary $POS3QL_BIN"
+else
+  step "build pos3ql (release)"
+  cargo build --release -q || { bad "build"; exit 1; }
+  ok "build"
+  POS3QL_BIN=./target/release/pos3ql
+fi
 
 step "start S3-compatible test server"
 python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PORT" \
@@ -954,7 +963,7 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && ( -x "$TORTURE_PG
     -o "-p $TORTURE_PG_PORT -k $TORTURE_SOCK -c listen_addresses=127.0.0.1 -c timezone=UTC" \
     -l "$WORK/torture-pg.log" start >/dev/null
   fi
-  if P3_BIN="${POS3QL_BIN:-./target/release/pos3ql}" P3_CONF="$WORK/server.conf" \
+  if P3_BIN="$POS3QL_BIN" P3_CONF="$WORK/server.conf" \
      P3_PORT=$PG_PORT P3_DATADIR="$WORK/data" P3_LOG="$WORK/server.log" P3_INITIAL_PID=$SERVER_PID \
      PGHOST=$TORTURE_PG_HOST PGPORT=$TORTURE_PG_PORT PGUSER=postgres PGDATABASE=postgres \
      "$POS3QL_VENV/bin/python" tests/external/torture_diff.py \

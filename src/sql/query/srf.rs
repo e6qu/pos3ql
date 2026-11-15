@@ -2525,6 +2525,7 @@ fn register_set_record_shapes<'a>(
         arena,
     });
     let fromless = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -2733,6 +2734,7 @@ pub(crate) fn describe_derived_definition<'a>(
                             && let Some(handle) = crate::sql::exec::register_shape_for(
                                 expression,
                                 &crate::sql::exec::CatalogCols {
+                                    remote_ctid: false,
                                     definition: None,
                                     alias: None,
                                     output_aliases: &[],
@@ -2752,6 +2754,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     sub.items,
                     None,
                     &crate::sql::exec::CatalogCols {
+                        remote_ctid: false,
                         definition: None,
                         alias: None,
                         output_aliases: &[],

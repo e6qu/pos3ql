@@ -1770,6 +1770,7 @@ fn inlined_body_properties(
         ast::Collation::None,
     )?;
     let body_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],

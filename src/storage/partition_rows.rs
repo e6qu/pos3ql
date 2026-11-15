@@ -100,12 +100,6 @@ impl<'value> PartitionKeyRow<'_, 'value> {
             .map(move |key| values.get(usize::from(key)).copied().unwrap_or(Datum::Null))
     }
 
-    pub(crate) fn all_known(self, known: &[bool]) -> bool {
-        self.scheme.keys[..usize::from(self.scheme.n_keys)]
-            .iter()
-            .all(|key| known.get(usize::from(*key)).copied().unwrap_or(false))
-    }
-
     pub(crate) fn matches(self, bound: PartitionBound) -> Result<bool, SqlError> {
         super::partition_bound_matches(
             self.scheme.strategy,
@@ -131,7 +125,7 @@ mod tests {
     };
 
     #[test]
-    fn partition_key_rows_match_and_prune_using_the_values_own_column_order() {
+    fn partition_key_rows_match_using_the_values_own_column_order() {
         let mut parent = TableDefBuilder::empty();
         parent.n_columns = 2;
         parent.columns[0] = ColumnMeta {
@@ -164,8 +158,6 @@ mod tests {
             let row = PartitionRow::new(&child, &values).unwrap();
             let keys = row.keys(&parent, scheme).unwrap();
             assert!(keys.matches(bound).unwrap());
-            assert!(!keys.all_known(&[true, false]));
-            assert!(keys.all_known(&[false, true]));
             let other = [Datum::Text("kept"), Datum::Int4(8)];
             assert!(
                 !PartitionRow::new(&child, &other)

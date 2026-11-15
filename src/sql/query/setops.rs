@@ -1389,6 +1389,7 @@ where
                 s.items,
                 None,
                 &exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],
@@ -1602,6 +1603,7 @@ fn register_record_shapes_inner(
         scope,
         outer,
         catalog: exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],

@@ -49586,6 +49586,25 @@ impl Storage {
         })
     }
 
+    /// Whether a visible user-defined function that `name` with `arity`
+    /// arguments could call is stable or volatile.
+    pub(crate) fn has_nonimmutable_function_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, attributes| {
+            matches!(
+                kind,
+                RoutineKind::Function { .. }
+                    | RoutineKind::SetFunction { .. }
+                    | RoutineKind::RecordFunction { .. }
+                    | RoutineKind::TableFunction
+            ) && attributes.volatility != RoutineVolatility::Immutable
+        })
+    }
+
     /// Whether a visible user-defined aggregate could be what `name` with
     /// `arity` arguments calls; built-in aggregates are known by name.
     pub(crate) fn has_aggregate_routine_candidate(

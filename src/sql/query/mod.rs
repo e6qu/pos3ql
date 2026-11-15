@@ -41,6 +41,8 @@ pub(crate) use retained::{
 mod routine_contract_tests;
 
 mod setops;
+pub(crate) use cte::{RecursiveChunk, RecursiveCteQuery};
+pub(crate) use setops::describe_set_body;
 pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
@@ -58,21 +60,21 @@ use materialize::{external_materialized_into, materialized_rows, materialized_se
 
 mod scan;
 pub(crate) use plan::{MAX_CONJUNCTS, flatten_and, order_qual, plan_time_bool, qual_cost};
+pub(crate) use scan::Chained;
 #[cfg(test)]
 pub(crate) use scan::JOIN_CANDIDATES;
 pub use scan::JoinRow;
 pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
-use scan::{
-    Chained, PaxReadDemand, pax_column_demand,
-    scan_source_recycling_retaining_match_with_pax_columns,
-    scan_source_recycling_with_indexed_candidates, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns,
-};
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index, dml_index_access_plan,
     dml_indexed_candidates, index_access_plan, index_leading_columns, ordered_index_access_plan,
     parameterized_index_access_plan, rowless_one_time_filter_passes,
+};
+use scan::{
+    PaxReadDemand, pax_column_demand, scan_source_recycling_retaining_match_with_pax_columns,
+    scan_source_recycling_with_indexed_candidates, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, lead_row_security,
@@ -87,6 +89,7 @@ pub(crate) use cte::{
 };
 pub(crate) use scope::unreachable_entry;
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
+pub(crate) use scope::{OuterColumnTypes, ScopeTypes};
 
 mod catalog_images;
 #[cfg(test)]
@@ -123,7 +126,9 @@ mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
-pub(crate) use cte::{PlannedCte, PlannedCteQuery, expand_ctes_for_plan};
+pub(crate) use cte::{
+    PlannedCte, PlannedCteQuery, expand_ctes_for_plan, expand_dml_ctes_for_plan, wrap_set_tree_with,
+};
 pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
@@ -3722,7 +3727,6 @@ pub(crate) fn bind_routine_statement_source<'a>(
             dependencies,
             arena,
             params,
-            None,
         )?),
         Stmt::SetQuery(query) => {
             let body = cte::expand_stored_set_tree_exec(
@@ -3730,7 +3734,7 @@ pub(crate) fn bind_routine_statement_source<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                cte::StoredExecutionContext::new(path, dependencies, params),
                 arena,
             )?;
             Stmt::SetQuery(SetQuery {
@@ -3752,7 +3756,6 @@ pub(crate) fn bind_routine_statement_source<'a>(
                 dependencies,
                 arena,
                 params,
-                None,
             );
         }
         _ => return Ok(statement),
@@ -3795,9 +3798,8 @@ pub(crate) fn execute_routine_query_under<'a>(
                     dependencies,
                     arena,
                     params,
-                    sequences,
                 )?,
-                None => expand_ctes_exec(select, storage, txid, arena, params, &[], sequences)?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[])?,
             };
             validate_locking(select, storage, txid, arena)?;
             if recycling {
@@ -3819,7 +3821,7 @@ pub(crate) fn execute_routine_query_under<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, sequences),
+                cte::StoredExecutionContext::new(path, dependencies, params),
                 arena,
             )?;
             let rebound = SetQuery {

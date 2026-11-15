@@ -2260,6 +2260,35 @@ fn equate_constants<'a>(
         .map_err(|_| Stop::full())?)
 }
 
+/// A sublink's query as the planner pulls it up: the `WITH` queries it
+/// inlines (`inline_cte`: referenced once, not `MATERIALIZED`, not volatile,
+/// recursive or data-modifying) substituted, and the simple derived tables
+/// that leaves merged in (`pull_up_simple_subquery`). A query one of whose
+/// `WITH` queries runs once is left as written.
+fn inlined_sublink_query<'a>(
+    subquery: &'a Select<'a>,
+    outer_scope: &QueryScope<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Step<&'a Select<'a>> {
+    if subquery.with.is_empty() {
+        return Ok(subquery);
+    }
+    let (expanded, planned) = super::cte::expand_ctes_for_plan(subquery, storage, txid, arena)?;
+    if !planned.is_empty() {
+        return Ok(subquery);
+    }
+    let outer = super::ScopeTypes(outer_scope);
+    Ok(pull_up_subqueries(
+        expanded,
+        storage,
+        txid,
+        arena,
+        Some(&outer),
+    )?)
+}
+
 /// The semi or anti join a `WHERE` conjunct becomes, if it pulls up.
 fn sublink_join<'a>(
     conjunct: &'a Expr<'a>,
@@ -2291,6 +2320,12 @@ fn sublink_join<'a>(
             all: false,
         } => (*select, JoinKind::Semi, Some((*operand, *operator))),
         _ => return Ok(None),
+    };
+    // `convert_EXISTS_sublink_to_join` keeps a query with `WITH` queries as
+    // a subplan; `convert_ANY_sublink_to_join` pulls it up.
+    let subquery = match operand {
+        Some(_) => inlined_sublink_query(subquery, outer_scope, storage, txid, arena)?,
+        None => subquery,
     };
     let Some(sub_from) = subquery.from.as_ref() else {
         return Ok(None);

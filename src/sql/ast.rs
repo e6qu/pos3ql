@@ -3505,7 +3505,6 @@ impl PartialEq for MaterializedCte<'_> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MaterializedCteSource<'a> {
     Inline(&'a [&'a [u8]]),
-    External(Option<crate::sql::external::ExternalRun>),
     RecursiveInline(&'a core::sync::atomic::AtomicUsize),
     RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
     /// A data-modifying `WITH` query that runs when its rows are first read.
@@ -3514,6 +3513,10 @@ pub(crate) enum MaterializedCteSource<'a> {
     /// as PostgreSQL's CTE scan runs it: a query that is never read never
     /// runs, and its calls happen after the main query's earlier ones.
     Deferred(DeferredCteQuery<'a>),
+    /// A recursive `WITH` query run an iteration at a time as its readers
+    /// pull rows, as PostgreSQL's `Recursive Union` under a CTE scan runs: a
+    /// reader that stops (a `LIMIT`) leaves the later iterations unrun.
+    Recursive(crate::sql::query::RecursiveCteQuery<'a>),
 }
 
 /// The query of a [`MaterializedCteSource::Deferred`] source and its rows
@@ -3553,7 +3556,6 @@ impl PartialEq for MaterializedCteSource<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (*self, *other) {
             (Self::Inline(left), Self::Inline(right)) => left == right,
-            (Self::External(left), Self::External(right)) => left == right,
             (Self::RecursiveInline(left), Self::RecursiveInline(right)) => {
                 core::ptr::eq(left, right)
             }
@@ -3564,6 +3566,7 @@ impl PartialEq for MaterializedCteSource<'_> {
                 core::ptr::eq(left.with, right.with) && left.index == right.index
             }
             (Self::Deferred(left), Self::Deferred(right)) => core::ptr::eq(left.rows, right.rows),
+            (Self::Recursive(left), Self::Recursive(right)) => left.same_query(&right),
             _ => false,
         }
     }
@@ -3632,10 +3635,10 @@ impl<'a> MaterializedCte<'a> {
         match self.source {
             MaterializedCteSource::Inline(rows) => rows,
             MaterializedCteSource::RecursiveInline(source) => inline_rows(source),
+            MaterializedCteSource::Recursive(query) => query.completed_rows(),
             // Only a read runs the query; see `read_rows`.
             MaterializedCteSource::Write(_)
             | MaterializedCteSource::Deferred(_)
-            | MaterializedCteSource::External(_)
             | MaterializedCteSource::RecursiveExternal(_) => &[],
         }
     }
@@ -3654,13 +3657,13 @@ impl<'a> MaterializedCte<'a> {
             MaterializedCteSource::Deferred(deferred) => {
                 crate::sql::query::read_deferred_cte(deferred, arena, query)
             }
+            MaterializedCteSource::Recursive(recursive) => recursive.read_all(arena, query),
             _ => Ok(self.rows()),
         }
     }
 
     pub(crate) fn external_run(&self) -> Option<crate::sql::external::ExternalRun> {
         match self.source {
-            MaterializedCteSource::External(run) => run,
             MaterializedCteSource::RecursiveExternal(address) => {
                 let address = address.load(core::sync::atomic::Ordering::Relaxed);
                 if address == 0 {
@@ -3670,6 +3673,7 @@ impl<'a> MaterializedCte<'a> {
                     Some(unsafe { *(address as *const crate::sql::external::ExternalRun) })
                 }
             }
+            MaterializedCteSource::Recursive(query) => query.completed_run(),
             MaterializedCteSource::Inline(_)
             | MaterializedCteSource::RecursiveInline(_)
             | MaterializedCteSource::Write(_)
@@ -6686,10 +6690,11 @@ impl<'a> Expr<'a> {
             | Expr::BitLit(_)
             | Expr::BoundLiteral { .. } => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
+            // A custom plan's parameter is a constant (`PARAM_FLAG_CONST`).
+            Expr::Param(index) => crate::sql::eval::custom_plan_binds(*index),
             Expr::Column { .. }
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
-            | Expr::Param(_)
             | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }

@@ -28446,7 +28446,7 @@ fn pg_prepared_statements<'a>(
                         parameter_types,
                         result_types,
                         Datum::Bool(true),
-                        Datum::Int8(0),
+                        Datum::Int8(prepared.generic_plans),
                         Datum::Int8(prepared.custom_plans),
                     ],
                     arena,

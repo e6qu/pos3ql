@@ -3092,15 +3092,8 @@ fn save_cursor_rows(
         capture.set_render(render);
         query.with_query(|parsed, params, _| match parsed {
             cursor::CursorStatement::Select(select) => {
-                let select = match query::expand_ctes_exec(
-                    select,
-                    storage,
-                    txid,
-                    work,
-                    params,
-                    &[],
-                    Some(sequence),
-                ) {
+                let select = match query::expand_ctes_exec(select, storage, txid, work, params, &[])
+                {
                     Ok(select) => select,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -15756,7 +15749,7 @@ impl Engine {
                 continue;
             }
             let (dml, mut materialized) =
-                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params, guc)?;
+                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params)?;
             materialized.source = if deferred {
                 Self::write_query_source(with, cte_index, params)
             } else {
@@ -15818,7 +15811,6 @@ impl Engine {
         txn: &mut TxnState,
         arena: &'a Arena,
         params: &[Datum<'a>],
-        guc: &GucState,
     ) -> Result<(&'a Stmt<'a>, ast::MaterializedCte<'a>), SqlError> {
         analyze_dml_cte(
             &self.storage,
@@ -15828,7 +15820,6 @@ impl Engine {
             txn.txid,
             arena,
             params,
-            &sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
         )
     }
 
@@ -16049,7 +16040,6 @@ impl Engine {
                 progress,
                 arena,
                 txn,
-                guc,
                 responder,
             ) {
                 // SAFETY: as above.
@@ -16135,7 +16125,6 @@ impl Engine {
         progress: &exec::RowProgress,
         arena: &Arena,
         txn: &mut TxnState,
-        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Option<KeptDriven>, SqlError> {
         if !matches!(with[index].dml, Some(Stmt::Insert(insert)) if insert.select.is_some()) {
@@ -16158,7 +16147,7 @@ impl Engine {
                 continue;
             }
             let (_, mut materialized) =
-                self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, block, params, guc)?;
+                self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, block, params)?;
             materialized.source = Self::write_query_source(with, prior, params);
             let materialized = block
                 .alloc(materialized)
@@ -16167,8 +16156,7 @@ impl Engine {
                 .push((with[prior].name, &*materialized))
                 .map_err(|_| query::arena_full_pub())?;
         }
-        let (dml, _) =
-            self.analyze_dml_cte(with, index, earlier.as_slice(), txn, block, params, guc)?;
+        let (dml, _) = self.analyze_dml_cte(with, index, earlier.as_slice(), txn, block, params)?;
         let (work, buffers) = self.work.cursor_parts();
         DrivenInsert::open(
             &self.storage,
@@ -16339,7 +16327,7 @@ impl Engine {
                     continue;
                 }
                 let (_, mut materialized) =
-                    self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, arena, params, guc)?;
+                    self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, arena, params)?;
                 materialized.source = Self::write_query_source(with, prior, params);
                 let materialized = arena
                     .alloc(materialized)
@@ -16349,7 +16337,7 @@ impl Engine {
                     .map_err(|_| query::arena_full_pub())?;
             }
             let (dml, _) =
-                self.analyze_dml_cte(with, index, earlier.as_slice(), txn, arena, params, guc)?;
+                self.analyze_dml_cte(with, index, earlier.as_slice(), txn, arena, params)?;
             Ok::<_, SqlError>(dml)
         })();
         let dml = match analysed {
@@ -16480,7 +16468,7 @@ impl Engine {
                 continue;
             }
             let (dml, mut materialized) =
-                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params, guc)?;
+                self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params)?;
             materialized.source = ast::MaterializedCteSource::Inline({
                 // The query is its statement's `CTE name` InitPlan.
                 let _cte = query::instrument::enter(query::instrument::Segment::Cte(cte_index));
@@ -16573,20 +16561,11 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
-        let statement = match query::expand_dml_ctes(
-            statement,
-            &[],
-            storage,
-            txn.txid,
-            arena,
-            params,
-            &[],
-            Some(&sequence),
-        ) {
-            Ok(statement) => statement,
-            Err(error) => return Ok(Err(error)),
-        };
+        let statement =
+            match query::expand_dml_ctes(statement, &[], storage, txn.txid, arena, params, &[]) {
+                Ok(statement) => statement,
+                Err(error) => return Ok(Err(error)),
+            };
         let (relation, event) = match statement {
             Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
             Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
@@ -17069,11 +17048,6 @@ impl Engine {
                 dependencies.view(),
                 arena,
                 params,
-                Some(&sequence::SeqEval::new(
-                    storage,
-                    guc.seq_session(),
-                    txn.txid,
-                )),
                 rule_owner,
                 binding.0,
                 binding.1,
@@ -17244,11 +17218,6 @@ impl Engine {
                             dependencies.view(),
                             arena,
                             params,
-                            Some(&sequence::SeqEval::new(
-                                storage,
-                                guc.seq_session(),
-                                txn.txid,
-                            )),
                             rule_owner,
                             transition.names,
                             transition.old,
@@ -17287,11 +17256,6 @@ impl Engine {
                         dependencies.view(),
                         arena,
                         params,
-                        Some(&sequence::SeqEval::new(
-                            storage,
-                            guc.seq_session(),
-                            txn.txid,
-                        )),
                         rule_owner,
                         transition.names,
                         transition.old,
@@ -17740,20 +17704,11 @@ impl Engine {
         }
         // Expand every DML source before the mutable storage borrow so views
         // behave consistently across INSERT, UPDATE FROM, DELETE USING and MERGE.
-        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
-        let statement = match query::expand_dml_ctes(
-            statement,
-            &[],
-            storage,
-            txn.txid,
-            arena,
-            params,
-            &[],
-            Some(&sequence),
-        ) {
-            Ok(expanded) => expanded,
-            Err(error) => return Ok(Err(error)),
-        };
+        let statement =
+            match query::expand_dml_ctes(statement, &[], storage, txn.txid, arena, params, &[]) {
+                Ok(expanded) => expanded,
+                Err(error) => return Ok(Err(error)),
+            };
         let relation = match statement {
             Stmt::Insert(insert) => Some(insert.table),
             Stmt::Update(update) => Some(update.table),
@@ -17905,21 +17860,12 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
-        let expanded = match query::expand_dml_ctes(
-            statement,
-            &[],
-            storage,
-            txn.txid,
-            arena,
-            params,
-            &[],
-            Some(&sequence),
-        ) {
-            Ok(Stmt::Merge(merge)) => merge,
-            Ok(_) => unreachable!("MERGE source expansion keeps its statement kind"),
-            Err(error) => return Ok(Err(error)),
-        };
+        let expanded =
+            match query::expand_dml_ctes(statement, &[], storage, txn.txid, arena, params, &[]) {
+                Ok(Stmt::Merge(merge)) => merge,
+                Ok(_) => unreachable!("MERGE source expansion keeps its statement kind"),
+                Err(error) => return Ok(Err(error)),
+            };
         exec::merge(
             storage,
             txn,
@@ -19971,8 +19917,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Option<Result<(), SqlError>>, WireFull> {
         let mark = arena.mark();
-        let opened =
-            self.open_write_readers(statement, dml_mats, arena, params, txn, guc, responder);
+        let opened = self.open_write_readers(statement, dml_mats, arena, params, txn, responder);
         let mut readers = match opened {
             Ok(Some(readers)) => readers,
             Ok(None) => {
@@ -20058,7 +20003,6 @@ impl Engine {
         arena: &'statement Arena,
         params: &[Datum<'statement>],
         txn: &mut TxnState,
-        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<
         Option<[Option<query::RetainedSelect<'statement>>; query::MAX_RETAINED_SOURCES]>,
@@ -20106,16 +20050,7 @@ impl Engine {
                 })
                 .map_err(|_| query::arena_full_pub())?;
             let expanded = {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                query::expand_ctes_exec(
-                    query,
-                    &self.storage,
-                    txn.txid,
-                    arena,
-                    params,
-                    dml_mats,
-                    Some(&sequence),
-                )?
+                query::expand_ctes_exec(query, &self.storage, txn.txid, arena, params, dml_mats)?
             };
             reads_writes |= expanded.from.as_ref().is_some_and(|from| {
                 from.base
@@ -20206,7 +20141,6 @@ impl Engine {
             &self.work,
             params,
             dml_mats,
-            Some(&sequence),
         ) {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
@@ -21619,7 +21553,6 @@ impl Engine {
         };
         let expanded = match with {
             Some((ctes, dml_mats)) => {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 match query::expand_dml_ctes(
                     statement,
                     ctes,
@@ -21628,7 +21561,6 @@ impl Engine {
                     block,
                     params,
                     dml_mats,
-                    Some(&sequence),
                 ) {
                     Ok(expanded) => expanded,
                     Err(error) => return Ok(Some(Err(error))),
@@ -21694,7 +21626,6 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         let connection_id = self.work.connection_id();
         let (work, row_buffers) = self.work.cursor_parts();
-        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_dml_ctes(
             statement,
             ctes,
@@ -21703,7 +21634,6 @@ impl Engine {
             work,
             params,
             dml_mats,
-            Some(&sequence),
         ) {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
@@ -23661,6 +23591,27 @@ impl Engine {
                     }
                     _ => (&**statement, None),
                 };
+                // `ExplainExecuteQuery` evaluates the arguments, then takes
+                // the statement's cached plan (`GetCachedPlan`): a custom plan
+                // folds the argument values in, a generic one prints `$n`.
+                let mut prepared_params: &[Datum] = &[];
+                let mut custom_plan = false;
+                if let Stmt::ExecutePrepared { name, args } = statement {
+                    prepared_params = match self.prepared_arguments(
+                        name,
+                        args,
+                        params,
+                        sqlprep,
+                        arena,
+                        txn.txid,
+                        guc.seq_session(),
+                    ) {
+                        Ok((values, _)) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    custom_plan = sqlprep.choose_plan(name, guc.plan_cache_mode())
+                        == prep::PlanChoice::Custom;
+                }
                 let planned = with_prepared_parameter_types(parameter_types, || {
                     self.prepare_planner_inputs(
                         planned_statement,
@@ -23691,13 +23642,20 @@ impl Engine {
                     Some(_) => None,
                     None => {
                         let plan = with_prepared_parameter_types(parameter_types, || {
-                            explain::plan_statement(
-                                &self.storage,
-                                txn.txid,
-                                planned_statement,
-                                query::instrument::BlockId::ROOT,
-                                arena,
-                            )
+                            let plan = || {
+                                explain::plan_statement(
+                                    &self.storage,
+                                    txn.txid,
+                                    planned_statement,
+                                    query::instrument::BlockId::ROOT,
+                                    arena,
+                                )
+                            };
+                            if custom_plan {
+                                eval::with_custom_plan_parameters(prepared_params, plan)
+                            } else {
+                                plan()
+                            }
                         });
                         match plan {
                             Ok(plan) => Some(plan),
@@ -23705,26 +23663,6 @@ impl Engine {
                         }
                     }
                 };
-                // SQL EXECUTE arguments are bounded by the pool's declared
-                // parameter count (prep::MAX_PREP_PARAMS) whenever types were
-                // declared; an arena slice carries the undeclared case too.
-                let mut prepared_params: &[Datum] = &[];
-                if options.analyze
-                    && let Stmt::ExecutePrepared { name, args } = statement
-                {
-                    prepared_params = match self.prepared_arguments(
-                        name,
-                        args,
-                        params,
-                        sqlprep,
-                        arena,
-                        txn.txid,
-                        guc.seq_session(),
-                    ) {
-                        Ok((values, _)) => values,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
                     let (before_wal_records, before_wal_bytes) = self.wal.stage_stats(txn.txid);
@@ -26162,7 +26100,7 @@ impl Engine {
                                 {
                                     return Ok(Err(error));
                                 }
-                                sqlprep.record_custom_plan(name);
+                                sqlprep.choose_plan(name, guc.plan_cache_mode());
                                 exec::with_bound_parameter_types(parameter_oids, || {
                                     self.execute_stmt(
                                         &statement,
@@ -34393,7 +34331,6 @@ pub(crate) fn analyze_dml_cte<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: &dyn SequenceAccess,
 ) -> Result<(&'a Stmt<'a>, ast::MaterializedCte<'a>), SqlError> {
     use crate::sql::exec::MAX_PROJ;
     use crate::sql::types::ColDesc;
@@ -34416,7 +34353,6 @@ pub(crate) fn analyze_dml_cte<'a>(
         arena,
         params,
         earlier,
-        Some(sequences),
     )?;
     if !matches!(
         dml,

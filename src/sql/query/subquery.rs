@@ -4737,6 +4737,9 @@ fn run_subquery<'a>(
     } else {
         None
     };
+    let stages = super::instrument::Stages::current();
+    let _limit_loop = stages.limit.start();
+    let _sort_loop = (n_keys > 0).then(|| stages.sort.start());
     let mut vals = ArenaList::new(arena);
     let mut keys = ArenaList::new(arena);
     // `LIMIT 0` reads no row.
@@ -4812,6 +4815,23 @@ fn run_subquery<'a>(
     let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
+    if n_keys > 0 {
+        // The sort returns the rows the limit pulls: those it skips and
+        // those it returns.
+        stages.sort.rows((start + n) as u64);
+        let bound = usize::try_from((offset as u64).saturating_add(limit))
+            .ok()
+            .filter(|&bound| select.limit.is_some() && count > bound * 2);
+        stages.sort.sorted(super::instrument::SortSpace {
+            method: if bound.is_some() {
+                super::instrument::SortMethod::TopNHeapsort
+            } else {
+                super::instrument::SortMethod::Quicksort
+            },
+            bytes: core::mem::size_of_val(vals) + core::mem::size_of_val(keys),
+        });
+    }
+    stages.limit.rows(n as u64);
     let mut saw_null = false;
     let out = arena
         .alloc_slice_with(n, |i| {

@@ -148,6 +148,7 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
             }
         }
         let columns = super::CatalogCols {
+            remote_ctid: false,
             definition: Some(crate::storage::RelationDefinition::from_definition(def)),
             alias: None,
             output_aliases: &[],
@@ -724,6 +725,7 @@ pub(super) fn resolve_default(
     let analysed = super::infer_type_res(
         expression,
         &super::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -1049,6 +1051,7 @@ pub(crate) fn require_immutable_index_expression<Definition0: crate::storage::De
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let columns = super::CatalogCols {
+        remote_ctid: false,
         definition: Some(crate::storage::RelationDefinition::from_definition(table)),
         alias: None,
         output_aliases: &[],
@@ -2008,6 +2011,7 @@ pub(super) fn attach_constraints(
                     let analysed = super::infer_type_res(
                         expression,
                         &super::CatalogCols {
+                            remote_ctid: false,
                             definition: Some(crate::storage::RelationDefinition::from_definition(
                                 def,
                             )),
@@ -2320,6 +2324,7 @@ fn exclusion_expression_type(
     let (type_oid, _) = super::infer_type_res(
         expression,
         &super::CatalogCols {
+            remote_ctid: false,
             definition: Some(crate::storage::RelationDefinition::from_definition(def)),
             alias: None,
             output_aliases: &[],

@@ -931,6 +931,7 @@ fn table_qual_cost<'t>(
             definition,
             alias: (exposed != definition.name.as_str()).then_some(exposed),
             output_aliases: &[],
+            remote_ctid: false,
         };
         query::qual_cost(conjunct, &columns, storage, txid, arena)
     }
@@ -2354,6 +2355,7 @@ fn single_relation_quals<'a>(
             definition: crate::storage::RelationDefinition::from_definition(table),
             alias: (exposed != table.name.as_str()).then_some(exposed),
             output_aliases: &[],
+            remote_ctid: false,
         };
         let ordered = arena
             .alloc_slice_with(security.len() + kept, |position| {
@@ -2551,6 +2553,7 @@ fn projected_shape<'a>(
                 definition: crate::storage::RelationDefinition::from_definition(definition),
                 alias: Some(name.as_str()),
                 output_aliases: &[],
+                remote_ctid: false,
             });
     let count = match scope {
         Some(scope) => query::describe_scope_items(
@@ -2620,6 +2623,7 @@ fn selects_aggregate(
         arena,
     });
     let empty_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -3933,6 +3937,7 @@ fn plan_pulled_select<'a>(
         arena,
     });
     let empty_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],

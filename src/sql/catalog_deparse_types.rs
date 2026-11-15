@@ -211,6 +211,7 @@ impl Context<'_> {
         let types = ScopeTypes {
             context: self,
             catalog: CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -261,6 +262,7 @@ impl Context<'_> {
         let types = ScopeTypes {
             context: self,
             catalog: CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],

@@ -1301,6 +1301,7 @@ impl<'a> RelationTargets<'a> {
             definition: crate::storage::RelationDefinition::from_definition(self.table),
             alias,
             output_aliases: &[],
+            remote_ctid: false,
         };
         let bound = matches!(
             value,

@@ -352,6 +352,7 @@ fn validate_table_sample<'a>(
         return Ok(());
     };
     let columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],

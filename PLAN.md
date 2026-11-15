@@ -974,7 +974,9 @@ more ship as one grouped scan (`differential_exact/583`). A foreign scan
 under a window or a local aggregate returns the window's input or the whole
 row, as a table scan does, and a `WINDOW` definition's keys are read whether
 or not a window uses them (`differential_exact/581`).
-Direct `UPDATE`/`DELETE` (with statement triggers firing around the remote
+A write's `RETURNING` list may read the remote row's `ctid`, which the remote
+`UPDATE`, `DELETE` or `INSERT` returns after the columns it reads
+(`deparseReturningList`; `differential_exact/584`). Direct `UPDATE`/`DELETE` (with statement triggers firing around the remote
 statement; a row trigger for its event or a stored generated column keeps it
 row by row) ships the columns its `RETURNING` list reads and projects that
 list over the returned rows; a `RETURNING` that reads `old` or `new` runs row
@@ -1003,9 +1005,8 @@ query does not read is computed where PostgreSQL replaces it with a typed
 a `WHERE` clause and no `ORDER BY` is hashed locally (as PostgreSQL's costs
 choose) with its scan's `Output` listing only the read columns; a refused
 connection reports `HV000` with the transport error where PostgreSQL
-reports `08001` `could not connect to server` with libpq's detail;
-`RETURNING ctid` of a foreign
-table fails with `42703`; and `EXPLAIN EXECUTE` plans a prepared statement
+reports `08001` `could not connect to server` with libpq's detail; and
+`EXPLAIN EXECUTE` plans a prepared statement
 with its parameters unbound, so a condition on `$1` neither ships nor
 prints. A select list or `ORDER BY` with a subquery reads every column. A
 query whose only FROM item is a foreign table, a scalar or `EXISTS` subquery

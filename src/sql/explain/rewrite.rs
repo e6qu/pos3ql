@@ -1354,6 +1354,7 @@ fn passes_columns(
             None => crate::sql::exec::infer_type_res(
                 expression,
                 &crate::sql::exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],

@@ -2158,6 +2158,7 @@ fn subquery_exists<'a>(
             scope: None,
             outer,
             catalog: crate::sql::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -3470,6 +3471,7 @@ fn subquery_item_type(
             scope,
             outer,
             catalog: crate::sql::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -3508,6 +3510,7 @@ impl<'scope, 'definition, 'outer, 'row, 'catalog>
             scope: Some(scope),
             outer,
             catalog: crate::sql::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -3875,6 +3878,7 @@ pub(crate) fn subquery_expression_type<'a>(
                 scope: scope.as_ref(),
                 outer: Some(outer),
                 catalog: crate::sql::exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],
@@ -3937,6 +3941,7 @@ pub(crate) fn subquery_expression_type<'a>(
         scope: scope.as_ref(),
         outer: Some(outer),
         catalog: crate::sql::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -4497,6 +4502,7 @@ fn run_subquery<'a>(
             scope: None,
             outer,
             catalog: crate::sql::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],
@@ -4622,6 +4628,7 @@ fn run_subquery<'a>(
         scope: Some(&scope),
         outer,
         catalog: crate::sql::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],

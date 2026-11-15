@@ -3738,6 +3738,7 @@ pub(crate) fn filter_view_rows<'a>(
         arena,
     });
     let empty_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -3830,6 +3831,7 @@ pub(crate) fn filter_view_rows<'a>(
         shallow: false,
     };
     let outer_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: Some(definition),
         alias,
         output_aliases: &[],

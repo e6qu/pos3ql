@@ -146,6 +146,7 @@ fn move_having_to_where<'a>(
         arena,
     });
     let fromless = super::super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -403,6 +404,7 @@ fn grouped_query(select: &Select<'_>, storage: &Storage, txid: u32, arena: &Aren
         return true;
     }
     let columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -687,6 +689,7 @@ fn pull_up_one<'a>(
         arena,
     });
     let fromless = super::super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],

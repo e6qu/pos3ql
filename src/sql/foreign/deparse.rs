@@ -3143,6 +3143,47 @@ fn plan_with<'a>(
     })
 }
 
+/// What a foreign write's remote `RETURNING` list returns
+/// (`deparseReturningList`): the columns the local statement reads, in table
+/// order, then the remote row's `ctid` when the statement reads it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteReturning {
+    pub columns: ColumnSet,
+    pub ctid: bool,
+}
+
+impl RemoteReturning {
+    pub(crate) const NONE: Self = Self {
+        columns: ColumnSet::EMPTY,
+        ctid: false,
+    };
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.columns.is_empty() && !self.ctid
+    }
+
+    /// The fields each returned row carries.
+    pub(crate) fn fields(self) -> usize {
+        self.columns.count_ones() as usize + usize::from(self.ctid)
+    }
+
+    /// ` RETURNING col, ..., ctid`, nothing when the list is empty.
+    pub(crate) fn write(self, deparser: &Deparser<'_>, output: &mut impl core::fmt::Write) {
+        if self.is_empty() {
+            return;
+        }
+        let _ = output.write_str(" RETURNING ");
+        if self.columns.is_empty() {
+            let _ = output.write_str("ctid");
+            return;
+        }
+        deparser.write_target_list(output, self.columns);
+        if self.ctid {
+            let _ = output.write_str(", ctid");
+        }
+    }
+}
+
 /// postgres_fdw's direct modification (`postgresPlanDirectModify`): an
 /// `UPDATE` (with `assignments`) or `DELETE` of one foreign table sent as one
 /// remote statement, when every condition and assigned value ships and no
@@ -3153,7 +3194,7 @@ pub(crate) fn direct_modify_sql<'a>(
     deparser: &Deparser<'_>,
     assignments: Option<&[(&str, &'a Expr<'a>)]>,
     predicate: Option<&'a Expr<'a>>,
-    returned: ColumnSet,
+    returned: RemoteReturning,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut conditions = RemoteText::new();
@@ -3204,10 +3245,7 @@ pub(crate) fn direct_modify_sql<'a>(
         }
     }
     let _ = sql.write_str(conditions.as_str());
-    if !returned.is_empty() {
-        let _ = sql.write_str(" RETURNING ");
-        deparser.write_target_list(&mut sql, returned);
-    }
+    returned.write(deparser, &mut sql);
     if sql.is_truncated() || conditions.is_truncated() {
         return Err(query_too_long());
     }
@@ -3229,8 +3267,8 @@ pub(crate) struct ForeignModifyScan<'a> {
     /// `UPDATE ... SET col = $2 ... WHERE ctid = $1` or
     /// `DELETE ... WHERE ctid = $1`, with its `RETURNING` list.
     pub modify_sql: &'a str,
-    /// The columns the command returns, in table order.
-    pub returned: ColumnSet,
+    /// What the command returns.
+    pub returned: RemoteReturning,
 }
 
 /// Plans the row-by-row form. `updated` lists an UPDATE's assigned columns
@@ -3240,7 +3278,7 @@ pub(crate) fn plan_modify_scan<'a>(
     deparser: &Deparser<'_>,
     updated: Option<ColumnSet>,
     predicate: Option<&'a Expr<'a>>,
-    returned: ColumnSet,
+    returned: RemoteReturning,
     whole_old: bool,
     arena: &'a Arena,
 ) -> Result<ForeignModifyScan<'a>, SqlError> {
@@ -3303,10 +3341,7 @@ pub(crate) fn plan_modify_scan<'a>(
         }
     }
     let _ = modify.write_str(" WHERE ctid = $1");
-    if !returned.is_empty() {
-        let _ = modify.write_str(" RETURNING ");
-        deparser.write_target_list(&mut modify, returned);
-    }
+    returned.write(deparser, &mut modify);
     if scan.is_truncated() || modify.is_truncated() || conditions.is_truncated() {
         return Err(query_too_long());
     }

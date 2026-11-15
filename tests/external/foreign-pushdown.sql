@@ -69,6 +69,15 @@ WITH w AS (UPDATE ft SET q = q + 1 WHERE id > 15 RETURNING id, q) SELECT * FROM 
 DO $$ DECLARE r int; BEGIN UPDATE ft SET q = q + 1 WHERE id = 14 RETURNING q INTO r; RAISE NOTICE 'r=%', r; END $$;
 UPDATE ft SET q = 2000 WHERE id = 15 RETURNING id;
 SELECT id, q FROM ft WHERE id BETWEEN 9 AND 20 ORDER BY id;
+-- RETURNING reads the remote row's ctid, which the remote command returns
+-- after the columns.
+BEGIN;
+UPDATE ft SET q = q + 1 WHERE id = 16 RETURNING ctid, id, q;
+UPDATE ft SET q = q + 1 WHERE id = 16 AND random() < 2 RETURNING ft.ctid;
+DELETE FROM ft WHERE id = 17 RETURNING ctid, id;
+DELETE FROM ft WHERE id = 18 AND random() < 2 RETURNING ctid;
+INSERT INTO ft (id, q) VALUES (40, 4) RETURNING ctid, id;
+ROLLBACK;
 
 -- Grouping and aggregates ship when the whole query does.
 :e SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;

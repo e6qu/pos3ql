@@ -22,6 +22,7 @@ fn collect_expression_dependencies<B: crate::storage::DefinitionBacking>(
     let result = (|| {
         let expression = crate::sql::parser::parse_expr(text, arena)?;
         let columns = super::CatalogCols {
+            remote_ctid: false,
             definition: Some(crate::storage::RelationDefinition::from_definition(def)),
             alias: None,
             output_aliases: &[],

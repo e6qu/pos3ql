@@ -954,6 +954,7 @@ pub(crate) fn fromless_key_is_constant(
         return Ok(false);
     }
     let columns = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -6078,6 +6079,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
         let columns = super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -9054,6 +9056,7 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         scope: None,
         outer: Some(row),
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -10251,6 +10254,7 @@ fn resolve_group_ordinals<'a>(
         arena,
     });
     let empty_columns = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -10629,6 +10633,7 @@ pub(super) fn resolve_position_target<'a>(
                         arena,
                     });
                     let empty_columns = super::exec::CatalogCols {
+                        remote_ctid: false,
                         definition: None,
                         alias: None,
                         output_aliases: &[],
@@ -10961,6 +10966,7 @@ pub(crate) fn validate_static_grouping<'a>(
         scope: Some(scope),
         outer: None,
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -11011,6 +11017,7 @@ where
         scope,
         outer: Some(outer),
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -12047,6 +12054,7 @@ fn check_fromless_literal_operands<'a>(
     txid: u32,
 ) -> Result<(), SqlError> {
     let columns = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -12747,6 +12755,7 @@ pub fn validate_locking(
         arena,
     });
     let fromless = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -13821,6 +13830,7 @@ pub(crate) fn analyse_fromless_select<'a>(
         return Ok(());
     }
     let columns = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -13988,6 +13998,7 @@ pub(crate) fn constant_select_resumable<'a>(
     };
 
     let resolved_columns = super::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -14872,6 +14883,7 @@ fn select_into_rows_mode<'a>(
         scope: analysis_scope.as_ref(),
         outer,
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -15277,6 +15289,7 @@ fn select_into_rows_mode<'a>(
         scope: Some(&scope),
         outer,
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -16061,6 +16074,7 @@ pub fn describe_catalog_items_as<'q>(
             super::exec::infer_type_res(
                 expression,
                 &super::exec::CatalogCols {
+                    remote_ctid: false,
                     definition,
                     alias,
                     output_aliases: &[],
@@ -17176,6 +17190,7 @@ fn aggregate_outer_columns<'s, 'd, 'o, 'r, 'c>(
         scope,
         outer: Some(outer),
         catalog: super::exec::CatalogCols {
+            remote_ctid: false,
             definition: None,
             alias: None,
             output_aliases: &[],
@@ -17904,6 +17919,7 @@ pub(super) fn record_star_width(
         }
         None => {
             fromless = super::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],

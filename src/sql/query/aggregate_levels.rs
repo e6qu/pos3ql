@@ -1119,6 +1119,7 @@ impl<'a> Analysis<'a> {
             }
             Columns::Hidden => {
                 fromless = crate::sql::exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],

@@ -2131,6 +2131,11 @@ impl Context<'_> {
                 query::sublink(self, select, output)?;
                 output.push("))")
             }
+            // A generic plan's external parameter (`get_parameter`).
+            Expr::Param(index) => {
+                output.push("$")?;
+                output.push(crate::stack_format!(16, "{index}").as_str())
+            }
             _ => output.unsupported(),
         }
     }

@@ -90857,7 +90857,7 @@ fn prepared_statement_catalog_describes_queries_and_dml_without_fallbacks() {
          EXECUTE select_plan(7); \
          EXECUTE insert_plan(8); \
          EXECUTE values_plan; \
-         SELECT name, custom_plans FROM pg_prepared_statements ORDER BY name; \
+         SELECT name, generic_plans, custom_plans FROM pg_prepared_statements ORDER BY name; \
          DEALLOCATE ALL; \
          SELECT count(*) FROM pg_prepared_statements",
     );
@@ -90871,9 +90871,10 @@ fn prepared_statement_catalog_describes_queries_and_dml_without_fallbacks() {
             "8|inserted",
             "1|one",
             "2|two",
-            "insert_plan|1",
-            "select_plan|1",
-            "values_plan|1",
+            // A statement without parameters runs its generic plan.
+            "insert_plan|0|1",
+            "select_plan|0|1",
+            "values_plan|1|0",
             "0",
         ],
         "{}",

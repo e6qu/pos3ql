@@ -889,3 +889,49 @@ fn lateral_items_plan_with_their_outer_columns() {
         ]
     );
 }
+
+#[test]
+fn explain_execute_shows_custom_and_generic_plans() {
+    let (mut session, mut engine) = setup("explain_execute_shows_custom_and_generic_plans");
+    session.success(
+        &mut engine,
+        "PREPARE pn_q(int, text) AS SELECT b FROM pn_t WHERE b > $1 AND $2 = 'x'",
+        true,
+    );
+    let mut explain = |sql: &str| {
+        data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {sql}"), true))
+    };
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'x')"),
+        ["Seq Scan on pn_t", "  Filter: (b > 98)"]
+    );
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'y')"),
+        ["Result", "  One-Time Filter: false"]
+    );
+    session.success(
+        &mut engine,
+        "SET plan_cache_mode = force_generic_plan",
+        true,
+    );
+    let mut explain = |sql: &str| {
+        data_rows(&session.success(&mut engine, &format!("EXPLAIN (COSTS OFF) {sql}"), true))
+    };
+    assert_eq!(
+        explain("EXECUTE pn_q(98, 'x')"),
+        [
+            "Result",
+            "  One-Time Filter: ($2 = 'x'::text)",
+            "  ->  Seq Scan on pn_t",
+            "        Filter: (b > $1)",
+        ]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT generic_plans, custom_plans FROM pg_prepared_statements",
+            true
+        )),
+        ["1|2"]
+    );
+}

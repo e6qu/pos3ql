@@ -60,6 +60,7 @@ struct Slot {
     text_len: usize,
     n_params: usize,
     prepared_at: i64,
+    generic_plans: i64,
     custom_plans: i64,
     n_results: usize,
     input_bytes: usize,
@@ -97,6 +98,7 @@ pub(crate) struct PreparedInfo<'a> {
     pub(crate) statement: &'a str,
     pub(crate) parameter_types: PreparedTypeOids<'a>,
     pub(crate) prepared_at: i64,
+    pub(crate) generic_plans: i64,
     pub(crate) custom_plans: i64,
     pub(crate) result_types: PreparedTypeOids<'a>,
 }
@@ -163,6 +165,7 @@ impl SqlPreparedPool {
                 text_len: 0,
                 n_params: 0,
                 prepared_at: 0,
+                generic_plans: 0,
                 custom_plans: 0,
                 n_results: 0,
                 input_bytes: 0,
@@ -248,6 +251,7 @@ impl SqlPreparedPool {
         slot.input_bytes = type_inputs.len();
         slot.name = SqlName::parse(name)?;
         slot.prepared_at = crate::sql::datetime::now_micros();
+        slot.generic_plans = 0;
         slot.custom_plans = 0;
         slot.active = true;
         slot.plan = plan;
@@ -524,6 +528,7 @@ impl SqlPreparedPool {
                     bytes: &slot.data.readable()[slot.text_len..result_start],
                 },
                 prepared_at: slot.prepared_at,
+                generic_plans: slot.generic_plans,
                 custom_plans: slot.custom_plans,
                 result_types: PreparedTypeOids {
                     bytes: &slot.data.readable()[result_start..result_end],
@@ -532,14 +537,44 @@ impl SqlPreparedPool {
         }
     }
 
-    pub(crate) fn record_custom_plan(&mut self, name: &str) {
+    /// PostgreSQL's `choose_custom_plan` for one execution of `name`, which
+    /// `GetCachedPlan` counts: a statement without parameters runs its
+    /// generic plan; `plan_cache_mode` forces one kind; otherwise the first
+    /// five executions get custom plans, then the generic plan.
+    /// PostgreSQL then keeps the generic plan only while its estimated cost
+    /// is below the custom plans' average; pos3ql does not compare the two.
+    pub(crate) fn choose_plan(
+        &mut self,
+        name: &str,
+        mode: crate::sql::guc::PlanCacheMode,
+    ) -> PlanChoice {
         let slot = self
             .slots
             .iter_mut()
             .find(|slot| slot.active && slot.name.as_str() == name)
             .expect("prepared statement was resolved before execution");
-        slot.custom_plans = slot.custom_plans.saturating_add(1);
+        let custom = slot.n_params > 0
+            && match mode {
+                crate::sql::guc::PlanCacheMode::ForceGenericPlan => false,
+                crate::sql::guc::PlanCacheMode::ForceCustomPlan => true,
+                crate::sql::guc::PlanCacheMode::Auto => slot.custom_plans < 5,
+            };
+        if custom {
+            slot.custom_plans = slot.custom_plans.saturating_add(1);
+            PlanChoice::Custom
+        } else {
+            slot.generic_plans = slot.generic_plans.saturating_add(1);
+            PlanChoice::Generic
+        }
     }
+}
+
+/// The plan an execution of a prepared statement uses: one planned for its
+/// parameter values, or one planned once for any values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlanChoice {
+    Custom,
+    Generic,
 }
 
 /// PostgreSQL's assignment coercion test for an `EXECUTE` argument

@@ -17,7 +17,7 @@ use super::eval::SqlError;
 
 mod planner;
 
-pub(crate) use planner::{PlannerMethods, format_g};
+pub(crate) use planner::{PlanCacheMode, PlannerMethods, format_g};
 
 /// Maximum stored byte length of a session search path. The resolver's
 /// entry bound is derived from this value, so a byte-valid path cannot overrun
@@ -2422,6 +2422,10 @@ impl GucState {
     /// Captures the non-default session values which the planner consumes.
     /// The returned storage is fixed-size and owns its values so rendering can
     /// continue after the GUC borrow ends.
+    pub(crate) fn plan_cache_mode(&self) -> PlanCacheMode {
+        self.store.borrow().current.planner.plan_cache_mode()
+    }
+
     pub(crate) fn planner_settings(&self) -> PlannerSettings {
         let state = self.store.borrow();
         let current = &state.current;

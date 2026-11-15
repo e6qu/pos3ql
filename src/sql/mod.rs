@@ -23590,6 +23590,27 @@ impl Engine {
                     }
                     _ => (&**statement, None),
                 };
+                // `ExplainExecuteQuery` evaluates the arguments, then takes
+                // the statement's cached plan (`GetCachedPlan`): a custom plan
+                // folds the argument values in, a generic one prints `$n`.
+                let mut prepared_params: &[Datum] = &[];
+                let mut custom_plan = false;
+                if let Stmt::ExecutePrepared { name, args } = statement {
+                    prepared_params = match self.prepared_arguments(
+                        name,
+                        args,
+                        params,
+                        sqlprep,
+                        arena,
+                        txn.txid,
+                        guc.seq_session(),
+                    ) {
+                        Ok((values, _)) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    custom_plan = sqlprep.choose_plan(name, guc.plan_cache_mode())
+                        == prep::PlanChoice::Custom;
+                }
                 let planned = with_prepared_parameter_types(parameter_types, || {
                     self.prepare_planner_inputs(
                         planned_statement,
@@ -23620,13 +23641,20 @@ impl Engine {
                     Some(_) => None,
                     None => {
                         let plan = with_prepared_parameter_types(parameter_types, || {
-                            explain::plan_statement(
-                                &self.storage,
-                                txn.txid,
-                                planned_statement,
-                                query::instrument::BlockId::ROOT,
-                                arena,
-                            )
+                            let plan = || {
+                                explain::plan_statement(
+                                    &self.storage,
+                                    txn.txid,
+                                    planned_statement,
+                                    query::instrument::BlockId::ROOT,
+                                    arena,
+                                )
+                            };
+                            if custom_plan {
+                                eval::with_custom_plan_parameters(prepared_params, plan)
+                            } else {
+                                plan()
+                            }
                         });
                         match plan {
                             Ok(plan) => Some(plan),
@@ -23634,26 +23662,6 @@ impl Engine {
                         }
                     }
                 };
-                // SQL EXECUTE arguments are bounded by the pool's declared
-                // parameter count (prep::MAX_PREP_PARAMS) whenever types were
-                // declared; an arena slice carries the undeclared case too.
-                let mut prepared_params: &[Datum] = &[];
-                if options.analyze
-                    && let Stmt::ExecutePrepared { name, args } = statement
-                {
-                    prepared_params = match self.prepared_arguments(
-                        name,
-                        args,
-                        params,
-                        sqlprep,
-                        arena,
-                        txn.txid,
-                        guc.seq_session(),
-                    ) {
-                        Ok((values, _)) => values,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
                     let (before_wal_records, before_wal_bytes) = self.wal.stage_stats(txn.txid);
@@ -26091,7 +26099,7 @@ impl Engine {
                                 {
                                     return Ok(Err(error));
                                 }
-                                sqlprep.record_custom_plan(name);
+                                sqlprep.choose_plan(name, guc.plan_cache_mode());
                                 exec::with_bound_parameter_types(parameter_oids, || {
                                     self.execute_stmt(
                                         &statement,

@@ -6685,10 +6685,11 @@ impl<'a> Expr<'a> {
             | Expr::BitLit(_)
             | Expr::BoundLiteral { .. } => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
+            // A custom plan's parameter is a constant (`PARAM_FLAG_CONST`).
+            Expr::Param(index) => crate::sql::eval::custom_plan_binds(*index),
             Expr::Column { .. }
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
-            | Expr::Param(_)
             | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }

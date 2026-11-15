@@ -997,9 +997,14 @@ hashed locally (as PostgreSQL's costs choose) with its scan's `Output`
 listing only the read columns; a window's and an upper node's `Output` lines
 print the window and grouped columns by name; a grouped scan read through a
 view or subquery prints unqualified columns; `RETURNING ctid` of a foreign
-table fails with `42703`; and `EXPLAIN EXECUTE` plans a prepared statement
-with its parameters unbound, so a condition on `$1` neither ships nor
-prints. A select list or `ORDER BY` with a subquery reads every column. A
+table fails with `42703`; and a condition on a prepared statement's
+parameter does not ship: `EXPLAIN EXECUTE` prints it as a local `Filter`,
+with the argument's value in a custom plan and `$1` in a generic one, where
+PostgreSQL sends the value or `$1::integer`. A prepared statement takes
+custom plans for its first five executions and its generic plan after
+them, as `choose_custom_plan` does under `plan_cache_mode = auto`, without
+PostgreSQL's comparison of the generic plan's cost with the custom plans'
+average. A select list or `ORDER BY` with a subquery reads every column. A
 query whose only FROM item is a foreign table, a scalar or `EXISTS` subquery
 over one, and a foreign partition or inheritance child read its cursor one
 `FETCH` batch at a time as the plan consumes rows, and close it as soon as

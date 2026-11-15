@@ -1083,16 +1083,40 @@ Removed`), and execution prunes with every value it knows. `UPDATE` and
 `DELETE` list each member as a result relation (`Update on pt1 pt_1`),
 `VERBOSE` prints each member's target list and `tableoid`, and `EXPLAIN
 ANALYZE` counts each member's scan (`differential_exact/600`-`604`).
-Remaining, each failing with `0A000`: a member with an index on a column
-the query's conditions, keys or aggregates read (PostgreSQL scans each
-partition by its own index as costs choose); `EXPLAIN ANALYZE` of pruning
-by a subquery's or an enclosing query's value, which PostgreSQL repeats for
-each scan; a joined write or `MERGE` into such a table; an `UPDATE` of an
-inheritance tree and a select list computed over one (PostgreSQL's
-`Result` above the `Append`); an outer join whose partitioned side keeps no
-member; and conditions on foreign members. Joins and grouping over
+A select list or `UPDATE` computed over an inheritance tree runs in a
+`Result` above its members' `Append`, which cannot project; `ONLY` writes
+the parent alone, a `RETURNING` list prints under the first member's name
+and a locked parent's members return their `tableoid`
+(`differential_exact/610`). Outer joins null-extend the rows a partitioned
+table or inheritance tree matches nowhere, and RIGHT and FULL joins return
+each member's unmatched rows (`differential_exact/611`). A key compared
+with an InitPlan's output or an enclosing query's column prunes during each
+scan, so `EXPLAIN ANALYZE` marks members no scan reached `(never
+executed)`; a write computes its uncorrelated scalar subqueries as
+InitPlans, and a FROM-less InitPlan counts its row
+(`differential_exact/612`). A partitioned table pruning empties at planning
+is a `Result` returning no rows: hashed on an outer join's nullable side,
+its columns unnamed when the plan scans another relation, and an inner or
+semi join with it returns nothing (`differential_exact/613`). A foreign
+partition or child ships the conditions it can to its server and shows no
+filter, or keeps every one (`differential_exact/614`). Remaining, each
+failing with `0A000`: a member with an index on a column the query's
+conditions, keys or aggregates read (execution scans members sequentially,
+while PostgreSQL scans each by its own index as costs choose, possibly
+under a `Merge Append`); `EXPLAIN ANALYZE` of pruning by a subquery that
+reads an enclosing query; a joined write (`UPDATE ... FROM`, `DELETE ...
+USING`) into such a table, which execution joins member by member where
+PostgreSQL joins one `Append`; `EXPLAIN` of any `MERGE`; a write whose
+subquery is correlated, a set or row subquery, or in `RETURNING`; a full or
+anti join with an emptied partitioned table, or an outer join with an
+emptied inheritance tree; a foreign member that ships only some of its
+conditions, and `VERBOSE` over foreign members; a whole-row reference to an
+inheritance child with columns of its own. Joins and grouping over
 partitioned tables use pos3ql's join and aggregation methods, which differ
-from PostgreSQL's cost choices as they do for plain tables. A btree index may use
+from PostgreSQL's cost choices as they do for plain tables, and `EXPLAIN
+ANALYZE` of a hash join reports pos3ql's own hash table (16 buckets for a
+small build) where PostgreSQL's holds at least 1024; a derived table that
+PostgreSQL pulls up into an outer join still prints under its own name. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

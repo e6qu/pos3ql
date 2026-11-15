@@ -1167,6 +1167,12 @@ impl<'a> RelationTargets<'a> {
         })
     }
 
+    /// The prefix the target's own columns print with: the exposed name in
+    /// an `INSERT`, none in an `UPDATE` or `DELETE` (`returning_scope`).
+    fn target_qualifier(&self) -> Option<&'a str> {
+        self.context.bare.is_none().then_some(self.exposed)
+    }
+
     /// A write's `RETURNING` list (built by [`Self::returning_scope`]).
     pub(super) fn returning(&self, returning: Returning<'_>) -> Result<Option<Output>, SqlError> {
         let mut entries = ArenaList::new(self.arena);
@@ -1177,16 +1183,18 @@ impl<'a> RelationTargets<'a> {
             match item {
                 SelectItem::Wildcard(_) => {
                     for column in 0..self.table.columns().len() {
-                        push(&mut entries, self.column(column, None)?)?;
+                        push(&mut entries, self.column(column, self.target_qualifier())?)?;
                     }
                 }
                 SelectItem::TableWildcard(qualifier) => {
                     let image = [returning.old_name(), returning.new_name()].contains(qualifier);
+                    let qualifier = if image {
+                        Some(*qualifier)
+                    } else {
+                        self.target_qualifier()
+                    };
                     for column in 0..self.table.columns().len() {
-                        push(
-                            &mut entries,
-                            self.column(column, image.then_some(*qualifier))?,
-                        )?;
+                        push(&mut entries, self.column(column, qualifier)?)?;
                     }
                 }
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {

@@ -8302,6 +8302,13 @@ fn plan_write<'a>(
             "EXPLAIN of a joined write to a partitioned table or inheritance tree is not supported"
         ));
     }
+    // MERGE joins its target to its source, which this plan does not build.
+    if matches!(statement, Stmt::Merge(_)) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of MERGE is not supported"
+        ));
+    }
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");

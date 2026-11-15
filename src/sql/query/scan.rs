@@ -9285,6 +9285,7 @@ fn scan_source_mode<'a>(
                         arena,
                         params,
                         hooks,
+                        outer,
                     };
                     let leaves = super::partition_prune::members(
                         storage,

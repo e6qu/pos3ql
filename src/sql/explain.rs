@@ -890,8 +890,19 @@ fn relation_mask(
 
 /// Whether PostgreSQL's planner turns `conjunct` into an equivalence class
 /// (an equality between columns or between a column and a constant), whose
-/// clauses it regenerates after the scan's other restrictions.
-fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
+/// clauses it regenerates after the scan's other restrictions. An
+/// uncorrelated scalar subquery is an InitPlan's output parameter there,
+/// which the class holds as a constant.
+fn equivalence_clause<'a>(
+    conjunct: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let initplan = |side: &'a Expr<'a>| -> Result<bool, SqlError> {
+        Ok(matches!(side, Expr::Subquery(_))
+            && !query::subquery_node_correlated(side, storage, txid, arena)?)
+    };
     let operand = |side: &Expr<'_>| {
         matches!(
             side,
@@ -912,17 +923,32 @@ fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
                 }
         )
     };
-    matches!(conjunct, Expr::Binary { operator: BinaryOp::Eq, left, right, .. }
-        if operand(left) && operand(right)
-            && (matches!(left, Expr::Column { .. }) || matches!(right, Expr::Column { .. })))
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = conjunct
+    else {
+        return Ok(false);
+    };
+    Ok((operand(left) || initplan(left)?)
+        && (operand(right) || initplan(right)?)
+        && (matches!(left, Expr::Column { .. }) || matches!(right, Expr::Column { .. })))
 }
 
 /// PostgreSQL's order of a scan's restrictions: the others as written, then
 /// the equivalence-class equalities in the order they were written.
-fn order_restrictions(conjuncts: &mut [&Expr<'_>], cost: &dyn Fn(&Expr<'_>) -> f64) {
+fn order_restrictions<'a>(
+    conjuncts: &mut [&'a Expr<'a>],
+    cost: &dyn Fn(&Expr<'_>) -> f64,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
     let mut ordered = 0;
     for index in 0..conjuncts.len() {
-        if !equivalence_clause(conjuncts[index]) {
+        if !equivalence_clause(conjuncts[index], storage, txid, arena)? {
             conjuncts[ordered..=index].rotate_right(1);
             ordered += 1;
         }
@@ -940,6 +966,7 @@ fn order_restrictions(conjuncts: &mut [&Expr<'_>], cost: &dyn Fn(&Expr<'_>) -> f
             at -= 1;
         }
     }
+    Ok(())
 }
 
 /// The cost of a conjunct over one table, for [`order_restrictions`].
@@ -1199,7 +1226,7 @@ struct JoinQuals<'a> {
 /// the order the joins add them.
 #[allow(clippy::too_many_arguments)]
 fn join_quals<'a>(
-    storage: &Storage,
+    storage: &'a Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     order: &[usize],
@@ -1675,7 +1702,7 @@ fn one_time_filter(
 /// cannot be printed.
 #[allow(clippy::too_many_arguments)]
 fn scan_filters<'a>(
-    storage: &Storage,
+    storage: &'a Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     own: &mut [&'a Expr<'a>],
@@ -1692,7 +1719,10 @@ fn scan_filters<'a>(
         order_restrictions(
             own,
             &table_qual_cost(storage, txid, exposed, relation.definition, arena),
-        );
+            storage,
+            txid,
+            arena,
+        )?;
         let moved = &moved[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + moved_count[index]];
         if moved.is_empty() {
             let joined = [relation.joined(false)];
@@ -1798,7 +1828,7 @@ fn resolve_relation(
 /// cannot be placed.
 #[allow(clippy::too_many_arguments)]
 fn outer_join_quals<'a>(
-    storage: &Storage,
+    storage: &'a Storage,
     txid: u32,
     relations: &[JoinRelation<'a>],
     joins: &'a [crate::sql::ast::Join<'a>],
@@ -2175,9 +2205,13 @@ fn derived_relation_filter<'a>(
     {
         return Ok(None);
     }
-    order_restrictions(&mut conjuncts[..count], &|conjunct| {
-        query::qual_cost(conjunct, &crate::sql::exec::NoCols, storage, txid, arena)
-    });
+    order_restrictions(
+        &mut conjuncts[..count],
+        &|conjunct| query::qual_cost(conjunct, &crate::sql::exec::NoCols, storage, txid, arena),
+        storage,
+        txid,
+        arena,
+    )?;
     let joined = [crate::sql::catalog::deparse::Joined::rule_columns(
         exposed,
         crate::sql::catalog::deparse::Columns::Derived(columns),
@@ -2367,7 +2401,7 @@ fn single_relation_quals<'a>(
         crate::storage::RelationDefinition::from_definition(table),
         arena,
     );
-    order_restrictions(&mut conjuncts[..kept], &cost);
+    order_restrictions(&mut conjuncts[..kept], &cost, storage, txid, arena)?;
     let conjuncts = if security.is_empty() {
         &conjuncts[..kept]
     } else {
@@ -2568,6 +2602,7 @@ fn relation_expansions<'a>(
             arena,
             params: parameters,
             hooks: &crate::sql::eval::NO_HOOKS,
+            outer: None,
         };
         let planned = members(
             storage,
@@ -3677,7 +3712,8 @@ pub(super) fn plan_select<'a>(
     // (`SS_process_ctes`) at every query level: a query run once is an
     // InitPlan of the query's top node, the others are inlined.
     let (select, ctes) = query::expand_ctes_for_plan(statement, storage, txid, arena)?;
-    let prior = CTE_PLANS.with(|planned| planned.replace(planned.get() || !ctes.is_empty()));
+    let prior =
+        SUBPLAN_RELATIONS.with(|planned| planned.replace(planned.get() || !ctes.is_empty()));
     let plan = plan_ctes(storage, txid, ctes, outer, block, arena).and_then(|ctes| {
         // A set operation with its own `WITH` list keeps the list's
         // InitPlans on its top node.
@@ -3696,7 +3732,7 @@ pub(super) fn plan_select<'a>(
         }
         plan_select_with_ctes(storage, txid, select, ctes, outer, block, arena)
     });
-    CTE_PLANS.with(|planned| planned.set(prior));
+    SUBPLAN_RELATIONS.with(|planned| planned.set(prior));
     plan
 }
 
@@ -3790,9 +3826,10 @@ thread_local! {
     /// How many subqueries deep the query being planned is: a subquery's
     /// range table entries join its statement's.
     static SUBLINK_DEPTH: core::cell::Cell<u16> = const { core::cell::Cell::new(0) };
-    /// Whether the statement being planned runs `WITH` queries as their own
-    /// plans, whose relations join the statement's range table.
-    static CTE_PLANS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Whether the statement being planned runs subplans whose relations
+    /// join the statement's range table: `WITH` queries run as their own
+    /// plans, or a write's InitPlans that read relations.
+    static SUBPLAN_RELATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// Whether the statement being planned scans a partitioned table or an
     /// inheritance tree whose members joined its range table.
     static EXPANDED_RELATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -4260,16 +4297,22 @@ fn attach_subplans<'a>(
         }
         Ok::<(), SqlError>(())
     };
+    // InitPlans precede the inputs of the top node, after a write's result
+    // relations, which are its properties.
+    let initplans_after = nodes
+        .iter()
+        .skip(1)
+        .take_while(|node| node.target_member)
+        .count();
     for (index, node) in nodes.iter().enumerate() {
         attached.push(*node)?;
-        // InitPlans precede the inputs of the top node.
-        if index == 0 {
+        if index == initplans_after {
             for (at, _) in sublinks
                 .iter()
                 .enumerate()
                 .filter(|(_, sublink)| sublink.kind == SubplanKind::InitPlan)
             {
-                push_subplan(&mut attached, *node, at)?;
+                push_subplan(&mut attached, nodes[0], at)?;
             }
         }
         // SubPlans follow the last node of their host's subtree: each
@@ -7030,7 +7073,7 @@ fn plan_keys(
 /// then qualifies the columns of sort and grouping keys.
 fn shares_range_table(statement: &Select<'_>) -> bool {
     if SUBLINK_DEPTH.with(core::cell::Cell::get) != 0
-        || CTE_PLANS.with(core::cell::Cell::get)
+        || SUBPLAN_RELATIONS.with(core::cell::Cell::get)
         || EXPANDED_RELATIONS.with(core::cell::Cell::get)
     {
         return true;
@@ -7852,6 +7895,145 @@ pub(super) fn plan_modification<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    // The subqueries are planned, and so numbered, before the conditions
+    // that print them.
+    let initplans = write_initplans(storage, txid, statement, block, arena)?;
+    let reads = initplans.iter().any(|initplan| {
+        initplan
+            .nodes
+            .iter()
+            .any(|node| !node.relation.as_str().is_empty())
+    });
+    let prior = SUBPLAN_RELATIONS.with(|planned| planned.replace(planned.get() || reads));
+    let plan = plan_write(storage, txid, statement, block, arena);
+    SUBPLAN_RELATIONS.with(|planned| planned.set(prior));
+    attach_subplans(plan?, 1, block, initplans, arena)
+}
+
+/// The InitPlans of an `UPDATE` or `DELETE`: each uncorrelated scalar
+/// subquery of its new values, in column order (`SS_process_sublinks` over
+/// the processed target list), then of its `WHERE`. Their outputs are
+/// parameters the write's node computes once. Any other subquery there is
+/// outside this plan.
+fn write_initplans<'a, 'e>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'e Stmt<'e>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<&'a [Sublink<'a>], SqlError> {
+    let (target, assignments, condition, returning, joined): (_, &[(&str, &'e Expr<'e>)], _, _, _) =
+        match statement {
+            Stmt::Update(update) => (
+                update.table,
+                update.assignments,
+                update.where_clause,
+                update.returning,
+                update.from.is_some(),
+            ),
+            Stmt::Delete(delete) => (
+                delete.table,
+                &[],
+                delete.where_clause,
+                delete.returning,
+                delete.using.is_some(),
+            ),
+            _ => return Ok(&[]),
+        };
+    let mut found = crate::mem::arena::ArenaList::new(arena);
+    let mut collect = |expression: &'e Expr<'e>| -> Result<(), SqlError> {
+        let mut failed = false;
+        visit_sublinks(expression, &mut |node| {
+            failed |= found.push(node).is_err();
+        });
+        if failed { Err(arena_full()) } else { Ok(()) }
+    };
+    let definition = relation_slot(storage, txid, target.schema, target.name)
+        .map(|slot| storage.table_def(slot, txid));
+    match definition.as_deref() {
+        Some(definition) => {
+            for column in definition.columns() {
+                for (name, value) in assignments {
+                    if *name == column.name.as_str() {
+                        collect(value)?;
+                    }
+                }
+            }
+        }
+        None => {
+            for (_, value) in assignments {
+                collect(value)?;
+            }
+        }
+    }
+    if let Some(condition) = condition {
+        collect(condition)?;
+    }
+    let mut returned = false;
+    for item in returning.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit_sublinks(expression, &mut |_| returned = true);
+        }
+    }
+    if returned || (joined && !found.as_slice().is_empty()) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a joined write's subquery or of a subquery in RETURNING is not supported"
+        ));
+    }
+    let mut planned = crate::mem::arena::ArenaList::new(arena);
+    for &node in found.as_slice() {
+        let Expr::Subquery(select) = node else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a write reading a set subquery (EXISTS, IN, ANY, ALL, ARRAY or a row) is not supported"
+            ));
+        };
+        if query::subquery_node_correlated(node, storage, txid, arena)? {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a write reading a correlated subquery is not supported"
+            ));
+        }
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let inner = plan_select(
+            storage,
+            txid,
+            select,
+            None,
+            block.child(Segment::Sublink(
+                core::ptr::from_ref(*select) as usize as u64
+            )),
+            arena,
+        );
+        SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        let Plan { nodes, count, .. } = inner?;
+        let number = match register_subplan(select, false, Compared::No)? {
+            crate::sql::catalog::deparse::SublinkPlan::InitPlan(number)
+            | crate::sql::catalog::deparse::SublinkPlan::SubPlan(number)
+            | crate::sql::catalog::deparse::SublinkPlan::HashedSubPlan(number) => number,
+        };
+        planned
+            .push(Sublink {
+                kind: SubplanKind::InitPlan,
+                number,
+                origin: SublinkOrigin::Where,
+                nodes: &nodes[..count],
+                cte: None,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    Ok(planned.into_mut_slice().map_err(|_| arena_full())?)
+}
+
+/// [`plan_modification`] of the write itself, its subqueries planned.
+fn plan_write<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'_>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
     let (verb, target, filtered, source, predicate, alias, joined) = match statement {
         Stmt::Insert(insert) => (
@@ -8547,6 +8729,7 @@ fn expanded_write<'e>(
         arena,
         params: crate::sql::eval::generic_plan_parameters(),
         hooks: &crate::sql::eval::NO_HOOKS,
+        outer: None,
     };
     let conditions = conjuncts(predicate, arena)?;
     let planned = members(
@@ -8763,7 +8946,7 @@ fn modification_outputs(
             definition,
             exposed,
             returning,
-            CTE_PLANS.with(core::cell::Cell::get),
+            SUBPLAN_RELATIONS.with(core::cell::Cell::get),
             arena,
         )?;
         Ok((
@@ -9226,11 +9409,11 @@ pub(super) fn plan_statement<'a>(
                 return plan_select(storage, txid, select, None, block, arena);
             }
             let (select, ctes) = query::expand_ctes_for_plan(select, storage, txid, arena)?;
-            let prior = CTE_PLANS.with(|planned| planned.replace(!ctes.is_empty()));
+            let prior = SUBPLAN_RELATIONS.with(|planned| planned.replace(!ctes.is_empty()));
             let plan = plan_ctes(storage, txid, ctes, None, block, arena).and_then(|ctes| {
                 plan_select_with_ctes(storage, txid, select, ctes, None, block, arena)
             });
-            CTE_PLANS.with(|planned| planned.set(prior));
+            SUBPLAN_RELATIONS.with(|planned| planned.set(prior));
             plan
         }
         Stmt::SetQuery(set_query) if !set_query.with.is_empty() => {
@@ -9243,12 +9426,12 @@ pub(super) fn plan_statement<'a>(
                 body: expanded.set_body.expect("the wrapper keeps its set body"),
                 ..*set_query
             };
-            let prior = CTE_PLANS.with(|planned| planned.replace(!ctes.is_empty()));
+            let prior = SUBPLAN_RELATIONS.with(|planned| planned.replace(!ctes.is_empty()));
             let plan = plan_ctes(storage, txid, ctes, None, block, arena).and_then(|ctes| {
                 let plan = plan_set_query(storage, txid, &planned, None, block, arena)?;
                 attach_subplans(plan, 0, block, ctes, arena)
             });
-            CTE_PLANS.with(|planned| planned.set(prior));
+            SUBPLAN_RELATIONS.with(|planned| planned.set(prior));
             plan
         }
         Stmt::SetQuery(set_query) => {
@@ -9297,12 +9480,12 @@ pub(super) fn plan_statement<'a>(
             } else {
                 statement
             };
-            let prior = CTE_PLANS.with(|cte_plans| cte_plans.replace(!planned.is_empty()));
+            let prior = SUBPLAN_RELATIONS.with(|cte_plans| cte_plans.replace(!planned.is_empty()));
             let plan = plan_ctes(storage, txid, planned, None, block, arena).and_then(|ctes| {
                 let plan = plan_modification(storage, txid, statement, block, arena)?;
                 attach_subplans(plan, 0, block, ctes, arena)
             });
-            CTE_PLANS.with(|cte_plans| cte_plans.set(prior));
+            SUBPLAN_RELATIONS.with(|cte_plans| cte_plans.set(prior));
             plan
         }
         _ => Err(sql_err!(

@@ -103812,6 +103812,7 @@ fn dml_pruned_leaves<'a, Definition0: crate::storage::DefinitionBacking>(
         arena,
         params,
         hooks,
+        outer: None,
     };
     Ok(partition_prune::members(
         storage,

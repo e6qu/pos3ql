@@ -805,7 +805,11 @@ impl<'a> RowReadView<'a> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::super::row_versions::{
         clear_pending_versions, push_committed_version, push_pending_version,

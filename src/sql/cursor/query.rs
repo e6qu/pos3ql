@@ -52,6 +52,7 @@ struct BoundQuery<'a> {
     source: &'a str,
     bindings: &'a [crate::sql::parser::NamedParameter<'a>],
     inputs: &'a [crate::sql::type_inputs::Binding<'a>],
+    image: crate::sql::type_inputs::InputImage,
 }
 
 /// A cursor query parsed again into a statement's arena.
@@ -311,10 +312,10 @@ impl CursorQuery {
             };
         }
         let bytes = arena
-            .alloc_slice_with(crate::sql::type_inputs::encoded_len(bound.inputs)?, |_| 0u8)
+            .alloc_slice_with(bound.image.encoded_len(bound.inputs)?, |_| 0u8)
             .map_err(|_| full())?;
-        crate::sql::type_inputs::encode_into(bound.inputs, bytes)?;
-        let inputs = crate::sql::type_inputs::decode(bytes, arena)?;
+        bound.image.encode_into(bound.inputs, bytes)?;
+        let inputs = bound.image.decode(bytes, arena)?;
         let statement = crate::sql::type_input_plans::with_owner(self.owner, || {
             crate::sql::exec::with_bound_parameter_types(parameter_types, || {
                 crate::sql::parser::parse_cursor_command(
@@ -388,12 +389,17 @@ impl CursorQuery {
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a cursor query binds its text, parameters, locals and typed inputs"
+    )]
     pub(crate) fn bind(
         &mut self,
         sql: &str,
         params: &[Datum],
         locals: &[CursorLocal],
         inputs: &[crate::sql::type_inputs::Binding<'_>],
+        image: crate::sql::type_inputs::InputImage,
         owner: crate::sql::type_input_plans::Owner,
         validate: impl FnOnce(&crate::sql::parser::Parser<'_>) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
@@ -413,10 +419,10 @@ impl CursorQuery {
         } = bind_locals(&self.arena, params, locals, full)?;
         let bytes = self
             .arena
-            .alloc_slice_with(crate::sql::type_inputs::encoded_len(inputs)?, |_| 0u8)
+            .alloc_slice_with(image.encoded_len(inputs)?, |_| 0u8)
             .map_err(|_| full())?;
-        crate::sql::type_inputs::encode_into(inputs, bytes)?;
-        let inputs = crate::sql::type_inputs::decode(bytes, &self.arena)?;
+        image.encode_into(inputs, bytes)?;
+        let inputs = image.decode(bytes, &self.arena)?;
         let statement = crate::sql::parser::parse_cursor_command(
             source,
             &self.arena,
@@ -441,6 +447,7 @@ impl CursorQuery {
             source,
             bindings,
             inputs,
+            image,
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed
@@ -815,7 +822,7 @@ impl CursorQuery {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 
@@ -830,6 +837,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Unlocated,
                     |_| Ok(()),
                 )
@@ -879,6 +887,7 @@ mod tests {
                 &[Datum::Text(&text), Datum::Record(&fields)],
                 &[],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -912,6 +921,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -938,6 +948,7 @@ mod tests {
                     &params,
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Unlocated,
                     |_| Ok(()),
                 )
@@ -1020,6 +1031,7 @@ mod tests {
                 &[],
                 &locals,
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -1083,6 +1095,7 @@ mod tests {
                 &[Datum::Record(&fields)],
                 &[local],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -1159,6 +1172,7 @@ mod tests {
                         conflict: crate::sql::guc::VariableConflict::Error,
                     }],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Unlocated,
                     |_| Ok(()),
                 )
@@ -1226,6 +1240,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    crate::sql::type_inputs::InputImage::Admitted,
                     crate::sql::type_input_plans::Owner::Unlocated,
                     |_| Ok(())
                 )
@@ -1240,6 +1255,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -1253,6 +1269,7 @@ mod tests {
                 &[Datum::Text(&wide)],
                 &[],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -1266,6 +1283,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                crate::sql::type_inputs::InputImage::Admitted,
                 crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
@@ -1385,6 +1403,7 @@ mod tests {
                         &[Datum::Null],
                         &[],
                         &[],
+                        crate::sql::type_inputs::InputImage::Admitted,
                         crate::sql::type_input_plans::Owner::Unlocated,
                         |_| Ok(()),
                     )
@@ -1431,6 +1450,7 @@ mod tests {
                         &[],
                         &[],
                         &[],
+                        crate::sql::type_inputs::InputImage::Admitted,
                         crate::sql::type_input_plans::Owner::Unlocated,
                         |_| Ok(()),
                     )

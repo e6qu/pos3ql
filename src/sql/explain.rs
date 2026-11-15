@@ -2185,6 +2185,70 @@ fn select_security_quals<'a>(
     }
 }
 
+/// The row-security quals an `UPDATE` or `DELETE` adds to its target's scan:
+/// its own command's policies, then, when it reads the target's columns, the
+/// `SELECT` policies, as PostgreSQL's `get_row_security_policies` lists them.
+fn write_security_quals<'a>(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    slot: usize,
+    definition: &crate::storage::TableDef,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let (command, alias, condition, assignments, returning) = match statement {
+        Stmt::Update(update) => (
+            crate::storage::PolicyCommandKind::Update,
+            update.alias,
+            update.where_clause,
+            update.assignments,
+            update.returning,
+        ),
+        Stmt::Delete(delete) => (
+            crate::storage::PolicyCommandKind::Delete,
+            delete.alias,
+            delete.where_clause,
+            &[][..],
+            delete.returning,
+        ),
+        _ => return Ok(&[]),
+    };
+    let Some(role) = storage.current_role_slot(txid) else {
+        return Ok(&[]);
+    };
+    let policies = |command| {
+        query::plan_row_security(
+            storage,
+            slot,
+            role,
+            command,
+            query::RowSecurityExpression::Using,
+            txid,
+            arena,
+        )
+    };
+    let own = policies(command)?;
+    let reads = crate::sql::exec::write_target_reads(
+        definition,
+        alias,
+        condition,
+        assignments,
+        returning,
+        storage,
+        txid,
+        arena,
+    )?;
+    let select = if reads.is_empty() {
+        None
+    } else {
+        policies(crate::storage::PolicyCommandKind::Select)?
+    };
+    match query::conjoin_row_security(own, select) {
+        Some(plan) => plan.security_quals(arena),
+        None => Ok(&[]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn single_relation_quals<'a>(
     storage: &Storage,
@@ -5815,6 +5879,7 @@ fn foreign_modification<'a>(
     // UPDATE (or a trigger) needs.
     node.set_output(lists.modified_row(
         assignments.unwrap_or(&[]),
+        alias,
         assignments.is_some() || triggers,
     )?);
     let (_, filter) = single_relation_quals(
@@ -7506,13 +7571,15 @@ pub(super) fn plan_modification<'a>(
             scan.alias = target_node.alias;
             scan.key = Some(NodeKey::new(block, Role::Scan(0)));
             let definition = storage.table_def(slot, txid);
+            let security =
+                write_security_quals(storage, statement, slot, &definition, txid, arena)?;
             let (index_cond, filter) = single_relation_quals(
                 storage,
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 false,
                 arena,
@@ -7523,19 +7590,13 @@ pub(super) fn plan_modification<'a>(
                 alias.unwrap_or(target.name),
                 &definition,
                 predicate,
-                &[],
+                security,
                 index.as_ref().map(|(plan, _)| plan),
                 true,
                 arena,
             )?;
-            let (returned, read) = modification_outputs(
-                storage,
-                txid,
-                statement,
-                &definition,
-                alias.unwrap_or(target.name),
-                arena,
-            )?;
+            let (returned, read) =
+                modification_outputs(storage, txid, statement, &definition, slot, alias, arena)?;
             plan.nodes[0].set_output(returned);
             scan.set_output(read);
             scan.with_qual(QualLabel::IndexCond, index_cond)
@@ -7569,13 +7630,15 @@ pub(super) fn plan_modification<'a>(
 /// `RETURNING` list on the write's node, and on an `UPDATE` or `DELETE`
 /// scan the new values of the assigned columns in column order
 /// (`rewriteTargetListIU`) followed by the row identity `ctid`. `None` for
-/// a list outside the deparser's coverage, as is `MERGE`'s.
+/// a list outside the deparser's coverage, as are `MERGE`'s and those of a
+/// table with descendants, whose children PostgreSQL scans each.
 fn modification_outputs(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
     definition: &crate::storage::TableDef,
-    exposed: &str,
+    slot: usize,
+    alias: Option<&str>,
     arena: &Arena,
 ) -> Result<(Option<targets::Output>, Option<targets::Output>), SqlError> {
     let (assignments, returning): (&[(&str, &Expr<'_>)], _) = match statement {
@@ -7583,6 +7646,10 @@ fn modification_outputs(
         Stmt::Delete(delete) => (&[], delete.returning),
         _ => return Ok((None, None)),
     };
+    if storage.relation_has_descendants(slot, txid) {
+        return Ok((None, None));
+    }
+    let exposed = alias.unwrap_or(definition.name.as_str());
     let mark = arena.mark();
     let result = (|| {
         let lists = targets::RelationTargets::returning_scope(
@@ -7590,7 +7657,7 @@ fn modification_outputs(
         )?;
         Ok((
             lists.returning(returning)?,
-            lists.modified_row(assignments, false)?,
+            lists.modified_row(assignments, alias, false)?,
         ))
     })();
     // SAFETY: the lists were copied out of the arena.
@@ -9119,7 +9186,11 @@ pub(super) fn emit_plan(
     Ok(Ok(()))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::{PlanNode, object_request_cost, structured_node_name};
     use crate::store::BlockIoStats;

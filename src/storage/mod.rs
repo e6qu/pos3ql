@@ -38,7 +38,11 @@ mod partition_triggers;
 pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
 mod prepared_catalog;
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod prepared_catalog_tests;
 mod prepared_foreign;
 use parameter_acls::ParameterAclGrantIdentity;
@@ -139,6 +143,7 @@ mod table_creation;
 mod table_definitions;
 mod table_edits;
 mod table_names;
+pub(crate) use table_names::VisibleTableNames;
 mod table_publication;
 mod type_contracts;
 mod type_creation;
@@ -170,7 +175,7 @@ mod prepared_objects;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod heap_relocation;
 mod row_heap;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(crate) use heap_relocation::HeapRelocationEntry;
 pub(crate) use heap_relocation::HeapRelocationWorkspace;
 pub(crate) use row_cleanup::{
@@ -17820,6 +17825,38 @@ impl Iterator for DatabaseIter<'_> {
     }
 }
 
+/// One transaction's explicit table indexes grouped by table slot, in index
+/// slot order within each table.
+pub(crate) struct TableIndexes<'a> {
+    starts: &'a [u32],
+    slots: &'a [u32],
+    transaction: u32,
+}
+
+impl TableIndexes<'_> {
+    pub(crate) fn for_table<'s>(
+        &'s self,
+        storage: &'s Storage,
+        table: usize,
+    ) -> impl Iterator<Item = IndexDef> + 's {
+        let identity = storage.tables[table].identity();
+        let selected = storage.catalog_object_identity(
+            catalog_sources::CatalogObjectSlot::Table(table),
+            identity.database,
+            identity.created_at,
+        );
+        self.slots[self.starts[table] as usize..self.starts[table + 1] as usize]
+            .iter()
+            .map(|&slot| storage.index(slot as usize))
+            .filter(move |index| {
+                index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == selected)
+            })
+            .filter_map(move |index| storage.project_index_binding(index, self.transaction))
+    }
+}
+
 struct IndexIter<'a, F = fn(&IndexDef) -> bool> {
     catalog: &'a Mutex<FixedVec<IndexDef>>,
     next_slot: usize,
@@ -17935,6 +17972,8 @@ impl Iterator for MatviewIter<'_> {
 
 pub struct Storage {
     transaction_mode: crate::config::TransactionMode,
+    #[cfg(test)]
+    pub(crate) catalog_capture_cross_check: bool,
     catalog_history: std::sync::Arc<CatalogHistory>,
     pub(crate) heap: RowHeap,
     tables: FixedVec<Table>,
@@ -24374,6 +24413,8 @@ impl Storage {
             transaction_capacity * table_capacity,
         )?;
         let storage = Self {
+            #[cfg(test)]
+            catalog_capture_cross_check: config.catalog_capture_cross_check,
             heap,
             tables,
             table_creation: Mutex::new(()),
@@ -42969,6 +43010,42 @@ impl Storage {
         self.find_table_name(table_names::TableNameScope::Transaction(txid), schema, name)
     }
 
+    /// Every table `find_visible` can return for `txid`, keyed by its schema
+    /// and name, so a pass resolving many stored names (foreign-key parents)
+    /// reads each table definition once instead of scanning per lookup.
+    pub(crate) fn visible_table_names<'a>(
+        &self,
+        txid: u32,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<table_names::VisibleTableNames<'a>, SqlError> {
+        let database = current_database();
+        let scope = table_names::TableNameScope::Transaction(txid);
+        let count = self.table_count();
+        let capacity = count
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(crate::sql::eval::arena_full)?
+            .max(8);
+        let slots = arena
+            .alloc_slice_with(capacity, |_| table_names::VisibleTableNames::EMPTY)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let mut names = table_names::VisibleTableNames::new(slots, txid);
+        for slot in 0..count {
+            let definition = self.table_def(slot, txid);
+            let identity = definition.identity();
+            if identity.database == database && scope.visible(identity.existence) {
+                // The lowest slot wins, as in `find_visible`'s ascending scan.
+                names.insert_first(
+                    self,
+                    slot,
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                );
+            }
+        }
+        Ok(names)
+    }
+
     fn find_table_name(
         &self,
         scope: table_names::TableNameScope,
@@ -53520,6 +53597,59 @@ impl Storage {
         self.indexes_for_selected(Some(slot), txid)
     }
 
+    /// The explicit indexes of each table `include` selects, visible to
+    /// `txid`, grouped by table in one pass over the index catalog: the same
+    /// rows `indexes_for_slot` yields, for a pass that visits every table.
+    pub(crate) fn table_indexes<'a>(
+        &self,
+        txid: u32,
+        include: impl Fn(usize) -> bool,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<TableIndexes<'a>, SqlError> {
+        let full = |_| crate::sql::eval::arena_full();
+        let count = self.table_count();
+        let database = current_database();
+        let starts = arena.alloc_slice_with(count + 1, |_| 0u32).map_err(full)?;
+        let catalog = self.index_catalog();
+        let owner = |index: &IndexDef| {
+            let binding = index.table_binding?;
+            let catalog_sources::CatalogObjectSlot::Table(table) = binding.source.slot() else {
+                return None;
+            };
+            // The binding's table identity is compared after the catalog
+            // lock is released, in `for_table`.
+            (table < count
+                && index.database == database
+                && matches!(index.relation, IndexRelationSource::Table)
+                && include(table)
+                && index.visible_to(txid))
+            .then_some(table)
+        };
+        for index in catalog.iter() {
+            if let Some(table) = owner(index) {
+                starts[table + 1] += 1;
+            }
+        }
+        for table in 0..count {
+            starts[table + 1] += starts[table];
+        }
+        let slots = arena
+            .alloc_slice_with(starts[count] as usize, |_| 0u32)
+            .map_err(full)?;
+        let next = arena.alloc_slice_copy(&starts[..count]).map_err(full)?;
+        for (slot, index) in catalog.iter().enumerate() {
+            if let Some(table) = owner(index) {
+                slots[next[table] as usize] = slot as u32;
+                next[table] += 1;
+            }
+        }
+        Ok(TableIndexes {
+            starts,
+            slots,
+            transaction: txid,
+        })
+    }
+
     fn indexes_for_selected(
         &self,
         slot: Option<usize>,
@@ -53533,15 +53663,14 @@ impl Storage {
                 identity.created_at,
             )
         });
+        // The table test runs first and before the iterator copies a
+        // definition: a catalog pass asks this of every table.
         self.matching_indexes(move |x| {
-            x.database == current_database()
+            x.table_binding
+                .is_some_and(|binding| Some(binding.source) == selected)
+                && x.database == current_database()
                 && x.visible_to(txid)
                 && matches!(x.relation, IndexRelationSource::Table)
-        })
-        .filter(move |(_, index)| {
-            index
-                .table_binding
-                .is_some_and(|binding| Some(binding.source) == selected)
         })
         .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }
@@ -53705,6 +53834,16 @@ impl Storage {
 
     fn index(&self, slot: usize) -> IndexDef {
         self.index_catalog()[slot]
+    }
+
+    /// The table slot an index is bound to, whether or not the index or the
+    /// table is visible: a dropped index keeps its binding until released.
+    pub(crate) fn index_bound_table_slot(&self, slot: usize) -> Option<usize> {
+        let binding = self.index_catalog()[slot].table_binding?;
+        match binding.source.slot() {
+            catalog_sources::CatalogObjectSlot::Table(table) => Some(table),
+            _ => None,
+        }
     }
 
     fn matching_indexes<F: Fn(&IndexDef) -> bool>(&self, accept: F) -> IndexIter<'_, F> {
@@ -60747,7 +60886,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(crate) mod tests {
     use super::*;
 
@@ -60869,8 +61008,16 @@ pub(crate) mod tests {
     include!("native_tests.rs");
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod table_name_tests;
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod startup_budget;

@@ -72,7 +72,11 @@ pub(crate) fn maybe_contains(bits: &[u8], key: u64) -> bool {
     positions(key, total).all(|position| bits[position / 8] & (1 << (position % 8)) != 0)
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

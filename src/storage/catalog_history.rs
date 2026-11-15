@@ -504,7 +504,7 @@ impl Drop for CatalogHistoryBatch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::guard::forbid_alloc;

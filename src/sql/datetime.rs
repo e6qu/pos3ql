@@ -2743,6 +2743,7 @@ pub(crate) mod test_clock {
         }
     }
 
+    #[cfg(not(feature = "sql-fixture-suite"))]
     #[test]
     fn explicit_wall_clock_scopes_restore_after_nested_calls_and_errors() {
         let prior = current();
@@ -2762,7 +2763,11 @@ pub(crate) mod test_clock {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::sql::types::Interval;
@@ -3135,7 +3140,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod deadline_ownership_tests {
     use super::StatementClock;
     use crate::sql::eval::sqlstate;

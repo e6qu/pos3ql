@@ -81,7 +81,11 @@ pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

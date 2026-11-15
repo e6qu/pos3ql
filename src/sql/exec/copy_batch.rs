@@ -222,7 +222,7 @@ impl FlushFailure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::sql::eval::sqlstate;

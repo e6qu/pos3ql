@@ -2854,7 +2854,7 @@ fn expression_reads(
     Ok(found)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

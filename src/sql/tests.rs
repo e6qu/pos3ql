@@ -18,6 +18,7 @@ mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
+mod catalog_capture_selection;
 mod catalog_identity_lookup;
 mod catalog_join_probes;
 mod catalog_join_work;
@@ -15900,7 +15901,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
                     &transaction,
                     2,
                     &[],
-                    &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                 )
                 .unwrap();
             assert_eq!(
@@ -19549,6 +19550,9 @@ fn truncate_fanout_releases_definition_images_before_statement_triggers() {
 fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
     const TABLES: usize = 300;
     let mut config = test_config("truncate-fanout-prepared-cold-recovery");
+    // Measures capacity, not capture selection: every other test repeats
+    // each reached-table catalog capture over all tables.
+    config.catalog_capture_cross_check = false;
     config.max_catalog_versions_per_object = 1;
     config.max_tables = TABLES;
     config.max_indexes = TABLES;
@@ -20070,7 +20074,7 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
                 None,
                 &GucState::new(),
                 &mut responder,
-                &[],
+                crate::sql::type_inputs::BoundInputs::Admitted(&[]),
             )
             .unwrap()
     };
@@ -28857,7 +28861,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [enum_oid, domain_oid]);
@@ -28868,7 +28872,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
@@ -28882,7 +28886,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             3,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
@@ -28895,7 +28899,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
@@ -28906,7 +28910,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
@@ -28917,7 +28921,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
@@ -28928,7 +28932,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(
@@ -29297,7 +29301,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
     let inferred = engine
-        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[], &[])
+        .infer_param_types(
+            "SELECT $1::record",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
+        )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
@@ -56292,7 +56303,7 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
             &transaction,
             2,
             &[],
-            &[],
+            crate::sql::type_inputs::BoundInputs::Admitted(&[]),
         )
         .unwrap();
     assert_eq!(
@@ -94461,7 +94472,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     Some(&session.cursors),
                     &session.guc,
                     &mut responder,
-                    &[],
+                    crate::sql::type_inputs::BoundInputs::Admitted(&[]),
                 ))
                 .unwrap()
             );

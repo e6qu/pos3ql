@@ -20419,7 +20419,11 @@ fn parse_partition_bound_manifest(
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod stored_dependency_tests {
     #[test]
     fn manifest_views_reject_invalid_and_oversized_paths_before_installing_metadata() {
@@ -23784,7 +23788,7 @@ mod stored_dependency_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 #[test]
 fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
     let mut config = Config::default_dev();
@@ -23838,7 +23842,7 @@ fn parallel_physical_emission_covers_maximum_chained_row_and_finish() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 #[test]
 fn parallel_physical_credential_rotation_waits_for_requests_not_retained_bytes() {
     use crate::store::BlockWriter;

@@ -3473,7 +3473,11 @@ pub(crate) fn logic<'a>(
     Ok(out.map_or(Datum::Null, Datum::Bool))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod hash_tests {
     use super::*;
     use crate::sql::types::Datum;

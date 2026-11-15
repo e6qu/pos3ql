@@ -281,7 +281,7 @@ fn encode(kind: TypmodKind, typmods: &[i32], count: usize) -> Result<i32, SqlErr
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::{TypmodKind, encode};
 

@@ -1201,12 +1201,14 @@ impl<'a> RelationTargets<'a> {
     }
 
     /// The row an `UPDATE` or `DELETE` scan hands its write: the new values
-    /// of the assigned columns in column order, coerced to each column
+    /// of the assigned columns in column order as the planner projects them
     /// (`rewriteTargetListIU`), the row identity `ctid`, then, when
-    /// `whole_row`, the old row a foreign write reads (`t.*`).
+    /// `whole_row`, the old row a foreign write reads (`t.*`). `alias` is
+    /// the name the statement gives the target.
     pub(super) fn modified_row(
         &self,
-        assignments: &[(&str, &Expr<'_>)],
+        assignments: &[(&str, &'a Expr<'a>)],
+        alias: Option<&str>,
         whole_row: bool,
     ) -> Result<Option<Output>, SqlError> {
         if assignments
@@ -1223,7 +1225,7 @@ impl<'a> RelationTargets<'a> {
             else {
                 continue;
             };
-            let Some(entry) = self.entry(value, Destination::Coerced(column.ctype.oid()))? else {
+            let Some(entry) = self.assigned(column, value, alias)? else {
                 return Ok(None);
             };
             entries.push(entry).map_err(|_| arena_full())?;
@@ -1241,24 +1243,209 @@ impl<'a> RelationTargets<'a> {
         render(entries.as_slice()).map(Some)
     }
 
-    /// A one-row `INSERT`'s `Result`: each column's value as the planner
-    /// coerced it. Only a row naming every column in order without
-    /// `DEFAULT` is covered.
-    pub(super) fn inserted_row(
+    /// The planned form of one column's new value: a `DEFAULT` is the
+    /// column's default expression (a null of its type when it has none), a
+    /// constant the planner folds to the column's type prints that constant,
+    /// and an element or slice assignment prints `column[...] := value`.
+    fn assigned(
         &self,
-        columns: &[&str],
-        row: &[&Expr<'_>],
-    ) -> Result<Option<Output>, SqlError> {
-        let definitions = self.table.columns();
-        if !self.covers(columns)
-            || row.len() != definitions.len()
-            || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+        column: &crate::storage::ColumnMeta,
+        value: &'a Expr<'a>,
+        alias: Option<&str>,
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let arena = self.arena;
+        let target = column.ctype.oid();
+        let value = match value {
+            Expr::DefaultMarker => match column.default.expression() {
+                None => return self.entry(&Expr::Null, Destination::Assignment(target)),
+                Some(source) => {
+                    let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                    crate::sql::parser::parse_expr(source, arena)?
+                }
+            },
+            Expr::Call { name, args, .. }
+                if matches!(
+                    *name,
+                    "__jsonb_subscript_set" | "__array_subscript_set" | "__assign_path"
+                ) =>
+            {
+                return self.assigned_path(column, name, args);
+            }
+            value => value,
+        };
+        // The planner folds a constant expression, coerced to the column's
+        // type. Analysis already converted a cast or typed literal to a
+        // bound value.
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(self.table),
+            alias,
+            output_aliases: &[],
+        };
+        let bound = matches!(
+            value,
+            Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(_),
+                ..
+            }
+        );
+        if bound
+            || crate::sql::exec::folds_to_constant(value)
+                && !matches!(value, Expr::Str(_) | Expr::Null)
+                && crate::sql::exec::infer_type_res(value, &columns)
+                    .is_ok_and(|(oid, _)| oid != crate::sql::types::oid::UNKNOWN)
+        {
+            let evaluated = crate::sql::eval::eval_full(
+                value,
+                arena,
+                &[],
+                &crate::sql::eval::NoColumns,
+                &crate::sql::eval::NO_HOOKS,
+            )?;
+            // An assignment enforces the column's modifier (`varchar(3)`).
+            let folded = crate::sql::exec::apply_typmod(
+                crate::sql::eval::cast_to(evaluated, column.ctype, arena)?,
+                column.ctype,
+                column.type_mod,
+                arena,
+            )?;
+            let length = crate::sql::exec::projected_row_len(&[folded])?;
+            let encoded = arena
+                .alloc_slice_with(length, |_| 0u8)
+                .map_err(|_| arena_full())?;
+            crate::sql::exec::encode_projected_into(&[folded], encoded)?;
+            let constant = arena
+                .alloc(Expr::BoundLiteral {
+                    value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                    type_oid: target,
+                    type_mod: -1,
+                    collation: None,
+                    source: value,
+                })
+                .map_err(|_| arena_full())?;
+            return self.entry(constant, Destination::Value);
+        }
+        self.entry(value, Destination::Assignment(target))
+    }
+
+    /// `column[i] := value` or `column[i:j] := value`, as PostgreSQL prints a
+    /// subscripted assignment (a `SubscriptingRef` with an assigned value).
+    /// An assignment through a composite field is not covered.
+    fn assigned_path(
+        &self,
+        column: &crate::storage::ColumnMeta,
+        name: &str,
+        args: &[&'a Expr<'a>],
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let crate::sql::types::ColType::Array(element) = column.ctype else {
+            return Ok(None);
+        };
+        // The parser's three assignment forms: element subscripts only, a
+        // subscript list holding a slice, and a path through fields.
+        let (base, value, kinds, operands): (&Expr<'_>, &Expr<'_>, &str, &[&Expr<'_>]) =
+            match (name, args) {
+                ("__jsonb_subscript_set", [base, value, operands @ ..]) if operands.len() <= 6 => {
+                    (base, value, &"eeeeee"[..operands.len()], operands)
+                }
+                ("__array_subscript_set", [base, value, Expr::Str(kinds), operands @ ..])
+                | ("__assign_path", [base, value, _, Expr::Str(kinds), operands @ ..]) => {
+                    (base, value, kinds, operands)
+                }
+                _ => return Ok(None),
+            };
+        if !kinds.bytes().all(|kind| matches!(kind, b'e' | b's'))
+            || operands.len()
+                != kinds
+                    .bytes()
+                    .map(|kind| 1 + usize::from(kind == b's'))
+                    .sum::<usize>()
         {
             return Ok(None);
         }
+        let Some(base) = self.entry(base, Destination::Value)? else {
+            return Ok(None);
+        };
+        let mut text = Output::new();
+        let _ = text.write_str(base.text);
+        let mut operand = operands.iter();
+        for kind in kinds.bytes() {
+            let _ = text.write_str("[");
+            for (index, bound) in operand
+                .by_ref()
+                .take(1 + usize::from(kind == b's'))
+                .enumerate()
+            {
+                let Some(bound) =
+                    self.entry(bound, Destination::Assignment(crate::sql::types::oid::INT4))?
+                else {
+                    return Ok(None);
+                };
+                if index != 0 {
+                    let _ = text.write_str(":");
+                }
+                let _ = text.write_str(bound.text);
+            }
+            let _ = text.write_str("]");
+        }
+        let target = if kinds.contains('s') {
+            column.ctype.oid()
+        } else {
+            element.element_oid()
+        };
+        let Some(value) = self.entry(value, Destination::Assignment(target))? else {
+            return Ok(None);
+        };
+        let _ = write!(text, " := {}", value.text);
+        let text = checked(text)?;
+        Ok(Some(Entry {
+            text: self
+                .arena
+                .alloc_str(text.as_str())
+                .map_err(|_| arena_full())?,
+            var: false,
+            referenced: false,
+        }))
+    }
+
+    /// A one-row `INSERT`'s `Result`: each column's value in column order as
+    /// the planner projects it, a column the row omits taking its
+    /// `DEFAULT`. A defaulted identity, serial or generated column is not
+    /// covered.
+    pub(super) fn inserted_row(
+        &self,
+        columns: &[&str],
+        row: &[&'a Expr<'a>],
+    ) -> Result<Option<Output>, SqlError> {
+        let definitions = self.table.columns();
+        let expected = if columns.is_empty() {
+            definitions.len()
+        } else {
+            columns.len()
+        };
+        if row.len() != expected {
+            return Ok(None);
+        }
         let mut entries = ArenaList::new(self.arena);
-        for (value, column) in row.iter().zip(definitions) {
-            let Some(entry) = self.entry(value, Destination::Coerced(column.ctype.oid()))? else {
+        for (index, column) in definitions.iter().enumerate() {
+            let value = if columns.is_empty() {
+                Some(row[index])
+            } else {
+                columns
+                    .iter()
+                    .position(|named| *named == column.name.as_str())
+                    .map(|at| row[at])
+            };
+            let value = value.unwrap_or(&Expr::DefaultMarker);
+            if matches!(value, Expr::DefaultMarker)
+                && (column.is_identity
+                    || column.auto_increment
+                    || matches!(
+                        column.default,
+                        crate::storage::ColumnDefault::Generated { .. }
+                    ))
+            {
+                return Ok(None);
+            }
+            let Some(entry) = self.assigned(column, value, None)? else {
                 return Ok(None);
             };
             entries.push(entry).map_err(|_| arena_full())?;

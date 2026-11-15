@@ -37,7 +37,7 @@ pub(crate) use retained::{
     stream_query, union_all_leaves,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod routine_contract_tests;
 
 mod setops;
@@ -13809,7 +13809,20 @@ pub(crate) fn analyse_fromless_select<'a>(
         txid,
         arena,
     };
+    // Analysis converts the literal operands of the target list, then of
+    // the condition.
+    let infer = |other: &'a Expr<'a>| {
+        super::exec::infer_type_res(other, &columns)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+    };
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check_literal_operands_typed(expression, &infer, storage, txid, arena)?;
+        }
+    }
     if let Some(condition) = statement.where_clause {
+        check_literal_operands_typed(condition, &infer, storage, txid, arena)?;
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
     check_fromless_keys(statement, &columns, storage, txid, arena)

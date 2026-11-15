@@ -33,11 +33,13 @@ pub(crate) struct DependencyEdge {
     pub(crate) kind: u8,
 }
 
-/// Visits every dependency visible to `txid`. Temporary arena space used to
-/// read stored dependencies is reclaimed only by the caller.
+/// Visits every dependency visible to `txid`, with only the selected tables'
+/// own rows. Temporary arena space used to read stored dependencies is
+/// reclaimed only by the caller.
 pub(crate) fn for_each_dependency(
     storage: &Storage,
     txid: u32,
+    tables: TableSelection<'_>,
     arena: &Arena,
     visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
@@ -86,7 +88,7 @@ pub(crate) fn for_each_dependency(
             "n"
         )?;
     }
-    for values in constraints::dependencies(storage, txid, arena)? {
+    for values in constraints::dependencies(storage, txid, tables, arena)? {
         let Datum::Char(kind) = values[6] else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -108,15 +110,16 @@ pub(crate) fn for_each_dependency(
         })?;
     }
 
+    let names = storage.visible_table_names(txid, arena)?;
     // Each RI trigger is internal to its foreign key or partition clone.
     for table in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(table, txid) {
+        if !tables.includes(table) || !storage.table_slot_visible_to(table, txid) {
             continue;
         }
         let definition = storage.table_def(table, txid);
         for key in definition.fkeys() {
             let Some(referenced) =
-                storage.find_visible(key.parent_schema.as_str(), key.parent.as_str(), txid)
+                names.find(storage, key.parent_schema.as_str(), key.parent.as_str())
             else {
                 continue;
             };
@@ -158,7 +161,7 @@ pub(crate) fn for_each_dependency(
             continue;
         };
         let Some(table_slot) =
-            storage.find_visible(owner.table_schema.as_str(), owner.table.as_str(), txid)
+            names.find(storage, owner.table_schema.as_str(), owner.table.as_str())
         else {
             continue;
         };
@@ -180,8 +183,8 @@ pub(crate) fn for_each_dependency(
         )?;
     }
 
-    relation_dependencies(storage, txid, arena, visit)?;
-    policy_dependencies(storage, txid, arena, visit)?;
+    relation_dependencies(storage, txid, tables, arena, visit)?;
+    policy_dependencies(storage, txid, tables, arena, visit)?;
     // PostgreSQL's foreign-data DDL: a wrapper uses its handler and validator,
     // a server its wrapper, and user mappings and foreign tables their server.
     for (_, entry) in storage.foreign_wrappers(txid) {
@@ -302,8 +305,11 @@ pub(crate) fn for_each_dependency(
     // column and on each column a key expression uses, and on the whole table
     // only when no key is a plain column.
     for (_, statistics) in storage.extended_statistics_visible(txid) {
-        let dependent = ObjectAddress::new(PG_STATISTIC_EXT_OID, statistics.oid(), 0);
         let table_slot = usize::from(statistics.table);
+        if !tables.includes(table_slot) {
+            continue;
+        }
+        let dependent = ObjectAddress::new(PG_STATISTIC_EXT_OID, statistics.oid(), 0);
         let table_oid = user_table_oid(storage, table_slot);
         let table = storage.table_def(table_slot, txid);
         // The key columns and the columns the expressions use are recorded
@@ -608,6 +614,12 @@ pub(crate) fn for_each_dependency(
     }
 
     for index_slot in 0..storage.index_count() {
+        if storage
+            .index_bound_table_slot(index_slot)
+            .is_some_and(|table| !tables.includes(table))
+        {
+            continue;
+        }
         let Some(index) = storage.index_visible_to(index_slot, txid) else {
             continue;
         };
@@ -1110,11 +1122,12 @@ fn user_type_oid(
 fn relation_dependencies(
     storage: &Storage,
     txid: u32,
+    tables: TableSelection<'_>,
     arena: &Arena,
     visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     for table in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(table, txid) {
+        if !tables.includes(table) || !storage.table_slot_visible_to(table, txid) {
             continue;
         }
         let relation = user_table_oid(storage, table);
@@ -1668,10 +1681,14 @@ fn stored_column_number(
 fn policy_dependencies(
     storage: &Storage,
     txid: u32,
+    tables: TableSelection<'_>,
     arena: &Arena,
     visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
+        if !tables.includes(usize::from(policy.table)) {
+            continue;
+        }
         let dependent = ObjectAddress::new(PG_POLICY_OID, crate::storage::policy_oid(&policy), 0);
         visit(DependencyEdge {
             dependent,

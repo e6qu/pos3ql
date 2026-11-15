@@ -559,7 +559,7 @@ impl Uploads {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};

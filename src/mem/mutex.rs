@@ -242,7 +242,7 @@ impl Barrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::Mutex;
     use crate::mem::guard::forbid_alloc;

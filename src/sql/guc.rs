@@ -5020,7 +5020,7 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
 
@@ -5368,7 +5368,11 @@ mod ownership_tests {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod budget_tests {
     use super::*;
 

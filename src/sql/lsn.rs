@@ -79,7 +79,11 @@ pub fn hash_extended(value: u64, seed: i64) -> i64 {
     ) as i64
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

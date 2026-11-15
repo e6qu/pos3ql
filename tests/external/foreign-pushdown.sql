@@ -115,7 +115,7 @@ SELECT max(id) FROM ft WHERE id > 1000;
 CREATE TABLE fpt (id int, q int) PARTITION BY RANGE (id);
 CREATE TABLE fpt_local PARTITION OF fpt FOR VALUES FROM (0) TO (10);
 CREATE FOREIGN TABLE fpt_remote PARTITION OF fpt FOR VALUES FROM (10) TO (100)
-  SERVER fdw_push OPTIONS (schema_name 'fdw_push_remote', table_name 't');
+  SERVER fdw_push OPTIONS (schema_name 'fdw_push_remote', table_name 'fpt');
 INSERT INTO fpt_local VALUES (1, 10), (5, 50);
 EXPLAIN (COSTS OFF) SELECT * FROM fpt WHERE q > 120;
 SELECT * FROM fpt WHERE q > 120 ORDER BY id, q;

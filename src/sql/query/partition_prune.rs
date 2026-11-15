@@ -19,8 +19,7 @@ use crate::sql::eval::{SqlError, arena_full, compare_datums_collated, sqlstate};
 use crate::sql::types::{ColType, Datum, oid};
 use crate::sql_err;
 use crate::storage::{
-    ColumnMeta, MAX_PARTITION_KEYS, PartitionBound, PartitionBoundValue, PartitionStrategy,
-    Storage,
+    ColumnMeta, MAX_PARTITION_KEYS, PartitionBound, PartitionBoundValue, PartitionStrategy, Storage,
 };
 use core::cmp::Ordering;
 
@@ -248,8 +247,7 @@ impl Operand<'_> {
         match (self, other) {
             (Self::Column(left), Self::Column(right)) => left == right,
             (Self::Other(left, _), Self::Other(right, _)) => left == right,
-            (Self::Value(left), Self::Value(right)) => match (left.expression, right.expression)
-            {
+            (Self::Value(left), Self::Value(right)) => match (left.expression, right.expression) {
                 (Some(left), Some(right)) => left == right,
                 _ => false,
             },
@@ -529,7 +527,9 @@ impl<'a> Context<'_, 'a> {
         )?
         .known_oid()
         .filter(|type_oid| *type_oid != oid::UNKNOWN)
-        .map(|type_oid| crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, type_oid));
+        .map(|type_oid| {
+            crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, type_oid)
+        });
         let target = other
             .and_then(|other| self.values.column(other))
             .map(|column| &self.root[column]);
@@ -844,7 +844,8 @@ impl<'a> Context<'_, 'a> {
                 }
             }
         }
-        let values: &'a mut [(Datum<'a>, usize)] = values.into_mut_slice().map_err(|_| arena_full())?;
+        let values: &'a mut [(Datum<'a>, usize)] =
+            values.into_mut_slice().map_err(|_| arena_full())?;
         let mut failed = None;
         let collation = level.key_columns[0].collation;
         values.sort_unstable_by(|left, right| {
@@ -1216,14 +1217,15 @@ impl<'a> Context<'_, 'a> {
                 break;
             }
         }
-        let n_null = null_keys[..level.n_keys].iter().filter(|null| **null).count();
+        let n_null = null_keys[..level.n_keys]
+            .iter()
+            .filter(|null| **null)
+            .count();
         let n_not_null = not_null_keys[..level.n_keys]
             .iter()
             .filter(|not_null| **not_null)
             .count();
-        if n_null != 0
-            && (level.strategy != PartitionStrategy::Hash || n_null == level.n_keys)
-        {
+        if n_null != 0 && (level.strategy != PartitionStrategy::Hash || n_null == level.n_keys) {
             let result = self.base_step(level, None, &[], &null_keys)?;
             results.push(result).map_err(|_| arena_full())?;
         } else if generate {
@@ -1247,7 +1249,10 @@ impl<'a> Context<'_, 'a> {
         key: usize,
     ) -> Result<Matched<'a>, SqlError> {
         let column = level.keys[key];
-        let key_type = level.key_columns[key].ctype.try_oid().unwrap_or(oid::UNKNOWN);
+        let key_type = level.key_columns[key]
+            .ctype
+            .try_oid()
+            .unwrap_or(oid::UNKNOWN);
         let key_type = crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, key_type);
         let hash = level.strategy == PartitionStrategy::Hash;
         match clause {
@@ -1366,14 +1371,14 @@ impl<'a> Context<'_, 'a> {
         // The keys whose clauses count: a RANGE key without one ends them, as
         // does a key with a strict inequality after its own clauses.
         let mut last_key = level.n_keys;
-        for key in 0..level.n_keys {
+        for (key, null) in null_keys.iter().enumerate().take(level.n_keys) {
             let mut of_key = clauses.iter().filter(|clause| clause.key == key);
             let count = of_key.clone().count();
             if level.strategy == PartitionStrategy::Range && count == 0 {
                 last_key = key;
                 break;
             }
-            if level.strategy == PartitionStrategy::Hash && count == 0 && !null_keys[key] {
+            if level.strategy == PartitionStrategy::Hash && count == 0 && !null {
                 return Ok(());
             }
             if of_key.any(|clause| matches!(clause.op, Cmp::Lt | Cmp::Gt)) {
@@ -1433,7 +1438,17 @@ impl<'a> Context<'_, 'a> {
         results: &mut ArenaList<'a, StepResult<'a>>,
     ) -> Result<(), SqlError> {
         let mut values = [Datum::Null; MAX_PARTITION_KEYS];
-        self.prefix_recurse(level, op, last, clauses, null_keys, 0, &mut values, 0, results)
+        self.prefix_recurse(
+            level,
+            op,
+            last,
+            clauses,
+            null_keys,
+            0,
+            &mut values,
+            0,
+            results,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1529,7 +1544,10 @@ impl<'a> Context<'_, 'a> {
         null_keys: &[bool; MAX_PARTITION_KEYS],
     ) -> Result<StepResult<'a>, SqlError> {
         let greatest = level.indexes.len();
-        let n_null = null_keys[..level.n_keys].iter().filter(|null| **null).count();
+        let n_null = null_keys[..level.n_keys]
+            .iter()
+            .filter(|null| **null)
+            .count();
         if values.len() + n_null != level.n_keys {
             return Ok(StepResult {
                 offsets: self.offsets(greatest, true)?,
@@ -1561,11 +1579,7 @@ impl<'a> Context<'_, 'a> {
     }
 
     /// `partition_list_bsearch`: the greatest datum at or below `value`.
-    fn list_search(
-        &self,
-        level: &Level<'a>,
-        value: &Datum<'a>,
-    ) -> Result<(isize, bool), SqlError> {
+    fn list_search(&self, level: &Level<'a>, value: &Datum<'a>) -> Result<(isize, bool), SqlError> {
         let (mut low, mut high) = (-1isize, level.list.len() as isize - 1);
         let mut equal = false;
         while low < high {
@@ -1883,19 +1897,20 @@ impl<'a> Context<'_, 'a> {
         for clause in inherited {
             qual.push(*clause).map_err(|_| arena_full())?;
         }
-        let key_value = |key: usize, value: &crate::storage::OwnedDatum| -> Result<Operand<'a>, SqlError> {
-            let datum = self
-                .arena
-                .alloc(*value)
-                .map_err(|_| arena_full())?
-                .as_datum();
-            Ok(Operand::Value(Value {
-                expression: None,
-                stage: PruneStage::Plan,
-                datum: Some(datum),
-                type_oid: level.key_columns[key].ctype.try_oid(),
-            }))
-        };
+        let key_value =
+            |key: usize, value: &crate::storage::OwnedDatum| -> Result<Operand<'a>, SqlError> {
+                let datum = self
+                    .arena
+                    .alloc(*value)
+                    .map_err(|_| arena_full())?
+                    .as_datum();
+                Ok(Operand::Value(Value {
+                    expression: None,
+                    stage: PruneStage::Plan,
+                    datum: Some(datum),
+                    type_oid: level.key_columns[key].ctype.try_oid(),
+                }))
+            };
         match &level.bounds[position] {
             PartitionBound::Range {
                 lower,
@@ -2088,7 +2103,9 @@ impl<'a> Context<'_, 'a> {
         match clause {
             Clause::And(items) | Clause::Or(items) => items.iter().any(Self::mutable),
             Clause::Compare { left, right, .. } => operand(left) || operand(right),
-            Clause::Array { operand: o, items, .. } => operand(o) || items.iter().any(operand),
+            Clause::Array {
+                operand: o, items, ..
+            } => operand(o) || items.iter().any(operand),
             Clause::NullTest { operand: o, .. } => operand(o),
             Clause::Constant(_) => false,
             Clause::Opaque { mutable } => *mutable,
@@ -2231,7 +2248,11 @@ fn classify<'a>(clause: &Clause<'a>) -> Class<'a> {
                 op: *op,
                 items,
             };
-            if *any { Class::Or(items) } else { Class::And(items) }
+            if *any {
+                Class::Or(items)
+            } else {
+                Class::And(items)
+            }
         }
         _ => Class::Atom,
     }
@@ -2251,7 +2272,11 @@ impl<'a> Context<'_, 'a> {
         // No restriction refutes itself, so a list compared with itself
         // needs two of them.
         let held = |list: &[Clause<'a>]| -> Result<Clause<'a>, SqlError> {
-            Ok(Clause::And(self.arena.alloc_slice_copy(list).map_err(|_| arena_full())?))
+            Ok(Clause::And(
+                self.arena
+                    .alloc_slice_copy(list)
+                    .map_err(|_| arena_full())?,
+            ))
         };
         if core::ptr::eq(predicates, clauses) {
             let both = held(predicates)?;
@@ -2275,8 +2300,14 @@ impl<'a> Context<'_, 'a> {
         self.refute(&clause, &predicate, weak)
     }
 
-    fn refute(&self, clause: &Clause<'a>, predicate: &Clause<'a>, weak: bool) -> Result<bool, SqlError> {
-        let any_predicate = |test: &dyn Fn(&Clause<'a>) -> Result<bool, SqlError>, items: Items<'a>| {
+    fn refute(
+        &self,
+        clause: &Clause<'a>,
+        predicate: &Clause<'a>,
+        weak: bool,
+    ) -> Result<bool, SqlError> {
+        let any_predicate = |test: &dyn Fn(&Clause<'a>) -> Result<bool, SqlError>,
+                             items: Items<'a>| {
             for index in 0..items.len() {
                 if test(&items.get(index))? {
                     return Ok(true);
@@ -2434,8 +2465,13 @@ impl<'a> Context<'_, 'a> {
         let Some(test) = table[clause_op.index()][pred_op.index()] else {
             return Ok(false);
         };
-        let ordering =
-            compare_datums_collated(self.storage, self.txid, collation, &pred_value, &clause_value)?;
+        let ordering = compare_datums_collated(
+            self.storage,
+            self.txid,
+            collation,
+            &pred_value,
+            &clause_value,
+        )?;
         Ok(test.holds(ordering))
     }
 
@@ -2586,7 +2622,10 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
                     ScanRelation::From { scope, .. } => {
                         scope.find_column_unsuggested(*qualifier, name).is_ok()
                     }
-                    ScanRelation::Target { columns, name: exposed } => {
+                    ScanRelation::Target {
+                        columns,
+                        name: exposed,
+                    } => {
                         qualifier.is_none_or(|qualifier| qualifier == exposed)
                             && columns.iter().any(|column| column.name.as_str() == *name)
                     }

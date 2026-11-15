@@ -9249,12 +9249,8 @@ fn scan_source_mode<'a>(
                 // The members executor pruning keeps, with every value this
                 // scan knows, as the plan's members name them.
                 let table = order[depth];
-                let conditions = super::partition_prune::scan_conditions(
-                    from,
-                    where_clause,
-                    table,
-                    arena,
-                )?;
+                let conditions =
+                    super::partition_prune::scan_conditions(from, where_clause, table, arena)?;
                 let values = super::partition_prune::ScanValues {
                     storage,
                     txid,

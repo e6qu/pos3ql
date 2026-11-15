@@ -709,7 +709,9 @@ impl Node {
     /// it: a member scan's share of its `Append`'s counts.
     pub(crate) fn add_counted(self, rows: u64, filtered: u64) {
         self.rows(rows);
-        self.with(|slot, _| slot.counters.filtered = slot.counters.filtered.saturating_add(filtered));
+        self.with(|slot, _| {
+            slot.counters.filtered = slot.counters.filtered.saturating_add(filtered)
+        });
     }
 
     /// Counts one row the node returned.

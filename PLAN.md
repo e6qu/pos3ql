@@ -1048,8 +1048,30 @@ that type's default hash function seeded as PostgreSQL seeds it, skipping
 null keys, and `satisfies_hash_partition` answers as PostgreSQL's does
 (`differential_exact/550`); any other key type fails with `0A000`. Partition
 keys are plain columns: expression keys and a key `COLLATE` fail (`0A000`
-and a syntax error). `EXPLAIN` of a partitioned table prints one scan of the
-parent where PostgreSQL prints an `Append` of the partitions it keeps. A btree index may use
+and a syntax error). A scan of a partitioned table or inheritance parent
+reads the members PostgreSQL's partition pruning (`partprune.c`: RANGE with
+multi-column prefixes, LIST with NULL and default partitions, HASH,
+booleans, `IN`, `<>`, `OR` and nested levels) and constraint exclusion
+(self-contradicting conditions, a member's `CHECK` and `NOT NULL`
+constraints) keep, and `EXPLAIN` prints the same members: an `Append` of
+their scans named `pt_1`, `pt_2`, ..., one member scanned under the table's
+own name, or a `Result` with a false `One-Time Filter` when none is left.
+Constants and a custom plan's arguments prune at planning; a generic plan's
+arguments and stable functions prune at executor startup (`Subplans
+Removed`), and execution prunes with every value it knows. `UPDATE` and
+`DELETE` list each member as a result relation (`Update on pt1 pt_1`),
+`VERBOSE` prints each member's target list and `tableoid`, and `EXPLAIN
+ANALYZE` counts each member's scan (`differential_exact/600`-`604`).
+Remaining, each failing with `0A000`: a member with an index on a column
+the query's conditions, keys or aggregates read (PostgreSQL scans each
+partition by its own index as costs choose); `EXPLAIN ANALYZE` of pruning
+by a subquery's or an enclosing query's value, which PostgreSQL repeats for
+each scan; a joined write or `MERGE` into such a table; an `UPDATE` of an
+inheritance tree and a select list computed over one (PostgreSQL's
+`Result` above the `Append`); an outer join whose partitioned side keeps no
+member; and conditions on foreign members. Joins and grouping over
+partitioned tables use pos3ql's join and aggregation methods, which differ
+from PostgreSQL's cost choices as they do for plain tables. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

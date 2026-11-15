@@ -352,8 +352,8 @@ impl PlanNode {
         batch_size: None,
         passthrough: false,
         subplans_removed: None,
-target_member: false,
-scan_pruned: false,
+        target_member: false,
+        scan_pruned: false,
     };
 }
 
@@ -2442,16 +2442,68 @@ struct Expansion<'a> {
     started: &'a [usize],
 }
 
+/// Rejects members that have an index on a column in `read`: PostgreSQL
+/// scans each partition by its own indexes as their costs choose, which
+/// this plan does not model.
+fn reject_member_indexes(
+    storage: &Storage,
+    txid: u32,
+    members: &[usize],
+    read: &dyn Fn(&str) -> bool,
+) -> Result<(), SqlError> {
+    for &member in members {
+        let definition = storage.table_def(member, txid);
+        for binding in 0..storage.value_binding_count(member) {
+            let (columns, count) = storage.value_binding_columns(member, binding);
+            let leading = (count != 0)
+                .then(|| definition.columns().get(usize::from(columns[0])))
+                .flatten();
+            if leading.is_none_or(|column| read(column.name.as_str())) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of a partition or inheritance child scanned by its index is not supported"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `expressions` read the column `name` of `relation`: a condition,
+/// key or aggregate argument an index of the relation could serve.
+fn reads_column<'e>(
+    expressions: impl Iterator<Item = &'e Expr<'e>>,
+    relation: &dyn Fn(Option<&str>, &str) -> bool,
+    name: &str,
+) -> bool {
+    let mut found = false;
+    for expression in expressions {
+        let _ = query::walk_expression_tree(expression, &mut |node| {
+            if let Expr::Column {
+                qualifier,
+                name: column,
+            } = node
+                && *column == name
+                && relation(*qualifier, column)
+            {
+                found = true;
+            }
+        });
+    }
+    found
+}
+
 /// Per FROM position of `scope`, the members its scan reads when it is a
 /// partitioned table or an inheritance parent with children.
 fn relation_expansions<'a>(
     storage: &Storage,
     txid: u32,
     scope: &QueryScope<'a>,
+    statement: &'a Select<'a>,
     from: &'a crate::sql::ast::FromClause<'a>,
-    where_clause: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<&'a [Option<Expansion<'a>>], SqlError> {
+    let where_clause = statement.where_clause;
     use query::partition_prune::{PruneStage, ScanValues, expands, members, scan_conditions};
     let expansions = arena
         .alloc_slice_with(scope.n, |_| None)
@@ -2493,10 +2545,26 @@ fn relation_expansions<'a>(
             params: parameters,
             hooks: &crate::sql::eval::NO_HOOKS,
         };
-        let planned = members(storage, txid, slot, conditions, &values, PruneStage::Plan, arena)?;
+        let planned = members(
+            storage,
+            txid,
+            slot,
+            conditions,
+            &values,
+            PruneStage::Plan,
+            arena,
+        )?;
         // A single member replaces the `Append`, which then prunes nothing.
         let started = if planned.leaves.len() >= 2 {
-            let kept = members(storage, txid, slot, conditions, &values, PruneStage::Startup, arena)?;
+            let kept = members(
+                storage,
+                txid,
+                slot,
+                conditions,
+                &values,
+                PruneStage::Startup,
+                arena,
+            )?;
             let started = arena
                 .alloc_slice_with(planned.leaves.len(), |_| 0usize)
                 .map_err(|_| arena_full())?;
@@ -2511,6 +2579,37 @@ fn relation_expansions<'a>(
         } else {
             planned.leaves
         };
+        // An index serves a condition, a sort or grouping key, or an
+        // aggregate's argument.
+        let own = |qualifier: Option<&str>, name: &str| {
+            matches!(
+                scope.find_column_unsuggested(qualifier, name),
+                Ok(query::ResolvedColumn::Table(found, _)) if found == table
+            )
+        };
+        let indexed = |name: &str| {
+            let mut aggregated = false;
+            for item in statement.items {
+                if let SelectItem::Expr { expression, .. } = item {
+                    let _ = query::walk_expression_tree(expression, &mut |node| {
+                        if node.is_aggregate_use()
+                            && let Expr::Call { args, .. } = node
+                        {
+                            aggregated |= reads_column(args.iter().copied(), &own, name);
+                        }
+                    });
+                }
+            }
+            let read = where_clause
+                .into_iter()
+                .chain(from.joins.iter().filter_map(|join| join.on))
+                .chain(statement.order_by.iter().map(|key| key.expression))
+                .chain(statement.group_by.iter().copied())
+                .chain(statement.distinct_on.iter().copied())
+                .chain(statement.having);
+            aggregated || reads_column(read, &own, name)
+        };
+        reject_member_indexes(storage, txid, planned.leaves, &indexed)?;
         if planned.expanded != 0 {
             EXPANDED_RELATIONS.with(|expanded| expanded.set(true));
         }
@@ -2519,10 +2618,35 @@ fn relation_expansions<'a>(
     Ok(expansions)
 }
 
+/// The names a statement's range table entries print under, as
+/// `set_rtable_names` makes each unique by a numeric suffix.
+struct RangeTableNames<'n> {
+    names: &'n mut [StackStr<96>],
+    count: usize,
+}
+
+impl RangeTableNames<'_> {
+    /// Takes the first name `base`, `base_1`, `base_2`, ... not yet taken.
+    fn take(&mut self, base: &str) -> Result<StackStr<96>, SqlError> {
+        let unique = unique_rtable_name(base, &self.names[..self.count]);
+        let Some(slot) = self.names.get_mut(self.count) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "EXPLAIN range table exceeds {} relations",
+                self.names.len()
+            ));
+        };
+        *slot = unique;
+        self.count += 1;
+        Ok(unique)
+    }
+}
+
 /// Pushes the scan of an expanded relation: its one member's scan, or an
 /// `Append` of each member's scan, each with the relation's conditions and
-/// target list under its own name (`pt_1`, `pt_2`, ...). `used` holds the
-/// range table names taken so far; `member_key` is each member's node.
+/// target list under its own name (`pt_1`, `pt_2`, ...) from `names`;
+/// `member_key` is each member's node.
+#[allow(clippy::too_many_arguments)]
 fn push_members(
     plan: &mut Plan<'_>,
     storage: &Storage,
@@ -2530,8 +2654,7 @@ fn push_members(
     scan: PlanNode,
     expansion: Expansion<'_>,
     nominal_named: bool,
-    used: &mut [StackStr<96>],
-    used_count: &mut usize,
+    names: &mut RangeTableNames<'_>,
     member_key: &dyn Fn(usize) -> Option<NodeKey>,
 ) -> Result<(), SqlError> {
     if scan.name.as_str() != "Seq Scan" || !scan.bitmap_index.as_str().is_empty() {
@@ -2569,25 +2692,12 @@ fn push_members(
         }
         Ok(node)
     };
-    let mut take = |name: &str| -> Result<StackStr<96>, SqlError> {
-        let unique = unique_rtable_name(name, &used[..*used_count]);
-        if *used_count == used.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "EXPLAIN range table exceeds {} relations",
-                used.len()
-            ));
-        }
-        used[*used_count] = unique;
-        *used_count += 1;
-        Ok(unique)
-    };
     let planned = expansion.planned.leaves;
     // One member is scanned in place of the `Append`. It takes the
     // relation's name, unless a write names the relation itself.
     if planned.len() == 1 {
         let alias = if nominal_named {
-            take(exposed.as_str())?
+            names.take(exposed.as_str())?
         } else {
             exposed
         };
@@ -2615,7 +2725,7 @@ fn push_members(
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
-        let alias = take(exposed.as_str())?;
+        let alias = names.take(exposed.as_str())?;
         let mut node = member(leaf, alias.as_str())?;
         node.depth = scan.depth + 1;
         node.key = member_key(leaf);
@@ -3486,8 +3596,8 @@ fn scan_node<'a>(
         batch_size: None,
         passthrough: false,
         subplans_removed: None,
-target_member: false,
-scan_pruned: false,
+        target_member: false,
+        scan_pruned: false,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -4162,7 +4272,7 @@ fn plan_pulled_select<'a>(
     }
     let expansions = match (scope.as_ref(), statement.from.as_ref()) {
         (Some(scope), Some(from)) => {
-            relation_expansions(storage, txid, scope, from, statement.where_clause, arena)?
+            relation_expansions(storage, txid, scope, statement, from, arena)?
         }
         _ => &[],
     };
@@ -4267,12 +4377,16 @@ fn plan_pulled_select<'a>(
             if !expansion.planned.leaves.is_empty() {
                 continue;
             }
-            let nullable = from.joins.iter().enumerate().any(|(index, join)| match join.kind {
-                crate::sql::ast::JoinKind::Left => index + 1 == table,
-                crate::sql::ast::JoinKind::Right => table <= index,
-                crate::sql::ast::JoinKind::Full => true,
-                _ => false,
-            });
+            let nullable = from
+                .joins
+                .iter()
+                .enumerate()
+                .any(|(index, join)| match join.kind {
+                    crate::sql::ast::JoinKind::Left => index + 1 == table,
+                    crate::sql::ast::JoinKind::Right => table <= index,
+                    crate::sql::ast::JoinKind::Full => true,
+                    _ => false,
+                });
             if nullable || from.joins.iter().any(|join| join.kind.is_semi_or_anti()) {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5229,14 +5343,16 @@ fn plan_pulled_select<'a>(
         // nested loop.
         let mut outer_rows = u64::MAX;
         // The range table names taken, which members' names avoid.
-        let used_names = arena
-            .alloc_slice_with(scope.n + members, |index| {
-                scope.names.get(index).map_or_else(StackStr::new, |name| {
-                    StackStr::from_str(crate::sql::catalog::deparse::printed_name(name))
+        let mut names = RangeTableNames {
+            names: arena
+                .alloc_slice_with(scope.n + members, |index| {
+                    scope.names.get(index).map_or_else(StackStr::new, |name| {
+                        StackStr::from_str(crate::sql::catalog::deparse::printed_name(name))
+                    })
                 })
-            })
-            .map_err(|_| arena_full())?;
-        let mut used_count = scope.n;
+                .map_err(|_| arena_full())?,
+            count: scope.n,
+        };
         for (position, &table) in table_order[..scope.n].iter().enumerate() {
             let depth = if n == 1 {
                 stage_count
@@ -5439,8 +5555,7 @@ fn plan_pulled_select<'a>(
                     scan,
                     expansion,
                     false,
-                    used_names,
-                    &mut used_count,
+                    &mut names,
                     &|leaf| {
                         Some(NodeKey::new(
                             block,
@@ -6930,8 +7045,8 @@ fn physical_scan_node(
         batch_size: None,
         passthrough: false,
         subplans_removed: None,
-target_member: false,
-scan_pruned: false,
+        target_member: false,
+        scan_pruned: false,
     }
 }
 
@@ -7098,8 +7213,8 @@ fn push_set_tree(
                 batch_size: None,
                 passthrough: false,
                 subplans_removed: None,
-target_member: false,
-scan_pruned: false,
+                target_member: false,
+                scan_pruned: false,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -7560,8 +7675,8 @@ pub(super) fn plan_modification<'a>(
         batch_size: None,
         passthrough: false,
         subplans_removed: None,
-target_member: false,
-scan_pruned: false,
+        target_member: false,
+        scan_pruned: false,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -8143,13 +8258,33 @@ fn expanded_write<'e>(
         hooks: &crate::sql::eval::NO_HOOKS,
     };
     let conditions = conjuncts(predicate, arena)?;
-    let planned = members(storage, txid, slot, conditions, &values, PruneStage::Plan, arena)?;
+    let planned = members(
+        storage,
+        txid,
+        slot,
+        conditions,
+        &values,
+        PruneStage::Plan,
+        arena,
+    )?;
+    let own = |qualifier: Option<&str>, _: &str| qualifier.is_none_or(|q| q == exposed);
+    reject_member_indexes(storage, txid, planned.leaves, &|name| {
+        reads_column(conditions.iter().copied(), &own, name)
+    })?;
     if planned.leaves.is_empty() {
         plan.push(empty)?;
         return Ok(empty);
     }
     let started = if planned.leaves.len() >= 2 {
-        let kept = members(storage, txid, slot, conditions, &values, PruneStage::Startup, arena)?;
+        let kept = members(
+            storage,
+            txid,
+            slot,
+            conditions,
+            &values,
+            PruneStage::Startup,
+            arena,
+        )?;
         let started = arena
             .alloc_slice_with(planned.leaves.len(), |_| 0usize)
             .map_err(|_| arena_full())?;
@@ -8221,7 +8356,10 @@ fn expanded_write<'e>(
             } else {
                 None
             };
-            Ok::<_, SqlError>((returned, lists.modified_row(assignments, alias, false, true)?))
+            Ok::<_, SqlError>((
+                returned,
+                lists.modified_row(assignments, alias, false, true)?,
+            ))
         })();
         // SAFETY: the lists were copied out of the arena.
         unsafe { arena.rewind_to(mark) };
@@ -8233,15 +8371,16 @@ fn expanded_write<'e>(
         .with_qual(QualLabel::Filter, filter)
         .with_verbose_qual(QualLabel::Filter, verbose_filter);
     // The result relations, named as the members' scans are.
-    let used = arena
-        .alloc_slice_with(started.len() + 1, |_| StackStr::<96>::new())
-        .map_err(|_| arena_full())?;
-    used[0] = StackStr::from_str(exposed);
-    let mut used_count = 1;
+    let fresh_names = || -> Result<RangeTableNames<'_>, SqlError> {
+        let names = arena
+            .alloc_slice_with(started.len() + 1, |_| StackStr::<96>::new())
+            .map_err(|_| arena_full())?;
+        names[0] = StackStr::from_str(exposed);
+        Ok(RangeTableNames { names, count: 1 })
+    };
+    let mut targets = fresh_names()?;
     for &leaf in started {
-        let name = unique_rtable_name(exposed, &used[..used_count]);
-        used[used_count] = name;
-        used_count += 1;
+        let name = targets.take(exposed)?;
         let member = storage.table_def(leaf, txid);
         plan.push(PlanNode {
             name: StackStr::from_str(verb),
@@ -8257,7 +8396,6 @@ fn expanded_write<'e>(
             ..PlanNode::EMPTY
         })?;
     }
-    let mut used_count = 1;
     push_members(
         plan,
         storage,
@@ -8265,8 +8403,7 @@ fn expanded_write<'e>(
         scan,
         Expansion { planned, started },
         true,
-        used,
-        &mut used_count,
+        &mut fresh_names()?,
         &|leaf| {
             Some(NodeKey::new(
                 block,
@@ -8459,7 +8596,8 @@ pub(super) fn visit_text_rows<E>(
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
         if node.target_member {
             let mut line = StackStr::<512>::new();
-            let parent = property_indent(node.depth.saturating_sub(1)) + 2 * usize::from(node.shift);
+            let parent =
+                property_indent(node.depth.saturating_sub(1)) + 2 * usize::from(node.shift);
             for _ in 0..parent {
                 let _ = write!(line, " ");
             }

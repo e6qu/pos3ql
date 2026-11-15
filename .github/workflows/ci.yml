@@ -804,7 +804,7 @@ jobs:
               external_lateral_runs_use_object_storage
               external_set_runs_use_object_storage
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 

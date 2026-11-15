@@ -1225,10 +1225,6 @@ pub fn expand_dml_ctes<'a>(
 /// Rebinds a SQL-standard routine statement to the catalog identities captured
 /// when the routine was defined. String-literal bodies deliberately use the
 /// ordinary invocation-time path and never enter this function.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "stored statements require their captured catalog and evaluation context"
-)]
 pub(crate) fn expand_stored_statement_exec<'a>(
     statement: &'a Stmt<'a>,
     storage: &Storage,
@@ -7766,10 +7762,6 @@ fn external_recursive_union(
 /// storage is arena-bounded: recursion that a reader drains without end
 /// fails loudly with arena exhaustion, and the statement timeout is honored
 /// per iteration.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recursion runs in its WITH position's plan block with its execution context"
-)]
 fn plan_recursive<'a>(
     cte: &'a Cte<'a>,
     position: usize,

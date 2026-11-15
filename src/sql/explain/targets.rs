@@ -1243,8 +1243,7 @@ impl<'a> RelationTargets<'a> {
                 let mut name = StackStr::<96>::new();
                 crate::sql::catalog::write_identifier(&mut name, qualifier);
                 let _ = name.write_str(".ctid");
-                &*self
-                    .arena
+                self.arena
                     .alloc_str(name.as_str())
                     .map_err(|_| arena_full())?
             }

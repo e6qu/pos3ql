@@ -8784,11 +8784,6 @@ fn plan_write<'a>(
     Ok(plan)
 }
 
-/// Plans an `UPDATE` or `DELETE` of a partitioned table or inheritance
-/// tree without other relations: each member it reaches is a result
-/// relation listed under the write, and its scans form the `Append` below
-/// it. Returns the write's input node.
-#[allow(clippy::too_many_arguments)]
 /// Whether a write returns nothing.
 fn returning_empty(statement: &Stmt<'_>) -> bool {
     match statement {
@@ -8808,6 +8803,11 @@ fn write_inheritance(statement: &Stmt<'_>) -> crate::sql::ast::RelationInheritan
     }
 }
 
+/// Plans an `UPDATE` or `DELETE` of a partitioned table or inheritance
+/// tree without other relations: each member it reaches is a result
+/// relation listed under the write, and its scans form the `Append` below
+/// it. Returns the write's input node.
+#[allow(clippy::too_many_arguments)]
 fn expanded_write<'e>(
     plan: &mut Plan<'_>,
     storage: &Storage,

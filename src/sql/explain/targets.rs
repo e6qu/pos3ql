@@ -1373,9 +1373,9 @@ impl<'a> RelationTargets<'a> {
             let mut read = ArenaList::new(self.arena);
             let mut whole_row = false;
             columns_of(value, &mut |column| {
-                if matches!(column, Expr::WholeRow(_)) {
-                    whole_row = true;
-                } else if read.push(column).is_err() {
+                // A whole-row reference, or a list past the arena, is
+                // outside this list.
+                if matches!(column, Expr::WholeRow(_)) || read.push(column).is_err() {
                     whole_row = true;
                 }
             });

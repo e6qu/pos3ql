@@ -10497,6 +10497,9 @@ fn scan_source_mode<'a>(
     Ok(())
 }
 
+/// A visitor of a member's rows: each row's identity and own columns.
+type MemberRowVisitor<'v, 'a> = dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError> + 'v;
+
 /// Visits each row of `leaf`, a member of an expanded FROM item, with its
 /// identity (none for a foreign member's, which come from its server as a
 /// foreign table read on its own does, by the remote query `pushed` when
@@ -10512,7 +10515,7 @@ fn for_each_member_row<'a>(
     recycle_rows: bool,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     pushed: Option<(&'a str, crate::sql::foreign::RemoteColumns<'a>)>,
-    visit: &mut dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError>,
+    visit: &mut MemberRowVisitor<'_, 'a>,
 ) -> Result<bool, SqlError> {
     if physical.kind == crate::storage::TableKind::Foreign {
         let stream = crate::sql::foreign::ForeignStream::new(leaf, pushed, arena)?;

@@ -2669,17 +2669,23 @@ impl RangeTableNames<'_> {
 /// Pushes the scan of an expanded relation: its one member's scan, or an
 /// `Append` of each member's scan, each with the relation's conditions and
 /// target list under its own name (`pt_1`, `pt_2`, ...) from `names`;
-/// `member_key` is each member's node.
+/// `member_key` is each member's node. `projection` is the target a
+/// `Result` above them computes: an `Append` cannot project
+/// (`is_projection_capable_path`), so an inheritance tree's scan/join
+/// target that differs from the columns its members return is computed
+/// there (`create_projection_plan`), and the `Result` stays when setrefs
+/// removes a one-member `Append`, naming the member's columns.
 #[allow(clippy::too_many_arguments)]
 fn push_members(
     plan: &mut Plan<'_>,
     storage: &Storage,
     txid: u32,
-    scan: PlanNode,
+    mut scan: PlanNode,
     expansion: Expansion<'_>,
     nominal_named: bool,
     names: &mut RangeTableNames<'_>,
     member_key: &dyn Fn(usize) -> Option<NodeKey>,
+    projection: Option<(targets::Output, bool)>,
 ) -> Result<(), SqlError> {
     if scan.name.as_str() != "Seq Scan" || !scan.bitmap_index.as_str().is_empty() {
         return Err(sql_err!(
@@ -2688,6 +2694,26 @@ fn push_members(
             scan.name.as_str()
         ));
     }
+    let result = match projection {
+        Some((output, output_unprintable)) => {
+            plan.push(PlanNode {
+                name: StackStr::from_str("Result"),
+                depth: scan.depth,
+                shift: scan.shift,
+                startup_cost: scan.startup_cost,
+                total_cost: scan.total_cost,
+                rows: scan.rows,
+                width: scan.width,
+                output,
+                output_unprintable,
+                passthrough: true,
+                ..PlanNode::EMPTY
+            })?;
+            scan.depth += 1;
+            Some(plan.count - 1)
+        }
+        None => None,
+    };
     let exposed = StackStr::<96>::from_str(scan.exposed_name());
     let member = |leaf: usize, alias: &str| -> Result<PlanNode, SqlError> {
         let definition = storage.table_def(leaf, txid);
@@ -2725,6 +2751,11 @@ fn push_members(
         } else {
             exposed
         };
+        if let Some(result) = result
+            && alias != exposed
+        {
+            plan.nodes[result].requalify(exposed.as_str(), alias.as_str());
+        }
         let mut node = member(planned[0], alias.as_str())?;
         node.key = scan.key;
         return plan.push(node);
@@ -5433,22 +5464,46 @@ fn plan_pulled_select<'a>(
             // target themselves (`apply_scanjoin_target_to_paths`); in a
             // join they read the columns needed above.
             let expanded = expansions.get(table).copied().flatten().is_some();
-            // An inheritance tree's members read the needed columns, and a
-            // `Result` above their `Append` computes the query's target,
-            // which this plan does not model.
-            if let (Some(found), true, true) = (block_targets.as_ref(), expanded, n == 1)
+            // An inheritance tree's members return the columns needed, and
+            // a `Result` above their `Append` computes the scan/join target
+            // when it differs (`apply_scanjoin_target_to_paths` projects a
+            // relation that is not partitioned as a whole).
+            let projection = if expanded
+                && n == 1
                 && !storage
                     .table_def(scope.slots[table], txid)
                     .partition
                     .is_partitioned()
-                && found.scan(table, true, targets::Demand::Exact)?.as_str()
-                    != found.scan(table, true, targets::Demand::Small)?.as_str()
             {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN of a query computing its select list over an inheritance tree is not supported"
-                ));
-            }
+                let Some(found) = block_targets.as_ref() else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of a select list over an inheritance tree outside the target list deparser's coverage is not supported"
+                    ));
+                };
+                // Each member returns its whole row as the parent's row
+                // type, the same value when the member adds no column.
+                if found.reads_whole_row(table) {
+                    let columns = storage.table_def(scope.slots[table], txid).n_columns;
+                    let leaves = expansions[table].map_or(&[][..], |expansion| expansion.started);
+                    if leaves
+                        .iter()
+                        .any(|&leaf| storage.table_def(leaf, txid).n_columns != columns)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "EXPLAIN of a whole-row reference to an inheritance child with its own columns is not supported"
+                        ));
+                    }
+                    None
+                } else {
+                    let target = found.scan_join()?;
+                    let needed = found.scan(table, false, targets::Demand::Small)?;
+                    (target.as_str() != needed.as_str()).then_some((target, needed))
+                }
+            } else {
+                None
+            };
             match block_targets.as_ref() {
                 Some(found) => {
                     scan.output = found.scan(
@@ -5467,6 +5522,9 @@ fn plan_pulled_select<'a>(
                 }
                 None if !aggregate => scan.output = widened(output),
                 None => {}
+            }
+            if let Some((_, needed)) = projection {
+                scan.output = needed;
             }
             // PostgreSQL estimates a relation never analyzed as at least ten
             // pages of rows (`estimate_rel_size`), where pos3ql counts its
@@ -5613,6 +5671,7 @@ fn plan_pulled_select<'a>(
                             Role::Member(position_role, u32::try_from(leaf).unwrap_or(u32::MAX)),
                         ))
                     },
+                    projection.map(|(target, _)| (target, false)),
                 )?,
                 None => push_scan(&mut plan, scan)?,
             }
@@ -8264,6 +8323,10 @@ pub(super) fn plan_modification<'a>(
         && !joined
         && matches!(statement, Stmt::Update(_) | Stmt::Delete(_))
         && query::partition_prune::expands(storage, slot, txid)
+        // `ONLY` of an inheritance parent writes the parent's own rows as a
+        // plain table's write does.
+        && (write_inheritance(statement) == crate::sql::ast::RelationInheritance::Descendants
+            || storage.table_def(slot, txid).partition.is_partitioned())
     {
         expanded_write(
             &mut plan, storage, txid, statement, slot, verb, filtered, predicate, alias, block,
@@ -8413,6 +8476,25 @@ pub(super) fn plan_modification<'a>(
 /// relation listed under the write, and its scans form the `Append` below
 /// it. Returns the write's input node.
 #[allow(clippy::too_many_arguments)]
+/// Whether a write returns nothing.
+fn returning_empty(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::Update(update) => update.returning.items.is_empty(),
+        Stmt::Delete(delete) => delete.returning.items.is_empty(),
+        Stmt::Insert(insert) => insert.returning.items.is_empty(),
+        _ => true,
+    }
+}
+
+/// Whether an `UPDATE` or `DELETE` writes its target's descendants too.
+fn write_inheritance(statement: &Stmt<'_>) -> crate::sql::ast::RelationInheritance {
+    match statement {
+        Stmt::Update(update) => update.inheritance,
+        Stmt::Delete(delete) => delete.inheritance,
+        _ => crate::sql::ast::RelationInheritance::Descendants,
+    }
+}
+
 fn expanded_write<'e>(
     plan: &mut Plan<'_>,
     storage: &Storage,
@@ -8427,11 +8509,7 @@ fn expanded_write<'e>(
     arena: &'e Arena,
 ) -> Result<PlanNode, SqlError> {
     use query::partition_prune::{PruneStage, ScanRelation, ScanValues, conjuncts, members};
-    let inheritance = match statement {
-        Stmt::Update(update) => update.inheritance,
-        Stmt::Delete(delete) => delete.inheritance,
-        _ => crate::sql::ast::RelationInheritance::Descendants,
-    };
+    let inheritance = write_inheritance(statement);
     let definition = (*storage.table_def(slot, txid)).clone();
     let exposed = alias.unwrap_or(definition.name.as_str());
     let width = storage
@@ -8447,23 +8525,10 @@ fn expanded_write<'e>(
         constant_false: true,
         ..PlanNode::EMPTY
     };
+    // `ONLY` of a partitioned table writes no rows.
     if inheritance == crate::sql::ast::RelationInheritance::Only {
-        if definition.partition.is_partitioned() {
-            plan.push(empty)?;
-            return Ok(empty);
-        }
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a write to ONLY an inheritance parent is not supported"
-        ));
-    }
-    // An inheritance tree's update computes its new values in a `Result`
-    // above the members' `Append`, which this plan does not model.
-    if matches!(statement, Stmt::Update(_)) && !definition.partition.is_partitioned() {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of an UPDATE of an inheritance tree is not supported"
-        ));
+        plan.push(empty)?;
+        return Ok(empty);
     }
     if predicate.is_some_and(|predicate| qual_false(predicate, arena)) {
         plan.push(empty)?;
@@ -8559,7 +8624,11 @@ fn expanded_write<'e>(
         true,
         arena,
     )?;
-    let (returned, read) = {
+    // An `UPDATE` of an inheritance tree computes its new values in a
+    // `Result` above the members' `Append`, which cannot project; a
+    // partitioned table's members compute them (`apply_scanjoin_target_to_paths`).
+    let projects = matches!(statement, Stmt::Update(_)) && !definition.partition.is_partitioned();
+    let (returned, modified, read) = {
         let (assignments, returning): (&[(&str, &Expr<'_>)], _) = match statement {
             Stmt::Update(update) => (update.assignments, update.returning),
             Stmt::Delete(delete) => (&[], delete.returning),
@@ -8576,16 +8645,17 @@ fn expanded_write<'e>(
                 true,
                 arena,
             )?;
-            // The `RETURNING` list over each member's row is not modelled.
-            let returned = if returning.items.is_empty() {
-                lists.returning(returning)?
+            let returned = lists.returning(returning)?;
+            let modified = lists.modified_row(assignments, alias, false, true)?;
+            // A partitioned table's members compute the new values
+            // themselves; an inheritance tree's return the columns read and
+            // a `Result` above computes them.
+            let read = if projects {
+                lists.modified_row_reads(assignments)?
             } else {
-                None
+                modified
             };
-            Ok::<_, SqlError>((
-                returned,
-                lists.modified_row(assignments, alias, false, true)?,
-            ))
+            Ok::<_, SqlError>((returned, modified, read))
         })();
         // SAFETY: the lists were copied out of the arena.
         unsafe { arena.rewind_to(mark) };
@@ -8593,6 +8663,11 @@ fn expanded_write<'e>(
     };
     plan.nodes[0].set_output(returned);
     scan.set_output(read);
+    let projection = projects.then(|| {
+        let mut result = PlanNode::EMPTY;
+        result.set_output(modified);
+        result
+    });
     let scan = scan
         .with_qual(QualLabel::Filter, filter)
         .with_verbose_qual(QualLabel::Filter, verbose_filter);
@@ -8605,6 +8680,17 @@ fn expanded_write<'e>(
         Ok(RangeTableNames { names, count: 1 })
     };
     let mut targets = fresh_names()?;
+    // The write's `RETURNING` list is set against its first result
+    // relation (`set_plan_refs` uses the first `returningLists` entry), so
+    // its columns print under that member's name.
+    match started.first() {
+        Some(_) => {
+            let first = unique_rtable_name(exposed, &targets.names[..targets.count]);
+            plan.nodes[0].requalify(exposed, first.as_str());
+        }
+        None if !returning_empty(statement) => plan.nodes[0].output_unprintable = true,
+        None => {}
+    }
     for &leaf in started {
         let name = targets.take(exposed)?;
         let member = storage.table_def(leaf, txid);
@@ -8636,6 +8722,7 @@ fn expanded_write<'e>(
                 Role::Member(0, u32::try_from(leaf).unwrap_or(u32::MAX)),
             ))
         },
+        projection.map(|result| (result.output, result.output_unprintable)),
     )?;
     Ok(scan)
 }
@@ -8660,7 +8747,9 @@ fn modification_outputs(
         Stmt::Delete(delete) => (&[], delete.returning),
         _ => return Ok((None, None)),
     };
-    if storage.relation_has_descendants(slot, txid) {
+    if write_inheritance(statement) == crate::sql::ast::RelationInheritance::Descendants
+        && storage.relation_has_descendants(slot, txid)
+    {
         return Ok((None, None));
     }
     let exposed = alias.unwrap_or(definition.name.as_str());

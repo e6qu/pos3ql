@@ -12011,7 +12011,7 @@ mod tests {
                     panic!()
                 };
                 assert!(
-                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to }, .. } if from.len() == 1 && to.len() == 1)
+                    matches!(child.partition, PartitionClause::Of { bound: PartitionBound::Range { from, to, .. }, .. } if from.len() == 1 && to.len() == 1)
                 );
                 let Stmt::CreateTable(default) = p.next_stmt().unwrap().unwrap() else {
                     panic!()
@@ -12019,7 +12019,7 @@ mod tests {
                 assert!(matches!(
                     default.partition,
                     PartitionClause::Of {
-                        bound: PartitionBound::Default,
+                        bound: PartitionBound::Default { .. },
                         ..
                     }
                 ));

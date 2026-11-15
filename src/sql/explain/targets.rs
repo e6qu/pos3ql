@@ -14,12 +14,12 @@
 use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
-use crate::sql::ast::{Expr, Select, SelectItem};
+use crate::sql::ast::{Expr, Returning, Select, SelectItem};
 use crate::sql::catalog::deparse::{Column, Columns, Context, Destination, Joined};
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::query::{self, QueryScope, ResolvedColumn};
 use crate::sql_err;
-use crate::storage::Storage;
+use crate::storage::{Storage, TableDef};
 use crate::util::StackStr;
 
 /// The longest `Output:` list a node holds.
@@ -1013,5 +1013,396 @@ fn conjuncts<'l, 'e: 'l>(
             conjuncts(right, out)
         }
         _ => out.push(condition).map_err(|_| arena_full()),
+    }
+}
+
+/// The target lists of nodes that read one relation outside a block's join
+/// tree: a foreign scan's (postgres_fdw's base or grouped relation), a
+/// write's `RETURNING` list and the row its scan hands the write. Each
+/// list is `None` when an entry is outside the deparser's coverage, which
+/// marks its node's output unprintable.
+pub(super) struct RelationTargets<'a> {
+    context: Context<'a>,
+    table: &'a TableDef,
+    exposed: &'a str,
+    arena: &'a Arena,
+}
+
+impl<'a> RelationTargets<'a> {
+    /// The lists over `table`, scanned as `exposed`. `qualify` is
+    /// `show_plan_tlist`'s prefixing rule: the range table holds more than
+    /// this relation.
+    pub(super) fn new(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        qualify: bool,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let joined = arena
+            .alloc_slice_with(1, |_| Joined::new(exposed, table))
+            .map_err(|_| arena_full())?;
+        Ok(Self::with_joined(
+            storage, txid, table, exposed, joined, qualify, None, arena,
+        ))
+    }
+
+    /// The lists of a write whose `RETURNING` list may name the old and new
+    /// rows (`returning`), which print qualified while the target's own
+    /// columns print bare.
+    pub(super) fn returning_scope(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        returning: Returning<'a>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let rows = [
+            Joined::new(exposed, table),
+            Joined::rule_row(returning.old_name(), table),
+            Joined::rule_row(returning.new_name(), table),
+        ];
+        let joined = arena
+            .alloc_slice_with(rows.len(), |at| rows[at])
+            .map_err(|_| arena_full())?;
+        Ok(Self::with_joined(
+            storage,
+            txid,
+            table,
+            exposed,
+            joined,
+            true,
+            Some(exposed),
+            arena,
+        ))
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "the deparse context")]
+    fn with_joined(
+        storage: &'a Storage,
+        txid: u32,
+        table: &'a TableDef,
+        exposed: &'a str,
+        joined: &'a [Joined<'a>],
+        qualify: bool,
+        bare: Option<&'a str>,
+        arena: &'a Arena,
+    ) -> Self {
+        Self {
+            context: Context {
+                storage,
+                txid,
+                table: Some(table),
+                parameters: &[],
+                joined,
+                pretty: false,
+                qualify,
+                bare,
+                domain_value: None,
+                sublinks: Some(&super::registered_sublink),
+                folded: true,
+                arena,
+                dependencies: None,
+            },
+            table,
+            exposed,
+            arena,
+        }
+    }
+
+    /// `expression` as an entry, `None` outside the deparser's coverage.
+    fn entry(
+        &self,
+        expression: &Expr<'_>,
+        destination: Destination,
+    ) -> Result<Option<Entry<'a>>, SqlError> {
+        let text = crate::sql::catalog::deparse::deparse_expression(
+            &self.context,
+            expression,
+            destination,
+            self.arena,
+        )?;
+        Ok(text.map(|text| Entry {
+            text,
+            var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
+            referenced: false,
+        }))
+    }
+
+    /// Column `index` of the relation, prefixed by `qualifier`.
+    fn column(&self, index: usize, qualifier: Option<&str>) -> Result<Entry<'a>, SqlError> {
+        let mut name = StackStr::<160>::new();
+        if let Some(qualifier) = qualifier {
+            crate::sql::catalog::write_identifier(&mut name, qualifier);
+            let _ = name.write_char('.');
+        }
+        crate::sql::catalog::write_identifier(&mut name, self.table.columns()[index].name.as_str());
+        Ok(Entry {
+            text: self
+                .arena
+                .alloc_str(name.as_str())
+                .map_err(|_| arena_full())?,
+            var: true,
+            referenced: false,
+        })
+    }
+
+    /// The relation's whole row as a locked foreign scan returns it
+    /// (`ROW_MARK_COPY`): `t.*`.
+    fn whole_row(&self) -> Result<Entry<'a>, SqlError> {
+        let mut name = StackStr::<80>::new();
+        crate::sql::catalog::write_identifier(&mut name, self.exposed);
+        let _ = name.write_str(".*");
+        Ok(Entry {
+            text: self
+                .arena
+                .alloc_str(name.as_str())
+                .map_err(|_| arena_full())?,
+            var: true,
+            referenced: false,
+        })
+    }
+
+    /// A write's `RETURNING` list (built by [`Self::returning_scope`]).
+    pub(super) fn returning(&self, returning: Returning<'_>) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
+            entries.push(entry).map_err(|_| arena_full())
+        };
+        for item in returning.items {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    for column in 0..self.table.columns().len() {
+                        push(&mut entries, self.column(column, None)?)?;
+                    }
+                }
+                SelectItem::TableWildcard(qualifier) => {
+                    let image = [returning.old_name(), returning.new_name()].contains(qualifier);
+                    for column in 0..self.table.columns().len() {
+                        push(
+                            &mut entries,
+                            self.column(column, image.then_some(*qualifier))?,
+                        )?;
+                    }
+                }
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    let Some(entry) = self.entry(expression, Destination::Value)? else {
+                        return Ok(None);
+                    };
+                    push(&mut entries, entry)?;
+                }
+            }
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// The row an `UPDATE` or `DELETE` scan hands its write: the new values
+    /// of the assigned columns in column order, coerced to each column
+    /// (`rewriteTargetListIU`), the row identity `ctid`, then, when
+    /// `whole_row`, the old row a foreign write reads (`t.*`).
+    pub(super) fn modified_row(
+        &self,
+        assignments: &[(&str, &Expr<'_>)],
+        whole_row: bool,
+    ) -> Result<Option<Output>, SqlError> {
+        if assignments
+            .iter()
+            .any(|(target, _)| self.table.column_index(target).is_none())
+        {
+            return Ok(None);
+        }
+        let mut entries = ArenaList::new(self.arena);
+        for column in self.table.columns() {
+            let Some(&(_, value)) = assignments
+                .iter()
+                .find(|(target, _)| *target == column.name.as_str())
+            else {
+                continue;
+            };
+            let Some(entry) = self.entry(value, Destination::Assignment(column.ctype.oid()))?
+            else {
+                return Ok(None);
+            };
+            entries.push(entry).map_err(|_| arena_full())?;
+        }
+        entries
+            .push(Entry {
+                text: "ctid",
+                var: true,
+                referenced: false,
+            })
+            .map_err(|_| arena_full())?;
+        if whole_row {
+            entries.push(self.whole_row()?).map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// A one-row `INSERT`'s `Result`: each column's value as the planner
+    /// coerced it. Only a row naming every column in order without
+    /// `DEFAULT` is covered.
+    pub(super) fn inserted_row(
+        &self,
+        columns: &[&str],
+        row: &[&Expr<'_>],
+    ) -> Result<Option<Output>, SqlError> {
+        let definitions = self.table.columns();
+        if !self.covers(columns)
+            || row.len() != definitions.len()
+            || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+        {
+            return Ok(None);
+        }
+        let mut entries = ArenaList::new(self.arena);
+        for (value, column) in row.iter().zip(definitions) {
+            let Some(entry) = self.entry(value, Destination::Assignment(column.ctype.oid()))?
+            else {
+                return Ok(None);
+            };
+            entries.push(entry).map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// A several-row `INSERT`'s `Values Scan`: its columns, each a column
+    /// of the `*VALUES*` list. Only rows naming every column in order
+    /// without `DEFAULT` are covered.
+    pub(super) fn values_scan(
+        &self,
+        columns: &[&str],
+        rows: &[&[&Expr<'_>]],
+    ) -> Result<Option<Output>, SqlError> {
+        let definitions = self.table.columns();
+        if !self.covers(columns)
+            || rows.iter().any(|row| {
+                row.len() != definitions.len()
+                    || row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+            })
+        {
+            return Ok(None);
+        }
+        let mut output = Output::new();
+        for column in 1..=definitions.len() {
+            if column > 1 {
+                let _ = output.write_str(", ");
+            }
+            let _ = write!(output, "\"*VALUES*\".column{column}");
+        }
+        checked(output).map(Some)
+    }
+
+    /// Whether an `INSERT`'s column list names every column in order (an
+    /// empty one does).
+    fn covers(&self, columns: &[&str]) -> bool {
+        let definitions = self.table.columns();
+        columns.is_empty()
+            || columns.len() == definitions.len()
+                && columns
+                    .iter()
+                    .zip(definitions)
+                    .all(|(named, column)| *named == column.name.as_str())
+    }
+
+    /// postgres_fdw's scan of the base relation: the select list (none
+    /// under a local aggregate, which reads the columns by name), the sort
+    /// keys it does not project, then the whole row a locking clause copies.
+    pub(super) fn foreign_scan(
+        &self,
+        statement: &Select<'_>,
+        sort_keys: &[crate::sql::ast::OrderBy<'_>],
+        aggregate: bool,
+    ) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
+            entries.push(entry).map_err(|_| arena_full())
+        };
+        for item in statement.items.iter().filter(|_| !aggregate) {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                    for column in 0..self.table.columns().len() {
+                        push(&mut entries, self.column(column, None)?)?;
+                    }
+                }
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    let Some(entry) = self.entry(expression, Destination::Value)? else {
+                        return Ok(None);
+                    };
+                    push(&mut entries, entry)?;
+                }
+            }
+        }
+        let exposed = self.exposed;
+        for key in sort_keys {
+            let projected = statement.items.iter().any(|item| match item {
+                SelectItem::Wildcard(_) => matches!(key.expression, Expr::Column { .. }),
+                SelectItem::TableWildcard(qualifier) => match key.expression {
+                    Expr::Column {
+                        qualifier: held, ..
+                    } => held.is_none_or(|q| q == *qualifier),
+                    _ => false,
+                },
+                SelectItem::Expr { expression, .. } => match (expression, key.expression) {
+                    (
+                        Expr::Column {
+                            qualifier,
+                            name: projected,
+                        },
+                        Expr::Column { name, .. },
+                    ) => {
+                        projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed)
+                    }
+                    (expression, key) => **expression == *key,
+                },
+                SelectItem::RecordStar(_) => false,
+            });
+            if projected {
+                continue;
+            }
+            let entry = match key.expression {
+                Expr::Column { name, .. } if self.table.column_index(name).is_some() => {
+                    let column = self.table.column_index(name).expect("checked above");
+                    self.column(column, None)?
+                }
+                expression => match self.entry(expression, Destination::Value)? {
+                    Some(entry) => entry,
+                    None => return Ok(None),
+                },
+            };
+            push(&mut entries, entry)?;
+        }
+        if !statement.locking.is_empty() {
+            push(&mut entries, self.whole_row()?)?;
+        }
+        render(entries.as_slice()).map(Some)
+    }
+
+    /// postgres_fdw's scan of a grouped relation: each select-list
+    /// expression, then the keys it lacks (`resjunk`), read from the remote
+    /// target list (`fdw_scan_tlist`), so any but a plain column prints in
+    /// parentheses.
+    pub(super) fn foreign_upper(
+        &self,
+        statement: &Select<'_>,
+        resjunk: &[&Expr<'_>],
+    ) -> Result<Option<Output>, SqlError> {
+        let mut entries = ArenaList::new(self.arena);
+        let items = statement.items.iter().map(|item| match item {
+            SelectItem::Expr { expression, .. } => Ok(*expression),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a grouped foreign scan has a star in its select list"
+            )),
+        });
+        for expression in items.chain(resjunk.iter().map(|&target| Ok(target))) {
+            let Some(entry) = self.entry(expression?, Destination::Value)? else {
+                return Ok(None);
+            };
+            entries
+                .push(entry.referenced(self.arena)?)
+                .map_err(|_| arena_full())?;
+        }
+        render(entries.as_slice()).map(Some)
     }
 }

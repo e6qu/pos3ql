@@ -846,11 +846,14 @@ pub struct CopyRowContext<'a, 'response> {
 
 pub(crate) struct SubscriptionCopyWorkspace<'a> {
     arena: &'a mut Arena,
-    transition_rows: &'a exec::CopyTransitionRows,
+    transition_rows: &'a mut exec::CopyTransitionRows,
 }
 
 impl<'a> SubscriptionCopyWorkspace<'a> {
-    pub(crate) fn new(arena: &'a mut Arena, transition_rows: &'a exec::CopyTransitionRows) -> Self {
+    pub(crate) fn new(
+        arena: &'a mut Arena,
+        transition_rows: &'a mut exec::CopyTransitionRows,
+    ) -> Self {
         Self {
             arena,
             transition_rows,
@@ -12299,7 +12302,7 @@ impl Engine {
         guc: &GucState,
         mut cursors: CursorCommitContext<'_>,
         responder: &mut Responder,
-        inserted: &exec::CopyTransitionRows,
+        inserted: &mut exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
         let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
@@ -12406,7 +12409,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         row_buffers: &mut crate::storage::RowCursorBuffers,
         responder: &mut Responder,
-        inserted: &exec::CopyTransitionRows,
+        inserted: &mut exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
         let _files = setup.restore_snapshot(storage)?;

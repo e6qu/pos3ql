@@ -92,7 +92,12 @@ fn respond_to(
         *status = b'I';
         out.extend(complete("ROLLBACK"));
     } else if command.starts_with("DECLARE ") {
-        *rows = 0..5;
+        // A grouped remote query returns one group, here valued 42.
+        *rows = if command.contains("count(*)") {
+            42..43
+        } else {
+            0..5
+        };
         *identities = command.contains("\nSELECT ctid ");
         out.extend(complete("DECLARE CURSOR"));
     } else if let Some(rest) = command.strip_prefix("FETCH ") {
@@ -123,6 +128,12 @@ fn respond_to(
         }
         out.extend(complete(&format!("INSERT 0 {values}")));
     } else if command.starts_with("UPDATE ") {
+        // A direct UPDATE's RETURNING list of `id` returns the two rows.
+        if command.ends_with(" RETURNING id") {
+            out.extend(id_description());
+            out.extend(id_row(4));
+            out.extend(id_row(5));
+        }
         out.extend(complete("UPDATE 2"));
     } else if command.starts_with("DELETE ") {
         out.extend(complete(if command.ends_with("ctid = $1") {
@@ -228,9 +239,18 @@ fn postgres_fdw_caches_connections_and_spells_its_remote_commands() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let scanned = run_with(&mut engine, &mut budget, "SELECT sum(id) FROM ft");
+    // A condition kept local leaves the aggregates here, over the rows.
+    let scanned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT sum(id) FROM ft WHERE random() < 2",
+    );
     assert_eq!(data_rows(&scanned), ["10"]);
-    let scanned = run_with(&mut engine, &mut budget, "SELECT count(*) FROM ft");
+    let scanned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM ft WHERE random() < 2",
+    );
     assert_eq!(data_rows(&scanned), ["5"]);
     let inserted = run_with(
         &mut engine,
@@ -433,6 +453,101 @@ fn postgres_fdw_pushes_conditions_order_and_limit_and_modifies_directly() {
 }
 
 #[test]
+fn direct_modify_ships_returning_columns_and_projects_the_returned_rows() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE ft SET note = 'y' WHERE id > 3 RETURNING id * 10, 'k'",
+    );
+    assert_eq!(data_rows(&updated), ["40|k", "50|k"]);
+    assert!(String::from_utf8_lossy(&updated).contains("UPDATE 2"));
+    // No column read: the tag's rows each project the list once.
+    let counted = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM ft WHERE id = 9 RETURNING 7",
+    );
+    assert_eq!(data_rows(&counted), ["7", "7", "7"]);
+    // A data-modifying WITH query captures the returned rows.
+    let captured = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH w AS (UPDATE ft SET note = 'z' WHERE id > 3 RETURNING id) SELECT sum(id) FROM w",
+    );
+    assert_eq!(data_rows(&captured), ["9"]);
+    assert_eq!(
+        remote_statements(&log),
+        [
+            "UPDATE public.ft SET note = 'y'::text WHERE ((id > 3)) RETURNING id",
+            "DELETE FROM public.ft WHERE ((id = 9))",
+            "UPDATE public.ft SET note = 'z'::text WHERE ((id > 3)) RETURNING id",
+        ]
+    );
+}
+
+#[test]
+fn grouped_queries_ship_their_aggregates() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let grouped = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) AS n FROM ft WHERE id > 1 HAVING count(*) > 1 LIMIT 3",
+    );
+    assert_eq!(
+        data_rows(&grouped),
+        ["42"],
+        "{}",
+        String::from_utf8_lossy(&grouped)
+    );
+    assert_eq!(
+        remote_statements(&log),
+        [
+            "DECLARE c1 CURSOR FOR\nSELECT count(*) FROM public.ft WHERE ((id > 1)) \
+          HAVING ((count(*) > 1))"
+        ]
+    );
+    // A window's and DISTINCT's order, and expression keys, ship.
+    for query in [
+        "SELECT id, row_number() OVER (ORDER BY id DESC) FROM ft",
+        "SELECT DISTINCT id FROM ft",
+        "SELECT id FROM ft ORDER BY id % 3 DESC",
+    ] {
+        let rows = run_with(&mut engine, &mut budget, query);
+        assert!(
+            !message_types(&rows).contains(&b'E'),
+            "{query}: {}",
+            String::from_utf8_lossy(&rows)
+        );
+    }
+    let statements = remote_statements(&log);
+    assert_eq!(
+        statements[1..],
+        [
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY id DESC NULLS FIRST",
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY id ASC NULLS LAST",
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY (id % 3) DESC NULLS FIRST",
+        ]
+    );
+    let plan = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM ft LIMIT 1",
+    );
+    assert_eq!(
+        data_rows(&plan),
+        [
+            "Limit",
+            "  Output: (count(*))",
+            "  ->  Foreign Scan",
+            "        Output: (count(*))",
+            "        Relations: Aggregate on (public.ft)",
+            "        Remote SQL: SELECT count(*) FROM public.ft",
+        ]
+    );
+}
+
+#[test]
 fn explain_verbose_shows_postgres_fdw_remote_sql() {
     let (_log, mut engine, mut budget) = scripted_table();
     let plan = |engine: &mut Engine, budget: &mut Budget, sql: &str| {
@@ -479,17 +594,49 @@ fn explain_verbose_shows_postgres_fdw_remote_sql() {
             "        Remote SQL: UPDATE public.ft SET note = 'y'::text WHERE ((id = 1))",
         ]
     );
+    // A direct command ships the columns its RETURNING list reads.
     assert_eq!(
         plan(
             &mut engine,
             &mut budget,
-            "DELETE FROM ft WHERE id = 1 RETURNING note"
+            "DELETE FROM ft WHERE id = 1 RETURNING note, upper(note), tableoid::regclass"
         ),
         [
             "Delete on public.ft",
+            "  Output: note, upper(note), (tableoid)::regclass",
+            "  ->  Foreign Delete on public.ft",
+            "        Remote SQL: DELETE FROM public.ft WHERE ((id = 1)) RETURNING note",
+        ]
+    );
+    // RETURNING of the old or new image changes the rows one at a time.
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "UPDATE ft SET id = 2 WHERE id = 1 RETURNING old.id, new.id, 1"
+        ),
+        [
+            "Update on public.ft",
+            "  Output: old.id, new.id, 1",
+            "  Remote SQL: UPDATE public.ft SET id = $2 WHERE ctid = $1 RETURNING id",
+            "  ->  Foreign Scan on public.ft",
+            "        Output: 2, ctid, ft.*",
+            "        Remote SQL: SELECT id, note, ctid FROM public.ft WHERE ((id = 1)) FOR UPDATE",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut engine,
+            &mut budget,
+            "DELETE FROM ft WHERE id = 1 AND random() < 2 RETURNING note"
+        ),
+        [
+            "Delete on public.ft",
+            "  Output: note",
             "  Remote SQL: DELETE FROM public.ft WHERE ctid = $1 RETURNING note",
             "  ->  Foreign Scan on public.ft",
             "        Output: ctid",
+            "        Filter: (random() < '2'::double precision)",
             "        Remote SQL: SELECT ctid FROM public.ft WHERE ((id = 1)) FOR UPDATE",
         ]
     );
@@ -502,5 +649,133 @@ fn explain_verbose_shows_postgres_fdw_remote_sql() {
             "  ->  Result",
             "        Output: 1, 'a'::text",
         ]
+    );
+}
+
+#[test]
+fn foreign_scans_fetch_batches_as_the_plan_reads_them() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FOREIGN TABLE ft OPTIONS (ADD fetch_size '2')",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    // A limit kept local reads one batch, then closes the cursor.
+    let limited = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM ft WHERE pg_typeof(id) IS NOT NULL LIMIT 1",
+    );
+    assert_eq!(data_rows(&limited), ["0"]);
+    // A window's second pass reads the fetched rows again.
+    let windowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, count(*) OVER () FROM ft WHERE pg_typeof(id) IS NOT NULL ORDER BY id LIMIT 1",
+    );
+    assert_eq!(data_rows(&windowed), ["0|5"]);
+    let fetches: Vec<String> = commands(&log)
+        .concat()
+        .into_iter()
+        .filter(|command| {
+            command.starts_with("DECLARE")
+                || command.starts_with("FETCH")
+                || command.starts_with("CLOSE")
+        })
+        .map(|command| command.lines().next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        fetches,
+        [
+            "DECLARE c1 CURSOR FOR",
+            "FETCH 2 FROM c1",
+            "CLOSE c1",
+            "DECLARE c1 CURSOR FOR",
+            "FETCH 2 FROM c1",
+            "FETCH 2 FROM c1",
+            "FETCH 2 FROM c1",
+            "CLOSE c1",
+        ]
+    );
+}
+
+#[test]
+fn foreign_insert_batches_wait_through_routine_calls() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FOREIGN TABLE ft OPTIONS (ADD batch_size '3'); \
+         CREATE FUNCTION label(i integer) RETURNS text LANGUAGE plpgsql \
+           AS $$BEGIN RETURN 'p' || i; END$$",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO ft SELECT i, label(i) FROM generate_series(1, 4) i",
+    );
+    assert!(
+        String::from_utf8_lossy(&inserted).contains("INSERT 0 4"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    // The calls pause the statement after each row; the queued rows still
+    // go out as full batches and the remainder at the end.
+    let batches: Vec<usize> = remote_statements(&log)
+        .iter()
+        .filter(|command| command.starts_with("INSERT "))
+        .map(|command| command.matches("($").count())
+        .collect();
+    assert_eq!(batches, [3, 1]);
+}
+
+#[test]
+fn direct_modification_admits_statement_triggers_and_sets_generated_columns() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION noted() RETURNS trigger LANGUAGE plpgsql \
+           AS $$BEGIN RETURN NULL; END$$; \
+         CREATE TRIGGER noted BEFORE UPDATE ON ft \
+           FOR EACH STATEMENT EXECUTE FUNCTION noted(); \
+         CREATE FOREIGN TABLE fg (id integer, g integer GENERATED ALWAYS AS (id * 2) STORED) \
+           SERVER scripted OPTIONS (schema_name 'public', table_name 'fg')",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE ft SET note = 'y' WHERE id = 3",
+    );
+    let modified: Vec<String> = remote_statements(&log)
+        .into_iter()
+        .filter(|command| command.starts_with("UPDATE "))
+        .collect();
+    assert_eq!(
+        modified,
+        ["UPDATE public.ft SET note = 'y'::text WHERE ((id = 3))"]
+    );
+    let explained = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (VERBOSE, COSTS OFF) UPDATE fg SET id = id + 1 WHERE id = 3",
+    );
+    assert!(
+        data_rows(&explained).iter().any(|line| {
+            line.contains("UPDATE public.fg SET id = $2, g = DEFAULT WHERE ctid = $1")
+        }),
+        "{}",
+        String::from_utf8_lossy(&explained)
     );
 }

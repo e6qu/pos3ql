@@ -91,6 +91,21 @@ impl Context<'_> {
             found => found,
         };
         Ok(match operator {
+            // `%` has no cross-type integer operators: the narrower operand
+            // is cast to the wider type.
+            BinaryOp::Mod
+                if matches!(
+                    (l.and_then(integer_rank), r.and_then(integer_rank)),
+                    (Some(lr), Some(rr)) if lr != rr
+                ) =>
+            {
+                let wider = if l.and_then(integer_rank) > r.and_then(integer_rank) {
+                    l
+                } else {
+                    r
+                };
+                (wider, wider)
+            }
             BinaryOp::Add
             | BinaryOp::Sub
             | BinaryOp::Mul

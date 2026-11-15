@@ -699,6 +699,7 @@ impl Conn {
                 budget,
                 config.txn_rows,
                 config.copy_transition_bytes,
+                config.foreign_send_bytes,
             )?,
             prepared,
             portals,
@@ -3359,7 +3360,7 @@ impl Conn {
                             arena: &self.arena,
                         },
                         &mut responder,
-                        &self.copy_transition_scratch,
+                        &mut self.copy_transition_scratch,
                         if extended {
                             crate::sql::CopyFinishMode::Statement
                         } else {
@@ -11060,7 +11061,7 @@ mod tests {
             Ok(_) => panic!("connection accepted an incomplete startup reservation"),
             Err(error) => error,
         };
-        assert_eq!(error.what, "copy_transition_bytes");
+        assert_eq!(error.what, "copy_foreign_bytes");
         assert_eq!(error.requested, error.remaining + 1);
     }
 

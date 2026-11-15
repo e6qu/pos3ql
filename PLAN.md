@@ -917,22 +917,63 @@ text and `batch_size` INSERTs match PostgreSQL's loopback in
 `tests/external/foreign-connection-cache.sql`. A query of one foreign table
 ships its needed columns, the conditions `is_foreign_expr` accepts (built-in
 immutable operators and functions over modeled built-in types, constants and
-`IN` lists, ordered as `order_qual_clauses` orders them), its `ORDER BY` when
-every key is a table column, and `LIMIT`/`OFFSET` when nothing stays local;
-direct `UPDATE`/`DELETE` and the row-by-row `WHERE ctid = $1` commands match,
-with their `EXPLAIN VERBOSE` plans, in `tests/external/foreign-pushdown.sql`
-and `differential_exact/504`. Remaining differences: joins, aggregates,
-`DISTINCT` orders, subquery parameters (`$1::text` with an `InitPlan`),
-`COLLATE` and `ORDER BY` expressions are not shipped; a direct `UPDATE`/`DELETE`
-with `RETURNING` runs row by row, as does one of a table with any trigger
-(PostgreSQL disqualifies only row triggers for the statement's event, so
-statement triggers must fire around the direct command first); an `UPDATE` sends no stored generated column
-values; a select list or `ORDER BY` with a subquery reads every column. A scan
-still reads all its rows before the plan consumes them (the cursor's `FETCH`
-batches are not streamed). COPY FROM into a foreign table sends one row at a
-time, ignoring `batch_size`. A batched INSERT also sends its queued rows when
-the statement pauses for a PL/pgSQL call or a full output buffer, which
-PostgreSQL does not. libpq options beyond host, hostaddr, port, dbname, user,
+`IN` lists, ordered as `order_qual_clauses` orders them), the order the plan
+reads its rows in (`ORDER BY` keys that are shippable expressions, the order
+`DISTINCT` reads its rows in under a `Unique` node, and the one window
+clause's partition and order keys), and `LIMIT`/`OFFSET` when nothing stays
+local. A grouped query of one foreign table whose select list, `GROUP BY`
+keys, `HAVING` conditions (a `HAVING` condition without aggregates moves to
+`WHERE`) and `ORDER BY` keys all ship and whose `WHERE` ships whole is one
+`Foreign Scan` of the grouped relation (`Relations: Aggregate on
+(public.t)`), with `count`, `sum`, `avg`, `min`, `max`, `bool_and`,
+`bool_or`, `every` and `string_agg` (`DISTINCT`, `FILTER`, ordered
+arguments) shipped, `GROUP BY` by target position, and its `LIMIT` shipped
+when the order is by an aggregate (`differential_exact/507`, `509`).
+Direct `UPDATE`/`DELETE` (with statement triggers firing around the remote
+statement; a row trigger for its event or a stored generated column keeps it
+row by row) ships the columns its `RETURNING` list reads and projects that
+list over the returned rows; a `RETURNING` that reads `old` or `new` runs row
+by row (`create_modifytable_plan`); the row-by-row `WHERE ctid = $1` commands
+(a stored generated column that depends on an updated one set to `DEFAULT`,
+`RETURNING` all columns only for an `AFTER` row trigger) match; and `EXPLAIN
+VERBOSE` prints the write node's `RETURNING` output (`differential_exact/506`),
+with their plans, in `tests/external/foreign-pushdown.sql` and
+`differential_exact/504`. Remaining differences: joins of foreign tables on
+the same server (`foreign_join_ok`) are not shipped, since PostgreSQL ships
+them only where its cost estimates prefer the remote join; a subquery's
+value is not sent as a parameter (`$1::integer` with an `InitPlan`); a
+`COLLATE` clause keeps an order or condition local, but its key prints as
+written rather than as PostgreSQL's relabeled column; a grouped query whose
+select list, `HAVING` or `ORDER BY` only partly ships, whose select list
+holds a constant or a star, or that has `DISTINCT` or a window over its
+groups, groups locally; `min`/`max`-only aggregates
+without `GROUP BY` group locally where PostgreSQL reads an ordered `LIMIT 1`
+scan in an `InitPlan`; `DISTINCT` with a `WHERE` clause and no `ORDER BY` is
+hashed locally (as PostgreSQL's costs choose) with its scan's `Output`
+listing only the read columns; a window's and an upper node's `Output` lines
+print the window and grouped columns by name; a grouped scan read through a
+view or subquery prints unqualified columns; `RETURNING ctid` of a foreign
+table fails with `42703`; and `EXPLAIN EXECUTE` plans a prepared statement
+with its parameters unbound, so a condition on `$1` neither ships nor
+prints. A select list or `ORDER BY` with a subquery reads every column. A
+query whose only FROM item is a foreign table, a scalar or `EXISTS` subquery
+over one, and a foreign partition or inheritance child read its cursor one
+`FETCH` batch at a time as the plan consumes rows, and close it as soon as
+the plan stops (`LIMIT`, `EXISTS`); a window's second pass reads the fetched
+rows again, and a statement restarted by routine calls reads the rows its
+earlier attempts fetched and continues the same cursor. Remaining: a foreign
+table joined with other FROM items is read whole before the join (a right
+or full join's unmatched-row pass and hash builds read the whole input), and
+a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
+completion before the first row is returned, so both fetch every remote
+batch where PostgreSQL fetches only what the reads need. COPY FROM into a foreign table queues its rows
+until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
+partition that cannot batch, the end of the data) and sends them in
+`batch_size` remote INSERTs; the queue is reserved per connection at startup
+and holds at most `foreign_send_bytes` (`54000` beyond). A batched INSERT keeps its queued rows in the
+statement's row progress when it pauses for a PL/pgSQL call or a wait, so
+they are sent when a batch fills or the statement ends, as PostgreSQL sends
+them. libpq options beyond host, hostaddr, port, dbname, user,
 password, connect_timeout, application_name and sslmode fail with `HV00D`.
 `CREATE
 EXTENSION postgres_fdw SCHEMA pg_catalog` fails because `pg_catalog` is a
@@ -942,8 +983,20 @@ referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
 detached and dropped; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
-clones (`54000`). `pg_get_partition_constraintdef(oid)`, which psql's `\d+`
-calls for a partition, fails with `0A000`. A btree index may use
+clones (`54000`). `pg_get_partition_constraintdef(oid)` and psql's `\d+`
+`Partition constraint:` line print the constraint PostgreSQL's
+`generate_partition_qual` builds from a partition's and its ancestors'
+bounds, and new bounds report PostgreSQL's overlap, default-conflict,
+empty-range and hash-modulus errors with the partition and value its bound
+search finds (`differential_exact/505`). A `HASH` partition key of an
+integer, text, `varchar`, `bpchar`, `bool`, `"char"`, `oid`, float,
+`numeric`, date, time, timestamp, `bytea` or `uuid` column routes rows with
+that type's default hash function seeded as PostgreSQL seeds it, skipping
+null keys, and `satisfies_hash_partition` answers as PostgreSQL's does
+(`differential_exact/550`); any other key type fails with `0A000`. Partition
+keys are plain columns: expression keys and a key `COLLATE` fail (`0A000`
+and a syntax error). `EXPLAIN` of a partitioned table prints one scan of the
+parent where PostgreSQL prints an `Append` of the partitions it keeps. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

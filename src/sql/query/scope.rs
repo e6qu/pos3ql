@@ -616,6 +616,13 @@ pub struct QueryScope<'d> {
     /// so decoding and relation-kind checks take the derived-table path; the
     /// empty arena slice is only a marker, not the row authority.
     pub(crate) external_runs: &'d mut [Option<crate::sql::external::ExternalRun>],
+    /// A foreign table the scan reads from its remote cursor batch by batch
+    /// as the plan consumes rows. `derived` is `Some` (empty) for it, as for
+    /// an external run: a marker, not the rows.
+    pub(crate) foreign_streams: &'d mut [Option<crate::sql::foreign::ForeignStream<'d>>],
+    /// Whether the FROM item being added is the query's only one, so a
+    /// foreign table there streams instead of being read whole first.
+    sole_source: bool,
     /// A `LATERAL` FROM item: its rows depend on the outer row, so they are
     /// **not** pre-materialized (`derived` holds an empty placeholder). The
     /// scan re-runs the item's body per outer row, resolving its outer column
@@ -1516,6 +1523,9 @@ impl<'d> QueryScope<'d> {
         let external_runs = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let foreign_streams = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let lateral = arena
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
@@ -1558,6 +1568,8 @@ impl<'d> QueryScope<'d> {
             view_accesses,
             derived,
             external_runs,
+            foreign_streams,
+            sole_source: false,
             lateral,
             func_scalar,
             row_types,
@@ -2070,6 +2082,7 @@ impl<'d> QueryScope<'d> {
         pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
+        scope.sole_source = from.joins.is_empty();
         scope.add_exec(
             storage,
             &from.base,
@@ -2081,6 +2094,7 @@ impl<'d> QueryScope<'d> {
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
             pushed,
         )?;
+        scope.sole_source = false;
         for (index, j) in from.joins.iter().enumerate() {
             scope.merge_left_of(from, index, arena)?;
             scope.right_of_outer_join = j.kind.is_right_or_full();
@@ -2419,6 +2433,47 @@ impl<'d> QueryScope<'d> {
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
                 let pushed = pushed.filter(|plan| plan.table_slot == slot);
+                // A grouped remote query fills its own relation.
+                if let Some(upper) = pushed.and_then(|plan| plan.upper.as_ref()) {
+                    let table = storage.table_def(slot, txid);
+                    self.defs.set_relation(
+                        source,
+                        crate::storage::RelationDefinition {
+                            schema: table.schema,
+                            name: table.name,
+                            n_columns: upper.columns.len(),
+                            columns: upper.columns,
+                        },
+                        arena,
+                    )?;
+                }
+                if self.sole_source && !tref.lateral {
+                    // The only FROM item: the plan reads it as the remote
+                    // cursor returns batches.
+                    let pushed = match pushed {
+                        Some(plan) => Some((
+                            arena.alloc_str(plan.sql).map_err(|_| arena_full())?,
+                            match plan.remote_columns() {
+                                crate::sql::foreign::RemoteColumns::Upper(columns) => {
+                                    crate::sql::foreign::RemoteColumns::Upper(
+                                        arena
+                                            .alloc_slice_with(columns.len(), |at| columns[at])
+                                            .map_err(|_| arena_full())?,
+                                    )
+                                }
+                                crate::sql::foreign::RemoteColumns::Table(fetched) => {
+                                    crate::sql::foreign::RemoteColumns::Table(fetched)
+                                }
+                            },
+                        )),
+                        None => None,
+                    };
+                    self.foreign_streams[source] = Some(crate::sql::foreign::ForeignStream::new(
+                        slot, pushed, arena,
+                    )?);
+                    self.derived[source] = Some(&[]);
+                    return Ok(());
+                }
                 let rows = crate::sql::foreign::materialize(
                     storage, slot, txid, arena, sequences, pushed,
                 )?;

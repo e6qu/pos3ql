@@ -59,6 +59,35 @@ UPDATE ft SET q = q + 1 WHERE id IN (6, 7);
 DELETE FROM ft WHERE id = 4 RETURNING note;
 DELETE FROM ft WHERE id = 8 AND random() < 2;
 SELECT id, q, note FROM ft WHERE id BETWEEN 3 AND 8 ORDER BY id;
+-- A direct command ships what its RETURNING list reads.
+:e UPDATE ft SET q = q + 1 WHERE id = 9 RETURNING id, q, tableoid::regclass;
+UPDATE ft SET q = q + 1 WHERE id IN (9, 10) RETURNING id, q, tableoid::regclass;
+UPDATE ft SET q = q + 1 WHERE id = 9 RETURNING old.q, new.q;
+DELETE FROM ft WHERE id = 11 RETURNING ft;
+DELETE FROM ft WHERE id IN (12, 13) RETURNING 1;
+WITH w AS (UPDATE ft SET q = q + 1 WHERE id > 15 RETURNING id, q) SELECT * FROM w ORDER BY id;
+DO $$ DECLARE r int; BEGIN UPDATE ft SET q = q + 1 WHERE id = 14 RETURNING q INTO r; RAISE NOTICE 'r=%', r; END $$;
+UPDATE ft SET q = 2000 WHERE id = 15 RETURNING id;
+SELECT id, q FROM ft WHERE id BETWEEN 9 AND 20 ORDER BY id;
+
+-- Grouping and aggregates ship when the whole query does.
+:e SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;
+SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;
+SELECT flag, count(DISTINCT c), sum(f) FILTER (WHERE id > 3), string_agg(v, ',' ORDER BY v DESC) FROM ft GROUP BY flag ORDER BY flag;
+SELECT count(*), sum(q), bool_and(flag), every(id > 0) FROM ft;
+SELECT count(*) FROM ft WHERE id > 1000;
+SELECT id % 4 AS k, count(*) FROM ft GROUP BY k HAVING sum(id) > 30 ORDER BY sum(id);
+SELECT count(*) FROM ft GROUP BY note ORDER BY 1 LIMIT 1;
+
+-- The order the plan reads rows in ships: expression keys, DISTINCT's
+-- order and a window's.
+:e SELECT id, note FROM ft ORDER BY s % 4 DESC, upper(note) LIMIT 5;
+SELECT id, note FROM ft ORDER BY s % 4 DESC, upper(note) LIMIT 5;
+:e SELECT DISTINCT c, flag FROM ft ORDER BY flag;
+SELECT DISTINCT c, flag FROM ft ORDER BY flag;
+SELECT DISTINCT ON (flag) flag, id FROM ft ORDER BY flag, id DESC;
+SELECT id, sum(q) OVER (PARTITION BY flag ORDER BY id) FROM ft WHERE id < 8;
+SELECT max(id), min(note) FROM ft;
 
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.

@@ -291,6 +291,83 @@ pub(crate) fn deparse_expression<'a>(
     Ok(output.supported.then(|| output.text.as_str()))
 }
 
+/// `get_const_expr` for a planner constant of a column's type, such as a
+/// partition bound: `constant`'s spellings with the column's type modifier
+/// in the label (a modifier labels even a bare decimal `numeric`), then
+/// `COLLATE` when the column's collation is not the type's default.
+pub(crate) fn column_constant<'a>(
+    storage: &Storage,
+    txid: u32,
+    value: &str,
+    column: &crate::storage::ColumnMeta,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let context = Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined: &[],
+        pretty: false,
+        qualify: false,
+        bare: None,
+        domain_value: None,
+        folded: false,
+        sublinks: None,
+    };
+    let type_oid = super::catalog_column_type_oid(storage, column, txid)?;
+    let type_mod = super::catalog_column_type_mod(column);
+    let mut output = Output::new(arena);
+    if type_mod < 0 {
+        context.constant(value, type_oid, &mut output)?;
+    } else {
+        // Only character, bit, numeric and datetime types take a modifier;
+        // of their constants only a decimal `numeric` prints bare.
+        let bare = type_oid == oid::NUMERIC
+            && value.starts_with(|first: char| first.is_ascii_digit())
+            && value.contains(['.', 'e', 'E']);
+        if bare {
+            output.push(value)?;
+        } else {
+            output.push("'")?;
+            for (index, part) in value.split('\'').enumerate() {
+                if index != 0 {
+                    output.push("''")?;
+                }
+                output.push(part)?;
+            }
+            output.push("'")?;
+        }
+        output.push("::")?;
+        context.type_name_mod(type_oid, type_mod, &mut output)?;
+    }
+    if !matches!(
+        column.collation,
+        crate::sql::ast::Collation::None | crate::sql::ast::Collation::Default
+    ) {
+        let name = super::collation_name_by_oid(storage, txid, column.collation.oid(), arena)?
+            .ok_or_else(|| {
+                crate::sql_err!(
+                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                    "cache lookup failed for collation {}",
+                    column.collation.oid()
+                )
+            })?;
+        output.push(" COLLATE ")?;
+        output.push(name)?;
+    }
+    if !output.supported {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+            "cache lookup failed for type {}",
+            type_oid
+        ));
+    }
+    Ok(output.text.as_str())
+}
+
 struct Output<'a> {
     arena: &'a Arena,
     text: ArenaString<'a>,
@@ -421,6 +498,9 @@ impl Context<'_> {
                 Columns::Derived(columns) => Ok(columns[column].type_oid),
             };
         }
+        if let Some((_, type_oid)) = self.system_column(qualifier, name) {
+            return Ok(Some(type_oid));
+        }
         let Some(table) = self.table else {
             return Ok(None);
         };
@@ -447,6 +527,7 @@ impl Context<'_> {
                     .iter()
                     .any(|parameter| parameter.name.as_str() == name)))
             || self.joined_source(qualifier, name).is_some()
+            || self.system_column(qualifier, name).is_some()
             || self.table.is_some_and(|table| {
                 qualifier.is_none_or(|qualifier| qualifier == table.name.as_str())
                     && table.column_index(name).is_some()
@@ -455,6 +536,34 @@ impl Context<'_> {
 
     /// The one FROM item a column reference names, searching the innermost
     /// query level first, and the column's position in it.
+    /// A system column (`tableoid`, `ctid`, ...) of the one table FROM item
+    /// the reference reaches, with the column's type.
+    fn system_column(&self, qualifier: Option<&str>, name: &str) -> Option<(&Joined<'_>, i32)> {
+        let type_oid = match name {
+            "tableoid" => oid::OID,
+            "ctid" => oid::TID,
+            "xmin" | "xmax" => oid::XID,
+            "cmin" | "cmax" => oid::CID,
+            _ => return None,
+        };
+        let mut found = None;
+        for joined in self.joined.iter().filter(|joined| {
+            joined.level == 0 && !joined.cte && matches!(joined.columns, Columns::Table(_))
+        }) {
+            let reachable = match qualifier {
+                Some(qualifier) => joined.addressable && joined.name == qualifier,
+                None => joined.unqualified,
+            };
+            if reachable {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(joined);
+            }
+        }
+        found.map(|joined| (joined, type_oid))
+    }
+
     fn joined_source(&self, qualifier: Option<&str>, name: &str) -> Option<(&Joined<'_>, usize)> {
         let deepest = self.joined.iter().map(|joined| joined.level).max()?;
         for level in 0..=deepest {
@@ -693,7 +802,11 @@ impl Context<'_> {
                 | BinaryOp::And
                 | BinaryOp::Or => Some(oid::BOOL),
                 BinaryOp::Concat => Some(oid::TEXT),
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                BinaryOp::Mod => {
+                    let (left, right) = self.binary_operands(*operator, left, right)?;
+                    left.or(right)
+                }
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                     let (left, right) = self.operand_types(left, right)?;
                     left.or(right)
                 }
@@ -1233,8 +1346,12 @@ impl Context<'_> {
                     }
                     None => {
                         if self.qualifies() {
-                            let Some((source, _)) = source else {
-                                return output.unsupported();
+                            let source = match source {
+                                Some((source, _)) => source,
+                                None => match self.system_column(*qualifier, name) {
+                                    Some((source, _)) => source,
+                                    None => return output.unsupported(),
+                                },
                             };
                             if self.bare != Some(source.printed) {
                                 write_identifier(&mut identifier, source.printed);

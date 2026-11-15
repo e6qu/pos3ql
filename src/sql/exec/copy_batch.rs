@@ -8,13 +8,14 @@
 //! or CHECK error in the same window wins over an earlier duplicate key, and
 //! an index error names only `COPY t, line N` because the input line has
 //! moved on. pos3ql stores each row at once, so it holds the first index
-//! error back until the flush PostgreSQL would perform.
+//! error back until the flush PostgreSQL would perform. A foreign table's
+//! rows do wait for the flush, which sends them in `batch_size` INSERTs.
 
 use crate::sql::eval::{Diagnostic, SqlError};
 use crate::util::StackStr;
 
 /// `MAX_BUFFERED_TUPLES`.
-const MAX_BUFFERED_TUPLES: usize = 1000;
+pub(crate) const MAX_BUFFERED_TUPLES: usize = 1000;
 /// `MAX_BUFFERED_BYTES`: input line bytes, end-of-line excluded.
 const MAX_BUFFERED_BYTES: usize = 65535;
 /// `MAX_PARTITION_BUFFERS`: partition buffers a flush keeps.
@@ -56,6 +57,8 @@ pub(crate) struct CopyBatch {
     deferred: Option<DeferredIndexError>,
     /// A flush before routing the current row failed; the row stops there.
     failed: Option<FlushFailure>,
+    /// Flushes so far, so the caller can send the rows a flush wrote out.
+    flushes: u64,
 }
 
 /// A flush found a buffered row's index error; the caller raises it.
@@ -77,6 +80,7 @@ impl CopyBatch {
             current: None,
             deferred: None,
             failed: None,
+            flushes: 0,
         }
     }
 
@@ -86,7 +90,8 @@ impl CopyBatch {
     }
 
     /// Routes the row to `leaf`; `leaf_batches` says the leaf has no BEFORE
-    /// or INSTEAD OF row trigger and is not a foreign table. Returns whether
+    /// or INSTEAD OF row trigger and, if it is a foreign table, a
+    /// postgres_fdw batch size above one. Returns whether
     /// the row is buffered. A conditional COPY that moves to a leaf that
     /// cannot batch flushes first; when that reports an earlier row's error,
     /// this returns `None` and [`Self::take_failure`] holds the error.
@@ -118,6 +123,11 @@ impl CopyBatch {
             self.current = Some(leaf);
         }
         Some(buffered)
+    }
+
+    /// The flushes so far; a change means buffered rows were written out.
+    pub(crate) const fn flushes(&self) -> u64 {
+        self.flushes
     }
 
     /// The failed flush [`Self::route`] reported.
@@ -184,6 +194,7 @@ impl CopyBatch {
         }
         self.tuples = 0;
         self.bytes = 0;
+        self.flushes += 1;
         let current = current.and_then(|leaf| u32::try_from(leaf).ok());
         while self.buffer_count > MAX_PARTITION_BUFFERS {
             if Some(self.buffers[0]) == current {

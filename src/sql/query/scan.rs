@@ -6517,6 +6517,7 @@ pub(crate) fn derived_key_plan<'a>(
     let build_table = order[depth];
     if scope.derived[build_table].is_none()
         || scope.external_runs[build_table].is_some()
+        || scope.foreign_streams[build_table].is_some()
         || scope.lateral[build_table]
     {
         return None;
@@ -9188,6 +9189,26 @@ fn scan_source_mode<'a>(
                     return Ok(false);
                 }
             }
+        } else if let Some(stream) = scope.foreign_streams[order[depth]] {
+            let mut index = 0usize;
+            let finished = crate::sql::foreign::stream_rows(
+                storage,
+                &stream,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |bytes| {
+                    check_timeout()?;
+                    let this = index;
+                    index += 1;
+                    recycled(arena, recycle_rows, retain_match, || {
+                        visit_candidate!(this, BoundRow::Encoded(bytes), None)
+                    })
+                },
+            )?;
+            if !finished {
+                return Ok(false);
+            }
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
@@ -9351,24 +9372,25 @@ fn scan_source_mode<'a>(
                     // A foreign child's rows come from its server, as a
                     // foreign table read on its own does.
                     if foreign {
-                        let rows = crate::sql::foreign::materialize(
+                        let stream = crate::sql::foreign::ForeignStream::new(leaf, None, arena)?;
+                        let finished = crate::sql::foreign::stream_rows(
                             storage,
-                            leaf,
+                            &stream,
                             txid,
                             arena,
                             hooks.sequences,
-                            None,
+                            &mut |bytes| {
+                                let mut values = [Datum::Null; MAX_COLUMNS];
+                                let width = crate::sql::exec::decode_projected_row_into(
+                                    bytes,
+                                    arena,
+                                    &mut values,
+                                )?;
+                                visit(None, &values[..width])
+                            },
                         )?;
-                        for bytes in rows {
-                            let mut values = [Datum::Null; MAX_COLUMNS];
-                            let width = crate::sql::exec::decode_projected_row_into(
-                                bytes,
-                                arena,
-                                &mut values,
-                            )?;
-                            if !visit(None, &values[..width])? {
-                                return Ok(false);
-                            }
+                        if !finished {
+                            return Ok(false);
                         }
                         continue;
                     }

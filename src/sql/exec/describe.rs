@@ -6562,6 +6562,7 @@ fn infer_type_unpositioned(
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
             | "pg_get_partkeydef"
+            | "pg_get_partition_constraintdef"
             | "pg_get_functiondef"
             | "pg_get_triggerdef"
             | "pg_get_function_arguments"

@@ -827,7 +827,9 @@ own `WITH` list follows the same rule as that query's InitPlans, and a
 subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive
 Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
 figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
-its whole query where PostgreSQL pulls only the rows read, a
+its whole query where PostgreSQL pulls only the rows read (so a recursive
+`WITH` query that only a `LIMIT` ends fails with `54000` once its rows
+exceed the statement arena, where PostgreSQL returns the limited rows), a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
 plan block), an `IN` over a subquery with its own `WITH` list stays a

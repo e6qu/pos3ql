@@ -79,6 +79,16 @@ SELECT count(*) FROM ft WHERE id > 1000;
 SELECT id % 4 AS k, count(*) FROM ft GROUP BY k HAVING sum(id) > 30 ORDER BY sum(id);
 SELECT count(*) FROM ft GROUP BY note ORDER BY 1 LIMIT 1;
 
+-- The order the plan reads rows in ships: expression keys, DISTINCT's
+-- order and a window's.
+:e SELECT id, note FROM ft ORDER BY s % 4 DESC, upper(note) LIMIT 5;
+SELECT id, note FROM ft ORDER BY s % 4 DESC, upper(note) LIMIT 5;
+:e SELECT DISTINCT c, flag FROM ft ORDER BY flag;
+SELECT DISTINCT c, flag FROM ft ORDER BY flag;
+SELECT DISTINCT ON (flag) flag, id FROM ft ORDER BY flag, id DESC;
+SELECT id, sum(q) OVER (PARTITION BY flag ORDER BY id) FROM ft WHERE id < 8;
+SELECT max(id), min(note) FROM ft;
+
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.
 SELECT name FROM app;

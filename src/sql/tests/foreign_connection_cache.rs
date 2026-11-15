@@ -507,6 +507,28 @@ fn grouped_queries_ship_their_aggregates() {
           HAVING ((count(*) > 1))"
         ]
     );
+    // A window's and DISTINCT's order, and expression keys, ship.
+    for query in [
+        "SELECT id, row_number() OVER (ORDER BY id DESC) FROM ft",
+        "SELECT DISTINCT id FROM ft",
+        "SELECT id FROM ft ORDER BY id % 3 DESC",
+    ] {
+        let rows = run_with(&mut engine, &mut budget, query);
+        assert!(
+            !message_types(&rows).contains(&b'E'),
+            "{query}: {}",
+            String::from_utf8_lossy(&rows)
+        );
+    }
+    let statements = remote_statements(&log);
+    assert_eq!(
+        statements[1..],
+        [
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY id DESC NULLS FIRST",
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY id ASC NULLS LAST",
+            "DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft ORDER BY (id % 3) DESC NULLS FIRST",
+        ]
+    );
     let plan = run_with(
         &mut engine,
         &mut budget,

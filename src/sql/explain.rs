@@ -3681,8 +3681,10 @@ fn plan_pulled_select<'a>(
             ),
         )?;
     }
-    // The keys the rows leave the last window sorted by.
-    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] = &[];
+    // The keys the rows leave the last window sorted by; a foreign scan's
+    // rows arrive in the order its remote query applies.
+    let mut window_sorted: &[crate::sql::ast::OrderBy<'_>] =
+        foreign_scan.as_ref().map_or(&[], |pushed| pushed.presorted);
     if has_window(statement) {
         total_cost += estimated_rows as f64 * 0.02;
         let (nodes, sorted) = window_stages(
@@ -3691,6 +3693,7 @@ fn plan_pulled_select<'a>(
             scope.as_ref(),
             statement,
             columns,
+            window_sorted,
             block,
             arena,
         )?;
@@ -3848,7 +3851,10 @@ fn plan_pulled_select<'a>(
             // Without an ordering PostgreSQL hashes the distinct rows.
             PlanNode {
                 name: StackStr::from_str(
-                    if statement.order_by.is_empty() && statement.distinct_on.is_empty() {
+                    if statement.order_by.is_empty()
+                        && statement.distinct_on.is_empty()
+                        && window_sorted.is_empty()
+                    {
                         "HashAggregate"
                     } else {
                         "Unique"
@@ -3859,6 +3865,7 @@ fn plan_pulled_select<'a>(
                     statement.order_by.is_empty()
                         && statement.distinct_on.is_empty()
                         && statement.group_by.is_empty()
+                        && window_sorted.is_empty()
                 }) {
                     Some(keys) => plan_keys(
                         storage,
@@ -4679,6 +4686,7 @@ fn window_stages<'e>(
     scope: Option<&QueryScope<'_>>,
     statement: &'e Select<'e>,
     columns: &dyn crate::sql::exec::ColTypeResolver,
+    presorted: &'e [crate::sql::ast::OrderBy<'e>],
     block: BlockId,
     arena: &'e Arena,
 ) -> Result<(&'e [PlanNode], &'e [crate::sql::ast::OrderBy<'e>]), SqlError> {
@@ -4697,7 +4705,7 @@ fn window_stages<'e>(
         .alloc_slice_with(windows.clauses.len() * 2, |_| PlanNode::EMPTY)
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = &[];
+    let mut sorted: &[crate::sql::ast::OrderBy<'e>] = presorted;
     // Unnamed windows take the names `w1`, `w2`, ... the named ones leave.
     let mut next_name = 1usize;
     let last = windows.clauses.len().saturating_sub(1);
@@ -5325,27 +5333,50 @@ fn foreign_scan_node(
         }
     }
     scan.output = output;
-    for &column in pushed.sort_columns {
-        let name = table.columns()[column].name.as_str();
+    for key in pushed.sort_keys {
         let projected = statement.items.iter().any(|item| match item {
-            SelectItem::Wildcard(_) => true,
-            SelectItem::TableWildcard(qualifier) => *qualifier == exposed,
-            SelectItem::Expr {
-                expression:
+            SelectItem::Wildcard(_) => matches!(key.expression, Expr::Column { .. }),
+            SelectItem::TableWildcard(qualifier) => {
+                matches!(key.expression, Expr::Column { qualifier: None, .. })
+                    || matches!(key.expression, Expr::Column { qualifier: Some(q), .. } if q == qualifier)
+            }
+            SelectItem::Expr { expression, .. } => match (expression, key.expression) {
+                (
                     Expr::Column {
                         qualifier,
                         name: projected,
                     },
-                ..
-            } => *projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed),
+                    Expr::Column { name, .. },
+                ) => projected == name && qualifier.is_none_or(|qualifier| qualifier == exposed),
+                (expression, key) => **expression == *key,
+            },
             _ => false,
         });
-        if !projected {
-            if !scan.output.is_empty() {
-                let _ = scan.output.write_str(", ");
-            }
-            crate::sql::catalog::write_identifier(&mut scan.output, name);
+        if projected {
+            continue;
         }
+        let text = match key.expression {
+            Expr::Column { name, .. } if table.column_index(name).is_some() => {
+                let mut name_text = StackStr::<72>::new();
+                crate::sql::catalog::write_identifier(&mut name_text, name);
+                arena
+                    .alloc_str(name_text.as_str())
+                    .map_err(|_| arena_full())?
+            }
+            expression => match crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                expression,
+                crate::sql::catalog::deparse::Destination::Value,
+                arena,
+            )? {
+                Some(text) => text,
+                None => continue,
+            },
+        };
+        if !scan.output.is_empty() {
+            let _ = scan.output.write_str(", ");
+        }
+        let _ = scan.output.write_str(text);
     }
     // `ROW_MARK_COPY` keeps the whole row of a locked foreign table.
     if !statement.locking.is_empty() {

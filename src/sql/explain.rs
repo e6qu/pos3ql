@@ -4162,12 +4162,11 @@ fn attach_subplans<'a>(
             .iter()
             .position(|node| node.key == Some(NodeKey::new(block, role)))
     };
-    let scan = || {
-        if relations == 1 {
-            find(Role::Scan(0))
-        } else {
-            find(Role::Join(u16::try_from(relations - 1).unwrap_or(u16::MAX)))
-        }
+    let scan = || match relations {
+        // A query without FROM evaluates its conditions in its `Result`.
+        0 => None,
+        1 => find(Role::Scan(0)),
+        _ => find(Role::Join(u16::try_from(relations - 1).unwrap_or(u16::MAX))),
     };
     let host = |sublink: &Sublink<'_>| -> usize {
         let at = match (sublink.kind, sublink.origin) {
@@ -5490,6 +5489,24 @@ fn plan_pulled_select<'a>(
             count: scope.n,
         };
         for (position, &table) in table_order[..scope.n].iter().enumerate() {
+            // postgres_fdw plans a foreign table read with other relations
+            // (a join, or a semi-join from `IN` or `EXISTS`) with its own
+            // estimates and join pushdown, which this plan does not model:
+            // neither the scan nor the join method above it would match.
+            if foreign_scan.is_none()
+                && scope.derived[table].is_none()
+                && scope.slots[table] != usize::MAX
+                && expansions.get(table).copied().flatten().is_none()
+            {
+                let definition = storage.table_def(scope.slots[table], txid);
+                if definition.kind == crate::storage::TableKind::Foreign {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of foreign table \"{}\" read with other relations or under column aliases is not supported",
+                        definition.name.as_str()
+                    ));
+                }
+            }
             let depth = if n == 1 {
                 stage_count
             } else {
@@ -9238,6 +9255,50 @@ pub(super) fn visit_text_rows<E>(
 }
 
 pub(super) fn plan_statement<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let plan = plan_statement_nodes(storage, txid, statement, block, arena)?;
+    if block == BlockId::ROOT {
+        reject_joined_foreign_scans(&plan)?;
+    }
+    Ok(plan)
+}
+
+/// A `Foreign Scan` below a join: postgres_fdw's estimates for a join's
+/// input, which choose PostgreSQL's join method and order, and its join
+/// pushdown (`foreign_join_ok`) are not modeled, so neither the join nor
+/// the scans under it would print as PostgreSQL's.
+fn reject_joined_foreign_scans(plan: &Plan<'_>) -> Result<(), SqlError> {
+    let nodes = &plan.nodes[..plan.count];
+    for (index, node) in nodes.iter().enumerate() {
+        if node.name.as_str() != "Foreign Scan" {
+            continue;
+        }
+        // Each ancestor up to the root of the subplan holding the scan.
+        let mut at = index;
+        while nodes[at].subplan.is_none() {
+            let depth = nodes[at].depth;
+            let Some(parent) = (0..at).rev().find(|&earlier| nodes[earlier].depth < depth) else {
+                break;
+            };
+            at = parent;
+            let name = nodes[at].name.as_str();
+            if name.contains(" Join") || name.starts_with("Nested Loop") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of a join over a foreign table scan is not supported"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_statement_nodes<'a>(
     storage: &Storage,
     txid: u32,
     statement: &'a Stmt<'a>,

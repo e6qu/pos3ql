@@ -135,6 +135,19 @@ DEALLOCATE fdw_p;
 DEALLOCATE fdw_q;
 DROP TABLE fdw_push_local;
 
+-- Values sent to the server print in postgres_fdw's transmission modes
+-- (ISO dates), whatever the session's DateStyle.
+SET DateStyle = 'SQL, DMY';
+INSERT INTO ft (id, d, ts, f) VALUES (100, '2024-01-05', '2024-01-02 03:04:05', 0.1234567890123);
+UPDATE ft SET d = '2024-02-07' WHERE id = 100 AND random() < 2;
+COPY ft (id, d) FROM STDIN;
+101	2024-01-05
+\.
+SELECT id, d, ts FROM ft WHERE id >= 100 ORDER BY id;
+RESET DateStyle;
+SELECT id, d, ts, f FROM ft WHERE id >= 100 ORDER BY id;
+DELETE FROM ft WHERE id >= 100;
+
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.
 SELECT name FROM app;

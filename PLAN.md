@@ -1002,34 +1002,60 @@ by row (`create_modifytable_plan`); the row-by-row `WHERE ctid = $1` commands
 `RETURNING` all columns only for an `AFTER` row trigger) match; and `EXPLAIN
 VERBOSE` prints the write node's `RETURNING` output (`differential_exact/506`),
 with their plans, in `tests/external/foreign-pushdown.sql` and
-`differential_exact/504`. Remaining differences: joins of foreign tables on
-the same server (`foreign_join_ok`) are not shipped, since PostgreSQL ships
-them only where its cost estimates prefer the remote join, and a join of a
-foreign table prints its scan as a `Seq Scan` under a hash join where
-PostgreSQL merge-joins sorted foreign scans; a subquery's value is not sent
-as a parameter (`$1::integer` with an `InitPlan`); a `COLLATE` clause keeps
-an order or condition local, but its key prints as written rather than as
-PostgreSQL's relabeled column (also for tables); a grouped query with
-`DISTINCT` or a window over its groups groups locally; a grouped query with a
-`LIMIT` whose remote order is by grouping keys, or none, groups locally where
-PostgreSQL's costs may still ship it over filtered groups (it ships `HAVING
-sum(id) > random() ORDER BY a LIMIT 3` but not the same over `avg(n)`), and
-a local `GROUP BY` under a `LIMIT` hashes where PostgreSQL groups the
-remotely sorted rows; a postponed volatile expression over groups sorted
-here declines the remote grouping; a view or subquery output the outer
-query does not read is computed where PostgreSQL replaces it with a typed
-`NULL` (`remove_unused_subquery_outputs`, also for tables); `DISTINCT` with
-a `WHERE` clause and no `ORDER BY` is hashed locally (as PostgreSQL's costs
-choose) with its scan's `Output` listing only the read columns; a refused
-connection reports `HV000` with the transport error where PostgreSQL
-reports `08001` `could not connect to server` with libpq's detail; and a condition on a
-prepared statement's parameter does not ship: `EXPLAIN EXECUTE` prints it as a local `Filter`,
-with the argument's value in a custom plan and `$1` in a generic one, where
-PostgreSQL sends the value or `$1::integer`. A prepared statement takes
-custom plans for its first five executions and its generic plan after
-them, as `choose_custom_plan` does under `plan_cache_mode = auto`, without
+`differential_exact/504`. A condition that compares with an uncorrelated
+scalar subquery reads the InitPlan's value as `$n::type` (`printRemoteParam`),
+and a prepared statement's parameter ships the same way: `EXPLAIN EXECUTE`
+prints the argument as a constant in a custom plan and `$n::type` in a generic
+one, an `IN` list of them as `ARRAY[...]`, and the scan sends the values when
+it declares its cursor (`differential_exact/621`, `622`). A parameter `LIMIT`
+stays local, and a condition reading only parameters or InitPlans gates the
+scan from a `Result`, under which the scan returns its physical columns (also
+for tables). An InitPlan of a `numeric`, character, time or interval type,
+which may carry a type modifier pos3ql does not derive, stays local; a
+correlated subquery's outer column does not ship as a parameter, and execution
+sends a custom plan's arguments as `$n` where PostgreSQL's remote query
+carries the values. Values sent to the server (`INSERT`, `UPDATE`, `COPY`
+and parameters) print in postgres_fdw's transmission modes (ISO dates,
+`extra_float_digits = 3`) whatever the session's settings. A connection that
+fails reports `08001` `could not connect to server "name"` with libpq's
+message as its detail (`differential_exact/620`). `COLLATE` prints as the
+planner leaves it: a constant carries its collation (`'a'::text COLLATE
+"C"`), any other operand is relabeled, which shows as a cast where implicit
+coercions print (`((note)::text)`), and a sort key then names its collation
+(`differential_exact/623`, also for tables). An `ORDER BY` key a `WHERE`
+equality fixes to a constant orders nothing: a table needs no `Sort` and a
+foreign scan ships neither the key nor, with no key left, the `LIMIT`
+(`differential_exact/624`). Without a `LIMIT`, the remote order ships only
+when postgres_fdw's sorted path costs no more than a local sort of the
+unordered rows (`estimate_path_cost_size` without remote estimates, a
+never-analyzed table of ten pages, `cost_sort`, `add_path`'s fuzz factor),
+with the selectivities `selfuncs.c` assumes without statistics
+(`differential_exact/625`); a condition outside that model (a pattern, a
+function returning a boolean) keeps the remote order. Remaining differences:
+`EXPLAIN` of a foreign table read with other relations (a join, or a
+semi-join from `IN` or `EXISTS`) or under column aliases fails with `0A000`,
+since postgres_fdw's join pushdown (`foreign_join_ok`) and its estimates for
+join inputs are not modeled; execution reads such a table whole and joins it
+here, with PostgreSQL's rows. `EXPLAIN` with costs prints a foreign scan's
+cost as zero. A grouped query with `DISTINCT` or a window over its groups
+groups locally; a grouped query with a `LIMIT` whose remote order is by
+grouping keys, or none, groups locally where PostgreSQL's costs may still
+ship it over filtered groups (it ships `HAVING sum(id) > random() ORDER BY a
+LIMIT 3` but not the same over `avg(n)`), and a local `GROUP BY` under a
+`LIMIT` hashes where PostgreSQL groups the remotely sorted rows; a postponed
+volatile expression over groups sorted here declines the remote grouping; a
+view or subquery output the outer query does not read is computed where
+PostgreSQL replaces it with a typed `NULL` (`remove_unused_subquery_outputs`,
+also for tables), which also removes a window or aggregate only that output
+reads and an unread set-operation branch column, and skips an error the
+output would raise; `DISTINCT` with a `WHERE` clause and no `ORDER BY` is
+hashed locally (as PostgreSQL's costs choose) with its scan's `Output`
+listing only the read columns. A prepared statement takes custom plans for
+its first five executions and its generic plan after them, as
+`choose_custom_plan` does under `plan_cache_mode = auto`, without
 PostgreSQL's comparison of the generic plan's cost with the custom plans'
-average. A select list or `ORDER BY` with a subquery reads every column. A
+average, which needs PostgreSQL's cost of every plan shape. A select list, condition or `ORDER BY` with a correlated subquery reads every
+column, where PostgreSQL fetches the columns the subquery reads. A
 query whose only FROM item is a foreign table, a scalar or `EXISTS` subquery
 over one, and a foreign partition or inheritance child read its cursor one
 `FETCH` batch at a time as the plan consumes rows, and close it as soon as
@@ -1040,7 +1066,9 @@ table joined with other FROM items is read whole before the join (a right
 or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
-batch where PostgreSQL fetches only what the reads need. COPY FROM into a foreign table queues its rows
+batch where PostgreSQL fetches only what the reads need. Date input reads
+`YYYY-MM-DD` and the special values; PostgreSQL's other forms (`05/01/2024`
+read in the `DateStyle` field order, month names) fail with `22007`. COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup

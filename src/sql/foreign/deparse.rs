@@ -399,21 +399,18 @@ impl<'t> Deparser<'t> {
             }
             // A number cast to a type is a constant of it (`5::bigint`).
             cast @ Expr::Cast {
-                operand,
-                type_name,
-                type_mod: -1,
-                ..
-            } if matches!(
-                operand,
-                Expr::Int(_)
+                operand:
+                    Expr::Int(_)
                     | Expr::NumericLit(_)
                     | Expr::Unary {
                         operator: UnaryOp::Neg,
                         operand: Expr::Int(_) | Expr::NumericLit(_),
                         ..
-                    }
-            ) =>
-            {
+                    },
+                type_name,
+                type_mod: -1,
+                ..
+            } => {
                 let ctype = ColType::from_sql_name(type_name)?;
                 if !modeled_type(ctype) {
                     return None;

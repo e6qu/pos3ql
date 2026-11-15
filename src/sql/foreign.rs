@@ -7,6 +7,7 @@ use crate::mem::arena::Arena;
 use crate::pg::replication_client::{ClientError, ClientEvent, ConnectionInfo, SqlEvent, SslMode};
 use crate::pg::respond::Responder;
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::guc::RenderContext;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::foreign::{ForeignMappingUser, ForeignServerDefinition};
@@ -241,6 +242,10 @@ fn decode_remote_field<'a>(
 }
 
 /// Why one poll of a foreign connection failed.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a failure ends the poll once; boxing would allocate at run time"
+)]
 enum PollFailure {
     Client(ClientError),
     TimedOut,
@@ -2228,7 +2233,6 @@ pub(crate) struct RemoteInsert<'values, 'data> {
     pub retrieved: deparse::RemoteReturning,
     /// Receives the stored row's `ctid` when `retrieved` carries it.
     pub ctid: &'values mut Option<RemoteTupleId>,
-    pub render: crate::sql::guc::RenderContext,
     /// A `BEFORE ROW INSERT` trigger applies, which rules out batching.
     pub before_row_triggers: bool,
 }
@@ -2341,7 +2345,6 @@ pub(crate) fn insert_row<'a>(
         on_conflict_do_nothing,
         retrieved,
         ctid,
-        render,
         before_row_triggers: _,
     } = request;
     let remote = RemoteTable::open(storage, table_slot, txid)?;
@@ -2353,7 +2356,8 @@ pub(crate) fn insert_row<'a>(
     let mut count = 0;
     for (value, definition) in values.iter().zip(table.columns()) {
         if !definition.default.is_generated() {
-            parameters[count] = Responder::datum_wire_text(value, render, arena)?;
+            parameters[count] =
+                Responder::datum_wire_text(value, RenderContext::transmission(), arena)?;
             count += 1;
         }
     }
@@ -2644,7 +2648,7 @@ impl<'a> ForeignInsertBatches<'a> {
             if column.default.is_generated() {
                 continue;
             }
-            let text = Responder::datum_wire_text(value, request.render, arena)?;
+            let text = Responder::datum_wire_text(value, RenderContext::transmission(), arena)?;
             let length = text.map_or(-1, |text| text.len() as i32);
             let end = pending.used + 4 + text.map_or(0, <[u8]>::len);
             if end > pending.buffer.len() {
@@ -2744,7 +2748,6 @@ pub(crate) fn insert_fields<'a>(
     table_slot: usize,
     txid: u32,
     values: &[Datum<'_>],
-    render: crate::sql::guc::RenderContext,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
     let definition = storage.table_def(table_slot, txid);
@@ -2755,7 +2758,7 @@ pub(crate) fn insert_fields<'a>(
         if column.default.is_generated() {
             continue;
         }
-        let text = Responder::datum_wire_text(value, render, arena)?;
+        let text = Responder::datum_wire_text(value, RenderContext::transmission(), arena)?;
         length += 4 + text.map_or(0, <[u8]>::len);
         texts[count] = text;
         count += 1;
@@ -2975,7 +2978,6 @@ pub(crate) struct RemoteUpdate<'values, 'data> {
     /// The new row, into which the `RETURNING` columns are merged.
     pub values: &'values mut [Datum<'data>],
     pub returned: deparse::RemoteReturning,
-    pub render: crate::sql::guc::RenderContext,
 }
 
 /// Updates exactly the parsed remote tuple; `false` when the server changed
@@ -2995,7 +2997,6 @@ pub(crate) fn update_row<'data>(
         target_columns,
         values,
         returned,
-        render,
     } = request;
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let query = match planned {
@@ -3018,7 +3019,8 @@ pub(crate) fn update_row<'data>(
     for column in (0..remote.table.n_columns).filter(|&column| {
         target_columns.contains(column) && !remote.table.columns()[column].default.is_generated()
     }) {
-        parameters[count] = Responder::datum_wire_text(&values[column], render, arena)?;
+        parameters[count] =
+            Responder::datum_wire_text(&values[column], RenderContext::transmission(), arena)?;
         count += 1;
     }
     let lease = enter_session(storage, txid, &remote.server)?;

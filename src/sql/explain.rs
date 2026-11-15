@@ -2510,6 +2510,11 @@ fn single_relation_quals<'a>(
 struct Expansion<'a> {
     planned: query::partition_prune::Members<'a>,
     started: &'a [usize],
+    /// Each foreign member ships the scan's conditions to its server
+    /// whole, leaving it no filter, except those in `foreign_local`, which
+    /// ship none.
+    foreign_shipped: bool,
+    foreign_local: &'a [usize],
 }
 
 /// Rejects members that have an index on a column in `read`: PostgreSQL
@@ -2601,6 +2606,8 @@ fn relation_expansions<'a>(
                         scan_pruned: false,
                     },
                     started: &[],
+                    foreign_shipped: false,
+                    foreign_local: &[],
                 });
             }
             continue;
@@ -2681,10 +2688,50 @@ fn relation_expansions<'a>(
             aggregated || reads_column(read, &own, name)
         };
         reject_member_indexes(storage, txid, planned.leaves, &indexed)?;
+        // postgres_fdw plans a foreign member as a foreign table scanned on
+        // its own; a condition it keeps local is outside this plan.
+        let own = query::partition_prune::own_restrictions(scope, conditions, table, arena)?;
+        let mut local = crate::mem::arena::ArenaList::new(arena);
+        for &leaf in planned.leaves {
+            if storage.table_def(leaf, txid).kind != crate::storage::TableKind::Foreign
+                || own.is_empty()
+            {
+                continue;
+            }
+            let plan = crate::sql::foreign::deparse::member_scan(
+                storage,
+                txid,
+                item,
+                leaf,
+                scope.names[table],
+                own,
+                arena,
+            )?;
+            let kept = match plan {
+                None => own.len(),
+                Some(plan) => match plan.local_where {
+                    None => 0,
+                    Some(kept) => crate::sql::foreign::deparse::conjuncts(Some(kept), arena)?.len(),
+                },
+            };
+            if kept == own.len() {
+                local.push(leaf).map_err(|_| arena_full())?;
+            } else if kept != 0 {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of a foreign partition or inheritance child shipping some of its conditions is not supported"
+                ));
+            }
+        }
         if planned.expanded != 0 {
             EXPANDED_RELATIONS.with(|expanded| expanded.set(true));
         }
-        expansions[table] = Some(Expansion { planned, started });
+        expansions[table] = Some(Expansion {
+            planned,
+            started,
+            foreign_shipped: true,
+            foreign_local: local.as_slice(),
+        });
     }
     Ok(expansions)
 }
@@ -2790,12 +2837,18 @@ fn push_members(
         };
         if definition.kind == crate::storage::TableKind::Foreign {
             // A foreign member's conditions go to its server where they
-            // ship, which this plan does not decide.
+            // ship, which only a query's own scan plans.
             if scan.qualifications().next().is_some() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN of a condition on a foreign partition or inheritance child is not supported"
-                ));
+                if !expansion.foreign_shipped {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of a condition on a foreign partition or inheritance child is not supported"
+                    ));
+                }
+                if !expansion.foreign_local.contains(&leaf) {
+                    node.quals = NO_QUALS;
+                    node.verbose_quals = NO_QUALS;
+                }
             }
             node.name = StackStr::from_str("Foreign Scan");
             node.output_unprintable = true;
@@ -8967,7 +9020,12 @@ fn expanded_write<'e>(
         storage,
         txid,
         scan,
-        Expansion { planned, started },
+        Expansion {
+            planned,
+            started,
+            foreign_shipped: false,
+            foreign_local: &[],
+        },
         true,
         &mut fresh_names()?,
         &|leaf| {

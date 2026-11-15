@@ -16,8 +16,8 @@ use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{
-    BinaryOp, Expr, LockStrength, OrderBy, RelationInheritance, Select, SelectItem, UnaryOp,
-    WindowSpec,
+    BinaryOp, Expr, LockStrength, OrderBy, RelationInheritance, Select, SelectItem, TableRef,
+    UnaryOp, WindowSpec,
 };
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::types::{ColType, Datum, oid};
@@ -2083,6 +2083,55 @@ pub(crate) fn plan_select<'a>(
         return Ok(Some(upper));
     }
     plan_with(&deparser, slot, statement, arena).map(Some)
+}
+
+/// The remote scan of `leaf`, a foreign member of the FROM item `item`
+/// exposed as `exposed`, under `conditions`, the item's own restrictions:
+/// postgres_fdw plans each foreign partition or child as a foreign table
+/// scanned on its own, shipping the conditions it can (`classifyConditions`)
+/// and keeping the rest as the member's filter.
+pub(crate) fn member_scan<'a>(
+    storage: &Storage,
+    txid: u32,
+    item: &TableRef<'a>,
+    leaf: usize,
+    exposed: &'a str,
+    conditions: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<ForeignSelectPlan<'a>>, SqlError> {
+    let definition = storage.table_def(leaf, txid);
+    let table = arena
+        .alloc_str(definition.name.as_str())
+        .map_err(|_| arena_full())?;
+    let schema = arena
+        .alloc_str(definition.schema.as_str())
+        .map_err(|_| arena_full())?;
+    let items = arena
+        .alloc_slice_copy(&[SelectItem::Wildcard(
+            crate::sql::ast::SourcePosition::UNKNOWN,
+        )])
+        .map_err(|_| arena_full())?;
+    let statement = arena
+        .alloc(Select {
+            items,
+            from: Some(crate::sql::ast::FromClause {
+                base: TableRef {
+                    schema: Some(schema),
+                    table,
+                    alias: Some(exposed),
+                    inheritance: RelationInheritance::Only,
+                    bound_table: None,
+                    sample: None,
+                    lateral: false,
+                    ..*item
+                },
+                joins: &[],
+            }),
+            where_clause: conjoin(conditions, arena)?,
+            ..Select::EMPTY
+        })
+        .map_err(|_| arena_full())?;
+    plan_select(storage, txid, statement, arena)
 }
 
 /// `preprocess_minmax_aggregates` over a query of one foreign table: a

@@ -2708,6 +2708,40 @@ impl<'a> ScanValues<'_, '_, 'a> {
     }
 }
 
+/// Of `conditions`, those that read FROM position `table` alone, without a
+/// subquery: the restrictions a foreign member's scan can ship.
+pub(crate) fn own_restrictions<'a>(
+    scope: &super::QueryScope<'a>,
+    conditions: &[&'a Expr<'a>],
+    table: usize,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let mut own = ArenaList::new(arena);
+    for &condition in conditions {
+        let mut alone = true;
+        super::walk_expression_tree(condition, &mut |node| match node {
+            Expr::Column { qualifier, name } => {
+                alone &= matches!(
+                    scope.find_column_unsuggested(*qualifier, name),
+                    Ok(super::ResolvedColumn::Table(found, _)) if found == table
+                );
+            }
+            Expr::WholeRow(_)
+            | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => alone = false,
+            _ => {}
+        })?;
+        if alone {
+            own.push(condition).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(own.as_slice())
+}
+
 /// Whether FROM position `table` is a partitioned table planning's pruning
 /// leaves no partition: PostgreSQL's dummy relation, which reads no rows.
 /// A partitioned table stores none itself, so its own (empty) rows are the

@@ -9380,6 +9380,25 @@ fn scan_source_mode<'a>(
                                 visit_candidate!(this, BoundRow::Values(values), rowid)
                             })
                         };
+                        // A foreign member ships the restrictions it can to
+                        // its server, as postgres_fdw plans it.
+                        let pushed = if foreign {
+                            let own = super::partition_prune::own_restrictions(
+                                scope, conditions, table, arena,
+                            )?;
+                            crate::sql::foreign::deparse::member_scan(
+                                storage,
+                                txid,
+                                source_ref(from, table),
+                                leaf,
+                                scope.names[table],
+                                own,
+                                arena,
+                            )?
+                            .map(|plan| (plan.sql, plan.remote_columns()))
+                        } else {
+                            None
+                        };
                         if !for_each_member_row(
                             storage,
                             txid,
@@ -9388,6 +9407,7 @@ fn scan_source_mode<'a>(
                             arena,
                             recycle_rows,
                             hooks.sequences,
+                            pushed,
                             &mut visit,
                         )? {
                             return Ok(false);
@@ -9991,6 +10011,7 @@ fn scan_source_mode<'a>(
                     arena,
                     true,
                     None,
+                    None,
                     &mut |_, _| {
                         total += 1;
                         Ok(true)
@@ -10235,6 +10256,7 @@ fn scan_source_mode<'a>(
                         arena,
                         recycle_rows,
                         hooks.sequences,
+                        None,
                         &mut |rowid, physical_values| {
                             check_timeout()?;
                             let this = ordinal;
@@ -10477,8 +10499,9 @@ fn scan_source_mode<'a>(
 
 /// Visits each row of `leaf`, a member of an expanded FROM item, with its
 /// identity (none for a foreign member's, which come from its server as a
-/// foreign table read on its own does) and its own columns, until `visit`
-/// returns false; returns whether every row was visited.
+/// foreign table read on its own does, by the remote query `pushed` when
+/// one is planned) and its own columns, until `visit` returns false;
+/// returns whether every row was visited.
 #[allow(clippy::too_many_arguments)]
 fn for_each_member_row<'a>(
     storage: &'a Storage,
@@ -10488,10 +10511,11 @@ fn for_each_member_row<'a>(
     arena: &'a Arena,
     recycle_rows: bool,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    pushed: Option<(&'a str, crate::sql::foreign::RemoteColumns<'a>)>,
     visit: &mut dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     if physical.kind == crate::storage::TableKind::Foreign {
-        let stream = crate::sql::foreign::ForeignStream::new(leaf, None, arena)?;
+        let stream = crate::sql::foreign::ForeignStream::new(leaf, pushed, arena)?;
         return crate::sql::foreign::stream_rows(
             storage,
             &stream,

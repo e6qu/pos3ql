@@ -1094,7 +1094,7 @@ fn diff_rows(
 
 /// Test builds compare every reached-table capture with the capture over all
 /// tables, so a relation that `reached_tables` misses fails the change that
-/// edits it instead of silently dropping a before-image.
+/// edits it rather than losing a before-image.
 #[cfg(test)]
 fn cross_check_reached_rows<'a>(
     relation: &CatalogSnapshotRelation,

@@ -2237,6 +2237,8 @@ impl<'a> WindowRows<'a> {
     }
 
     /// The row positions in ORDER BY order; ties keep their input order.
+    /// The rows already follow the first `presorted` keys.
+    #[expect(clippy::too_many_arguments, reason = "sort plan context")]
     pub(crate) fn ordered(
         &self,
         storage: &Storage,

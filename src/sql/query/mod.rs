@@ -41,6 +41,7 @@ pub(crate) use retained::{
 mod routine_contract_tests;
 
 mod setops;
+pub(crate) use cte::{RecursiveChunk, RecursiveCteQuery};
 pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
@@ -3536,7 +3537,6 @@ pub(crate) fn bind_routine_statement_source<'a>(
             dependencies,
             arena,
             params,
-            None,
         )?),
         Stmt::SetQuery(query) => {
             let body = cte::expand_stored_set_tree_exec(
@@ -3544,7 +3544,7 @@ pub(crate) fn bind_routine_statement_source<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                cte::StoredExecutionContext::new(path, dependencies, params),
                 arena,
             )?;
             Stmt::SetQuery(SetQuery {
@@ -3566,7 +3566,6 @@ pub(crate) fn bind_routine_statement_source<'a>(
                 dependencies,
                 arena,
                 params,
-                None,
             );
         }
         _ => return Ok(statement),
@@ -3609,9 +3608,8 @@ pub(crate) fn execute_routine_query_under<'a>(
                     dependencies,
                     arena,
                     params,
-                    sequences,
                 )?,
-                None => expand_ctes_exec(select, storage, txid, arena, params, &[], sequences)?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[])?,
             };
             validate_locking(select, storage, txid, arena)?;
             if recycling {
@@ -3633,7 +3631,7 @@ pub(crate) fn execute_routine_query_under<'a>(
                 query.body,
                 storage,
                 txid,
-                cte::StoredExecutionContext::new(path, dependencies, params, sequences),
+                cte::StoredExecutionContext::new(path, dependencies, params),
                 arena,
             )?;
             let rebound = SetQuery {

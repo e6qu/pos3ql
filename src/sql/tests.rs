@@ -89383,8 +89383,7 @@ fn common_table_expressions() {
     )
     .unwrap();
     let expanded =
-        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[], None)
-            .unwrap();
+        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[]).unwrap();
     let from = expanded.from.expect("expanded CTE sources");
     assert!(from.base.subquery.is_some() && from.base.cte.is_none());
     assert!(from.joins[0].table.subquery.is_some() && from.joins[0].table.cte.is_none());
@@ -89397,8 +89396,7 @@ fn common_table_expressions() {
     )
     .unwrap();
     let expanded =
-        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[], None)
-            .unwrap();
+        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[]).unwrap();
     let from = expanded.from.expect("expanded CTE sources");
     assert!(from.base.cte.is_some() && from.base.subquery.is_none());
     assert!(from.joins[0].table.cte.is_some() && from.joins[0].table.subquery.is_none());

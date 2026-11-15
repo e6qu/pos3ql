@@ -97,14 +97,13 @@ pub(crate) fn expand_stored_query_exec<'a>(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
     with_exec_context(
         select.with,
         storage,
         txid,
         arena,
-        ExecutionSubst::materializing(params, sequences),
+        ExecutionSubst::materializing(params),
         &[],
         &[],
         &[],
@@ -789,9 +788,8 @@ pub fn expand_ctes_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_enclosed_ctes_exec(sel, storage, txid, arena, params, dml_mats, sequences, None)
+    expand_enclosed_ctes_exec(sel, storage, txid, arena, params, dml_mats, None)
 }
 
 /// [`expand_ctes_exec`] for a query a routine runs: its `WITH` queries read
@@ -805,7 +803,6 @@ pub(crate) fn expand_enclosed_ctes_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&dyn SequenceAccess>,
     enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
 ) -> Result<&'a Select<'a>, SqlError> {
     if !select_contains_with(sel) && !storage.has_any_view() {
@@ -817,7 +814,7 @@ pub(crate) fn expand_enclosed_ctes_exec<'a>(
         storage,
         txid,
         arena,
-        ExecutionSubst::materializing(params, sequences),
+        ExecutionSubst::materializing(params),
         dml_mats,
         &[],
         &[],
@@ -859,7 +856,6 @@ pub(crate) fn expand_stream_ctes<'a>(
         arena,
         ExecutionSubst {
             params: &[],
-            sequences: None,
             refused: Some(&refused),
         },
         &[],
@@ -1174,19 +1170,8 @@ pub fn expand_dml_ctes<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    expand_dml_ctes_with_relations(
-        statement,
-        with,
-        storage,
-        txid,
-        arena,
-        params,
-        dml_mats,
-        &[],
-        sequences,
-    )
+    expand_dml_ctes_with_relations(statement, with, storage, txid, arena, params, dml_mats, &[])
 }
 
 /// Rebinds a SQL-standard routine statement to the catalog identities captured
@@ -1204,7 +1189,6 @@ pub(crate) fn expand_stored_statement_exec<'a>(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     expand_stored_statement_with_transition(
         statement,
@@ -1214,7 +1198,6 @@ pub(crate) fn expand_stored_statement_exec<'a>(
         dependencies,
         arena,
         params,
-        sequences,
         ViewReader::Session,
         None,
     )
@@ -1232,7 +1215,6 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
     authorization_role: u16,
     names: &'a [&'a str],
     old: &'a [&'a Expr<'a>],
@@ -1249,7 +1231,6 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
         dependencies,
         arena,
         params,
-        sequences,
         ViewReader::Role(authorization_role),
         Some(RuleTransition {
             names,
@@ -1274,7 +1255,6 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
     authorization_role: u16,
     names: &'a [&'a str],
     old: &'a [&'a Expr<'a>],
@@ -1288,7 +1268,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
         storage,
         txid,
         arena,
-        ExecutionSubst::materializing(params, sequences),
+        ExecutionSubst::materializing(params),
         &[],
         &[],
         &[],
@@ -3507,7 +3487,6 @@ fn expand_stored_statement_with_transition<'a>(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
     authorization_role: ViewReader,
     transition: Option<RuleTransition<'_, 'a>>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
@@ -3524,7 +3503,7 @@ fn expand_stored_statement_with_transition<'a>(
         storage,
         txid,
         arena,
-        ExecutionSubst::materializing(params, sequences),
+        ExecutionSubst::materializing(params),
         &[],
         &[],
         &[],
@@ -3595,17 +3574,7 @@ pub(crate) fn bind_dml_materialized_relations<'a>(
     params: &[Datum<'a>],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    expand_dml_ctes_with_relations(
-        statement,
-        &[],
-        storage,
-        txid,
-        arena,
-        params,
-        &[],
-        relations,
-        None,
-    )
+    expand_dml_ctes_with_relations(statement, &[], storage, txid, arena, params, &[], relations)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3618,14 +3587,13 @@ fn expand_dml_ctes_with_relations<'a>(
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     with_exec_context(
         with,
         storage,
         txid,
         arena,
-        ExecutionSubst::materializing(params, sequences),
+        ExecutionSubst::materializing(params),
         dml_mats,
         relations,
         &[],
@@ -4980,7 +4948,7 @@ fn with_exec_context<'a, 's, 'e, R>(
             if execution.refuses_evaluate_once() {
                 return Err(execution.refuse());
             }
-            let recursive = materialize_recursive(
+            let recursive = plan_recursive(
                 cte,
                 cte_index,
                 context,
@@ -4988,7 +4956,6 @@ fn with_exec_context<'a, 's, 'e, R>(
                 txid,
                 arena,
                 execution.params,
-                execution.sequences,
             )?;
             materialized
                 .push((cte.name, recursive))
@@ -5304,13 +5271,12 @@ pub(super) fn expand_set_tree_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     if with.is_empty() && !set_tree_contains_with(tree) && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, dml_mats, sequences)?;
+    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, dml_mats)?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -5318,7 +5284,6 @@ pub(super) struct StoredExecutionContext<'storage, 'params, 'a> {
     path: crate::storage::PathContext,
     dependencies: crate::storage::StoredQueryDependencyView<'storage>,
     params: &'params [Datum<'a>],
-    sequences: Option<&'params dyn SequenceAccess>,
 }
 
 impl<'storage, 'params, 'a> StoredExecutionContext<'storage, 'params, 'a> {
@@ -5326,13 +5291,11 @@ impl<'storage, 'params, 'a> StoredExecutionContext<'storage, 'params, 'a> {
         path: crate::storage::PathContext,
         dependencies: crate::storage::StoredQueryDependencyView<'storage>,
         params: &'params [Datum<'a>],
-        sequences: Option<&'params dyn SequenceAccess>,
     ) -> Self {
         Self {
             path,
             dependencies,
             params,
-            sequences,
         }
     }
 }
@@ -5354,7 +5317,6 @@ pub(super) fn expand_stored_set_tree_exec<'a>(
         execution.dependencies,
         arena,
         execution.params,
-        execution.sequences,
     )?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
@@ -5438,7 +5400,6 @@ struct Subst<'c, 'a, 's, 'e> {
 #[derive(Clone, Copy)]
 struct ExecutionSubst<'e, 'a> {
     params: &'e [Datum<'a>],
-    sequences: Option<&'e dyn SequenceAccess>,
     /// Set when the caller can only use a query whose CTEs all inline (a
     /// result stream): a CTE that must run once sets it and stops the
     /// expansion instead of materializing.
@@ -5446,10 +5407,9 @@ struct ExecutionSubst<'e, 'a> {
 }
 
 impl<'e, 'a> ExecutionSubst<'e, 'a> {
-    fn materializing(params: &'e [Datum<'a>], sequences: Option<&'e dyn SequenceAccess>) -> Self {
+    fn materializing(params: &'e [Datum<'a>]) -> Self {
         Self {
             params,
-            sequences,
             refused: None,
         }
     }
@@ -7749,18 +7709,20 @@ fn external_recursive_union(
         .expect("recursive work table has a block store")
 }
 
-/// Materializes a self-referencing recursive CTE to its fixpoint: the
+/// Plans a self-referencing recursive CTE, which its readers run to as many
+/// rows as they read (`ExecRecursiveUnion` under `CteScanNext`): the
 /// non-recursive term's rows first, then the recursive term evaluated
 /// repeatedly with the CTE name bound to the previous iteration's rows,
-/// accumulating until an iteration adds nothing (UNION deduplicates against
-/// everything seen; UNION ALL keeps duplicates and stops on an empty
-/// iteration). Row storage is arena-bounded: runaway recursion fails loudly
-/// with arena exhaustion, and the statement timeout is honored per iteration.
+/// until an iteration adds nothing (UNION deduplicates against everything
+/// seen; UNION ALL keeps duplicates and stops on an empty iteration). Row
+/// storage is arena-bounded: recursion that a reader drains without end
+/// fails loudly with arena exhaustion, and the statement timeout is honored
+/// per iteration.
 #[expect(
     clippy::too_many_arguments,
     reason = "recursion runs in its WITH position's plan block with its execution context"
 )]
-fn materialize_recursive<'a>(
+fn plan_recursive<'a>(
     cte: &'a Cte<'a>,
     position: usize,
     outer: Subst<'_, 'a, '_, '_>,
@@ -7768,14 +7730,10 @@ fn materialize_recursive<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
     // A WITH query run once is its own block of an explained plan: a
-    // `Recursive Union` of its two terms.
-    let _cte = super::instrument::enter(super::instrument::Segment::Cte(position));
-    let union_node = super::instrument::node(super::instrument::Role::SetOperation(0));
-    let _union = union_node.start();
-    let term = |position| super::instrument::enter(super::instrument::Segment::Branch(position));
+    // `Recursive Union` of its two terms. Its readers run it.
+    let block = super::instrument::current_block().child(super::instrument::Segment::Cte(position));
     let (base_tree, recursive_tree, union_all) = recursive_parts(cte.query, cte.name)?;
     // References to earlier CTEs inline now; the self-reference stays a bare
     // table name (it is not in `outer`'s bindings) for per-iteration binding.
@@ -7914,190 +7872,22 @@ fn materialize_recursive<'a>(
         )?
     };
 
-    if storage.spill_attached() {
-        let base_raw = {
-            let _term = term(0);
-            external_recursive_tree(
-                base_tree, storage, txid, arena, params, sequences, !union_all,
-            )?
-        };
-        let base = if decorated {
-            external_decorate_recursive_run(
-                storage, txid, base_raw, decoration, true, !union_all, false, arena,
-            )?
-        } else {
-            base_raw
-        };
-        let mut all = if union_all {
-            base
-        } else {
-            external_unique_run(storage, txid, base)?
-        };
-        let mut working = all;
-        let working_source = arena.alloc_atomic_usize(0).map_err(|_| arena_full())?;
-        let working_cte = arena
-            .alloc(MaterializedCte {
-                column_names: base_column_names,
-                column_types: base_column_types,
-                column_collations: base_column_collations,
-                definition: Some(working_definition),
-                source: crate::sql::ast::MaterializedCteSource::RecursiveExternal(working_source),
-            })
-            .map_err(|_| arena_full())?;
-        let binding = [(cte.name, &*working_cte)];
-        let context = Subst {
-            ctes: &[],
-            materialized: &binding,
-            storage,
-            txid: outer.txid,
-            depth: 0,
-            path: None,
-            dependencies: None,
-            authorization_role: ViewReader::Session,
-            qualifier: None,
-            rule_transition: None,
-            recursive_state: None,
-            execution: outer.execution,
-            shallow: false,
-        };
-        let step_tree = subst_set_tree(recursive_tree, context, arena)?;
-        let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let stepn = describe_set_body(
-            storage,
-            step_tree,
-            txid,
-            &mut step_desc,
-            arena,
-            None,
-            crate::sql::exec::DescriptionTarget::Sql,
-            None,
-        )?;
-        let expected_step_columns = ncols + decoration.state_types.len();
-        if stepn != expected_step_columns {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "each UNION query must have the same number of columns"
-            ));
-        }
-        for column in 0..ncols {
-            if step_desc[column].type_oid != base_column_types[column].0 {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
-                    cte.name,
-                    column + 1,
-                    base_column_types[column].0,
-                    step_desc[column].type_oid
-                ));
-            }
-        }
-        while working.is_some_and(|run| run.rows() > 0) {
-            check_timeout()?;
-            let run = arena
-                .alloc(working.expect("loop condition requires a run"))
-                .map_err(|_| arena_full())?;
-            working_source.store(
-                run as *const crate::sql::external::ExternalRun as usize,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            let iteration_mark = arena.mark();
-            let raw_candidates = {
-                let _term = term(1);
-                external_recursive_tree(
-                    step_tree, storage, txid, arena, params, sequences, !union_all,
-                )?
-            };
-            let candidates = if decorated {
-                external_decorate_recursive_run(
-                    storage,
-                    txid,
-                    raw_candidates,
-                    decoration,
-                    false,
-                    !union_all,
-                    false,
-                    arena,
-                )?
-            } else {
-                raw_candidates
-            };
-            let fresh = if union_all {
-                candidates
-            } else {
-                let unique = external_unique_run(storage, txid, candidates)?;
-                external_recursive_difference(storage, txid, unique, all)?
-            };
-            if fresh.is_none_or(|run| run.rows() == 0) {
-                unsafe { arena.rewind_to(iteration_mark) };
-                break;
-            }
-            let next_working = external_recursive_noncycle_run(
-                storage, txid, fresh, decoration, !union_all, arena,
-            )?;
-            all = external_recursive_union(storage, txid, all, fresh, !union_all)?;
-            working = next_working;
-            // Completed runs retain only block identities; all query scopes,
-            // decoded records, and sorter scratch from this iteration are dead.
-            unsafe { arena.rewind_to(iteration_mark) };
-        }
-        union_node.rows(all.map_or(0, |run| run.rows()));
-        return Ok(&*arena
-            .alloc(MaterializedCte {
-                column_names,
-                column_types,
-                column_collations,
-                definition: Some(definition),
-                source: crate::sql::ast::MaterializedCteSource::External(all),
-            })
-            .map_err(|_| arena_full())?);
-    }
-
-    // Base rows; UNION (without ALL) deduplicates them among themselves.
-    let (base_rows, _, _) = {
-        let _term = term(0);
-        materialize_set_body(storage, txid, base_tree, arena, params, sequences)?
-    };
-    const EMPTY: &[u8] = &[];
-    let base_rows = if decorated {
-        let rows = arena
-            .alloc_slice_with(base_rows.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (output, &source) in rows.iter_mut().zip(base_rows) {
-            *output = decorate_recursive_row(source, decoration, true, arena)?.0;
-        }
-        &*rows
-    } else {
-        base_rows
-    };
-    let mut all_rows: &'a [&'a [u8]] = if union_all {
-        base_rows
-    } else {
-        let deduped = arena
-            .alloc_slice_with(base_rows.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        let mut kept = 0usize;
-        for &r in base_rows.iter() {
-            if !contains_projected_row(storage, txid, &deduped[..kept], r)? {
-                deduped[kept] = r;
-                kept += 1;
-            }
-        }
-        &deduped[..kept]
-    };
-    let mut working: &'a [&'a [u8]] = all_rows;
-
-    // Bind the recursive reference once. Only the work-table row slice changes
-    // between iterations; rebuilding the substituted AST each time retains a
-    // full plan per iteration in the bump arena and makes shallow recursion
-    // exhaust memory before row capacity does.
+    let external = storage.spill_attached();
     let working_source = arena.alloc_atomic_usize(0).map_err(|_| arena_full())?;
+    // Bind the recursive reference once. Only the work table's rows change
+    // between iterations; rebuilding the substituted AST each time would
+    // retain a full plan per iteration.
     let working_cte = arena
         .alloc(MaterializedCte {
             column_names: base_column_names,
             column_types: base_column_types,
             column_collations: base_column_collations,
             definition: Some(working_definition),
-            source: crate::sql::ast::MaterializedCteSource::RecursiveInline(working_source),
+            source: if external {
+                crate::sql::ast::MaterializedCteSource::RecursiveExternal(working_source)
+            } else {
+                crate::sql::ast::MaterializedCteSource::RecursiveInline(working_source)
+            },
         })
         .map_err(|_| arena_full())?;
     let binding = [(cte.name, &*working_cte)];
@@ -8135,87 +7925,576 @@ fn materialize_recursive<'a>(
             "each UNION query must have the same number of columns"
         ));
     }
-    for c in 0..ncols {
-        if step_desc[c].type_oid != base_column_types[c].0 {
+    for column in 0..ncols {
+        if step_desc[column].type_oid != base_column_types[column].0 {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
                 cte.name,
-                c + 1,
-                base_column_types[c].0,
-                step_desc[c].type_oid
+                column + 1,
+                base_column_types[column].0,
+                step_desc[column].type_oid
             ));
         }
     }
-
-    while !working.is_empty() {
-        check_timeout()?;
-        let source = arena
-            .alloc(crate::sql::ast::MaterializedCteInlineSource {
-                address: working.as_ptr() as usize,
-                length: working.len(),
-            })
-            .map_err(|_| arena_full())?;
-        working_source.store(
-            source as *const crate::sql::ast::MaterializedCteInlineSource as usize,
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        let (step_rows, _, _) = {
-            let _term = term(1);
-            materialize_set_body(storage, txid, step_tree, arena, params, sequences)?
-        };
-        let step_rows = if decorated {
-            let rows = arena
-                .alloc_slice_with(step_rows.len(), |_| EMPTY)
-                .map_err(|_| arena_full())?;
-            for (output, &source) in rows.iter_mut().zip(step_rows) {
-                *output = decorate_recursive_row(source, decoration, false, arena)?.0;
-            }
-            &*rows
-        } else {
-            step_rows
-        };
-        // Keep the rows this iteration added: all of them under UNION ALL, only
-        // never-seen ones under UNION.
-        let fresh: &'a [&'a [u8]] = if union_all {
-            step_rows
-        } else {
-            let kept_rows = arena
-                .alloc_slice_with(step_rows.len(), |_| EMPTY)
-                .map_err(|_| arena_full())?;
-            let mut kept = 0usize;
-            for &r in step_rows.iter() {
-                if !contains_projected_row(storage, txid, all_rows, r)?
-                    && !contains_projected_row(storage, txid, &kept_rows[..kept], r)?
-                {
-                    kept_rows[kept] = r;
-                    kept += 1;
-                }
-            }
-            &kept_rows[..kept]
-        };
-        if fresh.is_empty() {
-            break;
-        }
-        let combined = arena
-            .alloc_slice_with(all_rows.len() + fresh.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        combined[..all_rows.len()].copy_from_slice(all_rows);
-        combined[all_rows.len()..].copy_from_slice(fresh);
-        all_rows = combined;
-        working = recursive_noncycle_rows(fresh, decoration, arena)?;
-    }
-
-    union_node.rows(all_rows.len() as u64);
+    let plan = arena
+        .alloc(RecursivePlan {
+            base_tree,
+            step_tree,
+            union_all,
+            decoration,
+            decorated,
+            working_source,
+            block,
+            external,
+            owner: core::ptr::from_ref(arena) as usize,
+        })
+        .map_err(|_| arena_full())?;
     Ok(&*arena
         .alloc(MaterializedCte {
             column_names,
             column_types,
             column_collations,
             definition: Some(definition),
-            source: crate::sql::ast::MaterializedCteSource::Inline(all_rows),
+            source: crate::sql::ast::MaterializedCteSource::Recursive(RecursiveCteQuery {
+                plan,
+                progress: arena.alloc_atomic_usize(0).map_err(|_| arena_full())?,
+            }),
         })
         .map_err(|_| arena_full())?)
+}
+
+/// What a recursive `WITH` query runs: its two terms, the work table its
+/// recursive term reads, and the plan block its `Recursive Union` counts in.
+#[derive(Clone, Copy)]
+pub(crate) struct RecursivePlan<'a> {
+    base_tree: &'a SetTree<'a>,
+    step_tree: &'a SetTree<'a>,
+    union_all: bool,
+    decoration: RecursiveDecoration<'a>,
+    decorated: bool,
+    /// The work table the recursive term reads: an inline row descriptor or
+    /// an external run, by address, set before each iteration.
+    working_source: &'a core::sync::atomic::AtomicUsize,
+    block: super::instrument::BlockId,
+    /// Rows live in external runs (spill storage attached) or in the
+    /// statement arena's persistent tail.
+    external: bool,
+    /// The statement arena that holds the query's rows.
+    owner: usize,
+}
+
+/// The rows one step of a recursive query added: the non-recursive term's,
+/// then each iteration's new rows, in the order PostgreSQL returns them.
+#[derive(Clone, Copy)]
+pub(crate) enum RecursiveChunk<'a> {
+    Inline(&'a [&'a [u8]]),
+    External(crate::sql::external::ExternalRun),
+}
+
+/// How far a recursive query has run. Each step publishes a new immutable
+/// snapshot in the statement arena's persistent tail, which per-row rewinds
+/// cannot reclaim, so a reader's chunks stay valid while the query grows.
+#[derive(Clone, Copy)]
+struct RecursiveProgress<'a> {
+    /// `chunks[..count]` of a persistent array of `capacity` entries; later
+    /// entries are written only before a snapshot that counts them.
+    chunks: *mut RecursiveChunk<'a>,
+    capacity: usize,
+    count: usize,
+    /// The rows the next iteration's work table holds.
+    working: RecursiveChunk<'a>,
+    /// Every row so far, for a `UNION` query's duplicate check and an
+    /// external reader of the whole result.
+    all: Option<crate::sql::external::ExternalRun>,
+    done: bool,
+    /// Every inline row in order, once a reader needed the whole result.
+    whole: Option<&'a [&'a [u8]]>,
+}
+
+/// A recursive `WITH` query its readers run a step at a time.
+#[derive(Clone, Copy)]
+pub(crate) struct RecursiveCteQuery<'a> {
+    plan: &'a RecursivePlan<'a>,
+    /// Zero before the first read, then the latest [`RecursiveProgress`].
+    progress: &'a core::sync::atomic::AtomicUsize,
+}
+
+impl core::fmt::Debug for RecursiveCteQuery<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RecursiveCteQuery")
+            .field("base", self.plan.base_tree)
+            .field("step", self.plan.step_tree)
+            .field("union_all", &self.plan.union_all)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> RecursiveCteQuery<'a> {
+    pub(crate) fn same_query(&self, other: &Self) -> bool {
+        core::ptr::eq(self.progress, other.progress)
+    }
+
+    fn progress(&self) -> Option<RecursiveProgress<'a>> {
+        let address = self.progress.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a nonzero address names an immutable persistent snapshot
+        // in the owner arena, which only a reset reclaims.
+        (address != 0).then(|| unsafe { *(address as *const RecursiveProgress<'a>) })
+    }
+
+    /// The whole result, once a reader ran the query to its end.
+    pub(crate) fn completed_rows(&self) -> &'a [&'a [u8]] {
+        self.progress()
+            .and_then(|progress| progress.whole)
+            .unwrap_or(&[])
+    }
+
+    /// The whole external result, once a reader ran the query to its end.
+    pub(crate) fn completed_run(&self) -> Option<crate::sql::external::ExternalRun> {
+        self.progress()
+            .filter(|progress| progress.done && self.plan.external)
+            .and_then(|progress| progress.all)
+    }
+
+    /// The `index`th chunk of rows, running the query's next steps until it
+    /// exists; `None` once the query ended before reaching it.
+    pub(crate) fn chunk(
+        &self,
+        index: usize,
+        arena: &'a Arena,
+        read: super::DeferredCteRead<'_, 'a>,
+    ) -> Result<Option<RecursiveChunk<'a>>, SqlError> {
+        loop {
+            if let Some(progress) = self.progress() {
+                if index < progress.count {
+                    // SAFETY: entries below `count` were written before this
+                    // snapshot was published and are never rewritten.
+                    return Ok(Some(unsafe { *progress.chunks.add(index) }));
+                }
+                if progress.done {
+                    return Ok(None);
+                }
+            }
+            self.step(arena, read)?;
+        }
+    }
+
+    /// Runs the query to its end and returns its inline rows (an external
+    /// query's rows are in [`Self::completed_run`]).
+    pub(crate) fn read_all(
+        &self,
+        arena: &'a Arena,
+        read: Option<super::DeferredCteRead<'_, 'a>>,
+    ) -> Result<&'a [&'a [u8]], SqlError> {
+        let Some(read) = read else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a WITH query was read without its statement context"
+            ));
+        };
+        while !self.progress().is_some_and(|progress| progress.done) {
+            self.step(arena, read)?;
+        }
+        let progress = self.progress().expect("a finished query has progress");
+        if self.plan.external {
+            return Ok(&[]);
+        }
+        if let Some(whole) = progress.whole {
+            return Ok(whole);
+        }
+        // SAFETY: as in `chunk`.
+        let chunks = unsafe { core::slice::from_raw_parts(progress.chunks, progress.count) };
+        let total = chunks
+            .iter()
+            .map(|chunk| match chunk {
+                RecursiveChunk::Inline(rows) => rows.len(),
+                RecursiveChunk::External(_) => 0,
+            })
+            .sum();
+        let whole = arena
+            .alloc_persistent_slice_with(total, |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let mut filled = 0usize;
+        for chunk in chunks {
+            if let RecursiveChunk::Inline(rows) = chunk {
+                whole[filled..filled + rows.len()].copy_from_slice(rows);
+                filled += rows.len();
+            }
+        }
+        let whole: &'a [&'a [u8]] = whole;
+        self.publish(
+            RecursiveProgress {
+                whole: Some(whole),
+                ..progress
+            },
+            arena,
+        )?;
+        Ok(whole)
+    }
+
+    fn publish(&self, progress: RecursiveProgress<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+        let snapshot = arena
+            .alloc_persistent_slice_with(1, |_| progress)
+            .map_err(|_| arena_full())?;
+        self.progress.store(
+            core::ptr::from_ref(&snapshot[0]) as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    /// Appends one chunk, growing the persistent chunk array geometrically.
+    fn with_chunk(
+        progress: RecursiveProgress<'a>,
+        chunk: RecursiveChunk<'a>,
+        arena: &'a Arena,
+    ) -> Result<RecursiveProgress<'a>, SqlError> {
+        let mut progress = progress;
+        if progress.count == progress.capacity {
+            let capacity = (progress.capacity * 2).max(8);
+            let grown = arena
+                .alloc_persistent_slice_with(capacity, |index| {
+                    if index < progress.count {
+                        // SAFETY: as in `chunk`.
+                        unsafe { *progress.chunks.add(index) }
+                    } else {
+                        chunk
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            progress.chunks = grown.as_mut_ptr();
+            progress.capacity = capacity;
+        }
+        // SAFETY: `count < capacity` and no published snapshot counts this
+        // entry yet.
+        unsafe { progress.chunks.add(progress.count).write(chunk) };
+        progress.count += 1;
+        Ok(progress)
+    }
+
+    /// Runs the non-recursive term, or one iteration of the recursive term,
+    /// and publishes the rows it added. Its scratch is reclaimed before it
+    /// returns; the rows it keeps move to the persistent tail.
+    fn step(&self, arena: &'a Arena, read: super::DeferredCteRead<'_, 'a>) -> Result<(), SqlError> {
+        if self.plan.owner != core::ptr::from_ref(arena) as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a WITH query was read outside the statement memory that ran it"
+            ));
+        }
+        check_timeout()?;
+        let plan = *self.plan;
+        let _cte = super::instrument::enter_block(plan.block);
+        let union_node = super::instrument::node(super::instrument::Role::SetOperation(0));
+        let _union = union_node.step();
+        let previous = self.progress();
+        let mark = arena.mark();
+        let next = if plan.external {
+            self.external_step(previous, arena, read)
+        } else {
+            self.inline_step(previous, arena, read)
+        };
+        // SAFETY: everything a step keeps (rows, chunk arrays, snapshots,
+        // external run identities) is in the persistent tail or the block
+        // store; its front allocations are scratch.
+        unsafe { arena.rewind_to(mark) };
+        let (next, added) = next?;
+        union_node.rows(added);
+        self.publish(next, arena)
+    }
+
+    fn empty_progress(working: RecursiveChunk<'a>) -> RecursiveProgress<'a> {
+        RecursiveProgress {
+            chunks: core::ptr::null_mut(),
+            capacity: 0,
+            count: 0,
+            working,
+            all: None,
+            done: false,
+            whole: None,
+        }
+    }
+
+    fn inline_step(
+        &self,
+        previous: Option<RecursiveProgress<'a>>,
+        arena: &'a Arena,
+        read: super::DeferredCteRead<'_, 'a>,
+    ) -> Result<(RecursiveProgress<'a>, u64), SqlError> {
+        let plan = *self.plan;
+        let (storage, txid) = (read.storage, read.txid);
+        const EMPTY: &[u8] = &[];
+        let base = previous.is_none();
+        let progress = match previous {
+            Some(progress) => progress,
+            None => Self::empty_progress(RecursiveChunk::Inline(&[])),
+        };
+        let rows = if base {
+            let _term = super::instrument::enter(super::instrument::Segment::Branch(0));
+            materialize_set_body(
+                storage,
+                txid,
+                plan.base_tree,
+                arena,
+                read.params,
+                read.sequences,
+            )?
+            .0
+        } else {
+            let RecursiveChunk::Inline(working) = progress.working else {
+                unreachable!("an inline query's work table is inline");
+            };
+            if working.is_empty() {
+                return Ok((
+                    RecursiveProgress {
+                        done: true,
+                        ..progress
+                    },
+                    0,
+                ));
+            }
+            let source = arena
+                .alloc(crate::sql::ast::MaterializedCteInlineSource {
+                    address: working.as_ptr() as usize,
+                    length: working.len(),
+                })
+                .map_err(|_| arena_full())?;
+            plan.working_source.store(
+                core::ptr::from_ref(source) as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            let _term = super::instrument::enter(super::instrument::Segment::Branch(1));
+            materialize_set_body(
+                storage,
+                txid,
+                plan.step_tree,
+                arena,
+                read.params,
+                read.sequences,
+            )?
+            .0
+        };
+        let rows = if plan.decorated {
+            let decorated = arena
+                .alloc_slice_with(rows.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (output, &source) in decorated.iter_mut().zip(rows) {
+                *output = decorate_recursive_row(source, plan.decoration, base, arena)?.0;
+            }
+            &*decorated
+        } else {
+            rows
+        };
+        // Keep the rows this step added: all of them under UNION ALL, only
+        // never-seen ones under UNION.
+        let fresh: &'a [&'a [u8]] = if plan.union_all {
+            rows
+        } else {
+            let kept_rows = arena
+                .alloc_slice_with(rows.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            let mut kept = 0usize;
+            // SAFETY: as in `chunk`.
+            let chunks = if progress.count == 0 {
+                &[][..]
+            } else {
+                unsafe { core::slice::from_raw_parts(progress.chunks, progress.count) }
+            };
+            for &row in rows {
+                let mut seen = contains_projected_row(storage, txid, &kept_rows[..kept], row)?;
+                for chunk in chunks {
+                    if seen {
+                        break;
+                    }
+                    if let RecursiveChunk::Inline(earlier) = chunk {
+                        seen = contains_projected_row(storage, txid, earlier, row)?;
+                    }
+                }
+                if !seen {
+                    kept_rows[kept] = row;
+                    kept += 1;
+                }
+            }
+            &kept_rows[..kept]
+        };
+        if fresh.is_empty() {
+            return Ok((
+                RecursiveProgress {
+                    done: true,
+                    working: RecursiveChunk::Inline(&[]),
+                    ..progress
+                },
+                0,
+            ));
+        }
+        let kept = arena
+            .alloc_persistent_slice_with(fresh.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (kept, row) in kept.iter_mut().zip(fresh) {
+            *kept = &*arena
+                .alloc_persistent_slice_with(row.len(), |index| row[index])
+                .map_err(|_| arena_full())?;
+        }
+        let kept: &'a [&'a [u8]] = kept;
+        let next_working = recursive_noncycle_rows(kept, plan.decoration, arena)?;
+        let next_working: &'a [&'a [u8]] = if core::ptr::eq(next_working, kept) {
+            kept
+        } else {
+            arena
+                .alloc_persistent_slice_with(next_working.len(), |index| next_working[index])
+                .map_err(|_| arena_full())?
+        };
+        let progress = Self::with_chunk(progress, RecursiveChunk::Inline(kept), arena)?;
+        Ok((
+            RecursiveProgress {
+                working: RecursiveChunk::Inline(next_working),
+                ..progress
+            },
+            kept.len() as u64,
+        ))
+    }
+
+    fn external_step(
+        &self,
+        previous: Option<RecursiveProgress<'a>>,
+        arena: &'a Arena,
+        read: super::DeferredCteRead<'_, 'a>,
+    ) -> Result<(RecursiveProgress<'a>, u64), SqlError> {
+        let plan = *self.plan;
+        let (storage, txid) = (read.storage, read.txid);
+        let sorted = !plan.union_all;
+        let Some(progress) = previous else {
+            let raw = {
+                let _term = super::instrument::enter(super::instrument::Segment::Branch(0));
+                external_recursive_tree(
+                    plan.base_tree,
+                    storage,
+                    txid,
+                    arena,
+                    read.params,
+                    read.sequences,
+                    sorted,
+                )?
+            };
+            let base = if plan.decorated {
+                external_decorate_recursive_run(
+                    storage,
+                    txid,
+                    raw,
+                    plan.decoration,
+                    true,
+                    sorted,
+                    false,
+                    arena,
+                )?
+            } else {
+                raw
+            };
+            let all = if plan.union_all {
+                base
+            } else {
+                external_unique_run(storage, txid, base)?
+            };
+            let Some(first) = all.filter(|run| run.rows() > 0) else {
+                return Ok((
+                    RecursiveProgress {
+                        done: true,
+                        ..Self::empty_progress(RecursiveChunk::Inline(&[]))
+                    },
+                    0,
+                ));
+            };
+            let progress = Self::with_chunk(
+                Self::empty_progress(RecursiveChunk::External(first)),
+                RecursiveChunk::External(first),
+                arena,
+            )?;
+            return Ok((
+                RecursiveProgress {
+                    all: Some(first),
+                    ..progress
+                },
+                first.rows(),
+            ));
+        };
+        let working = match progress.working {
+            RecursiveChunk::External(run) if run.rows() > 0 => run,
+            _ => {
+                return Ok((
+                    RecursiveProgress {
+                        done: true,
+                        ..progress
+                    },
+                    0,
+                ));
+            }
+        };
+        let run = arena.alloc(working).map_err(|_| arena_full())?;
+        plan.working_source.store(
+            core::ptr::from_ref(run) as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        let raw = {
+            let _term = super::instrument::enter(super::instrument::Segment::Branch(1));
+            external_recursive_tree(
+                plan.step_tree,
+                storage,
+                txid,
+                arena,
+                read.params,
+                read.sequences,
+                sorted,
+            )?
+        };
+        let candidates = if plan.decorated {
+            external_decorate_recursive_run(
+                storage,
+                txid,
+                raw,
+                plan.decoration,
+                false,
+                sorted,
+                false,
+                arena,
+            )?
+        } else {
+            raw
+        };
+        let fresh = if plan.union_all {
+            candidates
+        } else {
+            let unique = external_unique_run(storage, txid, candidates)?;
+            external_recursive_difference(storage, txid, unique, progress.all)?
+        };
+        let Some(fresh) = fresh.filter(|run| run.rows() > 0) else {
+            return Ok((
+                RecursiveProgress {
+                    done: true,
+                    ..progress
+                },
+                0,
+            ));
+        };
+        let next_working = external_recursive_noncycle_run(
+            storage,
+            txid,
+            Some(fresh),
+            plan.decoration,
+            sorted,
+            arena,
+        )?;
+        let all = external_recursive_union(storage, txid, progress.all, Some(fresh), sorted)?;
+        let progress = Self::with_chunk(progress, RecursiveChunk::External(fresh), arena)?;
+        Ok((
+            RecursiveProgress {
+                working: next_working.map_or(RecursiveChunk::Inline(&[]), RecursiveChunk::External),
+                all,
+                ..progress
+            },
+            fresh.rows(),
+        ))
+    }
 }
 
 /// Whether `rows` holds a row equal to `row` under SQL equality; recursive

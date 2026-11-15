@@ -4720,34 +4720,45 @@ fn run_subquery<'a>(
         expression_count += 1;
     }
     let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
+    // `ExecLimit` evaluates its bounds before reading its input, and an
+    // unsorted input stops once the rows the limit returns are read.
+    let offset =
+        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
+    let wanted = (n_keys == 0).then(|| (offset as u64).saturating_add(limit));
+    let stages = super::instrument::Stages::current();
+    let _limit_loop = stages.limit.start();
+    let _sort_loop = (n_keys > 0).then(|| stages.sort.start());
     let mut vals = ArenaList::new(arena);
     let mut keys = ArenaList::new(arena);
-    scan_source_with_pax_columns(
-        storage,
-        &scope,
-        from,
-        txid,
-        select.where_clause,
-        arena,
-        params,
-        &hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            let chained_row = Chained { inner: row, outer };
-            let value = eval_full(item, arena, params, &chained_row, &hooks)?;
-            vals.push(value).map_err(|_| arena_full())?;
-            for o in select.order_by.iter() {
-                // A positional `ORDER BY 1` sorts by the single output column.
-                let key = match o.expression {
-                    Expr::Int(_) => value,
-                    e => eval_full(e, arena, params, &chained_row, &hooks)?,
-                };
-                keys.push(key).map_err(|_| arena_full())?;
-            }
-            Ok(true)
-        },
-    )?;
+    if wanted != Some(0) {
+        scan_source_with_pax_columns(
+            storage,
+            &scope,
+            from,
+            txid,
+            select.where_clause,
+            arena,
+            params,
+            &hooks,
+            outer,
+            pax_columns,
+            &mut |row| {
+                let chained_row = Chained { inner: row, outer };
+                let value = eval_full(item, arena, params, &chained_row, &hooks)?;
+                vals.push(value).map_err(|_| arena_full())?;
+                for o in select.order_by.iter() {
+                    // A positional `ORDER BY 1` sorts by the single output column.
+                    let key = match o.expression {
+                        Expr::Int(_) => value,
+                        e => eval_full(e, arena, params, &chained_row, &hooks)?,
+                    };
+                    keys.push(key).map_err(|_| arena_full())?;
+                }
+                Ok(wanted.is_none_or(|wanted| (vals.len() as u64) < wanted))
+            },
+        )?;
+    }
 
     let count = vals.len();
     let vals = vals.as_slice();
@@ -4787,11 +4798,25 @@ fn run_subquery<'a>(
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
-    let offset =
-        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
-    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
+    if n_keys > 0 {
+        // The sort returns the rows the limit pulls: those it skips and
+        // those it returns.
+        stages.sort.rows((start + n) as u64);
+        let bound = usize::try_from((offset as u64).saturating_add(limit))
+            .ok()
+            .filter(|&bound| select.limit.is_some() && count > bound * 2);
+        stages.sort.sorted(super::instrument::SortSpace {
+            method: if bound.is_some() {
+                super::instrument::SortMethod::TopNHeapsort
+            } else {
+                super::instrument::SortMethod::Quicksort
+            },
+            bytes: core::mem::size_of_val(vals) + core::mem::size_of_val(keys),
+        });
+    }
+    stages.limit.rows(n as u64);
     let mut saw_null = false;
     let out = arena
         .alloc_slice_with(n, |i| {

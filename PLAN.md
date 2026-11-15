@@ -826,10 +826,15 @@ does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
 own `WITH` list follows the same rule as that query's InitPlans, and a
 subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive
 Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
-figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
-its whole query where PostgreSQL pulls only the rows read (so a recursive
-`WITH` query that only a `LIMIT` ends fails with `54000` once its rows
-exceed the statement arena, where PostgreSQL returns the limited rows), a
+figures per iteration. A recursive `WITH` query runs an iteration at a
+time as its readers pull rows, so one that only a `LIMIT` ends returns the
+limited rows, and a subquery's `LIMIT` without `ORDER BY` stops its scan
+once it has its rows. Still differing: an ordinary `WITH` query PostgreSQL
+runs once still runs whole when first read, and a recursive one read by a
+join, or by a recursive term that reads only part of an iteration, runs an
+iteration at a time where PostgreSQL pulls single rows; `ANALYZE` prints no
+`Storage:` lines for `CTE Scan` and `Recursive Union`; a `CTE Scan` in a
+scalar subquery's `InitPlan` prints `never executed`; a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
 plan block), an `IN` over a subquery with its own `WITH` list stays a

@@ -616,6 +616,10 @@ pub struct QueryScope<'d> {
     /// so decoding and relation-kind checks take the derived-table path; the
     /// empty arena slice is only a marker, not the row authority.
     pub(crate) external_runs: &'d mut [Option<crate::sql::external::ExternalRun>],
+    /// A recursive `WITH` query that is its query's only FROM item: the
+    /// scan runs it a step at a time as it reads (`derived` holds an empty
+    /// placeholder), so a reader that stops early stops the recursion.
+    pub(crate) recursive: &'d mut [Option<super::RecursiveCteQuery<'d>>],
     /// A `LATERAL` FROM item: its rows depend on the outer row, so they are
     /// **not** pre-materialized (`derived` holds an empty placeholder). The
     /// scan re-runs the item's body per outer row, resolving its outer column
@@ -1516,6 +1520,9 @@ impl<'d> QueryScope<'d> {
         let external_runs = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let recursive = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let lateral = arena
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
@@ -1558,6 +1565,7 @@ impl<'d> QueryScope<'d> {
             view_accesses,
             derived,
             external_runs,
+            recursive,
             lateral,
             func_scalar,
             row_types,
@@ -2080,6 +2088,7 @@ impl<'d> QueryScope<'d> {
             outer,
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
             pushed,
+            from.joins.is_empty(),
         )?;
         for (index, j) in from.joins.iter().enumerate() {
             scope.merge_left_of(from, index, arena)?;
@@ -2094,6 +2103,7 @@ impl<'d> QueryScope<'d> {
                 outer,
                 catalog_scan(&j.table, predicate, false),
                 None,
+                false,
             )?;
         }
         scope.right_of_outer_join = false;
@@ -2261,6 +2271,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         read: Option<super::DeferredCteRead<'_, 'a>>,
+        sole_source: bool,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -2328,12 +2339,19 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, def_reference);
         let materialize = read.is_some();
-        self.derived[self.n] = Some(if materialize {
-            m.read_rows(arena, read)?
+        if let (true, crate::sql::ast::MaterializedCteSource::Recursive(query)) =
+            (materialize && sole_source, m.source)
+        {
+            self.derived[self.n] = Some(&[]);
+            self.recursive[self.n] = Some(query);
         } else {
-            &[]
-        });
-        self.external_runs[self.n] = if materialize { m.external_run() } else { None };
+            self.derived[self.n] = Some(if materialize {
+                m.read_rows(arena, read)?
+            } else {
+                &[]
+            });
+            self.external_runs[self.n] = if materialize { m.external_run() } else { None };
+        }
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())
@@ -2355,6 +2373,7 @@ impl<'d> QueryScope<'d> {
         outer: Option<&dyn ColumnLookup<'a>>,
         catalog_scan: crate::sql::catalog_snapshot::CatalogScan,
         pushed: Option<&crate::sql::foreign::deparse::ForeignSelectPlan<'_>>,
+        sole_source: bool,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -2391,6 +2410,7 @@ impl<'d> QueryScope<'d> {
                     sequences,
                     outer,
                 }),
+                sole_source,
             );
         }
         if tref.is_function_source() {
@@ -2473,7 +2493,7 @@ impl<'d> QueryScope<'d> {
         let sub = if sub.with.is_empty() {
             sub
         } else {
-            super::expand_ctes_exec(sub, storage, txid, arena, params, &[], sequences)?
+            super::expand_ctes_exec(sub, storage, txid, arena, params, &[])?
         };
         let rows: &'a [&'a [u8]];
         let external_run;
@@ -2654,7 +2674,7 @@ impl<'d> QueryScope<'d> {
             ));
         }
         if let Some(m) = tref.cte {
-            return self.add_materialized(storage, tref, m, txid, arena, None);
+            return self.add_materialized(storage, tref, m, txid, arena, None, false);
         }
         if tref.is_function_source() {
             let outer_types = outer.map(OuterColumnTypes);

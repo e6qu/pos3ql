@@ -2697,12 +2697,14 @@ impl<'a> ScanValues<'_, '_, 'a> {
             ScanRelation::From { scope, .. } => {
                 scope.find_column_unsuggested(*qualifier, name).is_ok()
             }
+            // A target's columns include its system columns (`tableoid`).
             ScanRelation::Target {
                 columns,
                 name: exposed,
             } => {
                 qualifier.is_none_or(|qualifier| qualifier == exposed)
-                    && columns.iter().any(|column| column.name.as_str() == *name)
+                    && (columns.iter().any(|column| column.name.as_str() == *name)
+                        || ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"].contains(name))
             }
         }
     }

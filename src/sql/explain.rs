@@ -7368,10 +7368,18 @@ pub(super) fn plan_modification<'a>(
                 arena,
             )?;
         }
+        // A joined write's lists qualify each relation's columns, which
+        // this plan does not model.
+        plan.nodes[0].set_output(None);
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
     let child = if let (Some(select), Stmt::Insert(insert)) = (source, statement) {
+        // Its `RETURNING` list over a range table of the target and the
+        // source is not modelled.
+        if !insert.returning.is_empty() {
+            plan.nodes[0].set_output(None);
+        }
         // The source query's range table entries join the INSERT's.
         let source_plan = in_nested_block(|| {
             rewrite::insert_source_plan(storage, txid, insert, select, block, arena)
@@ -7398,9 +7406,10 @@ pub(super) fn plan_modification<'a>(
         statement,
         relation_slot(storage, txid, target.schema, target.name),
     ) {
-        // An INSERT into a view its INSTEAD OF trigger handles reads its rows.
+        // An INSERT into a view its INSTEAD OF trigger handles reads its rows,
+        // whose list over the view's columns is not modelled.
         let several = insert.rows.len() > 1;
-        let child = PlanNode {
+        let mut child = PlanNode {
             name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
             alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
             key: Some(NodeKey::new(block, Role::Values)),
@@ -7410,6 +7419,7 @@ pub(super) fn plan_modification<'a>(
             total_cost: 0.01,
             ..PlanNode::EMPTY
         };
+        child.set_output(None);
         plan.push(child)?;
         child
     } else if let Some(slot) = relation_slot(storage, txid, target.schema, target.name) {

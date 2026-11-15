@@ -813,7 +813,13 @@ computed in parentheses (`((x + 1))`), `Append` prints none, and columns
 are qualified when the range table holds more than one relation. A
 `Function Scan` prints its schema and `Function Call`, a joined relation's
 filter qualifies its columns, and a one-table `UPDATE` or `DELETE` scan
-returns the new values and `ctid`. A constant `OFFSET 0` or
+returns the new values (coerced to each column) and `ctid`. One-table
+writes print their `RETURNING` list (`old` and `new` qualified), an
+`INSERT`'s `Result` or `Values Scan` columns when its rows name every
+column without `DEFAULT` (`differential_exact/565`), and postgres_fdw
+scans and writes build their lists in the same target-list module. A
+`VERBOSE` plan holding a list the deparser does not cover fails with
+`0A000` instead of printing a wrong `Output:`. A constant `OFFSET 0` or
 `LIMIT NULL` adds no `Limit` (`limit_needed`), and a join input's
 `Subquery Scan` without a filter of its own is removed
 (`trivial_subqueryscan`), so the join's conditions name the subquery's own
@@ -844,9 +850,10 @@ stored relation of equal size, PostgreSQL's cost tie may pick the other
 outer or hashed side. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
 group lines of a window's own incremental sort or of one under a `LIMIT`,
-`VERBOSE` output lists of a joined `UPDATE` or `DELETE`, an `INSERT`'s
-`VALUES` rows, a `RETURNING` list naming `OLD` or `NEW`, a `(record).*`
-item, a sort below a postponed select list (whose input PostgreSQL
+`VERBOSE` output lists (rejected with `0A000`) of a joined `UPDATE` or
+`DELETE`, `MERGE`, an `INSERT` whose rows omit columns or use `DEFAULT`,
+an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
+`(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only

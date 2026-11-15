@@ -1033,10 +1033,12 @@ with the selectivities `selfuncs.c` assumes without statistics
 (`differential_exact/625`); a condition outside that model (a pattern, a
 function returning a boolean) keeps the remote order. Remaining differences:
 `EXPLAIN` of a foreign table read with other relations (a join, or a
-semi-join from `IN` or `EXISTS`) or under column aliases fails with `0A000`,
-since postgres_fdw's join pushdown (`foreign_join_ok`) and its estimates for
-join inputs are not modeled; execution reads such a table whole and joins it
-here, with PostgreSQL's rows. `EXPLAIN` with costs prints a foreign scan's
+semi-join from `IN` or `EXISTS`), under column aliases, or in a derived table
+below a join fails with `0A000`, since postgres_fdw's join pushdown
+(`foreign_join_ok`) and its estimates for join inputs are not modeled;
+execution reads such a table whole and joins it here, with PostgreSQL's rows.
+A join over a `WITH` query that reads a foreign table still prints pos3ql's
+join method where PostgreSQL's estimates may choose another. `EXPLAIN` with costs prints a foreign scan's
 cost as zero. A grouped query with `DISTINCT` or a window over its groups
 groups locally; a grouped query with a `LIMIT` whose remote order is by
 grouping keys, or none, groups locally where PostgreSQL's costs may still

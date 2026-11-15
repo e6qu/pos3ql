@@ -96,6 +96,11 @@ SELECT DISTINCT c, flag FROM ft ORDER BY flag;
 SELECT DISTINCT ON (flag) flag, id FROM ft ORDER BY flag, id DESC;
 SELECT id, sum(q) OVER (PARTITION BY flag ORDER BY id) FROM ft WHERE id < 8;
 SELECT max(id), min(note) FROM ft;
+-- A lone min or max reads the first row of the remote order.
+:e SELECT max(q) + 1 FROM ft WHERE id < 10;
+SELECT max(q) + 1 FROM ft WHERE id < 10;
+SELECT min(note), min(note) || '!' FROM ft WHERE random() < 2;
+SELECT max(id) FROM ft WHERE id > 1000;
 
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.

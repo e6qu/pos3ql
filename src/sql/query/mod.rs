@@ -13171,6 +13171,25 @@ pub(crate) fn select_query_resumable<'a>(
             );
         }
     }
+    // A lone `min` or `max` of a foreign table reads the first row of an
+    // ordered remote scan, as PostgreSQL's plan does.
+    match crate::sql::foreign::deparse::minmax_subquery(storage, txid, statement, arena) {
+        Ok(Some(rewritten)) => {
+            return constant_select_resumable(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return sql_fail(error),
+    }
     // A query of one foreign table sends its shippable conditions, order and
     // limit to the server; the rest runs here over the rows it returns.
     let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {

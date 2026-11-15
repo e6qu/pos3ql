@@ -1841,6 +1841,7 @@ fn appended_select<'a>(
             locking: &[],
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
+            minmax_subquery: false,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -1927,6 +1928,7 @@ pub(crate) fn set_query_select<'a>(
             locking: query.locking,
             windows: &[],
             written: crate::sql::ast::WrittenQuery::PLAIN,
+            minmax_subquery: false,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())

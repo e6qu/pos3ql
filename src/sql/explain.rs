@@ -3341,6 +3341,13 @@ fn plan_select_with_ctes<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
+    // A lone `min` or `max` of a foreign table is planned as the InitPlan
+    // execution runs.
+    if let Some(rewritten) =
+        crate::sql::foreign::deparse::minmax_subquery(storage, txid, statement, arena)?
+    {
+        return plan_select_with_ctes(storage, txid, rewritten, ctes, block, arena);
+    }
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
     let pulled = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
@@ -3423,7 +3430,15 @@ fn plan_sublinks<'a>(
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             visit_sublinks(expression, &mut |node| {
-                let _ = found.push((node, SublinkOrigin::Items));
+                // One occurrence the select list reads twice, such as a
+                // min/max aggregate's InitPlan, is one subplan.
+                if !found
+                    .as_slice()
+                    .iter()
+                    .any(|(seen, _): &(&Expr<'_>, SublinkOrigin)| core::ptr::eq(*seen, node))
+                {
+                    let _ = found.push((node, SublinkOrigin::Items));
+                }
             });
         }
     }
@@ -5084,15 +5099,25 @@ fn plan_pulled_select<'a>(
                 }
             }
             if let Some(pushed) = &foreign_scan {
-                foreign_scan_node(
-                    &mut scan, pushed, statement, scope, storage, txid, arena, aggregate,
+                let above = foreign_scan_node(
+                    &mut scan,
+                    pushed,
+                    statement,
+                    scope,
+                    storage,
+                    txid,
+                    arena,
+                    aggregate,
+                    qualify_outputs,
                 )?;
                 // A local limit over the remote order passes the scan's
-                // sort columns up.
-                if pushed.order_pushed {
+                // sort columns up, reading what the scan computes.
+                if pushed.order_pushed
+                    && let Some(above) = above
+                {
                     for node in plan.nodes[..plan.count].iter_mut() {
                         if node.name.as_str() == "Limit" {
-                            node.output = scan.output;
+                            node.output = above;
                             node.output_unprintable = scan.output_unprintable;
                         }
                     }
@@ -6106,20 +6131,21 @@ fn foreign_scan_node(
     txid: u32,
     arena: &Arena,
     aggregate: bool,
-) -> Result<(), SqlError> {
+    qualify: bool,
+) -> Result<Option<targets::Output>, SqlError> {
     scan.name = StackStr::from_str("Foreign Scan");
     scan.remote_sql = remote_sql_text(pushed.sql)?;
     // Under a local aggregate or window the scan returns what those nodes
     // read, as any relation scan there does.
     if aggregate || has_window(statement) {
-        return Ok(());
+        return Ok(None);
     }
     let table = storage.table_def(pushed.table_slot, txid);
-    scan.set_output(
-        targets::RelationTargets::new(storage, txid, &table, scope.names[0], false, arena)?
-            .foreign_scan(statement, pushed.sort_keys)?,
-    );
-    Ok(())
+    let outputs =
+        targets::RelationTargets::new(storage, txid, &table, scope.names[0], qualify, arena)?
+            .foreign_scan(statement, pushed.sort_keys)?;
+    scan.set_output(outputs.map(|(output, _)| output));
+    Ok(outputs.map(|(_, above)| above))
 }
 
 /// Whether a query's `LIMIT` and `OFFSET` need a `Limit` node, as

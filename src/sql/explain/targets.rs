@@ -1514,12 +1514,13 @@ impl<'a> RelationTargets<'a> {
     }
 
     /// postgres_fdw's scan of the base relation: the select list, the sort
-    /// keys it does not project, then the whole row a locking clause copies.
+    /// keys it does not project, then the whole row a locking clause copies;
+    /// then the same list as a node above reads it.
     pub(super) fn foreign_scan(
         &self,
         statement: &Select<'_>,
         sort_keys: &[crate::sql::ast::OrderBy<'_>],
-    ) -> Result<Option<Output>, SqlError> {
+    ) -> Result<Option<(Output, Output)>, SqlError> {
         let mut entries = ArenaList::new(self.arena);
         let push = |entries: &mut ArenaList<'a, Entry<'a>>, entry| {
             entries.push(entry).map_err(|_| arena_full())
@@ -1602,7 +1603,16 @@ impl<'a> RelationTargets<'a> {
         if !statement.locking.is_empty() {
             push(&mut entries, self.whole_row()?)?;
         }
-        render(entries.as_slice()).map(Some)
+        let mut above = ArenaList::new(self.arena);
+        for entry in entries.as_slice() {
+            above
+                .push(entry.referenced(self.arena)?)
+                .map_err(|_| arena_full())?;
+        }
+        Ok(Some((
+            render(entries.as_slice())?,
+            render(above.as_slice())?,
+        )))
     }
 
     /// postgres_fdw's scan of a grouped relation and the nodes above it:

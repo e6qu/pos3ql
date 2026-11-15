@@ -3257,6 +3257,7 @@ impl<'a> Parser<'a> {
                 limit_all: false,
                 grouping: grouping_written,
             },
+            minmax_subquery: false,
         })
     }
 
@@ -3533,6 +3534,7 @@ impl<'a> Parser<'a> {
                 limit_all,
                 ..crate::sql::ast::WrittenQuery::PLAIN
             },
+            minmax_subquery: false,
         })
     }
 
@@ -3564,6 +3566,7 @@ impl<'a> Parser<'a> {
                 set_body: Some(query.body),
                 locking: query.locking,
                 written: crate::sql::ast::WrittenQuery::PLAIN,
+                minmax_subquery: false,
             }),
             _ => Err(self.err_here("query must end in SELECT, TABLE, or VALUES")),
         }
@@ -3646,6 +3649,7 @@ impl<'a> Parser<'a> {
                 set_body: None,
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
+                minmax_subquery: false,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let mut ctes = ArenaList::new(self.arena);
@@ -3967,6 +3971,7 @@ impl<'a> Parser<'a> {
                         limit_all,
                         ..crate::sql::ast::WrittenQuery::PLAIN
                     },
+                    minmax_subquery: false,
                 },
             };
             let boxed = self
@@ -4026,6 +4031,7 @@ impl<'a> Parser<'a> {
                         values: true,
                         ..crate::sql::ast::WrittenQuery::PLAIN
                     },
+                    minmax_subquery: false,
                 };
                 let leaf = self.alloc_set(SetTree::Select(
                     self.arena
@@ -4115,6 +4121,7 @@ impl<'a> Parser<'a> {
                 set_body: None,
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
+                minmax_subquery: false,
             };
             return self.alloc_set(SetTree::Select(
                 self.arena
@@ -5202,6 +5209,7 @@ impl<'a> Parser<'a> {
                 set_body: None,
                 locking: &[],
                 written: crate::sql::ast::WrittenQuery::PLAIN,
+                minmax_subquery: false,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         Ok(TableRef {

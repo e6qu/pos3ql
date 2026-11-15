@@ -2085,6 +2085,197 @@ pub(crate) fn plan_select<'a>(
     plan_with(&deparser, slot, statement, arena).map(Some)
 }
 
+/// `preprocess_minmax_aggregates` over a query of one foreign table: a
+/// select list whose one aggregate is `min` or `max` of a shippable
+/// argument, without grouping, reads that aggregate as an InitPlan, the
+/// first row of the remote scan ordered by the argument with its nulls
+/// excluded and the query's conditions applied. The result is the
+/// FROM-less query reading that InitPlan. PostgreSQL's costs prefer that ordered `LIMIT 1` scan to a
+/// remote aggregate only for one such aggregate: each further one adds
+/// another remote query, and two or more ship as one grouped scan. `None`
+/// when the query does not take that path.
+pub(crate) fn minmax_subquery<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    let Some(from) = statement.from.as_ref() else {
+        return Ok(None);
+    };
+    let base = &from.base;
+    if !from.joins.is_empty()
+        || statement.set_body.is_some()
+        || !statement.with.is_empty()
+        || base.subquery.is_some()
+        || base.is_function_source()
+        || base.cte.is_some()
+        || base.sample.is_some()
+        || base.col_alias.is_some()
+        || base.view_access.is_some()
+        || base.lateral
+        || !statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.having.is_some()
+        || !statement.windows.is_empty()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || !statement.order_by.is_empty()
+        || statement.where_clause.is_some_and(Expr::contains_subquery)
+    {
+        return Ok(None);
+    }
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(base.schema, base.table, txid)
+    else {
+        return Ok(None);
+    };
+    let table = storage.table_def(slot, txid);
+    if table.kind != crate::storage::TableKind::Foreign
+        || base.inheritance == RelationInheritance::Descendants
+            && storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(None);
+    }
+    let Some((_, foreign)) = storage.foreign_table(slot as u16, txid) else {
+        return Ok(None);
+    };
+    let deparser = Deparser {
+        table: &table,
+        grouped: false,
+        foreign: &foreign,
+        exposed: base.alias.unwrap_or(base.table),
+        arena,
+        storage,
+        txid,
+    };
+    // The one aggregate, as many times as the select list repeats it.
+    let mut found: Option<&'a Expr<'a>> = None;
+    let mut eligible = true;
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if expression.contains_subquery() || has_window_call(expression)? {
+            return Ok(None);
+        }
+        crate::sql::query::walk_expression_tree(expression, &mut |node| {
+            if !node.is_aggregate_use() {
+                return;
+            }
+            let minmax = matches!(
+                node,
+                Expr::Call {
+                    name: "min" | "max" | "pg_catalog.min" | "pg_catalog.max",
+                    args: [_],
+                    distinct: false,
+                    order_by: [],
+                    filter: None,
+                    ..
+                }
+            );
+            match found {
+                _ if !minmax => eligible = false,
+                Some(first) if *first != *node => eligible = false,
+                _ => found = Some(node),
+            }
+        })?;
+    }
+    let (Some(aggregate), true) = (found, eligible) else {
+        return Ok(None);
+    };
+    let Expr::Call {
+        name,
+        args: [argument],
+        ..
+    } = aggregate
+    else {
+        unreachable!("matched above")
+    };
+    let mut probe = RemoteText::new();
+    if !deparser.try_write(&mut probe, argument)? {
+        return Ok(None);
+    }
+    let descending = name.ends_with("max");
+    let not_null = arena
+        .alloc(Expr::IsNull {
+            operand: argument,
+            negated: true,
+        })
+        .map_err(|_| arena_full())?;
+    let where_clause = match statement.where_clause {
+        Some(condition) => &*arena
+            .alloc(Expr::Binary {
+                operator: BinaryOp::And,
+                left: not_null,
+                right: condition,
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+            })
+            .map_err(|_| arena_full())?,
+        None => not_null,
+    };
+    let items = arena
+        .alloc_slice_copy(&[SelectItem::Expr {
+            expression: argument,
+            alias: None,
+        }])
+        .map_err(|_| arena_full())?;
+    let order_by = arena
+        .alloc_slice_copy(&[OrderBy {
+            expression: argument,
+            descending,
+            nulls_first: descending,
+        }])
+        .map_err(|_| arena_full())?;
+    let one = arena.alloc(Expr::Int(1)).map_err(|_| arena_full())?;
+    let subquery = arena
+        .alloc(Select {
+            items,
+            where_clause: Some(where_clause),
+            order_by,
+            limit: Some(one),
+            offset: None,
+            minmax_subquery: true,
+            ..*statement
+        })
+        .map_err(|_| arena_full())?;
+    let read = &*arena
+        .alloc(Expr::Subquery(subquery))
+        .map_err(|_| arena_full())?;
+    // The select list reads the subquery's value where it read the
+    // aggregate, under the names it had.
+    let rewritten = arena
+        .alloc_slice_copy(statement.items)
+        .map_err(|_| arena_full())?;
+    for item in rewritten.iter_mut() {
+        let SelectItem::Expr { expression, alias } = item else {
+            unreachable!("checked above")
+        };
+        *alias = Some(alias.unwrap_or_else(|| crate::sql::exec::derived_name(expression)));
+        *expression = crate::sql::ast::rewrite_expression(
+            expression,
+            arena,
+            &mut |node: &'a Expr<'a>| -> Shipped<Option<&'a Expr<'a>>> {
+                Ok((*node == *aggregate).then_some(read))
+            },
+        )
+        .map_err(|stop| match stop {
+            Stop::Error(error) => error,
+            Stop::Local => unreachable!("the rewrite never declines"),
+        })?;
+    }
+    let outer = arena
+        .alloc(Select {
+            items: rewritten,
+            from: None,
+            where_clause: None,
+            ..*statement
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Some(outer))
+}
+
 /// Whether `expression` holds an aggregate call outside a subquery.
 fn has_aggregate(expression: &Expr<'_>) -> Result<bool, SqlError> {
     let mut found = false;
@@ -2240,36 +2431,6 @@ fn plan_upper<'a>(
         || statement.group_by.iter().any(|key| key.contains_subquery())
     {
         return Ok(None);
-    }
-    // Without GROUP BY, aggregates that are all `min` or `max` of one
-    // argument read the first row of an ordered scan (`preprocess_minmax_aggregates`),
-    // which PostgreSQL's costs prefer.
-    if statement.group_by.is_empty() && statement.having.is_none() {
-        let mut minmax_only = true;
-        let mut any = false;
-        for item in statement.items {
-            if let SelectItem::Expr { expression, .. } = item {
-                crate::sql::query::walk_expression_tree(expression, &mut |node| {
-                    if node.is_aggregate_use() {
-                        any = true;
-                        minmax_only &= matches!(
-                            node,
-                            Expr::Call {
-                                name: "min" | "max" | "pg_catalog.min" | "pg_catalog.max",
-                                args: [_],
-                                distinct: false,
-                                order_by: [],
-                                filter: None,
-                                ..
-                            }
-                        );
-                    }
-                })?;
-            }
-        }
-        if any && minmax_only {
-            return Ok(None);
-        }
     }
     // The planner moves a HAVING condition without aggregates or volatile
     // calls into WHERE when the query has GROUP BY.
@@ -2925,6 +3086,7 @@ fn plan_with<'a>(
     // LIMIT and OFFSET ship when the remote rows are the final rows.
     let mut limit_text = RemoteText::new();
     let limit_pushed = (statement.limit.is_some() || statement.offset.is_some())
+        && !statement.minmax_subquery
         && kept.is_empty()
         && !grouped
         && simple_items

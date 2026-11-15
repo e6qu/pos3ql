@@ -69,6 +69,15 @@ WITH w AS (UPDATE ft SET q = q + 1 WHERE id > 15 RETURNING id, q) SELECT * FROM 
 DO $$ DECLARE r int; BEGIN UPDATE ft SET q = q + 1 WHERE id = 14 RETURNING q INTO r; RAISE NOTICE 'r=%', r; END $$;
 UPDATE ft SET q = 2000 WHERE id = 15 RETURNING id;
 SELECT id, q FROM ft WHERE id BETWEEN 9 AND 20 ORDER BY id;
+-- RETURNING reads the remote row's ctid, which the remote command returns
+-- after the columns.
+BEGIN;
+UPDATE ft SET q = q + 1 WHERE id = 16 RETURNING ctid, id, q;
+UPDATE ft SET q = q + 1 WHERE id = 16 AND random() < 2 RETURNING ft.ctid;
+DELETE FROM ft WHERE id = 17 RETURNING ctid, id;
+DELETE FROM ft WHERE id = 18 AND random() < 2 RETURNING ctid;
+INSERT INTO ft (id, q) VALUES (40, 4) RETURNING ctid, id;
+ROLLBACK;
 
 -- Grouping and aggregates ship when the whole query does.
 :e SELECT s % 3, count(*), sum(b), avg(n), max(note), min(d) FROM ft WHERE id < 15 GROUP BY s % 3 HAVING count(*) > 1 ORDER BY count(*) DESC, 1 LIMIT 2;
@@ -78,6 +87,14 @@ SELECT count(*), sum(q), bool_and(flag), every(id > 0) FROM ft;
 SELECT count(*) FROM ft WHERE id > 1000;
 SELECT id % 4 AS k, count(*) FROM ft GROUP BY k HAVING sum(id) > 30 ORDER BY sum(id);
 SELECT count(*) FROM ft GROUP BY note ORDER BY 1 LIMIT 1;
+-- A grouped query ships the aggregates of what it computes here: a constant
+-- or a star ships, a volatile expression or HAVING condition is evaluated
+-- over the remote groups, and an order only this side computes sorts them.
+:e SELECT s % 3, 'k', count(*) * 2 + random() * 0, sum(q) FROM ft GROUP BY s % 3 HAVING sum(id) > random() * 0 ORDER BY 1;
+SELECT s % 3, 'k', count(*) * 2 + random() * 0, sum(q) FROM ft GROUP BY s % 3 HAVING sum(id) > random() * 0 ORDER BY 1;
+SELECT flag, count(*) FROM ft GROUP BY flag HAVING max(id) > 19 + random() * 0;
+SELECT c, count(*) FROM ft GROUP BY c ORDER BY count(*) * (1 + random() * 0), c LIMIT 3;
+SELECT * FROM app GROUP BY name;
 
 -- The order the plan reads rows in ships: expression keys, DISTINCT's
 -- order and a window's.
@@ -88,6 +105,11 @@ SELECT DISTINCT c, flag FROM ft ORDER BY flag;
 SELECT DISTINCT ON (flag) flag, id FROM ft ORDER BY flag, id DESC;
 SELECT id, sum(q) OVER (PARTITION BY flag ORDER BY id) FROM ft WHERE id < 8;
 SELECT max(id), min(note) FROM ft;
+-- A lone min or max reads the first row of the remote order.
+:e SELECT max(q) + 1 FROM ft WHERE id < 10;
+SELECT max(q) + 1 FROM ft WHERE id < 10;
+SELECT min(note), min(note) || '!' FROM ft WHERE random() < 2;
+SELECT max(id) FROM ft WHERE id > 1000;
 
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.

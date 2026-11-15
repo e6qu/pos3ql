@@ -1277,6 +1277,7 @@ impl Engine {
                 candidate.input_collation,
             )?;
             let columns = super::exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],

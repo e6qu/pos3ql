@@ -411,6 +411,7 @@ fn accepted_assignment_inline_inputs_follow_expanded_projection_positions() {
             )
             .unwrap();
             let columns = exec::CatalogCols {
+                remote_ctid: false,
                 definition: None,
                 alias: None,
                 output_aliases: &[],

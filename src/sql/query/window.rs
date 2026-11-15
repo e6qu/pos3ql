@@ -189,6 +189,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
@@ -281,6 +282,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     Ok(&*arena.alloc(outer).map_err(|_| arena_full())?)
 }

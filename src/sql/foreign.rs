@@ -83,6 +83,14 @@ impl RemoteTupleId {
         let _ = write!(output, "({},{})", self.block, self.offset);
     }
 
+    /// The identity as a `tid` value.
+    pub(crate) fn tid(self) -> crate::sql::types::Tid {
+        crate::sql::types::Tid {
+            block: self.block,
+            offset: self.offset,
+        }
+    }
+
     pub(crate) fn sort_key(self) -> u64 {
         (u64::from(self.block) << 16) | u64::from(self.offset)
     }
@@ -1761,7 +1769,7 @@ pub(crate) fn direct_modify_sql<'a>(
     inheritance: crate::sql::ast::RelationInheritance,
     assignments: Option<&[(&str, &'a crate::sql::ast::Expr<'a>)]>,
     predicate: Option<&'a crate::sql::ast::Expr<'a>>,
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let table = storage.table_def(table_slot, txid);
@@ -1816,7 +1824,7 @@ pub(crate) fn modify_scan<'a>(
     exposed: &str,
     updated: Option<ColumnSet>,
     predicate: Option<&'a crate::sql::ast::Expr<'a>>,
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     whole_old: bool,
     arena: &'a Arena,
 ) -> Result<Option<deparse::ForeignModifyScan<'a>>, SqlError> {
@@ -1843,26 +1851,28 @@ pub(crate) fn modify_scan<'a>(
 
 /// Runs a direct `UPDATE` or `DELETE` as postgres_fdw's `execute_dml_stmt`
 /// does: the rows its tag reports and, when the command carries a
-/// `RETURNING` list of the `returned` columns, the rows the server returned,
-/// encoded in table order with the other columns `NULL`. The whole result
-/// arrives before the local `RETURNING` projection reads it.
+/// `RETURNING` list `returned`, the rows the server returned, encoded in
+/// table order with the other columns `NULL`, and each row's `ctid` when the
+/// list carries it. The whole result arrives before the local `RETURNING`
+/// projection reads it.
 pub(crate) fn direct_modify<'a>(
     storage: &Storage,
     table_slot: usize,
     txid: u32,
     sql: &str,
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<(u64, &'a [&'a [u8]]), SqlError> {
+) -> Result<DirectModified<'a>, SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let table = &remote.table;
     let lease = enter_session(storage, txid, &remote.server)?;
-    let expected = returned.count_ones() as usize;
+    let expected = returned.fields();
     let mut changed = None;
     let mut rows: *mut &[u8] = core::ptr::null_mut();
     let mut row_count = 0usize;
     let mut row_capacity = 0usize;
+    let mut ctids = crate::mem::arena::ArenaList::new(arena);
     exchange(
         storage,
         lease,
@@ -1877,12 +1887,18 @@ pub(crate) fn direct_modify<'a>(
                 let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
                 let mut fields = row.columns().iter();
                 for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
-                    if returned.contains(column) {
+                    if returned.columns.contains(column) {
                         let raw = *fields.next().expect("row shape checked");
                         *value = decode_foreign_field(
                             storage, table, column, raw, txid, arena, sequences,
                         )?;
                     }
+                }
+                if returned.ctid {
+                    let raw = *fields.next().expect("row shape checked");
+                    ctids
+                        .push(returned_ctid(raw)?)
+                        .map_err(|_| super::eval::arena_full())?;
                 }
                 let encoded = super::exec::encode_projected_pub(&values[..table.n_columns], arena)?;
                 push_row(arena, &mut rows, &mut row_count, &mut row_capacity, encoded)
@@ -1905,15 +1921,43 @@ pub(crate) fn direct_modify<'a>(
             row_count
         ));
     }
-    Ok((
+    Ok(DirectModified {
         changed,
-        if row_count == 0 {
+        rows: if row_count == 0 {
             &[]
         } else {
             // SAFETY: `push_row` wrote `row_count` entries at `rows`.
             unsafe { core::slice::from_raw_parts(rows, row_count) }
         },
-    ))
+        ctids: ctids.as_slice(),
+    })
+}
+
+/// What a direct `UPDATE` or `DELETE` reports: the rows its tag counts, the
+/// rows its `RETURNING` list sent and, when it carries `ctid`, theirs.
+pub(crate) struct DirectModified<'a> {
+    pub changed: u64,
+    pub rows: &'a [&'a [u8]],
+    pub ctids: &'a [RemoteTupleId],
+}
+
+/// The `ctid` a remote `RETURNING` list sent, which a changed row always has.
+fn returned_ctid(raw: Option<&[u8]>) -> Result<RemoteTupleId, SqlError> {
+    match raw {
+        Some(text) => RemoteTupleId::parse(text),
+        None => Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "foreign command returned a NULL ctid"
+        )),
+    }
+}
+
+/// A remote row command's outcome: whether it changed the row, which
+/// postgres_fdw otherwise skips, and the `ctid` its `RETURNING` list sent.
+#[derive(Clone, Copy)]
+pub(crate) struct RowChange {
+    pub changed: bool,
+    pub ctid: Option<RemoteTupleId>,
 }
 
 /// Visits the remote rows of an UPDATE or DELETE target with their parsed
@@ -2012,7 +2056,9 @@ fn tag_rows(tag: &str) -> Result<u64, SqlError> {
 pub(crate) struct RemoteInsert<'values, 'data> {
     pub values: &'values mut [Datum<'data>],
     pub on_conflict_do_nothing: bool,
-    pub retrieved: ColumnSet,
+    pub retrieved: deparse::RemoteReturning,
+    /// Receives the stored row's `ctid` when `retrieved` carries it.
+    pub ctid: &'values mut Option<RemoteTupleId>,
     pub render: crate::sql::guc::RenderContext,
     /// A `BEFORE ROW INSERT` trigger applies, which rules out batching.
     pub before_row_triggers: bool,
@@ -2025,7 +2071,7 @@ fn write_insert(
     remote: &RemoteTable,
     rows: usize,
     on_conflict_do_nothing: bool,
-    retrieved: ColumnSet,
+    retrieved: deparse::RemoteReturning,
 ) {
     let table = &remote.table;
     let _ = output.write_str("INSERT INTO ");
@@ -2066,11 +2112,14 @@ fn write_insert(
     }
     let mut first = true;
     for column in 0..table.n_columns {
-        if retrieved.contains(column) {
+        if retrieved.columns.contains(column) {
             let _ = output.write_str(if first { " RETURNING " } else { ", " });
             first = false;
             remote.write_column(output, column);
         }
+    }
+    if retrieved.ctid {
+        let _ = output.write_str(if first { " RETURNING ctid" } else { ", ctid" });
     }
 }
 
@@ -2083,7 +2132,7 @@ pub(crate) fn insert_explain(
     table_slot: usize,
     txid: u32,
     on_conflict_do_nothing: bool,
-    retrieved: ColumnSet,
+    retrieved: deparse::RemoteReturning,
     before_row_triggers: bool,
 ) -> Result<(deparse::RemoteText, u32), SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
@@ -2122,6 +2171,7 @@ pub(crate) fn insert_row<'a>(
         values,
         on_conflict_do_nothing,
         retrieved,
+        ctid,
         render,
         before_row_triggers: _,
     } = request;
@@ -2139,7 +2189,7 @@ pub(crate) fn insert_row<'a>(
         }
     }
     let lease = enter_session(storage, txid, &remote.server)?;
-    let fields = retrieved.count_ones() as usize;
+    let fields = retrieved.fields();
     let mut returned = false;
     let mut inserted = None;
     exchange(
@@ -2168,7 +2218,7 @@ pub(crate) fn insert_row<'a>(
                 returned = true;
                 let mut raw = row.columns().iter();
                 for (column, value) in values.iter_mut().enumerate() {
-                    *value = if retrieved.contains(column) {
+                    *value = if retrieved.columns.contains(column) {
                         let field = raw.next().copied().flatten();
                         let field = match field {
                             Some(field) => Some(
@@ -2182,6 +2232,9 @@ pub(crate) fn insert_row<'a>(
                     } else {
                         Datum::Null
                     };
+                }
+                if retrieved.ctid {
+                    *ctid = Some(returned_ctid(raw.next().copied().flatten())?);
                 }
                 Ok(())
             }
@@ -2598,7 +2651,7 @@ pub(crate) fn send_insert_batch(
         &remote,
         1,
         on_conflict_do_nothing,
-        ColumnSet::EMPTY,
+        deparse::RemoteReturning::NONE,
     );
     checked(&single, "INSERT query")?;
     let capacity = single.as_str().len() + rows * (per_row * 9 + remote.table.n_columns * 9 + 4);
@@ -2614,7 +2667,7 @@ pub(crate) fn send_insert_batch(
         &remote,
         rows,
         on_conflict_do_nothing,
-        ColumnSet::EMPTY,
+        deparse::RemoteReturning::NONE,
     );
     if query.truncated {
         return Err(sql_err!(
@@ -2654,13 +2707,14 @@ fn modify_row<'a>(
     arena: &'a Arena,
     query: &str,
     parameters: &[Option<&[u8]>],
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     values: &mut [Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<bool, SqlError> {
+) -> Result<RowChange, SqlError> {
     let txid = lease.transaction_id();
-    let expected = returned.count_ones() as usize;
+    let expected = returned.fields();
     let mut changed = None;
+    let mut ctid = None;
     let mut rows = 0;
     exchange(
         storage,
@@ -2690,7 +2744,7 @@ fn modify_row<'a>(
                 }
                 let mut fields = row.columns().iter();
                 for (column, value) in values[..table.n_columns].iter_mut().enumerate() {
-                    if returned.contains(column) {
+                    if returned.columns.contains(column) {
                         // The values outlive the response they arrived in.
                         let raw = match *fields.next().expect("row shape checked") {
                             Some(raw) => Some(
@@ -2705,12 +2759,18 @@ fn modify_row<'a>(
                         )?;
                     }
                 }
+                if returned.ctid {
+                    ctid = Some(returned_ctid(*fields.next().expect("row shape checked"))?);
+                }
                 Ok(())
             }
             _ => Err(unexpected_response(query)),
         },
     )?;
-    changed.ok_or_else(|| unexpected_response(query))
+    Ok(RowChange {
+        changed: changed.ok_or_else(|| unexpected_response(query))?,
+        ctid,
+    })
 }
 
 /// The command each row of a foreign `UPDATE` or `DELETE` runs, as
@@ -2721,7 +2781,7 @@ fn child_modify_sql<'a>(
     txid: u32,
     remote: &RemoteTable,
     updated: Option<ColumnSet>,
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let deparser = deparse::Deparser {
@@ -2744,7 +2804,7 @@ pub(crate) struct RemoteUpdate<'values, 'data> {
     pub target_columns: ColumnSet,
     /// The new row, into which the `RETURNING` columns are merged.
     pub values: &'values mut [Datum<'data>],
-    pub returned: ColumnSet,
+    pub returned: deparse::RemoteReturning,
     pub render: crate::sql::guc::RenderContext,
 }
 
@@ -2759,7 +2819,7 @@ pub(crate) fn update_row<'data>(
     planned: Option<&deparse::ForeignModifyScan<'_>>,
     arena: &'data Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<bool, SqlError> {
+) -> Result<RowChange, SqlError> {
     let RemoteUpdate {
         tuple_id,
         target_columns,
@@ -2815,11 +2875,11 @@ pub(crate) fn delete_row<'a>(
     txid: u32,
     tuple_id: RemoteTupleId,
     old: &mut [Datum<'a>],
-    returned: ColumnSet,
+    returned: deparse::RemoteReturning,
     planned: Option<&deparse::ForeignModifyScan<'_>>,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<bool, SqlError> {
+) -> Result<RowChange, SqlError> {
     let remote = RemoteTable::open(storage, table_slot, txid)?;
     let query = match planned {
         Some(planned) => planned.modify_sql,

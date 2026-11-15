@@ -1399,6 +1399,7 @@ pub(crate) fn rule_select<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     }
 }
 
@@ -3749,6 +3750,7 @@ pub(crate) fn filter_view_rows<'a>(
         arena,
     });
     let empty_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -3841,6 +3843,7 @@ pub(crate) fn filter_view_rows<'a>(
         shallow: false,
     };
     let outer_columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: Some(definition),
         alias,
         output_aliases: &[],
@@ -5392,6 +5395,7 @@ pub(crate) fn wrap_set_tree_with<'a>(
         set_body: Some(tree),
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -7479,6 +7483,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         set_body: Some(tree),
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -8700,6 +8705,7 @@ fn subst_select_body<'a>(
         set_body,
         locking: s.locking,
         written: crate::sql::ast::WrittenQuery::PLAIN,
+        minmax_subquery: false,
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
 }

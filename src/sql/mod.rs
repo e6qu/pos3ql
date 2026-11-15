@@ -21813,6 +21813,7 @@ impl Engine {
             | crate::storage::RoutineCallSelection::WrongKind { .. }
             | crate::storage::RoutineCallSelection::Absent) => {
                 let columns = exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],

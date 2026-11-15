@@ -149,6 +149,7 @@ pub fn describe_items<'q>(
             storage,
             txid,
             arena,
+            remote_ctid: false,
         },
         out,
     )?;
@@ -164,6 +165,9 @@ struct DescribeContext<'q, 'scope> {
     storage: Option<&'q crate::storage::Storage>,
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
+    /// The target is a foreign table, whose `RETURNING` list may read the
+    /// remote row's `ctid`.
+    remote_ctid: bool,
 }
 
 /// Single-target descriptor with names that exist only in a DML `RETURNING`
@@ -235,6 +239,7 @@ fn describe_items_with_output_aliases<'q>(
                 let resolver: &dyn ColTypeResolver = match storage {
                     Some(storage) => {
                         catalog_resolver = CatalogCols {
+                            remote_ctid: context.remote_ctid,
                             definition: def,
                             alias: table_alias,
                             output_aliases,
@@ -249,6 +254,7 @@ fn describe_items_with_output_aliases<'q>(
                             definition,
                             alias: table_alias,
                             output_aliases,
+                            remote_ctid: context.remote_ctid,
                         },
                         None => &NoCols,
                     },
@@ -295,6 +301,7 @@ fn describe_items_with_output_aliases<'q>(
                                 definition,
                                 alias: table_alias,
                                 output_aliases,
+                                remote_ctid: context.remote_ctid,
                             },
                             catalog_access,
                         )?,
@@ -437,6 +444,8 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
+    let remote_ctid =
+        definition.is_some_and(|definition| definition.kind == crate::storage::TableKind::Foreign);
     let count = describe_items_with_output_aliases(
         returning.items,
         DescribeContext {
@@ -446,6 +455,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             storage,
             txid,
             arena,
+            remote_ctid,
         },
         out,
     )?;
@@ -482,6 +492,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
                         storage: Some(storage),
                         txid,
                         arena,
+                        remote_ctid,
                     },
                     &mut |_| {
                         width += 1;
@@ -538,6 +549,9 @@ pub(crate) struct CatalogCols<'a> {
     pub(crate) storage: &'a crate::storage::Storage,
     pub(crate) txid: u32,
     pub(crate) arena: &'a crate::mem::arena::Arena,
+    /// The target is a foreign table whose `RETURNING` list may read the
+    /// remote row's `ctid`.
+    pub(crate) remote_ctid: bool,
 }
 
 pub(crate) fn static_meta_for_column(
@@ -756,6 +770,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 definition,
                 alias: self.alias,
                 output_aliases: self.output_aliases,
+                remote_ctid: self.remote_ctid,
             }
             .resolve(qualifier, name),
             None => NoCols.resolve(qualifier, name),
@@ -1060,6 +1075,7 @@ impl ColTypeResolver for CatalogCols<'_> {
             definition,
             alias: self.alias,
             output_aliases: self.output_aliases,
+            remote_ctid: false,
         }
         .record_column_handle(qualifier, name)
     }
@@ -1131,8 +1147,10 @@ fn describe_record_star<'q>(
         storage,
         txid,
         arena,
+        remote_ctid,
     } = context;
     let catalog_columns = storage.map(|storage| CatalogCols {
+        remote_ctid,
         definition: def,
         alias: table_alias,
         output_aliases,
@@ -1144,6 +1162,7 @@ fn describe_record_star<'q>(
         definition,
         alias: table_alias,
         output_aliases,
+        remote_ctid,
     });
     let columns: &dyn ColTypeResolver = if let Some(columns) = &catalog_columns {
         columns
@@ -1166,6 +1185,7 @@ fn describe_record_star<'q>(
             let resolver: &dyn ColTypeResolver = match (def, storage) {
                 (definition, Some(storage)) => {
                     catalog_resolver = CatalogCols {
+                        remote_ctid: false,
                         definition,
                         alias: table_alias,
                         output_aliases,
@@ -1180,6 +1200,7 @@ fn describe_record_star<'q>(
                         definition,
                         alias: table_alias,
                         output_aliases,
+                        remote_ctid: false,
                     };
                     &aliased_resolver
                 }
@@ -1260,6 +1281,7 @@ fn describe_record_star<'q>(
         }
         Expr::Call { .. } if storage.is_some() => {
             let resolver = CatalogCols {
+                remote_ctid: false,
                 definition: def,
                 alias: table_alias,
                 output_aliases,
@@ -1351,6 +1373,7 @@ fn describe_record_star<'q>(
                     definition,
                     alias: table_alias,
                     output_aliases,
+                    remote_ctid: false,
                 },
                 None => &NoCols,
             };
@@ -1414,6 +1437,7 @@ fn describe_record_star<'q>(
             let Some(handle) = expr_record_handle(base, resolver) else {
                 // Name the value's type through the catalog, as PostgreSQL does.
                 let catalog = CatalogCols {
+                    remote_ctid: false,
                     definition: def,
                     alias: table_alias,
                     output_aliases,
@@ -1462,6 +1486,7 @@ fn describe_record_star<'q>(
                     definition,
                     alias: table_alias,
                     output_aliases,
+                    remote_ctid: false,
                 },
                 None => &NoCols,
             };
@@ -4522,6 +4547,9 @@ pub(crate) struct AliasedDefCols<'d, 'a> {
     pub definition: crate::storage::RelationDefinition<'d>,
     pub alias: Option<&'a str>,
     pub output_aliases: &'a [&'a str],
+    /// Whether the relation is a foreign table, whose rows carry the remote
+    /// heap address a `RETURNING` list reads as `ctid`.
+    pub remote_ctid: bool,
 }
 impl ColTypeResolver for AliasedDefCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
@@ -4540,6 +4568,7 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
             // The written row's `tableoid` system column, also of its `old`
             // and `new` images.
             None if name == "tableoid" => Ok(ColType::Oid),
+            None if name == "ctid" && self.remote_ctid => Ok(ColType::Tid),
             None => {
                 let error = match qualifier {
                     Some(qualifier) => sql_err!(
@@ -4935,6 +4964,7 @@ pub(crate) fn infer_type_catalog(
     infer_type_res(
         expression,
         &CatalogCols {
+            remote_ctid: false,
             definition: definition.map(crate::storage::RelationDefinition::from_definition),
             alias: None,
             output_aliases: &[],

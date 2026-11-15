@@ -558,6 +558,7 @@ fn discover_default_source(
         visit(original, oid, type_mod, kind)
     };
     let columns = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
         definition: None,
         alias: None,
         output_aliases: &[],
@@ -1323,6 +1324,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                         columns: output_columns,
                     };
                     let columns = crate::sql::exec::CatalogCols {
+                        remote_ctid: false,
                         definition: Some(output),
                         alias: None,
                         output_aliases: &[],
@@ -1668,6 +1670,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     return self.call_statement(statement, &columns, outer);
                 }
                 let catalog = crate::sql::exec::CatalogCols {
+                    remote_ctid: false,
                     definition: None,
                     alias: None,
                     output_aliases: &[],
@@ -1918,18 +1921,32 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
         scope.set_target_aliases(&[returning.old_name(), returning.new_name()], arena)?;
         let schema = super::materialize::ScopeSchema(&scope);
-        let row = super::Chained {
+        let target_row = super::Chained {
             inner: &schema,
             outer,
         };
+        // A foreign target's RETURNING list may read the remote row's `ctid`.
+        let foreign = matches!(
+            self.storage.resolve_relation(target.schema, target.name, self.txid),
+            Some(crate::storage::ResolvedRelation::Table(slot))
+                if self.storage.table_def(slot, self.txid).kind == crate::storage::TableKind::Foreign
+        );
+        let remote_ctid = RemoteCtid {
+            target: alias.unwrap_or(target.name),
+        };
+        let with_ctid = super::Chained {
+            inner: &remote_ctid,
+            outer: Some(&target_row),
+        };
+        let row: &dyn ColumnLookup<'_> = if foreign { &with_ctid } else { &target_row };
         let columns = RuntimeColumnTypes {
-            row: &row,
+            row,
             catalog: Some(&catalog),
         };
         for item in returning.items {
             match item {
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                    self.expression(expression, &columns, &row)?;
+                    self.expression(expression, &columns, row)?;
                 }
                 SelectItem::TableWildcard(qualifier) => {
                     scope
@@ -1940,5 +1957,46 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             }
         }
         Ok(())
+    }
+}
+
+/// The remote row's `ctid` a foreign write target's `RETURNING` list reads
+/// (unqualified or through the target's name); every other name is left to
+/// the target's scope.
+struct RemoteCtid<'n> {
+    target: &'n str,
+}
+
+impl RemoteCtid<'_> {
+    fn reads(&self, qualifier: Option<&str>, name: &str) -> bool {
+        name == "ctid" && qualifier.is_none_or(|qualifier| qualifier == self.target)
+    }
+}
+
+impl<'a> ColumnLookup<'a> for RemoteCtid<'_> {
+    fn lookup(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::Datum<'a>, SqlError> {
+        Err(crate::sql::error_position::column_reference(
+            sql_err!(
+                crate::sql::eval::sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            ),
+            qualifier,
+            name,
+        ))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
+        self.reads(qualifier, name)
+            .then_some(crate::sql::types::ColType::Tid)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.reads(qualifier, name)
+            .then_some(crate::sql::types::oid::TID)
     }
 }

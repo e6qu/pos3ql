@@ -35,6 +35,9 @@ struct Entry<'a> {
     var: bool,
     /// Already printed as read from an input, in parentheses when needed.
     referenced: bool,
+    /// The text with its implicit coercions shown, which `get_variable`
+    /// prints for a target read from an input, when it differs.
+    shown: Option<&'a str>,
 }
 
 impl<'a> Entry<'a> {
@@ -44,12 +47,13 @@ impl<'a> Entry<'a> {
             return Ok(self);
         }
         let text = arena
-            .alloc_str_display(format_args!("({})", self.text))
+            .alloc_str_display(format_args!("({})", self.shown.unwrap_or(self.text)))
             .map_err(|_| arena_full())?;
         Ok(Self {
             text,
             var: false,
             referenced: true,
+            shown: None,
         })
     }
 }
@@ -286,6 +290,7 @@ impl<'a> BlockTargets<'a> {
             }
         };
         let deparse = |expression: &Expr<'_>| -> Result<Entry<'a>, Fail> {
+            let expression = crate::sql::catalog::deparse::planned(expression);
             let text = crate::sql::catalog::deparse::deparse_expression(
                 &context,
                 expression,
@@ -297,6 +302,7 @@ impl<'a> BlockTargets<'a> {
                 text,
                 var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
                 referenced: false,
+                shown: crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)?,
             })
         };
         let column_expression = |table: usize, column: usize| -> Result<&'a Expr<'a>, Fail> {
@@ -583,6 +589,7 @@ impl<'a> BlockTargets<'a> {
                             text,
                             var: true,
                             referenced: false,
+                            shown: None,
                         })
                     },
                 )?;
@@ -964,6 +971,7 @@ impl Entry<'_> {
         text: "",
         var: true,
         referenced: false,
+        shown: None,
     };
 }
 
@@ -1139,10 +1147,14 @@ impl<'a> RelationTargets<'a> {
             destination,
             self.arena,
         )?;
+        let expression = crate::sql::catalog::deparse::planned(expression);
+        let shown =
+            crate::sql::catalog::deparse::deparse_shown(&self.context, expression, self.arena)?;
         Ok(text.map(|text| Entry {
             text,
             var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
             referenced: false,
+            shown,
         }))
     }
 
@@ -1161,6 +1173,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: true,
             referenced: false,
+            shown: None,
         })
     }
 
@@ -1177,6 +1190,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: true,
             referenced: false,
+            shown: None,
         })
     }
 
@@ -1275,6 +1289,7 @@ impl<'a> RelationTargets<'a> {
                     text,
                     var: true,
                     referenced: false,
+                    shown: None,
                 })
                 .map_err(|_| arena_full())?;
         }
@@ -1445,6 +1460,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: false,
             referenced: false,
+            shown: None,
         }))
     }
 
@@ -1550,7 +1566,10 @@ impl<'a> RelationTargets<'a> {
             match item {
                 SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                     for column in 0..self.table.columns().len() {
-                        push(&mut entries, self.column(column, None)?)?;
+                        push(
+                            &mut entries,
+                            self.column(column, self.context.qualify.then_some(self.exposed))?,
+                        )?;
                     }
                 }
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
@@ -1612,7 +1631,7 @@ impl<'a> RelationTargets<'a> {
             let entry = match key {
                 Expr::Column { name, .. } if self.table.column_index(name).is_some() => {
                     let column = self.table.column_index(name).expect("checked above");
-                    self.column(column, None)?
+                    self.column(column, self.context.qualify.then_some(self.exposed))?
                 }
                 expression => match self.entry(expression, Destination::Value)? {
                     Some(entry) => entry,
@@ -1700,6 +1719,7 @@ impl<'a> RelationTargets<'a> {
             text,
             var: plain,
             referenced: read(expression),
+            shown: None,
         }))
     }
 }

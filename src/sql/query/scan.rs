@@ -9140,6 +9140,9 @@ fn scan_source_mode<'a>(
                 txid,
                 arena,
                 hooks.sequences,
+                &mut |expression| {
+                    crate::sql::eval::eval_full(expression, arena, params, &NoColumns, hooks)
+                },
                 &mut |bytes| {
                     check_timeout()?;
                     let this = index;
@@ -9335,13 +9338,20 @@ fn scan_source_mode<'a>(
                     // A foreign child's rows come from its server, as a
                     // foreign table read on its own does.
                     if foreign {
-                        let stream = crate::sql::foreign::ForeignStream::new(leaf, None, arena)?;
+                        let stream =
+                            crate::sql::foreign::ForeignStream::new(leaf, None, &[], arena)?;
                         let finished = crate::sql::foreign::stream_rows(
                             storage,
                             &stream,
                             txid,
                             arena,
                             hooks.sequences,
+                            &mut |_| {
+                                Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "a foreign partition scan reads no parameters"
+                                ))
+                            },
                             &mut |bytes| {
                                 let mut values = [Datum::Null; MAX_COLUMNS];
                                 let width = crate::sql::exec::decode_projected_row_into(

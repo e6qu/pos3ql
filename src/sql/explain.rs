@@ -917,6 +917,59 @@ fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
             && (matches!(left, Expr::Column { .. }) || matches!(right, Expr::Column { .. })))
 }
 
+/// Whether a one-relation query's `ORDER BY` key is a column one of its
+/// top-level `WHERE` equalities fixes to a constant, which makes the key's
+/// pathkey redundant.
+fn constant_fixed_key(statement: &Select<'_>, key: &Expr<'_>, arena: &Arena) -> bool {
+    let item = |index: usize| match statement.items.get(index) {
+        Some(SelectItem::Expr { expression, .. }) => Some(*expression),
+        _ => None,
+    };
+    let key = match key {
+        Expr::Int(position) => usize::try_from(*position)
+            .ok()
+            .and_then(|position| position.checked_sub(1))
+            .and_then(item),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => statement
+            .items
+            .iter()
+            .position(|candidate| {
+                matches!(candidate, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
+            })
+            .and_then(item),
+        _ => None,
+    }
+    .unwrap_or(key);
+    let Expr::Column {
+        qualifier: key_qualifier,
+        name: key_name,
+    } = key
+    else {
+        return false;
+    };
+    let same = |side: &Expr<'_>| {
+        matches!(side, Expr::Column { qualifier, name }
+            if name == key_name
+                && (qualifier.is_none() || key_qualifier.is_none() || qualifier == key_qualifier))
+    };
+    let constant = |side: &Expr<'_>| !matches!(side, Expr::Column { .. } | Expr::Bool(_));
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if let Some(condition) = statement.where_clause
+        && split_conjuncts(condition, &mut conjuncts, &mut count, arena).is_none()
+    {
+        return false;
+    }
+    conjuncts[..count].iter().any(|conjunct| {
+        equivalence_clause(conjunct)
+            && matches!(conjunct, Expr::Binary { left, right, .. }
+                if same(left) && constant(right) || same(right) && constant(left))
+    })
+}
+
 /// PostgreSQL's order of a scan's restrictions: the others as written, then
 /// the equivalence-class equalities in the order they were written.
 fn order_restrictions(conjuncts: &mut [&Expr<'_>], cost: &dyn Fn(&Expr<'_>) -> f64) {
@@ -3846,6 +3899,12 @@ fn plan_sublinks<'a>(
             let _ = found.push((node, SublinkOrigin::Having));
         });
     }
+    // A `LIMIT` or `OFFSET` subquery is an InitPlan of the top node.
+    for count in statement.limit.into_iter().chain(statement.offset) {
+        visit_sublinks(count, &mut |node| {
+            let _ = found.push((node, SublinkOrigin::Where));
+        });
+    }
     let found = found.as_slice();
     let relation = statement.from.as_ref().and_then(|from| {
         (from.joins.is_empty() && from.base.subquery.is_none() && !from.base.is_function_source())
@@ -4535,6 +4594,8 @@ fn plan_pulled_select<'a>(
 
     let mut stages = [PlanNode::EMPTY; MAX_EXPLAIN_STAGES];
     let mut stage_count = 0usize;
+    // Whether pseudoconstant conditions gate the one relation's scan.
+    let mut gated = false;
     fn add_stage(
         stages: &mut [PlanNode; MAX_EXPLAIN_STAGES],
         count: &mut usize,
@@ -4756,6 +4817,28 @@ fn plan_pulled_select<'a>(
         let mut count = 0;
         for key in keys {
             if !constant_keys(&[key.0])? {
+                kept[count] = Some(*key);
+                count += 1;
+            }
+        }
+        &*arena
+            .alloc_slice_with(count, |index| kept[index].expect("kept key"))
+            .map_err(|_| arena_full())?
+    } else if scope.as_ref().is_some_and(|scope| scope.n == 1)
+        && !statement.with_ties
+        && !aggregate
+        && !statement.distinct
+        && statement.distinct_on.is_empty()
+    {
+        // A key a `WHERE` equality fixes to a constant orders nothing: its
+        // pathkey is redundant in the constant's equivalence class.
+        let keys = order_keys(statement, arena)?;
+        let kept = arena
+            .alloc_slice_with(keys.len(), |_| None)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for key in keys {
+            if !constant_fixed_key(statement, key.0, arena) {
                 kept[count] = Some(*key);
                 count += 1;
             }
@@ -5098,6 +5181,7 @@ fn plan_pulled_select<'a>(
                 }
                 .with_qual(QualLabel::OneTimeFilter, filter);
                 stage_count += 1;
+                gated = true;
             }
             let security = select_security_quals(storage, scope, txid, arena)?;
             (index_conds[0], filters[0]) = single_relation_quals(
@@ -5278,8 +5362,13 @@ fn plan_pulled_select<'a>(
             passthrough: stages[index].passthrough,
         })
         .map_err(|_| arena_full())?;
-    let qualify_outputs =
-        n > 1 || shares_range_table(statement) || nested_block() || pulled_relations(written);
+    // The subqueries of a condition the remote query took still join the
+    // range table.
+    let qualify_outputs = n > 1
+        || shares_range_table(statement)
+        || shares_range_table(written)
+        || nested_block()
+        || pulled_relations(written);
     let block_targets = targets::BlockTargets::new(
         storage,
         txid,
@@ -5300,13 +5389,19 @@ fn plan_pulled_select<'a>(
     };
     // What the parent of a one-relation block's scan asks of its target
     // list (`create_plan_recurse`'s flags).
-    let single_demand = shapes
-        .iter()
-        .find(|stage| !stage.passthrough && !matches!(stage.name, "Limit" | "LockRows"))
-        .map_or(targets::Demand::Exact, |stage| match stage.name {
-            "Aggregate" | "HashAggregate" | "Group" | "ProjectSet" => targets::Demand::Label,
-            _ => targets::Demand::Small,
-        });
+    // A gating `Result` projects the scan's rows, which return their
+    // physical columns (`create_scan_plan` with pseudoconstant quals).
+    let single_demand = if gated {
+        targets::Demand::Any
+    } else {
+        shapes
+            .iter()
+            .find(|stage| !stage.passthrough && !matches!(stage.name, "Limit" | "LockRows"))
+            .map_or(targets::Demand::Exact, |stage| match stage.name {
+                "Aggregate" | "HashAggregate" | "Group" | "ProjectSet" => targets::Demand::Label,
+                _ => targets::Demand::Small,
+            })
+    };
     if constant_false {
         for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
             plan.push(PlanNode {
@@ -5583,15 +5678,18 @@ fn plan_pulled_select<'a>(
                     txid,
                     arena,
                     aggregate,
+                    gated,
                     qualify_outputs,
                 )?;
-                // A local limit over the remote order passes the scan's
-                // sort columns up, reading what the scan computes.
+                // A local limit, or a gating `Result`, over the remote order
+                // passes the scan's sort columns up, reading what the scan
+                // computes.
                 if pushed.order_pushed
                     && let Some(above) = above
                 {
                     for node in plan.nodes[..plan.count].iter_mut() {
-                        if node.name.as_str() == "Limit" {
+                        if node.name.as_str() == "Limit" || gated && node.name.as_str() == "Result"
+                        {
                             node.output = above;
                             node.output_unprintable = scan.output_unprintable;
                         }
@@ -6642,6 +6740,7 @@ fn foreign_scan_node(
     txid: u32,
     arena: &Arena,
     aggregate: bool,
+    gated: bool,
     qualify: bool,
 ) -> Result<Option<targets::Output>, SqlError> {
     scan.name = StackStr::from_str("Foreign Scan");
@@ -6655,7 +6754,11 @@ fn foreign_scan_node(
     let outputs =
         targets::RelationTargets::new(storage, txid, &table, scope.names[0], qualify, arena)?
             .foreign_scan(statement, pushed.sort_keys)?;
-    scan.set_output(outputs.map(|(output, _)| output));
+    // Under a gating `Result` the scan returns its physical columns and the
+    // `Result` computes the target.
+    if !gated {
+        scan.set_output(outputs.map(|(output, _)| output));
+    }
     Ok(outputs.map(|(_, above)| above))
 }
 
@@ -6912,13 +7015,32 @@ fn plan_keys(
                     .unwrap_or(key),
                 _ => key,
             };
+            let expression = crate::sql::catalog::deparse::planned(expression);
             let mark = arena.mark();
-            let part = crate::sql::catalog::deparse::deparse_expression(
-                &context,
-                expression,
-                crate::sql::catalog::deparse::Destination::Value,
-                arena,
-            );
+            // A collated sort key prints relabeled, then its collation; a
+            // grouping key as the input computes it, its relabeling shown.
+            let collated = match label {
+                KeyLabel::Sort => {
+                    crate::sql::catalog::deparse::planned_collated_key(&context, expression, arena)
+                }
+                KeyLabel::Group => {
+                    crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)
+                }
+                KeyLabel::None => Ok(None),
+            };
+            let (collated, part) = match collated {
+                Ok(Some(part)) => (true, Ok(Some(part))),
+                Ok(None) => (
+                    false,
+                    crate::sql::catalog::deparse::deparse_expression(
+                        &context,
+                        expression,
+                        crate::sql::catalog::deparse::Destination::Value,
+                        arena,
+                    ),
+                ),
+                Err(error) => (false, Err(error)),
+            };
             let written = part.map(|part| {
                 part.map(|part| {
                     if index != 0 {
@@ -6927,7 +7049,8 @@ fn plan_keys(
                     // A grouping key prints as written; a sort key reads its
                     // expression from the input's output, which PostgreSQL
                     // parenthesizes.
-                    if matches!(expression, Expr::Column { .. })
+                    if collated
+                        || matches!(expression, Expr::Column { .. })
                         || (label == KeyLabel::Group
                             && (matches!(expression, Expr::Call { .. })
                                 || fully_parenthesized(part)))
@@ -6992,6 +7115,9 @@ fn shares_range_table(statement: &Select<'_>) -> bool {
     }
     if let Some(having) = statement.having {
         visit(having);
+    }
+    for count in statement.limit.into_iter().chain(statement.offset) {
+        visit(count);
     }
     found
 }

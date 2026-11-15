@@ -240,11 +240,30 @@ fn decode_remote_field<'a>(
     super::exec::coerce(value, definition, storage, txid, arena, sequences)
 }
 
+/// Why one poll of a foreign connection failed.
+enum PollFailure {
+    Client(ClientError),
+    TimedOut,
+    Invalid,
+}
+
 fn poll_client(
     client: &mut crate::pg::replication_client::ReplicationClient,
     deadline: Instant,
     visit: &mut impl FnMut(ClientEvent<'_>) -> Result<(), ClientError>,
 ) -> Result<(), SqlError> {
+    poll_transport(client, deadline, visit).map_err(|failure| match failure {
+        PollFailure::Client(error) => client_error(error),
+        PollFailure::TimedOut => timed_out(),
+        PollFailure::Invalid => lost_connection(),
+    })
+}
+
+fn poll_transport(
+    client: &mut crate::pg::replication_client::ReplicationClient,
+    deadline: Instant,
+    visit: &mut impl FnMut(ClientEvent<'_>) -> Result<(), ClientError>,
+) -> Result<(), PollFailure> {
     let mut descriptor = libc::pollfd {
         fd: client.raw_fd(),
         events: libc::POLLIN
@@ -258,7 +277,7 @@ fn poll_client(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(timed_out());
+            return Err(PollFailure::TimedOut);
         }
         let timeout = remaining
             .as_nanos()
@@ -269,23 +288,25 @@ fn poll_client(
             continue;
         }
         if result < 0 {
-            return Err(client_error(ClientError::Io(
+            return Err(PollFailure::Client(ClientError::Io(
                 std::io::Error::last_os_error(),
             )));
         }
         if result == 0 {
-            return Err(timed_out());
+            return Err(PollFailure::TimedOut);
         }
         break;
     }
     if descriptor.revents & libc::POLLOUT != 0 {
-        client.writable().map_err(client_error)?;
+        client.writable().map_err(PollFailure::Client)?;
     }
     if descriptor.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
         // A closed peer reads as end of file after any frames it sent.
-        client.readable(usize::MAX, visit).map_err(client_error)?;
+        client
+            .readable(usize::MAX, visit)
+            .map_err(PollFailure::Client)?;
     } else if descriptor.revents & libc::POLLNVAL != 0 {
-        return Err(lost_connection());
+        return Err(PollFailure::Invalid);
     }
     Ok(())
 }
@@ -312,6 +333,7 @@ fn malformed() -> ClientError {
 /// A foreign server and the identity its cached connection has.
 #[derive(Clone, Copy)]
 struct RemoteServer {
+    name: crate::storage::SqlName,
     endpoint: ConnectionInfo,
     timeout: Duration,
     key: ForeignConnectionKey,
@@ -434,18 +456,25 @@ fn unexpected_response(command: &str) -> SqlError {
     )
 }
 
-/// Opens `server`'s connection and authenticates.
+/// Opens `server`'s connection and authenticates. Any failure is
+/// `connect_pg_server`'s `08001`, its detail the message libpq reports.
 fn connect(
     client: &mut crate::storage::ForeignClientGuard<'_>,
-    endpoint: ConnectionInfo,
-    timeout: Duration,
+    server: &RemoteServer,
 ) -> Result<(), SqlError> {
     client.unbind();
-    client.bind_sql(endpoint).map_err(client_error)?;
-    let deadline = Instant::now() + timeout;
+    let endpoint = server.endpoint;
+    if let Err(error) = client.bind_sql(endpoint) {
+        return Err(match error {
+            ClientError::Io(error) => connect_failed(server, ConnectFailure::Socket(&error)),
+            error => client_error(error),
+        });
+    }
+    let deadline = Instant::now() + server.timeout;
     let mut ready = false;
     while !ready {
-        poll_client(client, deadline, &mut |event| {
+        let connecting = client.is_connecting();
+        let polled = poll_transport(client, deadline, &mut |event| {
             match event {
                 ClientEvent::Sql(SqlEvent::Ready {
                     transaction_status: b'I',
@@ -453,9 +482,126 @@ fn connect(
                 _ => return Err(malformed()),
             }
             Ok(())
-        })?;
+        });
+        let failure = match &polled {
+            Ok(()) => continue,
+            Err(PollFailure::TimedOut) => ConnectFailure::TimedOut,
+            Err(PollFailure::Invalid) | Err(PollFailure::Client(ClientError::Closed)) => {
+                ConnectFailure::Closed
+            }
+            Err(PollFailure::Client(ClientError::Io(error))) if connecting => {
+                ConnectFailure::Socket(error)
+            }
+            Err(PollFailure::Client(ClientError::Io(error))) => ConnectFailure::Receive(error),
+            Err(PollFailure::Client(ClientError::Publisher(diagnostic))) => {
+                ConnectFailure::Server(diagnostic)
+            }
+            Err(PollFailure::Client(ClientError::Authentication))
+                if endpoint.password().is_none() =>
+            {
+                ConnectFailure::NoPassword
+            }
+            Err(PollFailure::Client(error)) => ConnectFailure::Other(error),
+        };
+        return Err(connect_failed(server, failure));
     }
     Ok(())
+}
+
+/// What libpq reports for a connection that failed.
+enum ConnectFailure<'e> {
+    /// The TCP connection failed (`connectFailureMessage`).
+    Socket(&'e std::io::Error),
+    Receive(&'e std::io::Error),
+    Closed,
+    TimedOut,
+    /// The server's startup error, always `FATAL`.
+    Server(&'e crate::pg::replication_client::PublisherDiagnostic),
+    NoPassword,
+    Other(&'e ClientError),
+}
+
+/// `strerror` of an operating-system error, as libpq prints it.
+fn write_strerror(output: &mut impl core::fmt::Write, error: &std::io::Error) {
+    let Some(code) = error.raw_os_error() else {
+        let _ = write!(output, "{error}");
+        return;
+    };
+    let mut buffer = [0 as libc::c_char; 256];
+    // SAFETY: the buffer is writable for its length and NUL-terminated on success.
+    let text = if unsafe { libc::strerror_r(code, buffer.as_mut_ptr(), buffer.len()) } == 0 {
+        unsafe { core::ffi::CStr::from_ptr(buffer.as_ptr()) }
+            .to_str()
+            .ok()
+    } else {
+        None
+    };
+    match text {
+        Some(text) => {
+            let _ = output.write_str(text);
+        }
+        None => {
+            let _ = write!(output, "{error}");
+        }
+    }
+}
+
+/// `could not connect to server "name"` with libpq's message as its detail:
+/// the host as given (the address in parentheses when it prints otherwise),
+/// the port and the reason.
+fn connect_failed(server: &RemoteServer, failure: ConnectFailure<'_>) -> SqlError {
+    let endpoint = server.endpoint;
+    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let _ = write!(detail, "connection to server at \"{}\"", endpoint.host());
+    let address = endpoint.socket_addr().ip();
+    let mut printed = StackStr::<64>::new();
+    let _ = write!(printed, "{address}");
+    if printed.as_str() != endpoint.host() {
+        let _ = write!(detail, " ({})", printed.as_str());
+    }
+    let _ = write!(detail, ", port {} failed: ", endpoint.port());
+    match failure {
+        ConnectFailure::Socket(error) => {
+            write_strerror(&mut detail, error);
+            let _ = detail.write_str(
+                "\n\tIs the server running on that host and accepting TCP/IP connections?",
+            );
+        }
+        ConnectFailure::Receive(error) => {
+            let _ = detail.write_str("could not receive data from server: ");
+            write_strerror(&mut detail, error);
+        }
+        ConnectFailure::Closed => {
+            let _ = detail.write_str(
+                "server closed the connection unexpectedly\n\tThis probably means the server \
+                 terminated abnormally\n\tbefore or while processing the request.",
+            );
+        }
+        ConnectFailure::TimedOut => {
+            let _ = detail.write_str("timeout expired");
+        }
+        ConnectFailure::Server(diagnostic) => {
+            let _ = write!(detail, "FATAL:  {}", diagnostic.message.as_str());
+            if let Some(text) = &diagnostic.detail {
+                let _ = write!(detail, "\nDETAIL:  {}", text.as_str());
+            }
+            if let Some(text) = &diagnostic.hint {
+                let _ = write!(detail, "\nHINT:  {}", text.as_str());
+            }
+        }
+        ConnectFailure::NoPassword => {
+            let _ = detail.write_str("fe_sendauth: no password supplied");
+        }
+        ConnectFailure::Other(error) => {
+            let _ = write!(detail, "{error}");
+        }
+    }
+    crate::sql::eval::stash_diagnostic(Some(detail), None);
+    sql_err!(
+        sqlstate::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+        "could not connect to server \"{}\"",
+        server.name.as_str()
+    )
 }
 
 /// postgres_fdw's `configure_remote_session` and `begin_remote_xact`: a
@@ -540,11 +686,7 @@ fn enter_session(
         server.keep_connections,
     )?;
     let open = |storage: &Storage| -> Result<(), SqlError> {
-        connect(
-            &mut storage.foreign_client(lease)?,
-            server.endpoint,
-            server.timeout,
-        )?;
+        connect(&mut storage.foreign_client(lease)?, server)?;
         begin(storage, lease, txid, true)
     };
     let result = match start {
@@ -1111,6 +1253,7 @@ fn connection_for_server(
     };
     Ok((
         RemoteServer {
+            name: server.name,
             endpoint,
             timeout: Duration::from_secs(timeout),
             key,
@@ -1292,16 +1435,18 @@ fn scan_cursor(
     fields: usize,
     visit: &mut dyn FnMut(crate::pg::replication_client::SqlDataRow<'_>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    let cursor = declare_cursor(storage, lease, query)?;
+    let cursor = declare_cursor(storage, lease, query, &[])?;
     while fetch_batch(storage, lease, cursor, query, fetch_size, fields, visit)? {}
     close_cursor(storage, lease, cursor)
 }
 
-/// `DECLARE cN CURSOR FOR query`, returning `N`.
+/// `DECLARE cN CURSOR FOR query` with the values of its parameters,
+/// returning `N`.
 fn declare_cursor(
     storage: &Storage,
     lease: ForeignSessionLease,
     query: &str,
+    params: &[Option<&[u8]>],
 ) -> Result<u32, SqlError> {
     let cursor = storage.foreign_client(lease)?.next_cursor_number();
     let mut declare = StackStr::<16_448>::new();
@@ -1311,7 +1456,7 @@ fn declare_cursor(
         storage,
         lease,
         declare.as_str(),
-        Some(&[]),
+        Some(params),
         query,
         &mut |event| match event {
             SqlEvent::CommandComplete {
@@ -1445,6 +1590,9 @@ pub(crate) struct ForeignStream<'a> {
     /// The remote query a pushed plan built and the columns it returns;
     /// `None` reads every column.
     pub(crate) pushed: Option<(&'a str, RemoteColumns<'a>)>,
+    /// The expressions whose values the remote query reads as `$1`, `$2`,
+    /// ..., evaluated when the scan declares its cursor.
+    params: &'a [&'a crate::sql::ast::Expr<'a>],
     state: crate::mem::arena::ArenaHandle<StreamState<'a>>,
     owner: &'a Arena,
 }
@@ -1469,6 +1617,7 @@ impl<'a> ForeignStream<'a> {
     pub(crate) fn new(
         table_slot: usize,
         pushed: Option<(&'a str, RemoteColumns<'a>)>,
+        params: &'a [&'a crate::sql::ast::Expr<'a>],
         owner: &'a Arena,
     ) -> Result<Self, SqlError> {
         let state = owner
@@ -1485,6 +1634,7 @@ impl<'a> ForeignStream<'a> {
         Ok(Self {
             table_slot,
             pushed,
+            params,
             state,
             owner,
         })
@@ -1577,6 +1727,7 @@ pub(crate) fn stream_rows<'a>(
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    evaluate: &mut dyn FnMut(&'a crate::sql::ast::Expr<'a>) -> Result<Datum<'a>, SqlError>,
     visit: &mut dyn FnMut(&'a [u8]) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     let remote = RemoteTable::open(storage, stream.table_slot, txid)?;
@@ -1633,8 +1784,24 @@ pub(crate) fn stream_rows<'a>(
                     }
                 }
                 start => {
+                    // `process_query_params`: the values, in the remote
+                    // session's transmission modes, before the cursor opens.
+                    let mut values = [None::<&[u8]>; deparse::MAX_REMOTE_PARAMS];
+                    for (value, &expression) in values.iter_mut().zip(stream.params) {
+                        let datum = evaluate(expression)?;
+                        *value = Responder::datum_wire_text(
+                            &datum,
+                            crate::sql::guc::RenderContext::transmission(),
+                            arena,
+                        )?;
+                    }
                     let lease = enter_session(storage, txid, &remote.server)?;
-                    let cursor = declare_cursor(storage, lease, query.as_str())?;
+                    let cursor = declare_cursor(
+                        storage,
+                        lease,
+                        query.as_str(),
+                        &values[..stream.params.len()],
+                    )?;
                     if let crate::sql::query::ForeignScanStart::New(ordinal) = start {
                         crate::sql::query::set_foreign_scan_cursor(ordinal, Some((lease, cursor)))?;
                         state.ordinal = Some(ordinal);
@@ -1809,6 +1976,7 @@ pub(crate) fn direct_modify_sql<'a>(
         arena,
         storage,
         txid,
+        params: None,
     };
     deparse::direct_modify_sql(&deparser, assignments, predicate, returned, arena)
 }
@@ -1845,6 +2013,7 @@ pub(crate) fn modify_scan<'a>(
         arena,
         storage,
         txid,
+        params: None,
     };
     deparse::plan_modify_scan(&deparser, updated, predicate, returned, whole_old, arena).map(Some)
 }
@@ -2792,6 +2961,7 @@ fn child_modify_sql<'a>(
         arena,
         storage,
         txid,
+        params: None,
     };
     Ok(deparse::plan_modify_scan(&deparser, updated, None, returned, true, arena)?.modify_sql)
 }

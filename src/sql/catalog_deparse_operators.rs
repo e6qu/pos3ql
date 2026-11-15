@@ -908,6 +908,9 @@ impl Context<'_> {
         collation: &crate::sql::ast::ParsedCollation<'_>,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
+        if self.folded {
+            return self.planned_collate(operand, collation, None, false, output);
+        }
         self.open(output)?;
         // An untyped literal is resolved as `text` before it is collated.
         let expected = match operand {
@@ -916,6 +919,18 @@ impl Context<'_> {
         };
         self.wrapped(operand, expected, Parent::Collate, true, output)?;
         output.push(" COLLATE ")?;
+        let Some((_, name)) = self.collation_name(collation)? else {
+            return output.unsupported();
+        };
+        output.push(name)?;
+        self.close(output)
+    }
+
+    /// A collation's OID and quoted name.
+    pub(super) fn collation_name(
+        &self,
+        collation: &crate::sql::ast::ParsedCollation<'_>,
+    ) -> Result<Option<(i32, &str)>, SqlError> {
         let resolved = match collation {
             crate::sql::ast::ParsedCollation::Builtin(collation) => Some(*collation),
             crate::sql::ast::ParsedCollation::Named(name) => {
@@ -923,20 +938,61 @@ impl Context<'_> {
                     .resolve_collation(name.schema, name.name, self.txid)
             }
         };
-        let name = match resolved {
-            Some(collation) => crate::sql::catalog::collation_name_by_oid(
-                self.storage,
-                self.txid,
-                collation.oid(),
-                self.arena,
-            )?,
-            None => None,
+        let Some(collation) = resolved else {
+            return Ok(None);
         };
-        let Some(name) = name else {
+        Ok(crate::sql::catalog::collation_name_by_oid(
+            self.storage,
+            self.txid,
+            collation.oid(),
+            self.arena,
+        )?
+        .map(|name| (collation.oid(), name)))
+    }
+
+    /// `COLLATE` as the planner leaves it (`eval_const_expressions`): a
+    /// constant carries the collation, printed after it when it is not the
+    /// type's default (`get_const_collation`); any other operand is relabeled
+    /// to the collation, an implicit `RelabelType` printed as a cast where
+    /// implicit coercions show (`shown`: an operand, or a lower node's
+    /// target read through `OUTER_VAR`), to `expected` or its own type.
+    pub(super) fn planned_collate(
+        &self,
+        operand: &Expr<'_>,
+        collation: &crate::sql::ast::ParsedCollation<'_>,
+        expected: Option<i32>,
+        shown: bool,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        let Some((collation, name)) = self.collation_name(collation)? else {
             return output.unsupported();
         };
-        output.push(name)?;
-        self.close(output)
+        let default = collation == crate::sql::ast::Collation::Default.oid();
+        if self.is_constant(operand) || matches!(operand, Expr::BoundLiteral { .. }) {
+            let expected = match operand {
+                Expr::Str(_) | Expr::Null => Some(expected.unwrap_or(oid::TEXT)),
+                _ => expected,
+            };
+            self.write(operand, expected, output)?;
+            if !default {
+                output.push(" COLLATE ")?;
+                output.push(name)?;
+            }
+            return Ok(());
+        }
+        if default || !shown {
+            return self.write(operand, expected, output);
+        }
+        let (type_oid, type_mod) = match expected {
+            Some(expected) => (expected, -1),
+            None => match self.relabel_type(operand)? {
+                Some(found) => found,
+                None => return output.unsupported(),
+            },
+        };
+        self.wrapped(operand, None, Parent::Cast, true, output)?;
+        output.push("::")?;
+        self.type_name_mod(type_oid, type_mod, output)
     }
 
     /// An ordered-set aggregate: its direct arguments, then `WITHIN GROUP`.

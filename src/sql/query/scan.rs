@@ -6028,6 +6028,30 @@ impl JoinMatchFlags<'_> {
     }
 }
 
+/// The rows of a RIGHT or FULL join's right side that matched.
+#[derive(Clone, Copy)]
+struct JoinMatches<'a> {
+    /// The flags kept in memory; none while an external match map records
+    /// the matches.
+    local: Option<JoinMatchFlags<'a>>,
+    /// For a partitioned table or inheritance tree, each member in scan
+    /// order with the ordinal of its first row. Members' row identities
+    /// repeat, so their rows are known by ordinal.
+    members: Option<&'a [(usize, usize)]>,
+}
+
+impl JoinMatches<'_> {
+    const NONE: Self = Self {
+        local: None,
+        members: None,
+    };
+
+    /// The identity a matched row is recorded under.
+    fn identity(&self, rowid: Option<u64>) -> Option<u64> {
+        if self.members.is_some() { None } else { rowid }
+    }
+}
+
 fn join_match_key(ordinal: usize, rowid: Option<u64>) -> u64 {
     rowid.unwrap_or(ordinal as u64)
 }
@@ -8563,7 +8587,7 @@ fn scan_source_mode<'a>(
         rowid: Option<u64>,
         bound: &mut [Option<BoundRow<'a>>],
         bound_rowids: &mut [Option<u64>],
-        matched: &[Option<JoinMatchFlags<'_>>],
+        matched: &[JoinMatches<'_>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
         conjuncts: DepthConjuncts<'_, 'a>,
@@ -8626,14 +8650,15 @@ fn scan_source_mode<'a>(
         )? {
             return Ok(false);
         }
-        if let Some(matched_rows) = matched[depth] {
-            matched_rows.flag(index, rowid)?.set(true);
+        let identity = matched[depth].identity(rowid);
+        if let Some(matched_rows) = matched[depth].local {
+            matched_rows.flag(index, identity)?.set(true);
         }
         record_external_match(
             storage,
             external_match_writer,
             depth,
-            join_match_key(index, rowid),
+            join_match_key(index, identity),
         )?;
         Ok(true)
     }
@@ -8656,7 +8681,7 @@ fn scan_source_mode<'a>(
         bound_rowids: &mut [Option<u64>],
         // For each RIGHT/FULL join level, one flag per scanned row of that
         // level's table, marking those that found a left partner.
-        matched: &[Option<JoinMatchFlags<'_>>],
+        matched: &[JoinMatches<'_>],
         external_match_writer: Option<core::ptr::NonNull<crate::sql::external::ExternalSorter>>,
         security_plans: &[Option<RowSecurityPlan<'a>>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
@@ -9237,344 +9262,317 @@ fn scan_source_mode<'a>(
             || (scope.derived[order[depth]].is_none()
                 && storage.relation_has_descendants(scope.slots[order[depth]], txid))
         {
-            // A heap-only outer scan uses heap-offset order, so row errors on
-            // freshly loaded tables follow PostgreSQL's physical insertion
-            // order. Spilled rows stream in SST order to avoid point-reading
-            // every immutable row; SQL without ORDER BY has no row-order
-            // contract. Inner scans avoid re-sorting for each outer row.
-            let slot = scope.slots[order[depth]];
-            if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
-                && storage.relation_has_descendants(slot, txid)
-            {
-                // The members executor pruning keeps, with every value this
-                // scan knows, as the plan's members name them.
-                let table = order[depth];
-                let conditions =
-                    super::partition_prune::scan_conditions(from, where_clause, table, arena)?;
-                let values = super::partition_prune::ScanValues {
-                    storage,
-                    txid,
-                    relation: super::partition_prune::ScanRelation::From { scope, table },
-                    arena,
-                    params,
-                    hooks,
-                };
-                let leaves = super::partition_prune::members(
-                    storage,
-                    txid,
-                    slot,
-                    conditions,
-                    &values,
-                    super::partition_prune::PruneStage::Scan,
-                    arena,
-                )?
-                .leaves;
-                let append = instrument::node(instrument::Role::Scan(
-                    u16::try_from(table).unwrap_or(u16::MAX),
-                ));
-                let mut index = 0usize;
-                let mut aborted = false;
-                let definitions = storage.table_definition_images();
-                let logical = scope
-                    .defs
-                    .stored(order[depth])
-                    .expect("resolved logical relation");
-                for &leaf in leaves {
-                    // Each member's scan counts its share of the `Append`'s
-                    // rows while it runs.
-                    let member = instrument::node(instrument::Role::Member(
+            // Each finished scan continues to the outer join's null row below.
+            'scanned: {
+                // A heap-only outer scan uses heap-offset order, so row errors on
+                // freshly loaded tables follow PostgreSQL's physical insertion
+                // order. Spilled rows stream in SST order to avoid point-reading
+                // every immutable row; SQL without ORDER BY has no row-order
+                // contract. Inner scans avoid re-sorting for each outer row.
+                let slot = scope.slots[order[depth]];
+                if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
+                    && storage.relation_has_descendants(slot, txid)
+                {
+                    // The members executor pruning keeps, with every value this
+                    // scan knows, as the plan's members name them.
+                    let table = order[depth];
+                    let conditions =
+                        super::partition_prune::scan_conditions(from, where_clause, table, arena)?;
+                    let values = super::partition_prune::ScanValues {
+                        storage,
+                        txid,
+                        relation: super::partition_prune::ScanRelation::From { scope, table },
+                        arena,
+                        params,
+                        hooks,
+                    };
+                    let leaves = super::partition_prune::members(
+                        storage,
+                        txid,
+                        slot,
+                        conditions,
+                        &values,
+                        super::partition_prune::PruneStage::Scan,
+                        arena,
+                    )?
+                    .leaves;
+                    let append = instrument::node(instrument::Role::Scan(
                         u16::try_from(table).unwrap_or(u16::MAX),
-                        u32::try_from(leaf).unwrap_or(u32::MAX),
                     ));
-                    let _member_loop = member.start();
-                    let _member_counts = MemberCounts::new(append, member);
-                    let physical = definitions.definition(storage, leaf, txid)?;
-                    let foreign = physical.kind == crate::storage::TableKind::Foreign;
-                    // PostgreSQL keeps no scan statistics for foreign tables.
-                    if !foreign {
-                        storage.record_relation_scan(
+                    let mut index = 0usize;
+                    let definitions = storage.table_definition_images();
+                    let logical = scope
+                        .defs
+                        .stored(order[depth])
+                        .expect("resolved logical relation");
+                    for &leaf in leaves {
+                        // A RIGHT or FULL join knows a member's rows by their
+                        // ordinal across every member.
+                        if let Some(members) = matched[depth].members {
+                            index = members
+                                .iter()
+                                .find(|(held, _)| *held == leaf)
+                                .map(|&(_, first)| first)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "join member changed during the join"
+                                    )
+                                })?;
+                        }
+                        // Each member's scan counts its share of the `Append`'s
+                        // rows while it runs.
+                        let member = instrument::node(instrument::Role::Member(
+                            u16::try_from(table).unwrap_or(u16::MAX),
+                            u32::try_from(leaf).unwrap_or(u32::MAX),
+                        ));
+                        let _member_loop = member.start();
+                        let _member_counts = MemberCounts::new(append, member);
+                        let physical = definitions.definition(storage, leaf, txid)?;
+                        let foreign = physical.kind == crate::storage::TableKind::Foreign;
+                        // PostgreSQL keeps no scan statistics for foreign tables.
+                        if !foreign {
+                            storage.record_relation_scan(
+                                txid,
+                                leaf,
+                                None,
+                                0,
+                                crate::sql::datetime::now_micros(),
+                            )?;
+                        }
+                        let mapping =
+                            crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                        let leaf_oid =
+                            Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
+                        let mut visit = |rowid: Option<u64>,
+                                         physical_values: &[Datum<'a>]|
+                         -> Result<bool, SqlError> {
+                            check_timeout()?;
+                            if !foreign {
+                                storage.record_relation_tuple_read(txid, leaf, None)?;
+                            }
+                            let this = index;
+                            index += 1;
+                            recycled(arena, recycle_rows, retain_match, || {
+                                // The leaf's oid follows the columns, as the row's
+                                // `tableoid`.
+                                let values = arena
+                                    .alloc_slice_with(logical.n_columns + 1, |_| Datum::Null)
+                                    .map_err(|_| arena_full())?;
+                                mapping.project(physical_values, &mut values[..logical.n_columns]);
+                                values[logical.n_columns] = leaf_oid;
+                                refresh_catalog_object_names(
+                                    storage,
+                                    txid,
+                                    &mut values[..logical.n_columns],
+                                    arena,
+                                )?;
+                                visit_candidate!(this, BoundRow::Values(values), rowid)
+                            })
+                        };
+                        if !for_each_member_row(
+                            storage,
                             txid,
                             leaf,
-                            None,
-                            0,
-                            crate::sql::datetime::now_micros(),
-                        )?;
-                    }
-                    let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
-                    let leaf_oid =
-                        Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
-                    let mut schema = [ColType::Bool; MAX_COLUMNS];
-                    physical.schema(&mut schema);
-                    let schema = &schema[..physical.n_columns];
-                    let mut visit = |rowid: Option<u64>,
-                                     physical_values: &[Datum<'a>]|
-                     -> Result<bool, SqlError> {
-                        check_timeout()?;
-                        if !foreign {
-                            storage.record_relation_tuple_read(txid, leaf, None)?;
-                        }
-                        let this = index;
-                        index += 1;
-                        recycled(arena, recycle_rows, retain_match, || {
-                            // The leaf's oid follows the columns, as the row's
-                            // `tableoid`.
-                            let values = arena
-                                .alloc_slice_with(logical.n_columns + 1, |_| Datum::Null)
-                                .map_err(|_| arena_full())?;
-                            mapping.project(physical_values, &mut values[..logical.n_columns]);
-                            values[logical.n_columns] = leaf_oid;
-                            refresh_catalog_object_names(
-                                storage,
-                                txid,
-                                &mut values[..logical.n_columns],
-                                arena,
-                            )?;
-                            visit_candidate!(this, BoundRow::Values(values), rowid)
-                        })
-                    };
-                    // A foreign child's rows come from its server, as a
-                    // foreign table read on its own does.
-                    if foreign {
-                        let stream = crate::sql::foreign::ForeignStream::new(leaf, None, arena)?;
-                        let finished = crate::sql::foreign::stream_rows(
-                            storage,
-                            &stream,
-                            txid,
+                            physical,
                             arena,
+                            recycle_rows,
                             hooks.sequences,
-                            &mut |bytes| {
-                                let mut values = [Datum::Null; MAX_COLUMNS];
-                                let width = crate::sql::exec::decode_projected_row_into(
-                                    bytes,
-                                    arena,
-                                    &mut values,
-                                )?;
-                                visit(None, &values[..width])
-                            },
-                        )?;
-                        if !finished {
+                            &mut visit,
+                        )? {
                             return Ok(false);
                         }
-                        continue;
                     }
-                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
-                    let flow = scan.for_each_overlay(&mut |rowid, home| {
-                        let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
-                        let mut values = [Datum::Null; MAX_COLUMNS];
-                        rowenc::decode(bytes, schema, &mut values)?;
-                        if !visit(Some(rowid), &values[..physical.n_columns])? {
-                            return Ok(core::ops::ControlFlow::Break(()));
-                        }
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    })?;
-                    if flow.is_break() {
-                        return Ok(false);
-                    }
-                    scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
-                        for row in rows {
-                            let mut decoded = [Datum::Null; MAX_COLUMNS];
-                            let values = match row.representation {
-                                crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                                    rowenc::decode(bytes, schema, &mut decoded)?;
-                                    &decoded[..physical.n_columns]
-                                }
-                                crate::storage::SpilledRowRepresentation::Values(values) => values,
-                            };
-                            if !visit(Some(row.rowid), values)? {
-                                aborted = true;
-                                return Ok(core::ops::ControlFlow::Break(()));
-                            }
-                        }
-                        Ok(core::ops::ControlFlow::Continue(()))
-                    })?;
-                    if aborted {
-                        return Ok(false);
-                    }
+                    break 'scanned;
                 }
-                return Ok(true);
-            }
-            let access = indexed.filter(|access| access.table == order[depth]);
-            // A target hash join's build already scanned this source once.
-            let hashed = (depth == 0 && order[0] == 0 && access.is_none())
-                .then_some(scope.target_hash_candidates)
-                .flatten();
-            let candidates = access.map(|access| access.rowids).or(hashed);
-            let index_order = depth == 0
-                && hashed.is_none()
-                && select_condition_reaches_index(storage, scope, txid, where_clause);
-            if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
-                visit_sequential_physical_rows!(slot);
-                return Ok(true);
-            }
-            if hashed.is_none() && access.is_none_or(|access| access.scan_executed) {
-                storage.record_relation_scan(
-                    txid,
-                    slot,
-                    access.map(|access| access.statistics()),
-                    access.map_or(0, |access| access.index_entries),
-                    crate::sql::datetime::now_micros(),
-                )?;
-            }
-            // A key-carrying ordered candidate set can satisfy the scan
-            // without fetching the base tuple when the physical demand proof
-            // names only index key columns. This is deliberately narrower
-            // than PostgreSQL INCLUDE coverage: payload columns are not yet
-            // stored in the value-index generation.
-            if let Some(access) = access.filter(|access| {
-                access.preserves_order
-                    && pax_demand
-                        .selected_mask(order[depth])
-                        .is_some_and(|demanded| access.covers(demanded))
-            }) {
-                let definition = scope.defs.get(order[depth]).expect("resolved");
-                let keys = access.keys.expect("covering access retains keys");
-                debug_assert_eq!(keys.len(), access.rowids.len());
-                let key_types = access.key_types;
-                let mut payload_types = [ColType::Bool; MAX_COLUMNS];
-                let mut n_payload = 0usize;
-                for (column, metadata) in definition.columns().iter().enumerate() {
-                    if access.payload_mask.contains(column) {
-                        payload_types[n_payload] = metadata.ctype;
-                        n_payload += 1;
-                    }
+                let access = indexed.filter(|access| access.table == order[depth]);
+                // A target hash join's build already scanned this source once.
+                let hashed = (depth == 0 && order[0] == 0 && access.is_none())
+                    .then_some(scope.target_hash_candidates)
+                    .flatten();
+                let candidates = access.map(|access| access.rowids).or(hashed);
+                let index_order = depth == 0
+                    && hashed.is_none()
+                    && select_condition_reaches_index(storage, scope, txid, where_clause);
+                if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
+                    visit_sequential_physical_rows!(slot);
+                    break 'scanned;
                 }
-                for (this, candidate) in keys.iter().enumerate() {
-                    check_timeout()?;
-                    debug_assert_eq!(candidate.rowid, access.rowids[this]);
-                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let values = arena
-                            .alloc_slice_with(definition.n_columns, |_| Datum::Null)
-                            .map_err(|_| arena_full())?;
-                        let mut key_values = [Datum::Null; MAX_INDEX_COLS];
-                        let key = &access.encoded_keys
-                            [candidate.key_at..candidate.key_at + candidate.key_len];
-                        rowenc::decode(
-                            key,
-                            &key_types[..access.n_columns],
-                            &mut key_values[..access.n_columns],
-                        )?;
-                        for (position, &column) in
-                            access.columns[..access.n_columns].iter().enumerate()
-                        {
-                            if access.expression_mask & (1 << position) == 0 {
-                                values[column as usize] = key_values[position];
-                            }
+                if hashed.is_none() && access.is_none_or(|access| access.scan_executed) {
+                    storage.record_relation_scan(
+                        txid,
+                        slot,
+                        access.map(|access| access.statistics()),
+                        access.map_or(0, |access| access.index_entries),
+                        crate::sql::datetime::now_micros(),
+                    )?;
+                }
+                // A key-carrying ordered candidate set can satisfy the scan
+                // without fetching the base tuple when the physical demand proof
+                // names only index key columns. This is deliberately narrower
+                // than PostgreSQL INCLUDE coverage: payload columns are not yet
+                // stored in the value-index generation.
+                if let Some(access) = access.filter(|access| {
+                    access.preserves_order
+                        && pax_demand
+                            .selected_mask(order[depth])
+                            .is_some_and(|demanded| access.covers(demanded))
+                }) {
+                    let definition = scope.defs.get(order[depth]).expect("resolved");
+                    let keys = access.keys.expect("covering access retains keys");
+                    debug_assert_eq!(keys.len(), access.rowids.len());
+                    let key_types = access.key_types;
+                    let mut payload_types = [ColType::Bool; MAX_COLUMNS];
+                    let mut n_payload = 0usize;
+                    for (column, metadata) in definition.columns().iter().enumerate() {
+                        if access.payload_mask.contains(column) {
+                            payload_types[n_payload] = metadata.ctype;
+                            n_payload += 1;
                         }
-                        let payload = &access.encoded_keys
-                            [candidate.payload_at..candidate.payload_at + candidate.payload_len];
-                        let mut payload_values = [Datum::Null; MAX_COLUMNS];
-                        if n_payload != 0 {
+                    }
+                    for (this, candidate) in keys.iter().enumerate() {
+                        check_timeout()?;
+                        debug_assert_eq!(candidate.rowid, access.rowids[this]);
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                            let values = arena
+                                .alloc_slice_with(definition.n_columns, |_| Datum::Null)
+                                .map_err(|_| arena_full())?;
+                            let mut key_values = [Datum::Null; MAX_INDEX_COLS];
+                            let key = &access.encoded_keys
+                                [candidate.key_at..candidate.key_at + candidate.key_len];
                             rowenc::decode(
-                                payload,
-                                &payload_types[..n_payload],
-                                &mut payload_values[..n_payload],
+                                key,
+                                &key_types[..access.n_columns],
+                                &mut key_values[..access.n_columns],
                             )?;
-                        }
-                        let mut payload_position = 0usize;
-                        for (column, value) in
-                            values.iter_mut().enumerate().take(definition.n_columns)
-                        {
-                            if access.payload_mask.contains(column) {
-                                *value = payload_values[payload_position];
-                                payload_position += 1;
+                            for (position, &column) in
+                                access.columns[..access.n_columns].iter().enumerate()
+                            {
+                                if access.expression_mask & (1 << position) == 0 {
+                                    values[column as usize] = key_values[position];
+                                }
                             }
+                            let payload = &access.encoded_keys[candidate.payload_at
+                                ..candidate.payload_at + candidate.payload_len];
+                            let mut payload_values = [Datum::Null; MAX_COLUMNS];
+                            if n_payload != 0 {
+                                rowenc::decode(
+                                    payload,
+                                    &payload_types[..n_payload],
+                                    &mut payload_values[..n_payload],
+                                )?;
+                            }
+                            let mut payload_position = 0usize;
+                            for (column, value) in
+                                values.iter_mut().enumerate().take(definition.n_columns)
+                            {
+                                if access.payload_mask.contains(column) {
+                                    *value = payload_values[payload_position];
+                                    payload_position += 1;
+                                }
+                            }
+                            refresh_catalog_object_names(storage, txid, values, arena)?;
+                            visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))
+                        })?;
+                        if !keep_scanning {
+                            return Ok(false);
                         }
-                        refresh_catalog_object_names(storage, txid, values, arena)?;
-                        visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))
+                    }
+                    break 'scanned;
+                }
+                // An order-providing index already fixed candidate order. Resolve
+                // and fetch one row at a time so LIMIT can stop before unrelated
+                // object-resident table rows are point-read.
+                if let Some(access) = access.filter(|access| access.preserves_order) {
+                    for (this, &rowid) in access.rowids.iter().enumerate() {
+                        check_timeout()?;
+                        let Some(state) = storage.row_state(slot, rowid)? else {
+                            continue;
+                        };
+                        let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
+                            continue;
+                        };
+                        storage.record_relation_tuple_read(
+                            txid,
+                            slot,
+                            Some(access.statistics()),
+                        )?;
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                            let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                        })?;
+                        if !keep_scanning {
+                            return Ok(false);
+                        }
+                    }
+                    break 'scanned;
+                }
+                let count = match candidates {
+                    Some(rowids) => rowids.len(),
+                    None => storage.visible_row_count(slot, txid)?,
+                };
+                let table_snapshot = storage.table_row_snapshot(slot, Some(arena))?;
+                let ordered = arena
+                    .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+                    .map_err(|_| arena_full())?;
+                let mut fill = 0usize;
+                if let Some(rowids) = candidates {
+                    for &rowid in rowids {
+                        let Some(state) = storage.row_state(slot, rowid)? else {
+                            continue;
+                        };
+                        if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                            ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
+                            fill += 1;
+                        }
+                    }
+                } else {
+                    storage.for_each_row_state(slot, &mut |rowid, state| {
+                        if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                            ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
+                            fill += 1;
+                        }
+                        Ok(core::ops::ControlFlow::Continue(()))
                     })?;
-                    if !keep_scanning {
-                        return Ok(false);
+                    debug_assert_eq!(fill, count, "visible count is stable");
+                }
+                // Spilled rows sort by rowid (their SST order — the physical order
+                // they were written in); heap rows keep heap-offset order after
+                // them, matching insertion order within each group. A hash
+                // chain's order is the hash join's output order.
+                // A condition an index answers reaches rows through their index
+                // entries, which keep an updated row's first position: rows go in
+                // row identity order, as data changes take them.
+                if hashed.is_none() && access.is_none_or(|access| !access.preserves_order) {
+                    if index_order {
+                        ordered[..fill].sort_unstable_by_key(|row| {
+                            row.expect("row snapshots are initialized").rowid()
+                        });
+                    } else {
+                        ordered[..fill].sort_unstable_by_key(|row| {
+                            row.expect("row snapshots are initialized").sort_key()
+                        });
                     }
                 }
-                return Ok(true);
-            }
-            // An order-providing index already fixed candidate order. Resolve
-            // and fetch one row at a time so LIMIT can stop before unrelated
-            // object-resident table rows are point-read.
-            if let Some(access) = access.filter(|access| access.preserves_order) {
-                for (this, &rowid) in access.rowids.iter().enumerate() {
+                for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
+                    let rowid = row.rowid();
+                    let home = row.read()?;
                     check_timeout()?;
-                    let Some(state) = storage.row_state(slot, rowid)? else {
-                        continue;
-                    };
-                    let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
-                        continue;
-                    };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
+                    if hashed.is_none() {
+                        storage.record_relation_tuple_read(
+                            txid,
+                            slot,
+                            access.map(|access| access.statistics()),
+                        )?;
+                    }
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                        let bytes =
+                            storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
                         visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                     })?;
                     if !keep_scanning {
                         return Ok(false);
                     }
-                }
-                return Ok(true);
-            }
-            let count = match candidates {
-                Some(rowids) => rowids.len(),
-                None => storage.visible_row_count(slot, txid)?,
-            };
-            let table_snapshot = storage.table_row_snapshot(slot, Some(arena))?;
-            let ordered = arena
-                .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
-                .map_err(|_| arena_full())?;
-            let mut fill = 0usize;
-            if let Some(rowids) = candidates {
-                for &rowid in rowids {
-                    let Some(state) = storage.row_state(slot, rowid)? else {
-                        continue;
-                    };
-                    if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
-                        fill += 1;
-                    }
-                }
-            } else {
-                storage.for_each_row_state(slot, &mut |rowid, state| {
-                    if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
-                        ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
-                        fill += 1;
-                    }
-                    Ok(core::ops::ControlFlow::Continue(()))
-                })?;
-                debug_assert_eq!(fill, count, "visible count is stable");
-            }
-            // Spilled rows sort by rowid (their SST order — the physical order
-            // they were written in); heap rows keep heap-offset order after
-            // them, matching insertion order within each group. A hash
-            // chain's order is the hash join's output order.
-            // A condition an index answers reaches rows through their index
-            // entries, which keep an updated row's first position: rows go in
-            // row identity order, as data changes take them.
-            if hashed.is_none() && access.is_none_or(|access| !access.preserves_order) {
-                if index_order {
-                    ordered[..fill].sort_unstable_by_key(|row| {
-                        row.expect("row snapshots are initialized").rowid()
-                    });
-                } else {
-                    ordered[..fill].sort_unstable_by_key(|row| {
-                        row.expect("row snapshots are initialized").sort_key()
-                    });
-                }
-            }
-            for (this, row) in ordered[..fill].iter().copied().flatten().enumerate() {
-                let rowid = row.rowid();
-                let home = row.read()?;
-                check_timeout()?;
-                if hashed.is_none() {
-                    storage.record_relation_tuple_read(
-                        txid,
-                        slot,
-                        access.map(|access| access.statistics()),
-                    )?;
-                }
-                let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                    let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
-                    visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                })?;
-                if !keep_scanning {
-                    return Ok(false);
                 }
             }
         } else {
@@ -9939,7 +9937,7 @@ fn scan_source_mode<'a>(
     // right (post-passes below, shallowest level first — so a deeper level's
     // flags also accumulate matches found during a shallower post-pass).
     let matched = arena
-        .alloc_slice_with(scope.n, |_| None)
+        .alloc_slice_with(scope.n, |_| JoinMatches::NONE)
         .map_err(|_| arena_full())?;
     let external_match_map = storage.spill_attached()
         && from
@@ -9950,11 +9948,59 @@ fn scan_source_mode<'a>(
         if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             continue;
         }
+        let t = i + 1;
+        // An expanded relation's rows are known by their ordinal across its
+        // members, each of which is counted here.
+        let members = if scope.derived[t].is_none()
+            && scope.external_runs[t].is_none()
+            && source_ref(from, t).inheritance == RelationInheritance::Descendants
+            && storage.relation_has_descendants(scope.slots[t], txid)
+        {
+            let leaves =
+                crate::sql::exec::relation_leaves_in_order(storage, scope.slots[t], txid, arena)?;
+            let definitions = storage.table_definition_images();
+            let members = arena
+                .alloc_slice_with(leaves.len(), |_| (0usize, 0usize))
+                .map_err(|_| arena_full())?;
+            let mut total = 0usize;
+            for (member, &leaf) in members.iter_mut().zip(leaves) {
+                let physical = definitions.definition(storage, leaf, txid)?;
+                if physical.kind == crate::storage::TableKind::Foreign {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "a RIGHT or FULL join returning the unmatched rows of a foreign partition or inheritance child is not supported"
+                    ));
+                }
+                *member = (leaf, total);
+                let mark = arena.mark();
+                let counted = for_each_member_row(
+                    storage,
+                    txid,
+                    leaf,
+                    physical,
+                    arena,
+                    true,
+                    None,
+                    &mut |_, _| {
+                        total += 1;
+                        Ok(true)
+                    },
+                );
+                // SAFETY: nothing the count read outlives it.
+                unsafe { arena.rewind_to(mark) };
+                counted?;
+            }
+            Some((&*members, total))
+        } else {
+            None
+        };
+        matched[t].members = members.map(|(members, _)| members);
         if external_match_map {
             continue;
         }
-        let t = i + 1;
-        let n_rows = if let Some(run) = scope.external_runs[t] {
+        let n_rows = if let Some((_, total)) = members {
+            total
+        } else if let Some(run) = scope.external_runs[t] {
             usize::try_from(run.rows()).map_err(|_| arena_full())?
         } else if let Some(rows) = scope.derived[t] {
             rows.len()
@@ -9964,7 +10010,10 @@ fn scan_source_mode<'a>(
         let flags = arena
             .alloc_slice_with(n_rows, |_| false)
             .map_err(|_| arena_full())?;
-        let rowids = if scope.external_runs[t].is_none() && scope.derived[t].is_none() {
+        let rowids = if members.is_none()
+            && scope.external_runs[t].is_none()
+            && scope.derived[t].is_none()
+        {
             let rowids = arena
                 .alloc_slice_with(n_rows, |_| 0u64)
                 .map_err(|_| arena_full())?;
@@ -9990,7 +10039,7 @@ fn scan_source_mode<'a>(
         } else {
             None
         };
-        matched[t] = Some(JoinMatchFlags {
+        matched[t].local = Some(JoinMatchFlags {
             flags: core::cell::Cell::from_mut(flags).as_slice_of_cells(),
             rowids,
         });
@@ -10052,7 +10101,7 @@ fn scan_source_mode<'a>(
         if !matches!(from.joins[d - 1].kind, JoinKind::Right | JoinKind::Full) {
             continue;
         }
-        let local_matches = matched[d];
+        let local_matches = matched[d].local;
         let mut phase_match_sorter = if external_match_map {
             let mut sorter = storage.external_sorter()?;
             sorter.reset();
@@ -10159,7 +10208,69 @@ fn scan_source_mode<'a>(
                     f,
                 )
             };
-            if let Some(run) = scope.external_runs[d] {
+            if let Some(members) = matched[d].members {
+                let definitions = storage.table_definition_images();
+                let logical = scope.defs.stored(d).expect("resolved logical relation");
+                for &(leaf, first) in members {
+                    let physical = definitions.definition(storage, leaf, txid)?;
+                    let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                    let leaf_oid =
+                        Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
+                    let mut ordinal = first;
+                    let finished = for_each_member_row(
+                        storage,
+                        txid,
+                        leaf,
+                        physical,
+                        arena,
+                        recycle_rows,
+                        hooks.sequences,
+                        &mut |rowid, physical_values| {
+                            check_timeout()?;
+                            let this = ordinal;
+                            ordinal += 1;
+                            recycled(arena, recycle_rows, retain_match, || {
+                                let already_matched = if external_match_map {
+                                    match external_match_reader.as_deref_mut() {
+                                        Some(reader) => external_match_contains(
+                                            storage,
+                                            reader,
+                                            match_run.expect("external match reader has a run"),
+                                            &mut previous_external_match,
+                                            d,
+                                            join_match_key(this, None),
+                                        )?,
+                                        None => false,
+                                    }
+                                } else {
+                                    local_matches
+                                        .expect("local match map")
+                                        .flag(this, None)?
+                                        .get()
+                                };
+                                if !sample_includes(sample_plans[d], rowid)? || already_matched {
+                                    return Ok(true);
+                                }
+                                let values = arena
+                                    .alloc_slice_with(logical.n_columns + 1, |_| Datum::Null)
+                                    .map_err(|_| arena_full())?;
+                                mapping.project(physical_values, &mut values[..logical.n_columns]);
+                                values[logical.n_columns] = leaf_oid;
+                                refresh_catalog_object_names(
+                                    storage,
+                                    txid,
+                                    &mut values[..logical.n_columns],
+                                    arena,
+                                )?;
+                                emit_unmatched(BoundRow::Values(values), rowid, f)
+                            })
+                        },
+                    )?;
+                    if !finished {
+                        return Ok(());
+                    }
+                }
+            } else if let Some(run) = scope.external_runs[d] {
                 let mut reader = storage.external_run_reader()?;
                 let mut index = 0usize;
                 storage
@@ -10352,6 +10463,73 @@ fn scan_source_mode<'a>(
         }
     }
     Ok(())
+}
+
+/// Visits each row of `leaf`, a member of an expanded FROM item, with its
+/// identity (none for a foreign member's, which come from its server as a
+/// foreign table read on its own does) and its own columns, until `visit`
+/// returns false; returns whether every row was visited.
+#[allow(clippy::too_many_arguments)]
+fn for_each_member_row<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    leaf: usize,
+    physical: &crate::storage::TableDef,
+    arena: &'a Arena,
+    recycle_rows: bool,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    visit: &mut dyn FnMut(Option<u64>, &[Datum<'a>]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    if physical.kind == crate::storage::TableKind::Foreign {
+        let stream = crate::sql::foreign::ForeignStream::new(leaf, None, arena)?;
+        return crate::sql::foreign::stream_rows(
+            storage,
+            &stream,
+            txid,
+            arena,
+            sequences,
+            &mut |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                let width = crate::sql::exec::decode_projected_row_into(bytes, arena, &mut values)?;
+                visit(None, &values[..width])
+            },
+        );
+    }
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    physical.schema(&mut schema);
+    let schema = &schema[..physical.n_columns];
+    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
+    let flow = scan.for_each_overlay(&mut |rowid, home| {
+        let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut values)?;
+        if !visit(Some(rowid), &values[..physical.n_columns])? {
+            return Ok(core::ops::ControlFlow::Break(()));
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    if flow.is_break() {
+        return Ok(false);
+    }
+    let mut aborted = false;
+    scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
+        for row in rows {
+            let mut decoded = [Datum::Null; MAX_COLUMNS];
+            let values = match row.representation {
+                crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                    rowenc::decode(bytes, schema, &mut decoded)?;
+                    &decoded[..physical.n_columns]
+                }
+                crate::storage::SpilledRowRepresentation::Values(values) => values,
+            };
+            if !visit(Some(row.rowid), values)? {
+                aborted = true;
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(!aborted)
 }
 
 /// Moves the rows an `Append` counts while one member's scan runs to that

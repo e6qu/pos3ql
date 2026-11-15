@@ -1667,7 +1667,11 @@ pub fn sort_dedup_projected(
     Ok(unique)
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

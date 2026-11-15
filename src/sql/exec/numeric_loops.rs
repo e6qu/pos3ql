@@ -252,5 +252,5 @@ pub(super) fn visit_nested_blocks<'a>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests;

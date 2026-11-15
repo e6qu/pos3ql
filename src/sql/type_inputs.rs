@@ -1130,7 +1130,7 @@ pub(crate) fn value<'a>(encoded: &'a [u8], arena: &'a Arena) -> Result<Datum<'a>
     Ok(output[0])
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

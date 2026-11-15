@@ -150,6 +150,19 @@ for test_partition in 0-of-12 1-of-12 2-of-12 3-of-12 4-of-12 5-of-12 \
     fi
 done
 
+# One native harness holding both library test suites exhausted the hosted
+# macOS runner's memory. Each suite builds in its own job, and a guard checks
+# that together they run every library test exactly once.
+for native_suite_entry in \
+    'suite: [sql-fixture-suite, unit-suite]' \
+    '--features "${{ matrix.suite }}"' \
+    'python3 tools/check-lib-test-suites.py'; do
+    if ! grep -Fq -- "$native_suite_entry" "$ci_workflow"; then
+        printf 'CI timeout guard: missing native library test suite split %s\n' "$native_suite_entry" >&2
+        failed=1
+    fi
+done
+
 # The differential matrix owns every disjoint deterministic phase and all ten
 # slices of the original seeded fuzz sequence.
 differential_workflow=.github/workflows/differential.yml

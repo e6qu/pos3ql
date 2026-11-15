@@ -9276,8 +9276,12 @@ fn require_column_type_unreferenced(
     );
     let mark = arena.mark();
     let mut first: Option<crate::sql::catalog::dependencies::ObjectAddress> = None;
-    let walked =
-        crate::sql::catalog::dependencies::for_each_dependency(storage, txid, arena, &mut |edge| {
+    let walked = crate::sql::catalog::dependencies::for_each_dependency(
+        storage,
+        txid,
+        crate::sql::catalog_snapshot::TableSelection::All,
+        arena,
+        &mut |edge| {
             if edge.referenced == referenced
                 && matches!(
                     edge.dependent.class,
@@ -9291,7 +9295,8 @@ fn require_column_type_unreferenced(
                 first = Some(edge.dependent);
             }
             Ok(())
-        });
+        },
+    );
     // SAFETY: the visit kept only copied addresses.
     unsafe { arena.rewind_to(mark) };
     walked?;
@@ -30438,7 +30443,11 @@ fn run_plpgsql_procedure<'a>(
     Ok(procedure_output_values(routine, &execution, outputs))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod trigger_program_tests {
     use super::*;
     use crate::mem::budget::Budget;
@@ -32444,7 +32453,7 @@ fn record_reference_error(error: &SqlError) -> bool {
 
 /// Whether PostgreSQL's planner folds `expression` to a constant: literals
 /// combined by operators and casts.
-fn folds_to_constant(expression: &Expr<'_>) -> bool {
+pub(crate) fn folds_to_constant(expression: &Expr<'_>) -> bool {
     match expression {
         Expr::Null
         | Expr::Bool(_)
@@ -106847,7 +106856,11 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
     describe::coltype_of_oid(o)
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

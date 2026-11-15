@@ -2757,7 +2757,11 @@ impl<'b> Responder<'b> {
     }
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     fn message_kinds(mut bytes: &[u8], out: &mut [u8]) -> usize {
         let mut count = 0;

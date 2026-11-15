@@ -749,7 +749,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     #[test]
     fn durable_catalog_position_rejects_zero_and_unrepresentable_sources() {

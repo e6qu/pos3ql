@@ -764,7 +764,7 @@ impl Drop for Loops<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

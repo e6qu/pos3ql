@@ -282,7 +282,7 @@ impl<Key: DefinitionKey, Definition> Drop for DefinitionImages<Key, Definition> 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

@@ -7676,7 +7676,7 @@ fn infer_type_unpositioned(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod temporary_shape_tests {
     use super::*;
 

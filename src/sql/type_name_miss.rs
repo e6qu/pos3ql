@@ -162,7 +162,7 @@ pub(crate) fn is_type_name_miss(error: &SqlError) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::TypeNameMiss;
 
@@ -250,7 +250,7 @@ pub(crate) fn split_type_name(written: &str) -> (Option<&str>, &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod split_tests {
     use super::split_type_name;
 

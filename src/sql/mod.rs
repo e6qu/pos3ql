@@ -14,7 +14,7 @@ mod catalog_snapshot_keys;
 pub(crate) mod commit;
 mod concurrent_index;
 mod driven_insert;
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), not(feature = "sql-fixture-suite")))]
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub(crate) mod array_assignment;
 pub(crate) mod assignment_path;
@@ -34194,12 +34194,15 @@ fn check_prepared_argument_count(
     ))
 }
 
-// Native SQL fixtures are separate from the ownership tests beside runtime modules.
-#[cfg(all(test, not(miri)))]
+// Native SQL fixtures are separate from the ownership tests beside runtime
+// modules, and form their own library test suite (see `Cargo.toml`).
+#[cfg(all(test, not(miri), not(feature = "unit-suite")))]
 mod tests;
 
 #[cfg(all(test, not(miri)))]
-pub(crate) use tests::object_reads::HttpObjectServer;
+mod http_object_server;
+#[cfg(all(test, not(miri)))]
+pub(crate) use http_object_server::HttpObjectServer;
 
 /// The extension initdb installs; its members are built in, so it cannot be
 /// altered, dropped or commented on.

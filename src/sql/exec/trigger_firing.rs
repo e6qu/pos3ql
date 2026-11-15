@@ -920,5 +920,5 @@ fn invalid(message: &str) -> SqlError {
     sql_err!(sqlstate::INTERNAL_ERROR, "{}", message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests;

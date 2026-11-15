@@ -488,7 +488,11 @@ pub(super) fn same_bindings(
             })
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::storage::tests::{make_def, test_budget, test_config};

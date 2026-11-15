@@ -828,7 +828,11 @@ fn refresh_catalog_object_names<'a>(
     Ok(())
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::{PaxColumnDemand, PaxReadDemand, SampleIdentity, TableSamplePlan};
     use crate::sql::ast::{BinaryOp, TableSampleMethod};

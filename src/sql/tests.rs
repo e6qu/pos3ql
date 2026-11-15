@@ -18,6 +18,7 @@ mod builtin_routine_changes;
 mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
+mod catalog_capture_selection;
 mod catalog_identity_lookup;
 mod catalog_join_probes;
 mod catalog_join_work;
@@ -19548,6 +19549,9 @@ fn truncate_fanout_releases_definition_images_before_statement_triggers() {
 fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
     const TABLES: usize = 300;
     let mut config = test_config("truncate-fanout-prepared-cold-recovery");
+    // Measures capacity, not capture selection: every other test repeats
+    // each reached-table catalog capture over all tables.
+    config.catalog_capture_cross_check = false;
     config.max_catalog_versions_per_object = 1;
     config.max_tables = TABLES;
     config.max_indexes = TABLES;

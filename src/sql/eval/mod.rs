@@ -176,7 +176,7 @@ pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod control_identity_tests;
 
 /// A PostgreSQL SQLSTATE that has already passed the protocol's five-byte
@@ -15244,7 +15244,11 @@ pub(crate) fn arena_full() -> SqlError {
     )
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

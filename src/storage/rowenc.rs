@@ -1066,7 +1066,11 @@ fn decode_physical_field_count(input: &[u8]) -> Option<(u16, usize)> {
     Some((fields, prefix))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::*;
 

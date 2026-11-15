@@ -177,7 +177,7 @@ fn inactive() -> SqlError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod ownership_tests {
     use super::*;
     use crate::mem::Budget;

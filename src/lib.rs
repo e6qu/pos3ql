@@ -11,6 +11,17 @@
 // SQL errors own a fixed protocol-sized message so post-startup error paths
 // allocate nothing. Boxing them to satisfy Clippy would violate that invariant.
 #![allow(clippy::result_large_err)]
+// A test-only helper that only the other library test suite calls is unused
+// in one suite's executable; the complete build (and Clippy) still checks it.
+#![cfg_attr(
+    all(test, any(feature = "sql-fixture-suite", feature = "unit-suite")),
+    allow(dead_code, unused_imports)
+)]
+
+// Each library test suite excludes the other's tests; together they are the
+// complete set, which a build without either feature runs.
+#[cfg(all(feature = "sql-fixture-suite", feature = "unit-suite"))]
+compile_error!("select at most one library test suite feature");
 
 pub(crate) mod checkpoint;
 pub mod config;

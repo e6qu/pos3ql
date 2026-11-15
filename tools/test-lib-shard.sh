@@ -5,6 +5,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 partition=${1:-}
+# Optional: where to keep the complete test list, for the suite guard.
+list_output=${2:-}
 index=${partition%%-of-*}
 count=${partition#*-of-}
 case "$index:$count" in
@@ -21,6 +23,9 @@ fi
 list=$(mktemp)
 trap 'rm -f "$list"' EXIT
 cargo test --locked --lib -- --list > "$list"
+if [ -n "$list_output" ]; then
+    cp "$list" "$list_output"
+fi
 
 # Validate cold-read effects before the rest of worker zero. Execute this
 # case once overall even if future test names move its ordinal to another worker.

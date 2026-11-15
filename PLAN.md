@@ -586,9 +586,11 @@ each restrictive one. `EXPLAIN` of a single-relation query, `UPDATE` or
 write's own policies, then the `SELECT` policies when it reads the target's
 columns, each listed once. `EXPLAIN VERBOSE` of an `UPDATE` or `DELETE` of a
 plain table prints its scan's `Output` (each assigned column's new value, then
-`ctid`) and its `RETURNING` list; a `DEFAULT` assignment, a constant the
-planner coerces to the column's type and a subscripted assignment leave the
-scan's `Output` unprinted. A foreign table's candidate
+`ctid`) and its `RETURNING` list, with a `DEFAULT` as the column's default
+(folded when constant, a typed null without one), a constant folded to the
+column's type and an element or slice assignment as `column[...] := value`;
+an assignment through a composite field leaves the scan's `Output`
+unprinted. A foreign table's candidate
 rows are read again by their remote row identity and qualified in the
 change loop the same way. Remaining gaps: an `UPDATE ... FROM` or `DELETE
 ... USING` whose target reaches a foreign table's rows qualifies them
@@ -1053,37 +1055,43 @@ limits do not count as evidence.
 [CONTRIBUTING.md](CONTRIBUTING.md) holds the verification gates. The roadmap is
 finished only when every milestone's "done when" is demonstrated.
 
-The macOS arm64 native test build is memory-bound: compiling the library test
-executable peaks at 7.2 GB of rustc memory footprint (measured on revision
-`deb5c406`, `native-ci` profile, Apple M-series, `RUSTC_WRAPPER` running
-`/usr/bin/time -l`), all of the hosted runner, which then swaps; the build
-takes about 10.5 minutes there against under 3 minutes on a larger machine.
-The library alone peaks at 5.1 GB, so its 4,075 tests add about 2.1 GB.
-`-Ztime-passes` shows the front end holding its results into code
-generation: parsing and name resolution reach 2.5 GB (1.8 GB for the library
-alone), type checking adds 1.2 GB (1.0) and borrow checking 1.6 GB (0.9), and
-the monomorphization graph adds 0.9 GB (none for the library alone), peaking
-when code generation partitions. The test modules use crate-private
-interfaces throughout (`run_with` drives `Engine` with private transaction,
-cursor and responder state), and the crate keeps that surface private
-(`unreachable_pub`), so moving them into integration tests would publish the
-engine's internals. Remaining: split the library test build so no compiler
-process holds both the largest SQL fixture suites (`sql::tests`, 150,000
-lines) and the other native suites, for example by building two test
-executables selected by an explicit Cargo feature, each in its own CI job,
-before the library grows enough to approach the 15-minute job limit again.
+The macOS arm64 native test build is memory-bound. Measured with a
+`RUSTC_WRAPPER` running `/usr/bin/time -l` on the `native-ci` profile (Apple
+M-series, peak memory footprint), the library alone peaks at 5.57 GB and one
+test executable holding every library test at 8.02 GB, more than a hosted
+macOS arm64 runner's 7 GB. The library tests therefore form two suites, each
+built by its own `native-test-build` job: `--features sql-fixture-suite` (the
+SQL fixtures in `sql::tests`) peaks at 6.90 GB and `--features unit-suite`
+(every other library test) at 7.11 GB. A build without either feature still
+runs the complete set, and `tools/check-lib-test-suites.py` checks in CI that
+the two suites together run every test exactly once. Remaining: each suite is
+still within about 0.1 GB of the runner's memory, so the next large addition
+of tests or library code needs a further split (for example the storage and
+checkpoint units apart from the SQL units) before it swaps again. The test
+modules use crate-private interfaces throughout (`run_with` drives `Engine`
+with private transaction, cursor and responder state), and the crate keeps
+that surface private (`unreachable_pub`), so moving them into integration
+tests would publish the engine's internals.
 
 Commit-time catalog history (`catalog_snapshot::capture_transaction`)
 synthesizes each catalog a transaction's changes can affect twice, as
 committed and as the transaction sees it, and records the rows that differ.
-Profiling `configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery`
-(300 tables chained by foreign keys, debug `native-ci` build) puts 95% of its
-time there: `pg_depend` takes 45% of the synthesis (its constraint
-dependencies rebuild `pg_constraint`), `pg_class` 15%, `pg_constraint` 14%,
-`pg_trigger` 7%, `pg_attribute` 6%. Each table's index catalog is now scanned
-once per table instead of once per key, and a foreign key's parent
-constraint is looked up only for a partition clone, which takes the test from
-88.5 s to 86.8 s. Remaining: synthesize only the rows of the objects a change
-touched (with the tables its foreign keys, partitions and triggers reach),
-per catalog, and look up a table's indexes and a foreign key's parent table
-through identity maps instead of scans of every index and table name.
+When every change edits one table (its definition, indexes, triggers,
+policies or statistics), `reached_tables` selects that table's partition or
+inheritance family and the tables one foreign key away in either direction
+with their families, and `pg_class`, `pg_attribute`, `pg_attrdef`,
+`pg_constraint`, `pg_depend`, `pg_index`, `pg_inherits` and `pg_trigger`
+materialize only those tables' rows; any other change compares
+every table. Lookups that resolve one table's row through another (a key's
+parent, `relhastriggers`, a clone's partition index) still read the
+complete catalog, through per-pass maps of each table's indexes and of
+visible table names. Test builds repeat every selected capture over all
+tables and fail on any difference. Profiling
+`configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery`
+(300 tables chained by foreign keys, `native-ci` build) took it from 94.5 s
+to 32 s. Remaining: `pg_type` (whose domain rows resolve their base type's I/O
+routines through the rows it built, a table's row type among them),
+`pg_shdepend`, `pg_description`, `pg_publication_rel`,
+`pg_policy`, `pg_statistic_ext`, `pg_partitioned_table`, `pg_rewrite` and
+`pg_sequence` still materialize every table's rows for a table change, and
+changes to views, sequences, routines and types select every table.

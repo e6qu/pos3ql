@@ -4911,23 +4911,7 @@ fn changed_row_outputs(
             else {
                 continue;
             };
-            // The planner coerces a constant of another type to the column's
-            // type and folds it; a `DEFAULT` prints the planned default.
-            if matches!(value, Expr::DefaultMarker)
-                || value.is_constant(true)
-                    && crate::sql::exec::infer_type_res(value, &columns).is_ok_and(|(oid, _)| {
-                        oid != column.ctype.oid() && oid != crate::sql::types::oid::UNKNOWN
-                    })
-            {
-                return Ok(false);
-            }
-            let Some(text) = crate::sql::catalog::deparse::deparse_expression(
-                &context,
-                value,
-                crate::sql::catalog::deparse::Destination::Assignment(column.ctype.oid()),
-                arena,
-            )?
-            else {
+            let Some(text) = assigned_output(&context, &columns, column, value, arena)? else {
                 return Ok(false);
             };
             let _ = write!(scan, "{text}, ");
@@ -4977,6 +4961,181 @@ fn changed_row_outputs(
         return Err(too_long());
     }
     Ok((scan, written))
+}
+
+/// The planned form of one column's new value in a scan's `Output`: a
+/// `DEFAULT` is the column's default expression (a null of its type when it
+/// has none), a constant the planner folds to the column's type prints that
+/// constant, and an element or slice assignment prints `column[...] := value`.
+fn assigned_output<'a>(
+    context: &crate::sql::catalog::deparse::Context<'_>,
+    columns: &crate::sql::exec::AliasedDefCols<'_, '_>,
+    column: &crate::storage::ColumnMeta,
+    value: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use crate::sql::catalog::deparse::{Destination, deparse_expression};
+    let target = column.ctype.oid();
+    let value = match value {
+        Expr::DefaultMarker => match column.default.expression() {
+            None => {
+                return deparse_expression(
+                    context,
+                    &Expr::Null,
+                    Destination::Assignment(target),
+                    arena,
+                );
+            }
+            Some(source) => {
+                let source = arena
+                    .alloc_str(source.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                crate::sql::parser::parse_expr(source, arena)?
+            }
+        },
+        Expr::Call { name, args, .. }
+            if matches!(
+                *name,
+                "__jsonb_subscript_set" | "__array_subscript_set" | "__assign_path"
+            ) =>
+        {
+            return assigned_path_output(context, column, name, args, arena);
+        }
+        value => value,
+    };
+    // The planner folds a constant expression, coerced to the column's type.
+    // Analysis already converted a cast or typed literal to a bound value.
+    let bound = matches!(
+        value,
+        Expr::BoundLiteral {
+            value: crate::sql::ast::BoundLiteralValue::Folded(_),
+            ..
+        }
+    );
+    if bound
+        || crate::sql::exec::folds_to_constant(value)
+            && !matches!(value, Expr::Str(_) | Expr::Null)
+            && crate::sql::exec::infer_type_res(value, columns)
+                .is_ok_and(|(oid, _)| oid != crate::sql::types::oid::UNKNOWN)
+    {
+        let evaluated = crate::sql::eval::eval_full(
+            value,
+            arena,
+            &[],
+            &crate::sql::eval::NoColumns,
+            &crate::sql::eval::NO_HOOKS,
+        )?;
+        // An assignment enforces the column's modifier (`varchar(3)`).
+        let folded = crate::sql::exec::apply_typmod(
+            crate::sql::eval::cast_to(evaluated, column.ctype, arena)?,
+            column.ctype,
+            column.type_mod,
+            arena,
+        )?;
+        let length = crate::sql::exec::projected_row_len(&[folded])?;
+        let encoded = arena
+            .alloc_slice_with(length, |_| 0u8)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        crate::sql::exec::encode_projected_into(&[folded], encoded)?;
+        let constant = arena
+            .alloc(Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::Folded(encoded),
+                type_oid: target,
+                type_mod: -1,
+                collation: None,
+                source: value,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        return deparse_expression(context, constant, Destination::Value, arena);
+    }
+    deparse_expression(context, value, Destination::Assignment(target), arena)
+}
+
+/// `column[i] := value` or `column[i:j] := value`, as PostgreSQL prints a
+/// subscripted assignment (a `SubscriptingRef` with an assigned value). An
+/// assignment through a composite field is not printed.
+fn assigned_path_output<'a>(
+    context: &crate::sql::catalog::deparse::Context<'_>,
+    column: &crate::storage::ColumnMeta,
+    name: &str,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use crate::sql::catalog::deparse::{Destination, deparse_expression};
+    let crate::sql::types::ColType::Array(element) = column.ctype else {
+        return Ok(None);
+    };
+    // The parser's three assignment forms: element subscripts only, a
+    // subscript list holding a slice, and a path through fields.
+    let (base, value, kinds, operands): (&Expr<'_>, &Expr<'_>, &str, &[&Expr<'_>]) =
+        match (name, args) {
+            ("__jsonb_subscript_set", [base, value, operands @ ..]) if operands.len() <= 6 => {
+                (base, value, &"eeeeee"[..operands.len()], operands)
+            }
+            ("__array_subscript_set", [base, value, Expr::Str(kinds), operands @ ..])
+            | ("__assign_path", [base, value, _, Expr::Str(kinds), operands @ ..]) => {
+                (base, value, kinds, operands)
+            }
+            _ => return Ok(None),
+        };
+    if !kinds.bytes().all(|kind| matches!(kind, b'e' | b's'))
+        || operands.len()
+            != kinds
+                .bytes()
+                .map(|kind| 1 + usize::from(kind == b's'))
+                .sum::<usize>()
+    {
+        return Ok(None);
+    }
+    let Some(base) = deparse_expression(context, base, Destination::Value, arena)? else {
+        return Ok(None);
+    };
+    let mut text = StackStr::<256>::new();
+    let _ = text.write_str(base);
+    let mut operand = operands.iter();
+    for kind in kinds.bytes() {
+        let _ = text.write_str("[");
+        for (index, bound) in operand
+            .by_ref()
+            .take(1 + usize::from(kind == b's'))
+            .enumerate()
+        {
+            let Some(bound) = deparse_expression(
+                context,
+                bound,
+                Destination::Assignment(crate::sql::types::oid::INT4),
+                arena,
+            )?
+            else {
+                return Ok(None);
+            };
+            if index != 0 {
+                let _ = text.write_str(":");
+            }
+            let _ = text.write_str(bound);
+        }
+        let _ = text.write_str("]");
+    }
+    let target = if kinds.contains('s') {
+        column.ctype.oid()
+    } else {
+        element.element_oid()
+    };
+    let Some(value) = deparse_expression(context, value, Destination::Assignment(target), arena)?
+    else {
+        return Ok(None);
+    };
+    let _ = write!(text, " := {value}");
+    if text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "EXPLAIN output column list exceeds 256 bytes"
+        ));
+    }
+    arena
+        .alloc_str(text.as_str())
+        .map(Some)
+        .map_err(|_| crate::sql::eval::arena_full())
 }
 
 fn inserted_row_output(
@@ -8332,7 +8491,11 @@ pub(super) fn emit_plan(
     Ok(Ok(()))
 }
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::{PlanNode, object_request_cost, structured_node_name};
     use crate::store::BlockIoStats;

@@ -803,9 +803,10 @@ fn action(code: u8) -> Datum<'static> {
 pub(super) fn dependencies<'a>(
     storage: &Storage,
     transaction: u32,
+    tables: super::TableSelection<'_>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
-    let constraints = super::pg_constraint_values(storage, transaction, arena)?;
+    let constraints = super::pg_constraint_values(storage, transaction, tables, arena)?;
     let definition = super::schema::require("pg_constraint", false);
     let [
         kind,
@@ -837,7 +838,7 @@ pub(super) fn dependencies<'a>(
             .position(|(field, _)| *field == name)
             .expect("constraint source field exists")
     });
-    let indexes = super::collect_indexes(storage, transaction, arena)?;
+    let indexes = super::collect_indexes(storage, transaction, tables, arena)?;
     let mut output = Output::new(arena);
     let mut push = |class, object, referenced_class, referenced_object, column, kind| {
         output.push(&[
@@ -1250,7 +1251,8 @@ pub(super) fn dependencies<'a>(
         }
     }
     for table in 0..storage.table_count() {
-        if storage.table_slot_visible_to(table, transaction)
+        if tables.includes(table)
+            && storage.table_slot_visible_to(table, transaction)
             && storage.table_def(table, transaction).has_toast
         {
             push(
@@ -1263,7 +1265,7 @@ pub(super) fn dependencies<'a>(
             )?;
         }
     }
-    for index in super::collect_toast_indexes(storage, transaction, arena)? {
+    for index in super::collect_toast_indexes(storage, transaction, tables, arena)? {
         for column in [1, 2] {
             push(
                 super::PG_CLASS_OID,

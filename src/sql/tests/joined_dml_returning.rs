@@ -616,3 +616,43 @@ fn write_explain_prints_row_security_and_verbose_outputs() {
         );
     });
 }
+
+/// EXPLAIN VERBOSE of an `UPDATE` prints each assigned column's planned value
+/// as PostgreSQL 18.6 does: a `DEFAULT` as the column's default, folded when
+/// constant and a typed null without one; a constant folded to the column's
+/// type; and an element or slice assignment as `column[...] := value`.
+#[test]
+fn update_verbose_output_prints_defaults_folded_constants_and_subscripts() {
+    with_engine("update-verbose-assigned-outputs", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE SEQUENCE uvo_seq; CREATE TABLE uvo (a int, b bigint DEFAULT 7, \
+             e int DEFAULT 5, f int, g int[], h int DEFAULT nextval('uvo_seq'), j float8)",
+        );
+        for (assignment, output) in [
+            ("b = DEFAULT", "'7'::bigint, ctid"),
+            ("e = DEFAULT", "5, ctid"),
+            ("f = DEFAULT", "NULL::integer, ctid"),
+            ("h = DEFAULT", "nextval('uvo_seq'::regclass), ctid"),
+            ("b = 1 + 2, a = -3", "'-3'::integer, '3'::bigint, ctid"),
+            ("a = 1.5, j = 1", "2, '1'::double precision, ctid"),
+            ("g[1] = 4", "g[1] := 4, ctid"),
+            ("g[1:2] = '{4,5}'", "g[1:2] := '{4,5}'::integer[], ctid"),
+        ] {
+            assert_eq!(
+                data_rows(&run_with(
+                    engine,
+                    budget,
+                    &format!("EXPLAIN (VERBOSE, COSTS OFF) UPDATE uvo SET {assignment}"),
+                )),
+                [
+                    "Update on public.uvo".to_string(),
+                    "  ->  Seq Scan on public.uvo".to_string(),
+                    format!("        Output: {output}"),
+                ],
+                "{assignment}"
+            );
+        }
+    });
+}

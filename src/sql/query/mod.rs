@@ -37,7 +37,7 @@ pub(crate) use retained::{
     stream_query, union_all_leaves,
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod routine_contract_tests;
 
 mod setops;

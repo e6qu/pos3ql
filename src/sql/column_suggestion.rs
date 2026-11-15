@@ -243,7 +243,7 @@ pub(crate) fn levenshtein(source: &str, target: &str) -> usize {
     previous[target_len]
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

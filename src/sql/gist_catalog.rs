@@ -14,7 +14,11 @@ pub(crate) const FAMILIES: [(i32, &str); 9] = [
     (6158, "multirange_ops"),
 ];
 
-#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[cfg(all(
+    test,
+    not(all(miri, feature = "miri-ownership")),
+    not(feature = "sql-fixture-suite")
+))]
 mod tests {
     use super::FAMILIES;
 

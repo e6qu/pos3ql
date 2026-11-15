@@ -50087,6 +50087,17 @@ impl Storage {
         Ok(found)
     }
 
+    /// The schema of the first visible user routine named `name` in the
+    /// current database, in catalog order.
+    pub(crate) fn visible_routine_schema(&self, name: &str, txid: u32) -> Option<SqlName> {
+        self.routine_entries().find_map(|(_, routine)| {
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name)
+                .then(|| routine.schema_for(txid))
+        })
+    }
+
     /// Whether a visible user routine of any schema with this name is volatile.
     pub(crate) fn has_volatile_routine_named(&self, name: &str, txid: u32) -> bool {
         self.routine_entries().any(|(slot, routine)| {

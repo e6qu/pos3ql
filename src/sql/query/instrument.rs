@@ -12,8 +12,12 @@
 //! slots for the current thread. Each operator asks for its node with
 //! [`node`], opens one loop per execution ([`Node::start`]) and counts the
 //! rows it returns and the rows its qualifications remove. The slots live in
-//! the statement arena next to the plan, so counting allocates nothing; an
-//! attempt that restarts after a wait plans, and so counts, afresh.
+//! the statement arena next to the plan, so counting allocates nothing. A
+//! statement that runs again from its first row after an attempt stopped
+//! counts each node in the last attempt that ran it: a node's counters
+//! restart when a later attempt first reaches it, so a node an earlier
+//! attempt finished for good (a data-modifying `WITH` query whose write the
+//! later attempts keep) reports that attempt's work.
 //!
 //! Routine and trigger bodies run statements of their own, which are not part
 //! of the explained plan: [`suspend`] hides the counters while they run.
@@ -37,9 +41,9 @@ pub(crate) enum Segment {
     /// The subquery whose query is at this address, run as a subplan: its
     /// operators count apart from the enclosing block's.
     Sublink(u64),
-    /// A `WITH` query run once. EXPLAIN does not show these yet; the
-    /// segment keeps their operators apart.
-    Cte,
+    /// The `WITH` query at this position of its list, run once: its
+    /// statement's `CTE name` InitPlan.
+    Cte(usize),
     /// The query at this position of the queries rewrite rules turn the
     /// statement into, which the top block holds.
     Query(u16),
@@ -52,7 +56,8 @@ impl Segment {
             Self::Branch(position) => (2 << 32) | position as u64,
             Self::Source => 3 << 32,
             Self::Sublink(query) => (4 << 56) ^ query,
-            Self::Cte => 5 << 32,
+            // A list position is far below 2^56 entries.
+            Self::Cte(position) => (5 << 56) ^ position as u64,
             Self::Query(position) => (6 << 32) | position as u64,
         }
     }
@@ -152,6 +157,170 @@ pub(crate) struct NodeCounters {
     pub(crate) sort: Option<SortSpace>,
     /// The most bytes of rows a window node held in memory.
     pub(crate) stored: Option<usize>,
+    /// An incremental sort's batches, when it sorted.
+    pub(crate) incremental: Option<IncrementalGroups>,
+}
+
+/// The batches of one kind an incremental sort sorted: their count and the
+/// bytes of rows they held, summed and at most.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct SortGroups {
+    pub(crate) count: u64,
+    pub(crate) total_bytes: usize,
+    pub(crate) peak_bytes: usize,
+}
+
+impl SortGroups {
+    fn add(&mut self, bytes: usize) {
+        self.count += 1;
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.peak_bytes = self.peak_bytes.max(bytes);
+    }
+}
+
+/// An incremental sort's full-sort and presorted-prefix batches.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct IncrementalGroups {
+    pub(crate) full: SortGroups,
+    pub(crate) presorted: SortGroups,
+}
+
+/// PostgreSQL's incremental sort (`nodeIncrementalSort.c`) batching, over
+/// rows that arrive ordered by the presorted keys, with no bound: it
+/// collects at least 32 rows and then the rest of the last one's prefix
+/// group into a full sort, and once a full sort passes 64 rows sorts each
+/// further prefix group on its own (`switchToPresortedPrefixMode`).
+pub(crate) struct IncrementalSortBatches {
+    groups: IncrementalGroups,
+    /// The prefix group of the latest row.
+    group: u64,
+    started: bool,
+    state: BatchState,
+    /// The full sort being loaded: each row's prefix group and bytes.
+    batch_groups: [u64; FULL_SORT_LIMIT],
+    batch_bytes: [usize; FULL_SORT_LIMIT],
+    batch_rows: usize,
+}
+
+const MIN_GROUP: usize = 32;
+/// A full sort past `2 * MIN_GROUP` rows switches to presorted mode.
+const FULL_SORT_LIMIT: usize = 2 * MIN_GROUP + 1;
+
+#[derive(Clone, Copy)]
+enum BatchState {
+    /// Loading a full sort; past `MIN_GROUP` rows it takes only rows of
+    /// the prefix group of its `MIN_GROUP`th row.
+    Full { pivot: Option<u64> },
+    /// Loading the rest of prefix group `group` into a prefix sort.
+    Prefix { group: u64, bytes: usize },
+}
+
+impl IncrementalSortBatches {
+    pub(crate) const fn new() -> Self {
+        const NONE: SortGroups = SortGroups {
+            count: 0,
+            total_bytes: 0,
+            peak_bytes: 0,
+        };
+        Self {
+            groups: IncrementalGroups {
+                full: NONE,
+                presorted: NONE,
+            },
+            group: 0,
+            started: false,
+            state: BatchState::Full { pivot: None },
+            batch_groups: [0; FULL_SORT_LIMIT],
+            batch_bytes: [0; FULL_SORT_LIMIT],
+            batch_rows: 0,
+        }
+    }
+
+    /// The next input row: whether its presorted keys differ from the
+    /// previous row's, and its bytes.
+    pub(crate) fn push(&mut self, new_group: bool, bytes: usize) {
+        if new_group && self.started {
+            self.group += 1;
+        }
+        self.started = true;
+        let group = self.group;
+        match self.state {
+            BatchState::Prefix {
+                group: held,
+                bytes: held_bytes,
+            } => {
+                if group == held {
+                    self.state = BatchState::Prefix {
+                        group: held,
+                        bytes: held_bytes.saturating_add(bytes),
+                    };
+                    return;
+                }
+                self.groups.presorted.add(held_bytes);
+                self.start_full(group, bytes);
+            }
+            BatchState::Full { pivot } => {
+                if self.batch_rows >= MIN_GROUP && pivot.is_some_and(|pivot| pivot != group) {
+                    self.finish_full();
+                    self.start_full(group, bytes);
+                    return;
+                }
+                self.batch_groups[self.batch_rows] = group;
+                self.batch_bytes[self.batch_rows] = bytes;
+                self.batch_rows += 1;
+                if self.batch_rows == MIN_GROUP {
+                    self.state = BatchState::Full { pivot: Some(group) };
+                }
+                if self.batch_rows == FULL_SORT_LIMIT {
+                    self.finish_full();
+                    self.switch_to_prefix();
+                }
+            }
+        }
+    }
+
+    /// The batches, once every row was pushed.
+    pub(crate) fn finish(mut self) -> IncrementalGroups {
+        match self.state {
+            BatchState::Full { .. } => self.finish_full(),
+            BatchState::Prefix { bytes, .. } => self.groups.presorted.add(bytes),
+        }
+        self.groups
+    }
+
+    fn start_full(&mut self, group: u64, bytes: usize) {
+        self.batch_groups[0] = group;
+        self.batch_bytes[0] = bytes;
+        self.batch_rows = 1;
+        self.state = BatchState::Full { pivot: None };
+    }
+
+    fn finish_full(&mut self) {
+        let bytes = self.batch_bytes[..self.batch_rows]
+            .iter()
+            .fold(0usize, |total, bytes| total.saturating_add(*bytes));
+        self.groups.full.add(bytes);
+    }
+
+    /// Sorts each prefix group of the full sort on its own; the last one
+    /// continues in the input.
+    fn switch_to_prefix(&mut self) {
+        let mut at = 0usize;
+        loop {
+            let group = self.batch_groups[at];
+            let mut bytes = 0usize;
+            while at < self.batch_rows && self.batch_groups[at] == group {
+                bytes = bytes.saturating_add(self.batch_bytes[at]);
+                at += 1;
+            }
+            if at == self.batch_rows {
+                self.batch_rows = 0;
+                self.state = BatchState::Prefix { group, bytes };
+                return;
+            }
+            self.groups.presorted.add(bytes);
+        }
+    }
 }
 
 /// How a sort ordered its rows, under PostgreSQL's names.
@@ -230,8 +399,10 @@ pub(crate) struct Slot {
     started: Option<std::time::Instant>,
     first_row: Option<u64>,
     /// Rows a write's change loop finished qualifying or removing, which a
-    /// later attempt does not see again: [`restart`] keeps them.
+    /// later attempt does not see again: a restarted slot keeps them.
     carried: Option<(u64, u64)>,
+    /// The attempt whose work the counters hold.
+    attempt: u32,
 }
 
 impl Slot {
@@ -248,11 +419,27 @@ impl Slot {
                 hash: None,
                 sort: None,
                 stored: None,
+                incremental: None,
             },
             open: 0,
             started: None,
             first_row: None,
             carried: None,
+            attempt: 0,
+        }
+    }
+
+    /// Restarts the counters for `attempt`, which reached the node after an
+    /// earlier attempt counted it, keeping the rows the earlier attempts'
+    /// write finished.
+    fn restart(&mut self, attempt: u32) {
+        let carried = self.carried;
+        *self = Self::new(self.key);
+        self.attempt = attempt;
+        if let Some((rows, filtered)) = carried {
+            self.carried = carried;
+            self.counters.rows = rows;
+            self.counters.filtered = filtered;
         }
     }
 
@@ -267,6 +454,8 @@ struct Registry {
     /// For a statement rewrite rules turn into several queries, the
     /// position of the next query to run.
     next_query: Option<u16>,
+    /// The statement's current attempt.
+    attempt: u32,
 }
 
 thread_local! {
@@ -312,6 +501,7 @@ fn install<R>(
         slots: NonNull::from(slots),
         timing,
         next_query,
+        attempt: 0,
     };
     let _restore = Restore {
         active: ACTIVE.with(|active| active.replace(Some(NonNull::from(&mut registry)))),
@@ -337,7 +527,8 @@ pub(crate) fn next_query() {
 
 /// Starts another attempt of the analyzed statement, which runs it again
 /// from its first row after an earlier attempt stopped for a routine call:
-/// the counters restart, so they report the attempt that completes.
+/// each node's counters restart when this attempt first reaches it, so they
+/// report the last attempt that ran the node.
 pub(crate) fn restart() {
     let Some(mut registry) = ACTIVE.with(Cell::get) else {
         return;
@@ -345,16 +536,7 @@ pub(crate) fn restart() {
     // SAFETY: see `node`; no `Node` of the statement is open between
     // attempts, and nothing else borrows the registry here.
     let registry = unsafe { registry.as_mut() };
-    let slots = unsafe { &mut *registry.slots.as_ptr() };
-    for slot in slots.iter_mut() {
-        let carried = slot.carried;
-        *slot = Slot::new(slot.key);
-        if let Some((rows, filtered)) = carried {
-            slot.carried = carried;
-            slot.counters.rows = rows;
-            slot.counters.filtered = filtered;
-        }
-    }
+    registry.attempt = registry.attempt.wrapping_add(1);
     if registry.next_query.is_some() {
         registry.next_query = Some(0);
     }
@@ -379,9 +561,15 @@ pub(crate) fn active() -> bool {
 }
 
 /// The block the executor is running.
-#[cfg(test)]
-fn current_block() -> BlockId {
+pub(crate) fn current_block() -> BlockId {
     BLOCK.with(Cell::get)
+}
+
+/// Runs nested blocks in `block` until the returned scope ends: a query
+/// planned in one block that runs later, from wherever it is first read.
+#[must_use]
+pub(crate) fn enter_block(block: BlockId) -> Entered {
+    Entered(BLOCK.with(|current| current.replace(block)))
 }
 
 thread_local! {
@@ -445,6 +633,7 @@ pub(crate) fn node(role: Role) -> Node {
     Node {
         slot: slot.map(NonNull::from),
         timing: registry.timing,
+        attempt: registry.attempt,
     }
 }
 
@@ -453,19 +642,26 @@ pub(crate) fn node(role: Role) -> Node {
 pub(crate) struct Node {
     slot: Option<NonNull<Slot>>,
     timing: bool,
+    /// The attempt the node counts for.
+    attempt: u32,
 }
 
 impl Node {
     pub(crate) const NONE: Self = Self {
         slot: None,
         timing: false,
+        attempt: 0,
     };
 
     fn with(self, update: impl FnOnce(&mut Slot, bool)) {
         if let Some(mut slot) = self.slot {
             // SAFETY: see `node`; the executor is single-threaded and no
             // reference into a slot is held across calls.
-            update(unsafe { slot.as_mut() }, self.timing);
+            let slot = unsafe { slot.as_mut() };
+            if slot.attempt != self.attempt {
+                slot.restart(self.attempt);
+            }
+            update(slot, self.timing);
         }
     }
 
@@ -531,6 +727,11 @@ impl Node {
         });
     }
 
+    /// Records the batches an incremental sort sorted.
+    pub(crate) fn incremental_sorted(self, groups: IncrementalGroups) {
+        self.with(|slot, _| slot.counters.incremental = Some(groups));
+    }
+
     /// Records a sort the node ran; across rescans PostgreSQL reports the
     /// one that used the most space, preferring one that spilled.
     pub(crate) fn sorted(self, space: SortSpace) {
@@ -592,6 +793,32 @@ impl Node {
         });
     }
 
+    /// Opens one step of the node's single execution: a node run in
+    /// several steps (a data-modifying `WITH` query its readers run a row at
+    /// a time) adds each step's time to one loop.
+    pub(crate) fn step(self) -> Step {
+        self.begin();
+        Step(self)
+    }
+
+    fn end_step(self) {
+        self.with(|slot, _| {
+            slot.open = slot.open.saturating_sub(1);
+            if slot.open != 0 {
+                return;
+            }
+            let first = slot.counters.loops == 0;
+            slot.counters.loops = 1;
+            if let Some(started) = slot.started.take() {
+                let total = elapsed_nanos(started);
+                slot.counters.total_nanos = slot.counters.total_nanos.saturating_add(total);
+                if first {
+                    slot.counters.startup_nanos = slot.first_row.take().unwrap_or(total);
+                }
+            }
+        });
+    }
+
     fn end(self) {
         self.with(|slot, _| {
             slot.open = slot.open.saturating_sub(1);
@@ -647,6 +874,16 @@ impl ScanOutput {
 
 fn elapsed_nanos(started: std::time::Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// One open step of a node's single execution.
+#[must_use]
+pub(crate) struct Step(Node);
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        self.0.end_step();
+    }
 }
 
 /// One open execution of a node.
@@ -797,6 +1034,72 @@ mod tests {
         let inner = slots[1].counters();
         assert_eq!((inner.loops, inner.rows), (1, 3));
         assert_eq!(slots[2].counters().loops, 0);
+    }
+
+    #[test]
+    fn each_node_reports_the_last_attempt_that_ran_it() {
+        let write = NodeKey::new(BlockId::ROOT.child(Segment::Cte(0)), Role::Scan(0));
+        let read = NodeKey::new(BlockId::ROOT, Role::Scan(0));
+        let mut slots = [Slot::new(Some(write)), Slot::new(Some(read))];
+        analyze(&mut slots, false, || {
+            restart();
+            {
+                let _cte = enter(Segment::Cte(0));
+                let scan = node(Role::Scan(0));
+                let _loop = scan.start();
+                scan.rows(4);
+                scan.filtered();
+            }
+            let scan = node(Role::Scan(0));
+            {
+                let _loop = scan.start();
+                scan.rows(2);
+            }
+            // The next attempt keeps the write and reads again.
+            restart();
+            let scan = node(Role::Scan(0));
+            let _loop = scan.start();
+            scan.rows(3);
+        });
+        let kept = slots[0].counters();
+        assert_eq!((kept.loops, kept.rows, kept.filtered), (1, 4, 1));
+        let read = slots[1].counters();
+        assert_eq!((read.loops, read.rows), (1, 3));
+    }
+
+    #[test]
+    fn a_node_run_in_steps_counts_one_loop() {
+        let modify = NodeKey::new(BlockId::ROOT, Role::Modify);
+        let mut slots = [Slot::new(Some(modify))];
+        analyze(&mut slots, false, || {
+            for _ in 0..3 {
+                let node = node(Role::Modify);
+                let _step = node.step();
+                node.row();
+            }
+        });
+        let counters = slots[0].counters();
+        assert_eq!((counters.loops, counters.rows), (1, 3));
+    }
+
+    fn batches(groups: &[usize]) -> (u64, u64) {
+        let mut batches = IncrementalSortBatches::new();
+        for &size in groups {
+            for row in 0..size {
+                batches.push(row == 0, 1);
+            }
+        }
+        let groups = batches.finish();
+        (groups.full.count, groups.presorted.count)
+    }
+
+    #[test]
+    fn incremental_sort_batches_follow_postgresql() {
+        assert_eq!(batches(&[50, 50, 50, 50]), (4, 0));
+        assert_eq!(batches(&[10, 30, 260, 10]), (3, 1));
+        // A full sort that passes 64 rows sorts its leading groups apart.
+        assert_eq!(batches(&[40, 30, 100]), (2, 2));
+        assert_eq!(batches(&[]), (1, 0));
     }
 
     #[test]

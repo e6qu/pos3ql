@@ -745,7 +745,8 @@ the constants the planner folds them into (`'2'::double precision`). Times are m
 per loop, to the first row and to the end; in pos3ql's push-based executor a
 node's time also includes the work of the nodes reading its rows. A locking
 clause plans a `LockRows` node below the `Limit`, which counts the rows it
-locked. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
+locked; rows read in scan order are locked as the scan returns them, and the
+scan stops once the limit has its rows, as the `Limit` pulls them. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
 `top-N heapsort` when a limit directly above bounds it and it read more than
 twice the bound, which pos3ql then also keeps to a heap of the bounded rows;
 `external merge` when its rows spilled to disk) and the space of the rows it
@@ -756,7 +757,10 @@ evaluation order, named `w1`, `w2`, ... when unnamed and printing its
 gives windows of frame-independent functions), over a `Sort` of its input
 or an `Incremental Sort` when the rows already follow a prefix of its keys;
 a query `ORDER BY` the last window's rows follow needs no sort. Under
-`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own. A
+`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own, and
+the query's `Incremental Sort` over a window prints its `Full-sort Groups`
+and `Pre-sorted Groups` lines, batched as `nodeIncrementalSort.c` batches
+its input (the memory figures pos3ql's own). A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated
@@ -772,34 +776,90 @@ subplan, plans the `Result` PostgreSQL adds above the sort to evaluate that
 list (`make_sort_input_target`), which hosts the list's subplans; execution
 still evaluates the list before sorting, so such a subplan runs, and a
 routine is called, once per input row where PostgreSQL runs it only for the
-rows the sort and limit return. An `IN`, `NOT IN`, `ANY` or `ALL`
-subquery run as a subplan prints its comparison in the condition
-(`Filter: (NOT (ANY (id = (hashed SubPlan 1).col1)))`): hashed when it is
-uncorrelated `IN` or `= ANY`, and scanned through the `Materialize`
-PostgreSQL adds over another uncorrelated one; that `Materialize` reports no
-`ANALYZE` figures yet, `VERBOSE` does not qualify the statement's columns
-when it has subplans, and an uncorrelated `< ANY` in `WHERE`, which
-PostgreSQL pulls up into a semi join, is shown as a subplan. Not yet shown:
-row subqueries as subplans, a correlated subquery of a join, `CTE` InitPlans
-and `CTE Scan` nodes for materialized `WITH` queries (a `WITH` query is
-merged into the statement, under a generated name when its relation's name
-clashes), semi and anti joins for `EXISTS`, `NOT EXISTS` and `IN` (pos3ql runs
-them as per-row subqueries; a pull-up into semi and anti joins that run as
-hash or nested-loop joins matches PostgreSQL's plans and figures in the
-common shapes, but its join is not yet read by the retained executor, so a
-cold statement with such a subquery would no longer wait for its blocks),
-an incremental sort's `ANALYZE` group lines,
-`VERBOSE` output lists of windows and expressions (the output columns' names
-are printed), aggregate and `Materialize` storage lines, per-node `Buffers`
+rows the sort and limit return. A top-level query's `WHERE` conjunct
+`EXISTS`, `NOT EXISTS`, `x IN` or `x op ANY` over a subquery that reads one
+stored table with only a non-volatile condition (correlated for `EXISTS`;
+`IN` and `ANY` may be correlated too, as in PostgreSQL 18) becomes a semi or
+anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one:
+two relations joined by column equalities hash the smaller side (`Hash Semi
+Join`, `Hash Anti Join`, or the `Hash Right` forms when the query's
+relation is smaller), others loop over a materialized copy (`Nested Loop
+Semi Join`), whose scan reads only as far as a loop needed, or over the
+inner scan itself when the outer side estimates one row. A joined column
+equated to a query column the `WHERE` equates to a constant takes the
+constant (`o.id = 30` and `i.oid = o.id` give `i.oid = 30`). Result streams
+read these joins in the retained reader, which waits on cold reads at any
+level. A compared subquery left in place prints as its comparison with the
+subplan's column (`(ANY (id = (hashed SubPlan 1).col1))`, `(ALL (id <>
+(SubPlan 1).col1))` over a `Materialize`), and `<> ALL` keeps its own form
+rather than becoming `NOT IN`; that `Materialize` reports no `ANALYZE`
+figures yet. Such a subquery stays a subplan when it reads
+a relation named like one of the query's, when a second subquery reads the
+same relation (PostgreSQL names it `t_1`), and PostgreSQL's alternatives of
+hashing an expression key (`(big.id + 1) = b2.id`) or joining the unique
+subquery rows (`Hash Join` over a `HashAggregate`) are not planned; pos3ql
+probes an index per outer row where PostgreSQL's costs may prefer a hash
+join or a bitmap scan. A relation never analyzed estimates its resident
+rows where PostgreSQL assumes ten pages (`estimate_rel_size`), so
+`EXPLAIN` costs and row figures differ there. `VERBOSE` prints each node's
+target list as `show_plan_tlist` does: a scan or join computes the
+select list with its resjunk sort, grouping and window keys and locked
+rows' `ctid` (an aggregate's input the grouping columns and the columns
+its other expressions read, a window's input its keys first), a scan
+whose parent accepts any columns returns its physical columns
+(`use_physical_tlist`), one under a `Sort`, `Hash` or `Materialize` only
+the columns needed above it, an upper node prints an expression its input
+computed in parentheses (`((x + 1))`), `Append` prints none, and columns
+are qualified when the range table holds more than one relation. A
+`Function Scan` prints its schema and `Function Call`, a joined relation's
+filter qualifies its columns, and a one-table `UPDATE` or `DELETE` scan
+returns the new values and `ctid`. A constant `OFFSET 0` or
+`LIMIT NULL` adds no `Limit` (`limit_needed`), and a join input's
+`Subquery Scan` without a filter of its own is removed
+(`trivial_subqueryscan`), so the join's conditions name the subquery's own
+relation; a relation a subquery reads again under a name the statement
+already uses prints as `t_1`. A statement's `WITH` query that PostgreSQL
+does not inline (`SS_process_ctes`: `MATERIALIZED`, read twice without
+`NOT MATERIALIZED`, volatile, recursive or data-modifying) is its top node's
+`CTE name` InitPlan, numbered before the query's subqueries and read by
+`CTE Scan` nodes without a `Materialize`; a derived table's or subquery's
+own `WITH` list follows the same rule as that query's InitPlans, and a
+subquery reading only its own `WITH` queries is uncorrelated; a recursive one is a `Recursive
+Union` whose recursive term reads a `WorkTable Scan`, with `ANALYZE`
+figures per iteration. Still differing: a `CTE Scan` under a `LIMIT` runs
+its whole query where PostgreSQL pulls only the rows read (so a recursive
+`WITH` query that only a `LIMIT` ends fails with `54000` once its rows
+exceed the statement arena, where PostgreSQL returns the limited rows), a
+data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
+`ANALYZE` figures (its write runs on a path that does not enter the query's
+plan block), an `IN` over a subquery with its own `WITH` list stays a
+subplan where PostgreSQL pulls it up into a semi join, a join condition
+over a derived table whose `WITH` query PostgreSQL reads directly names the
+derived table (`s.a` for `c.a`), `EXPLAIN` of a `LATERAL` item or a
+subquery's derived table reading an outer column fails with `42P01`. A
+subplan's relation renamed after one of the
+statement's (`r_1`, `e1_1`) prints its new name in its query block's
+conditions and lists. When a derived table or `CTE Scan` joins a
+stored relation of equal size, PostgreSQL's cost tie may pick the other
+outer or hashed side. Not yet shown: row
+subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
+group lines of a window's own incremental sort or of one under a `LIMIT`,
+`VERBOSE` output lists of a joined `UPDATE` or `DELETE`, an `INSERT`'s
+`VALUES` rows, a `RETURNING` list naming `OLD` or `NEW`, a `(record).*`
+item, a sort below a postponed select list (whose input PostgreSQL
+computes without the postponed expressions), and an `EXISTS` subplan's
+list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
-scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A node of a path
-the executor does not count (a data-modifying `WITH`, a joined `UPDATE` or
+scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A statement that runs again after an attempt stopped for a call counts each
+node in the last attempt that ran it, so a data-modifying `WITH` query whose
+write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
+and scan figures. A node of a path
+the executor does not count (a joined `UPDATE` or
 `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports
 the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
 joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`
 early leaves its `Sort` without figures, as pos3ql deduplicates before
-sorting; a `LIMIT` over a locking query without `ORDER BY` reads every row
-where PostgreSQL's `LockRows` stops early. Where pos3ql's plan differs from
+sorting. Where pos3ql's plan differs from
 PostgreSQL's cost-based one the figures are those of the plan it shows and
 runs: it hashes the second of two joined relations where PostgreSQL may hash
 the smaller filtered one, joins three or more relations in nested loops where

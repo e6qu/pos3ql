@@ -535,3 +535,328 @@ fn explain_plans_the_folded_statement() {
         );
     }
 }
+
+#[test]
+fn offset_zero_subqueries_keep_their_boundary_without_a_limit() {
+    let (mut session, mut engine) = setup("offset_zero_subqueries");
+    let costs = "COSTS OFF";
+    // `limit_needed`: OFFSET 0 and LIMIT NULL leave no `Limit`.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u OFFSET 0"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM pn_u LIMIT NULL"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    // The subquery is not pulled up, and its trivial `Subquery Scan` is
+    // removed, so the join's condition reads the subquery's own columns.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (SELECT * FROM pn_u OFFSET 0) x, \
+             (SELECT * FROM pn_u v OFFSET 0) y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (pn_u.a < v.a)",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Materialize",
+            "        ->  Seq Scan on pn_u v"
+        ]
+    );
+    // A condition the subquery cannot take stays on its scan.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (SELECT * FROM pn_u OFFSET 0) x WHERE x.a > 3"
+        ),
+        [
+            "Subquery Scan on x",
+            "  Filter: (x.a > 3)",
+            "  ->  Seq Scan on pn_u"
+        ]
+    );
+    let rows = data_rows(&session.success(
+        &mut engine,
+        "SELECT count(*) FROM (SELECT * FROM pn_u OFFSET 0) x, \
+         (SELECT * FROM pn_u OFFSET 0) y WHERE x.a < y.a",
+        true,
+    ));
+    assert_eq!(rows, ["190"]);
+}
+
+#[test]
+fn with_queries_run_once_are_cte_init_plans() {
+    let (mut session, mut engine) = setup("with_queries_run_once_are_cte_init_plans");
+    let costs = "COSTS OFF";
+    // Read once by default: inlined into the query.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS (SELECT * FROM pn_u) SELECT * FROM c"
+        ),
+        ["Seq Scan on pn_u"]
+    );
+    // Read twice: planned once, read by CTE Scans without a Materialize.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS (SELECT * FROM pn_u) SELECT * FROM c x, c y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (x.a < y.a)",
+            "  CTE c",
+            "    ->  Seq Scan on pn_u",
+            "  ->  CTE Scan on c x",
+            "  ->  CTE Scan on c y"
+        ]
+    );
+    // NOT MATERIALIZED inlines both reads, the second renamed uniquely.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS NOT MATERIALIZED (SELECT * FROM pn_u) \
+             SELECT * FROM c x, c y WHERE x.a < y.a"
+        ),
+        [
+            "Nested Loop",
+            "  Join Filter: (pn_u.a < pn_u_1.a)",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Materialize",
+            "        ->  Seq Scan on pn_u pn_u_1"
+        ]
+    );
+    // The CTE takes the first subplan number.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "WITH c AS MATERIALIZED (SELECT * FROM pn_u) SELECT * FROM c WHERE a > (SELECT 1)"
+        ),
+        [
+            "CTE Scan on c",
+            "  Filter: (a > (InitPlan 2).col1)",
+            "  CTE c",
+            "    ->  Seq Scan on pn_u",
+            "  InitPlan 2",
+            "    ->  Result"
+        ]
+    );
+    let analyzed = without_memory(plan(
+        &mut session,
+        &mut engine,
+        "ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+         SELECT * FROM r",
+    ));
+    let analyzed: Vec<_> = analyzed
+        .into_iter()
+        .filter(|line| !line.trim_start().starts_with("Storage:"))
+        .collect();
+    assert_eq!(
+        analyzed,
+        [
+            "CTE Scan on r (actual rows=5.00 loops=1)",
+            "  CTE r",
+            "    ->  Recursive Union (actual rows=5.00 loops=1)",
+            "          ->  Result (actual rows=1.00 loops=1)",
+            "          ->  WorkTable Scan on r r_1 (actual rows=0.80 loops=5)",
+            "                Filter: (n < 5)",
+            "                Rows Removed by Filter: 0"
+        ]
+    );
+}
+
+#[test]
+fn verbose_prints_each_nodes_target_list() {
+    let (mut session, mut engine) = setup("verbose_prints_each_nodes_target_list");
+    let verbose = "VERBOSE, COSTS OFF";
+    // A scan under an aggregate returns its physical columns; an upper node
+    // prints an expression its input computed in parentheses.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT a, count(*) FROM pn_t GROUP BY a ORDER BY 2"
+        ),
+        [
+            "Sort",
+            "  Output: a, (count(*))",
+            "  Sort Key: (count(*))",
+            "  ->  HashAggregate",
+            "        Output: a, count(*)",
+            "        Group Key: pn_t.a",
+            "        ->  Seq Scan on public.pn_t",
+            "              Output: a, b",
+        ]
+    );
+    // A sort's input computes the select list and its resjunk keys.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT a + 1 FROM pn_t ORDER BY b"
+        ),
+        [
+            "Sort",
+            "  Output: ((a + 1)), b",
+            "  Sort Key: pn_t.b",
+            "  ->  Seq Scan on public.pn_t",
+            "        Output: (a + 1), b",
+        ]
+    );
+    // Locked rows carry their identities; a function scan prints its call.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT b FROM pn_t LIMIT 2 FOR UPDATE"
+        ),
+        [
+            "Limit",
+            "  Output: b, ctid",
+            "  ->  LockRows",
+            "        Output: b, ctid",
+            "        ->  Seq Scan on public.pn_t",
+            "              Output: b, ctid",
+        ]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "SELECT g + 1 FROM generate_series(1, 3) g"
+        ),
+        [
+            "Function Scan on pg_catalog.generate_series g",
+            "  Output: (g + 1)",
+            "  Function Call: generate_series(1, 3)",
+        ]
+    );
+    // A DELETE's scan returns the row identity; RETURNING is the write's.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            verbose,
+            "DELETE FROM pn_u WHERE a = 3 RETURNING c"
+        ),
+        [
+            "Delete on public.pn_u",
+            "  Output: c",
+            "  ->  Seq Scan on public.pn_u",
+            "        Output: ctid",
+            "        Filter: (pn_u.a = 3)",
+        ]
+    );
+}
+
+#[test]
+fn nested_with_queries_follow_the_run_once_rule() {
+    let (mut session, mut engine) = setup("nested_with_queries_follow_the_run_once_rule");
+    let costs = "COSTS OFF";
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (WITH c AS MATERIALIZED (SELECT * FROM pn_t) SELECT * FROM c) s"
+        ),
+        ["CTE Scan on c", "  CTE c", "    ->  Seq Scan on pn_t"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT * FROM (WITH c AS (SELECT * FROM pn_t) SELECT * FROM c) s"
+        ),
+        ["Seq Scan on pn_t"]
+    );
+    // A subquery reading only its own WITH query is uncorrelated.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT (WITH c AS MATERIALIZED (SELECT max(a) m FROM pn_t) SELECT m FROM c) \
+             FROM pn_u LIMIT 1"
+        ),
+        [
+            "Limit",
+            "  InitPlan 2",
+            "    ->  CTE Scan on c",
+            "          CTE c",
+            "            ->  Aggregate",
+            "                  ->  Seq Scan on pn_t",
+            "  ->  Seq Scan on pn_u",
+        ]
+    );
+    // A subquery's list reads the query level around it.
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            costs,
+            "SELECT (SELECT pn_u.a + count(*) FROM pn_t) FROM pn_u"
+        ),
+        [
+            "Seq Scan on pn_u",
+            "  SubPlan 1",
+            "    ->  Aggregate",
+            "          ->  Seq Scan on pn_t",
+        ]
+    );
+}
+
+#[test]
+fn renamed_relations_print_their_new_names_in_conditions() {
+    let (mut session, mut engine) = setup("renamed_relations_print_their_new_names_in_conditions");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "VERBOSE, COSTS OFF",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+             SELECT * FROM r"
+        ),
+        [
+            "CTE Scan on r",
+            "  Output: r.n",
+            "  CTE r",
+            "    ->  Recursive Union",
+            "          ->  Result",
+            "                Output: 1",
+            "          ->  WorkTable Scan on r r_1",
+            "                Output: (r_1.n + 1)",
+            "                Filter: (r_1.n < 5)",
+        ]
+    );
+}

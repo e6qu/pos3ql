@@ -2034,7 +2034,8 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
                 JoinKind::Left => " LEFT JOIN ",
                 JoinKind::Right => " RIGHT JOIN ",
                 JoinKind::Full => " FULL JOIN ",
-                JoinKind::Comma => return output.unsupported(),
+                // A pulled-up subquery's join exists only in a planned query.
+                JoinKind::Comma | JoinKind::Semi | JoinKind::Anti => return output.unsupported(),
             };
             output.keyword(keyword, -STD, STD, JOIN)?;
             // A pretty right side that is itself an unaliased join needs

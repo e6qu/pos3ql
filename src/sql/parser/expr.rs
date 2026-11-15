@@ -690,24 +690,18 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                    // `= ANY (sub)` is IN, `<> ALL (sub)` is NOT IN; the rest
-                    // quantify over the subquery's collected result column
-                    // (same truth table as the array forms, per PostgreSQL).
+                    // `= ANY (sub)` is IN, as PostgreSQL's parser makes it
+                    // and its deparser prints it. `<> ALL (sub)` stays an
+                    // `ALL` comparison, which EXPLAIN and view definitions
+                    // print as written; the rest quantify over the
+                    // subquery's collected result column (same truth table
+                    // as the array forms, per PostgreSQL).
                     left = if operator == BinaryOp::Eq && !all {
                         self.arena_expr_at(
                             Expr::InSubquery {
                                 operand: left,
                                 select: boxed,
                                 negated: false,
-                            },
-                            operator_at,
-                        )?
-                    } else if operator == BinaryOp::NotEq && all {
-                        self.arena_expr_at(
-                            Expr::InSubquery {
-                                operand: left,
-                                select: boxed,
-                                negated: true,
                             },
                             operator_at,
                         )?

@@ -153,13 +153,22 @@ impl<'s> Columns<'s> {
     }
 }
 
+/// The name a FROM item prints under: a pulled-up subquery's relation
+/// answers to its own name behind a NUL byte, which no SQL identifier
+/// contains (see `JoinKind::Semi`), and a relation a merge renamed prints
+/// as the part of its name before its NUL byte.
+pub(crate) fn printed_name(name: &str) -> &str {
+    let name = name.strip_prefix('\0').unwrap_or(name);
+    name.split_once('\0').map_or(name, |(printed, _)| printed)
+}
+
 impl<'s> Joined<'s> {
     pub(crate) fn new(name: &'s str, table: &'s TableDef) -> Self {
         Self {
             name,
-            printed: name,
+            printed: printed_name(name),
             columns: Columns::Table(table),
-            unqualified: true,
+            unqualified: !name.starts_with('\0'),
             addressable: true,
             level: 0,
             row_type: None,

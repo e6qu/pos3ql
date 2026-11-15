@@ -1138,11 +1138,18 @@ fn restartable_statements_finish_without_block_caches() {
              WHERE i.id <= 2",
             &["1|2", "2|4"],
         ),
+        // The pulled-up `IN` and `NOT EXISTS` read tables no earlier
+        // statement read, so their semi and anti joins wait for them.
         (
             "SELECT id, (SELECT count(*) FROM cold_more), \
              (SELECT max(id) FROM cold_extra WHERE id < i.id + 5) \
-             FROM cold_items i WHERE id IN (SELECT id FROM cold_more WHERE id <= 2)",
+             FROM cold_items i WHERE id IN (SELECT id FROM cold_pairs WHERE id <= 2)",
             &["1|40|5", "2|40|6"],
+        ),
+        (
+            "SELECT id FROM cold_items i \
+             WHERE NOT EXISTS (SELECT 1 FROM cold_gone g WHERE g.id = i.id) AND id <= 41",
+            &["39", "40"],
         ),
         (
             "INSERT INTO seen_log SELECT 'u' || id FROM (SELECT id FROM cold_items \
@@ -1177,6 +1184,10 @@ fn restartable_statements_finish_without_block_caches() {
                  INSERT INTO cold_more SELECT generate_series(1, 40); \
                  CREATE TABLE cold_extra(id integer PRIMARY KEY); \
                  INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_pairs(id integer PRIMARY KEY); \
+                 INSERT INTO cold_pairs SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_gone(id integer); \
+                 INSERT INTO cold_gone SELECT generate_series(1, 38); \
                  CREATE TABLE ruled(id integer); \
                  CREATE RULE ruled_log AS ON INSERT TO ruled DO ALSO \
                  INSERT INTO seen_log SELECT 'r' || i.id || m.id || e.id FROM cold_items i \

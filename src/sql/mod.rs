@@ -15648,6 +15648,8 @@ impl Engine {
                 Self::write_query_source(with, cte_index, params)
             } else {
                 ast::MaterializedCteSource::Inline({
+                    // The query is its statement's `CTE name` InitPlan.
+                    let _cte = query::instrument::enter(query::instrument::Segment::Cte(cte_index));
                     let connection_id = self.work.connection_id();
                     let (work, row_buffers) = self.work.cursor_parts();
                     Self::execute_dml_cte(
@@ -15688,6 +15690,8 @@ impl Engine {
             with,
             index,
             params: (params.as_ptr() as usize, params.len()),
+            // Planned with the statement: its block is the statement's.
+            block: query::instrument::current_block().child(query::instrument::Segment::Cte(index)),
         })
     }
 
@@ -15732,6 +15736,9 @@ impl Engine {
         row_buffers: &mut crate::storage::RowCursorBuffers,
         responder: &mut Responder,
     ) -> Result<&'a [&'a [u8]], SqlError> {
+        // The query's `ModifyTable` node returns its RETURNING rows.
+        let modify = query::instrument::node(query::instrument::Role::Modify);
+        let _modify = modify.start();
         let (rows, outcome) = Self::execute_write_step(
             storage,
             dml_scratch,
@@ -15747,6 +15754,9 @@ impl Engine {
             responder,
             None,
         );
+        if outcome.is_ok() {
+            modify.rows(rows.len() as u64);
+        }
         outcome.map(|()| rows)
     }
 
@@ -16119,6 +16129,11 @@ impl Engine {
             // The run's syntax and rows use the statement arena, whose tail
             // also takes the step's retained calls; its executor uses the
             // query workspace, which the next attempt resets.
+            let _cte = query::instrument::enter_block(write.block);
+            // The query's `ModifyTable` node returns its RETURNING rows,
+            // one step of its execution per run.
+            let modify = query::instrument::node(query::instrument::Role::Modify);
+            let _modify = modify.step();
             let (rows, result) = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, arena)),
                 || {
@@ -16136,6 +16151,7 @@ impl Engine {
                 },
             );
             self.storage.set_read_snapshot(snapshot);
+            modify.rows(rows.len() as u64);
             for row in rows {
                 invocations.add_produced_row(key, row, query::StepRegion::unfinished(), arena)?;
             }
@@ -16353,6 +16369,8 @@ impl Engine {
             let (dml, mut materialized) =
                 self.analyze_dml_cte(with, cte_index, mats.as_slice(), txn, arena, params, guc)?;
             materialized.source = ast::MaterializedCteSource::Inline({
+                // The query is its statement's `CTE name` InitPlan.
+                let _cte = query::instrument::enter(query::instrument::Segment::Cte(cte_index));
                 let connection_id = self.work.connection_id();
                 let (work, row_buffers) = self.work.cursor_parts();
                 Self::execute_dml_cte(
@@ -19329,8 +19347,8 @@ impl Engine {
         if let Err(error) = invocations.require_replay() {
             return Ok(Err(error));
         }
-        // The routine's own statements are not part of an analyzed plan.
-        let _instrument = query::instrument::suspend();
+        // A data-modifying `WITH` query is its statement's InitPlan, which an
+        // analyzed plan counts in its own block.
         if let query::PendingRoutineTarget::WriteQuery(write) = pending.target {
             return type_input_plans::with_owner(pending.plan_owner, || {
                 self.complete_pending_write(
@@ -19347,6 +19365,8 @@ impl Engine {
                 )
             });
         }
+        // The routine's own statements are not part of an analyzed plan.
+        let _instrument = query::instrument::suspend();
         let outcome = type_input_plans::with_owner(pending.plan_owner, || {
             query::protect_statement_effects();
             let contract = match pending.target {

@@ -840,8 +840,16 @@ data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 plan block), an `IN` over a subquery with its own `WITH` list stays a
 subplan where PostgreSQL pulls it up into a semi join, a join condition
 over a derived table whose `WITH` query PostgreSQL reads directly names the
-derived table (`s.a` for `c.a`), `EXPLAIN` of a `LATERAL` item or a
-subquery's derived table reading an outer column fails with `42P01`. A
+derived table (`s.a` for `c.a`), `EXPLAIN` plans a `LATERAL` item and a
+subquery's derived table with the columns to their left and of the
+enclosing queries in scope, keeping no `Materialize` copy of a `LATERAL`
+subquery; still differing there: a simple subquery that reads such
+columns is not pulled up into its query (PostgreSQL merges it, so its
+`Subquery Scan` or `Result` disappears and its conditions join the
+query's), a single-relation query keeps a `Subquery Scan` PostgreSQL
+removes as trivial when the query only aggregates or returns its columns
+(`trivial_subqueryscan`), and a `LATERAL` subquery's own `Filter` on its
+output is not printed. A
 subplan's relation renamed after one of the
 statement's (`r_1`, `e1_1`) prints its new name in its query block's
 conditions and lists. When a derived table or `CTE Scan` joins a

@@ -1189,7 +1189,7 @@ pub(crate) struct ScopeSource {
 /// Type-only lookup over FROM items already registered in a scope. Table
 /// functions are implicitly lateral in PostgreSQL, so their output definition
 /// may depend on a preceding column before a concrete row has been bound.
-struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
+pub(crate) struct ScopeTypes<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 
 /// Schema construction can inspect a caller's columns without retaining values
 /// whose lifetime belongs to that caller's row scratch.

@@ -13,7 +13,7 @@ use crate::sql::ast::{
     BinaryOp, ExplainFormat, ExplainOptions, ExplainSerialize, Expr, Select, SelectItem, SetOp,
     SetQuery, SetTree, Stmt,
 };
-use crate::sql::eval::{SqlError, arena_full, sqlstate};
+use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
 use crate::sql::query::instrument::{BlockId, NodeCounters, NodeKey, Role, Segment, Slot};
 use crate::sql::query::{self, QueryScope};
@@ -2426,54 +2426,43 @@ fn consumed_by(index: Option<&query::IndexAccessPlan<'_>>, conjunct: &Expr<'_>) 
 fn projected_shape<'a>(
     statement: &Select<'a>,
     scope: Option<&QueryScope<'a>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(u32, StackStr<256>), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
-    // A subquery's list may read the stored relation of the query level
-    // around it.
-    let enclosing = (SUBLINK_DEPTH.with(core::cell::Cell::get) != 0)
-        .then(|| {
-            OUTER_RELATIONS.with(|outer| {
-                let outer = outer.borrow();
-                outer.0[..outer.1].last().copied()
-            })
-        })
-        .flatten();
-    let enclosing_def = enclosing.map(|(_, slot)| storage.table_def(slot, txid));
-    let enclosing_cols =
-        enclosing
-            .as_ref()
-            .zip(enclosing_def.as_ref())
-            .map(|((name, _), definition)| crate::sql::exec::AliasedDefCols {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
-                alias: Some(name.as_str()),
-                output_aliases: &[],
-            });
+    // A subquery's list may read the columns of the queries around it.
     let count = match scope {
         Some(scope) => query::describe_scope_items(
             statement.items,
             scope,
-            enclosing_cols
-                .as_ref()
-                .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
+            outer,
             storage,
             txid,
             arena,
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?,
-        None => query::describe_catalog_items_as(
-            statement.items,
-            enclosing_cols.as_ref().map(|columns| columns.definition),
-            enclosing.as_ref().map(|(name, _)| name.as_str()),
-            storage,
-            txid,
-            arena,
-            &mut columns,
-            crate::sql::exec::DescriptionTarget::Sql,
-        )?,
+        None => {
+            let outer_types = outer.map(query::OuterColumnTypes);
+            let statement = arena.alloc(*statement).map_err(|_| arena_full())?;
+            let tree = arena
+                .alloc(SetTree::Select(statement))
+                .map_err(|_| arena_full())?;
+            query::describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut columns,
+                arena,
+                None,
+                crate::sql::exec::DescriptionTarget::Sql,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            )?
+        }
     };
     let mut width = 0u32;
     let mut output = StackStr::new();
@@ -3210,19 +3199,20 @@ pub(super) fn plan_select<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     if statement.with.is_empty() {
-        return plan_select_with_ctes(storage, txid, statement, &[], block, arena);
+        return plan_select_with_ctes(storage, txid, statement, &[], outer, block, arena);
     }
     // A query's own `WITH` list follows the statement's rule
     // (`SS_process_ctes`) at every query level: a query run once is an
     // InitPlan of the query's top node, the others are inlined.
     let (select, ctes) = query::expand_ctes_for_plan(statement, storage, txid, arena)?;
     let prior = CTE_PLANS.with(|planned| planned.replace(planned.get() || !ctes.is_empty()));
-    let plan = plan_ctes(storage, txid, ctes, block, arena)
-        .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, block, arena));
+    let plan = plan_ctes(storage, txid, ctes, outer, block, arena)
+        .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, outer, block, arena));
     CTE_PLANS.with(|planned| planned.set(prior));
     plan
 }
@@ -3234,15 +3224,43 @@ fn plan_select_with_ctes<'a>(
     txid: u32,
     statement: &Select<'_>,
     ctes: &[Sublink<'a>],
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
-    let pulled = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
+    let outer_types = outer.map(query::OuterColumnTypes);
+    let pulled = query::pull_up_subqueries(
+        statement,
+        storage,
+        txid,
+        arena,
+        outer_types
+            .as_ref()
+            .map(|types| types as &dyn ColumnLookup<'_>),
+    )?;
+    // A subquery reads the columns of the query it is in, and of that
+    // query's enclosing queries.
+    let scope = pulled
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
+        .transpose()?;
+    let scope_types = scope.as_ref().map(query::ScopeTypes);
+    let enclosed = scope_types.as_ref().map(|types| query::Chained {
+        inner: types,
+        outer: outer_types
+            .as_ref()
+            .map(|types| types as &dyn ColumnLookup<'_>),
+    });
+    let enclosing = match enclosed.as_ref() {
+        Some(enclosed) => Some(enclosed as &dyn ColumnLookup<'_>),
+        None => outer,
+    };
     // PostgreSQL plans, and so numbers, a query's subqueries before it
     // prints the conditions that refer to them.
-    let sublinks = plan_sublinks(storage, txid, pulled, block, arena)?;
+    let sublinks = plan_sublinks(storage, txid, pulled, enclosing, block, arena)?;
     let sublinks = if ctes.is_empty() {
         sublinks
     } else {
@@ -3254,7 +3272,7 @@ fn plan_select_with_ctes<'a>(
             })
             .map_err(|_| arena_full())?
     };
-    let plan = plan_pulled_select(storage, txid, statement, pulled, block, arena)?;
+    let plan = plan_pulled_select(storage, txid, statement, pulled, outer, block, arena)?;
     attach_subplans(plan, pulled, block, sublinks, arena)
 }
 
@@ -3291,6 +3309,29 @@ thread_local! {
         const { core::cell::RefCell::new(([(StackStr::new(), 0); 8], 0)) };
 }
 
+/// Pushes the stored relations left of `table` in `scope` as relations
+/// around the query being planned, returning how many it pushed.
+fn push_outer_relations(scope: &QueryScope<'_>, table: usize) -> usize {
+    OUTER_RELATIONS.with(|outer| {
+        let mut outer = outer.borrow_mut();
+        let mut pushed = 0;
+        for left in 0..table {
+            let slot = scope.slots[left];
+            if scope.derived[left].is_some() || slot == usize::MAX {
+                continue;
+            }
+            let count = outer.1;
+            if count == outer.0.len() {
+                break;
+            }
+            outer.0[count] = (StackStr::from_str(scope.names[left]), slot);
+            outer.1 = count + 1;
+            pushed += 1;
+        }
+        pushed
+    })
+}
+
 /// The relations of the query levels around the one being planned.
 fn outer_relations(
     storage: &Storage,
@@ -3312,6 +3353,7 @@ fn plan_sublinks<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<&'a [Sublink<'a>], SqlError> {
@@ -3374,6 +3416,7 @@ fn plan_sublinks<'a>(
             storage,
             txid,
             select,
+            outer,
             block.child(Segment::Sublink(core::ptr::from_ref(select) as usize as u64)),
             arena,
         );
@@ -3449,6 +3492,7 @@ fn plan_ctes<'a>(
     storage: &Storage,
     txid: u32,
     ctes: &[query::PlannedCte<'_>],
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<&'a [Sublink<'a>], SqlError> {
@@ -3461,11 +3505,12 @@ fn plan_ctes<'a>(
                 storage,
                 txid,
                 select,
+                outer,
                 cte_block.child(Segment::Branch(0)),
                 arena,
             )?,
             query::PlannedCteQuery::Recursive(select) => {
-                plan_recursive_union(storage, txid, cte.name, select, cte_block, arena)?
+                plan_recursive_union(storage, txid, cte.name, select, outer, cte_block, arena)?
             }
             query::PlannedCteQuery::Modification(statement) => {
                 plan_modification(storage, txid, statement, cte_block, arena)?
@@ -3493,6 +3538,7 @@ fn plan_recursive_union<'a>(
     txid: u32,
     name: &str,
     select: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -3513,6 +3559,7 @@ fn plan_recursive_union<'a>(
                 storage,
                 txid,
                 select,
+                outer,
                 term_block.child(Segment::Branch(0)),
                 arena,
             )?,
@@ -3528,6 +3575,7 @@ fn plan_recursive_union<'a>(
                     with_ties: false,
                     locking: &[],
                 },
+                outer,
                 term_block,
                 arena,
             )?,
@@ -3757,6 +3805,7 @@ fn plan_pulled_select<'a>(
     txid: u32,
     statement: &Select<'_>,
     pulled: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -3773,7 +3822,7 @@ fn plan_pulled_select<'a>(
     };
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
-            storage, from, txid, arena, None,
+            storage, from, txid, arena, outer,
         )?),
         None => None,
     };
@@ -3784,7 +3833,8 @@ fn plan_pulled_select<'a>(
         .as_ref()
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 3 + MAX_EXPLAIN_STAGES);
     let mut plan = Plan::new(arena, capacity)?;
-    let (width, mut output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    let (width, mut output) =
+        projected_shape(statement, scope.as_ref(), outer, storage, txid, arena)?;
     if let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
         && scope.n == 1
         && let Some(list) = from.base.subquery.and_then(values_list)
@@ -4913,7 +4963,10 @@ fn plan_pulled_select<'a>(
                     .nth(table)
                     .and_then(|item| item.subquery)
                     .is_some_and(|body| values_list(body).is_none())
-            });
+            }) && !scope.lateral[table];
+            // A `LATERAL` subquery runs again for each outer row with its
+            // parameters (`create_subqueryscan_path` with `required_outer`),
+            // so no copy of its rows is kept.
             let sequential = (scan.name.as_str() == "Seq Scan" || subquery)
                 && nested_loop_materializes(
                     if n == 2 { outer_rows } else { u64::MAX },
@@ -5027,7 +5080,25 @@ fn plan_pulled_select<'a>(
             let derived_block = block.child(Segment::Derived(
                 u16::try_from(table).map_err(|_| arena_full())?,
             ));
-            let derived = plan_derived(storage, txid, body, derived_block, arena)?;
+            // A derived table reads the FROM items to its left (`LATERAL`)
+            // and the enclosing queries' columns.
+            let outer_types = outer.map(query::OuterColumnTypes);
+            let enclosing = query::Chained {
+                inner: &query::ScopeTypes(scope),
+                outer: outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            };
+            // Its conditions name the stored relations to its left
+            // qualified, as the enclosing query's in a correlated subplan.
+            let left_relations = if scope.lateral[table] {
+                push_outer_relations(scope, table)
+            } else {
+                0
+            };
+            let derived = plan_derived(storage, txid, body, Some(&enclosing), derived_block, arena);
+            OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= left_relations);
+            let derived = derived?;
             for node in derived.nodes[..derived.count].iter_mut() {
                 if node.relation.as_str().is_empty() {
                     continue;
@@ -6017,16 +6088,18 @@ fn plan_derived<'a>(
     storage: &Storage,
     txid: u32,
     body: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    in_nested_block(|| plan_derived_body(storage, txid, body, block, arena))
+    in_nested_block(|| plan_derived_body(storage, txid, body, outer, block, arena))
 }
 
 fn plan_derived_body<'a>(
     storage: &Storage,
     txid: u32,
     body: &Select<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -6043,10 +6116,11 @@ fn plan_derived_body<'a>(
                 with_ties: body.with_ties,
                 locking: body.locking,
             },
+            outer,
             block,
             arena,
         ),
-        None => plan_select(storage, txid, body, block, arena),
+        None => plan_select(storage, txid, body, outer, block, arena),
     }
 }
 
@@ -6546,6 +6620,7 @@ fn push_set_tree(
     storage: &Storage,
     txid: u32,
     tree: &SetTree<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     arena: &Arena,
     depth: u8,
     block: BlockId,
@@ -6565,7 +6640,8 @@ fn push_set_tree(
             let branch = block.child(Segment::Branch(numbers.1));
             numbers.1 = numbers.1.saturating_add(1);
             // A set operation's leaves are subqueries of its statement.
-            let leaf = in_nested_block(|| plan_select(storage, txid, select, branch, arena))?;
+            let leaf =
+                in_nested_block(|| plan_select(storage, txid, select, outer, branch, arena))?;
             let root = leaf.nodes[0];
             for node in &leaf.nodes[..leaf.count] {
                 let mut node = *node;
@@ -6586,10 +6662,10 @@ fn push_set_tree(
                 unreachable!("matched a set operation");
             };
             let left = push_set_tree(
-                plan, storage, txid, left, arena, depth, block, numbers, true,
+                plan, storage, txid, left, outer, arena, depth, block, numbers, true,
             )?;
             let right = push_set_tree(
-                plan, storage, txid, right, arena, depth, block, numbers, true,
+                plan, storage, txid, right, outer, arena, depth, block, numbers, true,
             )?;
             Ok(PlanNode {
                 rows: left.rows.saturating_add(right.rows),
@@ -6633,6 +6709,7 @@ fn push_set_tree(
                 storage,
                 txid,
                 left,
+                outer,
                 arena,
                 input_depth,
                 block,
@@ -6644,6 +6721,7 @@ fn push_set_tree(
                 storage,
                 txid,
                 right,
+                outer,
                 arena,
                 input_depth,
                 block,
@@ -6942,6 +7020,7 @@ pub(super) fn plan_set_query<'a>(
     storage: &Storage,
     txid: u32,
     query: &SetQuery<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
@@ -6976,6 +7055,7 @@ pub(super) fn plan_set_query<'a>(
         storage,
         txid,
         query.body,
+        outer,
         arena,
         wrapper_count as u8,
         block,
@@ -7422,6 +7502,7 @@ pub(super) fn plan_modification<'a>(
                     storage,
                     txid,
                     body,
+                    Some(&query::ScopeTypes(&scope)),
                     block.child(Segment::Derived(
                         u16::try_from(table).map_err(|_| arena_full())?,
                     )),
@@ -8126,12 +8207,13 @@ pub(super) fn plan_statement<'a>(
                 } else {
                     select
                 };
-                return plan_select(storage, txid, select, block, arena);
+                return plan_select(storage, txid, select, None, block, arena);
             }
             let (select, ctes) = query::expand_ctes_for_plan(select, storage, txid, arena)?;
             let prior = CTE_PLANS.with(|planned| planned.replace(!ctes.is_empty()));
-            let plan = plan_ctes(storage, txid, ctes, block, arena)
-                .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, block, arena));
+            let plan = plan_ctes(storage, txid, ctes, None, block, arena).and_then(|ctes| {
+                plan_select_with_ctes(storage, txid, select, ctes, None, block, arena)
+            });
             CTE_PLANS.with(|planned| planned.set(prior));
             plan
         }
@@ -8150,7 +8232,7 @@ pub(super) fn plan_statement<'a>(
                 body,
                 ..*set_query
             };
-            plan_set_query(storage, txid, &planned, block, arena)
+            plan_set_query(storage, txid, &planned, None, block, arena)
         }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
             if storage.has_any_view() =>

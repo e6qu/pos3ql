@@ -860,3 +860,32 @@ fn renamed_relations_print_their_new_names_in_conditions() {
         ]
     );
 }
+
+#[test]
+fn lateral_items_plan_with_their_outer_columns() {
+    let (mut session, mut engine) = setup("lateral_items_plan_with_their_outer_columns");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT * FROM pn_u, LATERAL (SELECT pn_u.a + 1 AS z OFFSET 0) s"
+        ),
+        ["Nested Loop", "  ->  Seq Scan on pn_u", "  ->  Result"]
+    );
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT * FROM pn_u, LATERAL (SELECT * FROM (SELECT b FROM pn_t \
+             WHERE pn_t.a = pn_u.a) d OFFSET 0) s"
+        ),
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on pn_u",
+            "  ->  Seq Scan on pn_t",
+            "        Filter: (a = pn_u.a)",
+        ]
+    );
+}

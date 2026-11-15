@@ -1391,7 +1391,10 @@ impl Context<'_> {
                                     None => return output.unsupported(),
                                 },
                             };
-                            if self.bare != Some(source.printed) {
+                            // A relation without a printed name is one the
+                            // plan never scans, which EXPLAIN names nothing
+                            // (`select_rtable_names_for_explain`).
+                            if self.bare != Some(source.printed) && !source.printed.is_empty() {
                                 write_identifier(&mut identifier, source.printed);
                                 let _ = identifier.write_char('.');
                             }

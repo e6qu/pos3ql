@@ -2708,6 +2708,53 @@ impl<'a> ScanValues<'_, '_, 'a> {
     }
 }
 
+/// Whether FROM position `table` is a partitioned table planning's pruning
+/// leaves no partition: PostgreSQL's dummy relation, which reads no rows.
+/// A partitioned table stores none itself, so its own (empty) rows are the
+/// relation's.
+pub(crate) fn plans_no_partition<'a>(
+    storage: &Storage,
+    scope: &super::QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let slot = scope.slots[table];
+    let item = core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .nth(table);
+    if scope.derived[table].is_some()
+        || slot == usize::MAX
+        || item.is_none_or(|item| item.cte.is_some() || item.subquery.is_some())
+        || !storage.table_def(slot, txid).partition.is_partitioned()
+    {
+        return Ok(false);
+    }
+    let values = ScanValues {
+        storage,
+        txid,
+        relation: ScanRelation::From { scope, table },
+        arena,
+        params: crate::sql::eval::generic_plan_parameters(),
+        hooks: &crate::sql::eval::NO_HOOKS,
+        outer: None,
+    };
+    let conditions = scan_conditions(from, where_clause, table, arena)?;
+    Ok(members(
+        storage,
+        txid,
+        slot,
+        conditions,
+        &values,
+        PruneStage::Plan,
+        arena,
+    )?
+    .leaves
+    .is_empty())
+}
+
 /// The conjuncts of `condition`, the restrictions of a write's target.
 pub(crate) fn conjuncts<'a>(
     condition: Option<&'a Expr<'a>>,
@@ -2739,7 +2786,7 @@ pub(crate) fn conjuncts<'a>(
 /// The conditions that restrict the scan of FROM position `table` itself
 /// (its `baserestrictinfo`): the `WHERE` conjuncts unless an outer join
 /// nulls the relation, and the `ON` conjuncts of the inner joins, or of the
-/// outer join whose nullable side it is.
+/// outer, semi or anti join whose nullable or inner side it is.
 pub(crate) fn scan_conditions<'a>(
     from: &crate::sql::ast::FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
@@ -2750,7 +2797,9 @@ pub(crate) fn scan_conditions<'a>(
     let nullable = from.joins.iter().enumerate().any(|(index, join)| {
         let right = index + 1;
         match join.kind {
-            JoinKind::Left => right == table,
+            // A semi or anti join's inner side is read only through its
+            // `ON` conditions.
+            JoinKind::Left | JoinKind::Semi | JoinKind::Anti => right == table,
             JoinKind::Right => table < right,
             JoinKind::Full => table <= right,
             _ => false,
@@ -2772,7 +2821,7 @@ pub(crate) fn scan_conditions<'a>(
         };
         let applies = match join.kind {
             JoinKind::Inner => !nullable,
-            JoinKind::Left => index + 1 == table,
+            JoinKind::Left | JoinKind::Semi | JoinKind::Anti => index + 1 == table,
             JoinKind::Right => table <= index,
             _ => false,
         };

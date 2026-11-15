@@ -1082,6 +1082,10 @@ struct JoinRelation<'a> {
     /// removes it (`trivial_subqueryscan`), so the join's conditions print
     /// the columns its plan outputs.
     subquery: Option<&'a [crate::sql::catalog::deparse::Column<'a>]>,
+    /// A partitioned table pruning left no member to scan: the plan reads
+    /// none of its range table entries, so EXPLAIN names it nothing and
+    /// prints its columns unqualified.
+    nameless: bool,
 }
 
 impl<'a> JoinRelation<'a> {
@@ -1092,6 +1096,7 @@ impl<'a> JoinRelation<'a> {
             table: Some(table),
             columns: crate::sql::catalog::deparse::Columns::Table(table),
             subquery: None,
+            nameless: false,
         }
     }
 
@@ -1099,7 +1104,14 @@ impl<'a> JoinRelation<'a> {
     /// `Subquery Scan` has no filter of its own and so is removed.
     fn joined(&self, removed: bool) -> crate::sql::catalog::deparse::Joined<'a> {
         match (self.table, self.subquery.filter(|_| removed)) {
-            (Some(table), _) => crate::sql::catalog::deparse::Joined::new(self.exposed, table),
+            (Some(table), _) => crate::sql::catalog::deparse::Joined {
+                printed: if self.nameless {
+                    ""
+                } else {
+                    crate::sql::catalog::deparse::printed_name(self.exposed)
+                },
+                ..crate::sql::catalog::deparse::Joined::new(self.exposed, table)
+            },
             (None, outputs) => crate::sql::catalog::deparse::Joined {
                 printed: crate::sql::catalog::deparse::printed_name(self.exposed),
                 unqualified: !self.exposed.starts_with('\0'),
@@ -2749,6 +2761,22 @@ fn push_members(
         }
         None => None,
     };
+    // A relation without members is PostgreSQL's dummy relation, scanned
+    // as a `Result` returning no rows.
+    if expansion.planned.leaves.is_empty() {
+        return plan.push(PlanNode {
+            name: StackStr::from_str("Result"),
+            depth: scan.depth,
+            shift: scan.shift,
+            key: scan.key,
+            rows: 0,
+            width: scan.width,
+            output: scan.output,
+            output_unprintable: scan.output_unprintable,
+            constant_false: true,
+            ..PlanNode::EMPTY
+        });
+    }
     let exposed = StackStr::<96>::from_str(scan.exposed_name());
     let member = |leaf: usize, alias: &str| -> Result<PlanNode, SqlError> {
         let definition = storage.table_def(leaf, txid);
@@ -3830,6 +3858,10 @@ thread_local! {
     /// join the statement's range table: `WITH` queries run as their own
     /// plans, or a write's InitPlans that read relations.
     static SUBPLAN_RELATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Whether a relation pruning leaves no member prints unnamed, and
+    /// whether planning met one.
+    static NAMELESS_DUMMIES: core::cell::Cell<(bool, bool)> =
+        const { core::cell::Cell::new((false, false)) };
     /// Whether the statement being planned scans a partitioned table or an
     /// inheritance tree whose members joined its range table.
     static EXPANDED_RELATIONS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -4482,9 +4514,15 @@ fn plan_pulled_select<'a>(
     let mut constant_false = statement
         .where_clause
         .is_some_and(|predicate| qual_false(predicate, arena));
-    // A relation none of whose members is scanned leaves the query no rows,
-    // as PostgreSQL's dummy relation does.
+    // A relation none of whose members is scanned is PostgreSQL's dummy
+    // relation: it leaves an inner or semi join no rows, and the nullable
+    // side of an outer join or an anti join's inner side reads a `Result`
+    // returning none, its columns named by no relation.
+    let nameless = arena
+        .alloc_slice_with(expansions.len(), |_| false)
+        .map_err(|_| arena_full())?;
     if let Some(from) = statement.from.as_ref() {
+        use crate::sql::ast::JoinKind;
         for (table, expansion) in expansions.iter().enumerate() {
             let Some(expansion) = expansion else {
                 continue;
@@ -4492,23 +4530,46 @@ fn plan_pulled_select<'a>(
             if !expansion.planned.leaves.is_empty() {
                 continue;
             }
-            let nullable = from
-                .joins
-                .iter()
-                .enumerate()
-                .any(|(index, join)| match join.kind {
-                    crate::sql::ast::JoinKind::Left => index + 1 == table,
-                    crate::sql::ast::JoinKind::Right => table <= index,
-                    crate::sql::ast::JoinKind::Full => true,
-                    _ => false,
-                });
-            if nullable || from.joins.iter().any(|join| join.kind.is_semi_or_anti()) {
+            let side = |kinds: &[JoinKind]| {
+                from.joins.iter().enumerate().any(|(index, join)| {
+                    kinds.contains(&join.kind)
+                        && match join.kind {
+                            JoinKind::Right => table <= index,
+                            JoinKind::Full => table <= index + 1,
+                            _ => index + 1 == table,
+                        }
+                })
+            };
+            if side(&[JoinKind::Full, JoinKind::Anti]) {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN of an outer join with a partitioned table none of whose partitions is scanned is not supported"
+                    "EXPLAIN of a full or anti join with a partitioned table none of whose partitions is scanned is not supported"
                 ));
             }
-            constant_false = true;
+            let unnamed = NAMELESS_DUMMIES.with(|dummies| {
+                let (unnamed, _) = dummies.get();
+                dummies.set((unnamed, true));
+                unnamed
+            });
+            if side(&[JoinKind::Left, JoinKind::Right]) {
+                // Execution hashes it only when it is partitioned: an
+                // excluded inheritance tree's parent rows are read.
+                if !scope.as_ref().is_some_and(|scope| {
+                    storage
+                        .table_def(scope.slots[table], txid)
+                        .partition
+                        .is_partitioned()
+                }) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of an outer join with an inheritance tree none of whose members is scanned is not supported"
+                    ));
+                }
+                nameless[table] = unnamed;
+            } else {
+                nameless[table] = unnamed;
+                constant_false = true;
+            }
         }
     }
 
@@ -5093,7 +5154,10 @@ fn plan_pulled_select<'a>(
                 core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
             for (table, item) in items.enumerate().take(scope.n) {
                 join_relations[table] = match (relation(table), item.subquery) {
-                    (Some((exposed, def)), _) => Some(JoinRelation::table(exposed, def)),
+                    (Some((exposed, def)), _) => Some(JoinRelation {
+                        nameless: nameless[table],
+                        ..JoinRelation::table(exposed, def)
+                    }),
                     (None, Some(body)) if values_list(body).is_none() => {
                         match scope.defs.get(table) {
                             Some(definition) => {
@@ -5114,6 +5178,7 @@ fn plan_pulled_select<'a>(
                                     table: None,
                                     columns: crate::sql::catalog::deparse::Columns::Derived(named),
                                     subquery: Some(outputs),
+                                    nameless: false,
                                 })
                             }
                             None => None,
@@ -5137,6 +5202,7 @@ fn plan_pulled_select<'a>(
                                     .map_err(|_| arena_full())?,
                             ),
                             subquery: None,
+                            nameless: false,
                         }),
                         None => None,
                     },
@@ -5365,6 +5431,7 @@ fn plan_pulled_select<'a>(
         window_names,
         aggregate,
         n > 1 || fromless,
+        nameless,
         arena,
     )?;
     let stage_output = |index: usize| -> targets::Output {
@@ -5499,6 +5566,7 @@ fn plan_pulled_select<'a>(
                                 .and_then(|item| item.subquery)
                                 .is_some_and(|body| values_list(body).is_none())
                         }))
+                        && !nameless[table]
                         && nested_loop_materializes(
                             if n == 2 { outer_rows } else { u64::MAX },
                             crate::sql::guc::planner_methods().material,
@@ -5630,7 +5698,10 @@ fn plan_pulled_select<'a>(
             // A `LATERAL` subquery runs again for each outer row with its
             // parameters (`create_subqueryscan_path` with `required_outer`),
             // so no copy of its rows is kept.
+            // A dummy relation's `Result` costs nothing to rescan, so no
+            // materialized copy is cheaper (`cost_material`).
             let sequential = (scan.name.as_str() == "Seq Scan" || subquery)
+                && !nameless[table]
                 && nested_loop_materializes(
                     if n == 2 { outer_rows } else { u64::MAX },
                     crate::sql::guc::planner_methods().material,
@@ -9390,13 +9461,39 @@ pub(super) fn plan_statement<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    if block == BlockId::ROOT {
-        reset_subplans();
-        EXPANDED_RELATIONS.with(|expanded| expanded.set(false));
-    }
     // The planner plans the statement its constant folding produced, and
     // raises the folding's notices and errors (`eval_const_expressions`).
     let statement = fold_statement(storage, txid, statement, arena)?;
+    if block != BlockId::ROOT {
+        return plan_folded_statement(storage, txid, statement, block, arena);
+    }
+    // `set_rtable_names` leaves a relation the plan never scans unnamed,
+    // unless the plan scans none at all (`rels_used` is empty).
+    let mut named = false;
+    loop {
+        reset_subplans();
+        EXPANDED_RELATIONS.with(|expanded| expanded.set(false));
+        NAMELESS_DUMMIES.with(|dummies| dummies.set((!named, false)));
+        let plan = plan_folded_statement(storage, txid, statement, block, arena);
+        let (_, seen) = NAMELESS_DUMMIES.with(|dummies| dummies.replace((false, false)));
+        let plan = plan?;
+        let scans = plan.nodes[..plan.count]
+            .iter()
+            .any(|node| !node.relation.as_str().is_empty() || node.name.as_str() == "Values Scan");
+        if named || !seen || scans {
+            return Ok(plan);
+        }
+        named = true;
+    }
+}
+
+fn plan_folded_statement<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     match statement {
         Stmt::Select(select) => {
             if select.with.is_empty() {

@@ -117,6 +117,7 @@ pub(super) struct BlockTargets<'a> {
 fn relations<'a>(
     scope: &'a QueryScope<'_>,
     statement: &Select<'_>,
+    nameless: &[bool],
     arena: &'a Arena,
 ) -> Result<&'a [Joined<'a>], Fail> {
     let items = statement
@@ -130,7 +131,16 @@ fn relations<'a>(
     for (table, slot) in joined.iter_mut().enumerate() {
         let item = items.next();
         if let Some(definition) = scope.defs.stored(table) {
-            *slot = Some(Joined::new(scope.names[table], definition));
+            // A relation the plan never scans has no name to print.
+            let joined = Joined::new(scope.names[table], definition);
+            *slot = Some(if nameless.get(table).copied().unwrap_or(false) {
+                Joined {
+                    printed: "",
+                    ..joined
+                }
+            } else {
+                joined
+            });
             continue;
         }
         let Some(definition) = scope.defs.get(table) else {
@@ -214,6 +224,7 @@ impl<'a> BlockTargets<'a> {
         window_names: &[&str],
         aggregate: bool,
         bottom_computes: bool,
+        nameless: &[bool],
         arena: &'a Arena,
     ) -> Result<Option<Self>, SqlError> {
         match Self::build(
@@ -227,6 +238,7 @@ impl<'a> BlockTargets<'a> {
             window_names,
             aggregate,
             bottom_computes,
+            nameless,
             arena,
         ) {
             Ok(targets) => Ok(Some(targets)),
@@ -247,10 +259,11 @@ impl<'a> BlockTargets<'a> {
         window_names: &[&str],
         aggregate: bool,
         bottom_computes: bool,
+        nameless: &[bool],
         arena: &'a Arena,
     ) -> Result<Self, Fail> {
         let joined = match scope {
-            Some(scope) => relations(scope, statement, arena)?,
+            Some(scope) => relations(scope, statement, nameless, arena)?,
             None => &[],
         };
         let relation_count = scope.map_or(0, |scope| scope.n);

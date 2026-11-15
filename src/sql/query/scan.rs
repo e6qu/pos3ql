@@ -6976,11 +6976,20 @@ pub(crate) fn select_hash_join_plan<'a>(
     // maps, which the hash plan's single-table scans and rowid-only payload
     // do not read. Derived sources have no storage slot, so classify that
     // boundary before asking storage for descendants.
-    let reads_tree = |source: usize| {
-        scope.derived[source].is_none()
+    let reads_tree = |source: usize| -> Result<bool, SqlError> {
+        Ok(scope.derived[source].is_none()
             && storage.relation_has_descendants(scope.slots[source], txid)
+            && !super::partition_prune::plans_no_partition(
+                storage,
+                scope,
+                from,
+                where_clause,
+                source,
+                txid,
+                arena,
+            )?)
     };
-    if reads_tree(first_table) || reads_tree(second_table) {
+    if reads_tree(first_table)? || reads_tree(second_table)? {
         return Ok(None);
     }
     const MAX_HASH_ENTRIES: usize = 1 << 15;

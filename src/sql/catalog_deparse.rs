@@ -893,6 +893,25 @@ impl Context<'_> {
         })
     }
 
+    /// For a comparison of a boolean expression with a boolean constant,
+    /// the expression and the constant.
+    fn boolean_equality<'e>(
+        &self,
+        left: &'e Expr<'e>,
+        right: &'e Expr<'e>,
+    ) -> Result<Option<(&'e Expr<'e>, bool)>, SqlError> {
+        let constant = |side: &Expr<'_>| match side {
+            Expr::Bool(value) => Some(*value),
+            _ => None,
+        };
+        let (tested, value) = match (constant(left), constant(right)) {
+            (None, Some(value)) => (left, value),
+            (Some(value), None) => (right, value),
+            _ => return Ok(None),
+        };
+        Ok((self.type_of(tested)? == Some(oid::BOOL)).then_some((tested, value)))
+    }
+
     /// Operand types after PostgreSQL's operator resolution, `None` only when
     /// both sides are unknown literals.
     fn operand_types(
@@ -1430,6 +1449,25 @@ impl Context<'_> {
             Expr::Unary {
                 operator, operand, ..
             } => self.prefix(*operator, operand, output),
+            Expr::Binary {
+                operator: operator @ (BinaryOp::Eq | BinaryOp::NotEq),
+                left,
+                right,
+                ..
+            } if self.folded
+                && let Some((tested, value)) = self.boolean_equality(left, right)? =>
+            {
+                // The planner's `simplify_boolean_equality`: `b = true` is
+                // `b`, and `b = false` is `NOT b`.
+                if value == (*operator == BinaryOp::Eq) {
+                    self.bare(tested, output)
+                } else {
+                    self.open(output)?;
+                    output.push("NOT ")?;
+                    self.wrapped(tested, Some(Some(oid::BOOL)), Parent::Not, true, output)?;
+                    self.close(output)
+                }
+            }
             Expr::Binary {
                 operator,
                 left,

@@ -5276,6 +5276,22 @@ fn plan_pulled_select<'a>(
             // target themselves (`apply_scanjoin_target_to_paths`); in a
             // join they read the columns needed above.
             let expanded = expansions.get(table).copied().flatten().is_some();
+            // An inheritance tree's members read the needed columns, and a
+            // `Result` above their `Append` computes the query's target,
+            // which this plan does not model.
+            if let (Some(found), true, true) = (block_targets.as_ref(), expanded, n == 1)
+                && !storage
+                    .table_def(scope.slots[table], txid)
+                    .partition
+                    .is_partitioned()
+                && found.scan(table, true, targets::Demand::Exact)?.as_str()
+                    != found.scan(table, true, targets::Demand::Small)?.as_str()
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of a query computing its select list over an inheritance tree is not supported"
+                ));
+            }
             match block_targets.as_ref() {
                 Some(found) => {
                     scan.output = found.scan(
@@ -7570,6 +7586,17 @@ scan_pruned: false,
             return Ok(plan);
         }
     }
+    // A joined write or a MERGE reads each member of a partitioned or
+    // inheritance target in its own join, which this plan does not model.
+    if (joined_from.is_some() || matches!(statement, Stmt::Merge(_)))
+        && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
+        && query::partition_prune::expands(storage, slot, txid)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a joined write to a partitioned table or inheritance tree is not supported"
+        ));
+    }
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");
@@ -8087,6 +8114,14 @@ fn expanded_write<'e>(
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "EXPLAIN of a write to ONLY an inheritance parent is not supported"
+        ));
+    }
+    // An inheritance tree's update computes its new values in a `Result`
+    // above the members' `Append`, which this plan does not model.
+    if matches!(statement, Stmt::Update(_)) && !definition.partition.is_partitioned() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of an UPDATE of an inheritance tree is not supported"
         ));
     }
     if predicate.is_some_and(|predicate| qual_false(predicate, arena)) {

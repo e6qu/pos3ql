@@ -31769,6 +31769,70 @@ fn multi_column_hash_partition_keys_match_postgresql_integer_hashing() {
 }
 
 #[test]
+fn hash_partition_keys_of_text_and_numeric_route_as_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE text_hash (k text, n numeric) PARTITION BY HASH (k); \
+         CREATE TABLE text_hash0 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 0); \
+         CREATE TABLE text_hash1 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 1); \
+         CREATE TABLE text_hash2 PARTITION OF text_hash FOR VALUES WITH (MODULUS 3, REMAINDER 2); \
+         INSERT INTO text_hash (k) VALUES ('key1'), ('key3'), ('key5'), (''), (NULL); \
+         SELECT tableoid::regclass, coalesce(k, 'null') FROM text_hash ORDER BY 2; \
+         SELECT satisfies_hash_partition('text_hash'::regclass, 3, 1, 'key3'::text), \
+           satisfies_hash_partition('text_hash'::regclass, 3, 2, 'key3'::text)",
+    );
+    let (mut engine, mut budget) = test_engine();
+    let numeric = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE numeric_hash (n numeric) PARTITION BY HASH (n); \
+         CREATE TABLE numeric_hash0 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 0); \
+         CREATE TABLE numeric_hash1 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 1); \
+         CREATE TABLE numeric_hash2 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 2); \
+         CREATE TABLE numeric_hash3 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 3); \
+         CREATE TABLE numeric_hash4 PARTITION OF numeric_hash FOR VALUES WITH (MODULUS 5, REMAINDER 4); \
+         INSERT INTO numeric_hash VALUES (0), (1.000), (100000000), (2111.1102), ('Infinity'), ('NaN'); \
+         SELECT tableoid::regclass, n FROM numeric_hash ORDER BY n",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "text_hash2|",
+            "text_hash0|key1",
+            "text_hash1|key3",
+            "text_hash2|key5",
+            "text_hash0|null",
+            "t|f",
+        ]
+    );
+    assert_eq!(
+        data_rows(&numeric),
+        [
+            "numeric_hash2|0",
+            "numeric_hash0|1.000",
+            "numeric_hash1|2111.1102",
+            "numeric_hash3|100000000",
+            "numeric_hash3|Infinity",
+            "numeric_hash3|NaN",
+        ]
+    );
+    let refused = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_hash (i interval) PARTITION BY HASH (i)",
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains(
+            "HASH partitioning is not supported for partition key column \"i\" of type interval"
+        ),
+        "{}",
+        String::from_utf8_lossy(&refused)
+    );
+}
+
+#[test]
 fn subpartitioned_tables_route_through_every_typed_level() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

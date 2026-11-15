@@ -3328,6 +3328,20 @@ pub trait CatalogAccess {
             "partition ancestry requires catalog access"
         ))
     }
+    /// `satisfies_hash_partition` over evaluated key values of `types`.
+    fn satisfies_hash_partition(
+        &self,
+        _oid: i32,
+        _modulus: i32,
+        _remainder: i32,
+        _types: &[i32],
+        _values: &[Datum<'_>],
+    ) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "satisfies_hash_partition requires catalog access"
+        ))
+    }
     /// A partition's implicit constraint, as `pg_get_partition_constraintdef`.
     fn partition_constraint_def<'a>(
         &self,
@@ -12000,6 +12014,53 @@ fn call<'a>(
                 ])
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
+        }
+        "satisfies_hash_partition" => {
+            if args.len() < 4 || args.len() > 3 + crate::storage::MAX_PARTITION_KEYS {
+                return undefined_function(written_name, args, row, hooks);
+            }
+            let mut fixed = [Datum::Null; 3];
+            for (value, argument) in fixed.iter_mut().zip(args) {
+                *value = eval_full(argument, arena, params, row, hooks)?;
+            }
+            if fixed.iter().any(Datum::is_null) {
+                return Ok(Datum::Bool(false));
+            }
+            let parent = match cast_to(fixed[0], ColType::Oid, arena)? {
+                Datum::Oid(parent) => parent as i32,
+                _ => unreachable!("validated oid conversion"),
+            };
+            let integer = |value: Datum<'_>| match cast_to(value, ColType::Int4, arena)? {
+                Datum::Int4(value) => Ok(value),
+                _ => unreachable!("validated int4 conversion"),
+            };
+            let (modulus, remainder) = (integer(fixed[1])?, integer(fixed[2])?);
+            let keys = &args[3..];
+            let mut types = [0i32; crate::storage::MAX_PARTITION_KEYS];
+            let mut values = [Datum::Null; crate::storage::MAX_PARTITION_KEYS];
+            let columns = RuntimeColumnTypes {
+                row,
+                catalog: hooks.catalog,
+            };
+            for (index, argument) in keys.iter().enumerate() {
+                types[index] = crate::sql::exec::infer_routine_argument_oid(argument, &columns)?;
+                values[index] = eval_full(argument, arena, params, row, hooks)?;
+            }
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "satisfies_hash_partition requires catalog access"
+                )
+            })?;
+            catalog
+                .satisfies_hash_partition(
+                    parent,
+                    modulus,
+                    remainder,
+                    &types[..keys.len()],
+                    &values[..keys.len()],
+                )
+                .map(Datum::Bool)
         }
         "pg_get_sequence_data" => {
             arity(1)?;

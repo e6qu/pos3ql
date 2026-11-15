@@ -5432,16 +5432,16 @@ fn resolve_partition_scheme<Definition0: crate::storage::DefinitionBacking>(
         }
     }
     if strategy == PartitionStrategy::Hash
-        && keys[..columns.len()].iter().any(|key| {
-            !matches!(
-                definition.columns.as_ref()[usize::from(*key)].ctype,
-                ColType::Int2 | ColType::Int4 | ColType::Int8
-            )
+        && let Some(key) = keys[..columns.len()].iter().find(|key| {
+            let column = &definition.columns.as_ref()[usize::from(**key)];
+            column.user_type.is_some() || !crate::storage::partition_hash_supported(column.ctype)
         })
     {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "HASH partitioning is supported for integer partition keys only"
+            "HASH partitioning is not supported for partition key column \"{}\" of type {}",
+            definition.columns.as_ref()[usize::from(*key)].name.as_str(),
+            definition.columns.as_ref()[usize::from(*key)].ctype.name()
         ));
     }
     Ok(crate::storage::PartitionScheme {

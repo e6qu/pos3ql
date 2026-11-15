@@ -16161,6 +16161,101 @@ pub fn partition_key_def_text<'a>(
 /// Source: <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/partitioning/partbounds.c>
 /// (`get_qual_for_hash`, `get_qual_for_list`, `get_qual_for_range`,
 /// `make_partition_op_expr`).
+/// PostgreSQL's `satisfies_hash_partition`: whether `values`, of the types
+/// `types`, hash to `remainder` modulo `modulus` as the hash partitioned
+/// table `oid` routes rows.
+pub(crate) fn satisfies_hash_partition(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    modulus: i32,
+    remainder: i32,
+    types: &[i32],
+    values: &[Datum<'_>],
+) -> Result<bool, SqlError> {
+    if modulus <= 0 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "modulus for hash partition must be an integer value greater than zero"
+        ));
+    }
+    if remainder < 0 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "remainder for hash partition must be an integer value greater than or equal to zero"
+        ));
+    }
+    if remainder >= modulus {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "remainder for hash partition must be less than modulus"
+        ));
+    }
+    let Some(slot) = table_slot_by_oid(storage, txid, oid) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "could not open relation with OID {}",
+            oid
+        ));
+    };
+    let table = storage.table_def(slot, txid);
+    let scheme = match table.partition.scheme {
+        Some(scheme) if scheme.strategy == crate::storage::PartitionStrategy::Hash => scheme,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "\"{}\" is not a hash partitioned table",
+                table.name.as_str()
+            ));
+        }
+    };
+    let keys = &scheme.keys[..usize::from(scheme.n_keys)];
+    if keys.len() != values.len() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "number of partitioning columns ({}) does not match number of partition keys provided ({})",
+            keys.len(),
+            values.len()
+        ));
+    }
+    let mut hash = 0u64;
+    for (index, (&key, (&supplied, &value))) in
+        keys.iter().zip(types.iter().zip(values)).enumerate()
+    {
+        let expected = catalog_column_type_oid(storage, &table.columns()[usize::from(key)], txid)?;
+        // `IsBinaryCoercible` from the key's type: `varchar` and `text`.
+        let coercible = supplied == expected
+            || matches!(
+                (expected, supplied),
+                (
+                    crate::sql::types::oid::VARCHAR,
+                    crate::sql::types::oid::TEXT
+                ) | (
+                    crate::sql::types::oid::TEXT,
+                    crate::sql::types::oid::VARCHAR
+                )
+            );
+        if !coercible {
+            let name = |type_oid: i32| -> Result<crate::util::StackStr<260>, SqlError> {
+                Ok(match crate::sql::exec::builtin_type_name_fixed(type_oid) {
+                    Some(name) => name,
+                    None => user_type_name_fixed(storage, txid, type_oid)?
+                        .unwrap_or_else(|| crate::util::StackStr::from_str("???")),
+                })
+            };
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "column {} of the partition key has type {}, but supplied value is of type {}",
+                index + 1,
+                name(expected)?.as_str(),
+                name(supplied)?.as_str()
+            ));
+        }
+        hash = crate::storage::partition_hash_combine(hash, value)?;
+    }
+    Ok(hash % modulus as u64 == remainder as u64)
+}
+
 pub fn partition_constraint_def_text<'a>(
     storage: &Storage,
     txid: u32,

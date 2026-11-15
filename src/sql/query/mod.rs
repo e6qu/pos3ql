@@ -7308,6 +7308,24 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<&'a str>, SqlError> {
         super::catalog::partition_constraint_def_text(self.storage, self.txid, oid, arena)
     }
+    fn satisfies_hash_partition(
+        &self,
+        oid: i32,
+        modulus: i32,
+        remainder: i32,
+        types: &[i32],
+        values: &[Datum<'_>],
+    ) -> Result<bool, SqlError> {
+        super::catalog::satisfies_hash_partition(
+            self.storage,
+            self.txid,
+            oid,
+            modulus,
+            remainder,
+            types,
+            values,
+        )
+    }
     fn relname<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::relname_text(self.storage, self.txid, oid, arena)
     }

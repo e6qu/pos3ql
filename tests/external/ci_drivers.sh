@@ -37,12 +37,19 @@ trap cleanup EXIT
 
 # --- start pos3ql (pure SQL/protocol; object storage off) ------------------
 git rev-parse HEAD > "$WORK/revision.txt" || exit 1
-if ! (
-  set -o pipefail
-  cargo build --release --locked 2>&1 | tee "$WORK/build.log"
-); then
-  echo "build failed"
-  exit 1
+# POS3QL_BIN names the server to test; without it the suite builds and tests
+# the release binary.
+if [[ -n ${POS3QL_BIN:-} ]]; then
+  [[ -x $POS3QL_BIN ]] || { echo "POS3QL_BIN is not executable: $POS3QL_BIN"; exit 1; }
+else
+  if ! (
+    set -o pipefail
+    cargo build --release --locked 2>&1 | tee "$WORK/build.log"
+  ); then
+    echo "build failed"
+    exit 1
+  fi
+  POS3QL_BIN=./target/release/pos3ql
 fi
 cat > "$WORK/p3.conf" <<EOF
 transaction_mode = mvcc
@@ -86,7 +93,7 @@ memtable_bytes = 256MiB
 max_prepared = 64
 max_prepared_transactions = 8
 EOF
-"${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
+"$POS3QL_BIN" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 for _ in $(seq 1 100); do
   psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -tAc "SELECT 1" >/dev/null 2>&1 && break

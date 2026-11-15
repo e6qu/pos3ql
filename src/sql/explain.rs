@@ -3292,8 +3292,24 @@ pub(super) fn plan_select<'a>(
     // InitPlan of the query's top node, the others are inlined.
     let (select, ctes) = query::expand_ctes_for_plan(statement, storage, txid, arena)?;
     let prior = CTE_PLANS.with(|planned| planned.replace(planned.get() || !ctes.is_empty()));
-    let plan = plan_ctes(storage, txid, ctes, outer, block, arena)
-        .and_then(|ctes| plan_select_with_ctes(storage, txid, select, ctes, outer, block, arena));
+    let plan = plan_ctes(storage, txid, ctes, outer, block, arena).and_then(|ctes| {
+        // A set operation with its own `WITH` list keeps the list's
+        // InitPlans on its top node.
+        if let Some(body) = select.set_body {
+            let set_query = SetQuery {
+                with: &[],
+                body,
+                order_by: select.order_by,
+                limit: select.limit,
+                offset: select.offset,
+                with_ties: select.with_ties,
+                locking: select.locking,
+            };
+            let plan = plan_set_query(storage, txid, &set_query, outer, block, arena)?;
+            return attach_subplans(plan, 0, block, ctes, arena);
+        }
+        plan_select_with_ctes(storage, txid, select, ctes, outer, block, arena)
+    });
     CTE_PLANS.with(|planned| planned.set(prior));
     plan
 }

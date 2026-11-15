@@ -867,8 +867,11 @@ iteration at a time where PostgreSQL pulls single rows; `ANALYZE` prints no
 scalar subquery's `InitPlan` prints `never executed`; a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
-plan block), an `IN` over a subquery with its own `WITH` list stays a
-subplan where PostgreSQL pulls it up into a semi join, a join condition
+plan block), an `IN` over a subquery with its own `WITH` list pulls
+up into a semi join once the `WITH` queries it inlines are substituted, but
+one whose `WITH` query runs once (`MATERIALIZED`, or read twice by a set
+operation) stays a subplan where PostgreSQL joins its `CTE Scan` or set
+operation, a join condition
 over a derived table whose `WITH` query PostgreSQL reads directly names the
 derived table (`s.a` for `c.a`), `EXPLAIN` plans a `LATERAL` item and a
 subquery's derived table with the columns to their left and of the

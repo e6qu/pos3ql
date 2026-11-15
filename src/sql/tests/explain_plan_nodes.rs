@@ -973,3 +973,32 @@ fn writing_with_queries_are_init_plans_of_any_main_statement() {
         ]
     );
 }
+
+#[test]
+fn in_subqueries_with_inlined_with_queries_pull_up() {
+    let (mut session, mut engine) = setup("in_subqueries_with_inlined_with_queries_pull_up");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "COSTS OFF",
+            "SELECT b FROM pn_t WHERE b IN (WITH c AS (SELECT a FROM pn_u) SELECT a FROM c)"
+        ),
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (pn_t.b = pn_u.a)",
+            "  ->  Seq Scan on pn_t",
+            "  ->  Hash",
+            "        ->  Seq Scan on pn_u",
+        ]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT b FROM pn_t WHERE b IN \
+             (WITH c AS (SELECT a FROM pn_u WHERE a > 15) SELECT a FROM c) ORDER BY b",
+            true
+        )),
+        ["16", "17", "18", "19", "20"]
+    );
+}

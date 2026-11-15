@@ -835,3 +835,28 @@ fn nested_with_queries_follow_the_run_once_rule() {
         ]
     );
 }
+
+#[test]
+fn renamed_relations_print_their_new_names_in_conditions() {
+    let (mut session, mut engine) = setup("renamed_relations_print_their_new_names_in_conditions");
+    assert_eq!(
+        plan(
+            &mut session,
+            &mut engine,
+            "VERBOSE, COSTS OFF",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) \
+             SELECT * FROM r"
+        ),
+        [
+            "CTE Scan on r",
+            "  Output: r.n",
+            "  CTE r",
+            "    ->  Recursive Union",
+            "          ->  Result",
+            "                Output: 1",
+            "          ->  WorkTable Scan on r r_1",
+            "                Output: (r_1.n + 1)",
+            "                Filter: (r_1.n < 5)",
+        ]
+    );
+}

@@ -831,10 +831,10 @@ plan block), an `IN` over a subquery with its own `WITH` list stays a
 subplan where PostgreSQL pulls it up into a semi join, a join condition
 over a derived table whose `WITH` query PostgreSQL reads directly names the
 derived table (`s.a` for `c.a`), `EXPLAIN` of a `LATERAL` item or a
-subquery's derived table reading an outer column fails with `42P01`, a
-and a recursive term's
-join is planned as a nested loop with conditions naming the relations
-before their `_1` renaming. When a derived table or `CTE Scan` joins a
+subquery's derived table reading an outer column fails with `42P01`. A
+subplan's relation renamed after one of the
+statement's (`r_1`, `e1_1`) prints its new name in its query block's
+conditions and lists. When a derived table or `CTE Scan` joins a
 stored relation of equal size, PostgreSQL's cost tie may pick the other
 outer or hashed side. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, an incremental

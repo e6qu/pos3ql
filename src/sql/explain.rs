@@ -236,6 +236,17 @@ impl PlanNode {
         self
     }
 
+    /// Names the relation `old` of this node's query block `new` in its
+    /// conditions, keys and target list.
+    fn requalify(&mut self, old: &str, new: &str) {
+        for (_, qual) in self.quals.iter_mut().chain(self.verbose_quals.iter_mut()) {
+            *qual = requalified(qual, old, new);
+        }
+        self.output = requalified(&self.output, old, new);
+        self.keys.plain = requalified(&self.keys.plain, old, new);
+        self.keys.verbose = requalified(&self.keys.verbose, old, new);
+    }
+
     /// The name the query exposes the node's relation under.
     fn exposed_name(&self) -> &str {
         if self.alias.as_str().is_empty() {
@@ -3667,6 +3678,18 @@ fn attach_subplans<'a>(
     let push_subplan = |attached: &mut Plan<'a>, parent: PlanNode, index: usize| {
         let sublink = &sublinks[index];
         for (at, node) in sublink.nodes.iter().enumerate() {
+            // The conditions and lists of a renamed relation's query block
+            // name it as renamed.
+            let mut node = *node;
+            for (other, renamed_node) in sublink.nodes.iter().enumerate() {
+                let Some(new) = renamed[offsets[index] + other] else {
+                    continue;
+                };
+                if renamed_node.key.map(|key| key.block) == node.key.map(|key| key.block) {
+                    node.requalify(renamed_node.exposed_name(), new.as_str());
+                }
+            }
+            let node = &node;
             let mut name = StackStr::<72>::new();
             match sublink.cte {
                 Some(cte) => {
@@ -5107,6 +5130,47 @@ fn shows_output(node: &PlanNode) -> bool {
             node.name.as_str(),
             "Append" | "Merge Append" | "Recursive Union"
         )
+}
+
+/// `text` with each column qualifier `old` (outside string literals and
+/// quoted names) replaced by `new`.
+fn requalified<const N: usize>(text: &StackStr<N>, old: &str, new: &str) -> StackStr<N> {
+    let source = text.as_str();
+    let pattern_len = old.len() + 1;
+    let mut out = StackStr::<N>::new();
+    let bytes = source.as_bytes();
+    let mut quoted: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quoted {
+            Some(quote) => {
+                if byte == quote {
+                    quoted = None;
+                }
+            }
+            None if byte == b'\'' || byte == b'"' => quoted = Some(byte),
+            None => {
+                let starts = index == 0 || {
+                    let prior = bytes[index - 1];
+                    !(prior.is_ascii_alphanumeric() || prior == b'_' || prior == b'.')
+                };
+                if starts
+                    && source[index..].starts_with(old)
+                    && bytes.get(index + old.len()) == Some(&b'.')
+                {
+                    let _ = out.write_str(new);
+                    let _ = out.write_char('.');
+                    index += pattern_len;
+                    continue;
+                }
+            }
+        }
+        let character = source[index..].chars().next().unwrap_or(' ');
+        let _ = out.write_char(character);
+        index += character.len_utf8();
+    }
+    if out.is_truncated() { *text } else { out }
 }
 
 /// An output column list held as a node's `Output:`.

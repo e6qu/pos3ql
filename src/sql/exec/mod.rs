@@ -614,7 +614,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
                 .then_some(None));
             };
             let context = RowCtx {
-                table_oid: None,
+                table_oid: Some(crate::sql::catalog::user_table_oid(storage, table) as u32),
                 def: crate::storage::RelationDefinition::from_definition(self.def),
                 values: &values[..self.def.n_columns],
                 alias: self.alias,
@@ -731,13 +731,13 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
             layout.project(&first_physical, &mut first_values);
             let relation = crate::storage::RelationDefinition::from_definition(self.def);
             let first_row = RowCtx {
-                table_oid: None,
+                table_oid: Some(crate::sql::catalog::user_table_oid(storage, table) as u32),
                 def: relation,
                 values: &first_values[..self.def.n_columns],
                 alias: self.alias,
             };
             let latest_row = RowCtx {
-                table_oid: None,
+                table_oid: Some(crate::sql::catalog::user_table_oid(storage, table) as u32),
                 def: relation,
                 values: &values[..self.def.n_columns],
                 alias: self.alias,
@@ -82252,12 +82252,16 @@ struct MergeSourceMembers<'d> {
     /// Each member's name, first source column and column count.
     members: &'d [(&'d str, usize, usize)],
     visible: usize,
+    /// The source column holding a stored source's `tableoid`, which the
+    /// statement reads: after every column a name or star reaches.
+    table_oid: Option<usize>,
 }
 
 impl MergeSourceMembers<'_> {
     const NONE: Self = Self {
         members: &[],
         visible: usize::MAX,
+        table_oid: None,
     };
 
     /// The source column `qualifier.name` names, if `qualifier` is a member.
@@ -82425,6 +82429,8 @@ struct MergeLookup<'d, 'v> {
     target_def: crate::storage::RelationDefinition<'d>,
     target_alias: &'d str,
     target: &'v [Datum<'v>],
+    /// The `tableoid` of the target row's table; `None` for a view's row.
+    target_oid: Option<u32>,
     source_def: &'d crate::storage::RelationDefinition<'d>,
     source_alias: &'d str,
     source_members: MergeSourceMembers<'d>,
@@ -82444,6 +82450,13 @@ struct MergeLookup<'d, 'v> {
 
 impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        match self.table_oid(qualifier, name) {
+            Some(MergeTableOid::Target(oid)) => return Ok(oid),
+            Some(MergeTableOid::Source(index)) => {
+                return Ok(self.source.map_or(Datum::Null, |source| source[index]));
+            }
+            None => {}
+        }
         match qualifier {
             Some(q) if self.old_name == Some(q) => self
                 .target_def
@@ -82606,10 +82619,16 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if self.table_oid(qualifier, name).is_some() {
+            return Some(ColType::Oid);
+        }
         self.column(qualifier, name).map(|column| column.ctype)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if self.table_oid(qualifier, name).is_some() {
+            return crate::sql::ast::Collation::None;
+        }
         self.column(qualifier, name)
             .map(|column| column.collation)
             .unwrap_or(crate::sql::ast::Collation::None)
@@ -82647,7 +82666,42 @@ fn merge_row_fields<'v>(
     Ok(&*fields)
 }
 
+/// Where a `MERGE` row reads a `tableoid`.
+enum MergeTableOid<'v> {
+    /// The target row's table.
+    Target(Datum<'v>),
+    /// The source row's column holding its table.
+    Source(usize),
+}
+
 impl<'d, 'v> MergeLookup<'d, 'v> {
+    /// The `tableoid` `qualifier.name` reads: the target's, its `RETURNING`
+    /// images' (null for an absent image), or a stored source's. Analysis
+    /// has rejected an unqualified name both relations answer.
+    fn table_oid(&self, qualifier: Option<&str>, name: &str) -> Option<MergeTableOid<'v>> {
+        if name != "tableoid" || self.target_def.column_index(name).is_some() {
+            return None;
+        }
+        let source = self
+            .source_members
+            .table_oid
+            .filter(|_| self.source.is_some() || self.source_namespace_when_absent)
+            .map(MergeTableOid::Source);
+        let oid = self.target_oid.map(Datum::Oid);
+        match qualifier {
+            Some(qualifier) if self.old_name == Some(qualifier) => {
+                oid.map(|oid| MergeTableOid::Target(self.old.map_or(Datum::Null, |_| oid)))
+            }
+            Some(qualifier) if self.new_name == Some(qualifier) => {
+                oid.map(|oid| MergeTableOid::Target(self.new.map_or(Datum::Null, |_| oid)))
+            }
+            Some(qualifier) if qualifier == self.target_alias => oid.map(MergeTableOid::Target),
+            Some(qualifier) if qualifier == self.source_alias => source,
+            Some(_) => None,
+            None => oid.map(MergeTableOid::Target).or(source),
+        }
+    }
+
     /// The row a whole-row reference to `table` reads: the `RETURNING`
     /// images, the target, or the source (its visible columns), with `None`
     /// for an absent row.
@@ -82804,7 +82858,8 @@ fn merge_source_demand(
                 return true;
             }
             let Some(column) = source.column_index(name) else {
-                return false;
+                // A stored source's `tableoid` is a column of its own.
+                return *name == "tableoid";
             };
             if column >= u64::BITS as usize {
                 return false;
@@ -82878,6 +82933,7 @@ fn merge_source_members<'a>(
     Ok(MergeSourceMembers {
         members: ranges,
         visible,
+        table_oid: None,
     })
 }
 
@@ -83577,7 +83633,13 @@ fn merge_source<'a>(
         outer,
     )?;
     let source_members = merge_source_members(storage, statement, &source_all_select, txid, arena)?;
-    let select = match merge_source_columns(statement, alias, &source_all_def) {
+    // `EXPLAIN ANALYZE` sizes a hashed source row from all its columns.
+    let narrowed = if crate::sql::query::instrument::active() {
+        None
+    } else {
+        merge_source_columns(statement, alias, &source_all_def)
+    };
+    let select = match narrowed {
         Some(columns) => {
             let mut items =
                 [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
@@ -83623,6 +83685,37 @@ fn merge_source<'a>(
         }
         None => source_all_select,
     };
+    let mut source_members = source_members;
+    let select = if merge_reads_source_table_oid(storage, statement, alias, txid) {
+        // The column follows every column a name or star reaches.
+        let visible = super::query::describe_derived_definition(
+            storage, &select, alias, None, txid, arena, outer,
+        )?
+        .n_columns;
+        source_members.visible = source_members.visible.min(visible);
+        source_members.table_oid = Some(visible);
+        let expression = arena
+            .alloc(Expr::Column {
+                qualifier: Some(alias),
+                name: "tableoid",
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        let items = arena
+            .alloc_slice_with(select.items.len() + 1, |index| {
+                select
+                    .items
+                    .get(index)
+                    .copied()
+                    .unwrap_or(SelectItem::Expr {
+                        expression,
+                        alias: Some("tableoid"),
+                    })
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        crate::sql::ast::Select { items, ..select }
+    } else {
+        select
+    };
     let def = super::query::describe_derived_definition(
         storage, &select, alias, None, txid, arena, outer,
     )?;
@@ -83632,6 +83725,70 @@ fn merge_source<'a>(
         select,
         def,
     })
+}
+
+/// Whether a `MERGE` from a stored relation reads the source's `tableoid`:
+/// by the source's name, or unqualified, where analysis has resolved it.
+fn merge_reads_source_table_oid(
+    storage: &Storage,
+    statement: &crate::sql::ast::Merge<'_>,
+    alias: &str,
+    txid: u32,
+) -> bool {
+    let source = statement.source;
+    let stored = source.subquery.is_none()
+        && source.cte.is_none()
+        && source.func_args.is_none()
+        && source.rows_from.is_none()
+        && source.join_members.is_none()
+        && !source.table.is_empty()
+        && matches!(
+            storage.resolve_relation(source.schema, source.table, txid),
+            Some(crate::storage::ResolvedRelation::Table(_))
+        );
+    if !stored {
+        return false;
+    }
+    let mut reads = false;
+    merge_for_each_expression(statement, &mut |expression| {
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            reads |= name == "tableoid" && qualifier.is_none_or(|qualifier| qualifier == alias);
+        });
+    });
+    reads
+}
+
+/// Visits every expression of a `MERGE` its rows evaluate: the join
+/// condition, each action's condition and values, and `RETURNING`.
+fn merge_for_each_expression<'a>(
+    statement: &crate::sql::ast::Merge<'a>,
+    visit: &mut dyn FnMut(&'a Expr<'a>),
+) {
+    visit(statement.on);
+    for when in statement.whens {
+        if let Some(condition) = when.condition() {
+            visit(condition);
+        }
+        match when.action() {
+            crate::sql::ast::MergeActionRef::Update(assignments) => {
+                for (_, value) in assignments {
+                    visit(value);
+                }
+            }
+            crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                for value in values {
+                    visit(value);
+                }
+            }
+            crate::sql::ast::MergeActionRef::Delete
+            | crate::sql::ast::MergeActionRef::DoNothing => {}
+        }
+    }
+    for item in statement.returning.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            visit(expression);
+        }
+    }
 }
 
 /// Selects the MERGE source's rows exactly once. Evaluating it again to
@@ -84092,17 +84249,65 @@ fn merge_target<'a>(
     // also when a resumed attempt selects them again after earlier rows
     // changed.
     let selection_snapshot = storage.dml_expression_snapshot(txn.command_id());
-    let source_rows = match merge_source_rows(
-        storage,
-        txn.txid,
-        &source,
-        arena,
-        params,
-        outer,
-        seq_session,
-    ) {
-        Ok(rows) => rows,
-        Err(error) => return sql_fail(error),
+    let source_rows = {
+        // The source's own query counts apart from the statement's plan.
+        let _source =
+            crate::sql::query::instrument::enter(crate::sql::query::instrument::Segment::Source);
+        match merge_source_rows(
+            storage,
+            txn.txid,
+            &source,
+            arena,
+            params,
+            outer,
+            seq_session,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => return sql_fail(error),
+        }
+    };
+    // The source's scan checks the `ON` conjuncts reading only the source,
+    // unless its unmatched rows reach an action.
+    let mut source_scan = MergeScanCounts::default();
+    let source_rows: &[&[u8]] = match join_plan.conditions.source {
+        None => {
+            source_scan.passed = source_rows.len() as u64;
+            source_rows
+        }
+        Some(condition) => {
+            let kept = match arena.alloc_slice_with(source_rows.len(), |_| &[][..]) {
+                Ok(kept) => kept,
+                Err(_) => return sql_fail(arena_full()),
+            };
+            let mut count = 0usize;
+            for &row in source_rows {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                let width = projected_row_width(row).min(MAX_COLUMNS);
+                for (column, value) in values.iter_mut().enumerate().take(width) {
+                    *value = decode_projected_pub(row, column);
+                }
+                let scope = merge_source_scope(&source.def, source.members, &values[..width]);
+                match eval_merge_expression(
+                    condition,
+                    storage,
+                    txn.txid,
+                    seq_session,
+                    arena,
+                    params,
+                    &ProceduralMergeScope { row: &scope, outer },
+                    None,
+                ) {
+                    Ok(Datum::Bool(true)) => {
+                        source_scan.pass();
+                        kept[count] = row;
+                        count += 1;
+                    }
+                    Ok(_) => source_scan.removed += 1,
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            &kept[..count]
+        }
     };
     let replication_role = match crate::sql::guc::active_session_replication_role() {
         Ok(role) => role,
@@ -84278,6 +84483,11 @@ fn merge_target<'a>(
             return sql_fail(e);
         }
     }
+    // What the target's scan of each member returned and removed.
+    let target_scan = match arena.alloc_slice_with(leaves.len(), |_| MergeScanCounts::default()) {
+        Ok(counts) => counts,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut accepted = 0usize;
     for j in 0..k {
         let row_table = tables[j];
@@ -84343,6 +84553,54 @@ fn merge_target<'a>(
             Ok(values) => &*values,
             Err(_) => return sql_fail(arena_full()),
         };
+        // The target's scan checks the `ON` conjuncts reading only the
+        // target, unless its unmatched rows reach an action.
+        let leaf = leaves
+            .iter()
+            .position(|&leaf| leaf == row_table)
+            .unwrap_or(0);
+        if let Some(condition) = join_plan.conditions.target {
+            let lookup = MergeLookup {
+                target_def: crate::storage::RelationDefinition::from_definition(def),
+                target_alias,
+                target: logical,
+                target_oid: Some(crate::sql::catalog::user_table_oid(storage, row_table) as u32),
+                source_def,
+                source_alias,
+                source_members,
+                source: None,
+                source_namespace_when_absent: false,
+                old_name: None,
+                old: None,
+                new_name: None,
+                new: None,
+            };
+            match eval_merge_expression(
+                condition,
+                storage,
+                txn.txid,
+                seq_session,
+                arena,
+                params,
+                &ProceduralMergeScope {
+                    row: &lookup,
+                    outer,
+                },
+                None,
+            ) {
+                Ok(Datum::Bool(true)) => {}
+                Ok(_) => {
+                    if let Some(counts) = target_scan.get_mut(leaf) {
+                        counts.removed += 1;
+                    }
+                    continue;
+                }
+                Err(error) => return sql_fail(error),
+            }
+        }
+        if let Some(counts) = target_scan.get_mut(leaf) {
+            counts.pass();
+        }
         ids[accepted] = row_id;
         tables[accepted] = row_table;
         selected_rows[accepted] = selected_rows[j];
@@ -84430,6 +84688,12 @@ fn merge_target<'a>(
         (Some(target), Some(source)) => (join_plan, join_plan.source_outer(target, source)),
         _ => (join_plan.unplanned(), true),
     };
+    // A relation planned without rows costs nothing to scan.
+    let inner_planned_rows = if source_outer {
+        planned_target_rows
+    } else {
+        planned_source_rows
+    };
     let (outer_len, inner_len) = if source_outer {
         (source_rows.len(), n_target)
     } else {
@@ -84489,6 +84753,23 @@ fn merge_target<'a>(
     } else {
         (preserves.1, preserves.0)
     };
+    if crate::sql::query::instrument::active() {
+        record_merge_scans(MergeScans {
+            source_outer,
+            preserves_outer,
+            preserves_inner,
+            inner_costs: inner_planned_rows.is_none_or(|rows| rows > 0),
+            hash: hash.as_ref(),
+            leaves,
+            target: target_scan,
+            target_rows: &target_vals[..n_target],
+            target_def: def,
+            source: source_scan,
+            source_rows,
+            source_def,
+            source_members,
+        });
+    }
     let layout = MergeCursor::resume(
         0,
         source_outer,
@@ -84553,6 +84834,11 @@ fn merge_target<'a>(
     // Whether the running outer row matched a row; kept with an unfinished
     // row.
     let mut matched = core::mem::take(&mut resumed_match).matched;
+    // The join's rows: each pair its conditions keep and each unmatched row
+    // it keeps.
+    let join_node =
+        crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Join(1));
+    let join_loop = join_node.start();
     let rows_outcome = (|| -> Outcome {
         loop {
             if returning_satisfied(&capture, affected_count) {
@@ -84561,6 +84847,13 @@ fn merge_target<'a>(
             let Some(event) = cursor.next(matched, matched_by_source, source_matched) else {
                 break;
             };
+            if let MergeEvent::NotMatched {
+                source: Some(_), ..
+            }
+            | MergeEvent::Pair { source: None, .. } = event
+            {
+                join_node.row();
+            }
             let (source_row, j, position, lost) = match event {
                 MergeEvent::NextOuter => {
                     matched = false;
@@ -84628,6 +84921,7 @@ fn merge_target<'a>(
                                     storage,
                                     txn,
                                     def,
+                                    Some(table_index),
                                     target_alias,
                                     source_def,
                                     source_alias,
@@ -84647,17 +84941,13 @@ fn merge_target<'a>(
                                     Err(error) => return sql_fail(error),
                                 }
                                 affected_count += 1;
+                                merge_changed(crate::sql::query::instrument::MergeChange::Insert);
                                 break 'not_matched;
                             }
                             Err(error) => return sql_fail(error),
                         }
                         // First satisfied WHEN NOT MATCHED clause (source columns only).
-                        let source_ctx = RowCtx {
-                            table_oid: None,
-                            def: *source_def,
-                            values: sv,
-                            alias: None,
-                        };
+                        let source_ctx = merge_source_scope(source_def, source_members, sv);
                         for when in statement.whens.iter().filter(|when| {
                             when.kind() == crate::sql::ast::MergeMatchKind::NotMatchedByTarget
                         }) {
@@ -84730,6 +85020,7 @@ fn merge_target<'a>(
                                                     storage,
                                                     txn,
                                                     def,
+                                                    Some(table_index),
                                                     target_alias,
                                                     source_def,
                                                     source_alias,
@@ -84751,6 +85042,7 @@ fn merge_target<'a>(
                                                 }
                                             }
                                             affected_count += 1;
+                                            merge_changed(crate::sql::query::instrument::MergeChange::Insert);
                                         }
                                         Ok(None) => {}
                                         Err(error) => return sql_fail(error),
@@ -84817,6 +85109,7 @@ fn merge_target<'a>(
                             storage,
                             txn,
                             def,
+                            Some(table_index),
                             target_alias,
                             source_def,
                             source_alias,
@@ -84840,6 +85133,11 @@ fn merge_target<'a>(
                             affected[j] = true;
                         }
                         affected_count += 1;
+                        merge_changed(if action == "UPDATE" {
+                            crate::sql::query::instrument::MergeChange::Update
+                        } else {
+                            crate::sql::query::instrument::MergeChange::Delete
+                        });
                         continue;
                     }
                     Err(error) => return sql_fail(error),
@@ -84848,6 +85146,9 @@ fn merge_target<'a>(
                     target_def: crate::storage::RelationDefinition::from_definition(def),
                     target_alias,
                     target: target_vals[j],
+                    target_oid: Some(
+                        crate::sql::catalog::user_table_oid(storage, target_tables[j]) as u32,
+                    ),
                     source_def,
                     source_alias,
                     source_members,
@@ -84859,21 +85160,37 @@ fn merge_target<'a>(
                     new: None,
                 };
                 if !by_source {
-                    match eval_merge_expression(
-                        statement.on,
-                        storage,
-                        txn.txid,
-                        seq_session,
-                        arena,
-                        params,
-                        &ProceduralMergeScope {
-                            row: &lookup,
-                            outer,
-                        },
-                        None,
-                    ) {
-                        Ok(Datum::Bool(true)) => {}
-                        Ok(_) => continue,
+                    // The hash join's key equalities, then the join's filter;
+                    // each relation's own conditions filtered its scan.
+                    let holds = |condition: Option<&'a Expr<'a>>| {
+                        condition.map_or(Ok(true), |condition| {
+                            eval_merge_expression(
+                                condition,
+                                storage,
+                                txn.txid,
+                                seq_session,
+                                arena,
+                                params,
+                                &ProceduralMergeScope {
+                                    row: &lookup,
+                                    outer,
+                                },
+                                None,
+                            )
+                            .map(|value| matches!(value, Datum::Bool(true)))
+                        })
+                    };
+                    match holds(join_plan.conditions.hash) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => return sql_fail(e),
+                    }
+                    match holds(join_plan.conditions.join) {
+                        Ok(true) => join_node.row(),
+                        Ok(false) => {
+                            join_node.join_filtered();
+                            continue;
+                        }
                         Err(e) => return sql_fail(e),
                     }
                     matched_by_source[j] = true;
@@ -84900,6 +85217,10 @@ fn merge_target<'a>(
                         target_def: crate::storage::RelationDefinition::from_definition(def),
                         target_alias,
                         target: pair_target,
+                        target_oid: Some(crate::sql::catalog::user_table_oid(
+                            storage,
+                            pair_row.map_or(target_tables[j], |row| row.sort_key().0),
+                        ) as u32),
                         source_def,
                         source_alias,
                         source_members,
@@ -85149,6 +85470,7 @@ fn merge_target<'a>(
                                         storage,
                                         txn,
                                         def,
+                                        Some(table_index),
                                         target_alias,
                                         source_def,
                                         source_alias,
@@ -85170,6 +85492,7 @@ fn merge_target<'a>(
                                     }
                                 }
                                 affected_count += 1;
+                                merge_changed(crate::sql::query::instrument::MergeChange::Delete);
                             }
                             MergeAction::Update(assignments) => {
                                 if affected[j] {
@@ -85643,6 +85966,7 @@ fn merge_target<'a>(
                                         storage,
                                         txn,
                                         def,
+                                        Some(table_index),
                                         target_alias,
                                         source_def,
                                         source_alias,
@@ -85665,6 +85989,7 @@ fn merge_target<'a>(
                                 }
                                 affected[j] = true;
                                 affected_count += 1;
+                                merge_changed(crate::sql::query::instrument::MergeChange::Update);
                             }
                             MergeAction::Insert { .. } => {
                                 return sql_fail(sql_err!(
@@ -85683,6 +86008,7 @@ fn merge_target<'a>(
         }
         sql_ok()
     })();
+    drop(join_loop);
     if let Some(progress) = progress {
         if matches!(&rows_outcome, Ok(Err(error)) if progress.stops_for(error))
             && let Err(error) = save_merge_state(
@@ -85747,6 +86073,218 @@ fn merge_target<'a>(
         },
         write_completion::RowPhaseEnd::of(returning_satisfied(&capture, affected_count)),
     )
+}
+
+/// The scope of a `MERGE` source row alone: the columns a name reaches,
+/// and a stored source's `tableoid`.
+fn merge_source_scope<'s, 'v, 'd>(
+    definition: &crate::storage::RelationDefinition<'d>,
+    members: MergeSourceMembers<'_>,
+    values: &'s [Datum<'v>],
+) -> RowCtx<'s, 'v, 'd> {
+    RowCtx {
+        table_oid: members.table_oid.and_then(|index| match values.get(index) {
+            Some(Datum::Oid(oid)) => Some(*oid),
+            _ => None,
+        }),
+        def: crate::storage::RelationDefinition {
+            n_columns: definition.n_columns.min(members.visible),
+            ..*definition
+        },
+        values,
+        alias: None,
+    }
+}
+
+/// The rows one scan of a `MERGE` returned and its filter removed, and the
+/// rows it removed before returning its first.
+#[derive(Clone, Copy, Default)]
+struct MergeScanCounts {
+    passed: u64,
+    removed: u64,
+    removed_before_first: u64,
+}
+
+impl MergeScanCounts {
+    fn pass(&mut self) {
+        if self.passed == 0 {
+            self.removed_before_first = self.removed;
+        }
+        self.passed += 1;
+    }
+
+    /// The counts of a scan its consumer stopped after its first row.
+    fn first_row(self) -> Self {
+        if self.passed == 0 {
+            return self;
+        }
+        Self {
+            passed: 1,
+            removed: self.removed_before_first,
+            removed_before_first: self.removed_before_first,
+        }
+    }
+
+    fn sum(counts: &[Self]) -> Self {
+        counts.iter().fold(Self::default(), |sum, counts| Self {
+            passed: sum.passed + counts.passed,
+            removed: sum.removed + counts.removed,
+            removed_before_first: 0,
+        })
+    }
+}
+
+/// What a `MERGE`'s join read: its plan's shape and each relation's rows.
+struct MergeScans<'r, 'a, Definition0: crate::storage::DefinitionBacking> {
+    source_outer: bool,
+    preserves_outer: bool,
+    preserves_inner: bool,
+    /// Whether the plan's inner relation costs anything to read.
+    inner_costs: bool,
+    hash: Option<&'r MergeHash<'a>>,
+    /// The target's members the join reads, and what each one's scan did.
+    leaves: &'r [usize],
+    target: &'r [MergeScanCounts],
+    target_rows: &'r [&'a [Datum<'a>]],
+    target_def: &'r crate::storage::TableDefinition<Definition0>,
+    source: MergeScanCounts,
+    source_rows: &'r [&'a [u8]],
+    source_def: &'r crate::storage::RelationDefinition<'r>,
+    source_members: MergeSourceMembers<'r>,
+}
+
+/// Records what a `MERGE`'s scans and its join's inner node did, as
+/// `EXPLAIN ANALYZE` reports PostgreSQL's nodes: the target's scan (its
+/// `Append` and each member's) at position 0, the source's at 1, and the
+/// `Hash` or `Materialize` over the inner one. A hash join that keeps no
+/// unmatched inner row reads the outer relation's first row before it
+/// builds its table when the outer scan starts for less than the inner one
+/// costs (`ExecHashJoin`), and stops when either side is empty; a nested
+/// loop reads its inner relation once per outer row, from a copy.
+fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
+    scans: MergeScans<'_, '_, Definition0>,
+) {
+    use crate::sql::query::instrument::{self, HashTable, Role};
+    let (outer_position, inner_position) = if scans.source_outer { (1, 0) } else { (0, 1) };
+    let target = MergeScanCounts::sum(scans.target);
+    let (outer, inner) = if scans.source_outer {
+        (scans.source, target)
+    } else {
+        (target, scans.source)
+    };
+    let hashed = scans.hash.is_some();
+    // The inner rows a hash table holds: those with a key, or every row
+    // when the join returns its unmatched ones.
+    let inner_rows = scans.hash.map_or(inner.passed, |hash| {
+        if scans.preserves_inner {
+            hash.inner.len() as u64
+        } else {
+            hash.inner.iter().filter(|hash| hash.is_some()).count() as u64
+        }
+    });
+    let prefetched = hashed && !scans.preserves_inner && scans.inner_costs;
+    let inner_runs = (hashed && !prefetched) || outer.passed > 0;
+    let outer_runs = !(hashed && !prefetched && inner_rows == 0 && !scans.preserves_outer);
+    let outer_first_only = prefetched && inner_rows == 0 && !scans.preserves_outer;
+    // One relation's scan; the target's counts each member under its
+    // `Append`, which the first-row stop also stops.
+    let record = |position: u16, counts: MergeScanCounts, first_only: bool| {
+        let node = instrument::node(Role::Scan(position));
+        let _scan = node.start();
+        if position == 1 {
+            let counts = if first_only {
+                counts.first_row()
+            } else {
+                counts
+            };
+            node.add_counted(counts.passed, counts.removed);
+            return;
+        }
+        let mut done = false;
+        for (&leaf, &member_counts) in scans.leaves.iter().zip(scans.target) {
+            if done {
+                break;
+            }
+            let counts = if first_only && member_counts.passed > 0 {
+                done = true;
+                member_counts.first_row()
+            } else {
+                member_counts
+            };
+            let member = target_member(leaf);
+            let _member = member.start();
+            member.add_counted(counts.passed, counts.removed);
+            node.add_counted(counts.passed, counts.removed);
+        }
+    };
+    if outer_runs {
+        record(outer_position, outer, outer_first_only);
+    }
+    if !inner_runs {
+        return;
+    }
+    record(inner_position, inner, false);
+    let Some(hash) = scans.hash else {
+        // The copy returns every inner row once per outer row.
+        let node = instrument::node(Role::Materialize(inner_position));
+        for _ in 0..outer.passed {
+            let _copy = node.start();
+            node.rows(inner.passed);
+        }
+        return;
+    };
+    let node = instrument::node(Role::Hash(inner_position));
+    let _hash = node.start();
+    node.rows(inner_rows);
+    // The table's rows as PostgreSQL stores them.
+    let mut tuple_bytes = node.hash_columns().map(|_| 0usize);
+    if let Some(columns) = node.hash_columns() {
+        let mut target_schema = [ColType::Bool; MAX_COLUMNS];
+        scans.target_def.schema(&mut target_schema);
+        let mut source_schema = [ColType::Bool; MAX_COLUMNS];
+        let visible = scans.source_def.n_columns.min(scans.source_members.visible);
+        for (ctype, column) in source_schema
+            .iter_mut()
+            .zip(&scans.source_def.columns()[..visible])
+        {
+            *ctype = column.ctype;
+        }
+        for (row, key) in hash.inner.iter().enumerate() {
+            if key.is_none() && !scans.preserves_inner {
+                continue;
+            }
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            let (values, schema): (&[Datum<'_>], &[ColType]) = if scans.source_outer {
+                (
+                    scans.target_rows[row],
+                    &target_schema[..scans.target_def.n_columns],
+                )
+            } else {
+                let bytes = scans.source_rows[row];
+                let width = projected_row_width(bytes).min(MAX_COLUMNS);
+                for (column, value) in values.iter_mut().enumerate().take(width) {
+                    *value = decode_projected_pub(bytes, column);
+                }
+                (&values[..width], &source_schema[..visible])
+            };
+            tuple_bytes = tuple_bytes.and_then(|bytes| {
+                Some(bytes + instrument::hashed_row_bytes(columns.as_slice(), values, schema)?)
+            });
+        }
+    }
+    let own_bytes = core::mem::size_of::<Option<u64>>() * (hash.outer.len() + hash.inner.len())
+        + core::mem::size_of::<u32>()
+            * (hash.buckets.len() + hash.next.len() + hash.unmatched.len());
+    node.hash_table(HashTable {
+        tuples: inner_rows,
+        tuple_bytes,
+        own_bytes,
+    });
+}
+
+/// Counts a row a `MERGE` action changed, as `EXPLAIN ANALYZE` reports it.
+fn merge_changed(change: crate::sql::query::instrument::MergeChange) {
+    crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Modify).merged(change);
 }
 
 /// The rows PostgreSQL's planner knows a `MERGE` source has: an analyzed
@@ -86365,6 +86903,7 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
     storage: &Storage,
     txn: &TxnState,
     def: &crate::storage::TableDefinition<Definition0>,
+    target_table: Option<usize>,
     target_alias: &str,
     source_def: &crate::storage::RelationDefinition<'_>,
     source_alias: &str,
@@ -86394,12 +86933,20 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
         return sql_fail(error);
     }
     let target = new.or(old).expect("a changed row has old or new values");
+    let target_oid = match target_table
+        .map(|table| returning_table_oid(storage, txn.txid, table, def, position.row, new))
+        .transpose()
+    {
+        Ok(oid) => oid,
+        Err(error) => return sql_fail(error),
+    };
     match emit_merge_returning(
         storage,
         txn.txid,
         def,
         target_alias,
         target,
+        target_oid,
         source_def,
         source_alias,
         source_members,
@@ -91161,6 +91708,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
     target_def: &crate::storage::TableDefinition<Definition0>,
     target_alias: &str,
     target: &[Datum<'a>],
+    target_oid: Option<u32>,
     source_def: &crate::storage::RelationDefinition<'_>,
     source_alias: &str,
     source_members: MergeSourceMembers<'_>,
@@ -91179,6 +91727,7 @@ fn emit_merge_returning<'a, Definition0: crate::storage::DefinitionBacking>(
         target_def: crate::storage::RelationDefinition::from_definition(target_def),
         target_alias,
         target,
+        target_oid,
         source_def,
         source_alias,
         source_members,
@@ -104822,7 +105371,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 None,
                 &mut |row, bytes, values| {
                     let context = RowCtx {
-                        table_oid: None,
+                        table_oid: Some(crate::sql::catalog::user_table_oid(storage, leaf) as u32),
                         def: crate::storage::RelationDefinition::from_definition(def),
                         values,
                         alias,
@@ -104922,7 +105471,9 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         let mut tv = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut tv);
                         let context = RowCtx {
-                            table_oid: None,
+                            table_oid: Some(
+                                crate::sql::catalog::user_table_oid(storage, leaf) as u32
+                            ),
                             def: crate::storage::RelationDefinition::from_definition(def),
                             values: &tv[..def.n_columns],
                             alias,
@@ -105079,7 +105630,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                 None,
                 &mut |row, bytes, values| {
                     let context = RowCtx {
-                        table_oid: None,
+                        table_oid: Some(crate::sql::catalog::user_table_oid(storage, leaf) as u32),
                         def: crate::storage::RelationDefinition::from_definition(def),
                         values,
                         alias,
@@ -105181,7 +105732,9 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut values);
                         let context = RowCtx {
-                            table_oid: None,
+                            table_oid: Some(
+                                crate::sql::catalog::user_table_oid(storage, leaf) as u32
+                            ),
                             def: crate::storage::RelationDefinition::from_definition(def),
                             values: &values[..def.n_columns],
                             alias,

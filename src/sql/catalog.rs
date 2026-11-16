@@ -15629,7 +15629,8 @@ fn visit_fkeys(
 
 /// Whether some visible foreign key references each table slot, over every
 /// table whatever a synthesis selects: a parent's `relhastriggers` counts its
-/// children's keys.
+/// children's keys. A key referencing a partitioned table also references
+/// each of its partitions, which carry the key's action triggers.
 fn foreign_key_parents<'a>(
     storage: &Storage,
     txid: u32,
@@ -15645,6 +15646,17 @@ fn foreign_key_parents<'a>(
     });
     // SAFETY: only the name map, now unused, was allocated since the mark.
     unsafe { arena.rewind_to(mark) };
+    let keyed = arena
+        .alloc_slice_copy(referenced)
+        .map_err(|_| arena_full())?;
+    for (table, referenced) in referenced.iter_mut().enumerate() {
+        *referenced = *referenced
+            || keyed.iter().enumerate().any(|(parent, &keyed)| {
+                keyed
+                    && storage.table_def(parent, txid).partition.is_partitioned()
+                    && storage.partition_descends_from(table, parent, txid)
+            });
+    }
     Ok(referenced)
 }
 

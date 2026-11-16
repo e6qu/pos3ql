@@ -2148,3 +2148,452 @@ impl<'a> RelationTargets<'a> {
         }))
     }
 }
+
+/// The lists `VERBOSE` prints for a `MERGE`: its `RETURNING` list, the
+/// join's processed target list, each relation's scan list (target, then
+/// source), and the values those scans' rows hold, which size a `Hash`
+/// built on them.
+pub(super) struct MergeWriteLists {
+    pub(super) returned: Option<Output>,
+    pub(super) join: Output,
+    pub(super) scans: [Output; 2],
+    pub(super) hashed: [HashColumns; 2],
+}
+
+/// One value a `MERGE` scan returns: its text and what a hashed row holds.
+#[derive(Clone, Copy)]
+struct MergeRead<'a> {
+    entry: Entry<'a>,
+    held: HashColumn,
+    /// The relation that returns it: 0 the target, 1 the source.
+    relation: usize,
+}
+
+impl<'a> RelationTargets<'a> {
+    /// The lists of a `MERGE` into `target` (exposed as `target_exposed`)
+    /// from the source `joined[1]`, a table or (`values`) a `VALUES` list,
+    /// joined on `join_conditions` (the `ON` conjuncts the join evaluates).
+    /// PostgreSQL's processed target list (`preprocess_targetlist`) holds a
+    /// plain target's row identity `ctid`; the source columns each action
+    /// reads, its condition first, then its values in target column order
+    /// (`rewriteTargetListIU`); with a `NOT MATCHED BY SOURCE` action the
+    /// source's whole row and the source columns `ON` reads, which tell a
+    /// matched row apart (`mergeJoinCondition`); the source's row mark (its
+    /// `ctid`, or a `VALUES` list's whole row); the source columns
+    /// `RETURNING` reads; then a partitioned or inheritance target's
+    /// `tableoid` and `ctid` (`distribute_row_identity_vars`). The target's
+    /// own columns come from the row the action fetches. Each scan returns
+    /// its relation's entries of that list, then the columns the join
+    /// conditions read, in `ON` order, then a tree target's row identity.
+    /// `None` outside the deparser's coverage.
+    #[expect(clippy::too_many_arguments, reason = "the statement's parts")]
+    pub(super) fn merge_write<'e>(
+        storage: &'a Storage,
+        txid: u32,
+        target: &'a TableDef,
+        target_exposed: &'a str,
+        joined: &'a [Joined<'a>],
+        values: bool,
+        tree: bool,
+        merge: &'e crate::sql::ast::Merge<'e>,
+        preserves_target: bool,
+        join_conditions: &[&'e Expr<'e>],
+        arena: &'a Arena,
+    ) -> Result<Option<MergeWriteLists>, SqlError> {
+        // A `VALUES` list's whole row the join condition reads is a
+        // placeholder for its row expression, outside these lists.
+        if values && preserves_target {
+            return Ok(None);
+        }
+        // `RETURNING` also names the target's old and new rows.
+        let rows = [
+            joined[0],
+            joined[1],
+            Joined::rule_row(
+                arena
+                    .alloc_str(merge.returning.old_name())
+                    .map_err(|_| arena_full())?,
+                target,
+            ),
+            Joined::rule_row(
+                arena
+                    .alloc_str(merge.returning.new_name())
+                    .map_err(|_| arena_full())?,
+                target,
+            ),
+        ];
+        let joined = arena
+            .alloc_slice_with(rows.len(), |at| rows[at])
+            .map_err(|_| arena_full())?;
+        let lists = Self::with_joined(
+            storage,
+            txid,
+            target,
+            target_exposed,
+            joined,
+            true,
+            None,
+            arena,
+        );
+        lists.merge_lists(values, tree, merge, preserves_target, join_conditions)
+    }
+
+    /// The text `relation.name` with `relation` quoted as needed.
+    fn qualified_text(&self, relation: &str, name: &str) -> Result<Entry<'a>, SqlError> {
+        let mut text = StackStr::<160>::new();
+        crate::sql::catalog::write_identifier(&mut text, relation);
+        let _ = text.write_char('.');
+        let _ = text.write_str(name);
+        Ok(Entry {
+            text: self
+                .arena
+                .alloc_str(text.as_str())
+                .map_err(|_| arena_full())?,
+            var: true,
+            referenced: false,
+            shown: None,
+        })
+    }
+
+    /// The relation (0 the target, 1 the source) a column or whole-row
+    /// reference reads, with what a hashed row holds for it; `Err(())` for
+    /// a reference outside the lists.
+    fn merge_owner(&self, column: &Expr<'_>) -> Result<(usize, HashColumn), ()> {
+        let source = &self.context.joined[1];
+        let target = &self.context.joined[0];
+        let held = |relation: &Joined<'_>, name: &str| match relation.columns.position(name) {
+            Some(index) => u16::try_from(index).map(HashColumn::Column).map_err(|_| ()),
+            None if name == "tableoid" => Ok(HashColumn::TableOid),
+            None => Err(()),
+        };
+        let image = |qualifier: &str| {
+            self.context.joined[2..]
+                .iter()
+                .any(|row| row.name == qualifier)
+        };
+        match column {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                name,
+            } if *qualifier == target.name || image(qualifier) => Ok((0, held(target, name)?)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if *name == source.name
+                && target.columns.position(name).is_none()
+                && source.columns.position(name).is_none() =>
+            {
+                Ok((1, HashColumn::WholeRow))
+            }
+            Expr::Column {
+                qualifier: Some(qualifier),
+                name,
+            } if *qualifier == source.name => Ok((1, held(source, name)?)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if target.columns.position(name).is_some() => Ok((0, held(target, name)?)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if source.columns.position(name).is_some() => Ok((1, held(source, name)?)),
+            Expr::WholeRow(name) if *name == target.name || image(name) => {
+                Ok((0, HashColumn::WholeRow))
+            }
+            Expr::WholeRow(name) if *name == source.name => Ok((1, HashColumn::WholeRow)),
+            _ => Err(()),
+        }
+    }
+
+    fn merge_lists<'e>(
+        &self,
+        values: bool,
+        tree: bool,
+        merge: &'e crate::sql::ast::Merge<'e>,
+        preserves_target: bool,
+        join_conditions: &[&'e Expr<'e>],
+    ) -> Result<Option<MergeWriteLists>, SqlError> {
+        use crate::sql::ast::MergeActionRef;
+        let arena = self.arena;
+        let source_name = self.context.joined[1].name;
+        let whole_row = |relation: usize| -> Result<Entry<'a>, SqlError> {
+            if relation == 1 && values {
+                self.qualified_text("*VALUES*", "*")
+            } else {
+                self.qualified_text(self.context.joined[relation].name, "*")
+            }
+        };
+        let push_new = |list: &mut ArenaList<'a, MergeRead<'a>>, read: MergeRead<'a>| {
+            if list
+                .as_slice()
+                .iter()
+                .any(|held| held.entry.text == read.entry.text)
+            {
+                return Ok(());
+            }
+            list.push(read).map_err(|_| arena_full())
+        };
+        let mut join: ArenaList<'a, MergeRead<'a>> = ArenaList::new(arena);
+        let mut reads: [ArenaList<'a, MergeRead<'a>>; 2] =
+            [ArenaList::new(arena), ArenaList::new(arena)];
+        // The references `expression` reads, by relation; `false` when one is
+        // outside the lists.
+        let references = |expression: &'e Expr<'e>,
+                          out: &mut [ArenaList<'a, MergeRead<'a>>; 2]|
+         -> Result<bool, SqlError> {
+            if expression.contains_subquery() {
+                return Ok(false);
+            }
+            let mut found = ArenaList::new(arena);
+            let mut full = false;
+            columns_of(expression, &mut |column| {
+                full |= found.push(column).is_err();
+            });
+            if full {
+                return Err(arena_full());
+            }
+            for &column in found.as_slice() {
+                let Ok((relation, held)) = self.merge_owner(column) else {
+                    return Ok(false);
+                };
+                let entry = match (column, held) {
+                    (Expr::WholeRow(_), _) | (Expr::Column { .. }, HashColumn::WholeRow) => {
+                        whole_row(relation)?
+                    }
+                    _ => match self.entry(column, Destination::Value)? {
+                        Some(entry) => entry,
+                        None => return Ok(false),
+                    },
+                };
+                push_new(
+                    &mut out[relation],
+                    MergeRead {
+                        entry,
+                        held,
+                        relation,
+                    },
+                )?;
+            }
+            Ok(true)
+        };
+        let identity = |relation: usize, column: &str, held| -> Result<MergeRead<'a>, SqlError> {
+            Ok(MergeRead {
+                entry: self.qualified_text(self.context.joined[relation].name, column)?,
+                held,
+                relation,
+            })
+        };
+        let used = |expression: &'e Expr<'e>,
+                    join: &mut ArenaList<'a, MergeRead<'a>>|
+         -> Result<bool, SqlError> {
+            let mut read: [ArenaList<'a, MergeRead<'a>>; 2] =
+                [ArenaList::new(arena), ArenaList::new(arena)];
+            if !references(expression, &mut read)? {
+                return Ok(false);
+            }
+            for &entry in read[1].as_slice() {
+                push_new(join, entry)?;
+            }
+            Ok(true)
+        };
+        if !tree {
+            push_new(&mut join, identity(0, "ctid", HashColumn::RowIdentity)?)?;
+        }
+        for when in merge.whens {
+            if let Some(condition) = when.condition()
+                && !used(condition, &mut join)?
+            {
+                return Ok(None);
+            }
+            // Each action's values in target column order.
+            for (index, column) in self.table.columns().iter().enumerate() {
+                let value = match when.action() {
+                    MergeActionRef::Update(assignments) => assignments
+                        .iter()
+                        .find(|(name, _)| *name == column.name.as_str())
+                        .map(|(_, value)| *value),
+                    MergeActionRef::Insert {
+                        columns, values, ..
+                    } => {
+                        if columns.is_empty() {
+                            values.get(index).copied()
+                        } else {
+                            columns
+                                .iter()
+                                .position(|name| *name == column.name.as_str())
+                                .and_then(|at| values.get(at).copied())
+                        }
+                    }
+                    MergeActionRef::Delete | MergeActionRef::DoNothing => None,
+                };
+                if let Some(value) = value
+                    && !used(value, &mut join)?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        if preserves_target {
+            push_new(
+                &mut join,
+                MergeRead {
+                    entry: whole_row(1)?,
+                    held: HashColumn::WholeRow,
+                    relation: 1,
+                },
+            )?;
+            if !used(merge.on, &mut join)? {
+                return Ok(None);
+            }
+        }
+        let mark = if values {
+            MergeRead {
+                entry: whole_row(1)?,
+                held: HashColumn::WholeRow,
+                relation: 1,
+            }
+        } else {
+            identity(1, "ctid", HashColumn::RowIdentity)?
+        };
+        push_new(&mut join, mark)?;
+        // `RETURNING` reads the target from the row the action changed.
+        let mut returned = ArenaList::new(arena);
+        let source_columns = self.context.joined[1].columns.len();
+        let source_column = |index: usize| -> Result<Option<MergeRead<'a>>, SqlError> {
+            let name = self.context.joined[1].columns.name(index);
+            let column = Expr::Column {
+                qualifier: Some(source_name),
+                name,
+            };
+            Ok(self
+                .entry(&column, Destination::Value)?
+                .map(|entry| MergeRead {
+                    entry,
+                    held: HashColumn::Column(u16::try_from(index).unwrap_or(u16::MAX)),
+                    relation: 1,
+                }))
+        };
+        for item in merge.returning.items {
+            let (sources, targets) = match item {
+                SelectItem::Wildcard(_) => (true, true),
+                SelectItem::TableWildcard(qualifier) if *qualifier == self.exposed => (false, true),
+                SelectItem::TableWildcard(qualifier) if *qualifier == source_name => (true, false),
+                SelectItem::Expr { expression, .. } => {
+                    let entry = match expression {
+                        // PostgreSQL's `MergeSupportFunc`.
+                        Expr::Call { name, args: [], .. }
+                            if name.eq_ignore_ascii_case("merge_action") =>
+                        {
+                            Some(Entry {
+                                text: "MERGE_ACTION()",
+                                var: false,
+                                referenced: false,
+                                shown: None,
+                            })
+                        }
+                        // A bare relation name is its whole row.
+                        Expr::Column {
+                            qualifier: None,
+                            name,
+                        } if matches!(
+                            self.merge_owner(expression),
+                            Ok((1, HashColumn::WholeRow))
+                        ) =>
+                        {
+                            let _ = name;
+                            Some(whole_row(1)?)
+                        }
+                        _ => self.entry(expression, Destination::Value)?,
+                    };
+                    let Some(entry) = entry else {
+                        return Ok(None);
+                    };
+                    returned.push(entry).map_err(|_| arena_full())?;
+                    if !used(expression, &mut join)? {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => return Ok(None),
+            };
+            if sources {
+                for index in 0..source_columns {
+                    let Some(read) = source_column(index)? else {
+                        return Ok(None);
+                    };
+                    returned.push(read.entry).map_err(|_| arena_full())?;
+                    push_new(&mut join, read)?;
+                }
+            }
+            if targets {
+                for index in 0..self.table.columns().len() {
+                    returned
+                        .push(self.column(index, Some(self.exposed))?)
+                        .map_err(|_| arena_full())?;
+                }
+            }
+        }
+        if tree {
+            for (column, held) in [
+                ("tableoid", HashColumn::TableOid),
+                ("ctid", HashColumn::RowIdentity),
+            ] {
+                push_new(&mut join, identity(0, column, held)?)?;
+            }
+        }
+        // Each scan returns its relation's entries of the join's list, then
+        // the columns the join conditions read.
+        for &read in join.as_slice() {
+            if !(tree && read.relation == 0) {
+                push_new(&mut reads[read.relation], read)?;
+            }
+        }
+        for &condition in join_conditions {
+            let mut read: [ArenaList<'a, MergeRead<'a>>; 2] =
+                [ArenaList::new(arena), ArenaList::new(arena)];
+            if !references(condition, &mut read)? {
+                return Ok(None);
+            }
+            for (reads, read) in reads.iter_mut().zip(&read) {
+                for &entry in read.as_slice() {
+                    push_new(reads, entry)?;
+                }
+            }
+        }
+        if tree {
+            for (column, held) in [
+                ("tableoid", HashColumn::TableOid),
+                ("ctid", HashColumn::RowIdentity),
+            ] {
+                push_new(&mut reads[0], identity(0, column, held)?)?;
+            }
+        }
+        let held = |reads: &ArenaList<'a, MergeRead<'a>>| -> Option<HashColumns> {
+            let mut columns = HashColumns::EMPTY;
+            for read in reads.as_slice() {
+                columns.push(read.held)?;
+            }
+            Some(columns)
+        };
+        let render_reads = |reads: &ArenaList<'a, MergeRead<'a>>| -> Result<Output, SqlError> {
+            let mut entries = ArenaList::new(arena);
+            for read in reads.as_slice() {
+                entries.push(read.entry).map_err(|_| arena_full())?;
+            }
+            render(entries.as_slice())
+        };
+        let (Some(target_held), Some(source_held)) = (held(&reads[0]), held(&reads[1])) else {
+            return Ok(None);
+        };
+        Ok(Some(MergeWriteLists {
+            returned: if merge.returning.items.is_empty() {
+                None
+            } else {
+                Some(render(returned.as_slice())?)
+            },
+            join: render_reads(&join)?,
+            scans: [render_reads(&reads[0])?, render_reads(&reads[1])?],
+            hashed: [target_held, source_held],
+        }))
+    }
+}

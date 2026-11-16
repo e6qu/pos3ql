@@ -781,6 +781,7 @@ fn select_output_width(
         .transpose()?;
     let columns = DependencyTypes {
         hidden: None,
+        merge_condition: false,
         scope: scope.as_ref(),
         excluded: None,
         transition: context.transition,
@@ -904,6 +905,7 @@ fn collect_statement(
     ) {
         let outer = DependencyTypes {
             hidden: None,
+            merge_condition: false,
             scope: None,
             excluded: None,
             transition: context.transition,
@@ -1360,6 +1362,7 @@ fn collect_dml_routine_calls_with_output<'a>(
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         hidden: None,
+        merge_condition: false,
         scope,
         excluded,
         storage,
@@ -1571,7 +1574,9 @@ pub(crate) fn validate_dml_assignment_casts(
             _ => unreachable!(),
         };
         let target_name = target.name;
-        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, transition)?;
+        let outer_row = transition;
+        let (scope, joined) =
+            dml_join_scope(storage, target, alias, extra, txid, arena, transition)?;
         // Each subquery level converts a constant compared with its columns
         // before any row is read, as PostgreSQL's analysis does: the WHERE
         // clause first, then the assignments or inserted values.
@@ -1584,6 +1589,7 @@ pub(crate) fn validate_dml_assignment_casts(
         });
         let columns = DependencyTypes {
             hidden: None,
+            merge_condition: false,
             scope: Some(&scope),
             excluded: Some(target),
             transition: transition
@@ -1757,19 +1763,90 @@ pub(crate) fn validate_dml_assignment_casts(
                 }
             }
             Stmt::Merge(merge) => {
+                // Each action's condition, then its values, in order. A
+                // `NOT MATCHED [BY TARGET]` action reads only the source, a
+                // `NOT MATCHED BY SOURCE` action only the target.
+                let (target_scope, _) =
+                    dml_join_scope(storage, merge.target, alias, None, txid, arena, outer_row)?;
+                let source_from = arena
+                    .alloc(FromClause {
+                        base: joined.joins[0].table,
+                        joins: &[],
+                    })
+                    .map_err(|_| arena_full())?;
+                let source_scope = super::QueryScope::resolve_schema(
+                    storage,
+                    source_from,
+                    txid,
+                    arena,
+                    outer_row,
+                )?;
+                let source_name = joined.joins[0]
+                    .table
+                    .alias
+                    .unwrap_or(joined.joins[0].table.table);
+                let source = scope.defs.get(1).expect("MERGE source resolved");
+                let target_columns = DependencyTypes {
+                    scope: Some(&target_scope),
+                    hidden: Some((source_name, source)),
+                    ..*merge_columns
+                };
+                let source_columns = DependencyTypes {
+                    scope: Some(&source_scope),
+                    excluded: None,
+                    hidden: Some((alias.unwrap_or(target_name), target)),
+                    ..*merge_columns
+                };
                 for when in merge.whens {
+                    let visible = match when.kind() {
+                        crate::sql::ast::MergeMatchKind::Matched => merge_columns,
+                        crate::sql::ast::MergeMatchKind::NotMatchedBySource => &target_columns,
+                        crate::sql::ast::MergeMatchKind::NotMatchedByTarget => &source_columns,
+                    };
+                    let hidden = visible.hidden.map(|(name, _)| name);
+                    let reach = |expression: &Expr<'_>| {
+                        hidden.map_or(Ok(()), |hidden| reject_whole_row_of(expression, hidden))
+                    };
+                    if let Some(condition) = when.condition() {
+                        reach(condition)?;
+                        crate::sql::exec::infer_routine_argument_oid(
+                            condition,
+                            &DependencyTypes {
+                                merge_condition: true,
+                                ..*visible
+                            },
+                        )?;
+                    }
                     match when.action() {
                         crate::sql::ast::MergeActionRef::Update(assignments) => {
                             for (name, expression) in assignments {
                                 check_multiple_assignment_source(
                                     expression, &scope, storage, txid, arena,
                                 )?;
-                                assign(name, expression, merge.target_alias)?;
+                                reach(expression)?;
+                                let index = target.column_index(name).ok_or_else(|| {
+                                    undefined_set_target(name, target_name, alias, expression)
+                                })?;
+                                validate_assignment_expression(
+                                    expression,
+                                    Some(name),
+                                    AssignmentTarget::Update,
+                                    &target.columns()[index],
+                                    visible,
+                                    storage,
+                                    txid,
+                                    arena,
+                                )?;
                             }
                         }
                         crate::sql::ast::MergeActionRef::Insert {
                             columns, values, ..
-                        } => insert_values(columns, values, merge_columns)?,
+                        } => {
+                            for value in values.iter() {
+                                reach(value)?;
+                            }
+                            insert_values(columns, values, &source_columns)?;
+                        }
                         _ => {}
                     }
                 }
@@ -2181,6 +2258,36 @@ fn visit_projection_sources<'s>(
     })
 }
 
+/// Fails as PostgreSQL does when `expression` reads the whole row of the
+/// relation `hidden`, which is out of its reach.
+fn reject_whole_row_of(expression: &Expr<'_>, hidden: &str) -> Result<(), SqlError> {
+    if let Expr::WholeRow(table) = expression
+        && *table == hidden
+    {
+        return Err(crate::sql::error_position::at_reference(
+            super::scope::unreachable_entry(table),
+            table,
+        ));
+    }
+    super::subquery::walk_children(expression, &mut |child| reject_whole_row_of(child, hidden))
+}
+
+/// Whether `name` is from the column list of an `INSERT` or of a `MERGE`
+/// insert action, which names no system column.
+fn inserts_column(statement: &Stmt<'_>, name: &str) -> bool {
+    match statement {
+        Stmt::Insert(_) => true,
+        Stmt::Merge(merge) => merge.whens.iter().any(|when| {
+            matches!(
+                when.action(),
+                crate::sql::ast::MergeActionRef::Insert { columns, .. }
+                    if columns.iter().any(|column| column.as_ptr() == name.as_ptr())
+            )
+        }),
+        _ => false,
+    }
+}
+
 pub(crate) fn for_each_dml_assignment<'a>(
     statement: &Stmt<'a>,
     visit: &mut dyn FnMut(
@@ -2417,6 +2524,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
         });
         let columns = DependencyTypes {
             hidden: None,
+            merge_condition: false,
             scope: Some(scope),
             excluded: Some(target),
             transition: transition
@@ -2452,7 +2560,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
-                    if matches!(statement, Stmt::Insert(_)) {
+                    if inserts_column(statement, name) {
                         crate::sql::error_position::at_reference(
                             sql_err!(
                                 sqlstate::UNDEFINED_COLUMN,
@@ -2555,6 +2663,7 @@ pub(crate) fn visit_projection_types(
             .transpose()?;
         let columns = DependencyTypes {
             hidden: None,
+            merge_condition: false,
             scope: scope.as_ref(),
             excluded: None,
             transition: transition
@@ -2825,6 +2934,16 @@ pub(crate) fn undefined_set_target(
     alias: Option<&str>,
     expression: &Expr<'_>,
 ) -> SqlError {
+    if crate::storage::SYSTEM_COLUMN_NAMES.contains(&name) {
+        return crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot assign to system column \"{}\"",
+                name
+            ),
+            name,
+        );
+    }
     let error = crate::sql::error_position::at_reference(
         sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -3370,6 +3489,9 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         &'definition str,
         crate::storage::RelationDefinition<'storage>,
     )>,
+    /// A `MERGE` action's `WHEN` condition, which reads no system column
+    /// but `tableoid`.
+    merge_condition: bool,
     arena: &'storage Arena,
 }
 
@@ -3559,22 +3681,30 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             {
                 return Ok(metadata.ctype);
             }
-            // PostgreSQL names the target the rows cannot reference.
-            return Err(match qualifier {
+            // PostgreSQL names the relation the expression cannot reference;
+            // other names resolve in the relations it can.
+            let visible = |name: &str| {
+                self.scope
+                    .is_some_and(|scope| scope.find_column(None, name).is_ok())
+            };
+            match qualifier {
                 Some(qualifier) if qualifier == hidden => {
-                    super::scope::unreachable_entry(qualifier)
+                    return Err(super::scope::unreachable_entry(qualifier));
                 }
-                None if definition.column_index(name).is_some() => {
-                    crate::sql::error_position::with_detail(
+                None if definition.column_index(name).is_some() && !visible(name) => {
+                    return Err(crate::sql::error_position::with_detail(
                         crate::sql::eval::empty_scope_column_error(None, name),
                         format_args!(
                             "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
                             name, hidden
                         ),
-                    )
+                    ));
                 }
-                _ => crate::sql::eval::empty_scope_column_error(qualifier, name),
-            });
+                _ if self.scope.is_none() => {
+                    return Err(crate::sql::eval::empty_scope_column_error(qualifier, name));
+                }
+                _ => {}
+            }
         }
         if qualifier == Some("excluded")
             && let Some(definition) = self.excluded
@@ -3609,6 +3739,21 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),
             None => crate::sql::exec::NoCols.resolve(qualifier, name),
         };
+        if self.merge_condition
+            && resolved
+                .as_ref()
+                .is_err_and(|error| error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED)
+            && crate::storage::SYSTEM_COLUMN_NAMES.contains(&name)
+        {
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "cannot use system column \"{}\" in MERGE WHEN condition",
+                    name
+                ),
+                qualifier.unwrap_or(name),
+            ));
+        }
         if resolved.as_ref().is_err_and(|error| {
             error.sqlstate == sqlstate::UNDEFINED_COLUMN
                 || error.sqlstate == sqlstate::UNDEFINED_TABLE
@@ -3622,7 +3767,15 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
-        if self.hidden.is_some() {
+        if let Some((hidden, definition)) = self.hidden
+            && (self.scope.is_none()
+                || qualifier == Some(hidden)
+                || (qualifier.is_none()
+                    && definition.column_index(name).is_some()
+                    && self
+                        .scope
+                        .is_some_and(|scope| scope.find_column(None, name).is_err())))
+        {
             return self
                 .transition
                 .and_then(|columns| columns.column_meta(qualifier, name));
@@ -3965,6 +4118,7 @@ fn collect_routine_dependencies<'a>(
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         hidden: None,
+        merge_condition: false,
         scope: None,
         excluded: None,
         transition: context.transition,
@@ -4005,6 +4159,7 @@ fn collect_routine_dependencies<'a>(
             let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             let resolver = DependencyTypes {
                 hidden: None,
+                merge_condition: false,
                 scope: Some(&scope),
                 excluded: None,
                 transition: context.transition,
@@ -4066,6 +4221,7 @@ pub(super) fn stored_routine_dependency_for_call(
     }
     let resolver = DependencyTypes {
         hidden: None,
+        merge_condition: false,
         scope: None,
         excluded: None,
         transition: None,
@@ -4141,6 +4297,7 @@ pub(super) fn stored_operator_dependency_for_call(
     }
     let resolver = DependencyTypes {
         hidden: None,
+        merge_condition: false,
         scope: None,
         excluded: None,
         transition: None,

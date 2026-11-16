@@ -163,6 +163,24 @@ pub(crate) struct NodeCounters {
     pub(crate) stored: Option<usize>,
     /// An incremental sort's batches, when it sorted.
     pub(crate) incremental: Option<IncrementalGroups>,
+    /// The rows each kind of a `MERGE`'s actions changed.
+    pub(crate) merged: MergeTuples,
+}
+
+/// The rows a `MERGE`'s actions inserted, updated and deleted.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct MergeTuples {
+    pub(crate) inserted: u64,
+    pub(crate) updated: u64,
+    pub(crate) deleted: u64,
+}
+
+/// The kind of row change a `MERGE` action made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MergeChange {
+    Insert,
+    Update,
+    Delete,
 }
 
 /// The batches of one kind an incremental sort sorted: their count and the
@@ -407,6 +425,8 @@ pub(crate) enum HashColumn {
     TableOid,
     /// The row identity (`ctid`) a locking clause reads.
     RowIdentity,
+    /// The build relation's whole row, a composite datum.
+    WholeRow,
 }
 
 /// The most values a sized `Hash` row holds.
@@ -502,6 +522,17 @@ pub(crate) fn hashed_row_bytes(
             }
             HashColumn::TableOid => (4, b'i', b'p', None),
             HashColumn::RowIdentity => (6, b's', b'p', None),
+            HashColumn::WholeRow => {
+                // A composite datum is a heap tuple whose header's first
+                // word is its varlena length; it packs like any varlena.
+                let payload = composite_bytes(values, schema)? - 4;
+                if payload < SHORT_VARLENA_MAX {
+                    data += payload + 1;
+                } else {
+                    data = align_to(data, b'd') + payload + 4;
+                }
+                continue;
+            }
         };
         if length > 0 {
             data = align_to(data, alignment) + length as usize;
@@ -525,6 +556,44 @@ pub(crate) fn hashed_row_bytes(
         0
     };
     Some(HASH_TUPLE_OVERHEAD + align_to(MINIMAL_TUPLE_HEADER + bitmap, b'd') + data)
+}
+
+/// The bytes of the composite datum of a row `values` of types `schema`
+/// (`heap_form_tuple`): the tuple header with its null bitmap, aligned,
+/// then each non-null value at its type's alignment.
+fn composite_bytes(
+    values: &[crate::sql::types::Datum<'_>],
+    schema: &[crate::sql::types::ColType],
+) -> Option<usize> {
+    /// `offsetof(HeapTupleHeaderData, t_bits)`.
+    const HEAP_TUPLE_HEADER: usize = 23;
+    let values = values.get(..schema.len())?;
+    let bitmap = if values.iter().any(|value| value.is_null()) {
+        values.len().div_ceil(8)
+    } else {
+        0
+    };
+    let mut data = align_to(HEAP_TUPLE_HEADER + bitmap, b'd');
+    for (value, column) in values.iter().zip(schema) {
+        if value.is_null() {
+            continue;
+        }
+        let layout = column.physical_layout();
+        if layout.length > 0 {
+            data = align_to(data, layout.alignment) + layout.length as usize;
+            continue;
+        }
+        if layout.length != -1 {
+            return None;
+        }
+        let payload = varlena_payload(value)?;
+        if layout.storage != b'p' && payload < SHORT_VARLENA_MAX {
+            data += payload + 1;
+        } else {
+            data = align_to(data, layout.alignment) + payload + 4;
+        }
+    }
+    Some(data)
 }
 
 /// One plan node's counters while the statement runs.
@@ -561,6 +630,11 @@ impl Slot {
                 sort: None,
                 stored: None,
                 incremental: None,
+                merged: MergeTuples {
+                    inserted: 0,
+                    updated: 0,
+                    deleted: 0,
+                },
             },
             open: 0,
             started: None,
@@ -900,6 +974,19 @@ impl Node {
                     own_bytes: held.own_bytes.max(table.own_bytes),
                 },
             });
+        });
+    }
+
+    /// Counts a row a `MERGE` action changed.
+    pub(crate) fn merged(self, change: MergeChange) {
+        self.with(|slot, _| {
+            let merged = &mut slot.counters.merged;
+            let count = match change {
+                MergeChange::Insert => &mut merged.inserted,
+                MergeChange::Update => &mut merged.updated,
+                MergeChange::Delete => &mut merged.deleted,
+            };
+            *count = count.saturating_add(1);
         });
     }
 

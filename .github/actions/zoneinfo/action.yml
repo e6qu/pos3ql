@@ -1,0 +1,10 @@
+name: Full zoneinfo
+description: Install the legacy zone names (PST8PDT, US/Eastern, ...) PostgreSQL's image has, which Ubuntu 24.04 splits into tzdata-legacy
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends tzdata-legacy
+        test -f /usr/share/zoneinfo/PST8PDT

@@ -551,6 +551,7 @@ jobs:
           sha256sum --strict --check SHA256SUMS
           chmod +x pos3ql
 
+      - uses: ./.github/actions/zoneinfo
       - uses: ./.github/actions/python-test-environment
         with:
           venv: target/external-venv

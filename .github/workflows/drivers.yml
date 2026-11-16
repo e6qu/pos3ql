@@ -42,6 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: ./.github/actions/zoneinfo
       - uses: ./.github/actions/python-test-environment
         with:
           venv: venv

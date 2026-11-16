@@ -498,6 +498,27 @@ struct Node {
 std::thread_local! {
     static HEAD: Cell<*const Node> = const { Cell::new(core::ptr::null()) };
     static SNAPSHOT: RefCell<Snapshot> = const { RefCell::new(Snapshot::EMPTY) };
+    /// How many probes are running whose errors are discarded; their errors
+    /// record no context, so the error being reported keeps its own.
+    static PROBES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs `probe`, an evaluation whose errors are discarded, without
+/// recording their context.
+pub(crate) fn without_recording<R>(probe: impl FnOnce() -> R) -> R {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            PROBES.with(|probes| probes.set(probes.get() - 1));
+        }
+    }
+    PROBES.with(|probes| probes.set(probes.get() + 1));
+    let _leave = Leave;
+    probe()
+}
+
+fn probing() -> bool {
+    PROBES.with(Cell::get) != 0
 }
 
 /// Runs `run` with `frame` active.
@@ -555,6 +576,9 @@ struct Snapshot {
     /// One-based character position in `query`; `None` when the error has
     /// no internal query.
     position: Option<usize>,
+    /// Whether `context` holds only the line the error was raised with, and
+    /// the active frames' lines are still to follow it.
+    frames_pending: bool,
 }
 
 impl Snapshot {
@@ -563,6 +587,7 @@ impl Snapshot {
         context: StackStr::new(),
         query: StackStr::new(),
         position: None,
+        frames_pending: false,
     };
 }
 
@@ -613,13 +638,17 @@ impl Write for Lines<'_> {
     }
 }
 
-/// Walks the active frames from the innermost, writing their lines.
-/// `position` is the error's cursor, which the first frame that runs a
-/// query takes as its internal query position.
-fn write_frames(out: &mut dyn Write, mut position: Option<usize>) -> Result<Internal, fmt::Error> {
+/// Walks the active frames from the innermost, writing their lines after
+/// any already `started`. `position` is the error's cursor, which the first
+/// frame that runs a query takes as its internal query position.
+fn write_frames(
+    out: &mut dyn Write,
+    started: bool,
+    mut position: Option<usize>,
+) -> Result<Internal, fmt::Error> {
     let mut lines = Lines {
         out,
-        started: false,
+        started,
         pending_line: false,
     };
     let mut internal = None;
@@ -657,21 +686,29 @@ struct Internal {
 /// unless it already has one. Returns the error to propagate: a context or
 /// internal query too long to report becomes a 54000 error.
 pub(crate) fn capture(error: SqlError) -> SqlError {
-    if error.sqlstate.internal_control().is_some() || HEAD.with(Cell::get).is_null() {
+    if error.sqlstate.internal_control().is_some() || HEAD.with(Cell::get).is_null() || probing() {
         return error;
     }
     let error_key = key(&error);
-    if SNAPSHOT.with(|snapshot| same_key(snapshot.borrow().key, error_key)) {
+    let raised_line = SNAPSHOT.with(|snapshot| {
+        let snapshot = snapshot.borrow();
+        same_key(snapshot.key, error_key).then_some(snapshot.frames_pending)
+    });
+    if raised_line == Some(false) {
         return error;
     }
     let position = crate::sql::error_position::take_position(&error);
     SNAPSHOT.with(|snapshot| {
         let mut snapshot = snapshot.borrow_mut();
         snapshot.key = None;
-        snapshot.context.clear();
+        snapshot.frames_pending = false;
+        if raised_line.is_none() {
+            snapshot.context.clear();
+        }
         snapshot.query.clear();
         snapshot.position = None;
-        let written = write_frames(&mut snapshot.context, position);
+        let started = !snapshot.context.is_empty();
+        let written = write_frames(&mut snapshot.context, started, position);
         let Ok(internal) = written else {
             return context_full();
         };
@@ -693,6 +730,35 @@ pub(crate) fn capture(error: SqlError) -> SqlError {
         snapshot.key = Some(error_key);
         error
     })
+}
+
+/// Records `line` as the first CONTEXT line of `error`, as PostgreSQL's
+/// `errcontext` adds one where an error is raised (`JSON data, line 1: ...`).
+/// The active frames' lines follow it once the error leaves the innermost
+/// frame.
+pub(crate) fn with_line(error: SqlError, line: fmt::Arguments<'_>) -> SqlError {
+    if error.sqlstate.internal_control().is_some() || probing() {
+        return error;
+    }
+    SNAPSHOT.with(|snapshot| {
+        let mut snapshot = snapshot.borrow_mut();
+        snapshot.context.clear();
+        snapshot.query.clear();
+        snapshot.position = None;
+        if snapshot.context.write_fmt(line).is_err() || snapshot.context.is_truncated() {
+            snapshot.key = None;
+            return context_full();
+        }
+        snapshot.key = Some(key(&error));
+        snapshot.frames_pending = true;
+        error
+    })
+}
+
+/// Forgets the context recorded for `error`, an error a caller handles
+/// itself, so no later error with the same SQLSTATE and message reports it.
+pub(crate) fn discard(error: &SqlError) {
+    take(error, |_| ());
 }
 
 fn context_full() -> SqlError {
@@ -731,6 +797,7 @@ pub(crate) fn with_reported<R>(
             .key
             .is_some_and(|(state, hash)| state == sqlstate && hash == message_hash(message));
         snapshot.key = None;
+        snapshot.frames_pending = false;
         if !matches {
             return report(None);
         }
@@ -758,6 +825,7 @@ pub(crate) fn restore(error: &SqlError, context: &str, internal: Option<(&str, u
         snapshot.query = StackStr::from_str(internal.map_or("", |(query, _)| query));
         snapshot.position = internal.map(|(_, position)| position);
         snapshot.key = Some(key(error));
+        snapshot.frames_pending = false;
     });
 }
 
@@ -771,7 +839,7 @@ pub(crate) struct Live;
 
 impl fmt::Display for Live {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_frames(out, None).map(|_| ())
+        write_frames(out, false, None).map(|_| ())
     }
 }
 

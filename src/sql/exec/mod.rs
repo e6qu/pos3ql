@@ -1741,7 +1741,7 @@ impl RelationKindName {
         let actual = Self::of(storage, name, txid).filter(|actual| *actual != expected)?;
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(crate::util::StackStr::from_str(actual.drop_hint())),
+            Some(crate::sql::eval::DiagnosticText::copy(actual.drop_hint())),
         );
         Some(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -3655,7 +3655,7 @@ fn alter_foreign_owner(
                         "selected foreign-data wrapper is unavailable"
                     )
                 })?;
-            super::eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
+            super::eval::stash_diagnostic(None, Some(crate::sql::eval::DiagnosticText::copy(hint)));
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to change owner of foreign-data wrapper \"{}\"",
@@ -4755,13 +4755,12 @@ fn validate_partitioned_unique_keys<Definition0: crate::storage::DefinitionBacki
     // column, compared with equality by an exclusion constraint.
     let lacks = |kind: &str, key: u16| {
         crate::sql::eval::stash_diagnostic(
-            Some(crate::stack_format!(
-                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            Some(crate::sql::eval::DiagnosticText::format(format_args!(
                 "{} constraint on table \"{}\" lacks column \"{}\" which is part of the partition key.",
                 kind,
                 def.name.as_str(),
                 def.columns()[usize::from(key)].name.as_str()
-            )),
+            ))),
             None,
         );
         sql_err!(
@@ -9972,8 +9971,7 @@ fn drop_row_type_columns(
         *target = slot;
     }
     let excluded = &*all_excluded;
-    let mut detail =
-        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut count = 0usize;
     // Attributes of composite types come first: PostgreSQL drops each such
     // attribute and keeps the composite type.
@@ -10045,16 +10043,11 @@ fn drop_row_type_columns(
     if count == 0 {
         return Ok(());
     }
-    if detail.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "row type dependency report exceeds its fixed buffer"
-        ));
-    }
+    let detail = detail.finish().into_text()?;
     if !cascade {
         crate::sql::eval::stash_diagnostic(
-            Some(detail),
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::from_text(detail)),
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP ... CASCADE to drop the dependent objects too.",
             )),
         );
@@ -10807,13 +10800,12 @@ pub fn create_schema(
         None
     };
     if name.starts_with("pg_") {
-        let mut detail =
-            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+        let mut detail = crate::sql::eval::DiagnosticWriter::new();
         let _ = core::fmt::Write::write_str(
             &mut detail,
             "The prefix \"pg_\" is reserved for system schemas.",
         );
-        crate::sql::eval::stash_diagnostic(Some(detail), None);
+        crate::sql::eval::stash_diagnostic(Some(detail.into()), None);
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::RESERVED_NAME,
             "unacceptable schema name \"{}\"",
@@ -12894,17 +12886,13 @@ fn role_dependency_detail(
     role: usize,
     txid: u32,
     arena: &Arena,
-) -> Result<
-    Option<crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>>,
-    SqlError,
-> {
+) -> Result<Option<crate::sql::eval::DiagnosticText>, SqlError> {
     use core::fmt::Write;
     const MAX_REPORTED_DEPENDENCIES: usize = 100;
     let mark = arena.mark();
     let result = (|| {
         let catalog = super::query::storage_catalog(storage, arena, txid);
-        let mut detail =
-            crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+        let mut detail = crate::sql::eval::DiagnosticWriter::new();
         let mut reported = 0usize;
         let mut unreported = 0usize;
         for dependency in super::catalog::shared_dependencies(storage, txid, arena)? {
@@ -12927,10 +12915,7 @@ fn role_dependency_detail(
                 _ => "privileges for ",
             };
             let separator = if reported == 0 { "" } else { "\n" };
-            if reported == MAX_REPORTED_DEPENDENCIES
-                || detail.len() + separator.len() + prefix.len() + description.len()
-                    > crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES - 64
-            {
+            if reported == MAX_REPORTED_DEPENDENCIES {
                 unreported += 1;
                 continue;
             }
@@ -12968,7 +12953,7 @@ fn role_dependency_detail(
             );
             reported += 1;
         }
-        Ok((reported != 0).then_some(detail))
+        Ok((reported != 0).then(|| detail.finish()))
     })();
     // The detail was copied out of the workspace.
     unsafe { arena.rewind_to(mark) };
@@ -18917,8 +18902,7 @@ pub(crate) fn drop_schema(
             .count();
         if reported_object_count > 0 && !cascade {
             let first = slots[0];
-            let mut detail =
-                crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            let mut detail = crate::sql::eval::DiagnosticWriter::new();
             for (i, o) in objects[..n_objects]
                 .iter()
                 .flatten()
@@ -19077,8 +19061,8 @@ pub(crate) fn drop_schema(
                 }
             }
             crate::sql::eval::stash_diagnostic(
-                Some(detail),
-                Some(crate::util::StackStr::from_str(
+                Some(detail.into()),
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "Use DROP ... CASCADE to drop the dependent objects too.",
                 )),
             );
@@ -19152,8 +19136,7 @@ pub(crate) fn drop_schema(
             }
         }
         if temporary.is_none() && reported_object_count > 0 {
-            let mut detail =
-                crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            let mut detail = crate::sql::eval::DiagnosticWriter::new();
             for (i, o) in objects[..n_objects]
                 .iter()
                 .flatten()
@@ -19171,6 +19154,10 @@ pub(crate) fn drop_schema(
                     line.as_str()
                 );
             }
+            let detail = match detail.finish().into_text() {
+                Ok(detail) => detail,
+                Err(error) => return sql_fail(error),
+            };
             if let Err(error) = dependency_report::send_cascade_lines(
                 responder,
                 detail.as_str(),
@@ -20511,7 +20498,7 @@ pub fn create_subscription(
     if options.connect == crate::sql::ast::SubscriptionConnect::Deferred {
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "To initiate replication, you must manually create the replication slot, \
                  enable the subscription, and refresh the subscription.",
             )),
@@ -21628,7 +21615,7 @@ fn publication_members(
                 .is_some()
             {
                 crate::sql::eval::stash_diagnostic(
-                    Some(StackStr::from_str(
+                    Some(crate::sql::eval::DiagnosticText::copy(
                         "User-defined or built-in mutable functions are not allowed.",
                     )),
                     None,
@@ -38220,7 +38207,7 @@ fn assign_trigger_record_field<'a>(
         }
         (Datum::Null, Some(PlpgsqlRecordShape::Dynamic), _) => {
             crate::sql::eval::stash_diagnostic(
-                Some(crate::util::StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "The tuple structure of a not-yet-assigned record is indeterminate.",
                 )),
                 None,
@@ -38357,12 +38344,13 @@ fn trigger_diagnostic_str<'a>(
     datum_to_text(value, context.arena)
 }
 
-fn trigger_diagnostic_text<'a, const N: usize>(
+/// The text of a `RAISE ... USING` option.
+fn trigger_raise_option<'a>(
     expression: &'a Expr<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
     expressions: &mut StatementExpressions<'_>,
-) -> Result<StackStr<N>, SqlError> {
+) -> Result<&'a str, SqlError> {
     let value = expressions.eval(context, expression, scope)?;
     if value.is_null() {
         return Err(sql_err!(
@@ -38370,7 +38358,21 @@ fn trigger_diagnostic_text<'a, const N: usize>(
             "RAISE statement option cannot be null"
         ));
     }
-    let value = StackStr::from_str(datum_to_text(value, context.arena)?);
+    datum_to_text(value, context.arena)
+}
+
+fn trigger_diagnostic_text<'a, const N: usize>(
+    expression: &'a Expr<'a>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    scope: &TriggerLocalScope<'_, 'a>,
+    expressions: &mut StatementExpressions<'_>,
+) -> Result<StackStr<N>, SqlError> {
+    let value = StackStr::from_str(trigger_raise_option(
+        expression,
+        context,
+        scope,
+        expressions,
+    )?);
     if value.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -41513,15 +41515,15 @@ fn execute_trigger_step_in<'a>(
             TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
                 let exception =
                     exception.expect("bare RAISE is parsed only in an exception handler");
-                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                    detail: exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                        diagnostics::Field::Detail,
-                    )?,
-                    hint: exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                        diagnostics::Field::Hint,
-                    )?,
-                    objects: exception.objects()?,
-                });
+                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                    exception
+                        .field(diagnostics::Field::Detail)
+                        .map(crate::sql::eval::DiagnosticText::copy),
+                    exception
+                        .field(diagnostics::Field::Hint)
+                        .map(crate::sql::eval::DiagnosticText::copy),
+                    exception.objects()?,
+                ));
                 let message = exception
                     .field(diagnostics::Field::Message)
                     .expect("caught error has a message");
@@ -41586,17 +41588,15 @@ fn execute_trigger_step_in<'a>(
                     let detail = raise
                         .detail
                         .map(|detail| {
-                            trigger_diagnostic_text::<
-                                { crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES },
-                            >(detail, context, &scope, &mut expressions)
+                            trigger_raise_option(detail, context, &scope, &mut expressions)
+                                .map(crate::sql::eval::DiagnosticText::copy)
                         })
                         .transpose()?;
                     let hint = raise
                         .hint
                         .map(|hint| {
-                            trigger_diagnostic_text::<
-                                { crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES },
-                            >(hint, context, &scope, &mut expressions)
+                            trigger_raise_option(hint, context, &scope, &mut expressions)
+                                .map(crate::sql::eval::DiagnosticText::copy)
                         })
                         .transpose()?;
                     let mut objects = crate::sql::eval::ErrorObjects::default();
@@ -41622,11 +41622,9 @@ fn execute_trigger_step_in<'a>(
                             .transpose()?;
                     }
                     if detail.is_some() || hint.is_some() || !objects.is_empty() {
-                        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                            detail,
-                            hint,
-                            objects,
-                        });
+                        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                            detail, hint, objects,
+                        ));
                     }
                     match raise.level {
                         TriggerRaiseLevel::Debug => context
@@ -43092,7 +43090,9 @@ fn execute_trigger_step_in<'a>(
                     TriggerCaseElse::RaiseNotFound => {
                         super::eval::stash_diagnostic(
                             None,
-                            Some(StackStr::from_str("CASE statement is missing ELSE part.")),
+                            Some(crate::sql::eval::DiagnosticText::copy(
+                                "CASE statement is missing ELSE part.",
+                            )),
                         );
                         Err(sql_err!(sqlstate::CASE_NOT_FOUND, "case not found"))
                     }
@@ -43554,7 +43554,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
         ));
     };
     let detail = match output[2] {
-        Datum::Text(detail) => Some(StackStr::from_str(detail)),
+        Datum::Text(detail) => Some(crate::sql::eval::DiagnosticText::copy(detail)),
         Datum::Null => None,
         _ => {
             return Err(sql_err!(
@@ -43564,7 +43564,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
         }
     };
     let hint = match output[3] {
-        Datum::Text(hint) => Some(StackStr::from_str(hint)),
+        Datum::Text(hint) => Some(crate::sql::eval::DiagnosticText::copy(hint)),
         Datum::Null => None,
         _ => {
             return Err(sql_err!(
@@ -44050,13 +44050,13 @@ fn check_too_many_rows(
         context.arena,
     );
     let detail = crate::sql::eval::take_diagnostic().and_then(|diagnostic| diagnostic.detail);
-    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-        detail,
-        hint: Some(crate::util::StackStr::from_str(
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+        detail.map(Into::into),
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Make sure the query returns a single row, or use LIMIT 1.",
         )),
-        objects: crate::sql::eval::ErrorObjects::default(),
-    });
+        crate::sql::eval::ErrorObjects::default(),
+    ));
     context
         .responder
         .warning(warning.sqlstate, warning.message.as_str())
@@ -44083,8 +44083,8 @@ fn check_multi_assignment(
     };
     let reports = targets.saturating_sub(sources) + usize::from(sources > targets);
     for _ in 0..reports {
-        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-            detail: Some(crate::util::StackStr::from_str(match level {
+        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+            Some(crate::sql::eval::DiagnosticText::copy(match level {
                 PlpgsqlExtraCheckLevel::Error => {
                     "strict_multi_assignment check of extra_errors is active."
                 }
@@ -44092,11 +44092,11 @@ fn check_multi_assignment(
                     "strict_multi_assignment check of extra_warnings is active."
                 }
             })),
-            hint: Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Make sure the query returns the exact list of columns.",
             )),
-            objects: crate::sql::eval::ErrorObjects::default(),
-        });
+            crate::sql::eval::ErrorObjects::default(),
+        ));
         let message = "number of source and target fields in assignment does not match";
         match level {
             PlpgsqlExtraCheckLevel::Error => {
@@ -44176,7 +44176,7 @@ fn with_strict_parameters(
     };
     match strict_parameters_detail(statement, parameters, arena) {
         Ok(Some(detail)) => {
-            crate::sql::eval::stash_diagnostic(Some(detail), None);
+            crate::sql::eval::stash_diagnostic(Some(detail.into()), None);
             error
         }
         Ok(None) => error,
@@ -44188,13 +44188,13 @@ fn strict_parameters_detail(
     statement: &str,
     parameters: StrictParameters<'_, '_>,
     arena: &Arena,
-) -> Result<Option<StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>>, SqlError> {
+) -> Result<Option<crate::sql::error_text::ErrorText>, SqlError> {
     use core::fmt::Write as _;
     arena
         .with_remaining_region(|scratch| {
-            let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+            let mut detail = crate::sql::eval::DiagnosticWriter::new();
             let mut listed = 0usize;
-            let mut item = |detail: &mut StackStr<_>,
+            let mut item = |detail: &mut crate::sql::eval::DiagnosticWriter,
                             name: core::fmt::Arguments<'_>,
                             value: Datum<'_>|
              -> Result<(), SqlError> {
@@ -44238,13 +44238,7 @@ fn strict_parameters_detail(
                     }
                 }
             }
-            if detail.is_truncated() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "STRICT parameter detail exceeds {} bytes",
-                    crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES
-                ));
-            }
+            let detail = detail.finish().into_text()?;
             Ok((listed != 0).then_some(detail))
         })
         .map_err(|_| super::query::arena_full_pub())?
@@ -55989,7 +55983,7 @@ fn resolve_drop_routine_target<'a>(
     {
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP AGGREGATE to drop aggregate functions.",
             )),
         );
@@ -56717,7 +56711,7 @@ pub fn create_view(
                 );
                 crate::sql::eval::stash_diagnostic(
                     None,
-                    Some(crate::util::StackStr::from_str(
+                    Some(crate::sql::eval::DiagnosticText::copy(
                         "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead.",
                     )),
                 );
@@ -57220,7 +57214,7 @@ pub(crate) fn require_alter_actions_supported(
         };
         if !supported {
             crate::sql::eval::stash_diagnostic(
-                Some(crate::util::StackStr::from_str(match kind {
+                Some(crate::sql::eval::DiagnosticText::copy(match kind {
                     AlterRelationKind::Table => "This operation is not supported for tables.",
                     AlterRelationKind::PartitionedTable => {
                         "This operation is not supported for partitioned tables."
@@ -63799,8 +63793,7 @@ fn report_type_dependent_routines(
         let _ = type_text.write_char('.');
     }
     write_identifier(&mut type_text, name.as_str());
-    let mut detail =
-        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut count = 0usize;
     for (slot, _) in selected
         .iter()
@@ -63827,16 +63820,17 @@ fn report_type_dependent_routines(
         }
         count += 1;
     }
-    if detail.is_truncated() || type_text.is_truncated() {
+    if type_text.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "type dependency report exceeds its fixed buffer"
         ));
     }
+    let detail = detail.finish().into_text()?;
     if !cascade {
         crate::sql::eval::stash_diagnostic(
-            Some(detail),
-            Some(crate::util::StackStr::from_str(
+            Some(detail.into()),
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP ... CASCADE to drop the dependent objects too.",
             )),
         );
@@ -66225,8 +66219,7 @@ fn report_composite_type_dependents(
     } = root;
     let CompositeTypeDependencySelection { views, matviews } = selection;
 
-    let mut detail =
-        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut count = 0usize;
     let mut push = |line: &str| {
         if count != 0 {
@@ -66346,18 +66339,13 @@ fn report_composite_type_dependents(
     if count == 0 {
         return Ok(false);
     }
-    if detail.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "composite type dependency report exceeds its fixed buffer"
-        ));
-    }
+    let detail = detail.finish().into_text()?;
     if cascade {
         dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     } else {
         crate::sql::eval::stash_diagnostic(
-            Some(detail),
-            Some(crate::util::StackStr::from_str(
+            Some(detail.into()),
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP ... CASCADE to drop the dependent objects too.",
             )),
         );
@@ -67673,8 +67661,7 @@ fn report_stored_query_dependents(
         let _ = write!(out, "rule {} on {} ", definition.name.as_str(), kind);
         write_name(out, &schema, &relation);
     };
-    let mut detail =
-        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut written = 0usize;
     for (slot, selected) in rules.iter().copied().enumerate() {
         if !selected {
@@ -67950,19 +67937,20 @@ fn report_stored_query_dependents(
             }
         }
     }
-    if written != count || detail.is_truncated() {
+    if written != count {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "stored-query dependency report exceeds its fixed buffer"
         ));
     }
+    let detail = detail.finish().into_text()?;
 
     if cascade {
         dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     } else {
         crate::sql::eval::stash_diagnostic(
-            Some(detail),
-            Some(crate::util::StackStr::from_str(
+            Some(detail.into()),
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP ... CASCADE to drop the dependent objects too.",
             )),
         );
@@ -70684,12 +70672,7 @@ fn raw_identifier_end(text: &str, start: usize) -> Option<usize> {
     Some(start + length)
 }
 
-pub(super) fn write_identifier<const N: usize>(
-    output: &mut crate::util::StackStr<N>,
-    identifier: &str,
-) {
-    use core::fmt::Write;
-
+pub(super) fn write_identifier(output: &mut impl core::fmt::Write, identifier: &str) {
     if !super::eval::ident_needs_quotes(identifier) {
         let _ = output.write_str(identifier);
         return;
@@ -76572,7 +76555,7 @@ pub(super) fn register_next_reindex_table<'a>(
         if selected.is_none() && !kind.valid() && !kind.is_partitioned() {
             crate::sql::eval::stash_diagnostic(
                 None,
-                Some(crate::util::StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "Use DROP INDEX or REINDEX INDEX.",
                 )),
             );
@@ -78002,7 +77985,7 @@ pub fn copy_begin(
         }
         super::eval::stash_diagnostic(
             None,
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use INSERT statements instead.",
             )),
         );
@@ -83443,7 +83426,7 @@ fn reject_merge_rules(
         return Ok(());
     }
     crate::sql::eval::stash_diagnostic(
-        Some(crate::util::StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "MERGE is not supported for relations with rules.",
         )),
         None,
@@ -96125,7 +96108,7 @@ fn drop_attached_key_constraints(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
-    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     for descendant in 0..storage.index_count() {
         if !index_descends_from(storage, descendant, slot, txn.txid) {
             continue;
@@ -96156,7 +96139,7 @@ fn drop_attached_key_constraints(
         );
         if !cascade {
             use core::fmt::Write;
-            let separator = if detail.as_str().is_empty() { "" } else { "\n" };
+            let separator = if detail.is_empty() { "" } else { "\n" };
             let _ = write!(detail, "{separator}{}", line.as_str());
             continue;
         }
@@ -96195,7 +96178,7 @@ fn drop_attached_key_constraints(
         stage_table_definition(storage, wal, txn, target, current, next)?;
         stage_index_drop(storage, wal, txn, descendant)?;
     }
-    if detail.as_str().is_empty() {
+    if detail.is_empty() {
         return Ok(());
     }
     let name = storage
@@ -96203,8 +96186,8 @@ fn drop_attached_key_constraints(
         .expect("the dropped index is visible")
         .name_for(txn.txid);
     crate::sql::eval::stash_diagnostic(
-        Some(detail),
-        Some(StackStr::from_str(
+        Some(detail.into()),
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Use DROP ... CASCADE to drop the dependent objects too.",
         )),
     );
@@ -96263,12 +96246,10 @@ fn drop_index_foreign_keys(
 fn constraint_requires_index(index: &str, table: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
         None,
-        Some(stack_format!(
-            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+        Some(crate::sql::eval::DiagnosticText::format(format_args!(
             "You can drop constraint {} on table {} instead.",
-            index,
-            table
-        )),
+            index, table
+        ))),
     );
     sql_err!(
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -96836,7 +96817,7 @@ fn drop_dependent_foreign_keys(
     }
     dependents.sort_unstable();
     let reported = dependents.iter().filter(|oid| **oid != 0).count();
-    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     for oid in dependents.iter().filter(|oid| **oid != 0) {
         use core::fmt::Write;
         let mark = arena.mark();
@@ -96846,17 +96827,12 @@ fn drop_dependent_foreign_keys(
             ObjectAddress::new(crate::sql::catalog::PG_CONSTRAINT_OID, *oid, 0),
             arena,
         )?;
-        let separator = if detail.as_str().is_empty() { "" } else { "\n" };
+        let separator = if detail.is_empty() { "" } else { "\n" };
         let _ = write!(detail, "{separator}drop cascades to {description}");
         // SAFETY: the line was copied into the report.
         unsafe { arena.rewind_to(mark) };
     }
-    if detail.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "dependency report exceeds its fixed buffer"
-        ));
-    }
+    let detail = detail.finish().into_text()?;
     dependency_report::send_cascade_lines(responder, detail.as_str(), reported)?;
     for table_slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(table_slot, txn.txid) {
@@ -97028,8 +97004,7 @@ fn exclusion_column_dependents(
     }
     let _ = write!(table, "{}", definition.name.as_str());
     let column_name = definition.columns()[column].name;
-    let mut detail =
-        crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut count = 0usize;
     for exclusion in definition.exclusions() {
         if exclusion
@@ -97064,18 +97039,19 @@ fn exclusion_column_dependents(
     if count == 0 {
         return Ok(());
     }
-    if detail.is_truncated() || table.is_truncated() {
+    if table.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "exclusion constraint dependency report exceeds its fixed buffer"
         ));
     }
+    let detail = detail.finish().into_text()?;
     if cascade {
         return dependency_report::send_cascade_lines(responder, detail.as_str(), count);
     }
     crate::sql::eval::stash_diagnostic(
-        Some(detail),
-        Some(crate::util::StackStr::from_str(
+        Some(detail.into()),
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Use DROP ... CASCADE to drop the dependent objects too.",
         )),
     );
@@ -97536,7 +97512,9 @@ fn partitioned_only_error(actions: &[AlterAction<'_>]) -> Option<SqlError> {
         AlterAction::DropColumn { .. } => {
             crate::sql::eval::stash_diagnostic(
                 None,
-                Some(StackStr::from_str("Do not specify the ONLY keyword.")),
+                Some(crate::sql::eval::DiagnosticText::copy(
+                    "Do not specify the ONLY keyword.",
+                )),
             );
             Some(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
@@ -107249,11 +107227,13 @@ fn coerce_composite_value_inner<'a>(
     let width = definition.active_field_count();
     if input.len() != width {
         crate::sql::eval::stash_diagnostic(
-            Some(crate::util::StackStr::from_str(if input.len() > width {
-                "Input has too many columns."
-            } else {
-                "Input has too few columns."
-            })),
+            Some(crate::sql::eval::DiagnosticText::copy(
+                if input.len() > width {
+                    "Input has too many columns."
+                } else {
+                    "Input has too few columns."
+                },
+            )),
             None,
         );
         return Err(sql_err!(
@@ -107425,7 +107405,10 @@ fn parse_record_literal<'a>(
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     let malformed = |detail: &str| {
-        crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy(detail)),
+            None,
+        );
         sql_err!(
             sqlstate::INVALID_TEXT_REPRESENTATION,
             "malformed record literal: \"{}\"",
@@ -108129,11 +108112,10 @@ fn apply_numeric_typmod<'a>(
     use super::numeric::Numeric;
     let overflow = |detail: core::fmt::Arguments<'_>| {
         crate::sql::eval::stash_diagnostic(
-            Some(stack_format!(
-                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            Some(crate::sql::eval::DiagnosticText::format(format_args!(
                 "{}",
                 detail
-            )),
+            ))),
             None,
         );
         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "numeric field overflow")
@@ -109936,16 +109918,14 @@ fn left_may_answer(
 /// PostgreSQL's `errorMissingColumn` for an unqualified column of the target
 /// that a FROM item's body names but cannot see.
 fn hidden_column_error(exposed: &str, name: &str) -> SqlError {
-    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-        detail: Some(crate::stack_format!(
-            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+        Some(crate::sql::eval::DiagnosticText::format(format_args!(
             "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
-            name,
-            exposed
-        )),
-        hint: None,
-        objects: crate::sql::eval::ErrorObjects::default(),
-    });
+            name, exposed
+        ))),
+        None,
+        crate::sql::eval::ErrorObjects::default(),
+    ));
     crate::sql::error_position::column_reference(
         sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -109960,20 +109940,19 @@ fn hidden_column_error(exposed: &str, name: &str) -> SqlError {
 /// `reference` is the qualifier or column in the statement text that names
 /// the target, where PostgreSQL places the error's cursor.
 fn target_reference_error(exposed: &str, reference: &str, kind: TargetReference) -> SqlError {
-    let explanation = crate::stack_format!(
-        crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+    let explanation = crate::sql::eval::DiagnosticText::format(format_args!(
         "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
         exposed
-    );
+    ));
     let (state, detail, hint) = match kind {
         TargetReference::Lateral => (sqlstate::INVALID_COLUMN_REFERENCE, None, Some(explanation)),
         TargetReference::Hidden => (sqlstate::UNDEFINED_TABLE, Some(explanation), None),
     };
-    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
         detail,
         hint,
-        objects: crate::sql::eval::ErrorObjects::default(),
-    });
+        crate::sql::eval::ErrorObjects::default(),
+    ));
     crate::sql::error_position::at_reference(
         sql_err!(
             state,

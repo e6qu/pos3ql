@@ -245,7 +245,7 @@ impl<'a> RowGenerator<'a> {
                     _ => return Err(container_error(crate::sql::json::Kind::Scalar)),
                 };
                 let object = !matches!(items.output, JsonOutput::Elements { .. });
-                let container = crate::sql::json::kind_of(text);
+                let container = crate::sql::json::container_kind(text)?;
                 let expected = if object {
                     crate::sql::json::Kind::Object
                 } else {
@@ -260,7 +260,12 @@ impl<'a> RowGenerator<'a> {
                     text
                 };
                 Ok(Self::Json {
-                    items: crate::sql::json::SourceItems::start(text, object, arena)?,
+                    items: crate::sql::json::SourceItems::start(
+                        text,
+                        object,
+                        !matches!(items.output, JsonOutput::Elements { text: false }),
+                        arena,
+                    )?,
                     kind: items,
                 })
             }

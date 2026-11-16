@@ -660,7 +660,7 @@ pub(crate) fn coerce_argument<'a>(
         };
         super::eval::stash_diagnostic(
             None,
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "You will need to rewrite or cast the expression.",
             )),
         );

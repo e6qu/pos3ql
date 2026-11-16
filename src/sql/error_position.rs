@@ -11,7 +11,7 @@
 //! PostgreSQL. The position travels beside the error and is attached only to
 //! the error it was computed for (same SQLSTATE and message).
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use crate::sql::eval::SqlError;
 
@@ -89,7 +89,7 @@ const NO_SOURCE: Source = Source {
     internal: false,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Pending {
     sqlstate: crate::sql::eval::SqlState,
     message_hash: u64,
@@ -100,7 +100,7 @@ struct Pending {
 }
 
 /// What PostgreSQL adds to an analysis error: its cursor and hint.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Annotation {
     pub(crate) position: Option<usize>,
     pub(crate) hint: Option<&'static str>,
@@ -111,26 +111,38 @@ pub(crate) struct Annotation {
 /// error it explains: it reaches the client only with that error (same
 /// SQLSTATE and message), so a probe that discards its error cannot attach
 /// text to an unrelated later one.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum AnalysisNote {
-    Detail(crate::util::StackStr<NOTE_BYTES>),
-    Hint(crate::util::StackStr<NOTE_BYTES>),
+    Detail(crate::sql::error_text::ErrorText),
+    Hint(crate::sql::error_text::ErrorText),
     /// A missing column's spelling suggestion: a later search over more
     /// enclosing queries replaces it.
     Suggestion(crate::util::StackStr<NOTE_BYTES>),
+    /// A DETAIL or HINT that did not fit the error text pool; the error is
+    /// reported as this exhaustion's `54000`.
+    Exhausted(crate::sql::error_text::TextExhausted),
 }
 
-/// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
+/// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording, the
+/// longest spelling suggestion.
 pub(crate) const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
 
-/// Attaches a computed DETAIL to `error`.
+/// Attaches a computed DETAIL to `error`, kept whole in the error text pool.
 pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
-    note(error, AnalysisNote::Detail(note_text(detail)))
+    note(
+        error,
+        crate::sql::error_text::ErrorText::format(detail)
+            .map_or_else(AnalysisNote::Exhausted, AnalysisNote::Detail),
+    )
 }
 
-/// Attaches a computed HINT to `error`.
+/// Attaches a computed HINT to `error`, kept whole in the error text pool.
 pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
-    note(error, AnalysisNote::Hint(note_text(hint)))
+    note(
+        error,
+        crate::sql::error_text::ErrorText::format(hint)
+            .map_or_else(AnalysisNote::Exhausted, AnalysisNote::Hint),
+    )
 }
 
 /// Attaches PostgreSQL's spelling suggestion for a missing column to
@@ -148,17 +160,18 @@ pub(crate) fn with_column_suggestion(
     let message_hash = message_hash(&error.message);
     PENDING.with(|pending| {
         let known = pending
-            .get()
+            .borrow()
+            .clone()
             .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
-        if known.is_some_and(|known| {
+        if known.as_ref().is_some_and(|known| {
             matches!(
                 known.note,
-                Some(AnalysisNote::Detail(_) | AnalysisNote::Hint(_))
+                Some(AnalysisNote::Detail(_) | AnalysisNote::Hint(_) | AnalysisNote::Exhausted(_))
             ) || known.hint.is_some()
         }) {
             return;
         }
-        pending.set(Some(Pending {
+        *pending.borrow_mut() = Some(Pending {
             sqlstate: error.sqlstate,
             message_hash,
             position: known.and_then(|known| known.position),
@@ -168,7 +181,7 @@ pub(crate) fn with_column_suggestion(
                 crate::sql::column_suggestion::offer_set_branches(&mut suggestion);
                 suggestion.hint().map(AnalysisNote::Suggestion)
             },
-        }))
+        })
     });
     error
 }
@@ -177,19 +190,12 @@ pub(crate) fn with_column_suggestion(
 fn has_pending_note(error: &SqlError) -> bool {
     let message_hash = message_hash(&error.message);
     PENDING.with(|pending| {
-        pending.get().is_some_and(|known| {
+        pending.borrow().as_ref().is_some_and(|known| {
             known.sqlstate == error.sqlstate
                 && known.message_hash == message_hash
                 && (known.note.is_some() || known.hint.is_some())
         })
     })
-}
-
-fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
-    use core::fmt::Write as _;
-    let mut out = crate::util::StackStr::new();
-    let _ = out.write_fmt(text);
-    out
 }
 
 fn note(error: SqlError, note: AnalysisNote) -> SqlError {
@@ -199,15 +205,16 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
     let message_hash = message_hash(&error.message);
     PENDING.with(|pending| {
         let known = pending
-            .get()
+            .borrow()
+            .clone()
             .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
-        pending.set(Some(Pending {
+        *pending.borrow_mut() = Some(Pending {
             sqlstate: error.sqlstate,
             message_hash,
-            position: known.and_then(|known| known.position),
-            hint: known.and_then(|known| known.hint),
+            position: known.as_ref().and_then(|known| known.position),
+            hint: known.as_ref().and_then(|known| known.hint),
             note: Some(note),
-        }))
+        })
     });
     error
 }
@@ -226,7 +233,7 @@ std::thread_local! {
     /// query-bearing command), whose relation and column lookups report a
     /// position; utility commands look names up without one.
     static ANALYZED: Cell<bool> = const { Cell::new(false) };
-    static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
+    static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
     /// The client's whole query string, PostgreSQL's `debug_query_string`:
     /// the outermost statement source while it runs.
     static CLIENT_QUERY: Cell<(*const u8, usize)> = const { Cell::new((core::ptr::null(), 0)) };
@@ -275,7 +282,7 @@ pub(crate) fn with_statement_source<R>(
     offset_base: usize,
     run: impl FnOnce() -> R,
 ) -> R {
-    PENDING.with(|pending| pending.set(None));
+    PENDING.with(|pending| *pending.borrow_mut() = None);
     crate::sql::error_context::reset();
     let _client = ClientQueryScope(CLIENT_QUERY.with(|client| {
         client
@@ -756,7 +763,12 @@ pub(crate) fn expression_error(
             name,
             source_position,
             ..
-        } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("function ") => {
+        // A quoted name is a function signature that text input names
+        // (`'f()'::regprocedure`), which PostgreSQL reports without a hint.
+        } if state == sqlstate::UNDEFINED_FUNCTION
+            && message.starts_with("function ")
+            && !message.starts_with("function \"") =>
+        {
             match source_position.get() {
                 Some(at) => annotated(error, Some(at), FUNCTION_HINT),
                 None => {
@@ -797,6 +809,19 @@ pub(crate) fn expression_error(
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), UNARY_OPERATOR_HINT)
+        }
+        // The operator a pattern match, IN list or quantified comparison
+        // resolves.
+        Expr::Like { .. }
+        | Expr::Match { .. }
+        | Expr::InList { .. }
+        | Expr::AnyAll { .. }
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+            if state == sqlstate::UNDEFINED_FUNCTION
+                && message.starts_with("operator does not exist: ") =>
+        {
+            with_hint(error, BINARY_OPERATOR_HINT)
         }
         Expr::Param(_) if state == sqlstate::UNDEFINED_PARAMETER => {
             at_expression(error, expression)
@@ -852,16 +877,17 @@ fn record(error: &SqlError, position: Option<usize>, hint: Option<&'static str>)
     }
     let message_hash = message_hash(&error.message);
     PENDING.with(|pending| {
+        let mut pending = pending.borrow_mut();
         let known = pending
-            .get()
+            .take()
             .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
-        pending.set(Some(Pending {
+        *pending = Some(Pending {
             sqlstate: error.sqlstate,
             message_hash,
-            position: known.and_then(|known| known.position).or(position),
-            hint: known.and_then(|known| known.hint).or(hint),
+            position: known.as_ref().and_then(|known| known.position).or(position),
+            hint: known.as_ref().and_then(|known| known.hint).or(hint),
             note: known.and_then(|known| known.note),
-        }))
+        })
     });
 }
 
@@ -870,12 +896,11 @@ fn record(error: &SqlError, position: Option<usize>, hint: Option<&'static str>)
 pub(crate) fn take_position(error: &SqlError) -> Option<usize> {
     let message_hash = message_hash(&error.message);
     PENDING.with(|pending| {
-        let mut known = pending.get().filter(|known| {
+        let mut pending = pending.borrow_mut();
+        let known = pending.as_mut().filter(|known| {
             known.sqlstate == error.sqlstate && known.message_hash == message_hash
         })?;
-        let position = known.position.take();
-        pending.set(Some(known));
-        position
+        known.position.take()
     })
 }
 
@@ -890,12 +915,13 @@ pub(crate) fn internal_parse_cursor(error: &SqlError, cursor: usize) {
 }
 
 /// Runs `probe`, an evaluation whose own errors are discarded, keeping the
-/// position, hint and diagnostic recorded for the error being reported.
+/// position, hint, diagnostic and context recorded for the error being
+/// reported.
 pub(crate) fn preserving_pending<R>(probe: impl FnOnce() -> R) -> R {
-    let pending = PENDING.with(Cell::get);
+    let pending = PENDING.with(|pending| pending.borrow().clone());
     let diagnostic = crate::sql::eval::take_diagnostic();
-    let result = probe();
-    PENDING.with(|slot| slot.set(pending));
+    let result = crate::sql::error_context::without_recording(probe);
+    PENDING.with(|slot| *slot.borrow_mut() = pending);
     let _ = crate::sql::eval::take_diagnostic();
     if let Some(diagnostic) = diagnostic {
         crate::sql::eval::stash_full_diagnostic(diagnostic);
@@ -1013,7 +1039,7 @@ pub(crate) fn set_internal_source(text: &str) {
 /// The position and hint recorded for the error being reported, if it is
 /// the error they were computed for.
 pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) -> Annotation {
-    let Some(pending) = PENDING.with(|pending| pending.take()) else {
+    let Some(pending) = PENDING.with(|pending| pending.borrow_mut().take()) else {
         return Annotation::default();
     };
     if pending.sqlstate == sqlstate && pending.message_hash == message_hash(message) {

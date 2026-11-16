@@ -14,6 +14,10 @@ use super::eval::SqlError;
 use super::numeric::Numeric;
 use core::fmt::Write as _;
 
+mod lexer;
+pub(crate) use lexer::SyntaxError;
+use lexer::{Expecting, Lexer, Token};
+
 /// Maximum nesting depth. The parser and serializers recurse per level, so
 /// this bounds the evaluation stack; container width is bounded only by the
 /// statement arena (PostgreSQL bounds depth by its `max_stack_depth`).
@@ -57,60 +61,242 @@ pub enum JsonTemporalKind {
     TimestampTz,
 }
 
-struct P<'a> {
-    b: &'a [u8],
-    at: usize,
-    arena: &'a Arena,
-    preserve_object_order: bool,
+/// Why JSON text did not parse: its syntax, as PostgreSQL reports it, or
+/// another error such as statement memory running out.
+pub(crate) enum Failure<'a> {
+    Syntax(SyntaxError<'a>),
+    Error(SqlError),
 }
 
-fn bad() -> SqlError {
-    sql_err!(
-        sqlstate::INVALID_TEXT_REPRESENTATION,
-        "invalid input syntax for type json"
-    )
+impl From<SqlError> for Failure<'_> {
+    fn from(error: SqlError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl<'a> From<SyntaxError<'a>> for Failure<'a> {
+    fn from(error: SyntaxError<'a>) -> Self {
+        Self::Syntax(error)
+    }
+}
+
+impl Failure<'_> {
+    pub(crate) fn error(self) -> SqlError {
+        match self {
+            Self::Syntax(syntax) => syntax.error(),
+            Self::Error(error) => error,
+        }
+    }
+}
+
+/// PostgreSQL's recursive-descent JSON parser (`pg_parse_json`). With an
+/// arena it builds the value's tree; without one it only checks the text,
+/// as the `json` type's input does.
+struct Parser<'a> {
+    lexer: Lexer<'a>,
+    arena: Option<&'a Arena>,
+    preserve_object_order: bool,
 }
 
 /// Parses `input` into an arena tree (jsonb semantics: objects sorted/deduped).
 pub fn parse<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
-    let mut p = P {
-        b: input.as_bytes(),
-        at: 0,
-        arena,
-        preserve_object_order: false,
-    };
-    p.ws();
-    let v = p.value(0)?;
-    p.ws();
-    if p.at != p.b.len() {
-        return Err(bad());
-    }
-    Ok(v)
+    Parser::new(input, true, Some(arena), false)
+        .document()
+        .map_err(Failure::error)
 }
 
 /// Parses JSON without applying jsonb object sorting or duplicate-key
 /// collapse. Consumers whose PostgreSQL behavior depends on source order use
 /// this boundary; ordinary jsonb operations use [`parse`].
 pub fn parse_source_order<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
-    let mut p = P {
-        b: input.as_bytes(),
-        at: 0,
-        arena,
-        preserve_object_order: true,
-    };
-    p.ws();
-    let value = p.value(0)?;
-    p.ws();
-    if p.at != p.b.len() {
-        return Err(bad());
-    }
-    Ok(value)
+    Parser::new(input, true, Some(arena), true)
+        .document()
+        .map_err(Failure::error)
 }
 
-/// Validates that `input` is well-formed JSON (for the `json` type, which is
-/// stored verbatim).
-pub fn validate(input: &str, arena: &Arena) -> Result<(), SqlError> {
-    parse(input, arena).map(|_| ())
+/// Checks that `input` is well-formed JSON, as the `json` type's input
+/// does: string escapes are not decoded, so `"\ud800"` and `"\u0000"` are
+/// accepted.
+pub fn validate(input: &str) -> Result<(), SqlError> {
+    Parser::new(input, false, None, false)
+        .document()
+        .map(|_| ())
+        .map_err(Failure::error)
+}
+
+/// The `IS JSON` predicate's parse of `input`: `None` when it is not JSON.
+/// Checking for unique keys decodes the keys, so their escapes are checked
+/// too, as PostgreSQL's `json_validate` does. Without unique keys only the
+/// value's kind is returned: containers are empty and scalars are null.
+pub fn parse_predicate<'a>(
+    input: &'a str,
+    unique_keys: bool,
+    arena: &'a Arena,
+) -> Result<Option<Json<'a>>, SqlError> {
+    let parsed = if unique_keys {
+        Parser::new(input, true, Some(arena), true).document()
+    } else {
+        Parser::new(input, false, None, false).document()
+    };
+    match parsed {
+        Ok(value) => Ok(Some(value)),
+        Err(Failure::Syntax(_)) => Ok(None),
+        Err(Failure::Error(error)) => Err(error),
+    }
+}
+
+impl<'a> Parser<'a> {
+    fn new(
+        input: &'a str,
+        need_escapes: bool,
+        arena: Option<&'a Arena>,
+        preserve_object_order: bool,
+    ) -> Self {
+        Self {
+            lexer: Lexer::new(input, need_escapes),
+            arena,
+            preserve_object_order,
+        }
+    }
+
+    fn document(&mut self) -> Result<Json<'a>, Failure<'a>> {
+        self.lexer.lex()?;
+        let value = self.value(0)?;
+        self.lexer.expect(Expecting::End, Token::End)?;
+        Ok(value)
+    }
+
+    fn value(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
+        match self.lexer.token() {
+            Token::ObjectStart => self.object(depth),
+            Token::ArrayStart => self.array(depth),
+            _ => self.scalar(),
+        }
+    }
+
+    fn nested(depth: u32) -> Result<(), SqlError> {
+        if depth > MAX_DEPTH {
+            return Err(sql_err!(
+                sqlstate::STATEMENT_TOO_COMPLEX,
+                "JSON nested too deeply"
+            ));
+        }
+        Ok(())
+    }
+
+    fn scalar(&mut self) -> Result<Json<'a>, Failure<'a>> {
+        let token = self.lexer.token();
+        if !matches!(
+            token,
+            Token::String | Token::Number | Token::True | Token::False | Token::Null
+        ) {
+            return Err(self.lexer.unexpected(Expecting::Value).into());
+        }
+        let text = self.lexer.text();
+        self.lexer.lex()?;
+        let Some(arena) = self.arena else {
+            return Ok(Json::Null);
+        };
+        Ok(match token {
+            Token::String => Json::Str(decode_string(&text[1..text.len() - 1], arena)?),
+            // Canonicalize through NUMERIC (so 1e2 -> 100, 1.0 -> 1.0).
+            Token::Number => Json::Number(
+                arena
+                    .alloc_str_display(Numeric::parse(text, arena)?)
+                    .map_err(|_| full())?,
+            ),
+            Token::True => Json::Bool(true),
+            Token::False => Json::Bool(false),
+            _ => Json::Null,
+        })
+    }
+
+    fn array(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
+        Self::nested(depth)?;
+        self.lexer.lex()?;
+        let mut items = self.arena.map(ArenaList::new);
+        if self.lexer.token() != Token::ArrayEnd {
+            loop {
+                let value = self.value(depth + 1)?;
+                if let Some(items) = &mut items {
+                    items.push(value).map_err(|_| full())?;
+                }
+                if self.lexer.token() != Token::Comma {
+                    break;
+                }
+                self.lexer.lex()?;
+            }
+        }
+        self.lexer.expect(Expecting::ArrayNext, Token::ArrayEnd)?;
+        Ok(Json::Array(items.map_or(&[], |items| items.as_slice())))
+    }
+
+    fn object(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
+        Self::nested(depth)?;
+        self.lexer.lex()?;
+        let mut members = self.arena.map(ArenaList::new);
+        match self.lexer.token() {
+            Token::String => loop {
+                self.field(&mut members, depth)?;
+                if self.lexer.token() != Token::Comma {
+                    break;
+                }
+                self.lexer.lex()?;
+            },
+            Token::ObjectEnd => {}
+            _ => return Err(self.lexer.unexpected(Expecting::ObjectStart).into()),
+        }
+        self.lexer.expect(Expecting::ObjectNext, Token::ObjectEnd)?;
+        let (Some(arena), Some(mut members)) = (self.arena, members) else {
+            return Ok(Json::Object(&[]));
+        };
+        if self.preserve_object_order {
+            return Ok(Json::Object(members.as_slice()));
+        }
+        // Stable-sort by key, then drop earlier duplicates (last value wins).
+        // jsonb orders object keys by length first, then bytewise — the same
+        // order PostgreSQL stores and prints them in.
+        crate::mem::arena::stable_sort_via(
+            arena,
+            members.as_mut_slice().map_err(|_| full())?,
+            |a, b| {
+                a.0.len()
+                    .cmp(&b.0.len())
+                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            },
+        )
+        .map_err(|_| full())?;
+        let ms = members.as_slice();
+        let mut out = ArenaList::new(arena);
+        for i in 0..ms.len() {
+            // For a run of equal keys, keep only the last that appeared. Since
+            // sort is stable, the last equal element is the last-inserted one.
+            if i + 1 < ms.len() && ms[i].0 == ms[i + 1].0 {
+                continue;
+            }
+            out.push(ms[i]).map_err(|_| full())?;
+        }
+        Ok(Json::Object(out.as_slice()))
+    }
+
+    fn field(
+        &mut self,
+        members: &mut Option<ArenaList<'a, (&'a str, Json<'a>)>>,
+        depth: u32,
+    ) -> Result<(), Failure<'a>> {
+        if self.lexer.token() != Token::String {
+            return Err(self.lexer.unexpected(Expecting::String).into());
+        }
+        let key = self.lexer.text();
+        self.lexer.lex()?;
+        self.lexer.expect(Expecting::ObjectLabel, Token::Colon)?;
+        let value = self.value(depth + 1)?;
+        if let (Some(arena), Some(members)) = (self.arena, members) {
+            let key = decode_string(&key[1..key.len() - 1], arena)?;
+            members.push((key, value)).map_err(|_| full())?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether every object in a source-order JSON tree has distinct decoded
@@ -151,6 +337,19 @@ pub fn kind_of(text: &str) -> Kind {
         }
     }
     Kind::Scalar
+}
+
+/// The kind of a document a JSON processing function deconstructs. A scalar
+/// is lexed first, as PostgreSQL lexes it before the function's semantic
+/// action rejects it, so a bad escape in it is reported instead.
+pub fn container_kind(text: &str) -> Result<Kind, SqlError> {
+    let kind = kind_of(text);
+    if kind == Kind::Scalar {
+        Lexer::new(text, true)
+            .lex()
+            .map_err(|error| error.error())?;
+    }
+    Ok(kind)
 }
 
 /// PostgreSQL's error for calling `*_object_keys` on a non-object.
@@ -228,9 +427,11 @@ pub fn array_elements_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
 /// the input.
 #[derive(Clone, Copy)]
 pub struct SourceItems<'a> {
-    text: &'a str,
-    at: usize,
+    /// Positioned at the first token of the next item, the separator after
+    /// the last one, or the closing bracket.
+    lexer: Lexer<'a>,
     object: bool,
+    first: bool,
     done: bool,
 }
 
@@ -240,17 +441,20 @@ pub type SourceItem<'a> = (Option<&'a str>, &'a str);
 
 impl<'a> SourceItems<'a> {
     /// Positions after the opening bracket of an object (`object`) or array.
-    /// `scratch` holds per-item parse trees only while validating.
-    pub fn start(text: &'a str, object: bool, scratch: &Arena) -> Result<Self, SqlError> {
-        let mut p = P {
-            b: text.as_bytes(),
-            at: 0,
-            arena: scratch,
-            preserve_object_order: true,
-        };
-        p.ws();
+    /// `need_escapes` checks string escapes as decoding them would, as
+    /// PostgreSQL does for every object and for the `_text` element
+    /// functions. Validation decodes nothing, so `scratch` holds nothing.
+    pub fn start(
+        text: &'a str,
+        object: bool,
+        need_escapes: bool,
+        scratch: &Arena,
+    ) -> Result<Self, SqlError> {
         let open = if object { b'{' } else { b'[' };
-        if p.b.get(p.at) != Some(&open) {
+        let first = text
+            .bytes()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+        if first != Some(open) {
             return Err(if object {
                 sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
@@ -263,10 +467,13 @@ impl<'a> SourceItems<'a> {
                 )
             });
         }
+        let mut lexer = Lexer::new(text, need_escapes);
+        let opened = lexer.lex().and_then(|()| lexer.lex());
+        opened.map_err(|error| error.error())?;
         let items = Self {
-            text,
-            at: p.at + 1,
+            lexer,
             object,
+            first: true,
             done: false,
         };
         let mut check = items;
@@ -294,58 +501,136 @@ impl<'a> SourceItems<'a> {
         if self.done {
             return Ok(None);
         }
-        let text: &'s str = self.text;
-        let mut p = P {
-            b: text.as_bytes(),
-            at: self.at,
-            arena,
+        let mut parser = Parser {
+            lexer: self.lexer,
+            arena: None,
             preserve_object_order: true,
         };
-        let close = if self.object { b'}' } else { b']' };
-        p.ws();
-        if p.b.get(p.at) == Some(&close) {
-            p.at += 1;
-            p.ws();
-            if p.at != p.b.len() {
-                return Err(bad());
-            }
+        let item = Self::item(&mut parser, self.object, self.first, arena);
+        self.lexer = parser.lexer;
+        self.first = false;
+        let item = item.map_err(Failure::error)?;
+        if item.is_none() {
             self.done = true;
-            return Ok(None);
         }
-        let key = if self.object {
-            if p.b.get(p.at) != Some(&b'"') {
-                return Err(bad());
+        Ok(item)
+    }
+
+    /// Parses the next item as `parse_object_field` or
+    /// `parse_array_element` would, or the end of the container.
+    fn item<'s>(
+        parser: &mut Parser<'a>,
+        object: bool,
+        first: bool,
+        arena: &'s Arena,
+    ) -> Result<Option<SourceItem<'s>>, Failure<'a>>
+    where
+        'a: 's,
+    {
+        let (close, next) = if object {
+            (Token::ObjectEnd, Expecting::ObjectNext)
+        } else {
+            (Token::ArrayEnd, Expecting::ArrayNext)
+        };
+        let lexer = &mut parser.lexer;
+        if first {
+            if lexer.token() == close {
+                return Self::close(lexer, close, next).map(|()| None);
             }
-            let key = decode_string(p.string()?, arena)?;
-            p.ws();
-            if p.b.get(p.at) != Some(&b':') {
-                return Err(bad());
+            if object && lexer.token() != Token::String {
+                return Err(lexer.unexpected(Expecting::ObjectStart).into());
             }
-            p.at += 1;
-            Some(key)
+        } else if lexer.token() == Token::Comma {
+            lexer.lex()?;
+        } else {
+            return Self::close(lexer, close, next).map(|()| None);
+        }
+        let key = if object {
+            if lexer.token() != Token::String {
+                return Err(lexer.unexpected(Expecting::String).into());
+            }
+            let key = lexer.text();
+            lexer.lex()?;
+            lexer.expect(Expecting::ObjectLabel, Token::Colon)?;
+            Some(decode_string(&key[1..key.len() - 1], arena)?)
         } else {
             None
         };
-        p.ws();
-        let start = p.at;
-        p.value(0)?;
-        let value = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
-        p.ws();
-        match p.b.get(p.at) {
-            Some(b',') => {
-                p.at += 1;
-                // A comma must be followed by another item.
-                p.ws();
-                if p.b.get(p.at) == Some(&close) {
-                    return Err(bad());
+        let start = parser.lexer.start();
+        parser.value(1)?;
+        let text = parser.lexer.input_text();
+        Ok(Some((key, &text[start..parser.lexer.previous_end()])))
+    }
+
+    fn close(lexer: &mut Lexer<'a>, close: Token, next: Expecting) -> Result<(), Failure<'a>> {
+        lexer.expect(next, close)?;
+        lexer.expect(Expecting::End, Token::End)?;
+        Ok(())
+    }
+}
+
+/// One step of a `json` accessor (`->`, `#>`): an object key or an array
+/// index, negative from the end.
+#[derive(Clone, Copy)]
+pub enum SourceStep<'k> {
+    Key(&'k str),
+    Index(i64),
+}
+
+/// The source text of the member or element `step` names in the `json`
+/// document `text`, as the `json` type's accessors return it: verbatim, the
+/// last of duplicate keys. The whole document is checked first, its string
+/// escapes as decoding them would, as PostgreSQL's `get_worker` parses it.
+pub fn source_member<'a>(
+    text: &'a str,
+    step: SourceStep<'_>,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    match (step, kind_of(text)) {
+        (SourceStep::Key(key), Kind::Object) => {
+            let mut items = SourceItems::start(text, true, true, arena)?;
+            let mut found = None;
+            while let Some((name, value)) = items.next(arena)? {
+                if name == Some(key) {
+                    found = Some(value);
                 }
             }
-            Some(byte) if *byte == close => {}
-            _ => return Err(bad()),
+            Ok(found)
         }
-        self.at = p.at;
-        Ok(Some((key, value)))
+        (SourceStep::Index(index), Kind::Array) => {
+            let items = array_elements_source(text, true, arena)?;
+            let resolved = if index < 0 {
+                i64::try_from(items.len()).map_err(|_| full())? + index
+            } else {
+                index
+            };
+            Ok(usize::try_from(resolved)
+                .ok()
+                .and_then(|resolved| items.get(resolved).copied()))
+        }
+        _ => {
+            Parser::new(text, true, None, false)
+                .document()
+                .map_err(Failure::error)?;
+            Ok(None)
+        }
     }
+}
+
+/// The text form of a `json` value's source, as `->>` and `#>>` return it:
+/// a string's decoded value, `None` for a JSON null, anything else verbatim.
+pub fn source_text<'a>(source: &'a str, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    let trimmed = source.trim_matches([' ', '\t', '\n', '\r']);
+    if trimmed == "null" {
+        return Ok(None);
+    }
+    if let Some(quoted) = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return decode_string(quoted, arena).map(Some);
+    }
+    Ok(Some(source))
 }
 
 /// Top-level members of a JSON object in source order, keys decoded and each
@@ -356,7 +641,7 @@ pub fn object_members_source<'a>(
     input: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a str)], SqlError> {
-    let mut items = SourceItems::start(input, true, arena)?;
+    let mut items = SourceItems::start(input, true, true, arena)?;
     let mut members = ArenaList::new(arena);
     while let Some((key, value)) = items.next(arena)? {
         members
@@ -371,245 +656,15 @@ pub fn object_members_source<'a>(
 /// `json_array_elements` on the `json` type (not `jsonb`).
 pub fn array_elements_source<'a>(
     input: &'a str,
+    need_escapes: bool,
     arena: &'a Arena,
 ) -> Result<&'a [&'a str], SqlError> {
-    let mut source = SourceItems::start(input, false, arena)?;
+    let mut source = SourceItems::start(input, false, need_escapes, arena)?;
     let mut items = ArenaList::new(arena);
     while let Some((_, element)) = source.next(arena)? {
         items.push(element).map_err(|_| full())?;
     }
     Ok(items.as_slice())
-}
-
-impl<'a> P<'a> {
-    fn ws(&mut self) {
-        while self.at < self.b.len() && matches!(self.b[self.at], b' ' | b'\t' | b'\n' | b'\r') {
-            self.at += 1;
-        }
-    }
-
-    fn value(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
-        if depth > MAX_DEPTH {
-            return Err(sql_err!(
-                sqlstate::STATEMENT_TOO_COMPLEX,
-                "JSON nested too deeply"
-            ));
-        }
-        self.ws();
-        match self.b.get(self.at) {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(decode_string(self.string()?, self.arena)?)),
-            Some(b't') => {
-                self.lit("true")?;
-                Ok(Json::Bool(true))
-            }
-            Some(b'f') => {
-                self.lit("false")?;
-                Ok(Json::Bool(false))
-            }
-            Some(b'n') => {
-                self.lit("null")?;
-                Ok(Json::Null)
-            }
-            Some(c) if *c == b'-' || c.is_ascii_digit() => self.number(),
-            _ => Err(bad()),
-        }
-    }
-
-    fn lit(&mut self, s: &str) -> Result<(), SqlError> {
-        if self.b[self.at..].starts_with(s.as_bytes()) {
-            self.at += s.len();
-            Ok(())
-        } else {
-            Err(bad())
-        }
-    }
-
-    fn number(&mut self) -> Result<Json<'a>, SqlError> {
-        let start = self.at;
-        if self.b.get(self.at) == Some(&b'-') {
-            self.at += 1;
-        }
-        if self.b.get(self.at) == Some(&b'0') {
-            self.at += 1;
-            if self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
-                return Err(bad());
-            }
-        } else {
-            let integer = self.at;
-            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
-                self.at += 1;
-            }
-            if integer == self.at {
-                return Err(bad());
-            }
-        }
-        if self.b.get(self.at) == Some(&b'.') {
-            self.at += 1;
-            let fraction = self.at;
-            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
-                self.at += 1;
-            }
-            if fraction == self.at {
-                return Err(bad());
-            }
-        }
-        if self
-            .b
-            .get(self.at)
-            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
-        {
-            self.at += 1;
-            if self
-                .b
-                .get(self.at)
-                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
-            {
-                self.at += 1;
-            }
-            let exponent = self.at;
-            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
-                self.at += 1;
-            }
-            if exponent == self.at {
-                return Err(bad());
-            }
-        }
-        let raw = core::str::from_utf8(&self.b[start..self.at]).map_err(|_| bad())?;
-        // Canonicalize through NUMERIC (so 1e2 -> 100, 1.0 -> 1.0).
-        let n = Numeric::parse(raw, self.arena).map_err(|_| bad())?;
-        let canon = crate::stack_format!(80, "{}", n);
-        Ok(Json::Number(
-            self.arena.alloc_str(canon.as_str()).map_err(|_| bad())?,
-        ))
-    }
-
-    /// Parses a JSON string literal, returning the source contents between the
-    /// quotes. The caller decodes escapes once at this parse boundary.
-    fn string(&mut self) -> Result<&'a str, SqlError> {
-        debug_assert_eq!(self.b[self.at], b'"');
-        self.at += 1;
-        let start = self.at;
-        loop {
-            match self.b.get(self.at) {
-                None => return Err(bad()),
-                Some(b'"') => {
-                    let s = core::str::from_utf8(&self.b[start..self.at]).map_err(|_| bad())?;
-                    self.at += 1;
-                    return Ok(s);
-                }
-                Some(b'\\') => {
-                    self.at += 1;
-                    match self.b.get(self.at) {
-                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
-                            self.at += 1;
-                        }
-                        Some(b'u') => {
-                            self.at += 1;
-                            for _ in 0..4 {
-                                if !self.b.get(self.at).is_some_and(u8::is_ascii_hexdigit) {
-                                    return Err(bad());
-                                }
-                                self.at += 1;
-                            }
-                        }
-                        _ => return Err(bad()),
-                    }
-                }
-                Some(byte) if *byte < 0x20 => return Err(bad()),
-                Some(_) => self.at += 1,
-            }
-        }
-    }
-
-    fn array(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
-        self.at += 1; // [
-        let mut items = ArenaList::new(self.arena);
-        self.ws();
-        if self.b.get(self.at) == Some(&b']') {
-            self.at += 1;
-            return Ok(Json::Array(&[]));
-        }
-        loop {
-            let value = self.value(depth + 1)?;
-            items.push(value).map_err(|_| full())?;
-            self.ws();
-            match self.b.get(self.at) {
-                Some(b',') => {
-                    self.at += 1;
-                }
-                Some(b']') => {
-                    self.at += 1;
-                    break;
-                }
-                _ => return Err(bad()),
-            }
-        }
-        Ok(Json::Array(items.as_slice()))
-    }
-
-    fn object(&mut self, depth: u32) -> Result<Json<'a>, SqlError> {
-        self.at += 1; // {
-        let mut members = ArenaList::new(self.arena);
-        self.ws();
-        if self.b.get(self.at) == Some(&b'}') {
-            self.at += 1;
-            return Ok(Json::Object(&[]));
-        }
-        loop {
-            self.ws();
-            if self.b.get(self.at) != Some(&b'"') {
-                return Err(bad());
-            }
-            let key = decode_string(self.string()?, self.arena)?;
-            self.ws();
-            if self.b.get(self.at) != Some(&b':') {
-                return Err(bad());
-            }
-            self.at += 1;
-            let value = self.value(depth + 1)?;
-            members.push((key, value)).map_err(|_| full())?;
-            self.ws();
-            match self.b.get(self.at) {
-                Some(b',') => {
-                    self.at += 1;
-                }
-                Some(b'}') => {
-                    self.at += 1;
-                    break;
-                }
-                _ => return Err(bad()),
-            }
-        }
-        if self.preserve_object_order {
-            return Ok(Json::Object(members.as_slice()));
-        }
-        // Stable-sort by key, then drop earlier duplicates (last value wins).
-        // jsonb orders object keys by length first, then bytewise — the same
-        // order PostgreSQL stores and prints them in.
-        crate::mem::arena::stable_sort_via(
-            self.arena,
-            members.as_mut_slice().map_err(|_| full())?,
-            |a, b| {
-                a.0.len()
-                    .cmp(&b.0.len())
-                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-            },
-        )
-        .map_err(|_| full())?;
-        let ms = members.as_slice();
-        let mut out = ArenaList::new(self.arena);
-        for i in 0..ms.len() {
-            // For a run of equal keys, keep only the last that appeared. Since
-            // sort is stable, the last equal element is the last-inserted one.
-            if i + 1 < ms.len() && ms[i].0 == ms[i + 1].0 {
-                continue;
-            }
-            out.push(ms[i]).map_err(|_| full())?;
-        }
-        Ok(Json::Object(out.as_slice()))
-    }
 }
 
 impl<'a> Json<'a> {
@@ -779,9 +834,28 @@ fn build_object<'a>(
 }
 
 /// Resolves a signed array index (negative counts from the end) into a bound.
-fn array_index(index: &str, len: usize) -> Option<usize> {
-    let i: i64 = index.parse().ok()?;
-    let resolved = if i < 0 { len as i64 + i } else { i };
+/// The array index a path element names, read as PostgreSQL's
+/// `setPathArray` does with `strtoint`: leading whitespace and a sign are
+/// allowed, anything after the digits is not. `level` is the element's
+/// zero-based place in the path.
+fn path_index(element: &str, level: usize) -> Result<i64, SqlError> {
+    let digits = element.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let unsigned = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    match digits.parse::<i32>() {
+        Ok(index) if !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit()) => {
+            Ok(i64::from(index))
+        }
+        _ => Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "path element at position {} is not an integer: \"{}\"",
+            level + 1,
+            element
+        )),
+    }
+}
+
+fn array_index(index: i64, len: usize) -> Option<usize> {
+    let resolved = if index < 0 { len as i64 + index } else { index };
     (resolved >= 0 && (resolved as usize) < len).then_some(resolved as usize)
 }
 
@@ -852,7 +926,7 @@ pub fn set_subscript<'a>(
                     "jsonb array subscript is not an integer"
                 ));
             };
-            let length = i64::try_from(items.len()).map_err(|_| bad())?;
+            let length = i64::try_from(items.len()).map_err(|_| full())?;
             let resolved = if raw < 0 { length + raw } else { raw };
             if resolved < 0 {
                 return Err(sql_err!(
@@ -860,7 +934,7 @@ pub fn set_subscript<'a>(
                     "jsonb array subscript is out of bounds"
                 ));
             }
-            let index = usize::try_from(resolved).map_err(|_| bad())?;
+            let index = usize::try_from(resolved).map_err(|_| full())?;
             let new_len = items.len().max(index + 1);
             let buffer = arena
                 .alloc_slice_with(new_len, |_| Json::Null)
@@ -896,7 +970,18 @@ pub fn set<'a>(
     create: bool,
     arena: &'a Arena,
 ) -> Result<Json<'a>, SqlError> {
-    let Some((head, rest)) = path.split_first() else {
+    set_at(root, path, 0, value, create, arena)
+}
+
+fn set_at<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    level: usize,
+    value: Json<'a>,
+    create: bool,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path[level..].split_first() else {
         return Ok(value);
     };
     match root {
@@ -907,7 +992,7 @@ pub fn set<'a>(
                 .map_err(|_| full())?;
             buffer[..n].copy_from_slice(members);
             if let Some(i) = members.iter().position(|(k, _)| k == head) {
-                buffer[i].1 = set(members[i].1, rest, value, create, arena)?;
+                buffer[i].1 = set_at(members[i].1, path, level + 1, value, create, arena)?;
             } else if rest.is_empty() && create {
                 buffer[n] = (*head, value);
                 return build_object(&buffer[..n + 1], arena);
@@ -917,14 +1002,14 @@ pub fn set<'a>(
             build_object(&buffer[..n], arena)
         }
         Json::Array(items) => {
-            let Some(i) = array_index(head, items.len()) else {
+            let Some(i) = array_index(path_index(head, level)?, items.len()) else {
                 return Ok(root);
             };
             let buffer = arena
                 .alloc_slice_with(items.len(), |_| Json::Null)
                 .map_err(|_| full())?;
             buffer[..items.len()].copy_from_slice(items);
-            buffer[i] = set(items[i], rest, value, create, arena)?;
+            buffer[i] = set_at(items[i], path, level + 1, value, create, arena)?;
             Ok(Json::Array(buffer))
         }
         // Cannot descend into a scalar; leave it unchanged.
@@ -941,7 +1026,18 @@ pub fn insert<'a>(
     after: bool,
     arena: &'a Arena,
 ) -> Result<Json<'a>, SqlError> {
-    let Some((head, rest)) = path.split_first() else {
+    insert_at(root, path, 0, value, after, arena)
+}
+
+fn insert_at<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    level: usize,
+    value: Json<'a>,
+    after: bool,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path[level..].split_first() else {
         return Ok(root);
     };
     match root {
@@ -958,7 +1054,7 @@ pub fn insert<'a>(
                         "cannot replace existing key"
                     ));
                 }
-                buffer[i].1 = insert(members[i].1, rest, value, after, arena)?;
+                buffer[i].1 = insert_at(members[i].1, path, level + 1, value, after, arena)?;
                 build_object(&buffer[..n], arena)
             } else if rest.is_empty() {
                 buffer[n] = (*head, value);
@@ -970,7 +1066,7 @@ pub fn insert<'a>(
         Json::Array(items) => {
             if rest.is_empty() {
                 // Insert into this array at the (possibly negative) position.
-                let raw: i64 = head.parse().map_err(|_| bad())?;
+                let raw = path_index(head, level)?;
                 let len = items.len() as i64;
                 let mut at = if raw < 0 { len + raw } else { raw };
                 at = at.clamp(0, len);
@@ -986,14 +1082,14 @@ pub fn insert<'a>(
                 buffer[at + 1..items.len() + 1].copy_from_slice(&items[at..]);
                 Ok(Json::Array(buffer))
             } else {
-                let Some(i) = array_index(head, items.len()) else {
+                let Some(i) = array_index(path_index(head, level)?, items.len()) else {
                     return Ok(root);
                 };
                 let buffer = arena
                     .alloc_slice_with(items.len(), |_| Json::Null)
                     .map_err(|_| full())?;
                 buffer[..items.len()].copy_from_slice(items);
-                buffer[i] = insert(items[i], rest, value, after, arena)?;
+                buffer[i] = insert_at(items[i], path, level + 1, value, after, arena)?;
                 Ok(Json::Array(buffer))
             }
         }
@@ -1110,16 +1206,22 @@ pub fn delete_path<'a>(
     path: &[&'a str],
     arena: &'a Arena,
 ) -> Result<Json<'a>, SqlError> {
-    let Some((head, rest)) = path.split_first() else {
+    delete_path_at(root, path, 0, arena)
+}
+
+fn delete_path_at<'a>(
+    root: Json<'a>,
+    path: &[&'a str],
+    level: usize,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path[level..].split_first() else {
         return Ok(root);
     };
     if rest.is_empty() {
         return match root {
             Json::Object(_) => delete_key(root, head, arena),
-            Json::Array(items) => {
-                let raw: i64 = head.parse().map_err(|_| bad())?;
-                delete_index(Json::Array(items), raw, arena)
-            }
+            Json::Array(items) => delete_index(Json::Array(items), path_index(head, level)?, arena),
             _ => Ok(root),
         };
     }
@@ -1127,18 +1229,18 @@ pub fn delete_path<'a>(
         Json::Object(members) => {
             let buffer = arena.alloc_slice_copy(members).map_err(|_| full())?;
             if let Some(i) = members.iter().position(|(k, _)| k == head) {
-                buffer[i].1 = delete_path(members[i].1, rest, arena)?;
+                buffer[i].1 = delete_path_at(members[i].1, path, level + 1, arena)?;
             } else {
                 return Ok(root);
             }
             Ok(Json::Object(buffer))
         }
         Json::Array(items) => {
-            let Some(i) = array_index(head, items.len()) else {
+            let Some(i) = array_index(path_index(head, level)?, items.len()) else {
                 return Ok(root);
             };
             let buffer = arena.alloc_slice_copy(items).map_err(|_| full())?;
-            buffer[i] = delete_path(items[i], rest, arena)?;
+            buffer[i] = delete_path_at(items[i], path, level + 1, arena)?;
             Ok(Json::Array(buffer))
         }
         _ => Ok(root),
@@ -1202,7 +1304,7 @@ pub fn pretty_to_arena<'a>(root: &Json, arena: &'a Arena) -> Result<&'a str, Sql
     let _ = pretty(root, 0, &mut counter);
     let bytes = arena
         .alloc_slice_with(counter.0, |_| 0u8)
-        .map_err(|_| bad())?;
+        .map_err(|_| full())?;
     struct SliceWriter<'b> {
         buffer: &'b mut [u8],
         at: usize,
@@ -1305,6 +1407,16 @@ pub fn decode_string<'a>(raw: &'a str, arena: &'a Arena) -> Result<&'a str, SqlE
     Ok(buffer.as_str())
 }
 
+/// A string escape [`decode_string`] cannot decode. JSON text reaches it only
+/// after the lexer checked its escapes; jsonpath's strings report their own
+/// syntax error instead.
+fn bad() -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_TEXT_REPRESENTATION,
+        "invalid input syntax for type json"
+    )
+}
+
 /// Parses four hex digits at `bytes[at..at+4]` into a code point.
 fn hex4(bytes: &[u8], at: usize) -> Result<u32, SqlError> {
     let mut value = 0u32;
@@ -1351,7 +1463,7 @@ pub(crate) fn map_string_values<'a>(
         Json::Array(items) => {
             let mapped = arena
                 .alloc_slice_with(items.len(), |_| Json::Null)
-                .map_err(|_| bad())?;
+                .map_err(|_| full())?;
             for (output, item) in mapped.iter_mut().zip(items) {
                 *output = map_string_values(*item, arena, transform)?;
             }
@@ -1360,7 +1472,7 @@ pub(crate) fn map_string_values<'a>(
         Json::Object(members) => {
             let mapped = arena
                 .alloc_slice_with(members.len(), |_| ("", Json::Null))
-                .map_err(|_| bad())?;
+                .map_err(|_| full())?;
             for (output, (key, item)) in mapped.iter_mut().zip(members) {
                 *output = (*key, map_string_values(*item, arena, transform)?);
             }

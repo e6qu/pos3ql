@@ -3881,15 +3881,14 @@ impl<'d> QueryScope<'d> {
                         .is_some_and(|definition| definition.name.as_str() == name)
             }) {
                 Some(aliased) => {
-                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                        detail: None,
-                        hint: Some(crate::stack_format!(
-                            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                        None,
+                        Some(crate::sql::eval::DiagnosticText::format(format_args!(
                             "Perhaps you meant to reference the table alias \"{}\".",
                             self.names[aliased]
-                        )),
-                        objects: crate::sql::eval::ErrorObjects::default(),
-                    });
+                        ))),
+                        crate::sql::eval::ErrorObjects::default(),
+                    ));
                     sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "invalid reference to FROM-clause entry for table \"{}\"",

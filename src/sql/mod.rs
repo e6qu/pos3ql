@@ -86,7 +86,7 @@ pub(crate) mod statistics;
 pub(crate) mod text_parser;
 pub mod timezone;
 mod timezone_abbreviation_data;
-mod timezone_name_data;
+mod timezone_data;
 pub mod to_char;
 pub mod trigger_events;
 pub(crate) mod two_phase;
@@ -311,7 +311,7 @@ pub enum EngineSetupError {
     Storage(SqlError),
     ForeignTransport(String),
     TriggerEventSpill(trigger_events::TriggerEventSpillError),
-    /// `timezone_directory` cannot serve PostgreSQL's named zones.
+    /// A pinned zone's TZif file does not fit the zone table.
     ZoneDatabase(crate::sql::tzif::ZoneDatabaseError),
 }
 
@@ -5003,8 +5003,7 @@ impl Engine {
             ));
         }
 
-        crate::sql::tzif::init_catalog(&config.timezone_directory)
-            .map_err(EngineSetupError::ZoneDatabase)?;
+        crate::sql::tzif::init_catalog().map_err(EngineSetupError::ZoneDatabase)?;
         budget.draw(
             exec::record_shape_pool_bytes(config.max_composites),
             "record_shapes",
@@ -29118,7 +29117,7 @@ pub(crate) fn pg_settings_rule_query<'a>(
     if !update.returning.items.is_empty() {
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "You need an unconditional ON UPDATE DO INSTEAD rule with a RETURNING clause.",
             )),
         );
@@ -29479,8 +29478,8 @@ pub(crate) fn report_parse_error(
 ) -> Result<(), WireFull> {
     if e.hint.is_some() || e.detail.is_some() {
         eval::stash_diagnostic(
-            e.detail.map(crate::util::StackStr::from_str),
-            e.hint.map(crate::util::StackStr::from_str),
+            e.detail.map(crate::sql::eval::DiagnosticText::copy),
+            e.hint.map(crate::sql::eval::DiagnosticText::copy),
         );
     }
     let message = e.render(text);

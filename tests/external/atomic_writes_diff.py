@@ -205,7 +205,6 @@ class Node:
             "trigger_event_spill_bytes": "64MiB",
             "error_text_bytes": "1MiB",
             "error_text_leases": "64",
-            "timezone_directory": "/usr/share/zoneinfo",
             "max_ddl_per_transaction": 16, "max_value_indexes": 8,
             "max_indexes": 8, "max_extended_statistics": 64,
             "max_casts": 8, "max_operators": 8,

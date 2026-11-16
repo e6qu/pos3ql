@@ -1075,16 +1075,19 @@ table joined with other FROM items is read whole before the join (a right
 or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
-batch where PostgreSQL fetches only what the reads need. Date and time input
-and `SET TimeZone` follow PostgreSQL's decoder and its POSIX zone
-specifications. The named zones are PostgreSQL 18.6's, pinned at build, but
-their TZif contents come from `timezone_directory`, so a host's tzdata
-release, not PostgreSQL's 2026c, decides historical and future offsets. Error messages longer than 192 bytes are kept whole in the
-`error_text_bytes` pool; DETAIL and HINT text is still bounded at 12 KiB
-(`54000` past it) rather than drawing from that pool. Invalid `json` and
-`jsonb` input reports no `Token "..." is invalid.` DETAIL or `JSON data,
-line N:` CONTEXT, and a malformed array literal no DETAIL (`Unexpected end of
-input.`). COPY FROM into a foreign table queues its rows
+batch where PostgreSQL fetches only what the reads need. The exact-error
+fixtures compare every DETAIL, HINT, QUERY and CONTEXT line, except the
+fields `tests/external/exact-diagnostics-gaps.tsv` names for 20 fixtures that
+still differ: PL/pgSQL assignments and expressions add a `PL/pgSQL
+assignment "..."` or `PL/pgSQL expression "..."` CONTEXT line PostgreSQL
+leaves out; procedural `SQL statement "..."` lines, inlined SQL functions'
+`SQL function "f" during inlining` lines, foreign-key queries' CONTEXT and
+some internal QUERY fields are missing; `ORDER BY` and `NULLIF` over a type
+without an ordering or equality operator and a schema-qualified hidden table
+lack PostgreSQL's HINT; role dependency DETAILs list objects in pos3ql's
+catalog order, not `pg_shdepend`'s; a unique index built over duplicates
+names a different duplicate key; and a catalog unique violation has no
+DETAIL. COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup

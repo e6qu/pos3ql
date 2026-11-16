@@ -174,6 +174,88 @@ impl Write for TextWriter {
     }
 }
 
+/// A DETAIL or HINT: whole in the error text pool, or the exhaustion that
+/// keeps it from being reported. The error or notice it belongs to is
+/// reported as that exhaustion's `54000` instead.
+#[derive(Clone)]
+pub struct DiagnosticText(Result<ErrorText, TextExhausted>);
+
+impl DiagnosticText {
+    /// Copies `text` whole.
+    pub fn copy(text: &str) -> Self {
+        Self(ErrorText::copy(text))
+    }
+
+    /// Formats `args` whole.
+    pub fn format(args: fmt::Arguments<'_>) -> Self {
+        Self(ErrorText::format(args))
+    }
+
+    /// Text already kept whole.
+    pub fn from_text(text: ErrorText) -> Self {
+        Self(Ok(text))
+    }
+
+    pub(crate) fn into_result(self) -> Result<ErrorText, TextExhausted> {
+        self.0
+    }
+
+    /// The text, or the `54000` reported because it did not fit.
+    pub fn into_text(self) -> Result<ErrorText, crate::sql::eval::SqlError> {
+        self.0.map_err(TextExhausted::error)
+    }
+}
+
+impl From<ErrorText> for DiagnosticText {
+    fn from(text: ErrorText) -> Self {
+        Self::from_text(text)
+    }
+}
+
+impl From<DiagnosticWriter> for DiagnosticText {
+    fn from(writer: DiagnosticWriter) -> Self {
+        writer.finish()
+    }
+}
+
+/// Writes a DETAIL or HINT piece by piece, keeping it whole.
+pub struct DiagnosticWriter {
+    writer: TextWriter,
+}
+
+impl DiagnosticWriter {
+    pub const fn new() -> Self {
+        Self {
+            writer: TextWriter::new(),
+        }
+    }
+
+    /// Bytes written so far.
+    pub fn len(&self) -> usize {
+        self.writer.written
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.writer.written == 0
+    }
+
+    pub fn finish(self) -> DiagnosticText {
+        DiagnosticText(self.writer.finish())
+    }
+}
+
+impl Default for DiagnosticWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Write for DiagnosticWriter {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.writer.write_str(text)
+    }
+}
+
 impl ErrorText {
     pub const fn new() -> Self {
         Self(Storage::Inline(StackStr::new()))
@@ -280,5 +362,54 @@ mod tests {
             unreserved.message.as_str(),
             "error text of 1000 bytes needs error_text_bytes, which this thread has not reserved"
         );
+    }
+
+    #[test]
+    fn a_detail_or_hint_is_kept_whole_or_reported_as_the_exhaustion() {
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let pool = LeasePool::new(
+            &mut budget,
+            crate::mem::lease_pool::Purpose::ERROR_TEXT,
+            16 * 1024,
+            2,
+        )
+        .unwrap();
+        install(Arc::clone(&pool));
+        let long = "d".repeat(13 * 1024);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut writer = DiagnosticWriter::new();
+            for chunk in long.as_bytes().chunks(1000) {
+                let _ = writer.write_str(core::str::from_utf8(chunk).unwrap());
+            }
+            assert_eq!(writer.len(), long.len());
+            let whole = crate::sql::eval::Diagnostic::new(
+                Some(writer.finish()),
+                Some(DiagnosticText::copy("short hint")),
+                crate::sql::eval::ErrorObjects::default(),
+            );
+            assert!(whole.exhaustion().is_none());
+            assert_eq!(whole.detail.as_ref().unwrap().len(), long.len());
+            assert_eq!(whole.hint.as_ref().unwrap().as_str(), "short hint");
+            // The pool holds 16 KiB; a second 13 KiB text does not fit.
+            let cut = crate::sql::eval::Diagnostic::new(
+                None,
+                Some(DiagnosticText::copy(&long)),
+                crate::sql::eval::ErrorObjects::default(),
+            );
+            let exhausted = cut.exhaustion().unwrap();
+            assert_eq!(exhausted.sqlstate, "54000");
+            assert!(
+                exhausted
+                    .message
+                    .as_str()
+                    .starts_with("error text of 13312 bytes does not fit error_text_bytes"),
+                "{}",
+                exhausted.message
+            );
+            assert!(cut.hint.is_none());
+            drop(whole);
+            assert!(DiagnosticText::copy(&long).into_text().is_ok());
+        });
+        POOL.with(|slot| slot.borrow_mut().take());
     }
 }

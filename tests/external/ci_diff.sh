@@ -1605,10 +1605,12 @@ fi
 
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
 # Data stays byte-exact; diagnostic records retain the failing SQL line.
-run_corpus() { # host port outfile file diagnostics
-  local diagnostics=$5 status=0
+run_corpus() { # host port outfile file diagnostics [omitted full fields, comma separated]
+  local diagnostics=$5 omitted=${6:-} status=0 field
+  local omit=()
+  for field in ${omitted//,/ }; do omit+=(--omit "$field"); done
   case "$diagnostics" in
-    sqlstate|verbose) ;;
+    sqlstate|verbose|full) ;;
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
@@ -1630,7 +1632,8 @@ run_corpus() { # host port outfile file diagnostics
     return 1
   fi
   python3 "$EXT/differential_diagnostics.py" --source "$4" --stdout "$3.stdout" \
-    --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" > "$3" || return 1
+    --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" \
+    ${omit[@]+"${omit[@]}"} > "$3" || return 1
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
@@ -1765,12 +1768,12 @@ fi
 reset_corpus_pair
 fi
 
-# --- exact-error corpora (message wording must match) -----------------------
+# --- exact-error corpora (diagnostics must match) ---------------------------
 # Each phase owns its fixed 64-table test budget.  Reusing the curated corpus
 # server made otherwise independent checks fail only after its catalog filled.
 if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == exact ]]; then
 restart_p3_fresh || exit 1
-echo "=== exact-error corpora (message wording must match) ==="
+echo "=== exact-error corpora (diagnostics must match) ==="
 # initdb draws the OIDs of what it creates after importing the platform's
 # collations from one counter, so those objects' absolute OIDs depend on the
 # reference's locale and ICU set, and the fixtures compare offsets only.
@@ -1787,14 +1790,18 @@ else
   bad "initdb numbering of the pinned reference image"
   printf 'PostgreSQL (rebased): %s\npos3ql:               %s\n' "$reference_numbering" "$p3_numbering"
 fi
+# Every DETAIL, HINT, QUERY and CONTEXT line is compared, except the fields
+# exact-diagnostics-gaps.tsv names for a fixture whose difference PLAN.md
+# records.
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
+  omitted=$(awk -F '\t' -v n="$n" '$1 == n { print $2 }' "$EXT/exact-diagnostics-gaps.tsv")
   # Each fixture starts from an empty catalog on both servers, so objects a
   # fixture leaves behind neither fill the fixed budgets nor show up in a
   # later fixture's catalog queries.
   reset_corpus_pair
-  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose || exit 1
-  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose || exit 1
+  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" full "$omitted" || exit 1
+  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" full "$omitted" || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"
   else
     bad "exact errors: $n"

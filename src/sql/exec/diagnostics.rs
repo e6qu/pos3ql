@@ -114,22 +114,27 @@ impl PendingError {
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Option<PendingDiagnostic>, SqlError> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        if diagnostic
+        if let Some(exhausted) = diagnostic
             .as_ref()
-            .is_some_and(crate::sql::eval::Diagnostic::is_truncated)
+            .and_then(crate::sql::eval::Diagnostic::exhaustion)
         {
-            return Err(crate::sql::eval::diagnostic_too_long());
+            crate::sql::error_context::discard(error);
+            return Err(exhausted);
         }
         crate::sql::error_context::take(error, |reported| {
             if diagnostic.is_none() && reported.is_none() {
                 return Ok(None);
             }
-            let detail = diagnostic
-                .as_ref()
-                .and_then(|d| d.detail.as_ref().map(StackStr::as_str));
-            let hint = diagnostic
-                .as_ref()
-                .and_then(|d| d.hint.as_ref().map(StackStr::as_str));
+            let detail = diagnostic.as_ref().and_then(|d| {
+                d.detail
+                    .as_ref()
+                    .map(crate::sql::error_text::ErrorText::as_str)
+            });
+            let hint = diagnostic.as_ref().and_then(|d| {
+                d.hint
+                    .as_ref()
+                    .map(crate::sql::error_text::ErrorText::as_str)
+            });
             let objects = diagnostic
                 .as_ref()
                 .map_or([None; 5], |d| object_texts(&d.objects));
@@ -221,14 +226,16 @@ impl PendingError {
             {
                 *field = diagnostic.text(span).map(StackStr::from_str);
             }
-            let detail = diagnostic.text(diagnostic.detail).map(StackStr::from_str);
-            let hint = diagnostic.text(diagnostic.hint).map(StackStr::from_str);
+            let detail = diagnostic
+                .text(diagnostic.detail)
+                .map(crate::sql::eval::DiagnosticText::copy);
+            let hint = diagnostic
+                .text(diagnostic.hint)
+                .map(crate::sql::eval::DiagnosticText::copy);
             if detail.is_some() || hint.is_some() || !objects.is_empty() {
-                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                    detail,
-                    hint,
-                    objects,
-                });
+                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                    detail, hint, objects,
+                ));
             }
             if let Some(context) = diagnostic.text(diagnostic.context) {
                 let internal = diagnostic
@@ -355,8 +362,18 @@ impl DiagnosticBuffers {
     ) -> Result<(), SqlError> {
         self.capture_fields(
             error,
-            diagnostic.and_then(|value| value.detail.as_ref().map(StackStr::as_str)),
-            diagnostic.and_then(|value| value.hint.as_ref().map(StackStr::as_str)),
+            diagnostic.and_then(|value| {
+                value
+                    .detail
+                    .as_ref()
+                    .map(crate::sql::error_text::ErrorText::as_str)
+            }),
+            diagnostic.and_then(|value| {
+                value
+                    .hint
+                    .as_ref()
+                    .map(crate::sql::error_text::ErrorText::as_str)
+            }),
             context,
             diagnostic.map_or([None; 5], |value| object_texts(&value.objects)),
             None,

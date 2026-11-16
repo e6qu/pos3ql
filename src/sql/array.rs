@@ -568,322 +568,603 @@ impl<'a> Iterator for Elements<'a> {
 
 impl ExactSizeIterator for Elements<'_> {}
 
+/// Reads an array literal as PostgreSQL's `array_in` does
+/// (`src/backend/utils/adt/arrayfuncs.c`), with its errors and DETAILs.
+///
+/// A first pass reads the syntax and counts the elements, so their slice is
+/// reserved at its exact size before any is converted. When that pass finds
+/// the literal malformed, the elements before the fault are converted first,
+/// because PostgreSQL converts each element as it reads it and reports a bad
+/// element ahead of a later syntax error.
 pub fn parse_literal<'a>(
     text: &'a str,
     element: ArrElem,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    let text = text.trim();
-    // The syntax pass determines the exact datum slice before any values are
-    // converted. This keeps literal parsing within statement memory without a
-    // compiled temporary array or a worst-case reservation.
-    let mut counter = LiteralParser::new(text, element, arena, true);
-    let _ = counter.bounds()?;
-    let mut no_items = [];
-    let mut counted_dimensions = [0usize; MAX_DIMENSIONS];
-    counter.level(&mut no_items, &mut counted_dimensions, 0)?;
-    counter.space();
-    if counter.at != counter.text.len() {
-        return Err(counter.bad());
-    }
-    let items = arena
-        .alloc_slice_with(counter.count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-
-    let mut parser = LiteralParser::new(text, element, arena, false);
-    let (supplied_bounds, supplied_count) = parser.bounds()?;
-    let mut dimensions = [0usize; MAX_DIMENSIONS];
-    let levels = parser.level(items, &mut dimensions, 0)?;
-    parser.space();
-    if parser.at != parser.text.len() {
-        return Err(parser.bad());
-    }
-    if levels == 0 || items[..parser.count].is_empty() {
+    let layout = match Reader::new(text, element, arena).read(&mut Pass::Count) {
+        Ok(layout) => layout,
+        Err(Fault::Error(error)) => return Err(error),
+        Err(Fault::Malformed(_)) => {
+            let fault = Reader::new(text, element, arena)
+                .read(&mut Pass::Check)
+                .err()
+                .expect("a malformed literal stays malformed");
+            return Err(fault.error(text));
+        }
+    };
+    if layout.items == 0 {
         return build(&[], arena);
     }
-    if supplied_count > 0 {
-        if supplied_count != levels {
-            return Err(parser.bad());
-        }
-        for (index, &(lower, upper)) in supplied_bounds[..supplied_count].iter().enumerate() {
-            let width = upper
-                .checked_sub(lower)
-                .and_then(|width| width.checked_add(1))
-                .ok_or_else(|| parser.bad())?;
-            if usize::try_from(width).ok() != Some(dimensions[index]) {
-                return Err(parser.bad());
-            }
-        }
-    }
-    let mut lowers = [1i32; MAX_DIMENSIONS];
-    for (index, &(lower, _)) in supplied_bounds[..supplied_count].iter().enumerate() {
-        lowers[index] = lower;
+    let items = alloc_items(arena, layout.items)?;
+    Reader::new(text, element, arena)
+        .read(&mut Pass::Fill(items))
+        .map_err(|fault| fault.error(text))?;
+    let mut dimensions = [0usize; MAX_DIMENSIONS];
+    for (dimension, &width) in dimensions
+        .iter_mut()
+        .zip(&layout.widths[..layout.dimensions])
+    {
+        *dimension = usize::try_from(width).expect("a read dimension is counted");
     }
     build_shaped(
         items,
-        Shape::new(&dimensions[..levels], &lowers[..levels])?,
+        Shape::new(
+            &dimensions[..layout.dimensions],
+            &layout.lower_bounds[..layout.dimensions],
+        )?,
         arena,
     )
 }
 
-struct LiteralParser<'a> {
-    text: &'a str,
+/// What a pass over an array literal does with its elements.
+enum Pass<'p, 'a> {
+    /// Reads the syntax only.
+    Count,
+    /// Converts each element and discards it.
+    Check,
+    /// Converts the elements into the slice the counting pass sized.
+    Fill(&'p mut [Datum<'a>]),
+}
+
+/// How an array literal is malformed: the DETAIL of PostgreSQL's
+/// `malformed array literal` error.
+#[derive(Clone, Copy)]
+enum Malformed {
+    MustStart,
+    MissingAfterDimensions(&'static str),
+    ContentsMustStart,
+    Junk,
+    Unexpected(u8),
+    UnexpectedElement,
+    IncorrectlyQuoted,
+    EndOfInput,
+    BracketWithoutDimension,
+    MissingDimensionValue,
+    DimensionsDoNotMatch,
+    SubArraysDoNotMatch,
+}
+
+enum Fault {
+    Malformed(Malformed),
+    Error(SqlError),
+}
+
+impl From<SqlError> for Fault {
+    fn from(error: SqlError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl Fault {
+    fn error(self, text: &str) -> SqlError {
+        let malformed = match self {
+            Self::Error(error) => return error,
+            Self::Malformed(malformed) => malformed,
+        };
+        let error = sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "malformed array literal: \"{}\"",
+            text
+        );
+        let detail = |detail: core::fmt::Arguments<'_>| super::eval::with_detail(error, detail);
+        match malformed {
+            Malformed::MustStart => detail(format_args!(
+                "Array value must start with \"{{\" or dimension information."
+            )),
+            Malformed::MissingAfterDimensions(what) => {
+                detail(format_args!("Missing \"{what}\" after array dimensions."))
+            }
+            Malformed::ContentsMustStart => {
+                detail(format_args!("Array contents must start with \"{{\"."))
+            }
+            Malformed::Junk => detail(format_args!("Junk after closing right brace.")),
+            Malformed::Unexpected(byte) => detail(format_args!(
+                "Unexpected \"{}\" character.",
+                char::from(byte)
+            )),
+            Malformed::UnexpectedElement => detail(format_args!("Unexpected array element.")),
+            Malformed::IncorrectlyQuoted => {
+                detail(format_args!("Incorrectly quoted array element."))
+            }
+            Malformed::EndOfInput => detail(format_args!("Unexpected end of input.")),
+            Malformed::BracketWithoutDimension => detail(format_args!(
+                "\"[\" must introduce explicitly-specified array dimensions."
+            )),
+            Malformed::MissingDimensionValue => {
+                detail(format_args!("Missing array dimension value."))
+            }
+            Malformed::DimensionsDoNotMatch => detail(format_args!(
+                "Specified array dimensions do not match array contents."
+            )),
+            Malformed::SubArraysDoNotMatch => detail(format_args!(
+                "Multidimensional arrays must have sub-arrays with matching dimensions."
+            )),
+        }
+    }
+}
+
+/// The dimensions and element count of a well-formed literal.
+struct Layout {
+    dimensions: usize,
+    widths: [i32; MAX_DIMENSIONS],
+    lower_bounds: [i32; MAX_DIMENSIONS],
+    items: usize,
+}
+
+/// One token of an array's contents (`ArrayToken`).
+enum ArrayToken {
+    LevelStart,
+    LevelEnd,
+    Delimiter,
+    /// An element's source between `start` and `end`: inside its quotes,
+    /// or unquoted with its trailing whitespace still included.
+    Element {
+        start: usize,
+        end: usize,
+        quoted: bool,
+        escaped: bool,
+    },
+}
+
+/// `scanner_isspace`.
+fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+struct Reader<'a> {
+    text: &'a [u8],
     at: usize,
     element: ArrElem,
     arena: &'a Arena,
-    count: usize,
-    count_only: bool,
 }
 
-impl<'a> LiteralParser<'a> {
-    fn new(text: &'a str, element: ArrElem, arena: &'a Arena, count_only: bool) -> Self {
+impl<'a> Reader<'a> {
+    fn new(text: &'a str, element: ArrElem, arena: &'a Arena) -> Self {
         Self {
-            text,
+            text: text.as_bytes(),
             at: 0,
             element,
             arena,
-            count: 0,
-            count_only,
         }
     }
 
-    fn bad(&self) -> SqlError {
-        sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "malformed array literal: \"{}\"",
-            self.text
-        )
+    fn peek(&self) -> Option<u8> {
+        self.text.get(self.at).copied()
     }
 
-    fn space(&mut self) {
-        while self
-            .text
-            .as_bytes()
-            .get(self.at)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
+    fn skip_spaces(&mut self) {
+        while self.peek().is_some_and(is_space) {
             self.at += 1;
         }
     }
 
-    fn bounds(&mut self) -> Result<([(i32, i32); MAX_DIMENSIONS], usize), SqlError> {
-        let mut result = [(0, 0); MAX_DIMENSIONS];
+    fn read(&mut self, pass: &mut Pass<'_, 'a>) -> Result<Layout, Fault> {
+        let mut widths = [-1i32; MAX_DIMENSIONS];
+        let mut lower_bounds = [1i32; MAX_DIMENSIONS];
+        let specified = self.read_dimensions(&mut widths, &mut lower_bounds)?;
+        if specified == 0 {
+            if self.peek() != Some(b'{') {
+                return Err(Fault::Malformed(Malformed::MustStart));
+            }
+        } else {
+            if self.peek() != Some(b'=') {
+                return Err(Fault::Malformed(Malformed::MissingAfterDimensions("=")));
+            }
+            self.at += 1;
+            self.skip_spaces();
+            if self.peek() != Some(b'{') {
+                return Err(Fault::Malformed(Malformed::ContentsMustStart));
+            }
+        }
+        let (dimensions, items) = self.read_contents(specified, &mut widths, pass)?;
+        while let Some(byte) = self.peek() {
+            self.at += 1;
+            if !is_space(byte) {
+                return Err(Fault::Malformed(Malformed::Junk));
+            }
+        }
+        Ok(Layout {
+            dimensions,
+            widths,
+            lower_bounds,
+            items,
+        })
+    }
+
+    /// `ReadArrayDimensions`: the `[m:n]` or `[n]` items before the
+    /// contents; returns how many there were.
+    fn read_dimensions(
+        &mut self,
+        widths: &mut [i32; MAX_DIMENSIONS],
+        lower_bounds: &mut [i32; MAX_DIMENSIONS],
+    ) -> Result<usize, Fault> {
         let mut count = 0;
         loop {
-            self.space();
-            if self.text.as_bytes().get(self.at) != Some(&b'[') {
-                break;
-            }
-            if count == MAX_DIMENSIONS {
-                return Err(self.bad());
+            // Whitespace is allowed between dimension items, not within them.
+            self.skip_spaces();
+            if self.peek() != Some(b'[') {
+                return Ok(count);
             }
             self.at += 1;
-            let lower = self.number()?;
-            if self.text.as_bytes().get(self.at) != Some(&b':') {
-                return Err(self.bad());
+            if count >= MAX_DIMENSIONS {
+                return Err(too_many_dimensions().into());
+            }
+            let Some(first) = self.read_dimension_integer()? else {
+                return Err(Fault::Malformed(Malformed::BracketWithoutDimension));
+            };
+            let upper = if self.peek() == Some(b':') {
+                lower_bounds[count] = first;
+                self.at += 1;
+                let Some(upper) = self.read_dimension_integer()? else {
+                    return Err(Fault::Malformed(Malformed::MissingDimensionValue));
+                };
+                upper
+            } else {
+                lower_bounds[count] = 1;
+                first
+            };
+            if self.peek() != Some(b']') {
+                return Err(Fault::Malformed(Malformed::MissingAfterDimensions("]")));
             }
             self.at += 1;
-            let upper = self.number()?;
-            if self.text.as_bytes().get(self.at) != Some(&b']') {
-                return Err(self.bad());
+            if upper < lower_bounds[count] {
+                return Err(sql_err!(
+                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                    "upper bound cannot be less than lower bound"
+                )
+                .into());
             }
-            self.at += 1;
-            result[count] = (lower, upper);
+            if upper == i32::MAX {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "array upper bound is too large: {upper}"
+                )
+                .into());
+            }
+            widths[count] = upper
+                .checked_sub(lower_bounds[count])
+                .and_then(|width| width.checked_add(1))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "array size exceeds the maximum allowed ({})",
+                        POSTGRESQL_MAX_ARRAY_SIZE
+                    )
+                })?;
             count += 1;
         }
-        if count > 0 {
-            if self.text.as_bytes().get(self.at) != Some(&b'=') {
-                return Err(self.bad());
-            }
-            self.at += 1;
-        }
-        Ok((result, count))
     }
 
-    fn number(&mut self) -> Result<i32, SqlError> {
-        self.space();
+    /// `ReadDimensionInt`: an integer read as `strtol` reads it, without
+    /// leading whitespace; `None` when no digits follow.
+    fn read_dimension_integer(&mut self) -> Result<Option<i32>, Fault> {
         let start = self.at;
-        if self
-            .text
-            .as_bytes()
-            .get(self.at)
-            .is_some_and(|byte| *byte == b'-' || *byte == b'+')
-        {
-            self.at += 1;
+        let mut at = start;
+        if matches!(self.peek(), Some(b'+' | b'-')) {
+            at += 1;
         }
-        let digits = self.at;
-        while self
-            .text
-            .as_bytes()
-            .get(self.at)
-            .is_some_and(u8::is_ascii_digit)
-        {
-            self.at += 1;
+        let digits = at;
+        while self.text.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
         }
-        if self.at == digits {
-            return Err(self.bad());
+        if at == digits {
+            return Ok(None);
         }
-        self.text[start..self.at].parse().map_err(|_| self.bad())
-    }
-
-    fn level(
-        &mut self,
-        items: &mut [Datum<'a>],
-        dimensions: &mut [usize; MAX_DIMENSIONS],
-        depth: usize,
-    ) -> Result<usize, SqlError> {
-        if depth == MAX_DIMENSIONS {
-            return Err(self.bad());
-        }
-        self.space();
-        if self.text.as_bytes().get(self.at) != Some(&b'{') {
-            return Err(self.bad());
-        }
-        self.at += 1;
-        self.space();
-        let start_count = self.count;
-        let mut width = 0usize;
-        let mut child_levels = None;
-        if self.text.as_bytes().get(self.at) != Some(&b'}') {
-            loop {
-                self.space();
-                let nested = self.text.as_bytes().get(self.at) == Some(&b'{');
-                if nested {
-                    let levels = self.level(items, dimensions, depth + 1)?;
-                    if child_levels
-                        .replace(levels)
-                        .is_some_and(|previous| previous != levels)
-                    {
-                        return Err(self.bad());
-                    }
-                } else {
-                    if child_levels.is_some() {
-                        return Err(self.bad());
-                    }
-                    self.value(items)?;
-                }
-                width += 1;
-                self.space();
-                match self.text.as_bytes().get(self.at) {
-                    Some(delimiter) if *delimiter == self.element.delimiter() => self.at += 1,
-                    Some(b'}') => break,
-                    _ => return Err(self.bad()),
-                }
-            }
-        }
-        self.at += 1;
-        if dimensions[depth] != 0 && dimensions[depth] != width {
-            return Err(self.bad());
-        }
-        dimensions[depth] = width;
-        let levels = child_levels.unwrap_or(0) + 1;
-        if width == 0 && depth > 0 {
-            return Err(self.bad());
-        }
-        if self.count == start_count && width > 0 && child_levels.is_none() {
-            return Err(self.bad());
-        }
-        Ok(levels)
-    }
-
-    fn value(&mut self, items: &mut [Datum<'a>]) -> Result<(), SqlError> {
-        if self.count == MAX_ELEMENTS {
-            return Err(array_too_large());
-        }
-        self.space();
-        let bytes = self.text.as_bytes();
-        if self.count_only {
-            if bytes.get(self.at) == Some(&b'\"') {
-                self.at += 1;
-                loop {
-                    let Some(&byte) = bytes.get(self.at) else {
-                        return Err(self.bad());
-                    };
-                    self.at += 1;
-                    match byte {
-                        b'\"' => break,
-                        b'\\' => {
-                            if bytes.get(self.at).is_none() {
-                                return Err(self.bad());
-                            }
-                            self.at += 1;
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                while let Some(&byte) = bytes.get(self.at) {
-                    if byte == self.element.delimiter() || byte == b'}' {
-                        break;
-                    }
-                    if byte == b'{' {
-                        return Err(self.bad());
-                    }
-                    self.at += 1;
-                }
-            }
-            self.count += 1;
-            return Ok(());
-        }
-        debug_assert!(self.count < items.len());
-        let (value, quoted) = if bytes.get(self.at) == Some(&b'\"') {
-            self.at += 1;
-            // A quoted array member is UTF-8 with byte-level backslash
-            // escapes.  Preserve its original bytes until validating UTF-8:
-            // converting each byte through `char` turns `é` into `Ã©`.
-            let output = self
-                .arena
-                .alloc_slice_with(bytes.len() - self.at, |_| 0u8)
-                .map_err(|_| arena_full())?;
-            let mut output_len = 0;
-            loop {
-                let Some(&byte) = bytes.get(self.at) else {
-                    return Err(self.bad());
-                };
-                self.at += 1;
-                match byte {
-                    b'\"' => break,
-                    b'\\' => {
-                        let Some(&escaped) = bytes.get(self.at) else {
-                            return Err(self.bad());
-                        };
-                        self.at += 1;
-                        output[output_len] = escaped;
-                        output_len += 1;
-                    }
-                    _ => {
-                        output[output_len] = byte;
-                        output_len += 1;
-                    }
-                }
-            }
-            (
-                self.arena
-                    .alloc_str(core::str::from_utf8(&output[..output_len]).map_err(|_| self.bad())?)
-                    .map_err(|_| arena_full())?,
-                true,
+        self.at = at;
+        // Only ASCII signs and digits were read.
+        let number = unsafe { core::str::from_utf8_unchecked(&self.text[start..at]) };
+        number.parse::<i32>().map(Some).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "array bound is out of integer range"
             )
+            .into()
+        })
+    }
+
+    /// `ReadArrayStr`: the braced contents, checked against `specified`
+    /// dimensions or deducing them into `widths`. Returns the dimension and
+    /// element counts.
+    fn read_contents(
+        &mut self,
+        specified: usize,
+        widths: &mut [i32; MAX_DIMENSIONS],
+        pass: &mut Pass<'_, 'a>,
+    ) -> Result<(usize, usize), Fault> {
+        let mut dimensions = specified;
+        let mut frozen = specified != 0;
+        let mut expect_delimiter = false;
+        let mut level = 0usize;
+        let mut counts = [0i32; MAX_DIMENSIONS];
+        let mut items = 0usize;
+        let mismatch = Fault::Malformed(if specified != 0 {
+            Malformed::DimensionsDoNotMatch
         } else {
-            let start = self.at;
-            while let Some(&byte) = bytes.get(self.at) {
-                if byte == self.element.delimiter() || byte == b'}' {
-                    break;
+            Malformed::SubArraysDoNotMatch
+        });
+        loop {
+            match self.read_token()? {
+                ArrayToken::LevelStart => {
+                    if expect_delimiter {
+                        return Err(Fault::Malformed(Malformed::Unexpected(b'{')));
+                    }
+                    if level >= MAX_DIMENSIONS {
+                        return Err(too_many_dimensions().into());
+                    }
+                    counts[level] = 0;
+                    level += 1;
+                    if level > dimensions {
+                        if frozen {
+                            return Err(mismatch);
+                        }
+                        dimensions = level;
+                    }
                 }
-                if byte == b'{' {
-                    return Err(self.bad());
+                ArrayToken::LevelEnd => {
+                    // A right brace may end an empty sub-array; otherwise it
+                    // stands where a delimiter is expected.
+                    if counts[level - 1] > 0 && !expect_delimiter {
+                        return Err(Fault::Malformed(Malformed::Unexpected(b'}')));
+                    }
+                    level -= 1;
+                    if level > 0 {
+                        counts[level - 1] += 1;
+                    }
+                    if widths[level] < 0 {
+                        widths[level] = counts[level];
+                    } else if counts[level] != widths[level] {
+                        return Err(mismatch);
+                    }
+                    expect_delimiter = true;
                 }
-                self.at += 1;
+                ArrayToken::Delimiter => {
+                    if !expect_delimiter {
+                        return Err(Fault::Malformed(Malformed::Unexpected(
+                            self.element.delimiter(),
+                        )));
+                    }
+                    expect_delimiter = false;
+                }
+                ArrayToken::Element {
+                    start,
+                    end,
+                    quoted,
+                    escaped,
+                } => {
+                    if expect_delimiter {
+                        return Err(Fault::Malformed(Malformed::UnexpectedElement));
+                    }
+                    if items == MAX_ELEMENTS {
+                        return Err(array_too_large().into());
+                    }
+                    self.convert(start, end, quoted, escaped, items, pass)?;
+                    items += 1;
+                    // After an element the dimension count is fixed, and
+                    // every element is at the same depth.
+                    frozen = true;
+                    if level != dimensions {
+                        return Err(mismatch);
+                    }
+                    counts[level - 1] += 1;
+                    expect_delimiter = true;
+                }
             }
-            (self.text[start..self.at].trim(), false)
+            if level == 0 {
+                return Ok((dimensions, items));
+            }
+        }
+    }
+
+    /// `ReadArrayToken`.
+    fn read_token(&mut self) -> Result<ArrayToken, Fault> {
+        let delimiter = self.element.delimiter();
+        loop {
+            let Some(byte) = self.peek() else {
+                return Err(Fault::Malformed(Malformed::EndOfInput));
+            };
+            match byte {
+                b'{' => {
+                    self.at += 1;
+                    return Ok(ArrayToken::LevelStart);
+                }
+                b'}' => {
+                    self.at += 1;
+                    return Ok(ArrayToken::LevelEnd);
+                }
+                b'"' => {
+                    self.at += 1;
+                    return self.quoted_element();
+                }
+                _ if byte == delimiter => {
+                    self.at += 1;
+                    return Ok(ArrayToken::Delimiter);
+                }
+                _ if is_space(byte) => self.at += 1,
+                _ => return self.unquoted_element(),
+            }
+        }
+    }
+
+    fn quoted_element(&mut self) -> Result<ArrayToken, Fault> {
+        let delimiter = self.element.delimiter();
+        let start = self.at;
+        let mut escaped = false;
+        loop {
+            match self.peek() {
+                None => return Err(Fault::Malformed(Malformed::EndOfInput)),
+                Some(b'\\') => {
+                    escaped = true;
+                    self.at += 1;
+                    if self.peek().is_none() {
+                        return Err(Fault::Malformed(Malformed::EndOfInput));
+                    }
+                    self.at += 1;
+                }
+                Some(b'"') => {
+                    let end = self.at;
+                    self.at += 1;
+                    // Only whitespace may separate the closing quote from a
+                    // delimiter or brace.
+                    while let Some(byte) = self.peek() {
+                        if byte == delimiter || byte == b'}' || byte == b'{' {
+                            return Ok(ArrayToken::Element {
+                                start,
+                                end,
+                                quoted: true,
+                                escaped,
+                            });
+                        }
+                        if !is_space(byte) {
+                            return Err(Fault::Malformed(Malformed::IncorrectlyQuoted));
+                        }
+                        self.at += 1;
+                    }
+                    return Err(Fault::Malformed(Malformed::EndOfInput));
+                }
+                Some(_) => self.at += 1,
+            }
+        }
+    }
+
+    fn unquoted_element(&mut self) -> Result<ArrayToken, Fault> {
+        let delimiter = self.element.delimiter();
+        let start = self.at;
+        let mut escaped = false;
+        loop {
+            match self.peek() {
+                None => return Err(Fault::Malformed(Malformed::EndOfInput)),
+                Some(b'{') => return Err(Fault::Malformed(Malformed::Unexpected(b'{'))),
+                Some(b'"') => return Err(Fault::Malformed(Malformed::IncorrectlyQuoted)),
+                Some(b'\\') => {
+                    escaped = true;
+                    self.at += 1;
+                    if self.peek().is_none() {
+                        return Err(Fault::Malformed(Malformed::EndOfInput));
+                    }
+                    self.at += 1;
+                }
+                Some(byte) if byte == delimiter || byte == b'}' => {
+                    return Ok(ArrayToken::Element {
+                        start,
+                        end: self.at,
+                        quoted: false,
+                        escaped,
+                    });
+                }
+                Some(_) => self.at += 1,
+            }
+        }
+    }
+
+    /// Converts the element at `index` whose source is `start..end`.
+    fn convert(
+        &self,
+        start: usize,
+        end: usize,
+        quoted: bool,
+        escaped: bool,
+        index: usize,
+        pass: &mut Pass<'_, 'a>,
+    ) -> Result<(), Fault> {
+        let target = match pass {
+            Pass::Count => return Ok(()),
+            Pass::Check => None,
+            Pass::Fill(items) => Some(&mut items[index]),
         };
-        items[self.count] = if !quoted && value.eq_ignore_ascii_case("null") {
-            Datum::Null
-        } else {
-            super::eval::cast_to(Datum::Text(value), self.element.to_coltype(), self.arena)?
+        let mark = self.arena.mark();
+        let datum = match self.element_value(start, end, quoted, escaped)? {
+            None => Datum::Null,
+            Some(value) => {
+                super::eval::cast_to(Datum::Text(value), self.element.to_coltype(), self.arena)?
+            }
         };
-        self.count += 1;
+        match target {
+            Some(item) => *item = datum,
+            // SAFETY: a checked element keeps no reference into the arena.
+            None => unsafe { self.arena.rewind_to(mark) },
+        }
         Ok(())
     }
+
+    /// The element's text with its backslash escapes removed and, unquoted,
+    /// its trailing unescaped whitespace trimmed; `None` for an unquoted
+    /// `NULL`.
+    fn element_value(
+        &self,
+        start: usize,
+        end: usize,
+        quoted: bool,
+        escaped: bool,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let source = &self.text[start..end];
+        let mut kept = source.len();
+        if !quoted {
+            while kept > 0 && is_space(source[kept - 1]) {
+                kept -= 1;
+            }
+        }
+        if !escaped {
+            // Element bounds are ASCII bytes of UTF-8 text.
+            let value = unsafe { core::str::from_utf8_unchecked(&source[..kept]) };
+            return Ok((quoted || !value.eq_ignore_ascii_case("NULL")).then_some(value));
+        }
+        let output = self
+            .arena
+            .alloc_slice_with(source.len(), |_| 0u8)
+            .map_err(|_| arena_full())?;
+        let mut length = 0;
+        let mut significant = 0;
+        let mut at = 0;
+        while at < source.len() {
+            let mut byte = source[at];
+            let literal = byte == b'\\';
+            if literal {
+                at += 1;
+                byte = source[at];
+            }
+            output[length] = byte;
+            length += 1;
+            if quoted || literal || !is_space(byte) {
+                significant = length;
+            }
+            at += 1;
+        }
+        // Escapes copy whole UTF-8 sequences byte by byte.
+        let value = core::str::from_utf8(&output[..significant])
+            .expect("an array element of UTF-8 text stays UTF-8");
+        Ok(Some(value))
+    }
+}
+
+/// PostgreSQL's `MaxArraySize`, which its array size errors name.
+const POSTGRESQL_MAX_ARRAY_SIZE: usize = 0x3FFF_FFFF / core::mem::size_of::<u64>();
+
+fn too_many_dimensions() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "number of array dimensions exceeds the maximum allowed ({})",
+        MAX_DIMENSIONS
+    )
 }
 
 pub fn write(f: &mut core::fmt::Formatter<'_>, element: ArrElem, raw: &[u8]) -> core::fmt::Result {

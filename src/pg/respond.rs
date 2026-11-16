@@ -365,10 +365,7 @@ impl AttemptMark {
 pub(crate) struct DependencyReport {
     pub(crate) filter: DependencyReportFilter,
     /// `drop cascades to ...` lines and their count, not yet sent.
-    pub(crate) notice: Option<(
-        crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>,
-        usize,
-    )>,
+    pub(crate) notice: Option<(crate::sql::error_text::ErrorText, usize)>,
 }
 
 /// The objects one `DROP`'s dependency report reached, as a fixed bit set of
@@ -1087,10 +1084,12 @@ impl<'b> Responder<'b> {
                 let sqlstate = pending.sqlstate;
                 let message = pending.message;
                 let cursor = pending.position.and_then(CursorPosition::from_position);
-                let diagnostic = pending.detail.map(|detail| crate::sql::eval::Diagnostic {
-                    detail: Some(crate::util::StackStr::from_str(detail)),
-                    hint: None,
-                    objects: crate::sql::eval::ErrorObjects::default(),
+                let diagnostic = pending.detail.map(|detail| {
+                    crate::sql::eval::Diagnostic::new(
+                        Some(crate::sql::eval::DiagnosticText::copy(detail)),
+                        None,
+                        crate::sql::eval::ErrorObjects::default(),
+                    )
                 });
                 self.emit_now(OutputClass::Control, |buffer| {
                     Self::build_notice_response(
@@ -2418,7 +2417,7 @@ impl<'b> Responder<'b> {
                 detail.as_str(),
             )
         } else {
-            crate::sql::eval::stash_diagnostic(Some(detail), None);
+            crate::sql::eval::stash_diagnostic(Some(detail.into()), None);
             self.notice(
                 crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
                 crate::stack_format!(128, "drop cascades to {} other objects", count).as_str(),
@@ -2568,6 +2567,17 @@ impl<'b> Responder<'b> {
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
+        // A notice whose DETAIL or HINT did not fit reports that instead.
+        if let Some(error) = diagnostic.and_then(crate::sql::eval::Diagnostic::exhaustion) {
+            return Self::build_notice_response(
+                buffer,
+                severity,
+                error.sqlstate.as_str(),
+                error.message.as_str(),
+                None,
+                None,
+            );
+        }
         {
             let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
             m.u8(b'S');
@@ -2645,15 +2655,22 @@ impl<'b> Responder<'b> {
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        if diagnostic
+        if let Some(error) = diagnostic
             .as_ref()
-            .is_some_and(crate::sql::eval::Diagnostic::is_truncated)
+            .and_then(crate::sql::eval::Diagnostic::exhaustion)
         {
-            let error = crate::sql::eval::diagnostic_too_long();
+            crate::sql::error_context::with_reported(sqlstate, message, |_| ());
             return self.error_severity(severity, error.sqlstate.as_str(), &error.message, None);
         }
         // An analysis error positions its subject in the statement text.
         let annotation = crate::sql::error_position::take_annotation(sqlstate, message);
+        if let Some(crate::sql::error_position::AnalysisNote::Exhausted(exhausted)) =
+            annotation.note
+        {
+            crate::sql::error_context::with_reported(sqlstate, message, |_| ());
+            let error = exhausted.error();
+            return self.error_severity(severity, error.sqlstate.as_str(), &error.message, None);
+        }
         let cursor = cursor.or_else(|| annotation.position.and_then(CursorPosition::from_position));
         let analysis_hint = annotation
             .hint
@@ -2686,11 +2703,16 @@ impl<'b> Responder<'b> {
                         m.u8(b'D');
                         m.cstr(detail.as_str());
                     }
-                    Some(
-                        crate::sql::error_position::AnalysisNote::Hint(hint)
-                        | crate::sql::error_position::AnalysisNote::Suggestion(hint),
-                    ) if analysis_hint.is_none()
-                        && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                    Some(crate::sql::error_position::AnalysisNote::Hint(hint))
+                        if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                    {
+                        m.u8(b'H');
+                        m.cstr(hint.as_str());
+                    }
+                    Some(crate::sql::error_position::AnalysisNote::Suggestion(hint))
+                        if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
                     {
                         m.u8(b'H');
                         m.cstr(hint.as_str());
@@ -3115,7 +3137,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::stash_diagnostic(
                 None,
-                Some(crate::util::StackStr::from_str("check the spelling")),
+                Some(crate::sql::eval::DiagnosticText::copy("check the spelling")),
             );
             let mut responder = Responder::new(&mut buffer);
             responder
@@ -3141,8 +3163,10 @@ mod tests {
                 for notice in [false, true] {
                     buffer.clear();
                     crate::sql::eval::stash_diagnostic(
-                        empty_detail.then(crate::util::StackStr::new),
-                        Some(crate::util::StackStr::from_str("use an authorized role")),
+                        empty_detail.then(|| crate::sql::eval::DiagnosticText::copy("")),
+                        Some(crate::sql::eval::DiagnosticText::copy(
+                            "use an authorized role",
+                        )),
                     );
                     let mut responder = Responder::new(&mut buffer);
                     if notice {

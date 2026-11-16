@@ -38,15 +38,15 @@ pub(super) fn reject_partial_merge_triggers(
     if !partial {
         return Ok(());
     }
-    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-        detail: Some(crate::util::StackStr::from_str(
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "MERGE is not supported for views with INSTEAD OF triggers for some actions but not all.",
         )),
-        hint: Some(crate::util::StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "To enable merging into the view, either provide a full set of INSTEAD OF triggers or drop the existing INSTEAD OF triggers.",
         )),
-        objects: crate::sql::eval::ErrorObjects::default(),
-    });
+        crate::sql::eval::ErrorObjects::default(),
+    ));
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
         "cannot merge into view \"{}\"",

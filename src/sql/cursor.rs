@@ -493,7 +493,7 @@ impl TableUse<'_> {
 pub(crate) fn forward_only() -> SqlError {
     super::eval::stash_diagnostic(
         None,
-        Some(StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Declare it with SCROLL option to enable backward scan.",
         )),
     );

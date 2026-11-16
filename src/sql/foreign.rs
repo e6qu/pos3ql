@@ -149,15 +149,15 @@ impl crate::sql::error_context::Frame for RemoteErrorFrame<'_> {
 fn client_error(error: ClientError) -> SqlError {
     match error {
         ClientError::Publisher(diagnostic) => {
-            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                detail: diagnostic
+            crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                diagnostic
                     .detail
-                    .map(|detail| crate::util::StackStr::from_str(detail.as_str())),
-                hint: diagnostic
+                    .map(|detail| crate::sql::eval::DiagnosticText::copy(detail.as_str())),
+                diagnostic
                     .hint
-                    .map(|hint| crate::util::StackStr::from_str(hint.as_str())),
-                objects: crate::sql::eval::ErrorObjects::default(),
-            });
+                    .map(|hint| crate::sql::eval::DiagnosticText::copy(hint.as_str())),
+                crate::sql::eval::ErrorObjects::default(),
+            ));
             let (text, len) = REMOTE_COMMAND.with(core::cell::Cell::get);
             // SAFETY: a `RemoteCommandScope` names a command that outlives it.
             let command = (!text.is_null()).then(|| unsafe {
@@ -556,7 +556,7 @@ fn write_strerror(output: &mut impl core::fmt::Write, error: &std::io::Error) {
 /// the port and the reason.
 fn connect_failed(server: &RemoteServer, failure: ConnectFailure<'_>) -> SqlError {
     let endpoint = server.endpoint;
-    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let _ = write!(detail, "connection to server at \"{}\"", endpoint.host());
     let address = endpoint.socket_addr().ip();
     let mut printed = StackStr::<64>::new();
@@ -601,7 +601,7 @@ fn connect_failed(server: &RemoteServer, failure: ConnectFailure<'_>) -> SqlErro
             let _ = write!(detail, "{error}");
         }
     }
-    crate::sql::eval::stash_diagnostic(Some(detail), None);
+    crate::sql::eval::stash_diagnostic(Some(detail.into()), None);
     sql_err!(
         sqlstate::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
         "could not connect to server \"{}\"",

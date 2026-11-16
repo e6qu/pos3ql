@@ -15,10 +15,9 @@ use core::fmt::Write as _;
 
 use crate::mem::arena::Arena;
 use crate::sql::catalog::dependencies::{DependencyEdge, ObjectAddress, for_each_dependency};
+use crate::sql::eval::SqlError;
 use crate::sql::eval::sqlstate;
-use crate::sql::eval::{MAX_DIAGNOSTIC_DETAIL_BYTES, SqlError};
 use crate::storage::Storage;
-use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 const NORMAL: u16 = 1 << 0;
@@ -513,11 +512,10 @@ pub(crate) fn required_by(
         let owner = describe(storage, txid, owner, arena)?;
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(stack_format!(
-                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            Some(crate::sql::eval::DiagnosticText::format(format_args!(
                 "You can drop {} instead.",
                 owner
-            )),
+            ))),
         );
         Ok::<_, SqlError>(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -570,7 +568,7 @@ pub(crate) fn report(
     cascade: bool,
     arena: &Arena,
 ) -> Result<crate::pg::respond::DependencyReport, SqlError> {
-    let mut detail = StackStr::<MAX_DIAGNOSTIC_DETAIL_BYTES>::new();
+    let mut detail = crate::sql::eval::DiagnosticWriter::new();
     let mut filter = crate::pg::respond::DependencyReportFilter::EMPTY;
     let mut reported = 0usize;
     let mut unreported = 0usize;
@@ -588,11 +586,10 @@ pub(crate) fn report(
             let owner = describe(storage, txid, owner, arena)?;
             crate::sql::eval::stash_diagnostic(
                 None,
-                Some(stack_format!(
-                    crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                Some(crate::sql::eval::DiagnosticText::format(format_args!(
                     "You can drop {} instead.",
                     owner
-                )),
+                ))),
             );
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -664,16 +661,11 @@ pub(crate) fn report(
             unreported
         );
     }
-    if detail.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "dependency report exceeds its fixed buffer"
-        ));
-    }
+    let detail = detail.finish().into_text()?;
     if refused {
         crate::sql::eval::stash_diagnostic(
-            Some(detail),
-            Some(StackStr::from_str(
+            Some(detail.into()),
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Use DROP ... CASCADE to drop the dependent objects too.",
             )),
         );
@@ -770,7 +762,10 @@ pub(crate) fn send_cascade_lines(
             .notice(sqlstate::SUCCESSFUL_COMPLETION, detail)
             .map_err(full)
     } else {
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail)), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy(detail)),
+            None,
+        );
         responder
             .notice(
                 sqlstate::SUCCESSFUL_COMPLETION,

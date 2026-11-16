@@ -371,7 +371,10 @@ impl PlpgsqlExtraChecks {
             return Ok(Self { text, checks: 0 });
         }
         let invalid = |detail: StackStr<160>| {
-            crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail.as_str())), None);
+            crate::sql::eval::stash_diagnostic(
+                Some(crate::sql::eval::DiagnosticText::copy(detail.as_str())),
+                None,
+            );
             sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "invalid value for parameter \"{}\": \"{}\"",
@@ -1442,7 +1445,9 @@ impl CustomNames {
         validate_custom_name(name)?;
         if self.reserved(name) {
             crate::sql::eval::stash_diagnostic(
-                Some(StackStr::from_str("\"plpgsql\" is a reserved prefix.")),
+                Some(crate::sql::eval::DiagnosticText::copy(
+                    "\"plpgsql\" is a reserved prefix.",
+                )),
                 None,
             );
             return Err(sql_err!(
@@ -1504,7 +1509,7 @@ fn validate_custom_name(name: &str) -> Result<(), SqlError> {
         return Ok(());
     }
     crate::sql::eval::stash_diagnostic(
-        Some(StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Custom parameter names must be two or more simple identifiers separated by dots.",
         )),
         None,
@@ -2333,7 +2338,9 @@ impl GucState {
                 .removed
                 .set(self.custom.removed.get() | (1 << slot));
             crate::sql::eval::stash_diagnostic(
-                Some(StackStr::from_str("\"plpgsql\" is now a reserved prefix.")),
+                Some(crate::sql::eval::DiagnosticText::copy(
+                    "\"plpgsql\" is now a reserved prefix.",
+                )),
                 None,
             );
             responder.warning(
@@ -4268,7 +4275,7 @@ pub(crate) fn parse_unitless_int(value: &str) -> Option<i32> {
 fn parse_int_setting(setting: IntSetting, value: &str) -> Result<i32, SqlError> {
     let invalid = |hint: &'static str| {
         if !hint.is_empty() {
-            super::eval::stash_diagnostic(None, Some(StackStr::from_str(hint)));
+            super::eval::stash_diagnostic(None, Some(crate::sql::eval::DiagnosticText::copy(hint)));
         }
         invalid_setting_value(setting.name, value)
     };
@@ -4926,11 +4933,10 @@ fn is_read_only(name: &str) -> bool {
 fn invalid_enum_value(param: &str, v: &str, available: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
         None,
-        Some(crate::stack_format!(
-            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+        Some(crate::sql::eval::DiagnosticText::format(format_args!(
             "Available values: {}.",
             available
-        )),
+        ))),
     );
     invalid_setting_value(param, v)
 }

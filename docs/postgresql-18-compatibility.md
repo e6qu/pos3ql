@@ -867,12 +867,12 @@ Dates and times:
   [Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
   (checksum-pinned at build) and the session zone: `2021-06-01 12:00 EST` is
   17:00 UTC; with `TimeZone = 'Asia/Shanghai'`, `CST` means UTC+8.
-  `timezone_abbreviations` cannot be changed. The named zones are
-  PostgreSQL 18.6's 598 (checksum-pinned at build); their TZif files come from
-  the required `timezone_directory` setting, and startup fails naming any zone
-  the directory lacks. On Debian and Ubuntu, `/usr/share/zoneinfo` holds the
-  legacy names such as `PST8PDT` and `US/Eastern` only with the
-  `tzdata-legacy` package.
+  `timezone_abbreviations` cannot be changed. The named zones and their
+  offsets are PostgreSQL 18.6's: its 598 zones, compiled from its tzdata 2026c
+  and built into pos3ql (checksum-pinned at build), as PostgreSQL ships its own
+  zone data. The host's zone files are not read, so
+  `'2030-06-01 12:00 Europe/Paris'` has PostgreSQL 18.6's offset whatever
+  tzdata release the host has.
 - Numeric time zones are hours east of UTC (`SET timezone TO '2.5'` is
   UTC+02:30), within ±167:59:59; month/day interval fields return `22023`
   ([PostgreSQL rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251),
@@ -1132,7 +1132,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
 | `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
-| `error_text_bytes`, `error_text_leases` | Error messages longer than 192 bytes, kept whole; one that does not fit fails with `54000` |
+| `error_text_bytes`, `error_text_leases` | Error messages, DETAILs and HINTs longer than 192 bytes, kept whole; text that does not fit fails with `54000` |
 | `definition_image_slots` | Schema pins held by executing statements |
 | `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
 | `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |

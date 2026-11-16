@@ -3274,7 +3274,7 @@ pub(crate) fn check_routine_scalar_result<'a>(
 
 /// PostgreSQL's `check_sql_stmt_retval` failure for a declared result.
 pub(crate) fn routine_result_mismatch(declared: &str, detail: &str) -> SqlError {
-    crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+    crate::sql::eval::stash_diagnostic(Some(crate::sql::eval::DiagnosticText::copy(detail)), None);
     sql_err!(
         sqlstate::INVALID_FUNCTION_DEFINITION,
         "return type mismatch in function declared to return {}",
@@ -10794,7 +10794,7 @@ pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
             );
             super::eval::stash_diagnostic(
                 None,
-                Some(crate::util::StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "Use the COLLATE clause to set the collation explicitly.",
                 )),
             );

@@ -80,8 +80,9 @@ All generators pin PostgreSQL 18.6 (`REL_18_6`), reject other versions, and
 record their source and checksums.
 
 ```sh
-# Named time zones, from REL_18_6 src/timezone/data/tzdata.zi.
-python3 tools/generate-pg18-timezone-names.py tzdata.zi src/sql/timezone_name_data.rs
+# Named time zones and their TZif data, compiled from REL_18_6
+# src/timezone/data/tzdata.zi with zic (tzcode 2022g reproduces the pin).
+python3 tools/generate-pg18-timezone-data.py tzdata.zi /usr/sbin/zic src/sql/timezone_data.rs
 
 # Built-in catalog metadata, from a running reference container.
 tools/generate-pg18-catalog-metadata.sh pos3ql-pg18-ref src/sql/catalog_metadata.rs

@@ -2009,7 +2009,10 @@ impl<'a> Parser<'a> {
                 None
             };
             if let Some((prefix, state, reason, detail)) = restriction {
-                crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail)), None);
+                crate::sql::eval::stash_diagnostic(
+                    Some(crate::sql::eval::DiagnosticText::copy(detail)),
+                    None,
+                );
                 return Err(ParseError {
                     at: statement_start,
                     message: stack_format!(

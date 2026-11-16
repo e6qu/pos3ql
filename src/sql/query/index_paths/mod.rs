@@ -227,9 +227,13 @@ impl Costs {
     }
 }
 
-/// `clamp_row_est`.
+/// `clamp_row_est`: `rint`, which rounds a half to even.
 pub(crate) fn clamp_row_est(rows: f64) -> f64 {
-    if rows <= 1.0 { 1.0 } else { rows.round() }
+    if rows <= 1.0 {
+        1.0
+    } else {
+        rows.round_ties_even()
+    }
 }
 
 fn clamp_probability(value: f64) -> f64 {
@@ -331,7 +335,7 @@ pub(crate) fn relation_size(storage: &Storage, slot: usize, txid: u32) -> Relati
     };
     RelationSize {
         pages: curpages,
-        tuples: (density * curpages).round(),
+        tuples: (density * curpages).round_ties_even(),
         allvisfrac,
     }
 }

@@ -7,9 +7,10 @@
 -- the column for its index. An UPDATE or DELETE whose costs choose a
 -- sequential scan changes rows in heap order, also when a routine call
 -- resumes it. The rows stay under the forced-spill run's 256 KiB memtable.
-CREATE TABLE d753 (id int PRIMARY KEY, b text, v varchar, n int, f boolean);
+CREATE TABLE d753 (id int, b text, v varchar, n int, f boolean);
 INSERT INTO d753 SELECT g, 'b' || g, 'v' || (g % 100), g % 50, g % 3 = 0
-  FROM generate_series(1, 3000) g;
+  FROM generate_series(1, 1500) g;
+ALTER TABLE d753 ADD PRIMARY KEY (id);
 CREATE INDEX ON d753 (v);
 CREATE INDEX ON d753 (n);
 ANALYZE d753;
@@ -38,8 +39,8 @@ SELECT id FROM d753 WHERE v::text = 'v7' ORDER BY id LIMIT 3;
 UPDATE d753 SET b = b || 'u' WHERE id % 37 = 0;
 CREATE FUNCTION d753_f(x int) RETURNS int LANGUAGE plpgsql AS $$
 BEGIN PERFORM count(*) FROM d753 WHERE id = x; RETURN x + 100; END $$;
-:e UPDATE d753 SET n = d753_f(n) WHERE n < 40 AND id > 2900;
-WITH u AS (UPDATE d753 SET n = d753_f(n) WHERE n < 40 AND id > 2900 RETURNING id)
+:e UPDATE d753 SET n = d753_f(n) WHERE n < 40 AND id > 1400;
+WITH u AS (UPDATE d753 SET n = d753_f(n) WHERE n < 40 AND id > 1400 RETURNING id)
   SELECT array_agg(id) FROM u;
-WITH u AS (DELETE FROM d753 WHERE n < 48 AND id > 2800 RETURNING id)
+WITH u AS (DELETE FROM d753 WHERE n < 48 AND id > 1300 RETURNING id)
   SELECT array_agg(id) FROM u;

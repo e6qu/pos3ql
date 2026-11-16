@@ -7,7 +7,7 @@
 -- selectivity is patternsel's. The rows stay under the forced-spill run's
 -- 256 KiB memtable.
 CREATE TABLE s752 (id int PRIMARY KEY, b text, n int);
-INSERT INTO s752 SELECT g, 'k' || (g % 300) || 'é' || g, g % 50 FROM generate_series(1, 3000) g;
+INSERT INTO s752 SELECT g, 'k' || (g % 300) || 'é' || g, g % 50 FROM generate_series(1, 1500) g;
 CREATE INDEX ON s752 (b);
 ANALYZE s752;
 \set e 'EXPLAIN'

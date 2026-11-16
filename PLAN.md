@@ -1271,9 +1271,12 @@ rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
 (`differential_exact/746`); other operators still compare every pair, and
 for a GiST constraint PostgreSQL names the partner its index scan finds
-first, where pos3ql names the first in heap order. Remaining: PostgreSQL
-compares merged CHECK predicates as analysed trees, so `a > 0::integer`
-and `a > 0` merge there but not here. PL/pgSQL row and record variables (a
+first, where pos3ql names the first in heap order. Merged CHECK predicates
+compare in their analysed form, as PostgreSQL's `equal()` compares cooked
+trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
+operator) conflict; a predicate outside the deparser's typed coverage compares
+as parsed. A declared column merged with an inherited one at another position
+is reported as moved (`differential_exact/781`). PL/pgSQL row and record variables (a
 trigger's `NEW` and `OLD` among them) are visible to analysis at every query
 level of a statement: `(r).*`, `r.*` and `ROW(r.*)` expand a row-typed
 variable, or a record variable holding a named composite value, inside derived

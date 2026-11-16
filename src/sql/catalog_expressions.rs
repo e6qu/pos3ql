@@ -596,7 +596,9 @@ pub(super) fn deparse<'a>(
             txid: transaction,
             arena,
             dependencies: None,
-            table: table.as_deref(),
+            table: table
+                .as_deref()
+                .map(|table| table as &dyn crate::sql::catalog::deparse::DeparseTable),
             parameters: &[],
             joined: &[],
             pretty,

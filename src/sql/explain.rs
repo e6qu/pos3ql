@@ -1887,7 +1887,9 @@ fn scan_filters<'a>(
                 let context = crate::sql::catalog::deparse::Context {
                     storage,
                     txid,
-                    table: relation.table,
+                    table: relation
+                        .table
+                        .map(|table| table as &dyn crate::sql::catalog::deparse::DeparseTable),
                     parameters: &[],
                     joined: &joined,
                     pretty: false,
@@ -11428,7 +11430,7 @@ fn plan_merge<'a, 'e>(
     target_scan.set_output(lists.as_ref().map(|lists| lists.scans[0]));
     let source_scan = match source_slot {
         Some(slot) => {
-            let definition = joined[1].table().expect("a table source");
+            let definition = &storage.table_def(slot, txid);
             let mut scan = physical_scan_node(
                 storage,
                 slot,

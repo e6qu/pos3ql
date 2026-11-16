@@ -2373,6 +2373,11 @@ fn create_table_kind(
             };
             let partition = def.partition.attachment.is_some();
             if let Err(error) = ddl::merge_with_existing_check(
+                ddl::CheckRelation {
+                    storage,
+                    txid: txn.txid,
+                    table: &def,
+                },
                 &def.checks[inherited],
                 true,
                 def.name.as_str(),
@@ -5233,12 +5238,31 @@ fn notify_inherited_column_merges(
             }
         }
     }
+    // The position of `name` among the inherited columns, each counted once
+    // in parent order (`findAttrByName` over the merged inherited list).
+    let inherited_position = |name: &str| -> Result<Option<usize>, SqlError> {
+        let mut position = 0usize;
+        for parent in 0..parents.len() {
+            for column in storage.table_def(parent_slot(parent)?, txid).columns() {
+                if defined_by_earlier_parent(parent, column.name.as_str())? {
+                    continue;
+                }
+                position += 1;
+                if column.name.as_str() == name {
+                    return Ok(Some(position));
+                }
+            }
+        }
+        Ok(None)
+    };
     for (index, column) in statement.columns.iter().enumerate() {
         if !reached(parents.len(), index) {
             break;
         }
-        match defined_by_earlier_parent(parents.len(), column.name) {
-            Ok(true) => responder.notice(
+        match inherited_position(column.name) {
+            // A declared column at its inherited column's position merges in
+            // place; elsewhere it moves there.
+            Ok(Some(position)) if position == index + 1 => responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(
                     160,
@@ -5247,7 +5271,24 @@ fn notify_inherited_column_merges(
                 )
                 .as_str(),
             )?,
-            Ok(false) => {}
+            Ok(Some(_)) => {
+                crate::sql::eval::stash_diagnostic(
+                    Some(crate::sql::eval::DiagnosticText::copy(
+                        "User-specified column moved to the position of the inherited column.",
+                    )),
+                    None,
+                );
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "moving and merging column \"{}\" with inherited definition",
+                        column.name
+                    )
+                    .as_str(),
+                )?;
+            }
+            Ok(None) => {}
             Err(error) => return Ok(Err(error)),
         }
     }
@@ -5367,7 +5408,14 @@ fn build_inherited_table_def(
                 }
             }
         }
-        inherit_table_checks(&parent_definition, &mut definition, false, arena)?;
+        inherit_table_checks(
+            storage,
+            txid,
+            &parent_definition,
+            &mut definition,
+            false,
+            arena,
+        )?;
         definition.inheritance.append(parent)?;
     }
     for (own_index, column) in own.columns().iter().enumerate() {
@@ -5500,21 +5548,36 @@ fn build_declared_table_def(
 /// requirements but deliberately leaves keys, foreign keys, and exclusion
 /// constraints local to each physical relation.
 fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     parent: &crate::storage::TableDefinition<Definition0>,
     child: &mut TableDefBuilder,
     require_existing: bool,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for inherited in parent.checks().iter().filter(|check| !check.no_inherit) {
-        if let Some(existing) = child.checks[..child.n_checks]
-            .iter_mut()
-            .find(|existing| existing.name == inherited.name)
+        if let Some(position) = child.checks[..child.n_checks]
+            .iter()
+            .position(|existing| existing.name == inherited.name)
         {
+            let columns = ddl::CheckRelation {
+                storage,
+                txid,
+                table: &*child,
+            };
+            let current = child.checks[position];
             if require_existing {
                 // `ALTER TABLE ... INHERIT` (`MergeConstraintsIntoExisting`).
-                ddl::merge_check_into_existing(inherited, existing, child.name.as_str(), arena)?;
+                ddl::merge_check_into_existing(
+                    columns,
+                    inherited,
+                    &current,
+                    child.name.as_str(),
+                    arena,
+                )?;
             } else if !ddl::same_check_expression(
-                existing.expression.as_str(),
+                columns,
+                current.expression.as_str(),
                 inherited.expression.as_str(),
                 arena,
             )? {
@@ -5525,6 +5588,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
                     inherited.name.as_str()
                 ));
             }
+            let existing = &mut child.checks[position];
             if inherited.validation.enforced() && !existing.validation.enforced() {
                 existing.validation = crate::storage::ConstraintValidation::EnforcedValidated;
             }
@@ -99381,7 +99445,16 @@ fn propagated_check_name<'a>(
         for check in parent.checks() {
             if !check.no_inherit
                 && !definition.checks().iter().any(|own| own.name == check.name)
-                && ddl::same_check_expression(check.expression.as_str(), stored, arena)?
+                && ddl::same_check_expression(
+                    ddl::CheckRelation {
+                        storage,
+                        txid,
+                        table: definition,
+                    },
+                    check.expression.as_str(),
+                    stored,
+                    arena,
+                )?
             {
                 found = Some(check);
                 break;
@@ -99607,16 +99680,29 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.n_uniques += 1;
     }
     for constraint in parent.checks() {
-        if let Some(existing) = child.checks[..child.n_checks]
-            .iter_mut()
-            .find(|existing| existing.name == constraint.name)
+        if let Some(position) = child.checks[..child.n_checks]
+            .iter()
+            .position(|existing| existing.name == constraint.name)
         {
+            let columns = ddl::CheckRelation {
+                storage,
+                txid: transaction,
+                table: &*child,
+            };
+            let current = child.checks[position];
             // The partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
             if matches!(mode, PartitionInheritance::Attach) {
-                ddl::merge_check_into_existing(constraint, existing, child.name.as_str(), arena)?;
+                ddl::merge_check_into_existing(
+                    columns,
+                    constraint,
+                    &current,
+                    child.name.as_str(),
+                    arena,
+                )?;
             } else if !ddl::same_check_expression(
-                existing.expression.as_str(),
+                columns,
+                current.expression.as_str(),
                 constraint.expression.as_str(),
                 arena,
             )? {
@@ -99626,7 +99712,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                     constraint.name.as_str()
                 ));
             }
-            existing.local = false;
+            child.checks[position].local = false;
             continue;
         }
         if matches!(mode, PartitionInheritance::Attach) {
@@ -100160,7 +100246,14 @@ fn alter_table_inheritance(
                 ));
             }
         }
-        if let Err(error) = inherit_table_checks(&parent_definition, &mut updated, true, arena) {
+        if let Err(error) = inherit_table_checks(
+            storage,
+            txn.txid,
+            &parent_definition,
+            &mut updated,
+            true,
+            arena,
+        ) {
             return sql_fail(error);
         }
         if let Err(error) = updated.inheritance.append(parent) {
@@ -100223,6 +100316,11 @@ fn alter_table_inheritance(
                 for parent in storage.table_def(usize::from(*slot), txn.txid).checks() {
                     if !parent.no_inherit && parent.name == check.name {
                         inherited |= match ddl::same_check_expression(
+                            ddl::CheckRelation {
+                                storage,
+                                txid: txn.txid,
+                                table: &updated,
+                            },
                             parent.expression.as_str(),
                             check.expression.as_str(),
                             arena,
@@ -103746,6 +103844,11 @@ fn alter_table_relation(
                     let existing = new_def.checks[position];
                     let partition = new_def.partition.attachment.is_some();
                     if let Err(error) = ddl::merge_with_existing_check(
+                        ddl::CheckRelation {
+                            storage,
+                            txid: txn.txid,
+                            table: &new_def,
+                        },
                         &existing,
                         crate::sql::catalog::check_inheritance_count(
                             storage,

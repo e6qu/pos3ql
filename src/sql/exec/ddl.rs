@@ -1130,6 +1130,7 @@ pub(crate) fn plain_column_reference<Definition0: crate::storage::DefinitionBack
 /// constraint with an inherited one: their parsed forms, regardless of
 /// spacing, redundant parentheses, keyword case or quoting.
 pub(crate) fn same_check_expression(
+    relation: CheckRelation<'_>,
     left: &str,
     right: &str,
     arena: &Arena,
@@ -1145,12 +1146,53 @@ pub(crate) fn same_check_expression(
         let right = arena
             .alloc_str(right)
             .map_err(|_| crate::sql::eval::arena_full())?;
-        Ok(crate::sql::parser::parse_expr(left, arena)?
-            == crate::sql::parser::parse_expr(right, arena)?)
+        let left = crate::sql::parser::parse_expr(left, arena)?;
+        let right = crate::sql::parser::parse_expr(right, arena)?;
+        // PostgreSQL compares the analysed predicates (`equal()`), whose
+        // printed forms differ exactly when they do: `a > 0::integer` and
+        // `a > 0` are one predicate. A shape the deparser does not model is
+        // compared as parsed.
+        let context = crate::sql::catalog::deparse::Context {
+            storage: relation.storage,
+            txid: relation.txid,
+            arena,
+            dependencies: None,
+            table: Some(relation.table),
+            parameters: &[],
+            joined: &[],
+            pretty: false,
+            qualify: false,
+            bare: None,
+            domain_value: None,
+            folded: false,
+            sublinks: None,
+            references: None,
+        };
+        let analysed = |expression| {
+            crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                expression,
+                crate::sql::catalog::deparse::Destination::Condition,
+                arena,
+            )
+        };
+        Ok(match (analysed(left)?, analysed(right)?) {
+            (Some(left), Some(right)) => left == right,
+            _ => left == right,
+        })
     })();
     // SAFETY: the comparison retains nothing of the arena.
     unsafe { arena.rewind_to(mark) };
     same
+}
+
+/// The relation whose columns two CHECK predicates compared by
+/// [`same_check_expression`] name.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckRelation<'d> {
+    pub(crate) storage: &'d Storage,
+    pub(crate) txid: u32,
+    pub(crate) table: &'d dyn crate::sql::catalog::deparse::DeparseTable,
 }
 
 /// PostgreSQL's analysis of a CHECK predicate when the constraint is
@@ -1232,6 +1274,7 @@ pub(crate) struct CheckAddition<'a> {
 /// `inherited` relations' constraints it receives: `Ok` merges, with the
 /// notice the caller reports; otherwise the conflict's error.
 pub(crate) fn merge_with_existing_check(
+    columns: CheckRelation<'_>,
     existing: &crate::storage::CheckConstraint,
     inherited: bool,
     relation: &str,
@@ -1240,7 +1283,12 @@ pub(crate) fn merge_with_existing_check(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let name = existing.name.as_str();
-    let found = same_check_expression(existing.expression.as_str(), addition.stored, arena)?;
+    let found = same_check_expression(
+        columns,
+        existing.expression.as_str(),
+        addition.stored,
+        arena,
+    )?;
     // A purely inherited constraint merges a local definition, so a parent
     // and its child may add it in either order; a partition's never does.
     let allow_merge = addition.allow_merge || (addition.local && !existing.local && !partition);
@@ -1296,6 +1344,7 @@ pub(crate) fn merge_with_existing_check(
 /// relation becoming the parent of `child`, which already has the
 /// same-named `existing`: `Ok` when it takes the parent's.
 pub(crate) fn merge_check_into_existing(
+    columns: CheckRelation<'_>,
     parent: &crate::storage::CheckConstraint,
     existing: &crate::storage::CheckConstraint,
     child: &str,
@@ -1303,6 +1352,7 @@ pub(crate) fn merge_check_into_existing(
 ) -> Result<(), SqlError> {
     let name = parent.name.as_str();
     if !same_check_expression(
+        columns,
         existing.expression.as_str(),
         parent.expression.as_str(),
         arena,

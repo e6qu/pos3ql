@@ -923,9 +923,19 @@ builds then for an outer key with most-common-value statistics
 (`ExecHashBuildSkewHash`), and values it stores compressed or out of line
 (rows over about 2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
 `jsonb`, ranges, records) reports pos3ql's own table bytes. A scan's
-cost and row model covers comparisons of a column with a constant; a
-comparison with an InitPlan's output or a stable call leaves the crude
-estimate, where PostgreSQL may also choose an index scan. JSON nests as
+cost and row model covers comparisons of a column with a constant, with an
+InitPlan's output (a constant of unknown value: `var_eq_non_const` and
+`DEFAULT_INEQ_SEL`, the InitPlan's parameter usable as an index condition)
+and with a stable expression estimated from its value at planning
+(`estimate_expression_value`), whose evaluation an index scan charges once at
+startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
+Remaining there: a stable expression the model cannot evaluate (a
+user-defined function) leaves the crude estimate, and PostgreSQL's
+`min`/`max` InitPlan of a local table (`preprocess_minmax_aggregates`) and the
+cost of an implicit coercion function inside a condition (`length(name)`
+casting to `text`) are not modelled. A plain `Aggregate`'s cost is not
+PostgreSQL's `cost_agg` (its input cost plus each aggregate's transition
+function per input row): EXPLAIN shows pos3ql's own estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's

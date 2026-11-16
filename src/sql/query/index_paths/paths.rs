@@ -636,6 +636,40 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     }
 
     /// `btcostestimate`: startup and total cost, selectivity, correlation.
+    /// The cost of evaluating the operands an index's conditions compare
+    /// its keys with: a constant or an InitPlan's output costs nothing, a
+    /// stable expression its functions.
+    fn operand_cost(&self, clauses: &[IndexClause<'a>]) -> f64 {
+        let planner = self.planner;
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(planner.definition),
+            alias: None,
+            output_aliases: &[],
+            remote_ctid: false,
+        };
+        clauses
+            .iter()
+            .filter_map(|clause| match clause.restriction.clause {
+                Clause::Compare { operand, .. }
+                    if !operand.is_constant(false)
+                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_)) =>
+                {
+                    Some(
+                        super::super::plan::qual_cost(
+                            operand,
+                            &columns,
+                            planner.storage,
+                            planner.txid,
+                            self.arena,
+                        ) / 2.0
+                            * self.costs().cpu_operator,
+                    )
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     fn btcostestimate(
         &self,
         index: usize,
@@ -806,8 +840,12 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             index_pages * costs.random_page
         };
         let qual_op = costs.cpu_operator * clauses.len() as f64;
+        // `index_other_operands_eval_cost`: the index conditions' other
+        // operands are evaluated once, when the scan starts.
+        let operands = self.operand_cost(clauses);
+        total += operands;
         total += index_tuples * sa_scans * (costs.cpu_index_tuple + qual_op);
-        let mut startup = 0.0;
+        let mut startup = operands;
         if index_entries > 1.0 {
             let descent = (index_entries.ln() / 2.0f64.ln()).ceil() * costs.cpu_operator;
             startup += descent;

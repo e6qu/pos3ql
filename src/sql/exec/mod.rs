@@ -100570,7 +100570,7 @@ fn alter_table_inheritance(
         }
     } else if !updated.inheritance.remove(parent) {
         return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
+            sqlstate::UNDEFINED_TABLE,
             "relation \"{}\" is not a parent of relation \"{}\"",
             parent_definition.name.as_str(),
             updated.name.as_str()

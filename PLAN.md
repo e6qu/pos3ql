@@ -891,21 +891,20 @@ outer or hashed side. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
 group lines of a window's own incremental sort or of one under a `LIMIT`,
 `VERBOSE` output lists (rejected with `0A000`) of a joined `UPDATE` or
-`DELETE`, `MERGE`, a several-row `INSERT` whose rows omit columns or
+`DELETE` other than one of a single FROM table read sequentially, of
+`MERGE`, a several-row `INSERT` whose rows omit columns or
 use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
-scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A statement that runs again after an attempt stopped for a call counts each
+scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
+ANALYZE` of a joined `UPDATE` or `DELETE` and of `MERGE` fails with `0A000`:
+the executor does not count their join's rows. A statement that runs again after an attempt stopped for a call counts each
 node in the last attempt that ran it, so a data-modifying `WITH` query whose
 write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
-and scan figures. A node of a path
-the executor does not count (a joined `UPDATE` or
-`DELETE`, `MERGE`) prints no actual figures, except the top node, which reports
-the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
-joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`
+and scan figures. A `LIMIT` that stops `Unique`
 early leaves its `Sort` without figures, as pos3ql deduplicates before
 sorting. Where pos3ql's plan differs from
 PostgreSQL's cost-based one the figures are those of the plan it shows and
@@ -1129,14 +1128,35 @@ is a `Result` returning no rows: hashed on an outer join's nullable side,
 its columns unnamed when the plan scans another relation, and an inner or
 semi join with it returns nothing (`differential_exact/613`). A foreign
 partition or child ships the conditions it can to its server and shows no
-filter, or keeps every one (`differential_exact/614`). Remaining, each
+filter, or keeps every one (`differential_exact/614`). An `UPDATE ... FROM` or `DELETE ... USING`
+into such a table runs, and `EXPLAIN` prints, one join over the `Append`
+of the members pruning keeps under its own conditions (FROM items'
+columns prune nothing), its first FROM table hashed by an equality as for
+a plain target; the write lists each member and `VERBOSE` prints each
+node's list (`differential_exact/630`). A `MERGE` joins its target, a
+partitioned table's `Append` included, and its source as PostgreSQL plans
+relations with statistics: a hash join building on the relation with fewer
+planned rows (on a tie, the source, or the target when only unmatched
+source rows reach an action), whose probe reads its rows in scan order and
+each key's hashed rows later rows first, then the unmatched hashed rows,
+those with a NULL key first; without an equality, a nested loop
+rescanning the smaller relation from a `Materialize`. `ON` conditions
+reading one side filter that side's scan unless the join keeps its
+unmatched rows, `DO NOTHING` actions keep none, and a join keeping both
+sides' rows without an equality between them fails as PostgreSQL's full
+join does (`0A000`) (`differential_exact/631`). PostgreSQL merges relations
+it has no statistics for, sorted by key; such a `MERGE` runs as a nested
+loop over its source rows in their order and its `EXPLAIN` fails with
+`0A000`, as do one from a source other than a table or `VALUES` list,
+with an index on either relation (PostgreSQL may scan or merge by it),
+with row security, and its `VERBOSE` lists. A `MERGE` expression reading
+its target's system columns (`tableoid`, `ctid`) still fails as an
+undefined column (`42703`), where PostgreSQL returns them. Remaining, each
 failing with `0A000`: a member with an index on a column the query's
 conditions, keys or aggregates read (execution scans members sequentially,
 while PostgreSQL scans each by its own index as costs choose, possibly
 under a `Merge Append`); `EXPLAIN ANALYZE` of pruning by a subquery that
-reads an enclosing query; a joined write (`UPDATE ... FROM`, `DELETE ...
-USING`) into such a table, which execution joins member by member where
-PostgreSQL joins one `Append`; `EXPLAIN` of any `MERGE`; a write whose
+reads an enclosing query; a write whose
 subquery is correlated, a set or row subquery, or in `RETURNING`; a full or
 anti join with an emptied partitioned table, or an outer join with an
 emptied inheritance tree; a foreign member that ships only some of its

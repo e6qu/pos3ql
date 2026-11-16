@@ -9010,9 +9010,12 @@ where
         }
         if matches!(conflict.origin, ConflictRowOrigin::OwnCommand(command) if command >= txn.command_id())
         {
-            return Err(sql_err!(
-                sqlstate::CARDINALITY_VIOLATION,
-                "ON CONFLICT DO UPDATE command cannot affect row a second time"
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                ),
+                "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
             ));
         }
     }
@@ -83914,6 +83917,11 @@ fn merge_target<'a>(
     ) {
         return sql_fail(error);
     }
+    // PostgreSQL plans the join before the statement's triggers fire.
+    let join_plan = match super::query::merge_join_plan(storage, statement, txn.txid, arena) {
+        Ok(plan) => plan,
+        Err(error) => return sql_fail(error),
+    };
     let reads_target = !reads_target.is_empty();
     let current_role = privilege_role;
     let select_security = if reads_target {
@@ -84142,6 +84150,36 @@ fn merge_target<'a>(
             format_args!("This operation is not supported for foreign tables."),
         ));
     }
+    // The join reads the members pruning keeps under the target's own
+    // conditions, unless its unmatched rows reach an action.
+    let all_leaves = leaves;
+    let leaves = if join_plan.preserves_target {
+        leaves
+    } else {
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        match dml_pruned_leaves(
+            storage,
+            table_index,
+            statement.target_inheritance,
+            def,
+            Some(target_alias),
+            Some(statement.on),
+            params,
+            &hooks,
+            true,
+            txn.txid,
+            arena,
+        ) {
+            Ok(leaves) => leaves,
+            Err(error) => return sql_fail(error),
+        }
+    };
     let mut n_target = 0usize;
     for &leaf in leaves {
         n_target = match storage.visible_row_count(leaf, txn.txid) {
@@ -84174,7 +84212,7 @@ fn merge_target<'a>(
         Err(_) => return sql_fail(arena_full()),
     };
     let mut retained_rows = DmlRowImages::new(arena);
-    for &leaf in leaves {
+    for &leaf in all_leaves {
         let physical = match definitions.definition(storage, leaf, txn.txid) {
             Ok(definition) => definition,
             Err(error) => return sql_fail(error),
@@ -84375,17 +84413,100 @@ fn merge_target<'a>(
     drop(selection_snapshot);
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
-    // Row progress counts, per source row, one position for each target row
-    // pair, one for the NOT MATCHED stage a lost pair runs, and one for the
-    // stage of a source row that matched nothing; the last source position
-    // is the NOT MATCHED BY SOURCE pass.
-    let stride = 2 * n_target + 1;
-    let positions = (source_rows.len() + 1).saturating_mul(stride);
+    // The join's plan orders the pairs that reach the actions.
+    let selected_rows = &selected_rows[..n_target];
+    // Without statistics PostgreSQL estimates both relations from their
+    // size on disk and merges them sorted; the rows then run as a nested
+    // loop over the source rows in their order instead.
+    let planned_target_rows = leaves.iter().try_fold(0u64, |rows, &leaf| {
+        storage
+            .table_statistics(leaf, txn.txid)
+            .valid
+            .then(|| rows.saturating_add(storage.planning_row_estimate(leaf)))
+    });
+    let planned_source_rows =
+        merge_source_planned_rows(storage, statement, source_rows.len(), txn.txid);
+    let (join_plan, source_outer) = match (planned_target_rows, planned_source_rows) {
+        (Some(target), Some(source)) => (join_plan, join_plan.source_outer(target, source)),
+        _ => (join_plan.unplanned(), true),
+    };
+    let (outer_len, inner_len) = if source_outer {
+        (source_rows.len(), n_target)
+    } else {
+        (n_target, source_rows.len())
+    };
+    let source_matched: &mut [bool] = match arena.alloc_slice_with(source_rows.len(), |_| false) {
+        Ok(flags) => flags,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    let hash = if join_plan.hashed() {
+        let mut source_columns = [0usize; 8];
+        for (slot, &(_, name)) in source_columns.iter_mut().zip(join_plan.keys()) {
+            match source_def
+                .columns()
+                .iter()
+                .position(|column| column.name.as_str() == name)
+            {
+                Some(column) => *slot = column,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a MERGE join key is missing from its source rows"
+                    ));
+                }
+            }
+        }
+        let keys = join_plan.keys();
+        let read = |outer: bool, row: usize, key: usize| -> Datum<'_> {
+            if outer == source_outer {
+                decode_projected_pub(source_rows[row], source_columns[key])
+            } else {
+                target_vals[row]
+                    .get(keys[key].0)
+                    .copied()
+                    .unwrap_or(Datum::Null)
+            }
+        };
+        match MergeHash::build(
+            storage,
+            txn.txid,
+            outer_len,
+            inner_len,
+            keys.len(),
+            join_plan.collations(),
+            &read,
+            arena,
+        ) {
+            Ok(hash) => Some(hash),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
+    let preserves = (join_plan.preserves_source, join_plan.preserves_target);
+    let (preserves_outer, preserves_inner) = if source_outer {
+        preserves
+    } else {
+        (preserves.1, preserves.0)
+    };
+    let layout = MergeCursor::resume(
+        0,
+        source_outer,
+        preserves_outer,
+        preserves_inner,
+        outer_len,
+        inner_len,
+        hash.as_ref(),
+    );
+    let positions = layout.positions();
     let (first_position, mut affected_count, mut resumed_match) = match progress.as_deref() {
         Some(progress) => {
             let resumed = match progress.resume_rows(|position| {
-                (position < positions)
-                    .then(|| selected_rows.get(position % stride).copied().flatten())
+                (position < positions).then(|| {
+                    layout
+                        .target_at(position)
+                        .and_then(|target| selected_rows[target])
+                })
             }) {
                 Ok(resumed) => resumed,
                 Err(error) => return sql_fail(error),
@@ -84407,10 +84528,12 @@ fn merge_target<'a>(
                 }
             }
             let matched = match progress.resumed_state(arena) {
-                Ok(Some(state)) => match restore_merge_state(state, affected, matched_by_source) {
-                    Ok(matched) => matched,
-                    Err(error) => return sql_fail(error),
-                },
+                Ok(Some(state)) => {
+                    match restore_merge_state(state, affected, matched_by_source, source_matched) {
+                        Ok(matched) => matched,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 Ok(None) => SourceRowMatch::default(),
                 Err(error) => return sql_fail(error),
             };
@@ -84418,44 +84541,51 @@ fn merge_target<'a>(
         }
         None => (0, 0, SourceRowMatch::default()),
     };
-    let has_not_matched_by_source = statement.whens.iter().any(|when| {
-        matches!(
-            when.kind(),
-            crate::sql::ast::MergeMatchKind::NotMatchedBySource
-        )
-    });
-    let mut source_index = first_position / stride;
-    // A resumed position past the pairs continues a lost pair's NOT MATCHED
-    // stage, or the stage of a source row that matched nothing.
-    let mut first_target = match first_position % stride {
-        pair if pair < 2 * n_target => pair % n_target.max(1),
-        _ => n_target,
-    };
-    let mut resumed_lost_pair = (n_target..2 * n_target)
-        .contains(&(first_position % stride))
-        .then_some(first_target);
-    // Whether the running source row matched a target row; kept with an
-    // unfinished row.
-    let mut matched = false;
+    let mut cursor = MergeCursor::resume(
+        first_position,
+        source_outer,
+        preserves_outer,
+        preserves_inner,
+        outer_len,
+        inner_len,
+        hash.as_ref(),
+    );
+    // Whether the running outer row matched a row; kept with an unfinished
+    // row.
+    let mut matched = core::mem::take(&mut resumed_match).matched;
     let rows_outcome = (|| -> Outcome {
-        'rows: loop {
+        loop {
             if returning_satisfied(&capture, affected_count) {
                 break;
             }
-            let by_source = source_index == source_rows.len();
-            if by_source && !has_not_matched_by_source {
+            let Some(event) = cursor.next(matched, matched_by_source, source_matched) else {
                 break;
-            }
-            let mut sv = [Datum::Null; MAX_COLUMNS];
-            let n_src_cols = if by_source {
-                source_def.n_columns
-            } else {
-                let sbytes = source_rows[source_index];
-                let width = projected_row_width(sbytes);
-                for (c, slot) in sv.iter_mut().enumerate().take(width) {
-                    *slot = decode_projected_pub(sbytes, c);
+            };
+            let (source_row, j, position, lost) = match event {
+                MergeEvent::NextOuter => {
+                    matched = false;
+                    continue;
                 }
-                width
+                MergeEvent::NotMatched { source, position } => (source, usize::MAX, position, 0),
+                MergeEvent::Pair {
+                    source,
+                    target,
+                    position,
+                    lost,
+                } => (source, target, position, lost),
+            };
+            let by_source = source_row.is_none();
+            let mut sv = [Datum::Null; MAX_COLUMNS];
+            let n_src_cols = match source_row {
+                None => source_def.n_columns,
+                Some(source_index) => {
+                    let sbytes = source_rows[source_index];
+                    let width = projected_row_width(sbytes);
+                    for (c, slot) in sv.iter_mut().enumerate().take(width) {
+                        *slot = decode_projected_pub(sbytes, c);
+                    }
+                    width
+                }
             };
             let sv = &sv[..source_def.n_columns.min(n_src_cols)];
             // A source row runs its NOT MATCHED [BY TARGET] stage when it
@@ -84638,20 +84768,11 @@ fn merge_target<'a>(
                     }
                 };
             }
-            let resumed = core::mem::take(&mut resumed_match);
-            matched = by_source || resumed.matched;
-            for j in core::mem::take(&mut first_target)..n_target {
-                if returning_satisfied(&capture, affected_count) {
-                    break 'rows;
-                }
-                if core::mem::take(&mut resumed_lost_pair) == Some(j) {
-                    run_not_matched!(source_index * stride + n_target + j);
-                    continue;
-                }
-                if by_source && matched_by_source[j] {
-                    continue;
-                }
-                let position = source_index * stride + j;
+            if let MergeEvent::NotMatched { .. } = event {
+                run_not_matched!(position);
+                continue;
+            }
+            {
                 match row_progress::start_row(
                     progress.as_deref_mut(),
                     position,
@@ -84756,6 +84877,9 @@ fn merge_target<'a>(
                         Err(e) => return sql_fail(e),
                     }
                     matched_by_source[j] = true;
+                    if let Some(source) = source_row {
+                        source_matched[source] = true;
+                    }
                     matched = true;
                 }
                 // A concurrent change found when locking the target row
@@ -85553,16 +85677,9 @@ fn merge_target<'a>(
                     }
                 }
                 if pair_lost {
-                    run_not_matched!(source_index * stride + n_target + j);
+                    run_not_matched!(lost);
                 }
             }
-            if !matched {
-                run_not_matched!(source_index * stride + 2 * n_target);
-            }
-            if by_source {
-                break;
-            }
-            source_index += 1;
         }
         sql_ok()
     })();
@@ -85572,6 +85689,7 @@ fn merge_target<'a>(
                 progress,
                 affected,
                 matched_by_source,
+                source_matched,
                 SourceRowMatch { matched },
                 arena,
                 &storage.row_work,
@@ -85631,6 +85749,524 @@ fn merge_target<'a>(
     )
 }
 
+/// The rows PostgreSQL's planner knows a `MERGE` source has: an analyzed
+/// table's estimate, or a `VALUES` list's `selected` rows. `None` for a
+/// source it estimates from its size on disk or its query's shape.
+pub(crate) fn merge_source_planned_rows(
+    storage: &Storage,
+    statement: &crate::sql::ast::Merge<'_>,
+    selected: usize,
+    txid: u32,
+) -> Option<u64> {
+    let source = statement.source;
+    if source.cte.is_some()
+        || source.func_args.is_some()
+        || source.rows_from.is_some()
+        || source.join_members.is_some()
+    {
+        return None;
+    }
+    if let Some(select) = source.subquery {
+        let values = select.order_by.is_empty()
+            && select.limit.is_none()
+            && select.offset.is_none()
+            && select.with.is_empty()
+            && matches!(
+                select.set_body,
+                Some(crate::sql::ast::SetTree::Op {
+                    syntax: crate::sql::ast::SetOperationSyntax::Values,
+                    ..
+                })
+            );
+        return values.then_some(selected as u64);
+    }
+    match storage.resolve_relation(source.schema, source.table, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot))
+            if !storage.relation_has_descendants(slot, txid)
+                && storage.table_statistics(slot, txid).valid =>
+        {
+            Some(storage.planning_row_estimate(slot))
+        }
+        _ => None,
+    }
+}
+
+/// A `MERGE` hash join's table: each outer row's key hash, and the inner
+/// rows chained by key hash, later rows first as PostgreSQL's buckets list
+/// them. A row with a NULL key has no hash and joins nothing.
+struct MergeHash<'a> {
+    outer: &'a [Option<u64>],
+    inner: &'a [Option<u64>],
+    buckets: &'a [u32],
+    next: &'a [u32],
+    /// The order unmatched inner rows leave the table in: those with a NULL
+    /// key first, then each key's rows, later rows first.
+    unmatched: &'a [u32],
+}
+
+impl<'a> MergeHash<'a> {
+    /// Hashes `outer_keys` and `inner_keys` rows, each row's keys read by
+    /// `read(row, key)`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        storage: &Storage,
+        txid: u32,
+        outer_rows: usize,
+        inner_rows: usize,
+        key_count: usize,
+        collations: &[crate::sql::ast::Collation],
+        read: &dyn Fn(bool, usize, usize) -> Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let columns: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let hash = |outer: bool, row: usize| -> Result<Option<u64>, SqlError> {
+            let mut keys = [Datum::Null; 8];
+            for (key, slot) in keys.iter_mut().enumerate().take(key_count) {
+                *slot = read(outer, row, key);
+                if slot.is_null() {
+                    return Ok(None);
+                }
+            }
+            crate::sql::eval::hash_key_collated_catalog(
+                storage,
+                txid,
+                &keys[..key_count],
+                &columns[..key_count],
+                collations,
+            )
+            .map(Some)
+        };
+        let outer = arena
+            .alloc_slice_with(outer_rows, |_| None)
+            .map_err(|_| arena_full())?;
+        for (row, slot) in outer.iter_mut().enumerate() {
+            *slot = hash(true, row)?;
+        }
+        let inner = arena
+            .alloc_slice_with(inner_rows, |_| None)
+            .map_err(|_| arena_full())?;
+        let next = arena
+            .alloc_slice_with(inner_rows, |_| u32::MAX)
+            .map_err(|_| arena_full())?;
+        let buckets = arena
+            .alloc_slice_with(inner_rows.max(1).next_power_of_two(), |_| u32::MAX)
+            .map_err(|_| arena_full())?;
+        let mask = buckets.len() - 1;
+        for row in 0..inner_rows {
+            let Some(value) = hash(false, row)? else {
+                continue;
+            };
+            inner[row] = Some(value);
+            let bucket = value as usize & mask;
+            next[row] = buckets[bucket];
+            buckets[bucket] = u32::try_from(row).map_err(|_| arena_full())?;
+        }
+        let unmatched = arena
+            .alloc_slice_with(inner_rows, |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for (row, hash) in inner.iter().enumerate() {
+            if hash.is_none() {
+                unmatched[count] = row as u32;
+                count += 1;
+            }
+        }
+        for row in 0..inner_rows {
+            let Some(value) = inner[row] else {
+                continue;
+            };
+            // A key's rows leave together, at its first row's place.
+            let mut entry = next[row];
+            while entry != u32::MAX && inner[entry as usize] != Some(value) {
+                entry = next[entry as usize];
+            }
+            if entry != u32::MAX {
+                continue;
+            }
+            let mut entry = buckets[value as usize & mask];
+            while entry != u32::MAX {
+                if inner[entry as usize] == Some(value) {
+                    unmatched[count] = entry;
+                    count += 1;
+                }
+                entry = next[entry as usize];
+            }
+        }
+        Ok(Self {
+            outer,
+            inner,
+            buckets,
+            next,
+            unmatched,
+        })
+    }
+
+    /// The first inner row at or after chain entry `entry` whose key hash
+    /// is the outer row's.
+    fn matching(&self, mut entry: u32, outer: usize) -> Option<usize> {
+        let hash = self.outer[outer]?;
+        while entry != u32::MAX {
+            if self.inner[entry as usize] == Some(hash) {
+                return Some(entry as usize);
+            }
+            entry = self.next[entry as usize];
+        }
+        None
+    }
+
+    fn first(&self, outer: usize) -> Option<usize> {
+        let hash = self.outer[outer]?;
+        self.matching(
+            self.buckets[hash as usize & (self.buckets.len() - 1)],
+            outer,
+        )
+    }
+
+    fn following(&self, inner: usize, outer: usize) -> Option<usize> {
+        self.matching(self.next[inner], outer)
+    }
+}
+
+/// What a `MERGE`'s join hands its actions next.
+#[derive(Clone, Copy)]
+enum MergeEvent {
+    /// The join moves to its next outer row.
+    NextOuter,
+    /// A candidate pair, or (without a source row) a target row no source
+    /// row matched; `lost` is the position of the NOT MATCHED stage a
+    /// concurrently changed pair runs.
+    Pair {
+        source: Option<usize>,
+        target: usize,
+        position: usize,
+        lost: usize,
+    },
+    /// The NOT MATCHED [BY TARGET] stage of a source row, or with a NULL
+    /// source row.
+    NotMatched {
+        source: Option<usize>,
+        position: usize,
+    },
+}
+
+/// Which part of an outer row a [`MergeCursor`] is in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeStage {
+    Candidates,
+    Alone,
+    Advance,
+    /// The inner rows no outer row matched, in the order they leave a
+    /// hash table or a nested loop's scan.
+    Final,
+}
+
+/// Walks a `MERGE` join in its plan's order: per outer row, its candidate
+/// inner rows (the hash chain of its key, or every inner row of a nested
+/// loop), then its own stage when nothing matched it; after the outer rows,
+/// each inner row nothing matched. Row progress positions count, per outer
+/// row, one per candidate slot, one per candidate's NOT MATCHED stage after
+/// a lost pair, the row's own stage and that stage's lost stage; the last
+/// outer position holds the unmatched inner rows and their lost stages.
+struct MergeCursor<'h> {
+    source_outer: bool,
+    preserves_outer: bool,
+    preserves_inner: bool,
+    outer_len: usize,
+    inner_len: usize,
+    stride: usize,
+    hash: Option<&'h MergeHash<'h>>,
+    outer: usize,
+    stage: MergeStage,
+    /// The current candidate, once the outer row's candidates started.
+    candidate: Option<Option<usize>>,
+    /// A resumed outer row continues from this candidate slot.
+    start_slot: usize,
+    /// A resumed candidate slot whose pair finished and whose lost
+    /// stage remains.
+    lost_slot: Option<usize>,
+    /// A resumed outer row continues its own stage's lost stage.
+    alone_lost: bool,
+    final_inner: usize,
+    final_lost: Option<usize>,
+}
+
+impl<'h> MergeCursor<'h> {
+    #[allow(clippy::too_many_arguments)]
+    fn resume(
+        first_position: usize,
+        source_outer: bool,
+        preserves_outer: bool,
+        preserves_inner: bool,
+        outer_len: usize,
+        inner_len: usize,
+        hash: Option<&'h MergeHash<'h>>,
+    ) -> Self {
+        let stride = 2 * inner_len + 2;
+        let mut cursor = Self {
+            source_outer,
+            preserves_outer,
+            preserves_inner,
+            outer_len,
+            inner_len,
+            stride,
+            hash,
+            outer: first_position / stride,
+            stage: MergeStage::Candidates,
+            candidate: None,
+            start_slot: 0,
+            lost_slot: None,
+            alone_lost: false,
+            final_inner: 0,
+            final_lost: None,
+        };
+        let rest = first_position % stride;
+        if cursor.outer >= outer_len {
+            cursor.outer = outer_len;
+            cursor.stage = MergeStage::Final;
+            if rest < inner_len {
+                cursor.final_inner = rest;
+            } else {
+                cursor.final_inner = rest - inner_len;
+                cursor.final_lost = Some(cursor.final_inner);
+            }
+        } else if rest < inner_len {
+            cursor.start_slot = rest;
+        } else if rest < 2 * inner_len {
+            cursor.start_slot = rest - inner_len;
+            cursor.lost_slot = Some(cursor.start_slot);
+        } else {
+            cursor.start_slot = inner_len;
+            cursor.alone_lost = rest == 2 * inner_len + 1;
+        }
+        cursor
+    }
+
+    /// Positions this walk numbers.
+    fn positions(&self) -> usize {
+        (self.outer_len + 1).saturating_mul(self.stride)
+    }
+
+    /// The target row the stage at `position` changes, if any.
+    fn target_at(&self, position: usize) -> Option<usize> {
+        let (outer, rest) = (position / self.stride, position % self.stride);
+        if outer >= self.outer_len {
+            return (self.source_outer && rest < self.inner_len).then(|| self.unmatched_at(rest));
+        }
+        if rest < self.inner_len {
+            let inner = self.inner_of(rest);
+            return Some(if self.source_outer { inner } else { outer });
+        }
+        (!self.source_outer && rest == 2 * self.inner_len).then_some(outer)
+    }
+
+    /// A candidate slot's inner row: hash chains list later rows first.
+    fn inner_of(&self, slot: usize) -> usize {
+        if self.hash.is_some() {
+            self.inner_len - 1 - slot
+        } else {
+            slot
+        }
+    }
+
+    fn slot_of(&self, inner: usize) -> usize {
+        self.inner_of(inner)
+    }
+
+    /// The inner row at `rank` of the unmatched inner rows' order.
+    fn unmatched_at(&self, rank: usize) -> usize {
+        self.hash.map_or(rank, |hash| hash.unmatched[rank] as usize)
+    }
+
+    fn advance_candidate(&mut self) -> Option<usize> {
+        let next = match (self.candidate, self.hash) {
+            (None, Some(hash)) => hash.first(self.outer),
+            (None, None) => (self.inner_len != 0).then_some(0),
+            (Some(current), Some(hash)) => {
+                current.and_then(|inner| hash.following(inner, self.outer))
+            }
+            (Some(current), None) => current
+                .map(|inner| inner + 1)
+                .filter(|&inner| inner < self.inner_len),
+        };
+        self.candidate = Some(next);
+        next
+    }
+
+    /// The source and target rows of the current outer row with `inner`.
+    fn pair(&self, inner: usize) -> (usize, usize) {
+        if self.source_outer {
+            (self.outer, inner)
+        } else {
+            (inner, self.outer)
+        }
+    }
+
+    /// The next event; `matched` says whether the current outer row matched
+    /// an inner row, `target_matched` and `source_matched` which rows a pair
+    /// matched.
+    fn next(
+        &mut self,
+        matched: bool,
+        target_matched: &[bool],
+        source_matched: &[bool],
+    ) -> Option<MergeEvent> {
+        loop {
+            let base = self.outer * self.stride;
+            match self.stage {
+                MergeStage::Candidates => {
+                    if self.outer == self.outer_len {
+                        self.stage = MergeStage::Final;
+                        continue;
+                    }
+                    while let Some(inner) = self.advance_candidate() {
+                        let slot = self.slot_of(inner);
+                        if slot < self.start_slot {
+                            continue;
+                        }
+                        let (source, target) = self.pair(inner);
+                        if self.lost_slot == Some(slot) {
+                            self.lost_slot = None;
+                            return Some(MergeEvent::NotMatched {
+                                source: Some(source),
+                                position: base + self.inner_len + slot,
+                            });
+                        }
+                        return Some(MergeEvent::Pair {
+                            source: Some(source),
+                            target,
+                            position: base + slot,
+                            lost: base + self.inner_len + slot,
+                        });
+                    }
+                    self.start_slot = 0;
+                    self.stage = MergeStage::Alone;
+                }
+                MergeStage::Alone => {
+                    self.stage = MergeStage::Advance;
+                    let alone = base + 2 * self.inner_len;
+                    if core::mem::take(&mut self.alone_lost) {
+                        return Some(MergeEvent::NotMatched {
+                            source: None,
+                            position: alone + 1,
+                        });
+                    }
+                    if matched || !self.preserves_outer {
+                        continue;
+                    }
+                    return Some(if self.source_outer {
+                        MergeEvent::NotMatched {
+                            source: Some(self.outer),
+                            position: alone,
+                        }
+                    } else {
+                        MergeEvent::Pair {
+                            source: None,
+                            target: self.outer,
+                            position: alone,
+                            lost: alone + 1,
+                        }
+                    });
+                }
+                MergeStage::Advance => {
+                    self.outer += 1;
+                    self.candidate = None;
+                    self.stage = MergeStage::Candidates;
+                    return Some(MergeEvent::NextOuter);
+                }
+                MergeStage::Final => {
+                    if !self.preserves_inner {
+                        return None;
+                    }
+                    while self.final_inner < self.inner_len {
+                        let rank = self.final_inner;
+                        self.final_inner += 1;
+                        if self.final_lost.take() == Some(rank) {
+                            return Some(MergeEvent::NotMatched {
+                                source: None,
+                                position: base + self.inner_len + rank,
+                            });
+                        }
+                        let inner = self.unmatched_at(rank);
+                        if self.source_outer {
+                            if target_matched[inner] {
+                                continue;
+                            }
+                            return Some(MergeEvent::Pair {
+                                source: None,
+                                target: inner,
+                                position: base + rank,
+                                lost: base + self.inner_len + rank,
+                            });
+                        }
+                        if source_matched[inner] {
+                            continue;
+                        }
+                        return Some(MergeEvent::NotMatched {
+                            source: Some(inner),
+                            position: base + rank,
+                        });
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_cursor_tests {
+    use super::{MergeCursor, MergeEvent};
+
+    /// Every event of a walk with its position, and its outer row's match.
+    fn walk(cursor: &mut MergeCursor<'_>, matched_pairs: &[(usize, usize)]) -> Vec<(usize, bool)> {
+        let mut events = Vec::new();
+        let mut matched = false;
+        let mut targets = [false; 3];
+        let mut sources = [false; 3];
+        while let Some(event) = cursor.next(matched, &targets, &sources) {
+            match event {
+                MergeEvent::NextOuter => matched = false,
+                MergeEvent::NotMatched { position, .. } => events.push((position, matched)),
+                MergeEvent::Pair {
+                    source,
+                    target,
+                    position,
+                    ..
+                } => {
+                    if let Some(source) = source
+                        && matched_pairs.contains(&(source, target))
+                    {
+                        matched = true;
+                        targets[target] = true;
+                        sources[source] = true;
+                    }
+                    events.push((position, matched));
+                }
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn positions_increase_and_resume_at_each_event() {
+        for source_outer in [true, false] {
+            let pairs = [(0, 1), (2, 2)];
+            let mut cursor = MergeCursor::resume(0, source_outer, true, true, 3, 3, None);
+            let events = walk(&mut cursor, &pairs);
+            // Each outer row offers every inner row, then its own stage when
+            // nothing matched it; then the unmatched inner rows.
+            assert_eq!(events.len(), 9 + 1 + 1);
+            for window in events.windows(2) {
+                assert!(window[0].0 < window[1].0, "{events:?}");
+            }
+            for &(position, _) in &events {
+                let resumed = MergeCursor::resume(position, source_outer, true, true, 3, 3, None);
+                assert_eq!(resumed.outer, position / resumed.stride);
+            }
+        }
+    }
+}
+
 /// The running `MERGE` source row's match state.
 #[derive(Clone, Copy, Default)]
 struct SourceRowMatch {
@@ -85654,25 +86290,29 @@ impl SourceRowMatch {
     }
 }
 
-/// Saves `MERGE`'s per-target flags and the running source row's match with
-/// an unfinished row: `1` or `0` per target row for `affected` and
-/// `matched_by_source`, then the running row's [`SourceRowMatch`] flag.
+/// Saves `MERGE`'s per-row flags and the running outer row's match with an
+/// unfinished row: `1` or `0` per target row for `affected` and
+/// `matched_by_source`, the running row's [`SourceRowMatch`] flag, then `1`
+/// or `0` per source row a pair matched.
 fn save_merge_state(
     progress: &mut RowProgress,
     affected: &[bool],
     matched_by_source: &[bool],
+    source_matched: &[bool],
     running: SourceRowMatch,
     arena: &Arena,
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let saved = (|| {
+        let targets = affected.len() * 2;
         let flags = arena
-            .alloc_slice_with(affected.len() * 2 + 1, |index| {
+            .alloc_slice_with(targets + 1 + source_matched.len(), |index| {
                 let set = match index.checked_sub(affected.len()) {
                     None => affected[index],
                     Some(offset) if offset < matched_by_source.len() => matched_by_source[offset],
-                    Some(_) => return running.flag(),
+                    Some(offset) if offset == matched_by_source.len() => return running.flag(),
+                    Some(_) => source_matched[index - targets - 1],
                 };
                 if set { b'1' } else { b'0' }
             })
@@ -85692,20 +86332,25 @@ fn restore_merge_state(
     state: &str,
     affected: &mut [bool],
     matched_by_source: &mut [bool],
+    source_matched: &mut [bool],
 ) -> Result<SourceRowMatch, SqlError> {
     let flags = state.as_bytes();
-    if flags.len() != affected.len() * 2 + 1 {
+    if flags.len() != affected.len() * 2 + 1 + source_matched.len() {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "a resumed MERGE selected different target rows"
         ));
     }
     let (affected_flags, rest) = flags.split_at(affected.len());
-    let (matched_flags, running) = rest.split_at(matched_by_source.len());
+    let (matched_flags, rest) = rest.split_at(matched_by_source.len());
+    let (running, source_flags) = rest.split_at(1);
     for (flag, saved) in affected.iter_mut().zip(affected_flags) {
         *flag = *saved == b'1';
     }
     for (flag, saved) in matched_by_source.iter_mut().zip(matched_flags) {
+        *flag = *saved == b'1';
+    }
+    for (flag, saved) in source_matched.iter_mut().zip(source_flags) {
         *flag = *saved == b'1';
     }
     SourceRowMatch::from_flag(running)
@@ -85888,9 +86533,12 @@ fn merge_view_row_visible<'a, Definition0: crate::storage::DefinitionBacking>(
 }
 
 fn merge_cardinality() -> SqlError {
-    sql_err!(
-        sqlstate::CARDINALITY_VIOLATION,
-        "MERGE command cannot affect row a second time"
+    crate::sql::error_position::with_hint(
+        sql_err!(
+            sqlstate::CARDINALITY_VIOLATION,
+            "MERGE command cannot affect row a second time"
+        ),
+        "Ensure that not more than one source row matches any one target row.",
     )
 }
 
@@ -91893,6 +92541,10 @@ pub(crate) fn update<'a>(
             DmlCapture::Update {
                 command: txn.command_id(),
             },
+            statement.alias,
+            statement.where_clause,
+            params,
+            &hooks,
         )
     } else if let Some(from) = statement.from {
         let target_hash = match super::query::target_hash_plan(
@@ -93642,6 +94294,10 @@ pub(crate) fn delete<'a>(
             txn.txid,
             scratch,
             delete_capture,
+            statement.alias,
+            statement.where_clause,
+            params,
+            &hooks,
         )
     } else if let Some(using) = statement.using {
         let target_hash = match super::query::target_hash_plan(
@@ -103606,11 +104262,39 @@ fn collect_join_candidates<'a, Definition0: crate::storage::DefinitionBacking>(
     txid: u32,
     scratch: &mut DmlScratch,
     capture: DmlCapture,
+    alias: Option<&str>,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
-    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        true,
+        txid,
+        arena,
+    )?;
+    capture_pruned_layouts(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        leaves,
+        &mut images,
+        capture,
+        txid,
+        arena,
+    )?;
+    for &leaf in leaves {
         let physical = (*storage.table_def(leaf, txid)).clone();
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
@@ -103768,6 +104452,30 @@ impl<'a, Definition: crate::storage::DefinitionBacking> LoopQualification<'_, 'a
     }
 }
 
+/// Captures the layouts of the target's leaves pruning left out of
+/// `leaves`: a row an `UPDATE` moves can land in one, whose layout its
+/// change reads.
+#[allow(clippy::too_many_arguments)]
+fn capture_pruned_layouts<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    leaves: &[usize],
+    images: &mut DmlRowImages<'a>,
+    capture: DmlCapture,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        if !leaves.contains(&leaf) {
+            let physical = (*storage.table_def(leaf, txid)).clone();
+            images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+        }
+    }
+    Ok(())
+}
+
 /// The `EXPLAIN ANALYZE` node of the scan of a write target's member `leaf`.
 fn target_member(leaf: usize) -> crate::sql::query::instrument::Node {
     crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Member(
@@ -103776,7 +104484,7 @@ fn target_member(leaf: usize) -> crate::sql::query::instrument::Node {
     ))
 }
 
-/// The leaves a one-table `UPDATE` or `DELETE` reads: the members of its
+/// The leaves an `UPDATE` or `DELETE` reads: the members of its
 /// partitioned or inheritance target that pruning and constraint exclusion
 /// keep under its `WHERE`, with every value its execution knows.
 #[allow(clippy::too_many_arguments)]
@@ -103789,6 +104497,7 @@ fn dml_pruned_leaves<'a, Definition0: crate::storage::DefinitionBacking>(
     where_clause: Option<&'a Expr<'a>>,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    joined: bool,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [usize], SqlError> {
@@ -103804,6 +104513,7 @@ fn dml_pruned_leaves<'a, Definition0: crate::storage::DefinitionBacking>(
         relation: partition_prune::ScanRelation::Target {
             columns: def.columns(),
             name: alias.unwrap_or(def.name.as_str()),
+            joined,
         },
         arena,
         params,
@@ -103890,17 +104600,21 @@ pub(super) fn collect_matches<'a>(
         where_clause,
         params,
         hooks,
+        false,
         txid,
         arena,
     )?;
-    // A row an UPDATE moves can land in a leaf pruning left out, whose
-    // layout its change reads.
-    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
-        if !leaves.contains(&leaf) {
-            let physical = (*storage.table_def(leaf, txid)).clone();
-            images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
-        }
-    }
+    capture_pruned_layouts(
+        storage,
+        table_index,
+        inheritance,
+        &def,
+        leaves,
+        &mut images,
+        capture,
+        txid,
+        arena,
+    )?;
     for &leaf in leaves {
         let member = target_member(leaf);
         let _member = member.start();
@@ -104068,7 +104782,31 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
         .map(|plan| plan.build(storage, txid, arena))
         .transpose()?;
     let mut images = DmlRowImages::new(arena);
-    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        true,
+        txid,
+        arena,
+    )?;
+    capture_pruned_layouts(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        leaves,
+        &mut images,
+        capture,
+        txid,
+        arena,
+    )?;
+    for &leaf in leaves {
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
             let layout =
@@ -104301,7 +105039,31 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
         .map(|plan| plan.build(storage, txid, arena))
         .transpose()?;
     let mut images = DmlRowImages::new(arena);
-    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        true,
+        txid,
+        arena,
+    )?;
+    capture_pruned_layouts(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        leaves,
+        &mut images,
+        capture,
+        txid,
+        arena,
+    )?;
+    for &leaf in leaves {
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
             let layout =

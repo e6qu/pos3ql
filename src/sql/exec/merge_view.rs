@@ -381,10 +381,12 @@ pub(super) fn merge_through_instead_triggers<'a>(
                     Err(error) => return sql_fail(error),
                 };
             let matched = match progress.resumed_state(arena) {
-                Ok(Some(state)) => match restore_merge_state(state, unacted, matched_by_source) {
-                    Ok(matched) => matched,
-                    Err(error) => return sql_fail(error),
-                },
+                Ok(Some(state)) => {
+                    match restore_merge_state(state, unacted, matched_by_source, &mut []) {
+                        Ok(matched) => matched,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 Ok(None) => SourceRowMatch::default(),
                 Err(error) => return sql_fail(error),
             };
@@ -825,6 +827,7 @@ pub(super) fn merge_through_instead_triggers<'a>(
                 progress,
                 unacted,
                 matched_by_source,
+                &[],
                 SourceRowMatch { matched },
                 arena,
                 &storage.row_work,

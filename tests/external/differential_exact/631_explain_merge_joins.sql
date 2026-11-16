@@ -1,0 +1,83 @@
+-- MERGE joins its target and source as PostgreSQL plans relations with
+-- statistics: a hash join building on the smaller relation, or a nested
+-- loop rescanning it, with ON conditions on one side filtering that side's
+-- scan unless the join keeps its unmatched rows. Its actions run in the
+-- join's order: the probing relation's rows in scan order, each joined row
+-- of a hashed key later rows first, then the unmatched rows of the hashed
+-- relation, those with a NULL key first.
+CREATE TABLE t631 (id int, v int);
+INSERT INTO t631 SELECT g, g FROM generate_series(1, 1000) g;
+CREATE TABLE s631 (k int, w int);
+INSERT INTO s631 SELECT g, g FROM generate_series(1, 1000) g;
+CREATE TABLE small631 (k int, w int);
+INSERT INTO small631 SELECT (g % 20) * 7, g FROM generate_series(1, 40) g;
+INSERT INTO small631 VALUES (NULL, 99), (2000, 1), (2001, 2);
+CREATE TABLE p631 (id int, v int) PARTITION BY RANGE (id);
+CREATE TABLE p631_1 PARTITION OF p631 FOR VALUES FROM (0) TO (500);
+CREATE TABLE p631_2 PARTITION OF p631 FOR VALUES FROM (500) TO (3000);
+INSERT INTO p631 SELECT g, g FROM generate_series(1, 1000) g;
+ANALYZE t631;
+ANALYZE s631;
+ANALYZE small631;
+ANALYZE p631;
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING s631 ON t631.id = s631.k
+  WHEN MATCHED THEN UPDATE SET v = s631.w;
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING s631 ON t631.id = s631.k
+  WHEN NOT MATCHED THEN INSERT VALUES (s631.k, s631.w);
+EXPLAIN (COSTS OFF) MERGE INTO small631 USING t631 ON t631.id = small631.k
+  WHEN MATCHED THEN UPDATE SET w = t631.v;
+EXPLAIN (COSTS OFF) MERGE INTO small631 USING t631 ON t631.id = small631.k
+  WHEN NOT MATCHED THEN INSERT VALUES (t631.id, t631.v);
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING small631 ON t631.id = small631.k
+  AND small631.w > 3 AND t631.v < 500 WHEN MATCHED THEN UPDATE SET v = small631.w;
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING small631 ON t631.id = small631.k
+  AND small631.w > 3 AND t631.v < 500 WHEN NOT MATCHED THEN INSERT VALUES (small631.k, small631.w);
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING small631 ON t631.id = small631.k
+  AND small631.w > 3 AND t631.v < 500 WHEN NOT MATCHED BY SOURCE THEN DELETE;
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING small631 ON t631.id = small631.k
+  WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED BY SOURCE THEN DELETE
+  WHEN NOT MATCHED THEN INSERT VALUES (small631.k, small631.w);
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING small631 ON t631.id < small631.k
+  WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING;
+EXPLAIN (COSTS OFF) MERGE INTO t631 USING (VALUES (5, 1), (6, 2)) v(k, w) ON t631.id = v.k
+  WHEN NOT MATCHED THEN INSERT VALUES (v.k, v.w);
+EXPLAIN (COSTS OFF) MERGE INTO p631 USING small631 ON p631.id = small631.k
+  WHEN MATCHED THEN UPDATE SET v = small631.w WHEN NOT MATCHED THEN INSERT VALUES (small631.k, small631.w);
+EXPLAIN (COSTS OFF) MERGE INTO p631 USING small631 ON p631.id = small631.k AND p631.id < 100
+  WHEN MATCHED THEN UPDATE SET v = small631.w;
+BEGIN;
+MERGE INTO t631 USING small631 ON t631.id = small631.k
+  WHEN MATCHED AND small631.w > 20 THEN UPDATE SET v = small631.w
+  WHEN NOT MATCHED THEN INSERT VALUES (small631.k, small631.w)
+  RETURNING merge_action(), t631.*, small631.*;
+ROLLBACK;
+BEGIN;
+MERGE INTO t631 USING small631 ON t631.id = small631.k
+  WHEN MATCHED AND small631.w > 20 THEN DELETE
+  WHEN NOT MATCHED BY SOURCE AND t631.id < 30 THEN UPDATE SET v = -1
+  RETURNING merge_action(), t631.*, small631.*;
+ROLLBACK;
+BEGIN;
+MERGE INTO small631 USING t631 ON t631.id = small631.k
+  WHEN MATCHED AND small631.w > 20 THEN UPDATE SET w = -t631.v
+  WHEN NOT MATCHED AND t631.id < 20 THEN INSERT VALUES (t631.id, t631.v)
+  RETURNING merge_action(), t631.*, small631.*;
+ROLLBACK;
+BEGIN;
+MERGE INTO small631 USING t631 ON t631.id = small631.k
+  WHEN NOT MATCHED BY SOURCE THEN DELETE
+  WHEN NOT MATCHED AND t631.id < 3 THEN INSERT VALUES (t631.id, t631.v)
+  RETURNING merge_action(), t631.*, small631.*;
+ROLLBACK;
+BEGIN;
+MERGE INTO p631 USING small631 ON p631.id = small631.k
+  WHEN MATCHED AND small631.w > 30 THEN UPDATE SET v = -small631.w
+  WHEN NOT MATCHED AND small631.k IS NOT NULL THEN INSERT VALUES (small631.k, small631.w)
+  RETURNING merge_action(), p631.*, small631.*;
+ROLLBACK;
+MERGE INTO t631 USING small631 ON t631.id = small631.k WHEN MATCHED THEN UPDATE SET v = small631.w;
+MERGE INTO t631 USING small631 ON t631.id < small631.k WHEN NOT MATCHED BY SOURCE THEN DELETE
+  WHEN NOT MATCHED THEN INSERT VALUES (small631.k, small631.w);
+INSERT INTO t631 VALUES (1, 1) ON CONFLICT DO NOTHING;
+CREATE TABLE u631 (id int PRIMARY KEY, v int);
+INSERT INTO u631 VALUES (1, 1), (1, 2) ON CONFLICT (id) DO UPDATE SET v = excluded.v;

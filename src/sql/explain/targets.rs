@@ -1845,3 +1845,289 @@ impl<'a> RelationTargets<'a> {
         }))
     }
 }
+
+/// The lists `VERBOSE` prints for a joined `UPDATE` or `DELETE` of one
+/// FROM table: the write's `RETURNING` list, the join's processed target
+/// list and each relation's scan list (`reltarget`).
+pub(super) struct JoinedWriteLists {
+    pub(super) returned: Option<Output>,
+    pub(super) join: Output,
+    pub(super) target: Output,
+    pub(super) source: Output,
+}
+
+impl<'a> RelationTargets<'a> {
+    /// The lists of a write of `target` (exposed as `target_exposed`)
+    /// joined to the FROM table `source`. The join computes the new values
+    /// of the assigned columns in column order (`rewriteTargetListIU`), the
+    /// target's row identity `ctid`, the FROM table's (its row mark), then
+    /// the FROM table's columns `RETURNING` reads; a partitioned or
+    /// inheritance target (`tree`) names its row by `tableoid` and `ctid`
+    /// after them all (`distribute_row_identity_vars`). Each scan returns
+    /// its relation's columns the join's list reads, first use first, then
+    /// those its join conditions read in `WHERE` order, then a tree
+    /// target's row identity. `None` outside the deparser's coverage.
+    #[expect(clippy::too_many_arguments, reason = "the write's parts")]
+    pub(super) fn joined_write(
+        storage: &'a Storage,
+        txid: u32,
+        target: &'a TableDef,
+        target_exposed: &'a str,
+        source: &'a TableDef,
+        source_exposed: &'a str,
+        tree: bool,
+        assignments: &[(&str, &'a Expr<'a>)],
+        returning: Returning<'a>,
+        condition: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Option<JoinedWriteLists>, SqlError> {
+        let rows = [
+            Joined::new(target_exposed, target),
+            Joined::new(source_exposed, source),
+        ];
+        let joined = arena
+            .alloc_slice_with(rows.len(), |at| rows[at])
+            .map_err(|_| arena_full())?;
+        let lists = Self::with_joined(
+            storage,
+            txid,
+            target,
+            target_exposed,
+            joined,
+            true,
+            None,
+            arena,
+        );
+        lists.joined_lists(
+            source,
+            source_exposed,
+            tree,
+            assignments,
+            returning,
+            condition,
+        )
+    }
+
+    /// The relation (0 the target, 1 the FROM table) a column reference
+    /// reads; `None` for a whole row or another name.
+    fn joined_owner(
+        &self,
+        source: &TableDef,
+        source_exposed: &str,
+        column: &Expr<'_>,
+    ) -> Option<usize> {
+        let Expr::Column { qualifier, name } = column else {
+            return None;
+        };
+        match qualifier {
+            Some(qualifier) if *qualifier == self.exposed => Some(0),
+            Some(qualifier) if *qualifier == source_exposed => Some(1),
+            Some(_) => None,
+            None if self.table.column_index(name).is_some() => Some(0),
+            None if source.column_index(name).is_some() => Some(1),
+            None => None,
+        }
+    }
+
+    /// Appends the columns `expression` reads to their relation's list in
+    /// `reads`, first use first; `false` when one is outside the lists.
+    fn joined_reads(
+        &self,
+        source: &TableDef,
+        source_exposed: &str,
+        expression: &'a Expr<'a>,
+        reads: &mut [ArenaList<'a, Entry<'a>>; 2],
+    ) -> Result<bool, SqlError> {
+        let mut found = ArenaList::new(self.arena);
+        let mut full = false;
+        columns_of(expression, &mut |column| {
+            full |= found.push(column).is_err();
+        });
+        if full {
+            return Err(arena_full());
+        }
+        for &column in found.as_slice() {
+            let Some(owner) = self.joined_owner(source, source_exposed, column) else {
+                return Ok(false);
+            };
+            let Some(entry) = self.entry(column, Destination::Value)? else {
+                return Ok(false);
+            };
+            if !reads[owner]
+                .as_slice()
+                .iter()
+                .any(|held| held.text == entry.text)
+            {
+                reads[owner].push(entry).map_err(|_| arena_full())?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn joined_lists(
+        &self,
+        source: &'a TableDef,
+        source_exposed: &'a str,
+        tree: bool,
+        assignments: &[(&str, &'a Expr<'a>)],
+        returning: Returning<'a>,
+        condition: Option<&'a Expr<'a>>,
+    ) -> Result<Option<JoinedWriteLists>, SqlError> {
+        let arena = self.arena;
+        if assignments
+            .iter()
+            .any(|(target, _)| self.table.column_index(target).is_none())
+        {
+            return Ok(None);
+        }
+        let qualified = |relation: &str, column: &str| -> Result<Entry<'a>, SqlError> {
+            let mut name = StackStr::<160>::new();
+            crate::sql::catalog::write_identifier(&mut name, relation);
+            let _ = name.write_char('.');
+            let _ = name.write_str(column);
+            Ok(Entry {
+                text: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+                var: true,
+                referenced: false,
+                shown: None,
+            })
+        };
+        let source_column = |index: usize| -> Result<Entry<'a>, SqlError> {
+            let mut name = StackStr::<160>::new();
+            crate::sql::catalog::write_identifier(&mut name, source_exposed);
+            let _ = name.write_char('.');
+            crate::sql::catalog::write_identifier(&mut name, source.columns()[index].name.as_str());
+            Ok(Entry {
+                text: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+                var: true,
+                referenced: false,
+                shown: None,
+            })
+        };
+        let push_new = |entries: &mut ArenaList<'a, Entry<'a>>, entry: Entry<'a>| {
+            if entries
+                .as_slice()
+                .iter()
+                .any(|held| held.text == entry.text)
+            {
+                return Ok(());
+            }
+            entries.push(entry).map_err(|_| arena_full())
+        };
+        // Per relation, the columns the join's list reads, in order; the
+        // row identities are entries of their own.
+        let mut reads: [ArenaList<'a, Entry<'a>>; 2] =
+            [ArenaList::new(arena), ArenaList::new(arena)];
+        let mut join = ArenaList::new(arena);
+        for column in self.table.columns() {
+            let Some(&(_, value)) = assignments
+                .iter()
+                .find(|(target, _)| *target == column.name.as_str())
+            else {
+                continue;
+            };
+            let Some(entry) = self.assigned(column, value, Some(self.exposed))? else {
+                return Ok(None);
+            };
+            join.push(entry).map_err(|_| arena_full())?;
+            if !self.joined_reads(source, source_exposed, value, &mut reads)? {
+                return Ok(None);
+            }
+        }
+        if !tree {
+            let identity = qualified(self.exposed, "ctid")?;
+            join.push(identity).map_err(|_| arena_full())?;
+            push_new(&mut reads[0], identity)?;
+        }
+        let mark = qualified(source_exposed, "ctid")?;
+        join.push(mark).map_err(|_| arena_full())?;
+        push_new(&mut reads[1], mark)?;
+        // The FROM table's columns `RETURNING` reads; the target's come
+        // from the row the write changes.
+        let mut returned = ArenaList::new(arena);
+        for item in returning.items {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    for index in 0..self.table.columns().len() {
+                        returned
+                            .push(self.column(index, Some(self.exposed))?)
+                            .map_err(|_| arena_full())?;
+                    }
+                    for index in 0..source.columns().len() {
+                        let entry = source_column(index)?;
+                        returned.push(entry).map_err(|_| arena_full())?;
+                        push_new(&mut join, entry)?;
+                        push_new(&mut reads[1], entry)?;
+                    }
+                }
+                SelectItem::TableWildcard(qualifier) if *qualifier == self.exposed => {
+                    for index in 0..self.table.columns().len() {
+                        returned
+                            .push(self.column(index, Some(self.exposed))?)
+                            .map_err(|_| arena_full())?;
+                    }
+                }
+                SelectItem::TableWildcard(qualifier) if *qualifier == source_exposed => {
+                    for index in 0..source.columns().len() {
+                        let entry = source_column(index)?;
+                        returned.push(entry).map_err(|_| arena_full())?;
+                        push_new(&mut join, entry)?;
+                        push_new(&mut reads[1], entry)?;
+                    }
+                }
+                SelectItem::Expr { expression, .. } => {
+                    let Some(entry) = self.entry(expression, Destination::Value)? else {
+                        return Ok(None);
+                    };
+                    returned.push(entry).map_err(|_| arena_full())?;
+                    let mut read: [ArenaList<'a, Entry<'a>>; 2] =
+                        [ArenaList::new(arena), ArenaList::new(arena)];
+                    if !self.joined_reads(source, source_exposed, expression, &mut read)? {
+                        return Ok(None);
+                    }
+                    for &entry in read[1].as_slice() {
+                        push_new(&mut join, entry)?;
+                        push_new(&mut reads[1], entry)?;
+                    }
+                }
+                SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => return Ok(None),
+            }
+        }
+        // The columns the join conditions read, in `WHERE` order.
+        let mut conditions = ArenaList::new(arena);
+        if let Some(condition) = condition {
+            conjuncts(condition, &mut conditions)?;
+        }
+        for &conjunct in conditions.as_slice() {
+            let mut read: [ArenaList<'a, Entry<'a>>; 2] =
+                [ArenaList::new(arena), ArenaList::new(arena)];
+            if !self.joined_reads(source, source_exposed, conjunct, &mut read)? {
+                return Ok(None);
+            }
+            if read.iter().all(|read| !read.as_slice().is_empty()) {
+                for (reads, read) in reads.iter_mut().zip(&read) {
+                    for &entry in read.as_slice() {
+                        push_new(reads, entry)?;
+                    }
+                }
+            }
+        }
+        if tree {
+            for column in ["tableoid", "ctid"] {
+                let entry = qualified(self.exposed, column)?;
+                join.push(entry).map_err(|_| arena_full())?;
+                reads[0].push(entry).map_err(|_| arena_full())?;
+            }
+        }
+        Ok(Some(JoinedWriteLists {
+            returned: if returning.items.is_empty() {
+                None
+            } else {
+                Some(render(returned.as_slice())?)
+            },
+            join: render(join.as_slice())?,
+            target: render(reads[0].as_slice())?,
+            source: render(reads[1].as_slice())?,
+        }))
+    }
+}

@@ -482,11 +482,20 @@ publisher slot before it returns, as PostgreSQL does, and keeps the apply
 worker stopped until its transaction ends; a synchronization slot an
 interrupted initial copy left on the publisher is dropped before the copy
 starts again, as PostgreSQL's table synchronization does. `CREATE
-SUBSCRIPTION` with `connect = true` still creates its slot and copies its
-tables in the background: PostgreSQL connects during the statement, reports
-`NOTICE: created replication slot "s" on publisher` (or fails the statement),
-and records each table's `pg_subscription_rel` row at commit before per-table
-synchronization workers copy them.
+SUBSCRIPTION` with `connect = true` connects while it runs: it fails with
+PostgreSQL's `08006` when the publisher is unreachable, warns about
+publications the publisher lacks (`42704`), requires each published table
+locally (`42P01`), creates the slot with `SNAPSHOT 'nothing'` and reports
+`NOTICE: created replication slot "s" on publisher`; with `create_slot` it is
+refused in a transaction block or function (`25001`). Its tables are recorded
+in `pg_subscription_rel` at commit as `i` (`r` without `copy_data`)
+(`differential_exact/782`). Remaining: the initial copy still runs as one
+bootstrap under one synchronization slot, so a table moves from `i` to `r`
+when the whole copy commits, without PostgreSQL's per-table `d`, `f` and `s`
+states, and a publication's differing column lists for one table are
+rejected by that copy rather than by the statement. The publisher connection
+needs a numeric host, port, user, dbname and sslmode (`22023` otherwise),
+where libpq resolves names and defaults.
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead

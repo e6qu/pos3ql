@@ -3861,6 +3861,43 @@ impl Engine {
         }
     }
 
+    /// The CREATE SUBSCRIPTION publisher step the server starts now on the
+    /// worker of free subscription slot `slot`.
+    pub(crate) fn start_subscription_connect(
+        &self,
+        slot: usize,
+    ) -> Option<(
+        crate::storage::SubscriptionConnectStep,
+        crate::storage::SubscriptionConnectRequest,
+    )> {
+        self.storage.start_subscription_connect(slot)
+    }
+
+    pub(crate) fn subscription_connect_pending(&self, slot: usize) -> bool {
+        self.storage.subscription_connect_pending(slot)
+    }
+
+    pub(crate) fn record_subscription_connect_table(
+        &self,
+        slot: usize,
+        table: crate::storage::PublisherTable,
+    ) {
+        self.storage.record_subscription_connect_table(slot, table);
+    }
+
+    pub(crate) fn record_subscription_connect_missing(&self, slot: usize, missing: u64) {
+        self.storage
+            .record_subscription_connect_missing(slot, missing);
+    }
+
+    pub(crate) fn finish_subscription_connect(
+        &self,
+        slot: usize,
+        failure: Option<crate::storage::SlotDropFailure>,
+    ) {
+        self.storage.finish_subscription_connect(slot, failure);
+    }
+
     /// The publisher slot drop a DROP SUBSCRIPTION statement is waiting
     /// for, which the server starts now.
     pub(crate) fn start_subscription_slot_drop(
@@ -4257,8 +4294,13 @@ impl Engine {
                 "subscription relation registration requires an apply transaction"
             ));
         }
-        self.storage
-            .stage_subscription_relation(stream, schema, table, txn.txid)?;
+        self.storage.stage_subscription_relation(
+            stream,
+            schema,
+            table,
+            crate::storage::SubscriptionRelationState::DataCopy,
+            txn.txid,
+        )?;
         let lsn = self.storage.bump_lsn();
         self.wal.stage_reserved(
             txn.txid,
@@ -4269,6 +4311,7 @@ impl Engine {
                 definition_generation: stream.definition_generation(),
                 schema,
                 table,
+                state: crate::storage::SubscriptionRelationState::DataCopy,
             },
         )
     }
@@ -24608,6 +24651,11 @@ impl Engine {
                     publications,
                     options: *options,
                 },
+                if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic {
+                    exec::SubscriptionDropContext::TransactionBlock
+                } else {
+                    exec::SubscriptionDropContext::TopLevel
+                },
                 responder,
             ),
             Stmt::AlterSubscription { name, action } => exec::alter_subscription(
@@ -32672,6 +32720,7 @@ fn apply_wal_op(
             definition_generation,
             schema,
             table,
+            state,
         } => {
             let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
                 sql_err!(
@@ -32692,7 +32741,7 @@ fn apply_wal_op(
                         "journal relation registration targets a replaced subscription stream"
                     )
                 })?;
-            storage.stage_subscription_relation(stream, schema, table, 0)?;
+            storage.stage_subscription_relation(stream, schema, table, state, 0)?;
             storage.commit_subscription_relation_refresh(0);
         }
         WalOp::FailSubscription {

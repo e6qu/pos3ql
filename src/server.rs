@@ -422,7 +422,28 @@ struct SubscriptionWorker {
     sql_want_write: bool,
     /// The client runs DROP SUBSCRIPTION's publisher slot drop.
     slot_drop: bool,
+    /// The worker of this free slot runs a CREATE SUBSCRIPTION step.
+    connect: Option<SubscriptionConnectWork>,
     detached_commit: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubscriptionConnectStage {
+    Connecting,
+    CheckingPublications,
+    ListingTables,
+    CreatingSlot,
+}
+
+/// One CREATE SUBSCRIPTION step a free slot's worker runs: its SQL client
+/// checks the publications and lists their tables, its replication client
+/// creates the slot.
+#[derive(Clone, Copy)]
+struct SubscriptionConnectWork {
+    stage: SubscriptionConnectStage,
+    request: crate::storage::SubscriptionConnectRequest,
+    /// The requested publications, by position, the publisher has.
+    found: u64,
 }
 
 const SUBSCRIPTION_FILTER_BYTES: usize = 4096;
@@ -586,6 +607,25 @@ fn subscription_discovery_query(
         append_sql_literal(&mut query, publication.as_str());
     }
     let _ = write!(query, ") ORDER BY schemaname, tablename, pubname");
+    (!query.is_truncated()).then_some(query).ok_or(())
+}
+
+/// A query of CREATE SUBSCRIPTION naming its publications as literals.
+fn subscription_connect_query(
+    head: &str,
+    publications: &[crate::storage::SqlName],
+    tail: &str,
+) -> Result<crate::util::StackStr<SUBSCRIPTION_QUERY_BYTES>, ()> {
+    use core::fmt::Write as _;
+    let mut query = crate::util::StackStr::new();
+    let _ = query.write_str(head);
+    for (index, publication) in publications.iter().enumerate() {
+        if index != 0 {
+            let _ = query.write_str(", ");
+        }
+        append_sql_literal(&mut query, publication.as_str());
+    }
+    let _ = query.write_str(tail);
     (!query.is_truncated()).then_some(query).ok_or(())
 }
 
@@ -1033,6 +1073,7 @@ impl Server {
                     registered_sql_fd: None,
                     sql_want_write: false,
                     slot_drop: false,
+                    connect: None,
                     detached_commit: false,
                 })
                 .expect("sized to max_subscriptions");
@@ -2153,6 +2194,7 @@ impl Server {
         worker.name = None;
         worker.definition = None;
         worker.slot_drop = false;
+        worker.connect = None;
         worker.want_write = false;
         worker.sql_want_write = false;
     }
@@ -2209,6 +2251,19 @@ impl Server {
                 }
                 continue;
             }
+            if self.subscriptions[slot].connect.is_some() {
+                self.sync_subscription_interest(slot)?;
+                self.sync_subscription_sql_interest(slot)?;
+                continue;
+            }
+            if let Some((step, request)) = self.engine.start_subscription_connect(slot) {
+                self.start_subscription_connect(slot, step, request)?;
+                continue;
+            }
+            if self.engine.subscription_connect_pending(slot) {
+                // The statement has not taken the outcome yet.
+                continue;
+            }
             if self.engine.subscription_slot_drop_pending(slot) {
                 // The waiting statement has not taken the outcome yet; the
                 // subscription it may still drop keeps no worker.
@@ -2248,30 +2303,6 @@ impl Server {
                             std::io::Error::from(std::io::ErrorKind::InvalidData)
                         })?;
                     let bind = match runtime.bootstrap {
-                        crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data } => {
-                            let bootstrap_slot = runtime.bootstrap_slot.ok_or_else(|| {
-                                stderr_line(
-                                    b"managed subscription bootstrap has no publisher slot\n",
-                                );
-                                std::io::Error::from(std::io::ErrorKind::InvalidData)
-                            })?;
-                            worker.bootstrap.stage = SubscriptionBootstrapStage::AwaitingSnapshot;
-                            worker.bootstrap.snapshot = None;
-                            worker.bootstrap.tables.clear();
-                            worker.bootstrap.table = 0;
-                            worker.bootstrap.copy_setup = None;
-                            worker.bootstrap.line.clear();
-                            let result = worker.client.bind_create_slot(
-                                runtime.endpoint.connection(),
-                                bootstrap_slot,
-                                runtime.behavior,
-                            );
-                            if result.is_err() {
-                                worker.bootstrap.stage = SubscriptionBootstrapStage::Idle;
-                            }
-                            let _ = copy_data;
-                            result
-                        }
                         crate::storage::SubscriptionBootstrap::CopyExternalSlot
                         | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
                         | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
@@ -2472,6 +2503,253 @@ impl Server {
         Ok(true)
     }
 
+    /// Starts a CREATE SUBSCRIPTION step on free slot `slot`'s worker.
+    fn start_subscription_connect(
+        &mut self,
+        slot: usize,
+        step: crate::storage::SubscriptionConnectStep,
+        request: crate::storage::SubscriptionConnectRequest,
+    ) -> std::io::Result<()> {
+        if self.subscriptions[slot].client.is_bound() || self.subscriptions[slot].sql.is_bound() {
+            self.unbind_subscription(slot);
+        }
+        self.subscriptions[slot].retry_at = None;
+        let endpoint = match request.connection.require_endpoint_for(request.name) {
+            Ok(endpoint) => endpoint.connection(),
+            Err(error) => {
+                let failure = slot_drop_message(true, format_args!("{}", error.message.as_str()));
+                self.finish_subscription_connect(slot, Some(failure));
+                return Ok(());
+            }
+        };
+        let worker = &mut self.subscriptions[slot];
+        let (bound, sql) = match step {
+            crate::storage::SubscriptionConnectStep::Discover => {
+                (worker.sql.bind_sql(endpoint), true)
+            }
+            crate::storage::SubscriptionConnectStep::CreateSlot => (
+                worker.client.bind_create_subscription_slot(
+                    endpoint,
+                    request.slot,
+                    request.behavior,
+                ),
+                false,
+            ),
+        };
+        match bound {
+            Ok(()) => {
+                worker.connect = Some(SubscriptionConnectWork {
+                    stage: if sql {
+                        SubscriptionConnectStage::Connecting
+                    } else {
+                        SubscriptionConnectStage::CreatingSlot
+                    },
+                    request,
+                    found: 0,
+                });
+                if sql {
+                    let fd = worker.sql.raw_fd();
+                    self.reactor
+                        .register_read(fd, Self::subscription_token(slot, true))?;
+                    self.subscriptions[slot].registered_sql_fd = Some(fd);
+                    self.sync_subscription_sql_interest(slot)?;
+                } else {
+                    let fd = worker.client.raw_fd();
+                    self.reactor
+                        .register_read(fd, Self::subscription_token(slot, false))?;
+                    self.subscriptions[slot].registered_fd = Some(fd);
+                    self.sync_subscription_interest(slot)?;
+                }
+            }
+            Err(error) => {
+                worker.client.unbind();
+                worker.sql.unbind();
+                let failure = slot_drop_client_failure(endpoint, &error, true);
+                self.finish_subscription_connect(slot, Some(failure));
+            }
+        }
+        Ok(())
+    }
+
+    /// Advances CREATE SUBSCRIPTION's publication and table discovery on the
+    /// SQL client of `slot`'s worker.
+    fn advance_subscription_connect_sql(
+        &mut self,
+        slot: usize,
+        readable: bool,
+        writable: bool,
+    ) -> std::io::Result<()> {
+        let worker = &mut self.subscriptions[slot];
+        let Some(mut work) = worker.connect else {
+            return Ok(());
+        };
+        if !worker.sql.is_bound() {
+            return Ok(());
+        }
+        let endpoint = worker
+            .sql
+            .endpoint()
+            .expect("a bound connect client has an endpoint");
+        let establishing = worker.sql.is_establishing();
+        let mut result = Ok(());
+        if writable {
+            result = worker.sql.writable();
+        }
+        let mut ready = false;
+        if result.is_ok() && readable {
+            let engine = &self.engine;
+            result = worker.sql.readable(usize::MAX, |event| {
+                use crate::pg::replication_client::{ClientError, ClientEvent, SqlEvent};
+                let ClientEvent::Sql(event) = event else {
+                    return Err(ClientError::PublisherError);
+                };
+                let text = |value: Option<&[u8]>| {
+                    value
+                        .and_then(|value| core::str::from_utf8(value).ok())
+                        .and_then(|value| crate::storage::SqlName::parse(value).ok())
+                        .ok_or(ClientError::PublisherError)
+                };
+                match (work.stage, event) {
+                    (SubscriptionConnectStage::Connecting, SqlEvent::Ready { .. }) => ready = true,
+                    (
+                        SubscriptionConnectStage::CheckingPublications
+                        | SubscriptionConnectStage::ListingTables,
+                        SqlEvent::RowDescription { .. } | SqlEvent::CommandComplete { .. },
+                    ) => {}
+                    (SubscriptionConnectStage::CheckingPublications, SqlEvent::DataRow(row)) => {
+                        let [name] = row.columns() else {
+                            return Err(ClientError::PublisherError);
+                        };
+                        let name = text(*name)?;
+                        if let Some(position) = work.request.publications
+                            [..work.request.publication_count]
+                            .iter()
+                            .position(|publication| *publication == name)
+                        {
+                            work.found |= 1 << position;
+                        }
+                    }
+                    (SubscriptionConnectStage::ListingTables, SqlEvent::DataRow(row)) => {
+                        let [schema, name] = row.columns() else {
+                            return Err(ClientError::PublisherError);
+                        };
+                        engine.record_subscription_connect_table(
+                            slot,
+                            crate::storage::PublisherTable {
+                                schema: text(*schema)?,
+                                name: text(*name)?,
+                            },
+                        );
+                    }
+                    (
+                        SubscriptionConnectStage::CheckingPublications
+                        | SubscriptionConnectStage::ListingTables,
+                        SqlEvent::Ready { .. },
+                    ) => ready = true,
+                    _ => return Err(ClientError::PublisherError),
+                }
+                Ok(())
+            });
+        }
+        if let Err(error) = result {
+            let failure = slot_drop_client_failure(endpoint, &error, establishing);
+            self.finish_subscription_connect(slot, Some(failure));
+            return Ok(());
+        }
+        let worker = &mut self.subscriptions[slot];
+        if ready {
+            let publications = &work.request.publications[..work.request.publication_count];
+            let query = match work.stage {
+                SubscriptionConnectStage::Connecting => {
+                    work.stage = SubscriptionConnectStage::CheckingPublications;
+                    subscription_connect_query(
+                        "SELECT t.pubname FROM pg_catalog.pg_publication t WHERE t.pubname IN (",
+                        publications,
+                        ")",
+                    )
+                }
+                SubscriptionConnectStage::CheckingPublications => {
+                    let all = if publications.len() == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << publications.len()) - 1
+                    };
+                    self.engine
+                        .record_subscription_connect_missing(slot, all & !work.found);
+                    work.stage = SubscriptionConnectStage::ListingTables;
+                    subscription_connect_query(
+                        "SELECT DISTINCT schemaname::text, tablename::text FROM pg_catalog.pg_publication_tables WHERE pubname IN (",
+                        publications,
+                        ") ORDER BY 1, 2",
+                    )
+                }
+                _ => {
+                    self.finish_subscription_connect(slot, None);
+                    return Ok(());
+                }
+            };
+            let sent = query.and_then(|query| worker.sql.query(query.as_str()).map_err(|_| ()));
+            if sent.is_err() {
+                let failure = slot_drop_message(
+                    false,
+                    format_args!("subscription publisher query exceeds its send buffer"),
+                );
+                self.finish_subscription_connect(slot, Some(failure));
+                return Ok(());
+            }
+        }
+        self.subscriptions[slot].connect = Some(work);
+        self.sync_subscription_sql_interest(slot)
+    }
+
+    /// Advances CREATE SUBSCRIPTION's slot creation.
+    fn advance_subscription_connect_slot(
+        &mut self,
+        slot: usize,
+        readable: bool,
+        writable: bool,
+    ) -> std::io::Result<()> {
+        let worker = &mut self.subscriptions[slot];
+        let endpoint = worker
+            .client
+            .endpoint()
+            .expect("a bound connect client has an endpoint");
+        let establishing = worker.client.is_establishing();
+        let mut result = Ok(());
+        if writable {
+            result = worker.client.writable();
+        }
+        if result.is_ok() && readable {
+            result = worker.client.readable(1, |_| {
+                Err(crate::pg::replication_client::ClientError::Protocol(
+                    crate::pg::replication_client::FrameError::Malformed,
+                ))
+            });
+        }
+        match result {
+            Err(error) => {
+                let failure = slot_drop_client_failure(endpoint, &error, establishing);
+                self.finish_subscription_connect(slot, Some(failure));
+            }
+            Ok(()) if worker.client.command_complete() => {
+                self.finish_subscription_connect(slot, None);
+            }
+            Ok(()) => self.sync_subscription_interest(slot)?,
+        }
+        Ok(())
+    }
+
+    /// Hands a CREATE SUBSCRIPTION step's outcome to its waiting statement.
+    fn finish_subscription_connect(
+        &mut self,
+        slot: usize,
+        failure: Option<crate::storage::SlotDropFailure>,
+    ) {
+        self.unbind_subscription(slot);
+        self.engine.finish_subscription_connect(slot, failure);
+        self.wake_io_waiters();
+    }
+
     /// Advances DROP SUBSCRIPTION's publisher slot drop. Its outcome, success
     /// or failure, goes to the waiting statement; it is never retried here.
     fn advance_subscription_slot_drop(
@@ -2578,6 +2856,14 @@ impl Server {
         writable: bool,
     ) -> std::io::Result<()> {
         if sql {
+            // Readiness reported in the poll batch that closed the SQL
+            // connection belongs to that connection.
+            if !self.subscriptions[slot].sql.is_bound() {
+                return Ok(());
+            }
+            if self.subscriptions[slot].connect.is_some() {
+                return self.advance_subscription_connect_sql(slot, readable, writable);
+            }
             return self.advance_subscription_sql(slot, readable, writable);
         }
         let worker = &mut self.subscriptions[slot];
@@ -2589,6 +2875,9 @@ impl Server {
         }
         if worker.slot_drop {
             return self.advance_subscription_slot_drop(slot, readable, writable);
+        }
+        if worker.connect.is_some() {
+            return self.advance_subscription_connect_slot(slot, readable, writable);
         }
         let mut failed = false;
         let mut publisher_failure = None;
@@ -2929,8 +3218,7 @@ impl Server {
             let copy_data = worker.definition.is_some_and(|binding| {
                 matches!(
                     binding.bootstrap,
-                    crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data: true }
-                        | crate::storage::SubscriptionBootstrap::CopyExternalSlot
+                    crate::storage::SubscriptionBootstrap::CopyExternalSlot
                         | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
                         | crate::storage::SubscriptionBootstrap::Refresh { copy_data: true }
                 )

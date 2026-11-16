@@ -675,10 +675,11 @@ enum ClientState {
 enum ClientPurpose {
     Unbound,
     Stream,
-    CreateSlot,
     /// A synchronization slot, which first drops one an interrupted copy
     /// left behind, as PostgreSQL's table synchronization does.
     CreateSyncSlot,
+    /// CREATE SUBSCRIPTION's permanent slot, whose snapshot nothing uses.
+    CreateSubscriptionSlot,
     DropSlot,
     Sql,
 }
@@ -932,17 +933,6 @@ impl ReplicationClient {
         self.state == ClientState::AwaitingSql
     }
 
-    pub(crate) fn bind_create_slot(
-        &mut self,
-        endpoint: ConnectionInfo,
-        slot: SqlName,
-        behavior: crate::storage::SubscriptionBehavior,
-    ) -> Result<(), ClientError> {
-        self.bind_command(endpoint, slot, ClientPurpose::CreateSlot)?;
-        self.behavior = behavior;
-        Ok(())
-    }
-
     /// Creates a synchronization slot, replacing one an interrupted copy
     /// left on the publisher.
     pub(crate) fn bind_create_sync_slot(
@@ -952,6 +942,19 @@ impl ReplicationClient {
         behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<(), ClientError> {
         self.bind_command(endpoint, slot, ClientPurpose::CreateSyncSlot)?;
+        self.behavior = behavior;
+        Ok(())
+    }
+
+    /// Creates CREATE SUBSCRIPTION's slot as PostgreSQL's subscriber does,
+    /// without exporting a snapshot: the initial copy uses its own.
+    pub(crate) fn bind_create_subscription_slot(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+        behavior: crate::storage::SubscriptionBehavior,
+    ) -> Result<(), ClientError> {
+        self.bind_command(endpoint, slot, ClientPurpose::CreateSubscriptionSlot)?;
         self.behavior = behavior;
         Ok(())
     }
@@ -1476,13 +1479,14 @@ fn consume_frame<'a>(
                     *state = ClientState::AwaitingCopyBoth;
                 }
             }
-            ClientPurpose::CreateSlot => {
-                create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
-                *state = ClientState::AwaitingSlotResult;
-            }
             ClientPurpose::CreateSyncSlot => {
                 drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingStaleSlotDrop;
+            }
+            ClientPurpose::CreateSubscriptionSlot => {
+                create_subscription_slot(send, slot, behavior)
+                    .map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingSlotResult;
             }
             ClientPurpose::DropSlot => {
                 drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
@@ -1499,6 +1503,16 @@ fn consume_frame<'a>(
             }
         },
         BackendFrame::RowDescription { fields: 4 } if *state == ClientState::AwaitingSlotResult => {
+        }
+        BackendFrame::DataRow(_)
+            if *state == ClientState::AwaitingSlotResult
+                && purpose == ClientPurpose::CreateSubscriptionSlot => {}
+        BackendFrame::CommandComplete {
+            tag: "CREATE_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingSlotResult
+            && purpose == ClientPurpose::CreateSubscriptionSlot =>
+        {
+            *state = ClientState::CommandComplete;
         }
         BackendFrame::DataRow(row) if *state == ClientState::AwaitingSlotResult => {
             *slot_snapshot = Some(parse_slot_snapshot(row)?);
@@ -2161,6 +2175,30 @@ pub(crate) fn create_replication_slot(
         &b"false"[..]
     });
     message.u8(b')');
+    message.u8(0);
+    if message.finish().is_err() {
+        buffer.truncate_to(mark);
+        return Err(WireFull);
+    }
+    Ok(())
+}
+
+/// `CREATE_REPLICATION_SLOT name LOGICAL pgoutput (SNAPSHOT 'nothing'...)`,
+/// as PostgreSQL's CREATE SUBSCRIPTION sends it (`CRS_NOEXPORT_SNAPSHOT`).
+fn create_subscription_slot(
+    buffer: &mut FixedBuf,
+    slot: SqlName,
+    behavior: crate::storage::SubscriptionBehavior,
+) -> Result<(), WireFull> {
+    let mark = buffer.mark();
+    let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
+    message.bytes(b"CREATE_REPLICATION_SLOT ");
+    append_identifier(&mut message, slot.as_str());
+    message.bytes(b" LOGICAL pgoutput (");
+    if behavior.failover {
+        message.bytes(b"FAILOVER, ");
+    }
+    message.bytes(b"SNAPSHOT 'nothing')");
     message.u8(0);
     if message.finish().is_err() {
         buffer.truncate_to(mark);

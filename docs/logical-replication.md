@@ -78,6 +78,14 @@ and publisher progress together before acknowledging that progress, so after a
 crash it never claims a transaction it lost. A delayed worker cannot advance a
 replaced subscription.
 
+`CREATE SUBSCRIPTION` connects to the publisher before it returns, as
+PostgreSQL does (unless `connect = false`): it checks the publications, lists
+their tables, which must exist locally, and creates the replication slot,
+reporting `NOTICE: created replication slot "name" on publisher`. Its tables
+appear in `pg_subscription_rel` as `i` when the statement commits and become
+`r` once the initial copy commits. Creating a slot cannot be rolled back, so
+`create_slot = true` is refused inside a transaction block (`25001`).
+
 `DROP SUBSCRIPTION` drops the publisher's replication slot before it returns,
 as PostgreSQL does: it stops the apply worker, sends `DROP_REPLICATION_SLOT
 name WAIT`, reports `NOTICE: dropped replication slot "name" on publisher`, and

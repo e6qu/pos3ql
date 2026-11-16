@@ -20533,11 +20533,12 @@ pub struct CreateSubscriptionCommand<'a> {
     pub options: crate::sql::ast::SubscriptionOptions<'a>,
 }
 
-pub fn create_subscription(
+pub(crate) fn create_subscription(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
     command: CreateSubscriptionCommand<'_>,
+    context: SubscriptionDropContext,
     responder: &mut Responder,
 ) -> Outcome {
     let CreateSubscriptionCommand {
@@ -20641,14 +20642,12 @@ pub fn create_subscription(
         (crate::sql::ast::SubscriptionConnect::Deferred, _, _) => {
             crate::storage::SubscriptionBootstrap::Deferred
         }
+        // The statement creates a managed slot; the initial copy uses a
+        // synchronization slot of its own, as for an existing slot.
         (
             crate::sql::ast::SubscriptionConnect::Now,
-            crate::storage::SubscriptionSlot::Managed(_),
-            copy_data,
-        ) => crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data },
-        (
-            crate::sql::ast::SubscriptionConnect::Now,
-            crate::storage::SubscriptionSlot::External(_),
+            crate::storage::SubscriptionSlot::Managed(_)
+            | crate::storage::SubscriptionSlot::External(_),
             true,
         ) => crate::storage::SubscriptionBootstrap::CopyExternalSlot,
         (
@@ -20686,6 +20685,26 @@ pub fn create_subscription(
         }
         publication_names[index] = publication;
     }
+    // PostgreSQL connects to the publisher while CREATE SUBSCRIPTION runs:
+    // it checks the publications, lists their tables and creates the slot.
+    let connected = if options.connect == crate::sql::ast::SubscriptionConnect::Now {
+        match connect_subscription_publisher(
+            storage,
+            txn,
+            name,
+            connection,
+            &publication_names[..publications.len()],
+            publisher_slot,
+            options.behavior.into(),
+            context,
+            responder,
+        )? {
+            Ok(connected) => Some(connected),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     let slot = match storage.create_subscription(
         crate::storage::SubscriptionSpec {
             name,
@@ -20733,6 +20752,25 @@ pub fn create_subscription(
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
     }
+    if let Some(connected) = connected {
+        // Each published table starts in `i` to be copied, or `r` without
+        // a copy, as PostgreSQL records it in pg_subscription_rel.
+        let state = if options.copy_data {
+            crate::storage::SubscriptionRelationState::Initializing
+        } else {
+            crate::storage::SubscriptionRelationState::Ready
+        };
+        if let Err(error) = record_created_subscription_relations(
+            storage,
+            wal,
+            txn,
+            slot,
+            &connected.tables[..connected.count],
+            state,
+        ) {
+            return sql_fail(error);
+        }
+    }
     if options.connect == crate::sql::ast::SubscriptionConnect::Deferred {
         crate::sql::eval::stash_diagnostic(
             None,
@@ -20747,6 +20785,268 @@ pub fn create_subscription(
         )?;
     }
     Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
+}
+
+/// What CREATE SUBSCRIPTION learned from its publisher: the local tables of
+/// its publications.
+struct ConnectedPublisher {
+    tables: [usize; crate::storage::MAX_PUBLICATION_TABLES],
+    count: usize,
+}
+
+/// CREATE SUBSCRIPTION's publisher connection (`walrcv_connect`,
+/// `check_publications`, `fetch_table_list` and `walrcv_create_slot`): the
+/// statement parks while the server runs each step and resumes from the
+/// start, so its messages are sent only when it finishes or fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the connection carries the statement's validated definition"
+)]
+fn connect_subscription_publisher(
+    storage: &Storage,
+    txn: &super::txn::TxnState,
+    name: SqlName,
+    connection: crate::storage::SubscriptionConnInfo,
+    publications: &[SqlName],
+    publisher_slot: crate::storage::SubscriptionSlot,
+    behavior: crate::storage::SubscriptionBehavior,
+    context: SubscriptionDropContext,
+    responder: &mut Responder,
+) -> Result<Result<ConnectedPublisher, SqlError>, WireFull> {
+    let create_slot = match publisher_slot {
+        crate::storage::SubscriptionSlot::Managed(slot) => Some(slot.sql_name()),
+        _ => None,
+    };
+    if create_slot.is_some() {
+        if context == SubscriptionDropContext::Function {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot be executed from a function"
+            )));
+        }
+        if context == SubscriptionDropContext::TransactionBlock || txn.is_explicit() {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot run inside a transaction block"
+            )));
+        }
+    }
+    if let Err(error) = connection.require_endpoint_for(name) {
+        return Ok(Err(error));
+    }
+    let owner = crate::storage::SlotDropOwner {
+        pid: storage.current_connection_id(),
+        txid: txn.txid,
+    };
+    let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+    names[..publications.len()].copy_from_slice(publications);
+    let request = crate::storage::SubscriptionConnectRequest {
+        name,
+        connection,
+        publications: names,
+        publication_count: publications.len(),
+        slot: create_slot.unwrap_or(SqlName::EMPTY),
+        behavior,
+    };
+    let pending = || {
+        sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "publisher connection of CREATE SUBSCRIPTION in progress"
+        )
+    };
+    let failed = |failure: crate::storage::SlotDropFailure, slot_step: bool| {
+        if failure.connect {
+            sql_err!(
+                sqlstate::CONNECTION_FAILURE,
+                "subscription \"{}\" could not connect to the publisher: {}",
+                name.as_str(),
+                failure.message.as_str()
+            )
+        } else if slot_step {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "could not create replication slot \"{}\": {}",
+                request.slot.as_str(),
+                failure.message.as_str()
+            )
+        } else {
+            sql_err!(
+                sqlstate::CONNECTION_FAILURE,
+                "could not receive list of replicated tables from the publisher: {}",
+                failure.message.as_str()
+            )
+        }
+    };
+    let discovered = match storage.poll_subscription_connect(
+        owner,
+        crate::storage::SubscriptionConnectStep::Discover,
+        request,
+    ) {
+        Err(error) => return Ok(Err(error)),
+        Ok(crate::storage::SubscriptionConnectPoll::Pending) => return Ok(Err(pending())),
+        Ok(crate::storage::SubscriptionConnectPoll::Failed(failure)) => {
+            storage.release_subscription_connect(owner);
+            return Ok(Err(failed(failure, false)));
+        }
+        Ok(crate::storage::SubscriptionConnectPoll::Done(slot)) => slot,
+    };
+    // The publisher's tables must exist locally as ordinary or partitioned
+    // tables before the slot is created.
+    let mut missing = 0u64;
+    let resolved = storage.subscription_connect_result(discovered, |tables, absent| {
+        missing = absent;
+        let mut found = [0usize; crate::storage::MAX_PUBLICATION_TABLES];
+        let mut count = 0usize;
+        for table in tables {
+            let slot = match storage.resolve_subscription_target(
+                table.schema.as_str(),
+                table.name.as_str(),
+                txn.txid,
+            ) {
+                Ok(slot) => slot,
+                Err(error) if error.sqlstate == sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "relation \"{}.{}\" does not exist",
+                        table.schema.as_str(),
+                        table.name.as_str()
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if count == found.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subscription relation catalog exhausted its startup capacity"
+                ));
+            }
+            found[count] = slot;
+            count += 1;
+        }
+        Ok((found, count))
+    });
+    let warn_missing = |responder: &mut Responder| -> Result<(), WireFull> {
+        if missing == 0 {
+            return Ok(());
+        }
+        let mut list = crate::util::StackStr::<4096>::new();
+        let mut count = 0;
+        for (position, publication) in publications.iter().enumerate() {
+            if missing & (1 << position) != 0 {
+                use core::fmt::Write as _;
+                let _ = write!(
+                    list,
+                    "{}\"{}\"",
+                    if count == 0 { "" } else { ", " },
+                    publication.as_str()
+                );
+                count += 1;
+            }
+        }
+        responder.warning(
+            sqlstate::UNDEFINED_OBJECT,
+            stack_format!(
+                4200,
+                "{} {} {} on the publisher",
+                if count == 1 {
+                    "publication"
+                } else {
+                    "publications"
+                },
+                list.as_str(),
+                if count == 1 {
+                    "does not exist"
+                } else {
+                    "do not exist"
+                }
+            )
+            .as_str(),
+        )
+    };
+    let (found, count) = match resolved.and_then(|resolved| resolved) {
+        Ok(found) => found,
+        Err(error) => {
+            storage.release_subscription_connect(owner);
+            warn_missing(responder)?;
+            return Ok(Err(error));
+        }
+    };
+    if create_slot.is_some() {
+        match storage.poll_subscription_connect(
+            owner,
+            crate::storage::SubscriptionConnectStep::CreateSlot,
+            request,
+        ) {
+            Err(error) => return Ok(Err(error)),
+            Ok(crate::storage::SubscriptionConnectPoll::Pending) => return Ok(Err(pending())),
+            Ok(crate::storage::SubscriptionConnectPoll::Failed(failure)) => {
+                storage.release_subscription_connect(owner);
+                warn_missing(responder)?;
+                return Ok(Err(failed(failure, true)));
+            }
+            Ok(crate::storage::SubscriptionConnectPoll::Done(_)) => {}
+        }
+    }
+    storage.release_subscription_connect(owner);
+    warn_missing(responder)?;
+    if create_slot.is_some() {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(
+                192,
+                "created replication slot \"{}\" on publisher",
+                request.slot.as_str()
+            )
+            .as_str(),
+        )?;
+    }
+    Ok(Ok(ConnectedPublisher {
+        tables: found,
+        count,
+    }))
+}
+
+/// Records CREATE SUBSCRIPTION's tables in pg_subscription_rel, journaled
+/// with the subscription and undone with its transaction.
+fn record_created_subscription_relations(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    slot: usize,
+    tables: &[usize],
+    state: crate::storage::SubscriptionRelationState,
+) -> Result<(), SqlError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    storage.add_created_subscription_relations(slot, tables, state, txn.txid)?;
+    txn.record_ddl(storage, super::txn::DdlUndo::SubscriptionRelationsChanged)?;
+    let stream = storage.subscription_stream(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "new subscription has no stream definition"
+        )
+    })?;
+    for &table in tables {
+        let (schema, name) = {
+            let definition = storage.table_def(table, txn.txid);
+            (definition.schema, definition.name)
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::AddSubscriptionRelation {
+                name: stream.name().as_str(),
+                created_at: stream.created_at(),
+                definition_generation: stream.definition_generation(),
+                schema: schema.as_str(),
+                table: name.as_str(),
+                state,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub fn alter_subscription(
@@ -36040,6 +36340,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         publications,
                         options: *options,
                     },
+                    super::exec::SubscriptionDropContext::Function,
                     responder,
                 ),
                 Stmt::AlterSubscription { name, action } => super::exec::alter_subscription(

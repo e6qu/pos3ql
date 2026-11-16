@@ -34,6 +34,7 @@ mod predicate;
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
+pub(crate) use like::like_escape;
 pub(crate) use paths::scan_path;
 
 /// Whether the table in `slot` has an index.
@@ -464,12 +465,25 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
         }
     }
     // Distinct keys: a unique index's every entry; else the key columns'
-    // distinct combinations, at most the entries.
+    // distinct combinations as `estimate_num_groups` counts them over the
+    // entries: the product of each column's distinct values, clamped to a
+    // tenth of the entries for several columns (but no fewer than the most
+    // any one column has), and to the entries.
     let distinct = if index.unique {
         entries
     } else {
         let mut product = 1.0;
+        let mut largest = 0.0f64;
+        let mut counted = 0;
+        let mut doubled = 1.0;
         for (position, &column) in index.columns[..index.n_cols].iter().enumerate() {
+            // A boolean key has two values.
+            if !index.expression_keys[position]
+                && planner.column_type(usize::from(column)) == ColType::Bool
+            {
+                doubled *= 2.0;
+                continue;
+            }
             // An expression key's own statistics count its distinct values,
             // a partial index's too.
             let own = (index.expression_keys[position])
@@ -479,7 +493,7 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
                         .index_column(info.stamp, position as u16 + 1)
                 })
                 .flatten();
-            product *= match own {
+            let distinct = match own {
                 Some(statistics) if statistics.distinct_fraction != 0.0 => {
                     clamp_row_est(f64::from(statistics.distinct_fraction) * entries)
                 }
@@ -488,8 +502,21 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
                 }
                 _ => planner.distinct(&planner.variable(usize::from(column))).0,
             };
+            product *= distinct;
+            largest = largest.max(distinct);
+            counted += 1;
         }
-        product
+        if counted > 0 && entries > 0.0 {
+            let mut clamp = entries;
+            if counted > 1 {
+                clamp *= 0.1;
+                if clamp < largest {
+                    clamp = largest.min(entries);
+                }
+            }
+            product = clamp_row_est(product.min(clamp));
+        }
+        (product * doubled).ceil().max(1.0)
     };
     let distinct = distinct.min(entries.max(1.0));
     let size = btree_size(entries, width, distinct, deduplicate);
@@ -2078,6 +2105,7 @@ pub(crate) fn query_shape<'a>(
         if target.is_constant(false) && !target.calls_routine() {
             continue;
         }
+        let target = without_own_type_cast(target, scope);
         let key = match target {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
                 Ok(ResolvedColumn::Table(0, column)) => OrderKey::Column {
@@ -2246,6 +2274,38 @@ fn projection<'a>(
     }))
 }
 
+/// `expression` without a cast of a column of the one relation of `scope`
+/// to the column's own type, which PostgreSQL's parser drops.
+pub(super) fn without_own_type_cast<'a>(
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'_>,
+) -> &'a Expr<'a> {
+    let Expr::Cast {
+        operand,
+        type_name,
+        type_mod: -1,
+        ..
+    } = expression
+    else {
+        return expression;
+    };
+    let Expr::Column { qualifier, name } = operand else {
+        return expression;
+    };
+    let (Ok(ResolvedColumn::Table(0, column)), Some(definition)) =
+        (scope.find_column(*qualifier, name), scope.defs.stored(0))
+    else {
+        return expression;
+    };
+    let meta = &definition.columns()[column];
+    let target = ColType::from_sql_name(type_name.trim_start_matches("pg_catalog."));
+    if meta.user_type.is_none() && target == Some(meta.ctype) {
+        operand
+    } else {
+        expression
+    }
+}
+
 /// A target list entry's width and per-row evaluation cost, and the
 /// column of the relation it is; `None` for an entry the model does not
 /// read (a subquery, or an expression of a catalog-defined type).
@@ -2259,6 +2319,7 @@ fn target_entry<'a>(
     arena: &'a Arena,
 ) -> Option<(u32, f64, Option<usize>)> {
     let costs = Costs::current();
+    let expression = without_own_type_cast(expression, scope);
     if let Expr::Column { qualifier, name } = expression
         && let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(*qualifier, name)
     {

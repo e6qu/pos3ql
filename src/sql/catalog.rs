@@ -5221,6 +5221,14 @@ pub(crate) fn builtin_cast_context(
         .and_then(|cast| crate::storage::CastContext::from_code(cast.context))
 }
 
+/// Whether a built-in cast from `source` to `target` is binary coercible
+/// (`castmethod` `b`): the planner relabels the value, at no cost.
+pub(crate) fn builtin_binary_cast(source: i32, target: i32) -> bool {
+    builtin_properties::CASTS
+        .iter()
+        .any(|cast| cast.source == source && cast.target == target && cast.method == b'b')
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO

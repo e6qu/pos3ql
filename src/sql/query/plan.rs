@@ -1276,7 +1276,22 @@ fn expression_cost(
         BoundDefault { expression, .. } => {
             expression_cost(expression, columns, storage, txid, arena, use_)
         }
-        Cast { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_) + 2.0,
+        // A cast to the operand's own type is no node and a binary-coercible
+        // one a relabeling, neither costing anything; another calls its
+        // function.
+        Cast {
+            operand, type_mod, ..
+        } => {
+            let free = *type_mod < 0
+                && match (oid_of(operand), oid_of(e)) {
+                    (Some(source), Some(target)) => {
+                        source == target || crate::sql::catalog::builtin_binary_cast(source, target)
+                    }
+                    _ => false,
+                };
+            expression_cost(operand, columns, storage, txid, arena, use_)
+                + if free { 0.0 } else { 2.0 }
+        }
         Collate { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_),
         Binary {
             operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
@@ -1287,6 +1302,20 @@ fn expression_cost(
             expression_cost(left, columns, storage, txid, arena, use_)
                 + expression_cost(right, columns, storage, txid, arena, use_)
         }
+        // `simplify_boolean_equality`: a comparison with a boolean constant
+        // is its other side or that side's `NOT`.
+        Binary {
+            operator: crate::sql::ast::BinaryOp::Eq | crate::sql::ast::BinaryOp::NotEq,
+            left,
+            right: Bool(_),
+            ..
+        }
+        | Binary {
+            operator: crate::sql::ast::BinaryOp::Eq | crate::sql::ast::BinaryOp::NotEq,
+            left: Bool(_),
+            right: left,
+            ..
+        } => expression_cost(left, columns, storage, txid, arena, use_),
         Binary { left, right, .. } => {
             expression_cost(left, columns, storage, txid, arena, use_)
                 + expression_cost(right, columns, storage, txid, arena, use_)

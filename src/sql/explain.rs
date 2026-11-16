@@ -6824,6 +6824,24 @@ fn plan_pulled_select<'a>(
             })
     };
     if constant_false {
+        // The dummy relation's columns are zero wide (`set_dummy_rel_pathlist`):
+        // its `Result` is as wide as the select list's other expressions.
+        let dummy_width = match (scope.as_ref(), aggregate) {
+            (Some(scope), false) if scope.n == 1 => query::index_paths::query_shape(
+                storage,
+                txid,
+                scope,
+                statement.items,
+                statement.order_by,
+                None,
+                None,
+                &[],
+                arena,
+            )?
+            .projection
+            .map_or(width, |projection| projection.expression_width),
+            _ => width,
+        };
         for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
             plan.push(PlanNode {
                 depth: depth as u8,
@@ -6846,7 +6864,7 @@ fn plan_pulled_select<'a>(
                 None => widened(output),
             },
             rows: 0,
-            width,
+            width: dummy_width,
             total_cost: 0.0,
             constant_false: true,
             ..PlanNode::EMPTY

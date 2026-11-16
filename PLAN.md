@@ -702,27 +702,50 @@ index's predicate) reach, `Rows Removed by Filter`, each bitmap index scan
 of a `BitmapAnd` or `BitmapOr`, a bitmap heap scan's `Heap Blocks` and an
 index-only scan's `Heap Fetches`, and each index scan's `Index Searches`. A
 table without index paths for the query keeps its sequential scan whatever
-its conditions. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+its conditions. Pattern conditions follow `like_support.c` under `C`
+(`differential_exact/752`): `LIKE` (its `ESCAPE` folded through
+`like_escape`, as `EXPLAIN` prints it), `ILIKE` (its prefix stopping at a
+letter), regular expressions (`~`, `~*`, their prefix read from the
+anchored characters `pg_regprefix` finds, exact before a final `$`) and
+`starts_with` (a prefix through its support function) bound an index by
+their prefix, a non-ASCII one too (`make_greater_string`'s UTF-8
+increment), with `patternsel`'s selectivity. A condition on an expression
+no index holds takes PostgreSQL's defaults (`differential_exact/753`): an
+equality `1/DEFAULT_NUM_DISTINCT` (a boolean's 1/2), an inequality
+`DEFAULT_INEQ_SEL`, two bounds of one expression `DEFAULT_RANGE_INEQ_SEL`,
+a NULL test `DEFAULT_UNK_SEL`, a boolean function a third, and a
+comparison with a boolean constant is its other side
+(`simplify_boolean_equality`). A cast of a column to its own type is no
+node, printed and costed as the column, and a binary-coercible cast costs
+nothing; a `varchar` or `text` relabeling is the column for its index. A
+dummy relation's `Result` is as wide as the select list's expressions. An
+`UPDATE` or `DELETE` whose costs choose a sequential scan changes its rows
+in heap order and reads no index; a resumed attempt reads the same order
+under the statement's snapshot. A btree's distinct keys are counted as
+`estimate_num_groups` clamps a product of columns' distinct values.
+Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
-methods, expression indexes over user-defined routines or types, `ILIKE`,
-regular expressions, `LIKE` with an escape or a non-ASCII prefix and other
-casts of indexed columns, extended statistics, a sub-partitioned table
+methods, expression indexes over user-defined routines or types (PostgreSQL
+inlines a simple SQL function's body, `inline_function`, into the index
+expression, the query and what `EXPLAIN` prints, which pos3ql does not do
+anywhere yet; and `CREATE INDEX` cannot evaluate a PL/pgSQL function, which
+needs the resumable executor), a regular
+expression with embedded options or a director (`(?i)`, `***=`),
+extended statistics, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. Remaining inexact without
-`0A000`: a sequential scan's estimates when a condition reads an expression
-no index holds (PostgreSQL's defaults for an unanalyzed expression), btree
-sizes after out-of-order inserts (PostgreSQL's page splits, `nbtsplitloc`,
-grow an index past the `CREATE INDEX` layout the model computes, which also
-estimates a multi-column index's distinct keys as the product of its
-columns'), the heap placement of rows a large update moves (a pruned
-page's freed space), and the row order of an `UPDATE` or `DELETE` whose
-costs choose a sequential scan while its condition reaches an index: it
-takes row identity order, where PostgreSQL reads heap order, because a
-resumed attempt must select the rows in the order of the first, and its own
-changes have moved the rows' heap positions since (heap order needs each
-row's position as the statement began). Grouping, `DISTINCT` and joins above the scan keep the
+`0A000`: btree sizes, which the model computes from the column statistics
+where PostgreSQL counts the pages its build (`nbtsort`) and later page
+splits (`nbtsplitloc`) made, and the heap placement of rows a large update
+moves (a pruned page's freed space, HOT chains), which also orders an
+index's equal keys by their current heap position. PostgreSQL 17's
+maintenance operations (`CREATE INDEX`, `ANALYZE`, `REINDEX`, `VACUUM`,
+`REFRESH MATERIALIZED VIEW`) evaluate expressions under the search path
+`pg_catalog, pg_temp`, so an error there names a domain outside it
+qualified (`value for domain public.posint violates ...`); pos3ql keeps
+the session's search path. Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM

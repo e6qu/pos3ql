@@ -38362,6 +38362,21 @@ impl Storage {
         self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
 
+    /// Whether a row of the table has a pending version of `txid`: its own
+    /// changes moved the row since the transaction began.
+    pub(crate) fn table_has_own_pending(&self, table_slot: usize, txid: u32) -> bool {
+        let (versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_read_for_batch()?,
+                self.tables[table_slot].rows.try_read_for_batch()?,
+            ))
+        });
+        rows.iter().any(|(_, &state)| {
+            pending_last(&versions.pending_row_versions, state.pending)
+                .is_some_and(|pending| pending.txid == txid)
+        })
+    }
+
     /// Cache probes need only this verdict while their saved block is borrowed;
     /// copy no row bytes or root owners and release metadata guards immediately.
     pub(crate) fn row_has_own_pending(&self, table_slot: usize, rowid: u64, txid: u32) -> bool {

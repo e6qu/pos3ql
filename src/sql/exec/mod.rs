@@ -105896,11 +105896,12 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
     })
 }
 
-/// Visits a table's visible rows in the order a sequential `SELECT` reads
-/// them, as PostgreSQL's data changes read their target: routines they call
-/// observe earlier rows' changes in that order: saved rows by row identity,
-/// then heap rows by heap position. Only a table without saved row files
-/// keeps an order record for every row.
+/// Visits the rows of `table` a sequential scan reads, in heap order: each
+/// row's version the statement sees, saved rows by identity and then
+/// resident ones by heap position. The order is the versions' own, so an
+/// attempt resumed after its own changes reads the rows in the order the
+/// statement's first attempt did. Without such changes the saved rows
+/// stream in that order.
 fn for_each_physical_row(
     storage: &Storage,
     table: usize,
@@ -105908,7 +105909,7 @@ fn for_each_physical_row(
     arena: &Arena,
     visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    if storage.spill_generation_count(table) != 0 {
+    if storage.spill_generation_count(table) != 0 && !storage.table_has_own_pending(table, txid) {
         let scan = storage.captured_row_scan_in(table, txid, arena)?;
         // The visitor never stops the scan early.
         let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
@@ -105928,19 +105929,32 @@ fn for_each_physical_row(
             )
         })?;
     let mut fill = 0usize;
-    storage.for_each_row_state(table, &mut |rowid, state| {
-        if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
-            let slot = ordered.get_mut(fill).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "visible row count changed during a data change's scan"
-                )
-            })?;
-            *slot = Some(snapshot.retain(rowid, &home)?);
-            fill += 1;
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
+    let mut retain = |rowid: u64, home: &crate::storage::VisibleRowHome| -> Result<(), SqlError> {
+        let slot = ordered.get_mut(fill).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "visible row count changed during a data change's scan"
+            )
+        })?;
+        *slot = Some(snapshot.retain(rowid, home)?);
+        fill += 1;
+        Ok(())
+    };
+    if storage.spill_generation_count(table) != 0 {
+        let scan = storage.captured_row_scan_in(table, txid, arena)?;
+        // The visitor never stops the scan early.
+        let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
+            retain(rowid, &home)?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    } else {
+        storage.for_each_row_state(table, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
+                retain(rowid, &home)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    }
     ordered[..fill].sort_unstable_by_key(|row| row.map(|row| row.sort_key()));
     for row in ordered[..fill].iter().copied().flatten() {
         visit(row.rowid(), row.read()?)?;
@@ -106394,7 +106408,11 @@ pub(super) fn collect_matches<'a>(
                 | crate::sql::query::index_paths::ScanKind::IndexOnly
         )
     });
+    // A sequential scan PostgreSQL's costs chose reads no index.
+    let sequential =
+        chosen.is_some_and(|order| order.kind == crate::sql::query::index_paths::ScanKind::Seq);
     let indexed = if transition.is_none()
+        && !sequential
         && def.kind != crate::storage::TableKind::Foreign
         && !storage.relation_has_descendants(table_index, txid)
     {
@@ -106421,21 +106439,20 @@ pub(super) fn collect_matches<'a>(
     // else physical order. (PostgreSQL's sequential scan reads heap order
     // even then; a resumed attempt would need the heap positions the rows
     // had when the statement began, which own changes move.)
-    let index_order =
-        match chosen.filter(|order| order.kind != crate::sql::query::index_paths::ScanKind::Seq) {
-            Some(_) => true,
-            None => {
-                indexed.is_some()
-                    || (def.kind != crate::storage::TableKind::Foreign
-                        && super::query::dml_condition_reaches_index(
-                            storage,
-                            &def,
-                            alias,
-                            txid,
-                            where_clause,
-                        ))
-            }
-        };
+    let index_order = match chosen {
+        Some(order) => order.kind != crate::sql::query::index_paths::ScanKind::Seq,
+        None => {
+            indexed.is_some()
+                || (def.kind != crate::storage::TableKind::Foreign
+                    && super::query::dml_condition_reaches_index(
+                        storage,
+                        &def,
+                        alias,
+                        txid,
+                        where_clause,
+                    ))
+        }
+    };
     // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
     // visible row it matched or its filter removed, and each member's share
     // when the target is a partitioned table or inheritance tree.

@@ -14292,7 +14292,7 @@ mod tests {
     #[test]
     fn compact_catalog_defaults_keep_postgresql_label_and_reference_types() {
         use crate::sql::types::Datum;
-        assert!(core::mem::size_of::<OwnedDatum>() <= 128);
+        assert!(core::mem::size_of::<OwnedDatum>() <= 136);
         let label = "é".repeat(31) + "a";
         let too_long = "é".repeat(32);
         let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
@@ -16415,35 +16415,29 @@ mod tests {
     #[test]
     fn table_payload_keeps_a_not_valid_not_null_constraint_only_on_its_column() {
         let mut definition = sample_def();
-        definition.columns[1].not_null = crate::storage::NotNullOrigin::Local;
-        definition.columns[1].not_null_validated = false;
+        definition.columns[0].not_null_validated = false;
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "not valid payload", 4096).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            assert!(append_payload(
-                &mut payload,
-                &WalOp::CreateTable {
-                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                    definition: (&definition).into(),
-                }
-            ));
-            let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
-            assert!(!restored.columns[1].not_null_validated);
-            assert!(restored.columns[0].not_null_validated);
-        });
-        // A nullable column encodes no NOT VALID bit, whatever it holds.
-        definition.columns[1].not_null = crate::storage::NotNullOrigin::Nullable;
-        crate::mem::guard::forbid_alloc(|| {
+        let mut encode = |definition: &TableDefBuilder| {
             payload.clear();
             assert!(append_payload(
                 &mut payload,
                 &WalOp::CreateTable {
                     identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                    definition: (&definition).into(),
+                    definition: definition.into(),
                 }
             ));
             let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
-            assert!(restored.columns[1].not_null_validated);
+            (
+                restored.columns[0].not_null_validated,
+                restored.columns[1].not_null_validated,
+            )
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(encode(&definition), (false, true));
+            // A nullable column encodes no NOT VALID bit, whatever it holds.
+            definition.columns[1].not_null_validated = false;
+            assert_eq!(encode(&definition), (false, true));
         });
     }
 

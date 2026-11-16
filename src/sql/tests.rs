@@ -62914,14 +62914,18 @@ fn enum_value_identity_compact_ids_preserve_value_size() {
         u32::MAX - 1
     );
     assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
-    assert!(
+    // A domain over an enum array keeps both identities.
+    let enum_array = ColType::Array(crate::sql::types::ArrElem::Enum(Some(
+        crate::storage::TypeCreation::parse(2).unwrap(),
+    )));
+    assert_eq!(
         crate::sql::types::ArrElem::domain(
             crate::storage::TypeCreation::parse(1).unwrap(),
-            ColType::Array(crate::sql::types::ArrElem::Enum(Some(
-                crate::storage::TypeCreation::parse(2).unwrap()
-            )))
+            enum_array
         )
-        .is_none()
+        .unwrap()
+        .to_coltype(),
+        enum_array
     );
 }
 

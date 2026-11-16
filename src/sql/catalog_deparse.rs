@@ -296,6 +296,74 @@ pub(crate) fn deparse_expression<'a>(
     Ok(output.supported.then(|| output.text.as_str()))
 }
 
+/// The expression the planner keeps for `expression`: a non-constant
+/// operand collated to the default collation it already has needs no
+/// relabeling (`eval_const_expressions`), so it is the operand itself.
+pub(crate) fn planned<'e>(expression: &'e Expr<'e>) -> &'e Expr<'e> {
+    match expression {
+        Expr::Collate {
+            operand,
+            collation:
+                crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::Default),
+        } if !matches!(
+            operand,
+            Expr::Str(_) | Expr::Null | Expr::BoundLiteral { .. }
+        ) =>
+        {
+            planned(operand)
+        }
+        other => other,
+    }
+}
+
+/// A planned expression as `get_variable` prints a lower node's target,
+/// with its implicit coercions shown, when that differs from its own text:
+/// a collated non-constant shows its relabeling (`(note)::text`).
+pub(crate) fn deparse_shown<'a>(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Expr::Collate { operand, collation } = expression else {
+        return Ok(None);
+    };
+    if !context.folded || context.is_constant(operand) {
+        return Ok(None);
+    }
+    let mut output = Output::new(arena);
+    context.planned_collate(operand, collation, None, true, &mut output)?;
+    Ok(output.supported.then(|| output.text.as_str()))
+}
+
+/// A sort key's `COLLATE`, as EXPLAIN shows one (`show_sortorder_options`):
+/// the relabeled key read from the input's targets, then the collation when
+/// it is not the type's default. `None` when `expression` is no collated
+/// column.
+pub(crate) fn planned_collated_key<'a>(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let Expr::Collate { operand, collation } = expression else {
+        return Ok(None);
+    };
+    if context.is_constant(operand) || !matches!(operand, Expr::Column { .. }) {
+        return Ok(None);
+    }
+    let Some((oid, name)) = context.collation_name(collation)? else {
+        return Ok(None);
+    };
+    let mut output = Output::new(arena);
+    output.push("(")?;
+    context.planned_collate(operand, collation, None, true, &mut output)?;
+    output.push(")")?;
+    if oid != crate::sql::ast::Collation::Default.oid() {
+        output.push(" COLLATE ")?;
+        output.push(name)?;
+    }
+    Ok(output.supported.then(|| output.text.as_str()))
+}
+
 /// `get_const_expr` for a planner constant of a column's type, such as a
 /// partition bound: `constant`'s spellings with the column's type modifier
 /// in the label (a modifier labels even a bare decimal `numeric`), then
@@ -521,6 +589,33 @@ impl Context<'_> {
             return Ok(None);
         };
         super::catalog_column_type_oid(self.storage, column, self.txid).map(Some)
+    }
+
+    /// The type and modifier a planner relabeling of `expression` keeps: a
+    /// column's declared ones; `None` for anything else.
+    fn relabel_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i32)>, SqlError> {
+        let Expr::Column { qualifier, name } = expression else {
+            return Ok(None);
+        };
+        let Some(type_oid) = self.column_type(*qualifier, name)? else {
+            return Ok(None);
+        };
+        let type_mod = match self.joined_source(*qualifier, name) {
+            Some((source, column)) => match source.columns {
+                Columns::Table(table) => super::catalog_column_type_mod(&table.columns()[column]),
+                Columns::Derived(_) => return Ok(None),
+            },
+            None => match self.table.and_then(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .find(|column| column.name.as_str() == *name)
+            }) {
+                Some(column) => super::catalog_column_type_mod(column),
+                None => return Ok(None),
+            },
+        };
+        Ok(Some((type_oid, type_mod)))
     }
 
     /// Whether a column reference names a parameter, a FROM item's column or
@@ -1055,6 +1150,13 @@ impl Context<'_> {
         expected: Option<i32>,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
+        // An operand shows the planner's collation relabeling.
+        if self.folded
+            && expected.is_some()
+            && let Expr::Collate { operand, collation } = expression
+        {
+            return self.planned_collate(operand, collation, expected, true, output);
+        }
         if matches!(expression, Expr::Str(_) | Expr::Null) {
             return self.literal(expression, expected.unwrap_or(oid::TEXT), output);
         }
@@ -1257,7 +1359,14 @@ impl Context<'_> {
                 ..*self
             };
             output.push("(")?;
-            computed.bare(expression, output)?;
+            // `get_variable` shows the target's implicit coercions.
+            if self.folded
+                && let Expr::Collate { operand, collation } = expression
+            {
+                computed.planned_collate(operand, collation, None, true, output)?;
+            } else {
+                computed.bare(expression, output)?;
+            }
             return output.push(")");
         }
         match expression {
@@ -1391,7 +1500,10 @@ impl Context<'_> {
                                     None => return output.unsupported(),
                                 },
                             };
-                            if self.bare != Some(source.printed) {
+                            // A relation without a printed name is one the
+                            // plan never scans, which EXPLAIN names nothing
+                            // (`select_rtable_names_for_explain`).
+                            if self.bare != Some(source.printed) && !source.printed.is_empty() {
                                 write_identifier(&mut identifier, source.printed);
                                 let _ = identifier.write_char('.');
                             }

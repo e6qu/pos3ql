@@ -758,6 +758,7 @@ pub mod sqlstate {
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const TRANSACTION_RESOLUTION_UNKNOWN: &str = "08007";
     pub const CONNECTION_FAILURE: &str = "08006";
+    pub const SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION: &str = "08001";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const UNDEFINED_FUNCTION: &str = "42883";
@@ -4918,7 +4919,7 @@ fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
 
 /// The custom plan's value of `$index`, read only within the scope that
 /// installed it; [`folded_literal`] copies it before the scope ends.
-fn custom_plan_parameter<'v>(index: u32) -> Option<Datum<'v>> {
+pub(crate) fn custom_plan_parameter<'v>(index: u32) -> Option<Datum<'v>> {
     let index = index.checked_sub(1)? as usize;
     let (values, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
     // SAFETY: `with_custom_plan_parameters` keeps the slice alive while it

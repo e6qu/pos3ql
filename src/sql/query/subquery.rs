@@ -4558,6 +4558,12 @@ fn run_subquery<'a>(
             inner: &crate::sql::eval::NoColumns,
             outer,
         };
+        // EXPLAIN ANALYZE's nodes: the one-row `Result` and the stages
+        // above it, as a FROM-less query run on its own counts them.
+        let stages = super::instrument::Stages::current();
+        let _stages = stages.start();
+        let result = super::instrument::node(super::instrument::Role::Result);
+        let _result = result.start();
         if let Some(w) = select.where_clause
             && !where_passes(w, arena, params, &base, &hooks)?
         {
@@ -4570,6 +4576,7 @@ fn run_subquery<'a>(
             ));
         }
         let v = eval_full(item, arena, params, &base, &hooks)?;
+        result.row();
         let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
         return Ok((
             &*out,

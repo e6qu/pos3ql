@@ -111,6 +111,55 @@ SELECT max(q) + 1 FROM ft WHERE id < 10;
 SELECT min(note), min(note) || '!' FROM ft WHERE random() < 2;
 SELECT max(id) FROM ft WHERE id > 1000;
 
+-- A foreign partition ships the scan's conditions it can to its server.
+CREATE TABLE fpt (id int, q int) PARTITION BY RANGE (id);
+CREATE TABLE fpt_local PARTITION OF fpt FOR VALUES FROM (0) TO (10);
+CREATE FOREIGN TABLE fpt_remote PARTITION OF fpt FOR VALUES FROM (10) TO (100)
+  SERVER fdw_push OPTIONS (schema_name 'fdw_push_remote', table_name 'fpt');
+INSERT INTO fpt_local VALUES (1, 10), (5, 50);
+EXPLAIN (COSTS OFF) SELECT * FROM fpt WHERE q > 120;
+SELECT * FROM fpt WHERE q > 120 ORDER BY id, q;
+SELECT * FROM fpt WHERE q < 60 AND id <> 11 ORDER BY id, q;
+SELECT count(*) FROM fpt WHERE id > 15;
+DROP TABLE fpt;
+
+-- InitPlan values and prepared statements' parameters ship as $n.
+CREATE TABLE fdw_push_local (x int, t text);
+INSERT INTO fdw_push_local VALUES (3, 'n4'), (5, 'n7');
+:e SELECT id, note FROM ft WHERE (SELECT max(x) FROM fdw_push_local) = id OR note = (SELECT min(t) FROM fdw_push_local);
+SELECT id, note FROM ft WHERE (SELECT max(x) FROM fdw_push_local) = id OR note = (SELECT min(t) FROM fdw_push_local) ORDER BY id;
+SELECT id FROM ft WHERE id < (SELECT max(x) FROM fdw_push_local) AND b > (SELECT min(x) FROM fdw_push_local) * 1000000000::bigint ORDER BY id;
+SELECT id FROM ft WHERE id IN ((SELECT 1), (SELECT 2)) ORDER BY id;
+SELECT id FROM ft WHERE id > (SELECT max(id) - 3 FROM ft) ORDER BY id;
+SELECT id FROM ft WHERE (SELECT x FROM fdw_push_local ORDER BY x LIMIT 1) > 2 AND id < 3 ORDER BY id;
+SELECT id, (SELECT 1) FROM ft ORDER BY id LIMIT 2;
+SELECT id FROM ft ORDER BY id LIMIT (SELECT 2);
+PREPARE fdw_p(int, text) AS SELECT id, note FROM ft WHERE id = $1 OR note = $2 ORDER BY id;
+EXECUTE fdw_p(3, 'n5');
+EXECUTE fdw_p(NULL, 'n6');
+SET plan_cache_mode = force_generic_plan;
+:e EXECUTE fdw_p(3, 'n5');
+EXECUTE fdw_p(3, 'n5');
+PREPARE fdw_q(date, float8, int, int) AS SELECT id FROM ft WHERE d > $1 AND f < $2 AND id IN ($3, $4) ORDER BY id;
+EXECUTE fdw_q('2024-01-02', 1.5, 3, 9);
+RESET plan_cache_mode;
+DEALLOCATE fdw_p;
+DEALLOCATE fdw_q;
+DROP TABLE fdw_push_local;
+
+-- Values sent to the server print in postgres_fdw's transmission modes
+-- (ISO dates), whatever the session's DateStyle.
+SET DateStyle = 'SQL, DMY';
+INSERT INTO ft (id, d, ts, f) VALUES (100, '2024-01-05', '2024-01-02 03:04:05', 0.1234567890123);
+UPDATE ft SET d = '2024-02-07' WHERE id = 100 AND random() < 2;
+COPY ft (id, d) FROM STDIN;
+101	2024-01-05
+\.
+SELECT id, d, ts FROM ft WHERE id >= 100 ORDER BY id;
+RESET DateStyle;
+SELECT id, d, ts, f FROM ft WHERE id >= 100 ORDER BY id;
+DELETE FROM ft WHERE id >= 100;
+
 -- A server change committed by COMMIT PREPARED reaches every client's
 -- cached connection, as a plain COMMIT's does.
 SELECT name FROM app;

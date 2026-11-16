@@ -779,3 +779,37 @@ fn direct_modification_admits_statement_triggers_and_sets_generated_columns() {
         String::from_utf8_lossy(&explained)
     );
 }
+
+#[test]
+fn postgres_fdw_sends_initplan_values_as_parameters() {
+    let (log, mut engine, mut budget) = scripted_table();
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM ft WHERE id = (SELECT 3) OR note = (SELECT 'a')",
+    );
+    assert!(
+        !message_types(&rows).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&rows)
+    );
+    assert_eq!(
+        remote_statements(&log),
+        ["DECLARE c1 CURSOR FOR\nSELECT id FROM public.ft \
+          WHERE (((id = $1::integer) OR (note = $2::text)))"]
+    );
+}
+
+#[test]
+fn explain_rejects_joins_over_foreign_scans() {
+    let (_log, mut engine, mut budget) = scripted_table();
+    for query in [
+        "EXPLAIN SELECT a.id FROM ft a JOIN ft b ON a.id = b.id",
+        "EXPLAIN SELECT x FROM (VALUES (3)) v(x) WHERE x IN (SELECT id FROM ft)",
+        "EXPLAIN SELECT * FROM (SELECT id FROM ft LIMIT 3) s \
+         JOIN (VALUES (1)) v(x) ON s.id = v.x",
+    ] {
+        let rows = run_with(&mut engine, &mut budget, query);
+        assert_eq!(error_sqlstates(&rows), ["0A000"], "{query}");
+    }
+}

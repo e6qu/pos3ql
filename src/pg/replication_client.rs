@@ -202,7 +202,7 @@ impl ConnectionInfo {
         })
     }
 
-    fn socket_addr(&self) -> SocketAddr {
+    pub(crate) fn socket_addr(&self) -> SocketAddr {
         SocketAddr::new(
             self.host
                 .as_str()
@@ -1068,6 +1068,12 @@ impl ReplicationClient {
 
     pub fn is_streaming(&self) -> bool {
         self.state == ClientState::Streaming
+    }
+
+    /// Whether the transport is still waiting for its TCP connection, before
+    /// any startup message reached the server.
+    pub(crate) fn is_connecting(&self) -> bool {
+        self.state == ClientState::Connecting
     }
 
     fn queue_startup(&mut self) -> Result<(), ClientError> {

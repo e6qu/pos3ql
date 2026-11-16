@@ -48,7 +48,7 @@ pub(crate) trait PruneValues<'a> {
     /// `value`, which [`Self::stage`] placed at or before the current stage.
     fn evaluate(&self, value: &'a Expr<'a>) -> Result<Datum<'a>, SqlError>;
     /// Whether `value`, which no stage knows here, is one PostgreSQL knows
-    /// during each scan: a subplan's result or an enclosing query's column.
+    /// during each scan: a correlated subplan's result.
     fn scan_value(&self, value: &'a Expr<'a>) -> bool;
 }
 
@@ -60,8 +60,9 @@ pub(crate) struct Members<'a> {
     /// Range table entries the relation's expansion added: every member
     /// pruning kept, partitioned or excluded by its constraints too.
     pub(crate) expanded: usize,
-    /// Whether PostgreSQL prunes the members again during each scan, by a
-    /// key compared with a subplan's result or an enclosing query's column.
+    /// Whether PostgreSQL prunes the members again during each scan by a
+    /// value execution here does not prune with: a subquery that reads an
+    /// enclosing query's columns.
     pub(crate) scan_pruned: bool,
 }
 
@@ -138,7 +139,8 @@ struct Context<'c, 'a> {
     values: &'c dyn PruneValues<'a>,
     stage: PruneStage,
     arena: &'a Arena,
-    /// Set when a key is compared with a value only a scan knows.
+    /// Set when a key is compared with a value PostgreSQL prunes with
+    /// during each scan but execution here does not.
     scan_pruned: core::cell::Cell<bool>,
 }
 
@@ -520,16 +522,23 @@ impl<'a> Context<'_, 'a> {
         let Some(stage) = self.values.stage(expression) else {
             return Ok(Operand::Other(expression, self.calls_mutable(expression)));
         };
-        let declared = crate::sql::eval::expression_type_identity(
-            expression,
-            &crate::sql::eval::NoColumns,
-            &crate::sql::eval::NO_HOOKS,
-        )?
-        .known_oid()
-        .filter(|type_oid| *type_oid != oid::UNKNOWN)
-        .map(|type_oid| {
-            crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, type_oid)
-        });
+        // An enclosing query's column or a subquery's result has the type
+        // of the value a scan computes; nothing earlier knows it.
+        let scan_value = stage == PruneStage::Scan;
+        let declared = if scan_value {
+            None
+        } else {
+            crate::sql::eval::expression_type_identity(
+                expression,
+                &crate::sql::eval::NoColumns,
+                &crate::sql::eval::NO_HOOKS,
+            )?
+            .known_oid()
+            .filter(|type_oid| *type_oid != oid::UNKNOWN)
+            .map(|type_oid| {
+                crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, type_oid)
+            })
+        };
         let target = other
             .and_then(|other| self.values.column(other))
             .map(|column| &self.root[column]);
@@ -538,7 +547,7 @@ impl<'a> Context<'_, 'a> {
             Some(match (declared, target) {
                 // An unknown literal takes the type of the column it is
                 // compared with, as the parser coerces it.
-                (None, Some(column)) if !raw.is_null() => crate::sql::exec::coerce(
+                (None, Some(column)) if !raw.is_null() && !scan_value => crate::sql::exec::coerce(
                     raw,
                     column,
                     self.storage,
@@ -553,6 +562,9 @@ impl<'a> Context<'_, 'a> {
         };
         let type_oid = match (declared, target, datum) {
             (Some(declared), _, _) => Some(declared),
+            (None, _, datum) if scan_value => datum.filter(|datum| !datum.is_null()).map(|datum| {
+                crate::sql::catalog::domain_root_type_oid(self.storage, self.txid, datum.type_oid())
+            }),
             (None, Some(column), _) => column.ctype.try_oid(),
             (None, None, Some(datum)) if !datum.is_null() => Some(datum.type_oid()),
             (None, None, _) => None,
@@ -1284,6 +1296,14 @@ impl<'a> Context<'_, 'a> {
                 }
                 if hash && op != Cmp::Eq {
                     return Ok(Matched::Unsupported);
+                }
+                // A scan's null value matches no partition under a strict
+                // operator (`perform_pruning_base_step`).
+                if value.stage == PruneStage::Scan
+                    && self.stage == PruneStage::Scan
+                    && value.datum.is_some_and(|datum| datum.is_null())
+                {
+                    return Ok(Matched::Steps(Steps::Contradictory));
                 }
                 let Some(value_type) = value.type_oid else {
                     return Ok(Matched::Unsupported);
@@ -2523,6 +2543,9 @@ pub(crate) struct ScanValues<'s, 'h, 'a> {
     pub(crate) arena: &'a Arena,
     pub(crate) params: &'s [Datum<'a>],
     pub(crate) hooks: &'s crate::sql::eval::EvalHooks<'h, 'a>,
+    /// The enclosing query's row, which a scan's pruning reads; none
+    /// before execution.
+    pub(crate) outer: Option<&'s dyn crate::sql::eval::ColumnLookup<'a>>,
 }
 
 impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
@@ -2561,22 +2584,39 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
                 _ => None,
             };
         };
+        let mut failed = None;
         super::walk_expression_tree(value, &mut |node| match node {
-            // The query's own columns, an enclosing query's, a subplan's
-            // result or a routine's variable: none of them prunes here.
+            // An enclosing query's column and an uncorrelated subquery's
+            // result (an InitPlan's) are known during each scan
+            // (`PARTTARGET_EXEC`); the query's own columns, a correlated
+            // subquery and a routine's variable prune nothing here.
+            Expr::Column { .. } if !self.resolves(node) => raise(Some(PruneStage::Scan)),
+            Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => {
+                match super::subquery::subquery_node_correlated(
+                    node,
+                    self.storage,
+                    self.txid,
+                    self.arena,
+                ) {
+                    Ok(false) => raise(Some(PruneStage::Scan)),
+                    Ok(true) => raise(None),
+                    Err(error) => {
+                        failed.get_or_insert(error);
+                    }
+                }
+            }
             Expr::Column { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::OuterAggregate { .. }
-            | Expr::DefaultMarker
-            | Expr::Subquery(_)
-            | Expr::RowSubquery { .. }
-            | Expr::InSubquery { .. }
-            | Expr::QuantifiedSubquery { .. }
-            | Expr::Exists(_)
-            | Expr::ArraySubquery(_) => raise(None),
+            | Expr::DefaultMarker => raise(None),
             Expr::Param(index) => {
                 if crate::sql::eval::custom_plan_binds(*index) {
                 } else if (*index as usize) <= self.params.len() {
@@ -2608,6 +2648,10 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
             _ => {}
         })
         .ok()?;
+        // A subquery whose correlation cannot be read prunes nothing.
+        if failed.is_some() {
+            return None;
+        }
         stage
     }
 
@@ -2617,20 +2661,8 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
         let mut own = false;
         let mut later = false;
         let _ = super::walk_expression_tree(value, &mut |node| match node {
-            Expr::Column { qualifier, name } => {
-                let resolves = match self.relation {
-                    ScanRelation::From { scope, .. } => {
-                        scope.find_column_unsuggested(*qualifier, name).is_ok()
-                    }
-                    ScanRelation::Target {
-                        columns,
-                        name: exposed,
-                    } => {
-                        qualifier.is_none_or(|qualifier| qualifier == exposed)
-                            && columns.iter().any(|column| column.name.as_str() == *name)
-                    }
-                };
-                if resolves {
+            Expr::Column { .. } => {
+                if self.resolves(node) {
                     own = true;
                 } else {
                     later = true;
@@ -2648,14 +2680,115 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
     }
 
     fn evaluate(&self, value: &'a Expr<'a>) -> Result<Datum<'a>, SqlError> {
-        crate::sql::eval::eval_full(
-            value,
-            self.arena,
-            self.params,
-            &crate::sql::eval::NoColumns,
-            self.hooks,
-        )
+        let outer: &dyn crate::sql::eval::ColumnLookup<'a> =
+            self.outer.unwrap_or(&crate::sql::eval::NoColumns);
+        crate::sql::eval::eval_full(value, self.arena, self.params, &outer, self.hooks)
     }
+}
+
+impl<'a> ScanValues<'_, '_, 'a> {
+    /// Whether the column `column` names is one of the query's own
+    /// relations' rather than an enclosing query's.
+    fn resolves(&self, column: &Expr<'_>) -> bool {
+        let Expr::Column { qualifier, name } = column else {
+            return false;
+        };
+        match self.relation {
+            ScanRelation::From { scope, .. } => {
+                scope.find_column_unsuggested(*qualifier, name).is_ok()
+            }
+            // A target's columns include its system columns (`tableoid`).
+            ScanRelation::Target {
+                columns,
+                name: exposed,
+            } => {
+                qualifier.is_none_or(|qualifier| qualifier == exposed)
+                    && (columns.iter().any(|column| column.name.as_str() == *name)
+                        || ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"].contains(name))
+            }
+        }
+    }
+}
+
+/// Of `conditions`, those that read FROM position `table` alone, without a
+/// subquery: the restrictions a foreign member's scan can ship.
+pub(crate) fn own_restrictions<'a>(
+    scope: &super::QueryScope<'a>,
+    conditions: &[&'a Expr<'a>],
+    table: usize,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let mut own = ArenaList::new(arena);
+    for &condition in conditions {
+        let mut alone = true;
+        super::walk_expression_tree(condition, &mut |node| match node {
+            Expr::Column { qualifier, name } => {
+                alone &= matches!(
+                    scope.find_column_unsuggested(*qualifier, name),
+                    Ok(super::ResolvedColumn::Table(found, _)) if found == table
+                );
+            }
+            Expr::WholeRow(_)
+            | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_) => alone = false,
+            _ => {}
+        })?;
+        if alone {
+            own.push(condition).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(own.as_slice())
+}
+
+/// Whether FROM position `table` is a partitioned table planning's pruning
+/// leaves no partition: PostgreSQL's dummy relation, which reads no rows.
+/// A partitioned table stores none itself, so its own (empty) rows are the
+/// relation's.
+pub(crate) fn plans_no_partition<'a>(
+    storage: &Storage,
+    scope: &super::QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let slot = scope.slots[table];
+    let item = core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .nth(table);
+    if scope.derived[table].is_some()
+        || slot == usize::MAX
+        || item.is_none_or(|item| item.cte.is_some() || item.subquery.is_some())
+        || !storage.table_def(slot, txid).partition.is_partitioned()
+    {
+        return Ok(false);
+    }
+    let values = ScanValues {
+        storage,
+        txid,
+        relation: ScanRelation::From { scope, table },
+        arena,
+        params: crate::sql::eval::generic_plan_parameters(),
+        hooks: &crate::sql::eval::NO_HOOKS,
+        outer: None,
+    };
+    let conditions = scan_conditions(from, where_clause, table, arena)?;
+    Ok(members(
+        storage,
+        txid,
+        slot,
+        conditions,
+        &values,
+        PruneStage::Plan,
+        arena,
+    )?
+    .leaves
+    .is_empty())
 }
 
 /// The conjuncts of `condition`, the restrictions of a write's target.
@@ -2689,7 +2822,7 @@ pub(crate) fn conjuncts<'a>(
 /// The conditions that restrict the scan of FROM position `table` itself
 /// (its `baserestrictinfo`): the `WHERE` conjuncts unless an outer join
 /// nulls the relation, and the `ON` conjuncts of the inner joins, or of the
-/// outer join whose nullable side it is.
+/// outer, semi or anti join whose nullable or inner side it is.
 pub(crate) fn scan_conditions<'a>(
     from: &crate::sql::ast::FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
@@ -2700,7 +2833,9 @@ pub(crate) fn scan_conditions<'a>(
     let nullable = from.joins.iter().enumerate().any(|(index, join)| {
         let right = index + 1;
         match join.kind {
-            JoinKind::Left => right == table,
+            // A semi or anti join's inner side is read only through its
+            // `ON` conditions.
+            JoinKind::Left | JoinKind::Semi | JoinKind::Anti => right == table,
             JoinKind::Right => table < right,
             JoinKind::Full => table <= right,
             _ => false,
@@ -2722,7 +2857,7 @@ pub(crate) fn scan_conditions<'a>(
         };
         let applies = match join.kind {
             JoinKind::Inner => !nullable,
-            JoinKind::Left => index + 1 == table,
+            JoinKind::Left | JoinKind::Semi | JoinKind::Anti => index + 1 == table,
             JoinKind::Right => table <= index,
             _ => false,
         };

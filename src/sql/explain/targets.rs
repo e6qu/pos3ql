@@ -35,6 +35,9 @@ struct Entry<'a> {
     var: bool,
     /// Already printed as read from an input, in parentheses when needed.
     referenced: bool,
+    /// The text with its implicit coercions shown, which `get_variable`
+    /// prints for a target read from an input, when it differs.
+    shown: Option<&'a str>,
 }
 
 impl<'a> Entry<'a> {
@@ -44,12 +47,13 @@ impl<'a> Entry<'a> {
             return Ok(self);
         }
         let text = arena
-            .alloc_str_display(format_args!("({})", self.text))
+            .alloc_str_display(format_args!("({})", self.shown.unwrap_or(self.text)))
             .map_err(|_| arena_full())?;
         Ok(Self {
             text,
             var: false,
             referenced: true,
+            shown: None,
         })
     }
 }
@@ -102,6 +106,8 @@ pub(super) struct BlockTargets<'a> {
     /// Per relation, its physical columns; None when it must project
     /// (row identities or whole-row references are read).
     physical: &'a [Option<&'a [Entry<'a>]>],
+    /// Per relation, whether the block reads its whole row.
+    whole_row: &'a [bool],
     /// Per stage, its output.
     stages: &'a [Output],
     /// The relations in join order.
@@ -115,6 +121,7 @@ pub(super) struct BlockTargets<'a> {
 fn relations<'a>(
     scope: &'a QueryScope<'_>,
     statement: &Select<'_>,
+    nameless: &[bool],
     arena: &'a Arena,
 ) -> Result<&'a [Joined<'a>], Fail> {
     let items = statement
@@ -128,7 +135,16 @@ fn relations<'a>(
     for (table, slot) in joined.iter_mut().enumerate() {
         let item = items.next();
         if let Some(definition) = scope.defs.stored(table) {
-            *slot = Some(Joined::new(scope.names[table], definition));
+            // A relation the plan never scans has no name to print.
+            let joined = Joined::new(scope.names[table], definition);
+            *slot = Some(if nameless.get(table).copied().unwrap_or(false) {
+                Joined {
+                    printed: "",
+                    ..joined
+                }
+            } else {
+                joined
+            });
             continue;
         }
         let Some(definition) = scope.defs.get(table) else {
@@ -212,6 +228,7 @@ impl<'a> BlockTargets<'a> {
         window_names: &[&str],
         aggregate: bool,
         bottom_computes: bool,
+        nameless: &[bool],
         arena: &'a Arena,
     ) -> Result<Option<Self>, SqlError> {
         match Self::build(
@@ -225,6 +242,7 @@ impl<'a> BlockTargets<'a> {
             window_names,
             aggregate,
             bottom_computes,
+            nameless,
             arena,
         ) {
             Ok(targets) => Ok(Some(targets)),
@@ -245,10 +263,11 @@ impl<'a> BlockTargets<'a> {
         window_names: &[&str],
         aggregate: bool,
         bottom_computes: bool,
+        nameless: &[bool],
         arena: &'a Arena,
     ) -> Result<Self, Fail> {
         let joined = match scope {
-            Some(scope) => relations(scope, statement, arena)?,
+            Some(scope) => relations(scope, statement, nameless, arena)?,
             None => &[],
         };
         let relation_count = scope.map_or(0, |scope| scope.n);
@@ -286,6 +305,7 @@ impl<'a> BlockTargets<'a> {
             }
         };
         let deparse = |expression: &Expr<'_>| -> Result<Entry<'a>, Fail> {
+            let expression = crate::sql::catalog::deparse::planned(expression);
             let text = crate::sql::catalog::deparse::deparse_expression(
                 &context,
                 expression,
@@ -297,6 +317,7 @@ impl<'a> BlockTargets<'a> {
                 text,
                 var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
                 referenced: false,
+                shown: crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)?,
             })
         };
         let column_expression = |table: usize, column: usize| -> Result<&'a Expr<'a>, Fail> {
@@ -558,34 +579,52 @@ impl<'a> BlockTargets<'a> {
                 });
             }
         }
-        // A locking clause reads each relation's row identity.
+        // A locking clause reads each relation's row identity, and of an
+        // expanded parent the member it came from (`preprocess_targetlist`
+        // adds `tableoid` for a row mark's `isParent`).
         let locking = !statement.locking.is_empty();
         if let Some(scope) = scope.filter(|_| locking) {
+            let mut items = statement.from.as_ref().map(|from| {
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            });
             for table in 0..scope.n {
+                let item = items.as_mut().and_then(Iterator::next);
                 if scope.defs.stored(table).is_none() {
                     return Err(unsupported());
                 }
-                let text = if qualify {
-                    arena
-                        .alloc_str_display(format_args!(
-                            "{}.ctid",
-                            crate::sql::catalog::deparse::printed_name(scope.names[table])
-                        ))
-                        .map_err(|_| arena_full())?
-                } else {
-                    "ctid"
-                };
-                push(
-                    &mut targets,
-                    Target {
-                        identity: Some(table),
-                        ..Target::column(Entry {
-                            text,
-                            var: true,
-                            referenced: false,
-                        })
-                    },
-                )?;
+                let parent = item.is_some_and(|item| {
+                    item.inheritance == crate::sql::ast::RelationInheritance::Descendants
+                        && item.cte.is_none()
+                        && item.subquery.is_none()
+                }) && scope.slots[table] != usize::MAX
+                    && query::partition_prune::expands(storage, scope.slots[table], txid);
+                for (column, wanted) in [("ctid", true), ("tableoid", parent)] {
+                    if !wanted {
+                        continue;
+                    }
+                    let text = if qualify {
+                        arena
+                            .alloc_str_display(format_args!(
+                                "{}.{column}",
+                                crate::sql::catalog::deparse::printed_name(scope.names[table])
+                            ))
+                            .map_err(|_| arena_full())?
+                    } else {
+                        column
+                    };
+                    push(
+                        &mut targets,
+                        Target {
+                            identity: Some(table),
+                            ..Target::column(Entry {
+                                text,
+                                var: true,
+                                referenced: false,
+                                shown: None,
+                            })
+                        },
+                    )?;
+                }
             }
         }
         let targets = targets.as_slice();
@@ -615,11 +654,36 @@ impl<'a> BlockTargets<'a> {
                     }
                     return;
                 }
-                let Some((table, index)) = resolve(column) else {
+                // A relation's `tableoid` is a column its scan returns; a
+                // bare relation name reads its whole row.
+                let resolved = match resolve(column) {
+                    Some((table, index)) => Some((table, Some(index))),
+                    None => match (scope, column) {
+                        (Some(scope), Expr::Column { qualifier, name }) => {
+                            match scope.find_column_unsuggested(*qualifier, name) {
+                                Ok(ResolvedColumn::TableOid(table)) => Some((table, None)),
+                                Err(_) if qualifier.is_none() => {
+                                    if let Some(table) =
+                                        scope.names[..scope.n].iter().position(|held| held == name)
+                                    {
+                                        whole_row[table] = true;
+                                    }
+                                    None
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
+                };
+                let Some((table, index)) = resolved else {
                     return;
                 };
                 let result = (|| -> Result<(), Fail> {
-                    let entry = column_entry(table, index)?;
+                    let entry = match index {
+                        Some(index) => column_entry(table, index)?,
+                        None => deparse(column)?,
+                    };
                     match needed_list
                         .as_slice()
                         .iter()
@@ -880,9 +944,15 @@ impl<'a> BlockTargets<'a> {
             labels_plain,
             needed,
             physical,
+            whole_row,
             stages: outputs,
             order,
         })
+    }
+
+    /// Whether the block reads `table`'s whole row.
+    pub(super) fn reads_whole_row(&self, table: usize) -> bool {
+        self.whole_row[table]
     }
 
     /// The output of stage `index`.
@@ -964,6 +1034,7 @@ impl Entry<'_> {
         text: "",
         var: true,
         referenced: false,
+        shown: None,
     };
 }
 
@@ -1139,10 +1210,14 @@ impl<'a> RelationTargets<'a> {
             destination,
             self.arena,
         )?;
+        let expression = crate::sql::catalog::deparse::planned(expression);
+        let shown =
+            crate::sql::catalog::deparse::deparse_shown(&self.context, expression, self.arena)?;
         Ok(text.map(|text| Entry {
             text,
             var: matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)),
             referenced: false,
+            shown,
         }))
     }
 
@@ -1161,6 +1236,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: true,
             referenced: false,
+            shown: None,
         })
     }
 
@@ -1177,6 +1253,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: true,
             referenced: false,
+            shown: None,
         })
     }
 
@@ -1275,6 +1352,7 @@ impl<'a> RelationTargets<'a> {
                     text,
                     var: true,
                     referenced: false,
+                    shown: None,
                 })
                 .map_err(|_| arena_full())?;
         }
@@ -1282,6 +1360,65 @@ impl<'a> RelationTargets<'a> {
             entries.push(self.whole_row()?).map_err(|_| arena_full())?;
         }
         render(entries.as_slice()).map(Some)
+    }
+
+    /// The columns the scan below a `Result` computing [`Self::modified_row`]
+    /// returns (the relation's `reltarget`): each column the new values
+    /// read, first use first (`pull_var_clause` over the processed target
+    /// list), then `tableoid` and the row identity `ctid`. `None` when a
+    /// value reads a whole row or the list is outside the deparser.
+    pub(super) fn modified_row_reads(
+        &self,
+        assignments: &[(&str, &'a Expr<'a>)],
+    ) -> Result<Option<Output>, SqlError> {
+        if assignments
+            .iter()
+            .any(|(target, _)| self.table.column_index(target).is_none())
+        {
+            return Ok(None);
+        }
+        let mut entries: ArenaList<'a, Entry<'a>> = ArenaList::new(self.arena);
+        for column in self.table.columns() {
+            let Some(&(_, value)) = assignments
+                .iter()
+                .find(|(target, _)| *target == column.name.as_str())
+            else {
+                continue;
+            };
+            let mut read = ArenaList::new(self.arena);
+            let mut whole_row = false;
+            columns_of(value, &mut |column| {
+                // A whole-row reference, or a list past the arena, is
+                // outside this list.
+                if matches!(column, Expr::WholeRow(_)) || read.push(column).is_err() {
+                    whole_row = true;
+                }
+            });
+            if whole_row {
+                return Ok(None);
+            }
+            for column in read.as_slice() {
+                let Some(entry) = self.entry(column, Destination::Value)? else {
+                    return Ok(None);
+                };
+                if !entries
+                    .as_slice()
+                    .iter()
+                    .any(|held| held.text == entry.text)
+                {
+                    entries.push(entry).map_err(|_| arena_full())?;
+                }
+            }
+        }
+        let Some(row) = self.modified_row(&[], None, false, true)? else {
+            return Ok(None);
+        };
+        let mut output = render(entries.as_slice())?;
+        if !output.is_empty() {
+            let _ = output.write_str(", ");
+        }
+        let _ = output.write_str(row.as_str());
+        checked(output).map(Some)
     }
 
     /// The planned form of one column's new value: a `DEFAULT` is the
@@ -1445,6 +1582,7 @@ impl<'a> RelationTargets<'a> {
                 .map_err(|_| arena_full())?,
             var: false,
             referenced: false,
+            shown: None,
         }))
     }
 
@@ -1550,7 +1688,10 @@ impl<'a> RelationTargets<'a> {
             match item {
                 SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                     for column in 0..self.table.columns().len() {
-                        push(&mut entries, self.column(column, None)?)?;
+                        push(
+                            &mut entries,
+                            self.column(column, self.context.qualify.then_some(self.exposed))?,
+                        )?;
                     }
                 }
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
@@ -1612,7 +1753,7 @@ impl<'a> RelationTargets<'a> {
             let entry = match key {
                 Expr::Column { name, .. } if self.table.column_index(name).is_some() => {
                     let column = self.table.column_index(name).expect("checked above");
-                    self.column(column, None)?
+                    self.column(column, self.context.qualify.then_some(self.exposed))?
                 }
                 expression => match self.entry(expression, Destination::Value)? {
                     Some(entry) => entry,
@@ -1700,6 +1841,7 @@ impl<'a> RelationTargets<'a> {
             text,
             var: plain,
             referenced: read(expression),
+            shown: None,
         }))
     }
 }

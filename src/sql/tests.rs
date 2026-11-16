@@ -71741,7 +71741,9 @@ fn ordered_index_scans_honor_direction_nulls_aliases_and_committed_overlays() {
          WHERE value = 'a' ORDER BY value",
     ));
     assert!(collated_plan.iter().any(|row| row.contains("Seq Scan")));
-    assert!(collated_plan.iter().any(|row| row.contains("Sort")));
+    // The equality fixes the sort key to a constant, so PostgreSQL's plan
+    // has no Sort either.
+    assert!(collated_plan.iter().all(|row| !row.contains("Sort")));
     assert!(collated_plan.iter().all(|row| !row.contains("Index Scan")));
     let forward_plan = data_rows(&run_with(
         &mut replayed,

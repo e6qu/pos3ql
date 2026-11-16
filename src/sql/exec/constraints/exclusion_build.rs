@@ -275,6 +275,10 @@ fn range_of<'v>(value: &Datum<'v>) -> Result<(&'v str, crate::sql::types::RangeK
     }
 }
 
+/// Runs a visit over one checked row's element values.
+type WithKeys<'w> = dyn Fn(usize, &mut dyn FnMut(&ExclusionKeys<'_>) -> Result<(), SqlError>) -> Result<(), SqlError>
+    + 'w;
+
 /// How the elements' operators let the build find conflicts.
 fn strategy(scan: &ExclusionScan<'_, '_>, n: usize) -> Strategy {
     let mut overlap = None;
@@ -302,10 +306,7 @@ fn sorted_first(
     n: usize,
     overlap: Option<usize>,
     count: usize,
-    with_keys: &dyn Fn(
-        usize,
-        &mut dyn FnMut(&ExclusionKeys<'_>) -> Result<(), SqlError>,
-    ) -> Result<(), SqlError>,
+    with_keys: &WithKeys<'_>,
     conflicts: &dyn Fn(usize, usize) -> Result<bool, SqlError>,
     arena: &Arena,
 ) -> Result<Option<usize>, SqlError> {

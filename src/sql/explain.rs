@@ -3852,6 +3852,7 @@ fn costed_relation<'a>(
 /// cost, then by any amount. Returns whether the FROM table is the outer
 /// relation and the join method; `None` when a relation's condition cannot
 /// be estimated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn joined_write_shape<'a>(
     storage: &Storage,
     scope: &mut QueryScope<'_>,

@@ -87,16 +87,16 @@ mod tests {
 
     #[test]
     fn a_deep_recursion_fails_before_the_stack_overflows() {
-        fn descend(depth: usize) -> Result<usize, SqlError> {
+        fn descend() -> Result<usize, SqlError> {
             check_stack_depth()?;
             let pad = core::hint::black_box([0u8; 512]);
-            descend(depth + 1).map(|reached| reached + usize::from(pad[0]))
+            descend().map(|reached| reached + usize::from(pad[0]))
         }
         // The test thread's fixed stack has room for thousands of levels,
         // but not unbounded ones.
         let error = std::thread::Builder::new()
             .stack_size(32 << 20)
-            .spawn(|| descend(0).unwrap_err())
+            .spawn(|| descend().unwrap_err())
             .unwrap()
             .join()
             .unwrap();

@@ -740,12 +740,11 @@ skip-array scan over several leaf pages. Remaining inexact without
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update
 moves (a pruned page's freed space, HOT chains), which also orders an
-index's equal keys by their current heap position. PostgreSQL 17's
-maintenance operations (`CREATE INDEX`, `ANALYZE`, `REINDEX`, `VACUUM`,
-`REFRESH MATERIALIZED VIEW`) evaluate expressions under the search path
-`pg_catalog, pg_temp`, so an error there names a domain outside it
-qualified (`value for domain public.posint violates ...`); pos3ql keeps
-the session's search path. Grouping, `DISTINCT` and joins above the scan keep the
+index's equal keys by their current heap position. Maintenance
+operations (`CREATE INDEX` and the index builds of `ALTER TABLE`,
+`REINDEX`, `ANALYZE`, materialized view population) evaluate under the
+search path `pg_catalog, pg_temp`, as PostgreSQL 17's `RestrictSearchPath`
+does, after their own names resolve (`differential_exact/754`). Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM

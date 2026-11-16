@@ -1519,10 +1519,13 @@ fn relation_qualifier<Definition0: crate::storage::DefinitionBacking>(
     if table == def.name.as_str() {
         Ok(())
     } else {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_TABLE,
-            "missing FROM-clause entry for table \"{}\"",
-            table
+        Err(crate::sql::error_position::at_subject(
+            sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"",
+                table
+            ),
+            table,
         ))
     }
 }
@@ -1675,11 +1678,14 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         // `(t).column` selects that column of the relation's row.
         Expr::Field { base, field } if *field != "*" && names_relation(base, def)? => {
             let Some(index) = def.column_index(field) else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column {}.{} does not exist",
-                    def.name.as_str(),
-                    field
+                return Err(crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        def.name.as_str(),
+                        field
+                    ),
+                    base,
                 ));
             };
             variables.add_column(index);

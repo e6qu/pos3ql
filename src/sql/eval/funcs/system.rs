@@ -247,6 +247,46 @@ pub(crate) fn session_schemas() -> SessionSchemas {
     SESSION_SCHEMAS.with(|s| *s.borrow())
 }
 
+/// The schema names `current_schema` and `current_schemas` report for `path`.
+/// An explicit `pg_catalog` is a real path element (`current_schema` can be
+/// `pg_catalog`); the implicit one only surfaces in `current_schemas(true)`.
+pub(crate) fn path_session_schemas(
+    storage: &crate::storage::Storage,
+    path: &crate::storage::PathContext,
+    txid: u32,
+) -> SessionSchemas {
+    use core::fmt::Write as _;
+    let mut published = SessionSchemas {
+        names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
+        n: 0,
+        catalog_pos: usize::MAX,
+    };
+    for entry in path.entries() {
+        let name = match entry {
+            crate::storage::PathEntry::Catalog => {
+                if !path.explicit_catalog() {
+                    if published.catalog_pos == usize::MAX {
+                        published.catalog_pos = published.n;
+                    }
+                    continue;
+                }
+                "pg_catalog"
+            }
+            crate::storage::PathEntry::InformationSchema => "information_schema",
+            crate::storage::PathEntry::Toast => "pg_toast",
+            crate::storage::PathEntry::Schema(slot) => {
+                let schema = storage.schema_def_for(usize::from(*slot), txid);
+                let _ = write!(published.names[published.n], "{}", schema.name.as_str());
+                published.n += 1;
+                continue;
+            }
+        };
+        let _ = write!(published.names[published.n], "{name}");
+        published.n += 1;
+    }
+    published
+}
+
 /// Maximum number of readable settings published per statement for
 /// `current_setting`. Comfortably covers the `SHOW ALL` set plus a margin.
 pub const MAX_SESSION_SETTINGS: usize = crate::sql::SETTING_NAMES.len();

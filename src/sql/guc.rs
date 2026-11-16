@@ -3334,6 +3334,31 @@ pub(crate) fn enter_active_routine_configs(
     })
 }
 
+/// The `search_path` PostgreSQL 17+ maintenance operations evaluate under
+/// (`RestrictSearchPath`, `GUC_SAFE_SEARCH_PATH`).
+pub(crate) const RESTRICTED_SEARCH_PATH: &str = "pg_catalog, pg_temp";
+
+/// Sets `search_path` to [`RESTRICTED_SEARCH_PATH`] for the active statement
+/// until the scope drops. Like `RestrictSearchPath`, it checks no privilege.
+pub(crate) fn enter_active_restricted_search_path() -> Result<RoutineConfigScope, SqlError> {
+    let config = crate::storage::RoutineConfig {
+        name: crate::storage::SqlName::parse("search_path")?,
+        value: crate::util::StackStr::from_str(RESTRICTED_SEARCH_PATH),
+    };
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "maintenance operation has no active session configuration"
+            ));
+        }
+        // SAFETY: EvalScope owns this dynamic extent and the returned scope
+        // is dropped before the statement's evaluation ends.
+        unsafe { &*pointer }.apply_routine_configs(&[config])
+    })
+}
+
 /// Moves placeholder `slot`'s value at every level of `state` into the
 /// built-in parameter `name` (`bit`), as PostgreSQL's
 /// `define_custom_variable` reapplies a placeholder's reset, session and

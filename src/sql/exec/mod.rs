@@ -1817,6 +1817,7 @@ mod numeric_loops;
 mod set_rows;
 mod transition_rows;
 pub(super) use call_environment::CallEnvironment;
+pub(crate) use call_environment::MaintenancePath;
 mod function_execution;
 mod procedure_execution;
 mod sql_function_execution;
@@ -61883,41 +61884,44 @@ fn require_static_catalog_comment_superuser(storage: &Storage, txid: u32) -> Res
 }
 
 /// Runs a `CREATE TABLE AS` query into encoded rows in two passes: a dry
-/// count, then the materialization with live sequences.
+/// count, then the materialization with live sequences. A materialized view
+/// binds its query as `REFRESH` does, by the dependencies its definition
+/// keeps, and is populated as a maintenance operation.
 fn create_table_as_rows<'a>(
     storage: &Storage,
     txid: u32,
     sql: &str,
+    materialized: Option<(
+        crate::storage::PathContext,
+        crate::storage::StoredQueryDependencyView<'_>,
+    )>,
     seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum],
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let sel = crate::sql::parser::parse_query(sql, arena)?;
     let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
-    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
-    let mut rows = 0usize;
-    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
-    super::query::select_into_rows(
-        storage,
-        txid,
-        sel,
-        arena,
-        params,
-        None,
-        Some(&dry_sequence),
-        &mut |_| {
-            rows += 1;
-            Ok(())
-        },
-    )?;
-    let empty: &[u8] = &[];
-    let rows_bytes: &mut [&[u8]] = arena.alloc_slice_with(rows, |_| empty).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "CREATE TABLE AS result exceeds the statement arena"
-        )
-    })?;
-    let mut at = 0usize;
+    let (sel, _maintenance) = match materialized {
+        Some((path, dependencies)) => (
+            super::query::expand_stored_query_exec(
+                sel,
+                storage,
+                txid,
+                path,
+                dependencies,
+                arena,
+                params,
+            )?,
+            Some(MaintenancePath::enter(storage, txid)?),
+        ),
+        None => (
+            super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?,
+            None,
+        ),
+    };
+    // One pass, as PostgreSQL runs the query once: each routine it calls
+    // and each sequence value it takes happens once.
+    let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
     super::query::select_into_rows(
         storage,
         txid,
@@ -61927,12 +61931,16 @@ fn create_table_as_rows<'a>(
         None,
         Some(&live_sequence),
         &mut |vals| {
-            rows_bytes[at] = encode_projected_pub(vals, arena)?;
-            at += 1;
-            Ok(())
+            let encoded = encode_projected_pub(vals, arena)?;
+            rows.push(encoded).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "CREATE TABLE AS result exceeds the statement arena"
+                )
+            })
         },
     )?;
-    Ok(rows_bytes)
+    Ok(rows.as_slice())
 }
 
 /// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's
@@ -62167,10 +62175,11 @@ pub fn create_table_as(
         ));
     }
     if with_data && !materialized {
-        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
-            Ok(rows) => rows,
-            Err(error) => return sql_fail(error),
-        };
+        computed =
+            match create_table_as_rows(storage, txn.txid, sql, None, seq_session, arena, params) {
+                Ok(rows) => rows,
+                Err(error) => return sql_fail(error),
+            };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def.clone(), txn.txid) {
@@ -62223,7 +62232,17 @@ pub fn create_table_as(
     let write_target = storage.select_table_definition(table_index, txn.txid).0;
     let mut count = 0u64;
     if with_data && materialized {
-        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+        computed = match create_table_as_rows(
+            storage,
+            txn.txid,
+            sql,
+            Some((path, dependencies.view())),
+            seq_session,
+            arena,
+            params,
+        ) {
             Ok(rows) => rows,
             Err(error) => return sql_fail(error),
         };
@@ -62445,34 +62464,12 @@ pub fn refresh_materialized_view(
     // Capture the replacement before mutating the backing table. Besides
     // separating immutable reads from writes, this preserves the statement
     // snapshot when a materialized view references its prior contents.
-    let mut rows = 0usize;
-    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-    if let Err(e) = super::query::select_into_rows(
-        storage,
-        txn.txid,
-        select,
-        arena,
-        params,
-        None,
-        Some(&dry_sequence),
-        &mut |_| {
-            rows += 1;
-            Ok(())
-        },
-    ) {
-        return sql_fail(e);
-    }
-    let empty: &[u8] = &[];
-    let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
-        Ok(r) => r,
-        Err(_) => {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "REFRESH result exceeds the statement arena"
-            ));
-        }
+    let _maintenance = match MaintenancePath::enter(storage, txn.txid) {
+        Ok(scope) => scope,
+        Err(error) => return sql_fail(error),
     };
-    let mut at = 0usize;
+    // One pass, as PostgreSQL runs the query once.
+    let mut captured = crate::mem::arena::ArenaList::new_persistent(arena);
     if let Err(e) = super::query::select_into_rows(
         storage,
         txn.txid,
@@ -62482,13 +62479,18 @@ pub fn refresh_materialized_view(
         None,
         Some(&live_sequence),
         &mut |values| {
-            rows_bytes[at] = encode_projected_pub(values, arena)?;
-            at += 1;
-            Ok(())
+            let encoded = encode_projected_pub(values, arena)?;
+            captured.push(encoded).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "REFRESH result exceeds the statement arena"
+                )
+            })
         },
     ) {
         return sql_fail(e);
     }
+    let rows_bytes = captured.as_slice();
     // Remove every visible row transactionally (a materialized view has no
     // constraints), then install the already-captured replacement.
     let mut rowids: [u64; 4096] = [0; 4096];
@@ -73406,11 +73408,18 @@ pub fn create_index(
                     None
                 }
                 None => {
-                    return sql_fail(sql_err!(
+                    let error = sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
                         "column \"{}\" does not exist",
                         column_name
-                    ));
+                    );
+                    // A parenthesized key is an analyzed expression, whose
+                    // error points at the name; a bare column has no position.
+                    return sql_fail(if index_column.expression_text.starts_with('(') {
+                        crate::sql::error_position::at_subject(error, column_name)
+                    } else {
+                        error
+                    });
                 }
             },
             None => match ddl::plain_column_reference(index_column.expression, &tdef) {
@@ -73487,10 +73496,13 @@ pub fn create_index(
                         if let Expr::WholeRow(name) = expression
                             && *name != table
                         {
-                            return Err(sql_err!(
-                                sqlstate::UNDEFINED_TABLE,
-                                "missing FROM-clause entry for table \"{}\"",
-                                name
+                            return Err(crate::sql::error_position::at_subject(
+                                sql_err!(
+                                    sqlstate::UNDEFINED_TABLE,
+                                    "missing FROM-clause entry for table \"{}\"",
+                                    name
+                                ),
+                                name,
                             ));
                         }
                         super::query::walk_children(expression, &mut |child| {
@@ -74226,6 +74238,7 @@ fn prepare_index_creation(
     arena: &Arena,
     operation: crate::storage::IndexBindingOperation,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txn.txid)?;
     let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
         sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -74394,6 +74407,7 @@ fn validate_index_rows(
     validation: IndexRowValidation,
     arena: &Arena,
 ) -> Result<crate::storage::TableStatistics, SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
     let statistics = scan_index_rows(storage, table_index, txid, arena, &mut |_, _, _| Ok(()))?;
     let keys = match validation {
         IndexRowValidation::Create { unique: false, .. } => return Ok(statistics),
@@ -77402,6 +77416,26 @@ fn materialize_index_definition(
     register_reindex_definition(storage, wal, txn, candidate.table, original)
 }
 
+/// Evaluates every index key of `table` over its rows, as the index rebuild
+/// of `CLUSTER` and `VACUUM FULL` does: a key whose expression fails, or a
+/// routine it calls, behaves as in PostgreSQL's rebuild.
+pub(crate) fn rebuild_table_index_keys(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
+    validate_index_rows(
+        storage,
+        table,
+        txid,
+        IndexRowValidation::Reindex { selected: None },
+        arena,
+    )
+    .map(|_| ())
+}
+
 fn rebuild_reindex_table_cache(
     storage: &mut Storage,
     txn: &TxnState,
@@ -77409,6 +77443,7 @@ fn rebuild_reindex_table_cache(
     selected: Option<i32>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txn.txid)?;
     validate_index_rows(
         storage,
         table,
@@ -78424,6 +78459,9 @@ pub fn cluster(
             return sql_fail(error);
         }
         if let Err(error) = set_clustered_index(storage, wal, txn, table, Some(selected)) {
+            return sql_fail(error);
+        }
+        if let Err(error) = rebuild_table_index_keys(storage, txn.txid, table, arena) {
             return sql_fail(error);
         }
     }
@@ -97177,6 +97215,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
     let physical = (*storage.table_def(table, txid)).clone();
     let mut sources = [0usize; MAX_COLUMNS];
     for (index, column) in def.columns().iter().enumerate() {
@@ -104654,6 +104693,16 @@ fn alter_table_relation(
             if matches!(source, ColSource::Cast { .. }) {
                 retyped.insert(column);
             }
+        }
+        let _maintenance = match MaintenancePath::enter(storage, txn.txid) {
+            Ok(scope) => scope,
+            Err(error) => return sql_fail(error),
+        };
+        // The rebuilt indexes evaluate their keys over the rewritten rows.
+        if let Err(error) = rows(true, &mut |_, values, _| {
+            constraints::check_index_tuple_sizes(storage, &new_def, values, txn.txid, arena)
+        }) {
+            return sql_fail(error);
         }
         for phase in [
             constraints::RebuildPhase::Kept,

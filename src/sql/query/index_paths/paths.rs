@@ -2151,10 +2151,17 @@ pub(crate) fn scan_path<'a>(
         // An expression key serves a condition on an expression, which a
         // condition the model has no form for may be, or an ORDER BY
         // expression; one it reads also serves its variable's conditions.
+        // A key the model does not read (one calling a user-defined routine,
+        // which PostgreSQL may inline) may hold any compared expression.
         let expression_served = catalog_index.expression_keys[..catalog_index.n_cols]
             .iter()
             .any(|&expression| expression)
-            && (unmodeled.is_some() || order.contains(&OrderKey::Expression));
+            && (unmodeled.is_some()
+                || order.contains(&OrderKey::Expression)
+                || (unread_expressions & (1 << position.min(63)) != 0
+                    && restrictions
+                        .iter()
+                        .any(|restriction| restriction.clause.compares_expression())));
         // A GiST or SP-GiST index may order by a distance (`<->`).
         let orders_by_distance = matches!(
             catalog_index.method,

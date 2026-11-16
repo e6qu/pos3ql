@@ -2,7 +2,6 @@
 -- expressions as PostgreSQL's executor runs it: the statement that builds
 -- or maintains the index calls the function for each row, under the
 -- maintenance operation's search path pg_catalog, pg_temp when it builds.
-\set VERBOSITY default
 CREATE DOMAIN posint755 AS int CHECK (VALUE > 0);
 CREATE TABLE lookup755 (k int);
 CREATE FUNCTION twice755(int) RETURNS int IMMUTABLE LANGUAGE plpgsql

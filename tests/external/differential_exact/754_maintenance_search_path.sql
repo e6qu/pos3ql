@@ -4,7 +4,6 @@
 -- command's own names are resolved: a domain outside that path is named
 -- qualified in a diagnostic, and the evaluation reports the restricted
 -- setting and schemas.
-\set VERBOSITY default
 CREATE SCHEMA s754;
 CREATE DOMAIN posint754 AS int CHECK (VALUE > 0);
 CREATE DOMAIN s754.small754 AS int CHECK (VALUE < 100);

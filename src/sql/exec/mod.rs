@@ -1826,7 +1826,8 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
 pub(crate) use sql_function_execution::{
-    check_inlined_polymorphic_result, check_polymorphic_sql_result, sql_function_inlining,
+    check_inlined_polymorphic_result, check_polymorphic_sql_result, sql_function_body_inlinable,
+    sql_function_inlining,
 };
 mod engine_triggers;
 mod plpgsql_conditions;

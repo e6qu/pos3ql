@@ -3700,8 +3700,14 @@ fn projected_shape<'a>(
     let mut width = 0u32;
     let mut output = StackStr::new();
     for column in &columns[..count] {
+        // A fixed-length type's width is its length, also where the
+        // description leaves the length unset (a subquery's column).
+        let length = crate::sql::types::ColType::from_oid(column.type_oid)
+            .map_or(0, |ctype| ctype.physical_layout().length);
         width = width.saturating_add(if column.typlen > 0 {
             column.typlen as u32
+        } else if length > 0 {
+            length as u32
         } else {
             32
         });
@@ -4223,12 +4229,13 @@ struct CostedRelation {
 #[allow(clippy::too_many_arguments)]
 fn costed_relation<'a>(
     storage: &Storage,
-    scope: &mut QueryScope<'a>,
+    scope: &mut QueryScope<'_>,
     table: usize,
     slots: &[usize],
     condition: Option<&'a Expr<'a>>,
-    keys: &[usize],
+    keys: &[Option<usize>],
     params: &[Datum<'a>],
+    routine: Option<crate::sql::exec::RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<CostedRelation>, SqlError> {
@@ -4253,6 +4260,7 @@ fn costed_relation<'a>(
                     scope.names[table],
                     condition,
                     params,
+                    routine,
                     txid,
                     arena,
                 )? {
@@ -4270,6 +4278,23 @@ fn costed_relation<'a>(
         let statistics = storage.table_statistics(slot, txid);
         let definition = storage.table_def(slot, txid);
         for (distinct, &column) in costed.distinct.iter_mut().zip(keys) {
+            // `get_variable_numdistinct` of an expression without
+            // statistics: the relation's rows when fewer than
+            // `DEFAULT_NUM_DISTINCT`, otherwise that default.
+            let Some(column) = column else {
+                let values = (tuples < 200.0).then(|| clamp_row_estimate(tuples));
+                *distinct = match (*distinct, values) {
+                    (Some(sum), Some(values)) => Some(
+                        sum + if tuples > 0.0 && rows < tuples {
+                            clamp_row_estimate(values * rows / tuples)
+                        } else {
+                            values
+                        },
+                    ),
+                    _ => None,
+                };
+                continue;
+            };
             let Some(column_statistics) = definition
                 .attributes
                 .number(column)
@@ -4315,20 +4340,22 @@ fn costed_relation<'a>(
 /// cost, then by any amount. Returns whether the FROM table is the outer
 /// relation and the join method; `None` when a relation's condition cannot
 /// be estimated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn joined_write_shape<'a>(
     storage: &Storage,
-    scope: &mut QueryScope<'a>,
+    scope: &mut QueryScope<'_>,
     leaves: &[usize],
     join: &query::JoinedWriteJoin<'a>,
     params: &[Datum<'a>],
+    routine: Option<crate::sql::exec::RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(bool, query::JoinedWriteMethod)>, SqlError> {
-    let mut target_keys = [0usize; 8];
-    let mut source_keys = [0usize; 8];
-    for (index, &(target_column, source_column)) in join.keys().iter().enumerate() {
-        target_keys[index] = target_column;
-        source_keys[index] = source_column;
+    let mut target_keys = [None; 8];
+    let mut source_keys = [None; 8];
+    for (index, key) in join.keys().iter().enumerate() {
+        target_keys[index] = key.target_column;
+        source_keys[index] = key.source_column;
     }
     let count = join.keys().len();
     let Some(target) = costed_relation(
@@ -4339,6 +4366,7 @@ pub(crate) fn joined_write_shape<'a>(
         join.conditions.target,
         &target_keys[..count],
         params,
+        routine,
         txid,
         arena,
     )?
@@ -4353,6 +4381,7 @@ pub(crate) fn joined_write_shape<'a>(
         join.conditions.source,
         &source_keys[..count],
         params,
+        routine,
         txid,
         arena,
     )?
@@ -4995,6 +5024,23 @@ struct Sublink<'a> {
     nodes: &'a [PlanNode],
     /// The name of the `WITH` query this InitPlan runs (`CTE name`).
     cte: Option<&'a str>,
+    /// Whether the subquery is an `EXISTS` test, which reads one row.
+    exists: bool,
+}
+
+impl Sublink<'_> {
+    /// What PostgreSQL's `cost_subplan` charges for running this InitPlan
+    /// once (`startup_cost` plus `per_call_cost`): its plan's total cost,
+    /// or for `EXISTS` its startup cost and the run cost of one row.
+    fn initplan_cost(&self) -> f64 {
+        let top = &self.nodes[0];
+        if self.exists {
+            top.startup_cost
+                + (top.total_cost - top.startup_cost) / clamp_row_estimate(top.rows as f64)
+        } else {
+            top.total_cost
+        }
+    }
 }
 
 thread_local! {
@@ -5149,6 +5195,10 @@ fn plan_sublinks<'a>(
             OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= 1);
         }
         let Plan { nodes, count, .. } = inner?;
+        // `simplify_EXISTS_query` drops an `EXISTS` subquery's output.
+        if matches!(node, Expr::Exists(_)) {
+            nodes[0].width = 0;
+        }
         let compared = Compared::of(node);
         // PostgreSQL rescans an uncorrelated subquery it compares row by
         // row from a materialized copy, unless `enable_material` is off or
@@ -5203,6 +5253,7 @@ fn plan_sublinks<'a>(
                 origin,
                 nodes,
                 cte: None,
+                exists: matches!(node, Expr::Exists(_)),
             })
             .map_err(|_| arena_full())?;
     }
@@ -5249,6 +5300,7 @@ fn plan_ctes<'a>(
                 origin: SublinkOrigin::Items,
                 nodes: &plan.nodes[..plan.count],
                 cte: Some(arena.alloc_str(cte.name).map_err(|_| arena_full())?),
+                exists: false,
             })
             .map_err(|_| arena_full())?;
     }
@@ -5481,6 +5533,13 @@ fn attach_subplans<'a>(
         }
         Ok::<(), SqlError>(())
     };
+    // `SS_charge_for_initplans`: the query's top node pays for running its
+    // InitPlans once, before its first row.
+    let initplan_cost = sublinks
+        .iter()
+        .filter(|sublink| sublink.kind == SubplanKind::InitPlan)
+        .map(Sublink::initplan_cost)
+        .sum::<f64>();
     // InitPlans precede the inputs of the top node, after a write's result
     // relations, which are its properties.
     let initplans_after = nodes
@@ -5488,8 +5547,32 @@ fn attach_subplans<'a>(
         .skip(1)
         .take_while(|node| node.target_member)
         .count();
+    // A gating `Result` takes its costs from the plan it gates, which
+    // already paid them (`create_gating_plan`).
+    let charged = if nodes[0].name.as_str() == "Result"
+        && nodes[0].passthrough
+        && nodes
+            .get(1)
+            .is_some_and(|child| child.depth == nodes[0].depth + 1)
+    {
+        2
+    } else {
+        1
+    };
     for (index, node) in nodes.iter().enumerate() {
-        attached.push(*node)?;
+        if index < charged {
+            attached.push(PlanNode {
+                startup_cost: if charged == 2 {
+                    nodes[charged - 1].startup_cost
+                } else {
+                    node.startup_cost
+                } + initplan_cost,
+                total_cost: node.total_cost + initplan_cost,
+                ..*node
+            })?;
+        } else {
+            attached.push(*node)?;
+        }
         if index == initplans_after {
             for (at, _) in sublinks
                 .iter()
@@ -5763,11 +5846,13 @@ fn plan_pulled_select<'a>(
                 output,
                 ..shape
             };
+            // Pseudoconstant conditions gate the scan instead
+            // (`create_gating_plan`) and cost it nothing.
             let planned = query::index_paths::scan_path(
                 storage,
                 scope,
                 txid,
-                statement.where_clause,
+                split_gating(storage, txid, statement.where_clause, arena)?.1,
                 query::streaming_pax_columns_ordered(
                     scope,
                     from,
@@ -9580,6 +9665,7 @@ fn write_initplans<'a, 'e>(
                 origin: SublinkOrigin::Where,
                 nodes: &nodes[..count],
                 cte: None,
+                exists: false,
             })
             .map_err(|_| arena_full())?;
     }
@@ -9805,6 +9891,7 @@ fn plan_write<'a>(
             predicate,
             leaves,
             &[],
+            None,
             txid,
             arena,
         )? {

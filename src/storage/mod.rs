@@ -155,7 +155,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::{CACHED_ARRAY_ELEMENT_BYTES, CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -1528,6 +1528,11 @@ pub struct ColumnMeta {
     /// Whether this column's local NOT NULL constraint participates in
     /// ordinary table inheritance. It is irrelevant for a nullable column.
     pub not_null_inheritable: bool,
+    /// PostgreSQL's `convalidated` of the column's NOT NULL constraint:
+    /// false for one added `NOT VALID`, which new rows satisfy but existing
+    /// ones were not checked against, so nothing may assume them non-null.
+    /// True for a nullable column.
+    pub not_null_validated: bool,
     pub unique: bool,
     pub primary: bool,
     /// Implicit identity generation in stored shapes. The SQL builder also
@@ -1735,6 +1740,12 @@ pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
 pub(crate) const MAX_VIEW_DEFAULTS: usize = 64;
 
 impl ColumnMeta {
+    /// Whether every row of the column is known to be non-null: a validated
+    /// NOT NULL constraint, which a proof may rely on.
+    pub const fn proven_not_null(&self) -> bool {
+        self.not_null.is_required() && self.not_null_validated
+    }
+
     pub const EMPTY: Self = ColumnMeta {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
@@ -1744,6 +1755,7 @@ impl ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -61862,6 +61874,7 @@ pub(crate) mod tests {
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

@@ -10,7 +10,9 @@ CREATE MATERIALIZED VIEW mvc AS SELECT c FROM t;
 ALTER TABLE t ALTER COLUMN c TYPE int;
 DROP MATERIALIZED VIEW mvc;
 ALTER TABLE t ALTER COLUMN c TYPE int;
-ALTER TABLE t ALTER COLUMN b TYPE varchar;
+-- Column b's view and materialized view rules both block its retype; which
+-- one PostgreSQL names follows pg_depend's heap order, which free-space reuse
+-- makes depend on the cluster's history, so b is retyped once vv is gone.
 DROP VIEW vv;
 ALTER TABLE t ALTER COLUMN b TYPE varchar;
 ALTER TABLE t ALTER COLUMN a TYPE bigint;

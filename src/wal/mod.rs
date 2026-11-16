@@ -280,7 +280,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 27;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 28;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1585,8 +1585,11 @@ fn append_table_payload<B: DefinitionBacking>(
             | (u8::from(c.user_type.is_some()) << 7);
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
-        // NOT NULL inheritability in bit 0, `attislocal` in bit 1.
-        ok &= buffer.append(&[u8::from(c.not_null_inheritable) | (u8::from(c.local) << 1)]);
+        // NOT NULL inheritability in bit 0, `attislocal` in bit 1, a NOT
+        // VALID NOT NULL constraint in bit 2.
+        ok &= buffer.append(&[u8::from(c.not_null_inheritable)
+            | (u8::from(c.local) << 1)
+            | (u8::from(!c.proven_not_null() && c.not_null.is_required()) << 2)]);
         // The generation kind (`pg_attribute.attgenerated`), zero when none.
         ok &= buffer.append(&[c
             .default
@@ -8675,11 +8678,16 @@ fn decode_op_inner<'a>(
                 let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
                 at += 1;
                 let column_flags = *payload.get(at)?;
-                if column_flags & !3 != 0 {
+                if column_flags & !7 != 0 {
                     return None;
                 }
                 let not_null_inheritable = column_flags & 1 != 0;
                 let local = column_flags & 2 != 0;
+                let not_null_validated = column_flags & 4 == 0;
+                // Only a NOT NULL constraint can be NOT VALID.
+                if !not_null_validated && !not_null.is_required() {
+                    return None;
+                }
                 at += 1;
                 let generation = match *payload.get(at)? {
                     0 => None,
@@ -8757,6 +8765,7 @@ fn decode_op_inner<'a>(
                     compression,
                     not_null,
                     not_null_inheritable,
+                    not_null_validated,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -12919,7 +12928,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
-        Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
+        Some(OwnedDatum::Array { len, .. }) => {
+            1 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES + *len as usize
+        }
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
             5 + *len as usize
         }
@@ -13360,11 +13371,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             len,
             bytes,
         }) => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             out[0] = 200;
-            out[1..7].copy_from_slice(&element.bytes());
-            out[7] = *len;
-            out[8..8 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            8 + *len as usize
+            out[1..1 + D].copy_from_slice(&element.bytes());
+            out[1 + D] = *len;
+            out[2 + D..2 + D + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + D + *len as usize
         }
         Some(OwnedDatum::Range {
             kind,
@@ -13678,11 +13690,12 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             })
         }
         200 => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             let element = crate::storage::CachedArrayElement::from_bytes(
-                payload.get(*at..*at + 6)?.try_into().ok()?,
+                payload.get(*at..*at + D)?.try_into().ok()?,
             )?;
-            let len = *payload.get(*at + 6)? as usize;
-            *at += 7;
+            let len = *payload.get(*at + D)? as usize;
+            *at += D + 1;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(OwnedDatum::Array {
                 element,
@@ -14283,7 +14296,7 @@ mod tests {
     #[test]
     fn compact_catalog_defaults_keep_postgresql_label_and_reference_types() {
         use crate::sql::types::Datum;
-        assert!(core::mem::size_of::<OwnedDatum>() <= 128);
+        assert!(core::mem::size_of::<OwnedDatum>() <= 136);
         let label = "é".repeat(31) + "a";
         let too_long = "é".repeat(32);
         let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
@@ -15797,6 +15810,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -15817,6 +15831,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -16398,6 +16413,35 @@ mod tests {
                 assert!(incompatible.append(&current.readable()[1..]));
                 assert!(decode_table_payload(incompatible.readable()).is_none());
             }
+        });
+    }
+
+    #[test]
+    fn table_payload_keeps_a_not_valid_not_null_constraint_only_on_its_column() {
+        let mut definition = sample_def();
+        definition.columns[0].not_null_validated = false;
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "not valid payload", 4096).unwrap();
+        let mut encode = |definition: &TableDefBuilder| {
+            payload.clear();
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: definition.into(),
+                }
+            ));
+            let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
+            (
+                restored.columns[0].not_null_validated,
+                restored.columns[1].not_null_validated,
+            )
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(encode(&definition), (false, true));
+            // A nullable column encodes no NOT VALID bit, whatever it holds.
+            definition.columns[1].not_null_validated = false;
+            assert_eq!(encode(&definition), (false, true));
         });
     }
 

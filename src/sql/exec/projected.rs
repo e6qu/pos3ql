@@ -280,7 +280,7 @@ pub fn projected_value_len(v: &Datum) -> Result<usize, SqlError> {
         Datum::JsonPath(text) => 4 + text.len(),
         Datum::Snapshot { value, .. } => 5 + value.raw().len(),
         // Compact element descriptor plus byte length.
-        Datum::Array { raw, .. } => 10 + raw.len(),
+        Datum::Array { raw, .. } => crate::storage::CACHED_ARRAY_ELEMENT_BYTES + 4 + raw.len(),
         Datum::Int2Vector { raw, .. } | Datum::OidVector { raw, .. } => 8 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
@@ -596,10 +596,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = tag;
             let descriptor = crate::storage::CachedArrayElement::from_element(described)
                 .expect("projected array type was bound");
-            out[1..7].copy_from_slice(&descriptor.bytes());
-            out[7..11].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            out[11..11 + raw.len()].copy_from_slice(raw);
-            11 + raw.len()
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
+            out[1..1 + D].copy_from_slice(&descriptor.bytes());
+            out[1 + D..5 + D].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[5 + D..5 + D + raw.len()].copy_from_slice(raw);
+            5 + D + raw.len()
         }
         Datum::Int2Vector { raw, lower_bound } => {
             out[0] = 29;
@@ -977,8 +978,9 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             )
         }
         tag @ (200 | 205) => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             let described = crate::storage::CachedArrayElement::from_bytes(
-                bytes[at..at + 6].try_into().unwrap(),
+                bytes[at..at + D].try_into().unwrap(),
             )
             .expect("projected array descriptor was checked")
             .element();
@@ -988,13 +990,13 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             } else {
                 described
             };
-            let len = u32::from_le_bytes(bytes[at + 6..at + 10].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(bytes[at + D..at + D + 4].try_into().unwrap()) as usize;
             (
                 Datum::Array {
                     element,
-                    raw: &bytes[at + 10..at + 10 + len],
+                    raw: &bytes[at + D + 4..at + D + 4 + len],
                 },
-                10 + len,
+                D + 4 + len,
             )
         }
         16 => {

@@ -18,10 +18,17 @@ mod lexer;
 pub(crate) use lexer::SyntaxError;
 use lexer::{Expecting, Lexer, Token};
 
-/// Maximum nesting depth. The parser and serializers recurse per level, so
-/// this bounds the evaluation stack; container width is bounded only by the
-/// statement arena (PostgreSQL bounds depth by its `max_stack_depth`).
-const MAX_DEPTH: u32 = 1000;
+/// The nesting depths PostgreSQL 18.6's `json` and `jsonb` input functions
+/// reach under its default `max_stack_depth` (2048kB) before
+/// `check_stack_depth` fails, measured against the reference server: its
+/// recursive descent spends a fixed stack frame per level. The parser and
+/// serializers here recurse per level within the query thread's fixed stack
+/// (`QUERY_STACK_BYTES`), so these bound that stack too; container width is
+/// bounded only by the statement arena.
+pub(crate) const JSON_MAX_DEPTH: u32 = 21_790;
+pub(crate) const JSONB_MAX_DEPTH: u32 = 18_675;
+
+pub(crate) use crate::sql::stack_depth::stack_depth_exceeded;
 
 /// Statement-arena exhaustion while building a JSON value.
 fn full() -> SqlError {
@@ -96,6 +103,8 @@ struct Parser<'a> {
     lexer: Lexer<'a>,
     arena: Option<&'a Arena>,
     preserve_object_order: bool,
+    /// The containers that may nest: `json`'s or `jsonb`'s depth.
+    max_depth: u32,
 }
 
 /// Parses `input` into an arena tree (jsonb semantics: objects sorted/deduped).
@@ -156,6 +165,12 @@ impl<'a> Parser<'a> {
             lexer: Lexer::new(input, need_escapes),
             arena,
             preserve_object_order,
+            // Only `jsonb`'s parse sorts and collapses object keys.
+            max_depth: if arena.is_some() && !preserve_object_order {
+                JSONB_MAX_DEPTH
+            } else {
+                JSON_MAX_DEPTH
+            },
         }
     }
 
@@ -167,6 +182,7 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
+        crate::sql::stack_depth::check_stack_depth()?;
         match self.lexer.token() {
             Token::ObjectStart => self.object(depth),
             Token::ArrayStart => self.array(depth),
@@ -174,12 +190,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn nested(depth: u32) -> Result<(), SqlError> {
-        if depth > MAX_DEPTH {
-            return Err(sql_err!(
-                sqlstate::STATEMENT_TOO_COMPLEX,
-                "JSON nested too deeply"
-            ));
+    fn nested(&self, depth: u32) -> Result<(), SqlError> {
+        if depth >= self.max_depth {
+            return Err(stack_depth_exceeded());
         }
         Ok(())
     }
@@ -212,7 +225,7 @@ impl<'a> Parser<'a> {
     }
 
     fn array(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
-        Self::nested(depth)?;
+        self.nested(depth)?;
         self.lexer.lex()?;
         let mut items = self.arena.map(ArenaList::new);
         if self.lexer.token() != Token::ArrayEnd {
@@ -232,7 +245,7 @@ impl<'a> Parser<'a> {
     }
 
     fn object(&mut self, depth: u32) -> Result<Json<'a>, Failure<'a>> {
-        Self::nested(depth)?;
+        self.nested(depth)?;
         self.lexer.lex()?;
         let mut members = self.arena.map(ArenaList::new);
         match self.lexer.token() {
@@ -505,6 +518,7 @@ impl<'a> SourceItems<'a> {
             lexer: self.lexer,
             arena: None,
             preserve_object_order: true,
+            max_depth: JSON_MAX_DEPTH,
         };
         let item = Self::item(&mut parser, self.object, self.first, arena);
         self.lexer = parser.lexer;

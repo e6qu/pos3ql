@@ -15906,7 +15906,8 @@ fn inherited_foreign_key_parent(
 }
 
 /// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
-/// `child_slot`: how many of its parents define it.
+/// `child_slot`: how many of its parents define an inheritable one of its
+/// name, which merging required to have the same predicate.
 pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
@@ -15919,11 +15920,7 @@ pub(crate) fn check_inheritance_count(
             .table_def(usize::from(attachment.parent), txid)
             .checks()
             .iter()
-            .any(|parent| {
-                !parent.no_inherit
-                    && parent.name == child.name
-                    && parent.expression == child.expression
-            })
+            .any(|parent| !parent.no_inherit && parent.name == child.name)
     }));
     partition_count
         + definition
@@ -15935,11 +15932,7 @@ pub(crate) fn check_inheritance_count(
                     .table_def(usize::from(**parent), txid)
                     .checks()
                     .iter()
-                    .any(|parent| {
-                        !parent.no_inherit
-                            && parent.name == child.name
-                            && parent.expression == child.expression
-                    })
+                    .any(|parent| !parent.no_inherit && parent.name == child.name)
             })
             .count()
 }
@@ -16175,6 +16168,9 @@ pub fn constraint_def_text<'a>(
                 write_identifier(&mut rendered, column.name.as_str());
                 if !column.not_null_inheritable {
                     let _ = rendered.write_str(" NO INHERIT");
+                }
+                if !column.not_null_validated {
+                    let _ = rendered.write_str(" NOT VALID");
                 }
                 return Ok(Some(alloc_rendered(
                     &rendered,
@@ -18610,11 +18606,6 @@ fn statistics_element(
             (kind == crate::storage::NamedTypeKind::Domain && !array).then_some(creation)
         });
     let element = match (domain, ctype) {
-        // An array element cannot name a domain over an array of a named
-        // type, so such a column's values are shown as the arrays they are.
-        // The text matches PostgreSQL; binary output names the array type
-        // where PostgreSQL names the domain.
-        (Some(_), ColType::Array(inner)) if inner.is_named() => ArrElem::nested(inner),
         (Some(domain), base) => ArrElem::domain(domain, base),
         (None, ColType::Array(inner)) => ArrElem::nested(inner),
         (None, scalar) => ArrElem::from_coltype(scalar),
@@ -22749,7 +22740,7 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     Datum::Bool(false),
                     Datum::Bool(true),
-                    Datum::Bool(true),
+                    Datum::Bool(column.not_null_validated),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
@@ -24135,6 +24126,7 @@ fn pg_attribute<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -31513,6 +31505,7 @@ fn info_column_type_usage<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

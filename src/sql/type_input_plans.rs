@@ -1483,7 +1483,7 @@ mod tests {
             for (at, key) in keys.iter().enumerate() {
                 let id = plans.reserve(*key).unwrap();
                 let bytes = if at == 0 {
-                    pool.copy_slice(b"TIP2\0\0\0\0").unwrap()
+                    pool.copy_slice(b"TIP3\0\0\0\0").unwrap()
                 } else {
                     SharedSlice::EMPTY
                 };
@@ -1672,7 +1672,7 @@ mod tests {
             plans
                 .complete(
                     first_id,
-                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                    InputImage::Runtime(pool.copy_slice(b"TIP3\0\0\0\0").unwrap()),
                 )
                 .unwrap();
             let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
@@ -2008,7 +2008,7 @@ mod tests {
             plans
                 .complete(
                     old,
-                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                    InputImage::Runtime(pool.copy_slice(b"TIP3\0\0\0\0").unwrap()),
                 )
                 .unwrap();
             let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
@@ -2101,7 +2101,7 @@ mod tests {
             assert!(replacement.reserved.is_none());
             assert!(plans.find(first.key).unwrap().is_none());
             assert!(
-                matches!(pinned, InputImage::Runtime(ref bytes) if bytes.as_ref() == b"TIP2\0\0\0\0")
+                matches!(pinned, InputImage::Runtime(ref bytes) if bytes.as_ref() == b"TIP3\0\0\0\0")
             );
             drop(pinned);
         });
@@ -2124,7 +2124,7 @@ mod tests {
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let bytes = pool.copy_slice(b"TIP3\0\0\0\0").unwrap();
             let root = Key {
                 owner: Owner::Cursor(1),
                 source: source(1),
@@ -2164,7 +2164,7 @@ mod tests {
             drop(bytes);
             assert!(pool.lease::<u8>(1).is_err());
             assert!(
-                matches!(&pinned, InputImage::Runtime(bytes) if bytes.as_ref() == b"TIP2\0\0\0\0")
+                matches!(&pinned, InputImage::Runtime(bytes) if bytes.as_ref() == b"TIP3\0\0\0\0")
             );
             drop(pinned);
             assert!(pool.lease::<u8>(64).is_ok());
@@ -2188,7 +2188,7 @@ mod tests {
             plans
                 .complete(
                     rejected,
-                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                    InputImage::Runtime(pool.copy_slice(b"TIP3\0\0\0\0").unwrap()),
                 )
                 .unwrap();
             plans
@@ -2205,7 +2205,7 @@ mod tests {
             plans
                 .complete(
                     accepted,
-                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                    InputImage::Runtime(pool.copy_slice(b"TIP3\0\0\0\0").unwrap()),
                 )
                 .unwrap();
             plans
@@ -2223,7 +2223,7 @@ mod tests {
             };
             plans.retire(Owner::Cursor(1));
             assert!(pool.lease::<u8>(1).is_err());
-            assert_eq!(bytes.as_ref(), b"TIP2\0\0\0\0");
+            assert_eq!(bytes.as_ref(), b"TIP3\0\0\0\0");
             drop(bytes);
             assert!(pool.lease::<u8>(64).is_ok());
         });
@@ -2245,7 +2245,7 @@ mod tests {
             source: source(7),
         };
         let (retained, old_child) = crate::mem::guard::forbid_alloc(|| {
-            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let bytes = pool.copy_slice(b"TIP3\0\0\0\0").unwrap();
             let parent = plans.reserve(root).unwrap();
             plans
                 .complete(parent, InputImage::Runtime(bytes.clone()))
@@ -2305,7 +2305,7 @@ mod tests {
                 source: source(10),
             };
             let parent = plans.reserve(first).unwrap();
-            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let bytes = pool.copy_slice(b"TIP3\0\0\0\0").unwrap();
             plans.complete(parent, InputImage::Runtime(bytes)).unwrap();
             let waiting = plans.reserve(second).unwrap();
             assert_eq!(
@@ -2346,7 +2346,7 @@ mod tests {
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 1024, 4).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let bytes = pool.copy_slice(b"TIP3\0\0\0\0").unwrap();
             let old_key = Key {
                 owner: Owner::Backend,
                 source: source(1),
@@ -2386,7 +2386,7 @@ mod tests {
                 matches!(plans.find(next_key).unwrap(), Some(Lookup::Ready(id, _)) if id == next)
             );
             assert!(
-                matches!(&retained, InputImage::Runtime(value) if value.as_ref() == b"TIP2\0\0\0\0")
+                matches!(&retained, InputImage::Runtime(value) if value.as_ref() == b"TIP3\0\0\0\0")
             );
             let dynamic_key = Key {
                 owner: Owner::Dynamic {

@@ -34859,6 +34859,77 @@ fn unique_builds_sort_their_keys_within_a_statement_deadline() {
 }
 
 #[test]
+fn exclusion_builds_sort_their_rows_within_a_statement_deadline() {
+    // Probing each row against every other compares O(n^2) pairs, which
+    // 7,500 rows take minutes for in a debug build. Sorting by the equality
+    // elements and sweeping the ranges compares O(n log n). Rebuilding a
+    // unique index after a rewrite sorts its keys too.
+    let mut config = test_config("exclusion-build-sort-deadline");
+    config.txn_rows = 16_384;
+    config.wal_buffer_bytes = 8 << 20;
+    config.wal_bytes = 64 << 20;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 20);
+    session.success(
+        &mut engine,
+        "CREATE TABLE swept (id integer, room int4range, span int4range); \
+         INSERT INTO swept SELECT g, int4range(g % 7, g % 7, '[]'), int4range(g * 10, g * 10 + 5) \
+           FROM generate_series(1, 7500) g; \
+         CREATE UNIQUE INDEX swept_id ON swept (id); \
+         SET statement_timeout = '60s'",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "ALTER TABLE swept ADD CONSTRAINT swept_span EXCLUDE USING gist (span WITH &&); \
+         ALTER TABLE swept ADD CONSTRAINT swept_room EXCLUDE USING gist (room WITH =, span WITH &&); \
+         ALTER TABLE swept ADD CONSTRAINT swept_key EXCLUDE USING btree (id WITH =)",
+        true,
+    );
+    session.success(&mut engine, "CHECKPOINT", true);
+    session.success(
+        &mut engine,
+        "ALTER TABLE swept ALTER COLUMN id TYPE bigint",
+        true,
+    );
+    session.success(&mut engine, "CHECKPOINT", true);
+    session.success(&mut engine, "REINDEX TABLE swept", true);
+    session.success(&mut engine, "CHECKPOINT", true);
+    session.success(
+        &mut engine,
+        "ALTER TABLE swept DROP CONSTRAINT swept_span",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "INSERT INTO swept VALUES (7501, '[99,99]', '[100,200)')",
+        true,
+    );
+    for (statement, message, detail) in [
+        (
+            "ALTER TABLE swept ADD CONSTRAINT swept_all EXCLUDE USING gist (span WITH &&)",
+            "could not create exclusion constraint \"swept_all\"",
+            "Key (span)=([100,105)) conflicts with key (span)=([100,200)).",
+        ),
+        (
+            "ALTER TABLE swept ALTER COLUMN span TYPE int4range \
+             USING CASE WHEN id = 10 THEN '[170,171)'::int4range ELSE span END",
+            "could not create exclusion constraint \"swept_room\"",
+            "Key (room, span)=([3,4), [170,171)) conflicts with key (room, span)=([3,4), [170,175)).",
+        ),
+    ] {
+        let failed = session.execute(&mut engine, statement, true);
+        let failed = String::from_utf8_lossy(&failed);
+        assert!(
+            failed.contains("23P01") && failed.contains(message) && failed.contains(detail),
+            "{failed}"
+        );
+    }
+}
+
+#[test]
 fn uncommitted_create_index_is_invisible_to_other_sessions() {
     let (mut e, mut b) = test_engine();
     let mut a = TxnState::new(&mut b, 256).unwrap();
@@ -62865,14 +62936,18 @@ fn enum_value_identity_compact_ids_preserve_value_size() {
         u32::MAX - 1
     );
     assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
-    assert!(
+    // A domain over an enum array keeps both identities.
+    let enum_array = ColType::Array(crate::sql::types::ArrElem::Enum(Some(
+        crate::storage::TypeCreation::parse(2).unwrap(),
+    )));
+    assert_eq!(
         crate::sql::types::ArrElem::domain(
             crate::storage::TypeCreation::parse(1).unwrap(),
-            ColType::Array(crate::sql::types::ArrElem::Enum(Some(
-                crate::storage::TypeCreation::parse(2).unwrap()
-            )))
+            enum_array
         )
-        .is_none()
+        .unwrap()
+        .to_coltype(),
+        enum_array
     );
 }
 

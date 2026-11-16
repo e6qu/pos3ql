@@ -4555,6 +4555,25 @@ pub(crate) fn work_mem_kilobytes() -> i32 {
     })
 }
 
+/// A planner setting's active value (booleans 0 or 1, integers and reals as
+/// themselves); its default outside a session.
+pub(crate) fn planner_value(name: &str) -> f64 {
+    let index = planner::planner_index(name).expect("a known planner setting");
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return planner::PlannerValues::DEFAULTS.0[index];
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }.store.borrow().current.planner.0[index]
+    })
+}
+
+/// The active `default_statistics_target`.
+pub(crate) fn default_statistics_target() -> usize {
+    planner_value("default_statistics_target") as usize
+}
+
 /// The plan methods the active session allows; PostgreSQL's defaults
 /// outside a session (background work runs with them).
 pub(crate) fn planner_methods() -> PlannerMethods {

@@ -85,6 +85,8 @@ pub(crate) enum Role {
     /// The scan of the FROM position: of its relation, or the `Append` of
     /// the members of its partitioned table or inheritance tree.
     Scan(u16),
+    /// The `Bitmap Index Scan` under the FROM position's bitmap heap scan.
+    BitmapIndex(u16),
     /// The scan of one member of the partitioned table or inheritance tree
     /// at the FROM position, by the member's storage slot.
     Member(u16, u32),
@@ -165,6 +167,10 @@ pub(crate) struct NodeCounters {
     pub(crate) incremental: Option<IncrementalGroups>,
     /// The rows each kind of a `MERGE`'s actions changed.
     pub(crate) merged: MergeTuples,
+    /// A bitmap heap scan's distinct heap pages (`Heap Blocks: exact`).
+    pub(crate) heap_blocks: u64,
+    /// An index-only scan's rows read from pages not all-visible.
+    pub(crate) heap_fetches: u64,
 }
 
 /// The rows a `MERGE`'s actions inserted, updated and deleted.
@@ -658,6 +664,8 @@ impl Slot {
                     updated: 0,
                     deleted: 0,
                 },
+                heap_blocks: 0,
+                heap_fetches: 0,
             },
             open: 0,
             started: None,
@@ -1047,6 +1055,20 @@ impl Node {
     pub(crate) fn checkpoint(self) {
         self.with(|slot, _| {
             slot.carried = Some((slot.counters.rows, slot.counters.filtered));
+        });
+    }
+
+    /// Counts a heap page a bitmap heap scan read.
+    pub(crate) fn heap_block(self) {
+        self.with(|slot, _| {
+            slot.counters.heap_blocks = slot.counters.heap_blocks.saturating_add(1)
+        });
+    }
+
+    /// Counts a row an index-only scan read from its heap page.
+    pub(crate) fn heap_fetch(self) {
+        self.with(|slot, _| {
+            slot.counters.heap_fetches = slot.counters.heap_fetches.saturating_add(1);
         });
     }
 

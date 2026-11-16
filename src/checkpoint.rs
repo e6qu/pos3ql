@@ -4215,12 +4215,14 @@ impl Checkpointer {
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut value_indexes: Vec<LoadedValueIndex> = Vec::new();
-        let mut table_statistics: Vec<(
-            usize,
-            crate::storage::TableStatistics,
-            crate::mem::lease_pool::MutableSlice<crate::storage::AnalyzedColumn>,
-            usize,
-        )> = Vec::new();
+        struct LoadedTableStatistics {
+            table_index: usize,
+            statistics: crate::storage::TableStatistics,
+            records: crate::mem::lease_pool::MutableSlice<crate::storage::AnalyzedColumn>,
+            values: crate::mem::lease_pool::MutableSlice<u8>,
+            expected: usize,
+        }
+        let mut table_statistics: Vec<LoadedTableStatistics> = Vec::new();
         let mut relation_index_hints: Vec<(usize, bool)> = Vec::new();
         struct LoadedExtendedStatistics {
             database: crate::storage::DatabaseOid,
@@ -4707,32 +4709,41 @@ impl Checkpointer {
                         parse_field(words.next(), "stats average row width")?;
                     let analyzed_generation: u64 =
                         parse_field(words.next(), "stats analyzed generation")?;
+                    let pages: u64 = parse_field(words.next(), "stats pages")?;
+                    let all_visible_pages: u64 =
+                        parse_field(words.next(), "stats all-visible pages")?;
                     let column_count: usize =
                         parse_field(words.next(), "stats analyzed column count")?;
+                    let value_bytes: usize = parse_field(words.next(), "stats distribution bytes")?;
                     if column_count > crate::storage::MAX_RELATION_COLUMNS
                         || words.next().is_some()
                         || table_statistics
                             .iter()
-                            .any(|(existing, _, _, _)| *existing == table_index)
+                            .any(|loaded| loaded.table_index == table_index)
                     {
                         return Err(CheckpointSetupError::Corrupt(
                             "duplicate or malformed table statistics",
                         ));
                     }
-                    table_statistics.push((
+                    table_statistics.push(LoadedTableStatistics {
                         table_index,
-                        crate::storage::TableStatistics {
+                        statistics: crate::storage::TableStatistics {
                             valid: true,
                             rows,
                             average_row_width,
                             analyzed_generation,
-                            columns: crate::mem::lease_pool::SharedSlice::EMPTY,
+                            pages,
+                            all_visible_pages,
+                            columns: crate::storage::ColumnImages::EMPTY,
                         },
-                        storage
+                        records: storage
                             .reserve_statistics_columns(column_count)
                             .map_err(CheckpointSetupError::Replay)?,
-                        column_count,
-                    ));
+                        values: storage
+                            .reserve_statistics_values(value_bytes)
+                            .map_err(CheckpointSetupError::Replay)?,
+                        expected: column_count,
+                    });
                 }
                 Some("cstat") => {
                     let table_index: usize = parse_field(words.next(), "cstat table index")?;
@@ -4742,34 +4753,25 @@ impl Checkpointer {
                             "statistics column out of range",
                         ));
                     }
-                    let null_fraction_ppm: u32 = parse_field(words.next(), "cstat null fraction")?;
-                    if null_fraction_ppm > 1_000_000 {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "statistics null fraction out of range",
-                        ));
-                    }
+                    let null_fraction: u32 = parse_field(words.next(), "cstat null fraction")?;
                     let distinct_values: u64 = parse_field(words.next(), "cstat distinct values")?;
-                    let distinct_fraction_ppm: u32 =
+                    let distinct_fraction: u32 =
                         parse_field(words.next(), "cstat distinct fraction")?;
-                    if distinct_fraction_ppm > 1_000_000 {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "statistics distinct fraction out of range",
-                        ));
-                    }
                     let average_width: u32 = parse_field(words.next(), "cstat average width")?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed column statistics"));
                     }
-                    let Some((_, _, columns, expected)) = table_statistics
+                    let Some(loaded) = table_statistics
                         .iter_mut()
-                        .find(|(existing, _, _, _)| *existing == table_index)
+                        .find(|loaded| loaded.table_index == table_index)
                     else {
                         return Err(CheckpointSetupError::Corrupt(
                             "column statistics precede table statistics",
                         ));
                     };
-                    if columns.len() == *expected
-                        || columns
+                    if loaded.records.len() == loaded.expected
+                        || loaded
+                            .records
                             .last()
                             .is_some_and(|previous| previous.attribute() >= column)
                     {
@@ -4781,18 +4783,67 @@ impl Checkpointer {
                         column,
                         crate::storage::ColumnStatistics {
                             valid: true,
-                            null_fraction_ppm,
+                            null_fraction: f32::from_bits(null_fraction),
                             distinct_values,
-                            distinct_fraction_ppm,
+                            distinct_fraction: f32::from_bits(distinct_fraction),
                             average_width,
                         },
                     )
                     .map_err(|_| {
                         CheckpointSetupError::Corrupt("invalid analyzed column statistics")
                     })?;
-                    columns
+                    loaded
+                        .records
                         .push_reserved(record)
                         .expect("manifest statistics count was reserved");
+                }
+                Some("cdist") => {
+                    let table_index: usize = parse_field(words.next(), "cdist table index")?;
+                    let column: u16 = parse_field(words.next(), "cdist attribute")?;
+                    let hex = words.next().unwrap_or("");
+                    let Some(loaded) = table_statistics
+                        .iter_mut()
+                        .find(|loaded| loaded.table_index == table_index)
+                    else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column distribution precedes table statistics",
+                        ));
+                    };
+                    let Some(record) = loaded
+                        .records
+                        .last_mut()
+                        .filter(|record| record.attribute() == column)
+                    else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column distribution does not follow its column statistics",
+                        ));
+                    };
+                    let at = loaded.values.len();
+                    if words.next().is_some()
+                        || hex.is_empty()
+                        || !hex.len().is_multiple_of(2)
+                        || !record.distribution_range().is_empty()
+                        || at + hex.len() / 2 > loaded.values.capacity_entries()
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "malformed column distribution",
+                        ));
+                    }
+                    for pair in hex.as_bytes().as_chunks::<2>().0 {
+                        let byte = core::str::from_utf8(pair)
+                            .ok()
+                            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "malformed column distribution",
+                            ))?;
+                        loaded
+                            .values
+                            .push_reserved(byte)
+                            .expect("manifest distribution bytes were reserved");
+                    }
+                    *record = record.with_distribution(at, hex.len() / 2).map_err(|_| {
+                        CheckpointSetupError::Corrupt("malformed column distribution")
+                    })?;
                 }
                 Some("estat") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -4956,24 +5007,22 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid estatexpr key"));
                     }
-                    let null_fraction_ppm = parse_field(words.next(), "estatexpr null fraction")?;
+                    let null_fraction: u32 = parse_field(words.next(), "estatexpr null fraction")?;
                     let distinct_values = parse_field(words.next(), "estatexpr distinct")?;
-                    let distinct_fraction_ppm =
+                    let distinct_fraction: u32 =
                         parse_field(words.next(), "estatexpr distinct fraction")?;
                     let average_width = parse_field(words.next(), "estatexpr width")?;
-                    if null_fraction_ppm > 1_000_000
-                        || distinct_fraction_ppm > 1_000_000
-                        || words.next().is_some()
-                    {
-                        return Err(CheckpointSetupError::Corrupt("invalid estatexpr"));
-                    }
-                    statistics.data.expression_statistics[key] = crate::storage::ColumnStatistics {
+                    let column = crate::storage::ColumnStatistics {
                         valid: true,
-                        null_fraction_ppm,
+                        null_fraction: f32::from_bits(null_fraction),
                         distinct_values,
-                        distinct_fraction_ppm,
+                        distinct_fraction: f32::from_bits(distinct_fraction),
                         average_width,
                     };
+                    if !column.fractions_valid() || words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatexpr"));
+                    }
+                    statistics.data.expression_statistics[key] = column;
                 }
                 Some("estatmcv") => {
                     let created_at: u64 = parse_field(words.next(), "estatmcv identity")?;
@@ -9900,7 +9949,14 @@ impl Checkpointer {
                 .replay_relation_index_hint(storage.table_position(slot), has_index, 0)
                 .map_err(|_| CheckpointSetupError::Corrupt("invalid relation index hint source"))?;
         }
-        for (manifest_index, mut statistics, columns, expected) in table_statistics {
+        for LoadedTableStatistics {
+            table_index: manifest_index,
+            mut statistics,
+            records: columns,
+            values,
+            expected,
+        } in table_statistics
+        {
             let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
                 CheckpointSetupError::Corrupt("statistics reference unknown table"),
             )?;
@@ -9914,7 +9970,14 @@ impl Checkpointer {
                     "incomplete analyzed column statistics",
                 ));
             }
-            statistics.columns = columns.freeze();
+            if values.len() != values.capacity_entries() {
+                return Err(CheckpointSetupError::Corrupt(
+                    "incomplete column distributions",
+                ));
+            }
+            statistics.columns =
+                crate::storage::ColumnImages::new(columns.freeze(), values.freeze())
+                    .map_err(|_| CheckpointSetupError::Corrupt("invalid column distributions"))?;
             storage
                 .install_table_statistics(slot, statistics)
                 .map_err(|_| {
@@ -11188,11 +11251,21 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "stats {slot} {} {} {} {}",
+                        "stats {slot} {} {} {} {} {} {} {}",
                         table_statistics.rows,
                         table_statistics.average_row_width,
                         table_statistics.analyzed_generation,
-                        table_statistics.columns.len()
+                        table_statistics.pages,
+                        table_statistics.all_visible_pages,
+                        table_statistics.columns.len(),
+                        table_statistics
+                            .columns
+                            .iter()
+                            .map(|record| table_statistics
+                                .columns
+                                .distribution_bytes(*record)
+                                .len())
+                            .sum::<usize>()
                     ),
                 )?;
                 for record in table_statistics.columns.iter() {
@@ -11202,12 +11275,19 @@ impl Checkpointer {
                         &mut self.manifest_output,
                         format_args!(
                             "cstat {slot} {column} {} {} {} {}",
-                            statistics.null_fraction_ppm,
+                            statistics.null_fraction.to_bits(),
                             statistics.distinct_values,
-                            statistics.distinct_fraction_ppm,
+                            statistics.distinct_fraction.to_bits(),
                             statistics.average_width
                         ),
                     )?;
+                    let distribution = table_statistics.columns.distribution_bytes(*record);
+                    if !distribution.is_empty() {
+                        write_manifest(
+                            &mut self.manifest_output,
+                            format_args!("cdist {slot} {column} {}", ManifestHex(distribution)),
+                        )?;
+                    }
                 }
             }
             // Constraint lines (hex-encoded names/text tolerate spaces):
@@ -11649,9 +11729,9 @@ impl Checkpointer {
                         format_args!(
                             "estatexpr {} {key} {} {} {} {}",
                             statistics.created_at,
-                            column.null_fraction_ppm,
+                            column.null_fraction.to_bits(),
                             column.distinct_values,
-                            column.distinct_fraction_ppm,
+                            column.distinct_fraction.to_bits(),
                             column.average_width,
                         ),
                     )?;
@@ -16472,6 +16552,18 @@ fn manifest_full() -> SqlError {
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "checkpoint manifest is full; raise checkpoint_manifest_bytes"
     )
+}
+
+/// Bytes written as lowercase hexadecimal digits.
+struct ManifestHex<'a>(&'a [u8]);
+
+impl core::fmt::Display for ManifestHex<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {

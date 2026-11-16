@@ -165,8 +165,15 @@ Other payload rules:
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
-- **Table statistics** use V5 marker 251, a declared record count and strictly
-  increasing column numbers 1–1,600. V3/V4 images are rejected.
+- **Table statistics** use V6 marker 250, a declared record count and strictly
+  increasing column numbers 1–1,600. Each column stores its null and
+  distinct fractions as IEEE-754 `float4` bits and ends with a four-byte
+  length and its value distribution: format byte 1, a correlation flag and
+  `float4`, the most-common-value and histogram counts, the most-common
+  frequencies, one offset per value and the values as one-column row
+  encodings (empty when ANALYZE computed none). The checkpoint manifest's
+  `stats` line adds the image's distribution bytes and a `cdist` line after
+  each `cstat` holds them in hexadecimal. V3–V5 images are rejected.
 - **Commit boundaries** append PostgreSQL-epoch commit microseconds to the
   transaction identity fields. The empty, identity-only and
   identity-plus-assignment forms are still read; LSN recovery can use them, but

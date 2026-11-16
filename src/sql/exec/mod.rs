@@ -72425,13 +72425,13 @@ pub(crate) fn analyze_extended_statistics(
         for key in 0..n_keys {
             data.expression_statistics[key] = ColumnStatistics {
                 valid: rows != 0,
-                null_fraction_ppm: nulls[key]
-                    .saturating_mul(1_000_000)
-                    .checked_div(rows)
-                    .unwrap_or(0)
-                    .min(u64::from(u32::MAX)) as u32,
+                null_fraction: if rows == 0 {
+                    0.0
+                } else {
+                    (nulls[key] as f64 / rows as f64) as f32
+                },
                 distinct_values: distinct_estimate(&key_registers[key]).min(non_nulls[key]),
-                distinct_fraction_ppm: 0,
+                distinct_fraction: 0.0,
                 average_width: widths[key]
                     .checked_div(non_nulls[key])
                     .unwrap_or(0)
@@ -74026,11 +74026,19 @@ fn validate_index_rows_by_probe(
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
+        let mut packing = crate::storage::heap_layout::HeapPacking::new();
+        let mut pack = |values: &[Datum]| {
+            packing.add(crate::storage::heap_layout::tuple_length(
+                values,
+                &schema[..definition.n_columns],
+            ));
+        };
         let overlay = scan.for_each_overlay(&mut |rowid, home| {
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
                 validate_values(rowid, &values[..definition.n_columns])?;
+                pack(&values[..definition.n_columns]);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -74054,6 +74062,7 @@ fn validate_index_rows_by_probe(
                     crate::storage::SpilledRowRepresentation::Values(values) => values,
                 };
                 validate_values(spilled.rowid, values)?;
+                pack(values);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => bytes.len() as u64,
@@ -74065,8 +74074,11 @@ fn validate_index_rows_by_probe(
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         let mut statistics = storage.table_statistics(table_index, 0);
-        statistics.valid = true;
+        // PostgreSQL's `index_update_stats` leaves a never-counted empty
+        // table's `reltuples` at -1.
+        statistics.valid |= rows != 0;
         statistics.rows = rows;
+        statistics.pages = packing.pages();
         statistics.average_row_width = row_bytes
             .checked_div(rows)
             .unwrap_or(0)

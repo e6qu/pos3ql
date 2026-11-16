@@ -84,6 +84,7 @@ pub(crate) use scan::{
     row_security_passes,
 };
 
+pub(crate) mod index_paths;
 mod scope;
 pub(crate) use cte::{
     bind_dml_materialized_relations, bind_materialized_expression, bind_materialized_relations,
@@ -13242,6 +13243,72 @@ pub(crate) fn select_query_resumable<'a>(
         storage,
         txid,
         arena,
+    };
+    // The scan of one relation follows the path PostgreSQL chooses for the
+    // query's ordering and row limit.
+    let _scan_context = if scope.n == 1
+        && statement
+            .where_clause
+            .is_none_or(|condition| !condition.contains_subquery())
+        && from.joins.is_empty()
+        && from.base.sample.is_none()
+        && statement.group_by.is_empty()
+        && !statement.distinct
+        && statement.distinct_on.is_empty()
+        && !statement
+            .order_by
+            .iter()
+            .any(|order| expr_has_window(order.expression))
+        && !has_set_returning_items(statement.items, storage, txid)
+    {
+        let aggregated = statement.having.is_some()
+            || statement.items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    expr_has_aggregate(expression, storage, txid, &resolved_columns).unwrap_or(true)
+                }
+                _ => false,
+            });
+        let windowed = statement.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
+        });
+        let shape = if windowed {
+            None
+        } else if aggregated {
+            Some(index_paths::QueryShape::default())
+        } else {
+            match index_paths::query_shape(
+                storage,
+                txid,
+                &scope,
+                statement.items,
+                statement.order_by,
+                statement.limit,
+                statement.offset,
+                params,
+                arena,
+            ) {
+                Ok(shape) => shape.map(|shape| index_paths::QueryShape {
+                    stop_at_limit: statement.locking.is_empty(),
+                    ..shape
+                }),
+                Err(error) => return sql_fail(error),
+            }
+        };
+        Some(index_paths::enter_query(
+            scope.slots[0],
+            statement.where_clause,
+            streaming_pax_columns_ordered(
+                &scope,
+                from,
+                statement.items,
+                statement.where_clause,
+                statement.order_by,
+            )
+            .selected_mask(0),
+            shape,
+        ))
+    } else {
+        None
     };
     let relation_mode = if statement.locking.is_empty() {
         crate::sql::ast::TableLockMode::AccessShare

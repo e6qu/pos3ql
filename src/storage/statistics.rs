@@ -1,7 +1,10 @@
 //! Statistics visibility and saved-image acknowledgements have separate ownership.
 
 mod columns;
-pub(crate) use columns::AnalyzedColumn;
+pub(crate) mod distribution;
+pub(crate) mod heap_layout;
+pub(crate) mod scalar;
+pub(crate) use columns::{AnalyzedColumn, ColumnImages};
 
 use core::mem::size_of;
 use core::num::NonZeroU64;
@@ -27,10 +30,15 @@ impl TableStatistics {
 
     pub(crate) fn relation_pages(&self) -> i32 {
         if self.valid {
-            self.rows
-                .saturating_mul(u64::from(self.average_row_width))
-                .div_ceil(8_192)
-                .min(i32::MAX as u64) as i32
+            self.pages.min(i32::MAX as u64) as i32
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn relation_all_visible_pages(&self) -> i32 {
+        if self.valid {
+            self.all_visible_pages.min(self.pages).min(i32::MAX as u64) as i32
         } else {
             0
         }
@@ -65,7 +73,7 @@ pub(super) enum StatisticsVersionOwner {
 pub(super) struct PreparedDefinitionStatistics<'a> {
     state: RwLockWriteGuard<'a, StatisticsState>,
     versions: RwLockWriteGuard<'a, FixedVec<PendingTableStatisticsSlot>>,
-    columns: super::SharedSlice<AnalyzedColumn>,
+    columns: ColumnImages,
     slot: usize,
     depth: u32,
     transaction: u32,
@@ -78,7 +86,7 @@ impl PreparedDefinitionStatistics<'_> {
             used: true,
             previous,
             depth: self.depth,
-            columns: core::mem::replace(&mut self.columns, super::SharedSlice::EMPTY),
+            columns: core::mem::replace(&mut self.columns, ColumnImages::EMPTY),
             owner: StatisticsVersionOwner::Definition(revision),
         };
         if self.slot == self.versions.len() {
@@ -424,7 +432,7 @@ fn clear_pending(state: &mut StatisticsState, versions: &mut FixedVec<PendingTab
     while let Some(slot) = tail {
         let entry = &mut versions[slot];
         tail = entry.previous;
-        entry.columns = super::SharedSlice::EMPTY;
+        entry.columns = ColumnImages::EMPTY;
         entry.used = false;
     }
 }
@@ -446,6 +454,44 @@ impl Storage {
         }
         self.statistics_pool
             .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+    }
+
+    /// The records of `source` that `retain` keeps with their distributions,
+    /// in a new image owning only their bytes.
+    pub(crate) fn retained_column_images(
+        &self,
+        source: &ColumnImages,
+        retain: &dyn Fn(AnalyzedColumn) -> bool,
+    ) -> Result<ColumnImages, SqlError> {
+        let (count, bytes) = source
+            .iter()
+            .filter(|record| retain(**record))
+            .fold((0, 0), |(count, bytes), record| {
+                (count + 1, bytes + record.distribution_range().len())
+            });
+        let mut records = self.reserve_statistics_columns(count)?;
+        let mut values = self.reserve_statistics_values(bytes)?;
+        for &record in source.iter().filter(|record| retain(**record)) {
+            let distribution = source.distribution_bytes(record);
+            let record = record.with_distribution(values.len(), distribution.len())?;
+            values
+                .extend_from_slice(distribution)
+                .expect("retained distribution bytes were reserved");
+            records
+                .push_reserved(record)
+                .expect("retained statistics count was reserved");
+        }
+        ColumnImages::new(records.freeze(), values.freeze())
+    }
+
+    /// Leases `bytes` of the statistics pool for column distributions.
+    pub(crate) fn reserve_statistics_values(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::mem::lease_pool::MutableSlice<u8>, SqlError> {
+        self.statistics_pool
+            .lease(bytes)
             .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
     }
 
@@ -536,7 +582,7 @@ impl Storage {
         &self,
         table_slot: usize,
         txid: u32,
-    ) -> Option<super::SharedSlice<AnalyzedColumn>> {
+    ) -> Option<ColumnImages> {
         let state = self.tables[table_slot].statistics.read();
         state
             .pending
@@ -673,6 +719,8 @@ impl Storage {
         state.committed.rows = statistics.rows;
         state.committed.average_row_width = statistics.average_row_width;
         state.committed.analyzed_generation = statistics.analyzed_generation;
+        state.committed.pages = statistics.pages;
+        state.committed.all_visible_pages = statistics.all_visible_pages;
         state.relation_revision = revision;
         state.dirty = true;
         state.wal_dirty = true;
@@ -700,6 +748,8 @@ impl Storage {
             statistics.rows = current.rows;
             statistics.average_row_width = current.average_row_width;
             statistics.analyzed_generation = current.analyzed_generation;
+            statistics.pages = current.pages;
+            statistics.all_visible_pages = current.all_visible_pages;
         }
         let revision = if origin == StatisticsOrigin::Definition {
             let definition = self.tables[table_slot].definition.read();
@@ -738,6 +788,8 @@ impl Storage {
                 state.committed.rows = statistics.rows;
                 state.committed.average_row_width = statistics.average_row_width;
                 state.committed.analyzed_generation = statistics.analyzed_generation;
+                state.committed.pages = statistics.pages;
+                state.committed.all_visible_pages = statistics.all_visible_pages;
                 state.relation_revision = next;
                 state.dirty = true;
                 state.wal_dirty = true;
@@ -780,6 +832,8 @@ impl Storage {
         state.committed.rows = statistics.rows;
         state.committed.average_row_width = statistics.average_row_width;
         state.committed.analyzed_generation = statistics.analyzed_generation;
+        state.committed.pages = statistics.pages;
+        state.committed.all_visible_pages = statistics.all_visible_pages;
         state.relation_revision = revision;
         state.dirty = true;
         state.wal_dirty |= dirty_wal;
@@ -812,7 +866,7 @@ impl Storage {
                     state.pending =
                         previous.map(|tail| PendingStatisticsHead { transaction, tail });
                 }
-                versions[slot].columns = super::SharedSlice::EMPTY;
+                versions[slot].columns = ColumnImages::EMPTY;
                 versions[slot].used = false;
                 let mut remaining = state.pending.map(|head| head.tail);
                 let mut depth = remaining.map_or(0, |tail| versions[tail].depth);
@@ -914,16 +968,11 @@ impl Storage {
                 "pending table-statistics pool is exhausted"
             ));
         }
-        let mut columns = self.reserve_statistics_columns(count)?;
-        for &record in source.iter().filter(retain) {
-            columns
-                .push_reserved(record)
-                .expect("filtered statistics count was reserved");
-        }
+        let columns = self.retained_column_images(source, &|record| retain(&&record))?;
         Ok(Some(PreparedDefinitionStatistics {
             state,
             versions,
-            columns: columns.freeze(),
+            columns,
             slot,
             depth,
             transaction,
@@ -951,7 +1000,7 @@ impl Storage {
             .write()
             .expect("statistics versions lock poisoned");
         state.committed.columns =
-            core::mem::replace(&mut versions[head.tail].columns, super::SharedSlice::EMPTY);
+            core::mem::replace(&mut versions[head.tail].columns, ColumnImages::EMPTY);
         state.dirty = true;
         clear_pending(&mut state, &mut versions);
     }
@@ -1244,7 +1293,13 @@ mod tests {
             rows,
             average_row_width: (rows * 2) as u32,
             analyzed_generation: rows * 3,
-            columns: columns.freeze(),
+            pages: rows,
+            all_visible_pages: 0,
+            columns: ColumnImages::new(
+                columns.freeze(),
+                crate::mem::lease_pool::SharedSlice::EMPTY,
+            )
+            .unwrap(),
         }
     }
 
@@ -1611,7 +1666,9 @@ mod tests {
             columns
                 .push_reserved(AnalyzedColumn::new(1, column).unwrap())
                 .unwrap();
-            same_counts.columns = columns.freeze();
+            same_counts.columns =
+                ColumnImages::new(columns.freeze(), crate::mem::lease_pool::SharedSlice::EMPTY)
+                    .unwrap();
             storage
                 .write_table_statistics(table, 11, same_counts.clone())
                 .unwrap();
@@ -1714,10 +1771,14 @@ mod tests {
                 .unwrap()
             };
             let mut initial = image(&storage, 1);
-            initial.columns = storage
-                .statistics_pool
-                .copy_slice(&[record(1, 5), record(2, 7)])
-                .unwrap();
+            initial.columns = ColumnImages::new(
+                storage
+                    .statistics_pool
+                    .copy_slice(&[record(1, 5), record(2, 7)])
+                    .unwrap(),
+                crate::mem::lease_pool::SharedSlice::EMPTY,
+            )
+            .unwrap();
             storage.write_table_statistics(table, 7, initial).unwrap();
             storage.commit_table_statistics(table, 7);
             let old = storage.table_statistics(table, 0);
@@ -1818,7 +1879,9 @@ mod tests {
             }
             let mut statistics = TableStatistics::EMPTY;
             statistics.valid = true;
-            statistics.columns = columns.freeze();
+            statistics.columns =
+                ColumnImages::new(columns.freeze(), crate::mem::lease_pool::SharedSlice::EMPTY)
+                    .unwrap();
             storage
                 .write_table_statistics(table, 7, statistics)
                 .unwrap();
@@ -1870,6 +1933,7 @@ mod tests {
             let mut first = empty.clone();
             first.valid = true;
             first.rows = 1;
+            first.pages = 1;
             first.average_row_width = 8;
             assert!(first.relation_estimates_changed(&empty));
             assert_eq!((first.relation_tuples(), first.relation_pages()), (1.0, 1));
@@ -1878,7 +1942,7 @@ mod tests {
             samples_only.average_row_width = 16;
             assert!(!samples_only.relation_estimates_changed(&first));
             let mut pages_changed = first.clone();
-            pages_changed.average_row_width = 8_193;
+            pages_changed.pages = 2;
             assert!(pages_changed.relation_estimates_changed(&first));
             assert_eq!(pages_changed.relation_pages(), 2);
             let mut rows_changed = first.clone();

@@ -591,7 +591,9 @@ mod tests {
                 .insert(1, RowState::committed_only_at(location, 11))
                 .unwrap();
             let before = storage.table_statistics(table, 0);
-            let failed = storage.analyze_table(table, 0, &[], &small).unwrap_err();
+            let failed = storage
+                .analyze_table(table, 0, &[], 100, &small)
+                .unwrap_err();
             assert_eq!(failed.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(storage.read_snapshot(), 1);
             assert_eq!(storage.commit_snapshot(), 7);

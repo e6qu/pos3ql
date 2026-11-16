@@ -88,8 +88,10 @@ fn prepared_definition_statistics_resolve_cold_with_the_shared_pool_full() {
                 let name = format!("prepared-statistics-{mode_name}-{checkpoint}-{commit}");
                 let mut config = test_config(&name);
                 config.transaction_mode = mode;
-                config.statistics_bytes = 128;
-                config.statistics_leases = 2;
+                // The committed image's records (two) and distributions,
+                // and the prepared image's one record and distribution.
+                config.statistics_bytes = 320;
+                config.statistics_leases = 4;
                 config.max_analyze_per_transaction = 1;
                 config.max_prepared_transactions = 1;
                 config.max_ddl_per_transaction = 8;
@@ -169,7 +171,7 @@ fn prepared_definition_statistics_resolve_cold_with_the_shared_pool_full() {
 fn assert_statistics_pool_full(engine: &Engine) {
     crate::mem::guard::forbid_alloc(|| {
         let Err(error) = engine.storage.statistics_pool().lease::<u8>(1) else {
-            panic!("committed and prepared statistics must occupy both startup leases");
+            panic!("committed and prepared statistics must occupy every startup lease");
         };
         assert_eq!(error.free_bytes, 0);
         assert_eq!(error.available_leases, 0);

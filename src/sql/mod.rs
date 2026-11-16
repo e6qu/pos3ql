@@ -10328,9 +10328,13 @@ impl Engine {
                     self.work.reset();
                     let started = datetime::now_micros();
                     let previous = self.storage.table_statistics(slot, txn.txid);
-                    let statistics = self
-                        .storage
-                        .analyze_table(slot, txn.txid, &[], &self.work)?;
+                    let statistics = self.storage.analyze_table(
+                        slot,
+                        txn.txid,
+                        &[],
+                        guc::default_statistics_target(),
+                        &self.work,
+                    )?;
                     if statistics.relation_estimates_changed(&previous) {
                         txn.record_statistics_plan_change(&self.storage, slot as u32);
                     }
@@ -10385,6 +10389,7 @@ impl Engine {
                     slot,
                     txn.txid,
                     &selected[..selected_count],
+                    guc::default_statistics_target(),
                     &self.work,
                 );
                 let statistics = statistics?;

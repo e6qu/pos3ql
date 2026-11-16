@@ -26310,8 +26310,8 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
             .table_statistics(table, 0)
             .column(2)
             .unwrap()
-            .null_fraction_ppm,
-        500_000
+            .null_fraction,
+        0.5
     );
     let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
         "COMMENT ON TABLE relation_estimates IS 'own comment';
@@ -54064,7 +54064,10 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
         .storage
         .extended_statistics_data(extended, reader.txid);
     assert_eq!(statistics.rows, 3);
-    assert_eq!(statistics.column(4).unwrap().null_fraction_ppm, 333_333);
+    assert_eq!(
+        statistics.column(4).unwrap().null_fraction,
+        (1.0f64 / 3.0) as f32
+    );
     assert_eq!(data.rows, 3);
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(data.mcv[0].values.as_str(), "{1,1}");
@@ -54119,8 +54122,8 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
             .table_statistics(table, reader.txid)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        1_000_000
+            .null_fraction,
+        1.0
     );
     run_txn(
         &mut engine,
@@ -54152,7 +54155,8 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
 #[test]
 fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
     let mut config = test_config("analysis-target-recycling");
-    config.work_arena_bytes = 12 << 10;
+    // One target's 30,000-row sample directory fits; three do not.
+    config.work_arena_bytes = 1 << 20;
     config.max_tables = 4;
     // Three resident relations each retain 256 rows during per-target ANALYZE.
     config.row_overlay_slots = 3 * 256;
@@ -54312,8 +54316,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
             .table_statistics(table, session.transaction.txid)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        1_000_000
+            .null_fraction,
+        1.0
     );
     assert_eq!(
         engine
@@ -54335,8 +54339,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
             .table_statistics(table, 0)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        333_333
+            .null_fraction,
+        (1.0f64 / 3.0) as f32
     );
     assert_eq!(
         engine.storage.extended_statistics_data(extended, 0).mcv[0]
@@ -54431,9 +54435,10 @@ fn vacuum_and_analyze() {
     let statistics = e.storage.table_statistics(slot, 0);
     assert!(statistics.valid);
     assert_eq!(statistics.rows, 2);
-    assert_eq!(statistics.column(1).unwrap().distinct_values, 2);
-    assert_eq!(statistics.column(2).unwrap().distinct_values, 2);
-    assert_eq!(statistics.column(1).unwrap().null_fraction_ppm, 0);
+    // Two different values are unique: PostgreSQL's `stadistinct` of -1.
+    assert_eq!(statistics.column(1).unwrap().distinct_fraction, 1.0);
+    assert_eq!(statistics.column(2).unwrap().distinct_fraction, 1.0);
+    assert_eq!(statistics.column(1).unwrap().null_fraction, 0.0);
     assert!(statistics.average_row_width > 0);
     let inheritance = run_with(
         &mut e,
@@ -54599,18 +54604,20 @@ fn vacuum_and_analyze() {
         )),
         ["a"]
     );
+    // ANALYZE of an empty table, as of a truncated one, leaves PostgreSQL's
+    // earlier column statistics in place.
     run_with(
         &mut e,
         &mut b,
         "TRUNCATE targeted_stats; ANALYZE targeted_stats(a)",
     );
-    assert!(
+    assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut b,
             "SELECT attname FROM pg_stats WHERE tablename = 'targeted_stats'"
-        ))
-        .is_empty()
+        )),
+        ["a"]
     );
 }
 
@@ -54993,9 +55000,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
          EXPLAIN (GENERIC_PLAN) EXECUTE ep_by_id(2)",
     ));
     assert!(
-        generic
-            .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
+        // PostgreSQL reads three rows on one page sequentially.
+        generic.iter().any(|row| row.contains("Seq Scan on ep")),
         "{generic:?}"
     );
     let analyzed_prepared = data_rows(&run_with(
@@ -55052,7 +55058,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on public.ep")),
+            .any(|row| row.contains("Seq Scan on public.ep")),
         "{detailed:?}"
     );
 
@@ -72147,10 +72153,11 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         "EXPLAIN SELECT key, payload, note FROM covered_rows \
          WHERE key >= 1 ORDER BY key",
     ));
+    // One row on one page: PostgreSQL sorts a sequential scan.
     assert!(
         covering_plan
             .iter()
-            .any(|row| row.contains("Index Only Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{covering_plan:?}"
     );
     assert_eq!(
@@ -72169,10 +72176,11 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         &mut replay_budget,
         "EXPLAIN SELECT payload, note FROM covered_rows WHERE key = 1 ORDER BY key",
     ));
+    // One row on one page: PostgreSQL reads it sequentially.
     assert!(
         exact_plan
             .iter()
-            .any(|row| row.contains("Index Only Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{exact_plan:?}"
     );
     let heap_plan = data_rows(&run_with(
@@ -72183,7 +72191,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     assert!(
         heap_plan
             .iter()
-            .any(|row| row.contains("Index Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{heap_plan:?}"
     );
     assert!(heap_plan.iter().all(|row| !row.contains("Index Only Scan")));
@@ -73494,13 +73502,16 @@ fn index_file_owners_unrelated_commits_preserve_index_access_for_an_older_snapsh
         "UPDATE index_invoices SET note = 'new' WHERE id = 1",
         true,
     );
+    // PostgreSQL's plan is the same index-only scan; the visibility map
+    // decides its heap fetches.
     let plan = data_rows(&reader.success(
         &mut engine,
         "EXPLAIN SELECT id, note FROM index_invoices WHERE id = 1 ORDER BY id",
         true,
     ));
     assert!(
-        plan.iter().all(|row| !row.contains("Index Only Scan")),
+        plan.iter()
+            .any(|row| row.contains("Index Only Scan using covered_invoice")),
         "{plan:?}"
     );
     // Stream the single historical match; sorting would upload simulator runs.
@@ -82385,7 +82396,10 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let restarted_statistics = restarted.storage.table_statistics(restarted_slot, 0);
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
-    assert_eq!(restarted_statistics.column(1).unwrap().distinct_values, 2);
+    assert_eq!(
+        restarted_statistics.column(1).unwrap().distinct_fraction,
+        1.0
+    );
     let composite_slot = restarted
         .storage
         .extended_statistics_slot("public", "snapshot_rows_id_value_stats", 0)
@@ -83690,7 +83704,8 @@ fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
         .unwrap();
     let statistics = recovered.storage.table_statistics(slot, 0);
     assert_eq!(statistics.rows, 512);
-    assert!(statistics.column(2).unwrap().distinct_values > 100);
+    // Every key is distinct: PostgreSQL's `stadistinct` of -1.
+    assert_eq!(statistics.column(2).unwrap().distinct_fraction, 1.0);
     assert!(statistics.average_row_width > 8_000);
 
     let before = recovered.storage.block_io_stats();
@@ -86324,7 +86339,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     ));
     assert!(
         plan.iter()
-            .any(|line| line.contains("Seq Scan on pruning_rows")),
+            .any(|line| line.contains("Index Scan using pruning_rows_pkey")),
         "{plan:?}"
     );
     assert_eq!(
@@ -87561,7 +87576,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
     ));
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using format_value_index")),
+            .any(|row| row.contains("Bitmap Index Scan on format_value_index")),
         "cold recovery must retain the renamed enum's published index: {plan:?}"
     );
     assert_eq!(

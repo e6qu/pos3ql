@@ -1029,6 +1029,21 @@ describe output with PostgreSQL 18.6.
 | GIN | Array, full-text, JSONB, and jsonpath bitmap predicates |
 | SP-GiST | Built-in network, range, geometry, text ordering/prefix, and geometric distance ordering |
 
+A query reading one ordinary table whose indexes are single-column B-trees,
+with conditions that compare a column with a constant (`k = 17`, `id < 50`,
+`d BETWEEN '2021-01-01' AND '2021-02-01'`) or test it for NULL, chooses its
+scan as PostgreSQL 18 does: it costs the sequential scan, each index's index
+or index-only scan and a bitmap heap scan with PostgreSQL's formulas and the
+statistics `ANALYZE` gathers, including for `ORDER BY` one column and
+`LIMIT`. `EXPLAIN` then shows the same `Seq Scan`, `Index Scan` (or `Index
+Scan Backward`), `Index Only Scan` or `Bitmap Heap Scan` over `Bitmap Index
+Scan`, and the rows come back in that scan's order. For example, after
+`ANALYZE orders`, `SELECT * FROM orders WHERE customer = 17` on a
+non-unique index reads a bitmap heap scan and returns the rows by heap
+position, as PostgreSQL does. Other queries (joins, several indexes combined,
+multi-column or expression indexes, `IN` lists and `OR` conditions) keep
+pos3ql's own choice, whose plans and row order can differ.
+
 Index names describe SQL behavior, not PostgreSQL's page layout; native index
 callbacks are not available. MVCC visibility and SQL rechecks decide every
 result. [Immutable index navigation](index-navigation.md) specifies pruning,
@@ -1203,10 +1218,15 @@ PostgreSQL 18's values, units, ranges, errors, `SHOW` text, `pg_settings` row,
 
 Where pos3ql's planner has the same choice, the setting decides it:
 
-- `enable_seqscan`, `enable_indexscan` and `enable_bitmapscan` choose between
-  a sequential scan and an index scan (a bitmap heap scan for BRIN and GIN
-  indexes). For example, `SET enable_indexscan = off` makes
-  `SELECT * FROM t WHERE id = 5` read `t` sequentially.
+- `enable_seqscan`, `enable_indexscan`, `enable_indexonlyscan` and
+  `enable_bitmapscan` choose between a sequential scan, an index scan and a
+  bitmap heap scan. For example, `SET enable_indexscan = off` makes
+  `SELECT * FROM t WHERE id = 5` read `t` through a bitmap heap scan, as
+  PostgreSQL does, when the query is one whose scan pos3ql chooses by
+  PostgreSQL's costs (see [physical access paths](#physical-access-paths)).
+  For the plan costs of such a scan, `seq_page_cost`, `random_page_cost`,
+  `cpu_tuple_cost`, `cpu_index_tuple_cost`, `cpu_operator_cost` and
+  `effective_cache_size` apply as in PostgreSQL.
 - `enable_hashjoin` and `enable_nestloop` choose between a hash join and a
   nested loop, and `enable_material` drops the `Materialize` step `EXPLAIN`
   shows over a nested loop's inner sequential scan.

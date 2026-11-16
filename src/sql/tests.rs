@@ -78502,10 +78502,17 @@ fn disabled_subscriptions_are_durable_catalog_objects() {
         )),
         ["f|named_slot_changes"]
     );
-    run_with(
+    let detached = run_with(
         &mut engine,
         &mut budget,
-        "DROP SUBSCRIPTION named_slot_changes",
+        "ALTER SUBSCRIPTION named_slot_changes SET (slot_name = NONE); \
+         DROP SUBSCRIPTION named_slot_changes",
+    );
+    assert!(
+        String::from_utf8_lossy(&detached).contains("DROP SUBSCRIPTION")
+            && !String::from_utf8_lossy(&detached).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&detached)
     );
     let contradictory = run_with(
         &mut engine,
@@ -79311,61 +79318,114 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
 }
 
 #[test]
-fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
-    let mut config = test_config("subscription-managed-cleanup");
-    config.object_store_on = true;
-    config.object_store_sim = true;
-    config.object_store_bucket = format!("subscription-managed-cleanup-{}", std::process::id());
-    config.block_cache_bytes = crate::store::BLOCK_SIZE;
-    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+fn subscription_drop_removes_the_publisher_slot_before_it_commits() {
+    let config = test_config("subscription-slot-drop");
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE SUBSCRIPTION managed_changes CONNECTION \
-         'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
-         PUBLICATION changes WITH (enabled = false, copy_data = false); \
-         DROP SUBSCRIPTION managed_changes",
-    );
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for name in ["managed_changes", "external_changes"] {
+        let slot = if name == "external_changes" {
+            ", create_slot = false, slot_name = 'external_slot'"
+        } else {
+            ""
+        };
+        session.success(
+            &mut engine,
+            &format!(
+                "CREATE SUBSCRIPTION {name} CONNECTION \
+                 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+                 PUBLICATION changes WITH (enabled = false, copy_data = false{slot})"
+            ),
+            false,
+        );
+    }
+    session.success(&mut engine, "BEGIN", false);
+    let refused = session.execute(&mut engine, "DROP SUBSCRIPTION managed_changes", false);
     assert!(
-        engine.storage.subscription("managed_changes", 0).is_none(),
-        "DROP hides the local catalog object at commit"
+        String::from_utf8_lossy(&refused)
+            .contains("C25001\0MDROP SUBSCRIPTION cannot run inside a transaction block"),
+        "{}",
+        String::from_utf8_lossy(&refused)
     );
-    let cleanup = engine
-        .subscription_cleanup_runtime(0)
-        .expect("managed publisher slot cleanup remains durable");
-    assert_eq!(cleanup.slot.as_str(), "managed_changes");
-    assert!(engine.checkpoint().unwrap());
-    drop(engine);
+    session.success(&mut engine, "ROLLBACK", false);
+    let syntax = session.execute(&mut engine, "DROP SUBSCRIPTION managed_changes, x", false);
+    assert!(String::from_utf8_lossy(&syntax).contains("C42601"));
 
-    let mut replay_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
-    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
-    let cleanup = replayed
-        .subscription_cleanup_runtime(0)
-        .expect("checkpoint recovery retains pending remote cleanup");
-    replayed
-        .complete_subscription_cleanup(0, cleanup.created_at, cleanup.name)
+    // The statement waits while the server drops the slot, then reports it.
+    let status = session.execute_status(&mut engine, "DROP SUBSCRIPTION managed_changes", false);
+    assert!(
+        matches!(status, ExecutionStatus::Blocked { .. }),
+        "{status:?}"
+    );
+    assert!(session.send.readable().is_empty());
+    let slot = (0..config.max_subscriptions)
+        .find(|slot| engine.subscription_slot_drop_pending(*slot))
+        .expect("the waiting DROP requested a slot drop");
+    let request = engine.start_subscription_slot_drop(slot).unwrap();
+    assert_eq!(request.slot.as_str(), "managed_changes");
+    assert!(engine.start_subscription_slot_drop(slot).is_none());
+    engine.finish_subscription_slot_drop(slot, None);
+    let dropped = session.execute(&mut engine, "DROP SUBSCRIPTION managed_changes", false);
+    let text = String::from_utf8_lossy(&dropped);
+    assert!(
+        text.contains("Mdropped replication slot \"managed_changes\" on publisher")
+            && text.contains("DROP SUBSCRIPTION"),
+        "{text}"
+    );
+    assert!(engine.storage.subscription("managed_changes", 0).is_none());
+    assert!(!engine.subscription_slot_drop_pending(slot));
+
+    // A failed drop keeps the subscription, as PostgreSQL's aborted DROP does.
+    let status = session.execute_status(&mut engine, "DROP SUBSCRIPTION external_changes", false);
+    assert!(
+        matches!(status, ExecutionStatus::Blocked { .. }),
+        "{status:?}"
+    );
+    let slot = (0..config.max_subscriptions)
+        .find(|slot| engine.subscription_slot_drop_pending(*slot))
         .unwrap();
-    assert!(replayed.subscription_cleanup_runtime(0).is_none());
-    drop(replayed);
-
-    let mut final_budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
-    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
-    assert!(final_engine.subscription_cleanup_runtime(0).is_none());
-    let created = run_with(
-        &mut final_engine,
-        &mut final_budget,
-        "CREATE SUBSCRIPTION managed_changes CONNECTION 'host=publisher port=5432' \
-         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    assert_eq!(
+        engine
+            .start_subscription_slot_drop(slot)
+            .unwrap()
+            .slot
+            .as_str(),
+        "external_slot"
     );
+    let message = crate::util::StackStr::<512>::from_str(
+        "ERROR:  replication slot \"external_slot\" does not exist",
+    );
+    engine.finish_subscription_slot_drop(
+        slot,
+        Some(crate::storage::SlotDropFailure {
+            connect: false,
+            message,
+        }),
+    );
+    let failed = session.execute(&mut engine, "DROP SUBSCRIPTION external_changes", false);
     assert!(
-        !String::from_utf8_lossy(&created).contains("ERROR"),
-        "cleanup completion releases the catalog slot: {}",
-        String::from_utf8_lossy(&created)
+        String::from_utf8_lossy(&failed).contains(
+            "C08006\0Mcould not drop replication slot \"external_slot\" on publisher: \
+             ERROR:  replication slot \"external_slot\" does not exist"
+        ),
+        "{}",
+        String::from_utf8_lossy(&failed)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    assert!(engine.storage.subscription("external_changes", 0).is_some());
+    assert!(!engine.subscription_slot_drop_pending(slot));
+
+    // A cancelled wait abandons the request; the server's later outcome is
+    // discarded and the subscription remains.
+    let status = session.execute_status(&mut engine, "DROP SUBSCRIPTION external_changes", false);
+    assert!(
+        matches!(status, ExecutionStatus::Blocked { .. }),
+        "{status:?}"
+    );
+    assert!(engine.start_subscription_slot_drop(slot).is_some());
+    engine.cancel_backend_wait(session.connection_id);
+    assert!(engine.subscription_slot_drop_pending(slot));
+    engine.finish_subscription_slot_drop(slot, None);
+    assert!(!engine.subscription_slot_drop_pending(slot));
 }
 
 #[test]

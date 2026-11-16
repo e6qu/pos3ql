@@ -21224,54 +21224,125 @@ fn alter_subscription_definition(
     Ok(())
 }
 
-pub fn drop_subscription(
+/// Where DROP SUBSCRIPTION runs, for PostgreSQL's PreventInTransactionBlock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionDropContext {
+    TopLevel,
+    TransactionBlock,
+    Function,
+}
+
+/// DROP SUBSCRIPTION. A subscription with a publisher slot drops that slot
+/// before it commits, as PostgreSQL does: the statement parks until the server
+/// has stopped the apply worker and run `DROP_REPLICATION_SLOT ... WAIT`, and
+/// the slot's removal cannot be rolled back, so it must run outside a
+/// transaction block.
+pub(crate) fn drop_subscription(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    names: &[&str],
+    name: &str,
     if_exists: bool,
+    context: SubscriptionDropContext,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        let Some((slot, _)) = storage.subscription(name, txn.txid) else {
-            if if_exists {
+    let Some((slot, definition)) = storage.subscription(name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "subscription \"{}\" does not exist, skipping", name).as_str(),
+            )?;
+            return Ok(Ok(responder.command_complete("DROP SUBSCRIPTION")?));
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "subscription \"{}\" does not exist",
+            name
+        ));
+    };
+    if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
+        return sql_fail(error);
+    }
+    let visible = definition.definition_to(txn.txid);
+    if let Some(remote_slot) = visible.slot.name() {
+        if context == SubscriptionDropContext::Function {
+            return sql_fail(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "DROP SUBSCRIPTION cannot be executed from a function"
+            ));
+        }
+        if context == SubscriptionDropContext::TransactionBlock || txn.is_explicit() {
+            return sql_fail(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "DROP SUBSCRIPTION cannot run inside a transaction block"
+            ));
+        }
+        if let Err(error) = visible.connection.require_endpoint_for(definition.name) {
+            return sql_fail(error);
+        }
+        let owner = crate::storage::SlotDropOwner {
+            pid: storage.current_connection_id(),
+            txid: txn.txid,
+        };
+        match storage.poll_subscription_slot_drop(slot, owner) {
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_IO_WAIT,
+                    "publisher replication slot drop in progress"
+                ));
+            }
+            Some(Some(failure)) if failure.connect => {
+                return sql_fail(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::CONNECTION_FAILURE,
+                        "could not connect to publisher when attempting to drop replication slot \"{}\": {}",
+                        remote_slot.as_str(),
+                        failure.message.as_str()
+                    ),
+                    "Use ALTER SUBSCRIPTION ... DISABLE to disable the subscription, and then use ALTER SUBSCRIPTION ... SET (slot_name = NONE) to disassociate it from the slot.",
+                ));
+            }
+            Some(Some(failure)) => {
+                return sql_fail(sql_err!(
+                    sqlstate::CONNECTION_FAILURE,
+                    "could not drop replication slot \"{}\" on publisher: {}",
+                    remote_slot.as_str(),
+                    failure.message.as_str()
+                ));
+            }
+            Some(None) => {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "subscription \"{}\" does not exist, skipping", name)
-                        .as_str(),
+                    stack_format!(
+                        192,
+                        "dropped replication slot \"{}\" on publisher",
+                        remote_slot.as_str()
+                    )
+                    .as_str(),
                 )?;
-                continue;
             }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription \"{}\" does not exist",
-                name
-            ));
-        };
-        if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
-            return sql_fail(error);
         }
-        let Some(slot) = (match storage.drop_subscription(name, txn.txid) {
-            Ok(slot) => slot,
-            Err(error) => return sql_fail(error),
-        }) else {
-            return sql_fail(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "subscription disappeared before DROP SUBSCRIPTION completed"
-            ));
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSubscription { name }) {
-            storage.rollback_subscription_drop(slot, txn.txid);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(
-            storage,
-            super::txn::DdlUndo::SubscriptionDropped(slot as u32),
-        ) {
-            storage.rollback_subscription_drop(slot, txn.txid);
-            return sql_fail(error);
-        }
+    }
+    let Some(slot) = (match storage.drop_subscription(name, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    }) else {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "subscription disappeared before DROP SUBSCRIPTION completed"
+        ));
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSubscription { name }) {
+        storage.rollback_subscription_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SubscriptionDropped(slot as u32),
+    ) {
+        storage.rollback_subscription_drop(slot, txn.txid);
+        return sql_fail(error);
     }
     Ok(Ok(responder.command_complete("DROP SUBSCRIPTION")?))
 }
@@ -35917,12 +35988,13 @@ fn execute_bound_plpgsql_utility<'a>(
                     *action,
                     responder,
                 ),
-                Stmt::DropSubscription { names, if_exists } => super::exec::drop_subscription(
+                Stmt::DropSubscription { name, if_exists } => super::exec::drop_subscription(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    names,
+                    name,
                     *if_exists,
+                    super::exec::SubscriptionDropContext::Function,
                     responder,
                 ),
                 Stmt::CreateTextSearchParser(command) => super::exec::create_text_search_parser(
@@ -82667,24 +82739,36 @@ fn copy_out_rows(
 /// an empty range).
 type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
 
-/// Per-field plan for binary COPY output. Scalars, arrays and bit strings
-/// encode arena-free (`Direct`); ranges and multiranges are pre-parsed into
-/// arena datums up front so the retry-safe emission closure never allocates
-/// or fails.
+/// Per-field plan for binary output. Scalars, arrays of scalars and bit
+/// strings encode arena-free (`Direct`); composites, arrays of composites and
+/// ranges are materialized up front, at every nesting depth, so the
+/// retry-safe emission closure never allocates or fails. A composite stored
+/// as text inside an array or another composite is decoded too: PostgreSQL's
+/// `record_send` and `array_send` call each member's binary send function.
 #[derive(Clone, Copy)]
 pub(crate) enum BinaryFieldPlan<'a> {
     Direct,
     /// Cursor capture prepares both formats. This placeholder is never sent:
     /// binary FETCH detects the unavailable send function from its type OID.
     Unavailable,
-    Composite(Datum<'a>),
+    Record(&'a [BinaryMember<'a>]),
     Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
     Multirange(&'a [RangeBinaryParts<'a>]),
-    CompositeArray(
-        crate::sql::types::ArrElem,
-        crate::sql::array::Shape,
-        &'a [Datum<'a>],
-    ),
+    Array {
+        element_oid: i32,
+        shape: crate::sql::array::Shape,
+        has_null: bool,
+        elements: &'a [BinaryMember<'a>],
+    },
+}
+
+/// One planned member of a composite or array: its type OID (sent before a
+/// record field), its value and that value's own plan.
+#[derive(Clone, Copy)]
+pub(crate) struct BinaryMember<'a> {
+    type_oid: i32,
+    value: Datum<'a>,
+    plan: BinaryFieldPlan<'a>,
 }
 
 /// Writes one already-planned binary field. Planning performs every fallible
@@ -82702,7 +82786,15 @@ pub(crate) fn encode_binary_field_plan(
             // another per-row bitmap.
             m.i32(0);
         }
-        BinaryFieldPlan::Composite(value) => Responder::encode_value_binary(m, &value),
+        BinaryFieldPlan::Record(fields) => {
+            m.field(|m| {
+                m.i32(fields.len() as i32);
+                for field in fields {
+                    m.i32(field.type_oid);
+                    encode_binary_field_plan(m, &field.value, field.plan);
+                }
+            });
+        }
         BinaryFieldPlan::Range(flags, lower, upper) => {
             m.field(|m| encode_range_binary(m, flags, lower, upper));
         }
@@ -82714,17 +82806,22 @@ pub(crate) fn encode_binary_field_plan(
                 }
             });
         }
-        BinaryFieldPlan::CompositeArray(element, shape, elements) => {
+        BinaryFieldPlan::Array {
+            element_oid,
+            shape,
+            has_null,
+            elements,
+        } => {
             m.field(|m| {
                 m.i32(shape.dimension_count() as i32);
-                m.i32(i32::from(elements.iter().any(Datum::is_null)));
-                m.i32(element.element_oid());
+                m.i32(i32::from(has_null));
+                m.i32(element_oid);
                 for index in 0..shape.dimension_count() {
                     m.i32(shape.dimension(index).unwrap() as i32);
                     m.i32(shape.lower_bound(index).unwrap());
                 }
                 for element in elements {
-                    Responder::encode_value_binary(m, element);
+                    encode_binary_field_plan(m, &element.value, element.plan);
                 }
             });
         }
@@ -82747,14 +82844,27 @@ pub(crate) fn binary_field_plan<'a>(
             slot,
             physical_fields,
             text,
-        } => Ok(BinaryFieldPlan::Composite(decode_stored_composite_text(
-            text,
-            *slot,
-            *physical_fields,
-            storage,
-            txid,
-            arena,
-        )?)),
+        } => {
+            let decoded =
+                decode_stored_composite_text(text, *slot, *physical_fields, storage, txid, arena)?;
+            binary_field_plan(&decoded, storage, txid, arena)
+        }
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            let members = arena
+                .alloc_slice_with(fields.len(), |_| BinaryMember {
+                    type_oid: 0,
+                    value: Datum::Null,
+                    plan: BinaryFieldPlan::Direct,
+                })
+                .map_err(|_| binary_plan_arena_full())?;
+            for (member, field) in members.iter_mut().zip(fields.iter()) {
+                *member = binary_member(field.type_oid, field.value, storage, txid, arena)?;
+                if matches!(member.plan, BinaryFieldPlan::Unavailable) {
+                    return Ok(BinaryFieldPlan::Unavailable);
+                }
+            }
+            Ok(BinaryFieldPlan::Record(members))
+        }
         Datum::Range { text, kind } => {
             let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
             Ok(BinaryFieldPlan::Range(flags, lower, upper))
@@ -82781,40 +82891,69 @@ pub(crate) fn binary_field_plan<'a>(
             ) =>
         {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-            let values = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            let elements = arena
+                .alloc_slice_with(shape.element_count(), |_| BinaryMember {
+                    type_oid: 0,
+                    value: Datum::Null,
+                    plan: BinaryFieldPlan::Direct,
+                })
+                .map_err(|_| binary_plan_arena_full())?;
+            let mut has_null = false;
             if *element == crate::sql::types::ArrElem::Record {
-                for (value, payload) in values
+                for (member, payload) in elements
                     .iter_mut()
                     .zip(crate::sql::array::element_payloads(raw))
                 {
-                    *value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
+                    let value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
+                    has_null |= value.is_null();
+                    *member = binary_member(0, value, storage, txid, arena)?;
                 }
             } else {
-                for (value, decoded) in values
+                for (member, value) in elements
                     .iter_mut()
                     .zip(crate::sql::array::elements(raw, *element))
                 {
-                    *value = match decoded {
-                        Datum::CompositeText {
-                            slot,
-                            physical_fields,
-                            text,
-                        } => decode_stored_composite_text(
-                            text,
-                            slot,
-                            physical_fields,
-                            storage,
-                            txid,
-                            arena,
-                        )?,
-                        value => value,
-                    };
+                    has_null |= value.is_null();
+                    *member = binary_member(0, value, storage, txid, arena)?;
                 }
             }
-            Ok(BinaryFieldPlan::CompositeArray(*element, shape, values))
+            if elements
+                .iter()
+                .any(|member| matches!(member.plan, BinaryFieldPlan::Unavailable))
+            {
+                return Ok(BinaryFieldPlan::Unavailable);
+            }
+            Ok(BinaryFieldPlan::Array {
+                element_oid: element.element_oid(),
+                shape,
+                has_null,
+                elements,
+            })
         }
         _ => Ok(BinaryFieldPlan::Direct),
     }
+}
+
+fn binary_member<'a>(
+    type_oid: i32,
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<BinaryMember<'a>, SqlError> {
+    let plan = binary_field_plan(&value, storage, txid, arena)?;
+    Ok(BinaryMember {
+        type_oid,
+        value,
+        plan,
+    })
+}
+
+fn binary_plan_arena_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "binary output value exceeds the statement arena"
+    )
 }
 
 /// Parses a canonical range text into its PostgreSQL binary flags byte plus the

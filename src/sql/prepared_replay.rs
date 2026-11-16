@@ -809,7 +809,6 @@ pub(super) fn stage_catalog_record(
         | WalOp::AlterReplicationSlot { .. }
         | WalOp::DropReplicationSlot { .. }
         | WalOp::AdvanceReplicationSlot { .. }
-        | WalOp::CompleteSubscriptionCleanup { .. }
         | WalOp::FailSubscription { .. }
         | WalOp::ResetSubscriptionRelations { .. }
         | WalOp::AddSubscriptionRelation { .. }

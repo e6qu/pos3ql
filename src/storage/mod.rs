@@ -8077,9 +8077,9 @@ pub(crate) struct ReplicationSlotDef {
     pub restart_lsn: u64,
     pub confirmed_flush_lsn: u64,
     pub behavior: ReplicationSlotBehavior,
-    pub active: bool,
-    /// Transient publisher backend identity. PostgreSQL does not persist slot
-    /// activity across restart, whereas the slot cursor above is durable.
+    /// Transient publisher backend identity, present while the slot is
+    /// active. PostgreSQL does not persist slot activity across restart,
+    /// whereas the slot cursor above is durable.
     pub active_pid: Option<i32>,
     pub sent_lsn: u64,
     /// Startup-bounded statistics for transactions actually emitted to a
@@ -8091,13 +8091,26 @@ pub(crate) struct ReplicationSlotDef {
 }
 
 impl ReplicationSlotDef {
+    pub(crate) const fn active(&self) -> bool {
+        self.active_pid.is_some()
+    }
+
+    /// PostgreSQL's refusal to acquire a slot another backend holds.
+    pub(crate) fn in_use_error(&self) -> SqlError {
+        sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "replication slot \"{}\" is active for PID {}",
+            self.name.as_str(),
+            self.active_pid.expect("an active slot records its backend")
+        )
+    }
+
     const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         name: SqlName::EMPTY,
         restart_lsn: 0,
         confirmed_flush_lsn: 0,
         behavior: ReplicationSlotBehavior::DEFAULT,
-        active: false,
         active_pid: None,
         sent_lsn: 0,
         total_txns: 0,
@@ -8159,7 +8172,9 @@ pub(crate) struct SubscriptionDef {
     pub bootstrap: SubscriptionBootstrap,
     pending_bootstrap: Option<PendingSubscriptionBootstrap>,
     pending_relation_refresh: Option<u32>,
-    pub(crate) cleanup: SubscriptionCleanup,
+    /// Transient: DROP SUBSCRIPTION's remote slot removal, which the server
+    /// performs on the publisher while the requesting statement waits.
+    pub(crate) slot_drop: SubscriptionSlotDrop,
     pub(crate) failure: Option<SubscriptionFailure>,
     /// Transient PostgreSQL-compatible worker counters. Durable apply
     /// position remains `confirmed_lsn`; statistics restart with the server.
@@ -8656,10 +8671,54 @@ pub(crate) enum SubscriptionBootstrap {
     Ready,
 }
 
+/// DROP SUBSCRIPTION removes the publisher slot before it commits, as
+/// PostgreSQL does. The statement parks while the server stops the apply
+/// worker and runs `DROP_REPLICATION_SLOT ... WAIT`; the backend that asked
+/// receives the outcome when it resumes. A requester that is cancelled or
+/// disconnects abandons its request: a running drop still completes on the
+/// publisher, and the subscription stays, as after an aborted PostgreSQL drop.
+// Each subscription catalog entry, sized at startup, holds one in place.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SubscriptionCleanup {
-    None,
-    DropManagedSlot,
+pub(crate) enum SubscriptionSlotDrop {
+    Idle,
+    Requested {
+        owner: SlotDropOwner,
+    },
+    Running {
+        owner: Option<SlotDropOwner>,
+    },
+    Finished {
+        owner: SlotDropOwner,
+        failure: Option<SlotDropFailure>,
+    },
+}
+
+impl SubscriptionSlotDrop {
+    /// The transaction that other DDL on this subscription waits for.
+    const fn owner_txid(self) -> Option<u32> {
+        match self {
+            Self::Requested { owner }
+            | Self::Running { owner: Some(owner) }
+            | Self::Finished { owner, .. } => Some(owner.txid),
+            Self::Idle | Self::Running { owner: None } => None,
+        }
+    }
+}
+
+/// The backend statement waiting for a slot drop, and its transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotDropOwner {
+    pub pid: i32,
+    pub txid: u32,
+}
+
+/// Why a publisher slot drop failed, with libpq's text for the failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotDropFailure {
+    /// The connection failed before the command ran.
+    pub connect: bool,
+    pub message: StackStr<512>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8715,7 +8774,7 @@ impl SubscriptionDef {
         bootstrap: SubscriptionBootstrap::Deferred,
         pending_bootstrap: None,
         pending_relation_refresh: None,
-        cleanup: SubscriptionCleanup::None,
+        slot_drop: SubscriptionSlotDrop::Idle,
         failure: None,
         apply_error_count: 0,
         sync_error_count: 0,
@@ -18189,6 +18248,8 @@ pub struct Storage {
     extended_statistics_catalog: Mutex<ExtendedStatisticsCatalog>,
     publications: Mutex<FixedVec<PublicationDef>>,
     replication_slots: Mutex<FixedVec<ReplicationSlotDef>>,
+    /// Counts slot releases, which wake `DROP_REPLICATION_SLOT ... WAIT`.
+    replication_slot_releases: u64,
     subscription_catalog: Mutex<SubscriptionCatalog>,
     foreign: Mutex<foreign::ForeignCatalog>,
     foreign_sessions: ForeignSessionPool,
@@ -21254,10 +21315,17 @@ impl Storage {
             None
         };
         let wait = match reason {
+            // DROP SUBSCRIPTION waits for the publisher, not object storage.
+            crate::sql::StatementWait::ObjectIo if self.awaits_subscription_slot_drop(pid) => {
+                (Some("Client"), Some("LibPQWalReceiverReceive"))
+            }
             crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
             crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
             crate::sql::StatementWait::ClientOutput => (Some("Client"), Some("ClientWrite")),
             crate::sql::StatementWait::Timer => (Some("Timeout"), Some("PgSleep")),
+            crate::sql::StatementWait::ReplicationSlot => {
+                (Some("IPC"), Some("ReplicationSlotDrop"))
+            }
             crate::sql::StatementWait::Lock => {
                 lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
             }
@@ -24669,6 +24737,7 @@ impl Storage {
             }),
             publications: Mutex::new(publications),
             replication_slots: Mutex::new(replication_slots),
+            replication_slot_releases: 0,
             subscription_catalog: Mutex::new(SubscriptionCatalog {
                 definitions: subscriptions,
                 relations: subscription_relations,
@@ -29796,9 +29865,7 @@ impl Storage {
             catalog: &self.subscription_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| {
-            value.ddl_state.committed_exists() || value.cleanup != SubscriptionCleanup::None
-        })
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_matviews(&self) -> impl Iterator<Item = (usize, MatviewDef)> + '_ {
@@ -44978,7 +45045,6 @@ impl Storage {
             restart_lsn,
             confirmed_flush_lsn,
             behavior,
-            active: false,
             active_pid: None,
             sent_lsn: confirmed_flush_lsn,
             total_txns: 0,
@@ -45030,12 +45096,8 @@ impl Storage {
                     name.as_str()
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         slot.behavior = behavior;
         Ok(())
@@ -45097,12 +45159,8 @@ impl Storage {
                 name
             ));
         };
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         *slot = ReplicationSlotDef::EMPTY;
         Ok(())
@@ -45180,14 +45238,9 @@ impl Storage {
                     name
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
-        slot.active = true;
         slot.active_pid = Some(backend_pid);
         slot.sent_lsn = slot.confirmed_flush_lsn;
         Ok(slot.confirmed_flush_lsn)
@@ -45255,9 +45308,13 @@ impl Storage {
         if let Some(slot) = replication_slots.iter_mut().find(|slot| {
             slot.database == current_database() && slot.live && slot.name.as_str() == name
         }) {
-            slot.active = false;
             slot.active_pid = None;
+            self.replication_slot_releases += 1;
         }
+    }
+
+    pub(crate) fn replication_slot_releases(&self) -> u64 {
+        self.replication_slot_releases
     }
 
     pub(crate) fn subscriptions_with_slots_visible_to(
@@ -45302,20 +45359,6 @@ impl Storage {
             .lock()
             .expect("subscription catalog lock poisoned")
             .definitions[slot]
-    }
-
-    pub(crate) fn subscriptions_with_slots_durable(
-        &self,
-    ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
-        SubscriptionIter {
-            catalog: &self.subscription_catalog,
-            next_slot: 0,
-        }
-        .filter(|(_, subscription)| {
-            subscription.database == current_database()
-                && (subscription.ddl_state == CatalogDdlState::Present
-                    || subscription.cleanup != SubscriptionCleanup::None)
-        })
     }
 
     pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, SubscriptionDef)> {
@@ -45402,10 +45445,11 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = catalog.definitions.iter().position(|subscription| {
-            subscription.ddl_state == CatalogDdlState::Absent
-                && subscription.cleanup == SubscriptionCleanup::None
-        }) else {
+        let Some(slot) = catalog
+            .definitions
+            .iter()
+            .position(|subscription| subscription.ddl_state == CatalogDdlState::Absent)
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many subscriptions (limit {})",
@@ -45434,7 +45478,7 @@ impl Storage {
             bootstrap: spec.bootstrap,
             pending_bootstrap: None,
             pending_relation_refresh: None,
-            cleanup: SubscriptionCleanup::None,
+            slot_drop: SubscriptionSlotDrop::Idle,
             failure: None,
             apply_error_count: 0,
             sync_error_count: 0,
@@ -45742,84 +45786,133 @@ impl Storage {
                 *relation = SubscriptionRelation::EMPTY;
             }
         }
-        let cleanup = match catalog.definitions[slot].slot {
-            SubscriptionSlot::Managed(_) => SubscriptionCleanup::DropManagedSlot,
-            SubscriptionSlot::Absent | SubscriptionSlot::External(_) => SubscriptionCleanup::None,
-        };
-        if cleanup == SubscriptionCleanup::None {
-            catalog.definitions[slot] = SubscriptionDef::EMPTY;
-        } else {
-            catalog.definitions[slot].cleanup = cleanup;
-            catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
-        }
+        catalog.definitions[slot] = SubscriptionDef::EMPTY;
         drop(catalog);
         self.drop_comments_by_subid(CommentClass::Subscription, created_at as u32);
     }
 
-    pub(crate) fn subscription_cleanup(
+    fn subscription_slot_drop_entry<T>(
         &self,
         slot: usize,
-    ) -> Option<(u64, SqlName, SubscriptionConnInfo, SqlName)> {
-        let catalog = self
+        visit: impl FnOnce(&mut SubscriptionDef) -> T,
+    ) -> T {
+        let mut catalog = self
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get(slot)?;
-        let SubscriptionCleanup::DropManagedSlot = subscription.cleanup else {
-            return None;
-        };
-        let SubscriptionSlot::Managed(remote_slot) = subscription.slot else {
-            unreachable!("managed cleanup retains a managed slot")
-        };
-        Some((
-            subscription.created_at,
-            subscription.name,
-            subscription.connection,
-            remote_slot.sql_name(),
-        ))
+        visit(&mut catalog.definitions[slot])
     }
 
-    /// Checks that `slot` still holds the dropped subscription `created_at`
-    /// whose managed slot cleanup [`Self::complete_subscription_cleanup`]
-    /// completes; callers check before journaling the completion.
-    pub(crate) fn check_subscription_cleanup(
+    /// The publisher slot removal the server must start for `slot`: its
+    /// endpoint identity, connection and remote slot name.
+    pub(crate) fn requested_subscription_slot_drop(
         &self,
         slot: usize,
-        created_at: u64,
-    ) -> Result<(), SqlError> {
-        let catalog = self
-            .subscription_catalog
-            .lock()
-            .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get(slot).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription cleanup slot is invalid"
-            )
-        })?;
-        if subscription.ddl_state != CatalogDdlState::Absent
-            || subscription.created_at != created_at
-            || subscription.cleanup != SubscriptionCleanup::DropManagedSlot
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "subscription cleanup identity changed"
-            ));
-        }
-        Ok(())
+    ) -> Option<(SqlName, SubscriptionConnInfo, SqlName)> {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            let SubscriptionSlotDrop::Requested { .. } = subscription.slot_drop else {
+                return None;
+            };
+            Some((
+                subscription.name,
+                subscription.connection,
+                subscription.slot.name()?.sql_name(),
+            ))
+        })
     }
 
-    pub(crate) fn complete_subscription_cleanup(
-        &mut self,
+    /// Whether the apply worker of `slot` must stay stopped for a slot drop.
+    pub(crate) fn subscription_slot_drop_pending(&self, slot: usize) -> bool {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            subscription.slot_drop != SubscriptionSlotDrop::Idle
+        })
+    }
+
+    /// Asks the server to drop the publisher slot of `slot` for `owner`.
+    /// Returns the finished outcome once, or `None` while it is pending.
+    pub(crate) fn poll_subscription_slot_drop(
+        &self,
         slot: usize,
-        created_at: u64,
-    ) -> Result<(), SqlError> {
-        self.check_subscription_cleanup(slot, created_at)?;
+        owner: SlotDropOwner,
+    ) -> Option<Option<SlotDropFailure>> {
+        self.subscription_slot_drop_entry(slot, |subscription| match subscription.slot_drop {
+            SubscriptionSlotDrop::Idle => {
+                subscription.slot_drop = SubscriptionSlotDrop::Requested { owner };
+                None
+            }
+            SubscriptionSlotDrop::Finished {
+                owner: finished,
+                failure,
+            } if finished == owner => {
+                subscription.slot_drop = SubscriptionSlotDrop::Idle;
+                Some(failure)
+            }
+            SubscriptionSlotDrop::Requested { .. }
+            | SubscriptionSlotDrop::Running { .. }
+            | SubscriptionSlotDrop::Finished { .. } => None,
+        })
+    }
+
+    pub(crate) fn start_subscription_slot_drop(&self, slot: usize) {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            if let SubscriptionSlotDrop::Requested { owner } = subscription.slot_drop {
+                subscription.slot_drop = SubscriptionSlotDrop::Running { owner: Some(owner) };
+            }
+        });
+    }
+
+    /// Records a running drop's outcome for its owner, or forgets it when the
+    /// owner abandoned it.
+    pub(crate) fn finish_subscription_slot_drop(
+        &self,
+        slot: usize,
+        failure: Option<SlotDropFailure>,
+    ) {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            subscription.slot_drop = match subscription.slot_drop {
+                SubscriptionSlotDrop::Running { owner: Some(owner) } => {
+                    SubscriptionSlotDrop::Finished { owner, failure }
+                }
+                _ => SubscriptionSlotDrop::Idle,
+            };
+        });
+    }
+
+    fn awaits_subscription_slot_drop(&self, pid: i32) -> bool {
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
-            .definitions[slot] = SubscriptionDef::EMPTY;
-        Ok(())
+            .definitions
+            .iter()
+            .any(|subscription| match subscription.slot_drop {
+                SubscriptionSlotDrop::Requested { owner }
+                | SubscriptionSlotDrop::Running { owner: Some(owner) }
+                | SubscriptionSlotDrop::Finished { owner, .. } => owner.pid == pid,
+                SubscriptionSlotDrop::Idle | SubscriptionSlotDrop::Running { owner: None } => false,
+            })
+    }
+
+    /// Abandons every slot drop requested by backend `pid`, whose statement
+    /// ended without consuming the outcome.
+    pub(crate) fn abandon_subscription_slot_drops(&self, pid: i32) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for subscription in catalog.definitions.iter_mut() {
+            subscription.slot_drop = match subscription.slot_drop {
+                SubscriptionSlotDrop::Requested { owner }
+                | SubscriptionSlotDrop::Finished { owner, .. }
+                    if owner.pid == pid =>
+                {
+                    SubscriptionSlotDrop::Idle
+                }
+                SubscriptionSlotDrop::Running { owner: Some(owner) } if owner.pid == pid => {
+                    SubscriptionSlotDrop::Running { owner: None }
+                }
+                state => state,
+            };
+        }
     }
 
     pub(crate) fn rollback_subscription_create(&mut self, slot: usize) {
@@ -45884,6 +45977,7 @@ impl Storage {
             subscription.pending_relation_refresh,
             subscription.pending_definition.map(|pending| pending.txid),
             subscription.ownership.pending.map(|pending| pending.txid),
+            subscription.slot_drop.owner_txid(),
         ]
         .into_iter()
         .flatten()

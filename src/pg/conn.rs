@@ -1424,6 +1424,9 @@ impl Conn {
                 crate::sql::StatementWait::Timer => self
                     .sleep_remaining()
                     .is_none_or(|remaining| remaining.is_zero()),
+                crate::sql::StatementWait::ReplicationSlot => {
+                    self.parked_generation != engine.replication_slot_releases()
+                }
             };
         if !ready {
             return None;
@@ -5438,8 +5441,14 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
-                Ok(LogicalReplicationCommand::DropSlot { name }) => {
+                Ok(LogicalReplicationCommand::DropSlot { name, wait }) => {
+                    // Read before trying, so a release in between still wakes.
+                    let releases = engine.replication_slot_releases();
                     if let Err(error) = engine.drop_replication_slot(name) {
+                        if wait && error.sqlstate == sqlstate::OBJECT_IN_USE {
+                            self.park(crate::sql::StatementWait::ReplicationSlot, releases);
+                            return Step::Parked;
+                        }
                         let mut responder = output(&mut self.send, &mut self.overflow);
                         if responder
                             .error(error.sqlstate, error.message.as_str())
@@ -5723,6 +5732,8 @@ enum LogicalReplicationCommand<'a> {
     },
     DropSlot {
         name: crate::storage::ReplicationSlotName,
+        /// Wait for an active slot's release instead of failing.
+        wait: bool,
     },
     AlterSlot {
         name: crate::storage::ReplicationSlotName,
@@ -5768,7 +5779,10 @@ fn parse_logical_replication_command(
                 "invalid DROP_REPLICATION_SLOT input"
             ));
         }
-        return Ok(LogicalReplicationCommand::DropSlot { name });
+        return Ok(LogicalReplicationCommand::DropSlot {
+            name,
+            wait: option.is_some(),
+        });
     }
     if command.eq_ignore_ascii_case("alter_replication_slot") {
         let name = take_replication_slot_name(&mut input)?.ok_or_else(|| {
@@ -11840,13 +11854,14 @@ mod tests {
         ));
         let dropped =
             parse_logical_replication_command("DROP_REPLICATION_SLOT \"changes\"").unwrap();
-        let LogicalReplicationCommand::DropSlot { name } = dropped else {
+        let LogicalReplicationCommand::DropSlot { name, wait } = dropped else {
             panic!("expected DROP_REPLICATION_SLOT")
         };
         assert_eq!(name.as_str(), "changes");
+        assert!(!wait);
         assert!(matches!(
             parse_logical_replication_command("DROP_REPLICATION_SLOT changes WAIT"),
-            Ok(LogicalReplicationCommand::DropSlot { .. })
+            Ok(LogicalReplicationCommand::DropSlot { wait: true, .. })
         ));
     }
 

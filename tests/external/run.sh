@@ -1211,22 +1211,20 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "subscription local WAL recovery (got $(subscription_rows))"
     subscription_diagnostics
   fi
-  if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
-    -c "DROP SUBSCRIPTION subscription_apply" >/dev/null 2>&1; then
-    bad "managed subscription drop"
+  # PostgreSQL's DROP SUBSCRIPTION drops the publisher slot before it
+  # returns, so the slot is checked once, without waiting.
+  if ! drop_output=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+    -c "DROP SUBSCRIPTION subscription_apply" 2>&1); then
+    bad "managed subscription drop: $drop_output"
   else
-    publisher_slot_count=1
-    for _ in {1..100}; do
-      publisher_slot_count=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
-        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
-      [[ "$publisher_slot_count" == "0" ]] && break
-      sleep 0.1
-    done
+    publisher_slot_count=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
+      -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
     local_subscription_count=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT count(*) FROM pg_subscription WHERE subname = 'subscription_apply'")
-    [[ "$publisher_slot_count" == "0" && "$local_subscription_count" == "0" ]] \
+    [[ "$publisher_slot_count" == "0" && "$local_subscription_count" == "0" \
+      && "$drop_output" == 'NOTICE:  dropped replication slot "subscription_apply" on publisher' ]] \
       && ok "managed subscription drop removes the publisher slot and local catalog object" \
-      || bad "managed subscription cleanup (publisher $publisher_slot_count, local $local_subscription_count)"
+      || bad "managed subscription cleanup (publisher $publisher_slot_count, local $local_subscription_count, output $drop_output)"
   fi
   fi
   fi
@@ -1338,13 +1336,8 @@ else
   fi
   if "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "DROP SUBSCRIPTION pos3ql_subscription" >/dev/null 2>&1; then
-    pos3ql_slot_count=1
-    for _ in {1..100}; do
-      pos3ql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
-        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pos3ql_subscription'")
-      [[ "$pos3ql_slot_count" == "0" ]] && break
-      sleep 0.1
-    done
+    pos3ql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
+      -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pos3ql_subscription'")
     [[ "$pos3ql_slot_count" == "0" ]] \
       && ok "pos3ql managed publisher slot cleanup completes" \
       || bad "pos3ql managed publisher slot cleanup (got $pos3ql_slot_count)"
@@ -1553,13 +1546,8 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
     fi
     if "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \
       -c "DROP SUBSCRIPTION postgresql_subscriber" >/dev/null 2>&1; then
-      postgresql_slot_count=1
-      for _ in {1..100}; do
-        postgresql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
-          -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'postgresql_subscriber'")
-        [[ "$postgresql_slot_count" == "0" ]] && break
-        sleep 0.1
-      done
+      postgresql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
+        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'postgresql_subscriber'")
       [[ "$postgresql_slot_count" == "0" ]] \
         && ok "PostgreSQL subscriber drop removes its pos3ql publisher slot" \
         || bad "PostgreSQL subscriber slot cleanup (got $postgresql_slot_count)"

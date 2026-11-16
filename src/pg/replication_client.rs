@@ -658,6 +658,9 @@ enum ClientState {
     AwaitingSlotAlter,
     AwaitingSlotAlterReady,
     AwaitingSlotResult,
+    /// Dropping a stale synchronization slot before creating it again.
+    AwaitingStaleSlotDrop,
+    AwaitingStaleSlotDropReady,
     SnapshotReady,
     AwaitingDropResult,
     CommandComplete,
@@ -673,6 +676,9 @@ enum ClientPurpose {
     Unbound,
     Stream,
     CreateSlot,
+    /// A synchronization slot, which first drops one an interrupted copy
+    /// left behind, as PostgreSQL's table synchronization does.
+    CreateSyncSlot,
     DropSlot,
     Sql,
 }
@@ -937,6 +943,19 @@ impl ReplicationClient {
         Ok(())
     }
 
+    /// Creates a synchronization slot, replacing one an interrupted copy
+    /// left on the publisher.
+    pub(crate) fn bind_create_sync_slot(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+        behavior: crate::storage::SubscriptionBehavior,
+    ) -> Result<(), ClientError> {
+        self.bind_command(endpoint, slot, ClientPurpose::CreateSyncSlot)?;
+        self.behavior = behavior;
+        Ok(())
+    }
+
     pub(crate) fn bind_drop_slot(
         &mut self,
         endpoint: ConnectionInfo,
@@ -1074,6 +1093,22 @@ impl ReplicationClient {
     /// any startup message reached the server.
     pub(crate) fn is_connecting(&self) -> bool {
         self.state == ClientState::Connecting
+    }
+
+    /// Whether the connection is still being established: a failure now is
+    /// a connection failure rather than a failed command.
+    pub(crate) fn is_establishing(&self) -> bool {
+        matches!(
+            self.state,
+            ClientState::Connecting
+                | ClientState::AwaitingSslResponse
+                | ClientState::AwaitingAuthentication
+                | ClientState::AwaitingReady
+        )
+    }
+
+    pub(crate) fn endpoint(&self) -> Option<ConnectionInfo> {
+        self.endpoint
     }
 
     fn queue_startup(&mut self) -> Result<(), ClientError> {
@@ -1445,6 +1480,10 @@ fn consume_frame<'a>(
                 create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingSlotResult;
             }
+            ClientPurpose::CreateSyncSlot => {
+                drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingStaleSlotDrop;
+            }
             ClientPurpose::DropSlot => {
                 drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingDropResult;
@@ -1473,6 +1512,25 @@ fn consume_frame<'a>(
             tag: "DROP_REPLICATION_SLOT",
         } if *state == ClientState::AwaitingDropResult => {
             *state = ClientState::CommandComplete;
+        }
+        BackendFrame::CommandComplete {
+            tag: "DROP_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingStaleSlotDrop => {
+            *state = ClientState::AwaitingStaleSlotDropReady;
+        }
+        // No stale slot: the drop's error ends its command.
+        BackendFrame::Error { fields } if *state == ClientState::AwaitingStaleSlotDrop => {
+            let diagnostic = publisher_diagnostic(fields)?;
+            if diagnostic.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_OBJECT {
+                return Err(ClientError::Publisher(diagnostic));
+            }
+            *state = ClientState::AwaitingStaleSlotDropReady;
+        }
+        BackendFrame::ReadyForQuery {
+            transaction_status: b'I',
+        } if *state == ClientState::AwaitingStaleSlotDropReady => {
+            create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
+            *state = ClientState::AwaitingSlotResult;
         }
         BackendFrame::CommandComplete {
             tag: "ALTER_REPLICATION_SLOT",
@@ -2141,11 +2199,15 @@ fn alter_replication_slot(
     Ok(())
 }
 
+/// `DROP_REPLICATION_SLOT name WAIT`, as PostgreSQL's subscriber sends it: a
+/// slot still held by a walsender that is shutting down is dropped once it is
+/// released instead of failing.
 pub fn drop_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(), WireFull> {
     let mark = buffer.mark();
     let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
     message.bytes(b"DROP_REPLICATION_SLOT ");
     append_identifier(&mut message, slot.as_str());
+    message.bytes(b" WAIT");
     message.u8(0);
     if message.finish().is_err() {
         buffer.truncate_to(mark);

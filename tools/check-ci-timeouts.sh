@@ -181,7 +181,8 @@ for differential_shard in \
     corpus-1 corpus-2 corpus-3 corpus-4 corpus-execution-widths \
     auxiliary-pg-regress-a auxiliary-pg-regress-b \
     auxiliary-pg-regress-c auxiliary-pg-regress-d auxiliary-pg-regress-e \
-    auxiliary-exact auxiliary-copy auxiliary-types \
+    auxiliary-exact-a auxiliary-exact-b auxiliary-exact-c \
+    auxiliary-copy auxiliary-types \
     auxiliary-listen auxiliary-composites; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential shard %s\n' "$differential_shard" >&2
@@ -196,6 +197,15 @@ if (( $(grep -Fc 'pg_regress_shard: "0"' "$differential_workflow") != 1 )) \
     || (( $(grep -Fc 'pg_regress_shards: "8"' "$differential_workflow") != 2 )) \
     || ! grep -Fq -- "POSTGRES_REGRESS_SHARDS: \${{ matrix.pg_regress_shards || '4' }}" "$differential_workflow"; then
     printf '%s\n' 'CI timeout guard: PostgreSQL regression inputs must retain complete file slices' >&2
+    failed=1
+fi
+# Exact-diagnostics slices 0..2 of 3 together run every fixture exactly once.
+if (( $(grep -Fc 'exact_shards: "3"' "$differential_workflow") != 3 )) \
+    || (( $(grep -Fc 'exact_shard: "0"' "$differential_workflow") != 1 )) \
+    || (( $(grep -Fc 'exact_shard: "1"' "$differential_workflow") != 1 )) \
+    || (( $(grep -Fc 'exact_shard: "2"' "$differential_workflow") != 1 )) \
+    || ! grep -Fq -- "EXACT_SHARDS: \${{ matrix.exact_shards || '1' }}" "$differential_workflow"; then
+    printf '%s\n' 'CI timeout guard: exact-diagnostics fixtures must retain complete slices' >&2
     failed=1
 fi
 # Split file slices retain upstream dependency order and exactly one owner.

@@ -477,7 +477,16 @@ that PostgreSQL does once while planning. Parameter inference walks a statement 
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. 
+`text` where PostgreSQL reports `42804`. `DROP SUBSCRIPTION` drops the
+publisher slot before it returns, as PostgreSQL does, and keeps the apply
+worker stopped until its transaction ends; a synchronization slot an
+interrupted initial copy left on the publisher is dropped before the copy
+starts again, as PostgreSQL's table synchronization does. `CREATE
+SUBSCRIPTION` with `connect = true` still creates its slot and copies its
+tables in the background: PostgreSQL connects during the statement, reports
+`NOTICE: created replication slot "s" on publisher` (or fails the statement),
+and records each table's `pg_subscription_rel` row at commit before per-table
+synchronization workers copy them.
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
@@ -1278,7 +1287,13 @@ log n) comparisons and names the first conflicting row in heap order
 for a GiST constraint PostgreSQL names the partner its index scan finds
 first, where pos3ql names the first in heap order. Remaining: PostgreSQL
 compares merged CHECK predicates as analysed trees, so `a > 0::integer`
-and `a > 0` merge there but not here.
+and `a > 0` merge there but not here. A PL/pgSQL `record` variable (one not
+declared with a row type) expands under `(r).*` from its current value, where
+PostgreSQL reports `42809 record type has not been registered`; and inside a
+derived table (`SELECT s.a FROM (SELECT (r).*) s`) any row or record variable
+is not found (`42703`), where PostgreSQL expands a row-typed one. The
+variable's value reaches the outer statement's expansion but not the derived
+table's scope, which needs PL/pgSQL row variables in subquery analysis.
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in

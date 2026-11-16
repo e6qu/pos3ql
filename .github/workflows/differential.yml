@@ -409,7 +409,7 @@ jobs:
             auxiliary_phase: pg_regress
             pg_regress_shard: "7"
             pg_regress_shards: "8"
-          - shard: auxiliary-exact
+          - shard: auxiliary-exact-a
             run_fast: "1"
             run_core: "0"
             run_corpus: "0"
@@ -421,6 +421,36 @@ jobs:
             fuzz_count: "0"
             corpus_shard: "0"
             auxiliary_phase: exact
+            exact_shard: "0"
+            exact_shards: "3"
+          - shard: auxiliary-exact-b
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: exact
+            exact_shard: "1"
+            exact_shards: "3"
+          - shard: auxiliary-exact-c
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+            auxiliary_phase: exact
+            exact_shard: "2"
+            exact_shards: "3"
           - shard: auxiliary-copy
             run_fast: "1"
             run_core: "0"
@@ -581,6 +611,8 @@ jobs:
           AUXILIARY_PHASE: ${{ matrix.auxiliary_phase }}
           POSTGRES_REGRESS_SHARD: ${{ matrix.pg_regress_shard || '0' }}
           POSTGRES_REGRESS_SHARDS: ${{ matrix.pg_regress_shards || '4' }}
+          EXACT_SHARD: ${{ matrix.exact_shard || '0' }}
+          EXACT_SHARDS: ${{ matrix.exact_shards || '1' }}
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}
           FAST_CORPUS_SHARDS: "4"

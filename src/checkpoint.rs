@@ -12145,7 +12145,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
+                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
                     subscription.ownership.owner,
                     u8::from(subscription.enabled),
@@ -12168,10 +12168,6 @@ impl Checkpointer {
                     subscription.definition_generation,
                     subscription.confirmed_lsn,
                     subscription.origin_lsn,
-                    u8::from(
-                        subscription.cleanup
-                            == crate::storage::SubscriptionCleanup::DropManagedSlot
-                    ),
                     u8::from(subscription.failure.is_some()),
                     failure_code.as_str(),
                     failure_message.as_str(),
@@ -19197,13 +19193,6 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             "subscription origin position",
         ));
     }
-    let cleanup = match parse_field::<u8>(words.next(), "subscription cleanup state")? {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(CheckpointSetupError::Corrupt("subscription cleanup state"));
-        }
-    };
     let failure = match parse_field::<u8>(words.next(), "subscription failure state")? {
         0 => {
             if words.next() != Some("-") || words.next() != Some("-") {
@@ -19316,18 +19305,7 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             ))?;
         storage.apply_subscription_advance(advance, origin_lsn);
     }
-    if cleanup {
-        let dropped = storage
-            .drop_subscription(name.as_str(), 0)
-            .map_err(|error| {
-                CheckpointSetupError::ObjectStore(format!(
-                    "manifest subscription cleanup rejected: {}",
-                    error.message.as_str()
-                ))
-            })?
-            .ok_or(CheckpointSetupError::Corrupt("subscription cleanup target"))?;
-        storage.commit_subscription_drop(dropped);
-    } else if let Some(failure) = failure {
+    if let Some(failure) = failure {
         let stream = storage
             .subscription_stream(slot, 0)
             .ok_or(CheckpointSetupError::Corrupt("subscription failure target"))?;

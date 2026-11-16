@@ -7669,15 +7669,19 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_ident("subscription")? {
-            let (names, if_exists) = self.drop_targets("subscription name")?;
-            let mut subscription_names = ArenaList::new(self.arena);
-            for name in names {
-                self.push(&mut subscription_names, name.name)?;
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.col_ident("subscription name")?;
+            // No object depends on a subscription, so PostgreSQL accepts
+            // either behavior and both mean the same.
+            if !self.eat_ident("cascade")? {
+                let _ = self.eat_ident("restrict")?;
             }
-            return Ok(Stmt::DropSubscription {
-                names: subscription_names.as_slice(),
-                if_exists,
-            });
+            return Ok(Stmt::DropSubscription { name, if_exists });
         }
         if self.eat_ident("event")? {
             self.expect_ident("trigger")?;

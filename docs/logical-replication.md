@@ -76,7 +76,29 @@ A subscription copies the publisher's initial snapshot with binary COPY, then
 applies ordinary and streamed pgoutput transactions. It saves local row changes
 and publisher progress together before acknowledging that progress, so after a
 crash it never claims a transaction it lost. A delayed worker cannot advance a
-replaced subscription, and managed slot cleanup survives crashes.
+replaced subscription.
+
+`DROP SUBSCRIPTION` drops the publisher's replication slot before it returns,
+as PostgreSQL does: it stops the apply worker, sends `DROP_REPLICATION_SLOT
+name WAIT`, reports `NOTICE: dropped replication slot "name" on publisher`, and
+then removes the subscription; the apply worker stays stopped until the
+dropping transaction ends. Because the slot cannot come back, a
+subscription with a slot cannot be dropped inside a transaction block (`25001`).
+If the publisher is unreachable or refuses the drop, the command fails with
+`08006` and the subscription stays.
+
+**User example:** when the publisher is gone for good, detach the slot first,
+then drop only the local subscription:
+
+```sql
+ALTER SUBSCRIPTION orders_sub DISABLE;
+ALTER SUBSCRIPTION orders_sub SET (slot_name = NONE);
+DROP SUBSCRIPTION orders_sub;
+```
+
+As a publisher, pos3ql honors `DROP_REPLICATION_SLOT name WAIT` by waiting for
+an active slot's walsender to release it; without `WAIT`, an active slot
+returns `55006`.
 
 Workers use their own session settings and an empty `search_path`, as in
 PostgreSQL. Schema-qualify tables inside replica-enabled trigger functions, for

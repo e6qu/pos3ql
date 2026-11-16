@@ -107,7 +107,7 @@ impl<'a> BuildKey<'a> {
             !index.nulls_not_distinct,
         );
         let classes = super::resolve_index_operator_classes(index)?;
-        for position in 0..index.n_cols {
+        for (position, class) in classes[..index.n_cols].iter().enumerate() {
             if let Some(source) = &index.expressions[position] {
                 let source = arena
                     .alloc_str(source.as_str())
@@ -124,7 +124,7 @@ impl<'a> BuildKey<'a> {
                     )?);
             }
             key.order[position] = KeyColumn {
-                order: match classes[position].expect("index operator class resolved") {
+                order: match class.expect("index operator class resolved") {
                     IndexOperatorClass::Btree(class) if class.is_pattern() => KeyOrder::Bytes,
                     IndexOperatorClass::Btree(_) => KeyOrder::Collated(index.collations[position]),
                     IndexOperatorClass::Catalog(oid) => {

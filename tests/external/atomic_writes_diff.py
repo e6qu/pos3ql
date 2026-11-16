@@ -112,9 +112,13 @@ def setup(connection, schema, read_kind):
     for statement in statements:
         connection.execute(statement)
     if read_kind == "index":
+        # PostgreSQL 18.6 itself picks the covering Index Only Scan for the
+        # report once the table spans several pages and VACUUM has set its
+        # visibility map; a one-page table is cheaper to scan sequentially.
         connection.execute(f"INSERT INTO {schema}.cold_invoices "
-            "SELECT i, 'other invoice' FROM generate_series(13, 137) AS i")
+            "SELECT i, 'other invoice' FROM generate_series(13, 1000) AS i")
         connection.execute(f"CREATE INDEX covered_invoice ON {schema}.cold_invoices(id) INCLUDE (note)")
+        connection.execute(f"VACUUM ANALYZE {schema}.cold_invoices")
 
 
 def current_state(connection, schema):
@@ -192,7 +196,7 @@ class Node:
             # Recovery verifies each table's last data block. Two frames let
             # the warm order's index and data evict that cached invoice block.
             "block_cache_bytes": "512KiB", "disk_cache_bytes": 0,
-            "max_tables": 8, "row_overlay_slots": 256, "txn_rows": 256,
+            "max_tables": 8, "row_overlay_slots": 2048, "txn_rows": 2048,
             "row_work_bytes": "8MiB", "row_work_leases": 128, "definition_image_slots": 256,
             "execution_control_bytes": "256KiB", "execution_control_leases": 256,
             "table_metadata_bytes": "64MiB", "table_metadata_leases": 8192,

@@ -352,20 +352,7 @@ pub(super) unsafe fn for_each_validation_row(
             unsafe { arena.rewind_to(row_mark) };
             result
         };
-        let flow = scan.for_each_overlay(&mut |rowid, home| {
-            storage.with_row_bytes(table, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                validate(rowid, &values[..schema.len()])
-            })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-        if flow.is_break() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "constraint validation stopped before completing the scan"
-            ));
-        }
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
             for row in rows {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
@@ -379,7 +366,22 @@ pub(super) unsafe fn for_each_validation_row(
                 validate(row.rowid, values)?;
             }
             Ok(core::ops::ControlFlow::Continue(()))
-        })
+        })?;
+        let flow = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+            storage.with_row_bytes(table, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                validate(rowid, &values[..schema.len()])
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        if flow.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint validation stopped before completing the scan"
+            ));
+        }
+        Ok(())
     })();
     // SAFETY: every row callback and retained scan has ended; only owned errors
     // or success escape. Persistent tail allocations are preserved.

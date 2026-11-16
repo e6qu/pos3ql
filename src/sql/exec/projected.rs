@@ -587,8 +587,14 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             5 + text.len()
         }
         Datum::Array { element, raw } => {
-            out[0] = 200;
-            let descriptor = crate::storage::CachedArrayElement::from_element(*element)
+            // A nested element (a statistics array's member arrays) is
+            // described by its members' element.
+            let (tag, described) = match element.nested_member() {
+                Some(member) => (205, member),
+                None => (200, *element),
+            };
+            out[0] = tag;
+            let descriptor = crate::storage::CachedArrayElement::from_element(described)
                 .expect("projected array type was bound");
             out[1..7].copy_from_slice(&descriptor.bytes());
             out[7..11].copy_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -970,12 +976,18 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 4 + len,
             )
         }
-        200 => {
-            let element = crate::storage::CachedArrayElement::from_bytes(
+        tag @ (200 | 205) => {
+            let described = crate::storage::CachedArrayElement::from_bytes(
                 bytes[at..at + 6].try_into().unwrap(),
             )
             .expect("projected array descriptor was checked")
             .element();
+            let element = if tag == 205 {
+                crate::sql::types::ArrElem::nested(described)
+                    .expect("projected nested array describes its member element")
+            } else {
+                described
+            };
             let len = u32::from_le_bytes(bytes[at + 6..at + 10].try_into().unwrap()) as usize;
             (
                 Datum::Array {

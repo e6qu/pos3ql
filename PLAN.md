@@ -645,7 +645,10 @@ and the column's correlation, `cost_bitmap_heap_scan`, `cost_seqscan`,
 `create_limit_path` under `LIMIT`) from the statistics ANALYZE gathers, and
 returns its rows in that scan's order: an index scan by key (backward for the
 reverse order), a bitmap heap scan and a sequential scan by heap position
-(`differential_exact/691`, `692`). `EXPLAIN ANALYZE` counts what the chosen
+(`differential_exact/691`, `692`): rows saved to object storage first, then
+the resident versions written since, also while a heap compaction is moving
+rows between memtable buffers. Constraint validation, index builds,
+`VACUUM` and `ANALYZE` read rows in the same order. `EXPLAIN ANALYZE` counts what the chosen
 scan reads: rows its index conditions reach, `Rows Removed by Filter`, a
 bitmap heap scan's `Heap Blocks` and an index-only scan's `Heap Fetches`, and
 each index scan's `Index Searches`. Remaining: multi-column, expression,
@@ -1279,10 +1282,17 @@ relation, where PostgreSQL reads at most its first row; a derived table that
 PostgreSQL pulls up into an outer join still prints under its own name.
 ANALYZE gathers PostgreSQL's column statistics (`compute_scalar_stats`: most
 common values, histogram bounds, correlation and `n_distinct`) from the same
-sample PostgreSQL reads (`differential_exact/690`). Remaining: the element
-statistics of arrays and `tsvector` columns, range and multirange histograms,
-`compute_distinct_stats` for types without an ordering, and the widths of
-values PostgreSQL compresses; a table larger than 300 rows per unit of the
+sample PostgreSQL reads (`differential_exact/690`). `pg_stats` shows them as
+an `anyarray` of the column's declared type, in text and binary form: enum,
+domain and composite values, and an array column's values as an array of
+arrays. Range, multirange and `tsvector` columns count every value distinct
+and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
+`compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
+do. Remaining: the element statistics of arrays and `tsvector` columns, range
+and multirange histograms, `compute_distinct_stats` for types without an
+ordering, the widths of values PostgreSQL compresses, and the binary element
+type of a domain over an array of an enum or composite, which names the
+array type where PostgreSQL names the domain; a table larger than 300 rows per unit of the
 statistics target is sampled at random, as PostgreSQL samples it, so its
 figures differ from run to run. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which

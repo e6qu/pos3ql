@@ -74169,7 +74169,7 @@ fn for_each_index_build_row(
     definition.schema(&mut schema);
     let schema = &schema[..definition.n_columns];
     let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
-    let mut each = |rowid: u64, home| {
+    let each = |visit: &mut constraints::BuildRowVisit<'_>, rowid: u64, home| {
         storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut values)?;
@@ -74178,27 +74178,24 @@ fn for_each_index_build_row(
         Ok(core::ops::ControlFlow::Continue(()))
     };
     let scanned = if ordered {
-        scan.for_each_home_physically(arena, &mut each)?
+        scan.for_each_home_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
     } else {
-        let overlay = scan.for_each_overlay(&mut each)?;
-        if overlay.is_continue() {
-            scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
-                for spilled in batch {
-                    match spilled.representation {
-                        crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                            let mut values = [Datum::Null; MAX_COLUMNS];
-                            rowenc::decode(bytes, schema, &mut values)?;
-                            visit(spilled.rowid, &values[..schema.len()], bytes.len())?;
-                        }
-                        crate::storage::SpilledRowRepresentation::Values(values) => {
-                            visit(spilled.rowid, values, rowenc::encoded_len(values))?;
-                        }
+        scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+            for spilled in batch {
+                match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, schema, &mut values)?;
+                        visit(spilled.rowid, &values[..schema.len()], bytes.len())?;
+                    }
+                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                        visit(spilled.rowid, values, rowenc::encoded_len(values))?;
                     }
                 }
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
-        }
-        overlay
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        scan.for_each_resident_physically(arena, &mut |rowid, home| each(visit, rowid, home))?
     };
     if scanned.is_break() {
         return Err(sql_err!(
@@ -74248,24 +74245,7 @@ fn scan_index_rows(
                 &schema[..definition.n_columns],
             ));
         };
-        let overlay = scan.for_each_overlay(&mut |rowid, home| {
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                validate_values(rowid, &values[..definition.n_columns])?;
-                pack(&values[..definition.n_columns]);
-                rows = rows.saturating_add(1);
-                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
-                Ok(())
-            })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-        if overlay.is_break() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "index validation stopped before completing the scan"
-            ));
-        }
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
             for spilled in batch {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
@@ -74288,6 +74268,24 @@ fn scan_index_rows(
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
+        let overlay = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+            storage.with_row_bytes(table_index, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                validate_values(rowid, &values[..definition.n_columns])?;
+                pack(&values[..definition.n_columns]);
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        if overlay.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index validation stopped before completing the scan"
+            ));
+        }
         let mut statistics = storage.table_statistics(table_index, 0);
         // PostgreSQL's `index_update_stats` leaves a never-counted empty
         // table's `reltuples` at -1.

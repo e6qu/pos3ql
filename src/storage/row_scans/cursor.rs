@@ -39,11 +39,13 @@ struct RowScanSource {
     /// searches to skip the rows they shadow.
     rows: ArenaSliceHandle<CapturedRowRecord>,
     /// Positions in `rows` in a sequential scan's heap order, the order the
-    /// resident rows are returned in.
+    /// resident rows are returned in after the saved rows.
     order: ArenaSliceHandle<u32>,
     members: ArenaSliceHandle<MemberCursor>,
     resident: usize,
     commit: u64,
+    /// The saved-row walk has returned every saved row.
+    saved_done: bool,
     done: bool,
     spill: SpillWalkProgress,
 }
@@ -177,6 +179,7 @@ impl RowCursor {
             members,
             resident: 0,
             commit,
+            saved_done: false,
             done: false,
             spill: SpillWalkProgress::START,
         });
@@ -197,6 +200,7 @@ impl RowCursor {
             .map_err(state_error)?
             .fill(MemberCursor::EMPTY);
         source.resident = 0;
+        source.saved_done = false;
         source.done = false;
         source.spill = SpillWalkProgress::START;
         Ok(())
@@ -221,6 +225,48 @@ impl RowCursor {
             .map_err(state_error)?;
         if source.done {
             return Ok(None);
+        }
+        // A sequential scan reads the saved rows no resident version
+        // shadows first, by row identity, then the resident rows by heap
+        // position, as `CapturedRowScan::for_each_home_physically` does.
+        if !source.saved_done {
+            let mut members = state_arena
+                .retained_slice_mut(source.members)
+                .map_err(state_error)?;
+            // The bounded walk can consume a tombstone or a shadowed saved row
+            // without producing a visible row. Keep its progress and ask again.
+            loop {
+                crate::sql::query::check_timeout()?;
+                let mut row = None;
+                let complete = Storage::spill_merged_walk_bytes(
+                    source.snapshot.roots(),
+                    arena,
+                    false,
+                    decoded_columns,
+                    true,
+                    crate::storage::SpillOverlayMode::VisibleScan(&RowScanIds::Captured(&rows)),
+                    Some(
+                        source
+                            .spill
+                            .resume(&mut members, &buffers.scan, 1, u64::MAX),
+                    ),
+                    &mut |rowid, commit_lsn, representation| {
+                        row = Some(CursorRow {
+                            rowid,
+                            version: crate::storage::RowVersion::committed(commit_lsn),
+                            bytes: CursorRowBytes::Spilled(representation),
+                        });
+                        Ok(ControlFlow::Break(()))
+                    },
+                )?;
+                source.saved_done = complete;
+                if row.is_some() {
+                    return Ok(row);
+                }
+                if complete {
+                    break;
+                }
+            }
         }
         let order = state_arena
             .retained_slice_mut(source.order)
@@ -257,40 +303,8 @@ impl RowCursor {
                 bytes,
             }));
         }
-        let mut members = state_arena
-            .retained_slice_mut(source.members)
-            .map_err(state_error)?;
-        // The bounded walk can consume a tombstone or a shadowed saved row
-        // without producing a visible row. Keep its progress and ask again.
-        loop {
-            crate::sql::query::check_timeout()?;
-            let mut row = None;
-            let complete = Storage::spill_merged_walk_bytes(
-                source.snapshot.roots(),
-                arena,
-                false,
-                decoded_columns,
-                true,
-                crate::storage::SpillOverlayMode::VisibleScan(&RowScanIds::Captured(&rows)),
-                Some(
-                    source
-                        .spill
-                        .resume(&mut members, &buffers.scan, 1, u64::MAX),
-                ),
-                &mut |rowid, commit_lsn, representation| {
-                    row = Some(CursorRow {
-                        rowid,
-                        version: crate::storage::RowVersion::committed(commit_lsn),
-                        bytes: CursorRowBytes::Spilled(representation),
-                    });
-                    Ok(ControlFlow::Break(()))
-                },
-            )?;
-            source.done = complete;
-            if row.is_some() || complete {
-                return Ok(row);
-            }
-        }
+        source.done = true;
+        Ok(None)
     }
 }
 

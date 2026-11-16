@@ -851,16 +851,7 @@ impl<'s, 'a> Planner<'s, 'a> {
         let scan = self
             .storage
             .captured_row_scan_in(self.slot, self.txid, self.arena)?;
-        let _ = scan.for_each_overlay(&mut |rowid, home| {
-            self.storage
-                .with_row_bytes(self.slot, rowid, home, |bytes| {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
-                    observe(values[column]);
-                    Ok(())
-                })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(self.arena, true, None, &mut |batch| {
             for row in batch {
                 let mut values = [Datum::Null; MAX_COLUMNS];
@@ -873,6 +864,16 @@ impl<'s, 'a> Planner<'s, 'a> {
                 };
                 observe(value);
             }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let _ = scan.for_each_resident_physically(self.arena, &mut |rowid, home| {
+            self.storage
+                .with_row_bytes(self.slot, rowid, home, |bytes| {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
+                    observe(values[column]);
+                    Ok(())
+                })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         drop(scan);

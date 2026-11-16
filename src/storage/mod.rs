@@ -38559,18 +38559,7 @@ impl Storage {
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
         let mut packing = heap_layout::HeapPacking::new();
-        let _ = scan.for_each_overlay(&mut |rowid, home| {
-            crate::sql::query::check_timeout()?;
-            self.with_row_bytes(table_slot, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                packing.add(heap_layout::tuple_length(&values[..n_columns], schema));
-                rows = rows.saturating_add(1);
-                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
-                Ok(())
-            })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
             for row in batch {
                 crate::sql::query::check_timeout()?;
@@ -38588,6 +38577,18 @@ impl Storage {
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(length as u64);
             }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+            crate::sql::query::check_timeout()?;
+            self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                packing.add(heap_layout::tuple_length(&values[..n_columns], schema));
+                rows = rows.saturating_add(1);
+                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
+                Ok(())
+            })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         let generation = scan.publication_generation(self, table_slot)?;
@@ -38726,14 +38727,7 @@ impl Storage {
                 }
             }
         };
-        let _ = scan.for_each_overlay(&mut |rowid, home| {
-            crate::sql::query::check_timeout()?;
-            self.with_row_bytes(table_slot, rowid, home, |bytes| {
-                observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
-                Ok(())
-            })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
             for row in batch {
                 crate::sql::query::check_timeout()?;
@@ -38748,6 +38742,14 @@ impl Storage {
                     }
                 }
             }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+            crate::sql::query::check_timeout()?;
+            self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
+                Ok(())
+            })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         let sample = &mut sample[..sampled];
@@ -38777,16 +38779,7 @@ impl Storage {
                 }
                 Ok(())
             };
-            let _ = scan.for_each_overlay(&mut |rowid, home| {
-                crate::sql::query::check_timeout()?;
-                self.with_row_bytes(table_slot, rowid, home, |bytes| {
-                    copy(bytes.len(), &mut |out| {
-                        out.copy_from_slice(bytes);
-                        Ok(())
-                    })
-                })?;
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
+            // A sequential scan's order: saved rows, then resident rows.
             scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
                 for row in batch {
                     crate::sql::query::check_timeout()?;
@@ -38805,6 +38798,16 @@ impl Storage {
                         }
                     }
                 }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+                crate::sql::query::check_timeout()?;
+                self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                    copy(bytes.len(), &mut |out| {
+                        out.copy_from_slice(bytes);
+                        Ok(())
+                    })
+                })?;
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
             if next != sample.len() {
@@ -39002,16 +39005,34 @@ impl Storage {
                     average_width: computed.width.max(0) as u32,
                 }
             } else {
-                let distinct_values = distinct_estimate(&registers).min(nonnull_count as u64);
+                let null_fraction = (null_count as f64 / sample_rows.len() as f64) as f32;
+                let (distinct_values, distinct_fraction) = if matches!(
+                    ctype,
+                    ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
+                ) {
+                    // PostgreSQL's compute_range_stats and compute_tsvector_stats
+                    // assume every non-null value is distinct.
+                    (0, 1.0 - null_fraction)
+                } else if !ctype.has_default_equality() {
+                    // compute_trivial_stats: without an equality operator the
+                    // distinct count stays unknown.
+                    (0, 0.0)
+                } else {
+                    let distinct_values = distinct_estimate(&registers).min(nonnull_count as u64);
+                    (
+                        distinct_values,
+                        if distinct_values.saturating_mul(10) > rows {
+                            (distinct_values as f64 / rows as f64).min(1.0) as f32
+                        } else {
+                            0.0
+                        },
+                    )
+                };
                 ColumnStatistics {
                     valid: true,
-                    null_fraction: (null_count as f64 / sample_rows.len() as f64) as f32,
+                    null_fraction,
                     distinct_values,
-                    distinct_fraction: if distinct_values.saturating_mul(10) > rows {
-                        (distinct_values as f64 / rows as f64).min(1.0) as f32
-                    } else {
-                        0.0
-                    },
+                    distinct_fraction,
                     average_width: match width {
                         Ok(total) if nonnull_count > 0 => (total / nonnull_count as f64) as u32,
                         Ok(_) => 0,
@@ -45312,16 +45333,19 @@ impl Storage {
         ))
     }
 
-    pub(crate) fn complete_subscription_cleanup(
-        &mut self,
+    /// Checks that `slot` still holds the dropped subscription `created_at`
+    /// whose managed slot cleanup [`Self::complete_subscription_cleanup`]
+    /// completes; callers check before journaling the completion.
+    pub(crate) fn check_subscription_cleanup(
+        &self,
         slot: usize,
         created_at: u64,
     ) -> Result<(), SqlError> {
-        let mut catalog = self
+        let catalog = self
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get_mut(slot).ok_or_else(|| {
+        let subscription = catalog.definitions.get(slot).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "subscription cleanup slot is invalid"
@@ -45336,7 +45360,19 @@ impl Storage {
                 "subscription cleanup identity changed"
             ));
         }
-        *subscription = SubscriptionDef::EMPTY;
+        Ok(())
+    }
+
+    pub(crate) fn complete_subscription_cleanup(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+    ) -> Result<(), SqlError> {
+        self.check_subscription_cleanup(slot, created_at)?;
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions[slot] = SubscriptionDef::EMPTY;
         Ok(())
     }
 
@@ -45603,16 +45639,19 @@ impl Storage {
         }
     }
 
-    pub(crate) fn fail_subscription(
-        &mut self,
+    /// Checks that `stream` is still the subscription's current definition,
+    /// as [`Self::fail_subscription`] requires. Callers journaling a failure
+    /// check first, so a definition replaced since the worker bound it never
+    /// reaches a committed record that could not be applied.
+    pub(crate) fn check_subscription_failure(
+        &self,
         stream: SubscriptionStream,
-        failure: SubscriptionFailure,
     ) -> Result<(), SqlError> {
-        let mut catalog = self
+        let catalog = self
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get_mut(stream.slot()).ok_or_else(|| {
+        let subscription = catalog.definitions.get(stream.slot()).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "subscription worker slot is invalid"
@@ -45629,6 +45668,20 @@ impl Storage {
                 "subscription failure targets a replaced stream definition"
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn fail_subscription(
+        &mut self,
+        stream: SubscriptionStream,
+        failure: SubscriptionFailure,
+    ) -> Result<(), SqlError> {
+        self.check_subscription_failure(stream)?;
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = &mut catalog.definitions[stream.slot()];
         subscription.failure = Some(failure);
         if matches!(subscription.bootstrap, SubscriptionBootstrap::Ready) {
             subscription.apply_error_count = subscription.apply_error_count.saturating_add(1);

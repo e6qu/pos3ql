@@ -7876,15 +7876,7 @@ fn heap_pages_of_rows<'a>(
         }
     };
     let scan = storage.captured_row_scan_in(slot, txid, arena)?;
-    let _ = scan.for_each_overlay(&mut |rowid, home| {
-        storage.with_row_bytes(slot, rowid, home, |bytes| {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut values)?;
-            place(rowid, &values[..n_columns]);
-            Ok(())
-        })?;
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
+    // A sequential scan's order: saved rows, then resident rows.
     scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
         for row in batch {
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -7897,6 +7889,15 @@ fn heap_pages_of_rows<'a>(
             };
             place(row.rowid, values);
         }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+        storage.with_row_bytes(slot, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            place(rowid, &values[..n_columns]);
+            Ok(())
+        })?;
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
     drop(scan);
@@ -9298,26 +9299,26 @@ fn scan_source_mode<'a>(
                 let scan = storage.captured_row_scan_in($slot, txid, arena)?;
                 let mut index = 0usize;
                 let mut aborted = false;
-                let _ = scan.for_each_overlay(&mut |rowid, home| {
-                    use core::ops::ControlFlow;
-                    check_timeout()?;
-                    storage.record_relation_tuple_read(txid, $slot, None)?;
-                    let this = index;
-                    index += 1;
-                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let bytes = storage.row_bytes($slot, rowid, home, arena)?;
-                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                    })?;
-                    if !keep_scanning {
-                        aborted = true;
-                        return Ok(ControlFlow::Break(()));
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
+                // A sequential scan's order: the saved rows no resident
+                // version shadows, then the resident rows by heap position.
+                visit_spilled_rows!($slot, scan, index, aborted);
                 if !aborted {
-                    // Spill entries shadowed by the overlay are omitted by
-                    // the merged cursor; their resident versions ran first.
-                    visit_spilled_rows!($slot, scan, index, aborted);
+                    let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+                        use core::ops::ControlFlow;
+                        check_timeout()?;
+                        storage.record_relation_tuple_read(txid, $slot, None)?;
+                        let this = index;
+                        index += 1;
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                            let bytes = storage.row_bytes($slot, rowid, home, arena)?;
+                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                        })?;
+                        if !keep_scanning {
+                            aborted = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    })?;
                 }
                 if aborted {
                     return Ok(false);
@@ -11026,18 +11027,7 @@ fn for_each_member_row<'a>(
     physical.schema(&mut schema);
     let schema = &schema[..physical.n_columns];
     let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
-    let flow = scan.for_each_overlay(&mut |rowid, home| {
-        let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, schema, &mut values)?;
-        if !visit(Some(rowid), &values[..physical.n_columns])? {
-            return Ok(core::ops::ControlFlow::Break(()));
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
-    if flow.is_break() {
-        return Ok(false);
-    }
+    // A sequential scan's order: saved rows, then resident rows.
     let mut aborted = false;
     scan.for_each_spilled_row_batch(arena, recycle_rows, None, &mut |rows| {
         for row in rows {
@@ -11056,7 +11046,19 @@ fn for_each_member_row<'a>(
         }
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
-    Ok(!aborted)
+    if aborted {
+        return Ok(false);
+    }
+    let flow = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+        let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, schema, &mut values)?;
+        if !visit(Some(rowid), &values[..physical.n_columns])? {
+            return Ok(core::ops::ControlFlow::Break(()));
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    Ok(flow.is_continue())
 }
 
 /// Moves the rows an `Append` counts while one member's scan runs to that

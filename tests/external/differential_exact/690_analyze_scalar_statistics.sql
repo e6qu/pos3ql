@@ -59,3 +59,31 @@ DELETE FROM one690;
 ANALYZE one690;
 SELECT attname, null_frac, n_distinct, most_common_vals, histogram_bounds, correlation
   FROM pg_stats WHERE tablename = 'one690';
+-- Every gathered statistic shows as an anyarray of the column's own type:
+-- enum labels, domain and composite values, and an array column's arrays
+-- (an array of arrays). Range, multirange and tsvector columns get no
+-- most common values and count every value distinct; a type without an
+-- equality operator leaves the distinct count unknown.
+CREATE TYPE t690_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE DOMAIN t690_pos AS int CHECK (VALUE > 0);
+CREATE DOMAIN t690_ints AS int[];
+CREATE DOMAIN t690_moods AS t690_mood[];
+CREATE TYPE t690_pair AS (a int, b text);
+CREATE TABLE k690 (e t690_mood, ea t690_mood[], ia int[], d t690_pos, da t690_pos[],
+  di t690_ints, dm t690_moods, c t690_pair, ca t690_pair[], ta text[], bx box[],
+  r int4range, mr int4multirange, tv tsvector, js json);
+INSERT INTO k690
+  SELECT (ARRAY['sad', 'ok', 'happy'])[1 + g % 3]::t690_mood,
+         ARRAY[(ARRAY['sad', 'ok', 'happy'])[1 + g % 3]::t690_mood], ARRAY[g % 4, 1],
+         1 + g % 5, ARRAY[1 + g % 2]::t690_pos[], ARRAY[g % 3]::t690_ints,
+         ARRAY['ok']::t690_moods, ROW(g % 3, 'x y')::t690_pair,
+         ARRAY[ROW(g % 2, 'q')::t690_pair], ARRAY['a b', 'c"'],
+         ARRAY[box(point(g % 2, 0), point(1, 1))],
+         CASE WHEN g % 2 = 0 THEN int4range(g % 3, 5) END,
+         int4multirange(int4range(g % 3, 5)), ('w' || g % 3)::tsvector, '{}'::json
+  FROM generate_series(1, 100) g;
+ANALYZE k690;
+SELECT attname, null_frac, n_distinct, most_common_vals, most_common_freqs,
+       histogram_bounds, correlation
+  FROM pg_stats WHERE tablename = 'k690' ORDER BY attname;
+SELECT null_frac FROM pg_stats WHERE tablename = 'k690' AND attname = 'e';

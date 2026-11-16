@@ -3879,6 +3879,8 @@ impl Engine {
         created_at: u64,
         name: SqlName,
     ) -> Result<(), SqlError> {
+        // A committed record must apply: check before journaling it.
+        self.storage.check_subscription_cleanup(slot, created_at)?;
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {
@@ -3914,6 +3916,10 @@ impl Engine {
         stream: crate::storage::SubscriptionStream,
         failure: crate::storage::SubscriptionFailure,
     ) -> Result<(), SqlError> {
+        // A failure raced by DROP or ALTER SUBSCRIPTION names a replaced
+        // definition; reject it before journaling, since a committed record
+        // that cannot apply would leave the commit outcome unresolved.
+        self.storage.check_subscription_failure(stream)?;
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
             self.storage.lsn().checked_add(1).ok_or_else(|| {

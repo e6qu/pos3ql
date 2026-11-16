@@ -23285,6 +23285,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v40",
                 "pos3ql-manifest-v41",
                 "pos3ql-manifest-v45",
+                "pos3ql-manifest-v46",
                 "pos3ql-manifest-v47 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");

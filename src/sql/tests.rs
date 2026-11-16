@@ -32840,9 +32840,9 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low TO STDOUT (FORMAT csv, HEADER true); COPY export_other TO STDOUT (FORMAT csv)",
             true
         )),
-        // COPY reads a table in the order SELECT scans it: pending rows,
-        // then saved ones.
-        ["id,note", "3,moved", "31,added", "30,\"far, saved\""]
+        // COPY reads a table in the order a sequential scan does: saved
+        // rows, then the rows written since, as PostgreSQL's heap holds them.
+        ["id,note", "3,moved", "30,\"far, saved\"", "31,added"]
     );
     assert_eq!(
         copy_data_rows(&session.success(
@@ -32850,7 +32850,7 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low (note, id) TO STDOUT; COPY export_other (note, id) TO STDOUT",
             true
         )),
-        ["moved\t3", "added\t31", "far, saved\t30"]
+        ["moved\t3", "far, saved\t30", "added\t31"]
     );
     let binary = session.success(
         &mut engine,
@@ -71375,8 +71375,6 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.txn_rows = 8192;
-    config.row_overlay_slots = 8192;
     config.value_index_rows = 8192;
     config.object_store_bucket = format!("composite-index-access-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -79529,6 +79527,105 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
 }
 
 #[test]
+fn sequential_scans_read_saved_rows_before_resident_updates() {
+    let name = "scan-saved-before-resident";
+    let mut config = test_config(name);
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("{name}-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    // The checkpoint saves the rows; the updated versions stay resident.
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE saved_order (id int, t text); \
+         INSERT INTO saved_order SELECT g, 'k' || g FROM generate_series(1, 300) g",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE saved_order SET t = 'moved' WHERE id IN (4, 8)",
+    );
+    assert!(!String::from_utf8_lossy(&updated).contains("ERROR"));
+    let table = engine.storage.find_table("public", "saved_order").unwrap();
+    assert!(engine.storage.spill_generation_count(table) > 0);
+    // PostgreSQL appends the updated tuples after the heap's earlier ones.
+    let expected = ["1|k1", "2|k2", "4|moved", "8|moved"];
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, t FROM saved_order WHERE t = 'moved' OR id < 3",
+        )),
+        expected
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; DECLARE saved_cursor CURSOR FOR SELECT id, t FROM saved_order \
+             WHERE t = 'moved' OR id < 3; FETCH ALL FROM saved_cursor; COMMIT",
+        )),
+        expected
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn subscription_failure_for_a_replaced_definition_is_rejected_before_journaling() {
+    let config = test_config("subscription-failure-replaced");
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION replaced_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=replaced_changes sslmode=disable' \
+         PUBLICATION changes WITH (create_slot = false, copy_data = false, slot_name = replaced_slot)",
+    );
+    let stream = engine.subscription_stream("replaced_changes").unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION replaced_changes SET PUBLICATION other_changes WITH (refresh = false)",
+    );
+    let journaled = engine.operational_snapshot().wal_used_bytes;
+    let error = engine
+        .fail_subscription(
+            stream,
+            crate::storage::SubscriptionFailure {
+                sqlstate: crate::sql::eval::SqlState::parse("42P01").unwrap(),
+                message: crate::util::StackStr::from_str("publisher relation is missing"),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.sqlstate,
+        crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+    );
+    assert_eq!(
+        engine.operational_snapshot().wal_used_bytes,
+        journaled,
+        "no failure record was journaled"
+    );
+    assert!(
+        engine
+            .storage
+            .subscription("replaced_changes", 0)
+            .unwrap()
+            .1
+            .failure
+            .is_none()
+    );
+}
+
+#[test]
 fn subscription_failure_policy_is_durable_and_typed() {
     let mut config = test_config("subscription-failure-recovery");
     config.object_store_on = true;
@@ -86213,17 +86310,18 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     assert!(!engine.maybe_checkpoint());
     assert!(engine.checkpoint_work_pending());
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT id FROM maintenance_retry"
-        )),
-        ["1"],
-        "failed remote maintenance must not fence reads after local publication cleanup"
-    );
-
+    // The saved row is read from the object store once it answers again,
+    // while the failed maintenance is still pending.
     namespace.borrow_mut().faults.transient_per_mille = 0;
+    let read = run_with(&mut engine, &mut budget, "SELECT id FROM maintenance_retry");
+    assert!(
+        !String::from_utf8_lossy(&read).contains("ERROR"),
+        "failed remote maintenance must not fence reads after local publication cleanup: {}",
+        String::from_utf8_lossy(&read)
+    );
+    assert_eq!(data_rows(&read), ["1"]);
+    assert!(engine.checkpoint_work_pending());
+
     // Resumption now separates inventory reads, listing and deletion. Bound
     // turns by fixture size while retaining the original network deadlines.
     let max_turns = 2 * namespace.borrow().object_count() + 16;

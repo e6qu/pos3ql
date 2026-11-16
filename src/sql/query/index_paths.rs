@@ -2259,7 +2259,7 @@ pub(crate) fn running_query(
     (context.slot == slot).then_some((context.shape, context.needed))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

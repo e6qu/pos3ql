@@ -56,8 +56,10 @@ pub(crate) use joined_from::{
     recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
 mod materialize;
+mod minmax;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
+pub(crate) use minmax::local_minmax_subquery;
 
 pub(crate) mod partition_prune;
 mod scan;
@@ -11195,6 +11197,26 @@ pub(super) fn selected_aggregate_call(
     txid: u32,
     columns: &dyn super::exec::ColTypeResolver,
 ) -> Result<bool, SqlError> {
+    Ok(aggregate_routine(expression, storage, txid, columns)?.is_some())
+}
+
+/// The routine an aggregate call runs, as the call's resolution selects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateRoutine {
+    /// An aggregate the SQL grammar spells (`xmlagg`), with no catalog call.
+    Syntax,
+    Builtin(i32),
+    Stored(usize),
+}
+
+/// The aggregate `expression` calls, or `None` when it is not an aggregate
+/// call.
+pub(crate) fn aggregate_routine(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<Option<AggregateRoutine>, SqlError> {
     use crate::storage::{RoutineCallKind, RoutineCallSelection, RoutineKind};
     let Expr::Call {
         name,
@@ -11210,10 +11232,12 @@ pub(super) fn selected_aggregate_call(
         ..
     } = expression
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if super::eval::is_sql_syntax_call(expression) {
-        return Ok(expression.is_aggregate());
+        return Ok(expression
+            .is_aggregate()
+            .then_some(AggregateRoutine::Syntax));
     }
     let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
     if args.len() > argument_oids.len() {
@@ -11293,13 +11317,13 @@ pub(super) fn selected_aggregate_call(
                 ));
             }
             match kind {
-                RoutineKind::Aggregate(_) => Ok(true),
+                RoutineKind::Aggregate(_) => Ok(Some(AggregateRoutine::Stored(slot))),
                 RoutineKind::Procedure => Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "{} is a procedure",
                     name
                 )),
-                _ => Ok(false),
+                _ => Ok(None),
             }
         }
         RoutineCallSelection::Builtin { oid, .. } => {
@@ -11323,7 +11347,7 @@ pub(super) fn selected_aggregate_call(
                     name
                 ));
             }
-            Ok(signature.kind == b'a')
+            Ok((signature.kind == b'a').then_some(AggregateRoutine::Builtin(oid)))
         }
         RoutineCallSelection::Ambiguous => Err(super::exec::function_lookup_error(
             name,
@@ -11350,10 +11374,10 @@ pub(super) fn selected_aggregate_call(
                     columns,
                 ));
             }
-            Ok(false)
+            Ok(None)
         }
     }?;
-    if !aggregate
+    if aggregate.is_none()
         && over.is_none()
         && (*star || *distinct || !order_by.is_empty() || filter.is_some())
     {

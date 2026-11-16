@@ -79353,20 +79353,24 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
         )
     );
     session.success(&mut engine, "ROLLBACK", false);
-    let discover =
-        |session: &mut ConfiguredTransactionSession, engine: &mut Engine, table: &str| {
-            let status = session.execute_status(engine, create, false);
-            assert!(
-                matches!(status, ExecutionStatus::Blocked { .. }),
-                "{status:?}"
-            );
-            let slot = (0..config.max_subscriptions)
-                .find(|slot| engine.subscription_connect_pending(*slot))
-                .expect("the waiting CREATE asked for its publisher");
-            let (step, request) = engine.start_subscription_connect(slot).unwrap();
-            assert_eq!(step, crate::storage::SubscriptionConnectStep::Discover);
-            assert_eq!(request.publication_count, 2);
-            engine.record_subscription_connect_missing(slot, 0b10);
+    let discover = |session: &mut ConfiguredTransactionSession,
+                    engine: &mut Engine,
+                    table: &str,
+                    lists: usize| {
+        let status = session.execute_status(engine, create, false);
+        assert!(
+            matches!(status, ExecutionStatus::Blocked { .. }),
+            "{status:?}"
+        );
+        let slot = (0..config.max_subscriptions)
+            .find(|slot| engine.subscription_connect_pending(*slot))
+            .expect("the waiting CREATE asked for its publisher");
+        let (step, request) = engine.start_subscription_connect(slot).unwrap();
+        assert_eq!(step, crate::storage::SubscriptionConnectStep::Discover);
+        assert_eq!(request.publication_count, 2);
+        engine.record_subscription_connect_missing(slot, 0b10);
+        // The publisher lists a table once per distinct column list.
+        for _ in 0..lists {
             engine.record_subscription_connect_table(
                 slot,
                 crate::storage::PublisherTable {
@@ -79374,11 +79378,24 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
                     name: crate::storage::SqlName::parse(table).unwrap(),
                 },
             );
-            engine.finish_subscription_connect(slot, None);
-            slot
-        };
+        }
+        engine.finish_subscription_connect(slot, None);
+        slot
+    };
+    // Different column lists for one table fail the statement, after the
+    // missing publication's warning.
+    discover(&mut session, &mut engine, "items", 2);
+    let mismatched =
+        String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
+    assert!(
+        mismatched.contains("Mpublication \"absent\" does not exist on the publisher")
+            && mismatched.contains(
+                "C0A000\0Mcannot use different column lists for table \"public.items\" in different publications"
+            ),
+        "{mismatched}"
+    );
     // A published table missing locally fails before any slot is created.
-    discover(&mut session, &mut engine, "items");
+    discover(&mut session, &mut engine, "items", 1);
     let missing = String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
     assert!(
         missing.contains("Mpublication \"absent\" does not exist on the publisher")
@@ -79386,7 +79403,7 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
         "{missing}"
     );
     session.success(&mut engine, "CREATE TABLE items (id int)", false);
-    let slot = discover(&mut session, &mut engine, "items");
+    let slot = discover(&mut session, &mut engine, "items", 1);
     let status = session.execute_status(&mut engine, create, false);
     assert!(
         matches!(status, ExecutionStatus::Blocked { .. }),

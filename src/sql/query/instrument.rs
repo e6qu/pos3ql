@@ -844,8 +844,8 @@ thread_local! {
 /// current one, until the returned scope ends. A subquery's runners nest
 /// (a row subquery runs its set): only the outermost enters.
 #[must_use]
-pub(crate) fn enter_sublink<T>(query: *const T) -> SublinkEntered {
-    let query = query as usize as u64;
+pub(crate) fn enter_sublink(query: &crate::sql::ast::Select<'_>) -> SublinkEntered {
+    let query = query.instrument_identity();
     if SUBLINK.with(Cell::get) == query {
         return SublinkEntered(None);
     }

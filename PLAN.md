@@ -492,10 +492,13 @@ in `pg_subscription_rel` at commit as `i` (`r` without `copy_data`)
 (`differential_exact/782`). Remaining: the initial copy still runs as one
 bootstrap under one synchronization slot, so a table moves from `i` to `r`
 when the whole copy commits, without PostgreSQL's per-table `d`, `f` and `s`
-states, and a publication's differing column lists for one table are
-rejected by that copy rather than by the statement. The publisher connection
-needs a numeric host, port, user, dbname and sslmode (`22023` otherwise),
-where libpq resolves names and defaults.
+states. A table its publications publish with different column lists fails
+`CREATE SUBSCRIPTION` with PostgreSQL's `0A000` before any slot is created,
+as `fetch_table_list` does; `ALTER SUBSCRIPTION ... REFRESH PUBLICATION`
+still rejects it in its copy rather than in the statement. The publisher connection
+needs a port, user, dbname and sslmode (`22023` otherwise), where libpq
+applies its defaults, and a numeric host: resolving a host name as libpq does
+is blocked by the fixed-memory rule ([B-351](BUGS.md)).
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
@@ -929,13 +932,36 @@ InitPlan's output (a constant of unknown value: `var_eq_non_const` and
 and with a stable expression estimated from its value at planning
 (`estimate_expression_value`), whose evaluation an index scan charges once at
 startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
-Remaining there: a stable expression the model cannot evaluate (a
-user-defined function) leaves the crude estimate, and PostgreSQL's
-`min`/`max` InitPlan of a local table (`preprocess_minmax_aggregates`) and the
-cost of an implicit coercion function inside a condition (`length(name)`
-casting to `text`) are not modelled. A plain `Aggregate`'s cost is not
-PostgreSQL's `cost_agg` (its input cost plus each aggregate's transition
-function per input row): EXPLAIN shows pos3ql's own estimate. JSON nests as
+`min` and `max` of the columns of one plain table are explained as
+PostgreSQL's `preprocess_minmax_aggregates` plans them: each an InitPlan
+reading the first row of the index scan ordered by its column with nulls
+excluded, when those scans cost less than the aggregate
+(`differential_exact/791`). Execution still aggregates the rows, since a
+subquery's ordered `LIMIT` reads and sorts every row rather than stopping an
+ordered index scan, so `EXPLAIN ANALYZE` of such a plan fails with `0A000`;
+a written scalar subquery's `ORDER BY ... LIMIT` over an index reports every
+row its scan reads where PostgreSQL's stops at the limit. Remaining there: a stable expression the model cannot evaluate
+(a user-defined function) leaves the crude estimate, and the cost of an
+implicit coercion function inside a condition (`length(name)` casting to
+`text`) is not modelled. Aggregation over the chosen scan of one
+plain table is costed as PostgreSQL's `cost_agg` costs it
+(`differential_exact/790`): each transition state's function and input
+expressions per input row and each final function once per group
+(`get_agg_clause_costs`, from PostgreSQL 18.6's `pg_aggregate`, states shared
+as `find_compatible_trans` shares them), a plain `Aggregate`, and for a
+`GROUP BY` of the table's columns a `GroupAggregate` over a `Sort` weighed
+against a `HashAggregate` with its spill model (`hash_agg_entry_size`,
+`hash_agg_set_limits`, `Planned Partitions`) and the `ORDER BY` sort above
+either, the grouping taking the `ORDER BY`'s key order
+(`preprocess_groupclause`) and the groups `estimate_num_groups`.
+`EXPLAIN ANALYZE` of a `GroupAggregate` fails with `0A000`, as execution
+does not sort its input. Remaining: grouping sets (PostgreSQL's `Hash Key`
+lists and `MixedAggregate` from `consider_groupingsets_paths`, which pos3ql
+prints as one `Group Key`), `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
+`ORDER BY` inputs, user-defined aggregates, a select list computing
+expressions over aggregates, grouping by expressions, by a column an index
+orders (presorted and incremental paths) and over joins keep pos3ql's own
+estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's

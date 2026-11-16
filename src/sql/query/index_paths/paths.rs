@@ -2438,6 +2438,11 @@ fn build<'a>(
         }
         super::Member::No => {}
     }
+    if let Some(grouping) = shape.grouping {
+        return grouped(
+            paths, kept, shape, grouping, definition, needed, rows, width,
+        );
+    }
     let order = paths.order;
     let groups = |presorted: usize| {
         let mut columns = [0usize; super::MAX_ORDER_KEYS];
@@ -2469,6 +2474,147 @@ fn build<'a>(
     )?);
     path.sort_cost = upper.sort_cost;
     path.limit_cost = upper.limit_cost;
+    Ok(Ok(Planned::Chosen(path)))
+}
+
+/// `add_paths_to_grouping_rel` over the relation's `kept` paths, which no
+/// index orders by a grouping column: a `GroupAggregate` over the cheapest
+/// path sorted and a `HashAggregate` over it, kept as `add_path` keeps
+/// them, then `create_ordered_paths` for the query's `ORDER BY`.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+fn grouped<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    kept: &[Candidate],
+    shape: QueryShape,
+    grouping: super::GroupingShape,
+    definition: &crate::storage::TableDef,
+    needed: Option<u64>,
+    rows: f64,
+    width: f64,
+) -> Built<Planned<'a>> {
+    use super::aggregate::{AggInput, AggStrategy, cost_agg};
+    let planner = paths.planner;
+    let costs = planner.costs;
+    let methods = crate::sql::guc::planner_methods();
+    let columns = &grouping.columns[..grouping.len];
+    // An index ordered by a grouping column gives PostgreSQL presorted
+    // input paths, which the model leaves out.
+    for (index, info) in planner.indexes.iter().enumerate() {
+        let catalog = &info.catalog;
+        if paths.usable[index]
+            && catalog.n_cols > 0
+            && columns.contains(&usize::from(catalog.columns[0]))
+        {
+            return Ok(Err("a grouping column an index orders"));
+        }
+    }
+    let kept_options = paths
+        .arena
+        .alloc_slice_with(kept.len(), |at| Some(kept[at]))
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let cheapest = cheapest_total(kept_options).expect("the relation keeps a path");
+    let groups = estimate_groups(planner, columns, rows);
+    // The sorted strategy over the cheapest path, sorted.
+    let (sort_startup, sort_run) = tuplesort_cost(rows, width, None, costs);
+    let input_sort = (
+        cheapest.total + sort_startup,
+        cheapest.total + sort_startup + sort_run,
+    );
+    let sorted_input = AggInput {
+        startup: input_sort.0,
+        total: input_sort.1,
+        rows,
+        width,
+    };
+    let (startup, total, _) = cost_agg(
+        AggStrategy::Sorted,
+        &grouping.aggregates,
+        columns.len(),
+        groups,
+        sorted_input,
+    );
+    let sorted = Candidate {
+        startup,
+        total,
+        presorted: columns.len(),
+        disabled: cheapest.disabled + u32::from(!methods.sort),
+        ..cheapest
+    };
+    let hashed_input = AggInput {
+        startup: cheapest.startup,
+        total: cheapest.total,
+        rows,
+        width,
+    };
+    let (startup, total, _) = cost_agg(
+        AggStrategy::Hashed,
+        &grouping.aggregates,
+        columns.len(),
+        groups,
+        hashed_input,
+    );
+    let hashed = Candidate {
+        startup,
+        total,
+        presorted: 0,
+        disabled: cheapest.disabled + u32::from(!methods.hashagg),
+        ..cheapest
+    };
+    let mut grouped_paths = [None::<Candidate>; MAX_CANDIDATES];
+    let grouped_count = add_paths(&[sorted, hashed], false, &mut grouped_paths);
+    let grouped_paths = &grouped_paths[..grouped_count];
+    let cheapest_grouped = cheapest_total(grouped_paths).expect("a grouped path is kept");
+    // `create_ordered_paths`: a path in the `ORDER BY` order as it is, the
+    // cheapest one sorted.
+    let (sort_startup, sort_run) = tuplesort_cost(groups, grouping.output_width, None, costs);
+    let sort_groups = |path: Candidate| Candidate {
+        startup: path.total + sort_startup,
+        total: path.total + sort_startup + sort_run,
+        disabled: path.disabled + u32::from(!methods.sort),
+        ..path
+    };
+    let mut finals = [cheapest; MAX_CANDIDATES];
+    let mut final_count = 0;
+    for path in grouped_paths.iter().flatten() {
+        let satisfied = match grouping.order {
+            super::GroupOrder::None => true,
+            super::GroupOrder::Grouped => path.presorted > 0,
+            super::GroupOrder::Other => false,
+        };
+        finals[final_count] = if satisfied {
+            *path
+        } else if path.presorted == cheapest_grouped.presorted
+            && path.total == cheapest_grouped.total
+        {
+            sort_groups(*path)
+        } else {
+            continue;
+        };
+        final_count += 1;
+    }
+    let mut ordered = [None::<Candidate>; MAX_CANDIDATES];
+    let ordered_count = add_paths(&finals[..final_count], false, &mut ordered);
+    let chosen = cheapest_total(&ordered[..ordered_count]).expect("an ordered path is kept");
+    let hashed_chosen = chosen.presorted == 0;
+    let aggregate = if hashed_chosen { hashed } else { sorted };
+    let output_sort = (grouping.order != super::GroupOrder::None
+        && (hashed_chosen || grouping.order == super::GroupOrder::Other))
+        .then_some((
+            aggregate.total + sort_startup,
+            aggregate.total + sort_startup + sort_run,
+        ));
+    let mut path = outside!(describe(
+        paths, &cheapest, &cheapest, shape, definition, needed, rows
+    )?);
+    path.grouped = Some(super::GroupedPath {
+        input_sort: (!hashed_chosen).then_some(input_sort),
+        planned_partitions: hashed_chosen
+            .then(|| super::aggregate::planned_partitions(&grouping.aggregates, groups, width)),
+        startup: aggregate.startup,
+        total: aggregate.total,
+        rows: groups,
+        output_sort,
+    });
     Ok(Ok(Planned::Chosen(path)))
 }
 
@@ -2812,6 +2958,7 @@ fn describe<'a>(
         predicate: &[],
         sort_cost: None,
         limit_cost: None,
+        grouped: None,
         // A scan that returns the requested order stops when its limit has
         // the rows it needs.
         stop_after: match shape.limit {

@@ -122,6 +122,9 @@ struct PlanNode {
     bitmap_index_estimate: Option<(f64, u64)>,
     /// Why `EXPLAIN ANALYZE` cannot count this node as PostgreSQL does.
     analyze_unsupported: Option<&'static str>,
+    /// The partitions a hash aggregate expects to spill its groups to,
+    /// which text shows only when there are any.
+    planned_partitions: Option<u32>,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -387,6 +390,7 @@ impl PlanNode {
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
 }
 
@@ -3083,6 +3087,7 @@ fn push_members(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3679,6 +3684,20 @@ fn projected_shape<'a>(
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?,
+        // A query without FROM types its subqueries' values as the
+        // statement's description does.
+        None if statement.set_body.is_none() && outer.is_none() => {
+            let statement = arena.alloc(*statement).map_err(|_| arena_full())?;
+            query::describe_select(
+                statement,
+                storage,
+                txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?
+        }
         None => {
             let outer_types = outer.map(query::OuterColumnTypes);
             let statement = arena.alloc(*statement).map_err(|_| arena_full())?;
@@ -3781,6 +3800,316 @@ fn has_aggregate(
         }
     }
     Ok(false)
+}
+
+/// The scan and grouping PostgreSQL's planner chooses for a query grouping
+/// the rows of one table by its columns, with the keys its sort and its
+/// `Group Key` list in the order the grouping uses.
+#[derive(Clone, Copy)]
+struct GroupedScan<'a> {
+    path: query::index_paths::ScanPath<'a>,
+    sort_keys: &'a [KeyItem<'a>],
+    group_keys: &'a [KeyItem<'a>],
+    /// The width of the rows the grouping returns, each column of the
+    /// table its analyzed width.
+    width: u32,
+}
+
+/// [`GroupedScan`] of `statement`, or `None` when the query is outside the
+/// model: a `HAVING`, `LIMIT`, `DISTINCT`, window or set-returning list, a
+/// grouping key other than a column of the table, a select list computing
+/// more than aggregates, columns and constants, an `ORDER BY` sharing only
+/// part of its leading keys with the grouping, or a scan the model of
+/// [`query::index_paths`] leaves out.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+fn grouped_scan_path<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    output_width: u32,
+    arena: &'a Arena,
+) -> Result<Option<GroupedScan<'a>>, SqlError> {
+    use query::index_paths::{GroupOrder, GroupingShape, MAX_ORDER_KEYS, QueryShape};
+    if statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.group_by.len() > MAX_ORDER_KEYS
+        || scope.n != 1
+        || !from.joins.is_empty()
+        || from.base.sample.is_some()
+        || statement.having.is_some()
+        || statement.limit.is_some()
+        || statement.offset.is_some()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || has_window(statement)
+        || query::has_set_returning_items(statement.items, storage, txid)
+        || scope.slots[0] == usize::MAX
+        || scope.derived[0].is_some()
+    {
+        return Ok(None);
+    }
+    let slot = scope.slots[0];
+    if storage.table_def(slot, txid).partition.is_partitioned()
+        || storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(None);
+    }
+    // An ordinal names a select-list entry.
+    let resolve = |expression: &'a Expr<'a>| -> &'a Expr<'a> {
+        match expression {
+            Expr::Int(position) if *position >= 1 => statement
+                .items
+                .get(*position as usize - 1)
+                .and_then(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .unwrap_or(expression),
+            _ => expression,
+        }
+    };
+    let column_of = |expression: &'a Expr<'a>| -> Option<usize> {
+        match resolve(expression) {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(query::ResolvedColumn::Table(0, column)) => Some(column),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut group = [0usize; MAX_ORDER_KEYS];
+    let mut group_len = 0;
+    for &key in statement.group_by {
+        let Some(column) = column_of(key) else {
+            return Ok(None);
+        };
+        if !group[..group_len].contains(&column) {
+            group[group_len] = column;
+            group_len += 1;
+        }
+    }
+    // `preprocess_groupclause`: the grouping takes the `ORDER BY`'s order
+    // and directions when its keys lead with grouping columns.
+    let mut ordered = [None::<(usize, (bool, bool))>; MAX_ORDER_KEYS];
+    let mut ordered_len = 0;
+    let mut order = if statement.order_by.is_empty() {
+        GroupOrder::None
+    } else {
+        GroupOrder::Grouped
+    };
+    for (at, key) in statement.order_by.iter().enumerate() {
+        let column = column_of(key.expression).filter(|column| group[..group_len].contains(column));
+        match column {
+            Some(column) if order == GroupOrder::Grouped => {
+                if !ordered[..ordered_len]
+                    .iter()
+                    .flatten()
+                    .any(|(seen, _)| *seen == column)
+                {
+                    ordered[ordered_len] = Some((column, (key.descending, key.nulls_first)));
+                    ordered_len += 1;
+                }
+            }
+            Some(_) => return Ok(None),
+            None if at == 0 => order = GroupOrder::Other,
+            None => return Ok(None),
+        }
+    }
+    if order == GroupOrder::Other {
+        ordered_len = 0;
+    }
+    let mut columns_in_order = [0usize; MAX_ORDER_KEYS];
+    let mut directions = [None::<(bool, bool)>; MAX_ORDER_KEYS];
+    for (at, (column, direction)) in ordered[..ordered_len].iter().flatten().enumerate() {
+        columns_in_order[at] = *column;
+        directions[at] = Some(*direction);
+    }
+    let mut count = ordered_len;
+    for &column in &group[..group_len] {
+        if !columns_in_order[..count].contains(&column) {
+            columns_in_order[count] = column;
+            count += 1;
+        }
+    }
+    // A column of a variable-length type is as wide as ANALYZE measured.
+    let mut output_width = output_width;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Some(column) = column_of(expression)
+            && scope.defs.stored(0).is_some_and(|definition| {
+                definition.columns()[column].ctype.physical_layout().length <= 0
+            })
+        {
+            output_width = output_width - 32
+                + query::index_paths::column_width(storage, txid, scope.slots[0], column);
+        }
+    }
+    // The aggregates' costs, over a list of aggregates, columns and
+    // constants.
+    let expressions = arena
+        .alloc_slice_with(statement.items.len() + statement.order_by.len(), |_| {
+            &Expr::Null
+        })
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    for (slot, key) in expressions[statement.items.len()..]
+        .iter_mut()
+        .zip(statement.order_by)
+    {
+        *slot = resolve(key.expression);
+    }
+    let Some(aggregates) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let group_mask = columns_in_order[..count]
+        .iter()
+        .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+    let output = query::streaming_pax_columns_ordered(
+        scope,
+        from,
+        statement.items,
+        None,
+        statement.order_by,
+    )
+    .selected_mask(0)
+    .map(|mask| mask | group_mask);
+    let needed = query::streaming_pax_columns_ordered(
+        scope,
+        from,
+        statement.items,
+        statement.where_clause,
+        statement.order_by,
+    )
+    .selected_mask(0)
+    .map(|mask| mask | group_mask);
+    let shape = QueryShape {
+        only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+        output,
+        grouping: Some(GroupingShape {
+            columns: columns_in_order,
+            len: count,
+            aggregates,
+            output_width: f64::from(output_width),
+            order,
+        }),
+        ..QueryShape::default()
+    };
+    let planned = query::index_paths::scan_path(
+        storage,
+        scope,
+        txid,
+        split_gating(storage, txid, statement.where_clause, arena)?.1,
+        needed,
+        &[],
+        arena,
+        shape,
+    )?;
+    let query::index_paths::Planned::Chosen(path) = planned else {
+        return Ok(None);
+    };
+    if path.grouped.is_none() {
+        return Ok(None);
+    }
+    // The keys as the plan prints them: each grouping column by the
+    // `GROUP BY` entry naming it.
+    let entry = |column: usize| -> &'a Expr<'a> {
+        statement
+            .group_by
+            .iter()
+            .copied()
+            .find(|key| column_of(key) == Some(column))
+            .expect("a grouping column has its entry")
+    };
+    let sort_keys = arena
+        .alloc_slice_with(count, |at| {
+            (
+                entry(columns_in_order[at]),
+                Some(directions[at].unwrap_or((false, false))),
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let group_keys = arena
+        .alloc_slice_with(count, |at| (entry(columns_in_order[at]), None))
+        .map_err(|_| arena_full())?;
+    Ok(Some(GroupedScan {
+        path,
+        sort_keys,
+        group_keys,
+        width: output_width,
+    }))
+}
+
+/// `cost_agg` of a plain aggregate over the chosen `path` of the one
+/// relation `statement` reads: `None` when its select list computes more
+/// than aggregates, columns and constants, or an aggregate is outside the
+/// model of [`query::index_paths::aggregate_costs`].
+fn plain_aggregate_cost<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    path: &query::index_paths::ScanPath<'_>,
+    arena: &'a Arena,
+) -> Result<Option<(f64, f64)>, SqlError> {
+    let expressions = arena
+        .alloc_slice_with(statement.items.len(), |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        // The target list's own cost is outside the model.
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    let Some(costs) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let (startup, total, _) = query::index_paths::cost_agg(
+        query::index_paths::AggStrategy::Plain,
+        &costs,
+        0,
+        1.0,
+        query::index_paths::AggInput {
+            startup: path.startup_cost,
+            total: path.total_cost,
+            rows: path.rows,
+            width: f64::from(path.width),
+        },
+    );
+    Ok(Some((startup, total)))
 }
 
 fn has_window(statement: &Select<'_>) -> bool {
@@ -4896,6 +5225,7 @@ fn scan_node<'a>(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -4959,6 +5289,20 @@ fn plan_select_with_ctes<'a>(
         crate::sql::foreign::deparse::minmax_subquery(storage, txid, statement, arena)?
     {
         return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
+    }
+    // `min` and `max` of a local table are explained as PostgreSQL plans
+    // them when an index orders them. Execution aggregates the rows, and a
+    // subquery's ordered `LIMIT` reads every row, so the InitPlans' counts
+    // would differ.
+    if outer.is_none()
+        && let Some(rewritten) = query::local_minmax_subquery(storage, txid, statement, arena)?
+    {
+        let plan = plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena)?;
+        if plan.count > 0 {
+            plan.nodes[0].analyze_unsupported =
+                Some("EXPLAIN ANALYZE of min or max read through an index is not supported");
+        }
+        return Ok(plan);
     }
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
@@ -5189,7 +5533,7 @@ fn plan_sublinks<'a>(
             txid,
             select,
             outer,
-            block.child(Segment::Sublink(core::ptr::from_ref(select) as usize as u64)),
+            block.child(Segment::Sublink(select.instrument_identity())),
             arena,
         );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
@@ -5668,7 +6012,7 @@ fn plan_pulled_select<'a>(
         scope.n * 3 + MAX_EXPLAIN_STAGES + members
     });
     let mut plan = Plan::new(arena, capacity)?;
-    let (width, mut output) =
+    let (mut width, mut output) =
         projected_shape(statement, scope.as_ref(), outer, storage, txid, arena)?;
     if let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
         && scope.n == 1
@@ -5885,6 +6229,15 @@ fn plan_pulled_select<'a>(
         }
         _ => None,
     };
+    // The grouping PostgreSQL's planner chooses over the scan of one table.
+    let grouped = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from)) if chosen_path.is_none() => {
+            grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+        }
+        _ => None,
+    };
+    let grouped_path = grouped.map(|grouped| grouped.path);
+    let chosen_scan = chosen_path.or(grouped_path);
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
     let mut object_requests = 0u64;
@@ -5948,7 +6301,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-                chosen_path,
+                chosen_scan,
             )?;
             scan_indexes[table] = index;
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
@@ -6090,25 +6443,82 @@ fn plan_pulled_select<'a>(
     // A FROM-less query grouped by constants groups its one row.
     let constant_group = fromless && constant_keys(statement.group_by)?;
     if aggregate {
+        // PostgreSQL's `cost_agg` over the chosen scan of one relation.
+        let exact = match chosen_path {
+            Some(path) if statement.group_by.is_empty() && statement.having.is_none() => {
+                plain_aggregate_cost(storage, txid, statement, columns, &path, arena)?
+            }
+            _ => None,
+        };
         estimated_rows = if statement.group_by.is_empty() {
             1
         } else {
             (estimated_rows as f64).sqrt().ceil().max(1.0) as u64
         };
-        total_cost += estimated_rows as f64 * 0.02;
+        let mut aggregate_startup = 0.0;
+        match exact {
+            Some((startup, total)) => {
+                aggregate_startup = startup;
+                total_cost = total;
+            }
+            None => total_cost += estimated_rows as f64 * 0.02,
+        }
+        let mut aggregate_name = if statement.group_by.is_empty() {
+            "Aggregate"
+        } else if constant_group {
+            "Group"
+        } else {
+            "HashAggregate"
+        };
+        let mut aggregate_keys = group_keys(statement, arena)?;
+        let mut planned_partitions = None;
+        if let Some(grouped) = grouped
+            && let Some(path) = grouped.path.grouped
+        {
+            if let Some((startup, total)) = path.input_sort {
+                add_stage(
+                    &mut stages,
+                    &mut stage_count,
+                    PlanNode {
+                        name: StackStr::from_str("Sort"),
+                        keys: plan_keys(
+                            storage,
+                            txid,
+                            scope.as_ref(),
+                            statement,
+                            KeyLabel::Sort,
+                            grouped.sort_keys,
+                            arena,
+                        )?,
+                        startup_cost: startup,
+                        total_cost: total,
+                        rows: grouped.path.rows as u64,
+                        width: grouped.path.width,
+                        object_requests,
+                        cache_blocks,
+                        analyze_unsupported: Some(
+                            "EXPLAIN ANALYZE of a sorted grouping is not supported",
+                        ),
+                        ..PlanNode::EMPTY
+                    },
+                )?;
+                aggregate_name = "GroupAggregate";
+            }
+            planned_partitions = path.planned_partitions;
+            aggregate_keys = Some(grouped.group_keys);
+            aggregate_startup = path.startup;
+            total_cost = path.total;
+            estimated_rows = path.rows as u64;
+            width = grouped.width;
+        }
         add_stage(
             &mut stages,
             &mut stage_count,
             PlanNode {
-                name: StackStr::from_str(if statement.group_by.is_empty() {
-                    "Aggregate"
-                } else if constant_group {
-                    "Group"
-                } else {
-                    "HashAggregate"
-                }),
+                name: StackStr::from_str(aggregate_name),
                 key: Some(NodeKey::new(aggregated_block, Role::Aggregate)),
-                keys: match group_keys(statement, arena)?
+                planned_partitions,
+                keys: match aggregate_keys
                     .filter(|_| !statement.group_by.is_empty() && !constant_group)
                 {
                     Some(keys) => plan_keys(
@@ -6122,6 +6532,7 @@ fn plan_pulled_select<'a>(
                     )?,
                     None => PlanKeys::NONE,
                 },
+                startup_cost: aggregate_startup,
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -6247,9 +6658,10 @@ fn plan_pulled_select<'a>(
     };
     // The chosen path may return the rows ordered; otherwise the legacy
     // ordered index does.
-    let scan_ordered = match chosen_path {
-        Some(path) => path.sort == query::index_paths::SortKind::None,
-        None => ordered_index.is_some(),
+    let scan_ordered = match (chosen_path, grouped_path.and_then(|path| path.grouped)) {
+        (Some(path), _) => path.sort == query::index_paths::SortKind::None,
+        (None, Some(grouped)) => grouped.output_sort.is_none(),
+        (None, None) => ordered_index.is_some(),
     };
     if !sorted_keys.is_empty()
         && !scan_ordered
@@ -6288,6 +6700,12 @@ fn plan_pulled_select<'a>(
             node.total_cost = total;
             node.rows = path.rows as u64;
             node.width = path.width;
+        }
+        if let Some(grouped) = grouped_path.and_then(|path| path.grouped)
+            && let Some((startup, total)) = grouped.output_sort
+        {
+            node.startup_cost = startup;
+            node.total_cost = total;
         }
         if presorted != 0 {
             let prefix = plan_keys(
@@ -7051,7 +7469,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-                chosen_path,
+                chosen_scan,
             )?;
             // A join's outer relation, and an inner one it rescans directly,
             // may return their physical columns; one under a `Hash` or
@@ -9015,6 +9433,7 @@ fn physical_scan_node(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     }
 }
 
@@ -9189,6 +9608,7 @@ fn push_set_tree(
                 inner_unique: false,
                 bitmap_index_estimate: None,
                 analyze_unsupported: None,
+                planned_partitions: None,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -9649,9 +10069,7 @@ fn write_initplans<'a, 'e>(
             txid,
             select,
             None,
-            block.child(Segment::Sublink(
-                core::ptr::from_ref(*select) as usize as u64
-            )),
+            block.child(Segment::Sublink(select.instrument_identity())),
             arena,
         );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
@@ -9810,6 +10228,7 @@ fn plan_write<'a>(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -12364,6 +12783,16 @@ pub(super) fn visit_text_rows<E>(
                 emit(line.as_str())?;
             }
         }
+        if options.costs
+            && let Some(partitions) = node.planned_partitions.filter(|&partitions| partitions > 0)
+        {
+            let mut line = StackStr::<64>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Planned Partitions: {partitions}");
+            emit(line.as_str())?;
+        }
         for line in index_scan_details(node, node_actual) {
             let mut text = StackStr::<128>::new();
             for _ in 0..node_indent(node) {
@@ -13370,6 +13799,11 @@ fn structured_node(
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
         }
+    }
+    if options.costs
+        && let Some(partitions) = node.planned_partitions
+    {
+        document.number("Planned Partitions", partitions);
     }
     let counters = match node_actual {
         NodeActual::Unmeasured => None,

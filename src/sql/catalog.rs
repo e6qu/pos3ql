@@ -29,6 +29,38 @@ mod schema;
 #[path = "catalog_planner_properties.rs"]
 mod planner_properties;
 
+#[path = "catalog_aggregate_costs.rs"]
+mod aggregate_costs;
+
+/// The bytes an aggregate's transition state adds to a hash aggregate's
+/// entry (`transitionSpace`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TransitionSpace {
+    Fixed(u32),
+    /// The state has the call's input type (a polymorphic state type).
+    Input,
+}
+
+/// What PostgreSQL's planner charges for a built-in aggregate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AggregateCost {
+    /// The transition function, which with `initial` decides whether two
+    /// aggregates of the same inputs share one state.
+    pub transition: i32,
+    pub transition_cost: f64,
+    /// The final function's `procost`; 0 without one.
+    pub final_cost: f64,
+    pub initial: Option<&'static str>,
+    pub space: TransitionSpace,
+}
+
+pub(crate) fn builtin_aggregate_cost(oid: i32) -> Option<AggregateCost> {
+    let index = aggregate_costs::AGGREGATE_COSTS
+        .binary_search_by_key(&oid, |(oid, _)| *oid)
+        .ok()?;
+    Some(aggregate_costs::AGGREGATE_COSTS[index].1)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct BuiltinPlannerProcedure {
     pub volatility: u8,

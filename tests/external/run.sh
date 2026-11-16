@@ -1022,8 +1022,8 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   SUB_PSQL="$SUB_PGBIN/psql"
   if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'subscription_apply%' OR slot_name LIKE 'pos3ql_%_sync'" \
-    -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right" \
-    -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target, subscription_typed, subscription_union_target" \
+    -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right, subscription_mismatch_left, subscription_mismatch_right" \
+    -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target, subscription_typed, subscription_union_target, subscription_mismatch" \
     -c "DROP TYPE IF EXISTS subscription_pair" \
     -c "DROP TYPE IF EXISTS subscription_state" \
     -c "DROP DOMAIN IF EXISTS subscription_positive" \
@@ -1042,6 +1042,9 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     -c "CREATE PUBLICATION subscription_apply_pub_columns_left FOR TABLE subscription_union_target (id, left_value, right_value) WHERE (id > 0)" \
     -c "CREATE PUBLICATION subscription_apply_pub_columns_right FOR TABLE subscription_union_target (id, left_value, right_value) WHERE (id < 0)" \
     -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_refresh_target" \
+    -c "CREATE TABLE subscription_mismatch (id int PRIMARY KEY, left_value text, right_value text)" \
+    -c "CREATE PUBLICATION subscription_mismatch_left FOR TABLE subscription_mismatch (id, left_value)" \
+    -c "CREATE PUBLICATION subscription_mismatch_right FOR TABLE subscription_mismatch (id, right_value)" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher setup"
   elif ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
@@ -1226,6 +1229,17 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
       && ok "managed subscription drop removes the publisher slot and local catalog object" \
       || bad "managed subscription cleanup (publisher $publisher_slot_count, local $local_subscription_count, output $drop_output)"
   fi
+  # A table published with different column lists fails CREATE
+  # SUBSCRIPTION itself, as PostgreSQL's fetch_table_list does.
+  mismatch_output=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+    -c "CREATE TABLE subscription_mismatch (id int PRIMARY KEY, left_value text, right_value text)" \
+    -c "CREATE SUBSCRIPTION subscription_mismatch CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres sslmode=disable' PUBLICATION subscription_mismatch_left, subscription_mismatch_right" 2>&1)
+  mismatch_slots=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
+    -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'subscription_mismatch'")
+  [[ "$mismatch_output" == 'ERROR:  cannot use different column lists for table "public.subscription_mismatch" in different publications' \
+    && "$mismatch_slots" == "0" ]] \
+    && ok "CREATE SUBSCRIPTION rejects different column lists for one table" \
+    || bad "CREATE SUBSCRIPTION column lists (output $mismatch_output, slots $mismatch_slots)"
   fi
   fi
   fi

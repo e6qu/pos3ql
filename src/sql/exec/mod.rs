@@ -20893,8 +20893,16 @@ fn connect_subscription_publisher(
     // The publisher's tables must exist locally as ordinary or partitioned
     // tables before the slot is created.
     let mut missing = 0u64;
-    let resolved = storage.subscription_connect_result(discovered, |tables, absent| {
+    let resolved = storage.subscription_connect_result(discovered, |tables, absent, mismatched| {
         missing = absent;
+        if mismatched && let Some(table) = tables.last() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use different column lists for table \"{}.{}\" in different publications",
+                table.schema.as_str(),
+                table.name.as_str()
+            ));
+        }
         let mut found = [0usize; crate::storage::MAX_PUBLICATION_TABLES];
         let mut count = 0usize;
         for table in tables {
@@ -85132,7 +85140,7 @@ fn merge_source<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
-        minmax_subquery: false,
+        minmax_subquery: None,
     };
     // Keep temporary source descriptions by value. Retaining full copies here
     // would consume the fixed statement arena before selecting source rows.

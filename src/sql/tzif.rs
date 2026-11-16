@@ -59,6 +59,7 @@ struct ZoneData {
     type_after: [u8; MAX_TRANSITIONS],
     n_transitions: usize,
     types: [TypeInfo; MAX_TYPES],
+    n_types: usize,
     /// The type in effect before the first transition.
     first_type: u8,
     /// The POSIX rule from the file footer, for instants past the last
@@ -77,6 +78,7 @@ const EMPTY_ZONE: ZoneData = ZoneData {
     type_after: [0; MAX_TRANSITIONS],
     n_transitions: 0,
     types: [EMPTY_TYPE; MAX_TYPES],
+    n_types: 0,
     first_type: 0,
     footer: None,
 };
@@ -280,6 +282,19 @@ fn with_zone<T>(slot: TzifSlot, read: impl FnOnce(&ZoneData) -> T) -> T {
 
 pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>, bool) {
     with_zone(slot, |zone| resolve_zone(zone, utc_micros))
+}
+
+/// `pg_get_timezone_offset`: the zone's one offset east of UTC when every
+/// local-time type it records has the same offset.
+pub(crate) fn constant_offset(slot: TzifSlot) -> Option<i32> {
+    with_zone(slot, |zone| {
+        let types = &zone.types[..zone.n_types];
+        let first = types.first()?.utoff;
+        types
+            .iter()
+            .all(|kind| kind.utoff == first)
+            .then_some(first)
+    })
 }
 
 pub(crate) enum AbbreviationMeaning {
@@ -560,6 +575,7 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         };
     }
     out.n_transitions = timecnt;
+    out.n_types = typecnt;
     // The type before history begins: RFC 8536 recommends the first standard
     // (non-DST) type; PostgreSQL behaves likewise.
     out.first_type = 0;

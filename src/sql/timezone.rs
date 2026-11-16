@@ -150,6 +150,15 @@ impl Timezone {
         matching.or(fallback)
     }
 
+    /// The zone's offset east of UTC when it has only ever had one.
+    pub(crate) fn constant_offset(&self) -> Option<i32> {
+        match self {
+            Timezone::Posix(zone) => zone.dst.is_none().then_some(zone.std_off),
+            Timezone::Tzif(slot) => super::tzif::constant_offset(*slot),
+            Timezone::Abbreviation { .. } => None,
+        }
+    }
+
     pub(crate) fn visit_abbreviations(self, utc: i64, visit: impl FnMut(StackStr<8>, i32, bool)) {
         match self {
             Self::Posix(zone) => {
@@ -197,7 +206,7 @@ impl PosixZone {
 
     fn in_dst(&self, utc: i64, d: Dst) -> bool {
         // Determine the local year from the standard-time projection.
-        let local = utc + self.std_off as i64 * 1_000_000;
+        let local = utc.saturating_add(self.std_off as i64 * 1_000_000);
         let (year, _, _) = civil_from_days(local.div_euclid(DAY_US) + PG_EPOCH_DAYS);
         let start = trans_instant(year, d.start, self.std_off);
         let end = trans_instant(year, d.end, self.dst_off);
@@ -220,7 +229,11 @@ fn trans_instant(year: i64, t: Trans, off_secs: i32) -> i64 {
         dom -= 7; // "last" (week 5) or an overshoot clamps to the final occurrence
     }
     let day = days_from_civil(year, t.month, dom as u32) - PG_EPOCH_DAYS;
-    (day * DAY_US + t.seconds * 1_000_000) - off_secs as i64 * 1_000_000
+    // Transitions past the timestamp range saturate: input probes local
+    // times there before rejecting them as out of range.
+    day.saturating_mul(DAY_US)
+        .saturating_add(t.seconds * 1_000_000)
+        .saturating_sub(off_secs as i64 * 1_000_000)
 }
 
 fn days_in_month(y: i64, m: u32) -> u32 {
@@ -288,10 +301,6 @@ pub(crate) fn lookup_abbreviation(name: &str) -> Option<Timezone> {
             })
         }
     }
-}
-
-pub(crate) fn lookup_input(name: &str) -> Option<Timezone> {
-    lookup_abbreviation(name).or_else(|| lookup(name))
 }
 
 /// Parses a POSIX `TZ` string (the TZif footer form): `std offset [dst
@@ -517,8 +526,8 @@ mod tests {
                     assert_eq!((actual_offset, actual_dst), (offset, is_dst), "{name}");
                 }
             }
-            assert!(lookup_input("Unknown_Zone").is_none());
-            assert_eq!(lookup_input("eSt").unwrap().resolve(0).0, -5 * H);
+            assert!(lookup_abbreviation("Unknown_Zone").is_none());
+            assert_eq!(lookup_abbreviation("eSt").unwrap().resolve(0).0, -5 * H);
             for name in ["éééé", "Etc/éé"] {
                 assert!(super::super::guc::parse_timezone(name).is_none());
             }

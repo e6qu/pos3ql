@@ -1475,15 +1475,8 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Bpchar(_) => Datum::Bpchar(s),
         Datum::Time(_) => Datum::Time(datetime::parse_time(s)?),
         Datum::Timetz(..) => {
-            let (t, zone) = datetime::parse_timetz(s)?;
-            Datum::Timetz(
-                t,
-                zone.unwrap_or_else(|| {
-                    crate::sql::timezone::session()
-                        .resolve(datetime::now_micros())
-                        .0
-                }),
-            )
+            let time = datetime::parse_timetz(s)?;
+            Datum::Timetz(time.micros, time.east)
         }
         Datum::Interval(_) => Datum::Interval(datetime::parse_interval(s)?),
         Datum::Inet(_) => {

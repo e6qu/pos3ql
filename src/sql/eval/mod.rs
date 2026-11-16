@@ -769,6 +769,7 @@ pub mod sqlstate {
     pub const ZERO_LENGTH_CHARACTER_STRING: &str = "2200F";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+    pub const INVALID_TIME_ZONE_DISPLACEMENT_VALUE: &str = "22009";
     pub const SUBSTRING_ERROR: &str = "22011";
     pub const INTERVAL_FIELD_OVERFLOW: &str = "22015";
     pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";

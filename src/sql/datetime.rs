@@ -170,75 +170,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
-/// Parses `YYYY-MM-DD` into days since 2000-01-01. Malformed input is
-/// 22007 (invalid_datetime_format); a well-formed but impossible date is
-/// 22008 (datetime_field_overflow), matching PostgreSQL.
-pub fn parse_date(s: &str) -> Result<i32, SqlError> {
-    let bad = || {
-        sql_err!(
-            sqlstate::INVALID_DATETIME_FORMAT,
-            "invalid input syntax for type date: \"{}\"",
-            s
-        )
-    };
-    let out_of_range = || {
-        sql_err!(
-            sqlstate::DATETIME_FIELD_OVERFLOW,
-            "date/time field value out of range: \"{}\"",
-            s
-        )
-    };
-    let trimmed = s.trim();
-    if trimmed.eq_ignore_ascii_case("infinity") {
-        return Ok(DATE_INFINITY);
-    }
-    if trimmed.eq_ignore_ascii_case("epoch") {
-        return Ok(-(PG_EPOCH_SECS / 86_400) as i32);
-    }
-    if let Some(day) = special_day(trimmed) {
-        let local = special_local_micros(day).ok_or_else(out_of_range)?;
-        return Ok(local.div_euclid(86_400_000_000) as i32);
-    }
-    if trimmed.eq_ignore_ascii_case("-infinity") {
-        return Ok(DATE_NEG_INFINITY);
-    }
-    let mut parts = trimmed.splitn(3, '-');
-    let (year, month, day) = (
-        parts
-            .next()
-            .and_then(|p| p.parse::<i64>().ok())
-            .ok_or_else(bad)?,
-        parts
-            .next()
-            .and_then(|p| p.parse::<u32>().ok())
-            .ok_or_else(bad)?,
-        parts
-            .next()
-            .and_then(|p| p.parse::<u32>().ok())
-            .ok_or_else(bad)?,
-    );
-    // `ValidateDate`: a month or day no month has is `DTERR_MD_FIELD_OVERFLOW`,
-    // which suggests another DateStyle; a day past its month's end is not.
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(datestyle_hint(out_of_range()));
-    }
-    if day > days_in_month(year, month) {
-        return Err(out_of_range());
-    }
-    let days = days_from_civil(year, month, day) - PG_EPOCH_DAYS;
-    i32::try_from(days).map_err(|_| out_of_range())
-}
-
-/// `DateTimeParseError`'s hint for `DTERR_MD_FIELD_OVERFLOW`.
-fn datestyle_hint(error: SqlError) -> SqlError {
-    crate::sql::eval::stash_diagnostic(
-        None,
-        Some(StackStr::from_str(
-            "Perhaps you need a different \"DateStyle\" setting.",
-        )),
-    );
-    error
-}
+pub use super::datetime_input::{parse_date, parse_time, parse_timestamp, parse_timetz};
 
 const MONTH_ABBR: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -1075,344 +1007,6 @@ pub fn make_timestamp(
     days.checked_mul(86_400_000_000)
         .and_then(|date| date.checked_add(time_of_day))
         .ok_or_else(timestamp_out_of_range)
-}
-
-/// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
-/// microseconds since 2000-01-01 UTC. `require_tz_shift` applies the zone
-/// offset (timestamptz); plain timestamp ignores any suffix.
-pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
-    // The type this input is for names the error, so `timestamptz` reports
-    // `timestamp with time zone`, as PostgreSQL does.
-    let type_name = if apply_timezone {
-        "timestamp with time zone"
-    } else {
-        "timestamp"
-    };
-    let bad = || {
-        sql_err!(
-            sqlstate::INVALID_DATETIME_FORMAT,
-            "invalid input syntax for type {}: \"{}\"",
-            type_name,
-            s
-        )
-    };
-    let t = s.trim();
-    if t.eq_ignore_ascii_case("infinity") {
-        return Ok(TIMESTAMP_INFINITY);
-    }
-    if t.eq_ignore_ascii_case("epoch") {
-        return Ok(-PG_EPOCH_SECS * 1_000_000);
-    }
-    if let Some(day) = special_day(t) {
-        let out_of_range = || {
-            sql_err!(
-                sqlstate::DATETIME_FIELD_OVERFLOW,
-                "date/time field value out of range: \"{}\"",
-                s
-            )
-        };
-        return match day {
-            SpecialDay::Now if apply_timezone => Ok(transaction_micros()),
-            day => {
-                let local = special_local_micros(day).ok_or_else(out_of_range)?;
-                if apply_timezone {
-                    super::timezone::session()
-                        .resolve_local(local)
-                        .ok_or_else(out_of_range)
-                } else {
-                    Ok(local)
-                }
-            }
-        };
-    }
-    if t.eq_ignore_ascii_case("-infinity") {
-        return Ok(TIMESTAMP_NEG_INFINITY);
-    }
-    // PostgreSQL's era marker applies to the date even when it follows a
-    // timestamp time component. Consume it before the ordinary zone parser,
-    // where `BC` would otherwise look like a named zone.
-    let (t, bc) = match t.rsplit_once(' ') {
-        Some((head, era)) if era.eq_ignore_ascii_case("BC") => (head.trim_end(), true),
-        Some((head, era)) if era.eq_ignore_ascii_case("AD") => (head.trim_end(), false),
-        _ => (t, false),
-    };
-    // Split date and time parts.
-    let (date_part, rest) = match t.find([' ', 'T']) {
-        Some(i) => (&t[..i], &t[i + 1..]),
-        None => (t, ""),
-    };
-    // A syntactically bad date part is this timestamp's malformed input, not a
-    // `date` error surfaced verbatim — so a 22007 from `parse_date` is remapped
-    // to the timestamp type, while its 22008 out-of-range error is kept, since
-    // an impossible date is an impossible timestamp too.
-    // The out-of-range error names the whole timestamp input, as PostgreSQL's
-    // `DateTimeParseError` does; its pending hint stays with it.
-    let mut date_days = parse_date(date_part).map_err(|e| {
-        if e.sqlstate == "22007" {
-            bad()
-        } else if e.sqlstate == sqlstate::DATETIME_FIELD_OVERFLOW {
-            sql_err!(
-                sqlstate::DATETIME_FIELD_OVERFLOW,
-                "date/time field value out of range: \"{}\"",
-                s
-            )
-        } else {
-            e
-        }
-    })? as i64;
-    if bc {
-        let (year, month, day) = civil_from_days(date_days + PG_EPOCH_DAYS);
-        date_days = days_from_civil(1 - year, month, day) - PG_EPOCH_DAYS;
-    }
-
-    if rest.is_empty() {
-        let local = date_days
-            .checked_mul(86_400_000_000)
-            .ok_or_else(timestamp_out_of_range)?;
-        return if apply_timezone {
-            super::timezone::session()
-                .resolve_local(local)
-                .ok_or_else(timestamp_out_of_range)
-        } else {
-            Ok(local)
-        };
-    }
-
-    // Trailing *named* zone (`... Europe/Moscow`, `... EST`, `... UTC`): the
-    // name resolves at the timestamp's own instant, so a historical rule
-    // applies to a historical timestamp. A name such as Etc/GMT+5 must be
-    // recognized before splitting numeric-offset suffixes.
-    let mut named_zone: Option<super::timezone::Timezone> = None;
-    let rest = if let Some((head, name)) = rest.rsplit_once(' ') {
-        let name = name.trim();
-        let name_like = name.bytes().any(|byte| byte.is_ascii_alphabetic());
-        if name_like {
-            if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
-                named_zone = Some(super::timezone::Timezone::utc());
-            } else {
-                named_zone = Some(super::timezone::lookup_input(name).ok_or_else(|| {
-                    // PostgreSQL reports the name case-folded.
-                    let mut folded = crate::util::StackStr::<64>::new();
-                    use core::fmt::Write as _;
-                    for c in name.chars() {
-                        let _ = folded.write_char(c.to_ascii_lowercase());
-                    }
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "time zone \"{}\" not recognized",
-                        folded.as_str()
-                    )
-                })?);
-            }
-            head.trim_end()
-        } else {
-            rest
-        }
-    } else {
-        rest
-    };
-    // Trailing zone: Z, +HH, +HH:MM, -HH, -HH:MM. Whether an offset was
-    // written matters: a bare timestamptz literal is interpreted in the
-    // *session* zone, as PostgreSQL reads it.
-    let (time_part, timezone_seconds, explicit_offset) =
-        if let Some(stripped) = rest.strip_suffix('Z') {
-            (stripped, 0i64, true)
-        } else if let Some(pos) = rest.rfind(['+', '-']) {
-            if pos > 0 {
-                let (tp, zone) = rest.split_at(pos);
-                let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
-                let z = &zone[1..];
-                let (h, m) = match z.split_once(':') {
-                    Some((h, m)) => (
-                        h.parse::<i64>().map_err(|_| bad())?,
-                        m.parse::<i64>().map_err(|_| bad())?,
-                    ),
-                    None => (z.parse::<i64>().map_err(|_| bad())?, 0),
-                };
-                (tp, sign * (h * 3600 + m * 60), true)
-            } else {
-                (rest, 0, false)
-            }
-        } else {
-            (rest, 0, false)
-        };
-
-    let mut it = time_part.trim().splitn(3, ':');
-    let h: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
-    let m: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
-    let (sec, micros) = match it.next() {
-        None => (0i64, 0i64),
-        Some(sec_part) => match sec_part.split_once('.') {
-            None => (sec_part.parse().map_err(|_| bad())?, 0),
-            Some((sp, fp)) => {
-                let sec = sp.parse().map_err(|_| bad())?;
-                let mut micros = 0i64;
-                let mut scale = 100_000i64;
-                for c in fp.chars().take(6) {
-                    let d = c.to_digit(10).ok_or_else(bad)? as i64;
-                    micros += d * scale;
-                    scale /= 10;
-                }
-                (sec, micros)
-            }
-        },
-    };
-    if !(0..24).contains(&h) || !(0..60).contains(&m) || !(0..61).contains(&sec) {
-        return Err(sql_err!(
-            sqlstate::DATETIME_FIELD_OVERFLOW,
-            "date/time field value out of range: \"{}\"",
-            s
-        ));
-    }
-    let mut total = date_days
-        .checked_mul(86_400_000_000)
-        .and_then(|date| {
-            (h * 3600 + m * 60 + sec)
-                .checked_mul(1_000_000)
-                .and_then(|time| date.checked_add(time))
-        })
-        .and_then(|timestamp| timestamp.checked_add(micros))
-        .ok_or_else(timestamp_out_of_range)?;
-    if apply_timezone {
-        if let Some(zone) = named_zone {
-            total = zone
-                .resolve_local(total)
-                .ok_or_else(timestamp_out_of_range)?;
-        } else if explicit_offset {
-            total = total
-                .checked_sub(timezone_seconds * 1_000_000)
-                .ok_or_else(timestamp_out_of_range)?;
-        } else {
-            // No zone written: the wall time reads in the session zone.
-            total = super::timezone::session()
-                .resolve_local(total)
-                .ok_or_else(timestamp_out_of_range)?;
-        }
-    }
-    Ok(total)
-}
-
-/// Parses a time of day, returning the microseconds since midnight and the
-/// zone offset (seconds east) when the text carried one. Both `time` and
-/// `timetz` come through here: PostgreSQL accepts a zone on either and simply
-/// ignores it for the zoneless type, so `'12:00:00-05'::time` is `12:00:00`.
-pub fn parse_timetz(s: &str) -> Result<(i64, Option<i32>), SqlError> {
-    parse_time_parts(s, "time with time zone")
-}
-
-/// Microseconds since midnight, discarding any zone the text carried.
-pub fn parse_time(s: &str) -> Result<i64, SqlError> {
-    Ok(parse_time_parts(s, "time")?.0)
-}
-
-fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlError> {
-    let bad = || {
-        sql_err!(
-            sqlstate::INVALID_DATETIME_FORMAT,
-            "invalid input syntax for type {}: \"{}\"",
-            type_name,
-            s
-        )
-    };
-    // PostgreSQL's special time inputs: midnight UTC and the transaction's
-    // session-zone time of day.
-    if s.trim().eq_ignore_ascii_case("allballs") {
-        return Ok((0, Some(0)));
-    }
-    if s.trim().eq_ignore_ascii_case("now") {
-        let now = transaction_micros();
-        let offset = super::timezone::session().resolve(now).0;
-        let local = now + i64::from(offset) * 1_000_000;
-        return Ok((local.rem_euclid(86_400_000_000), Some(offset)));
-    }
-    let t = s.trim();
-    // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
-    // sign has to be past the start so a lone offset is not read as a time.
-    let (t, zone) = if let Some(stripped) = t.strip_suffix('Z').or_else(|| t.strip_suffix('z')) {
-        (stripped, Some(0))
-    } else if let Some((head, name)) = t.rsplit_once(' ') {
-        let name = name.trim();
-        if matches!(name.as_bytes().first(), Some(b'+' | b'-')) {
-            (head, Some(parse_zone_offset(name).ok_or_else(bad)?))
-        // `UTC`/`GMT` are the zone names PostgreSQL accepts here that are not
-        // in the region table; anything else goes through the usual lookup.
-        } else if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
-            (head, Some(0))
-        } else {
-            match super::timezone::lookup_input(name) {
-                Some(z) => (head, Some(z.resolve(now_micros()).0)),
-                None => return Err(bad()),
-            }
-        }
-    } else {
-        match t.rfind(['+', '-']) {
-            Some(i) if i > 0 => {
-                let (head, zone) = t.split_at(i);
-                (head, Some(parse_zone_offset(zone).ok_or_else(bad)?))
-            }
-            _ => (t, None),
-        }
-    };
-    let t = t.trim();
-    let mut it = t.splitn(3, ':');
-    let h: i64 = it
-        .next()
-        .and_then(|p| p.trim().parse().ok())
-        .ok_or_else(bad)?;
-    let m: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
-    let (sec, micros) = match it.next() {
-        None => (0i64, 0i64),
-        Some(sec_part) => match sec_part.split_once('.') {
-            None => (sec_part.parse().map_err(|_| bad())?, 0),
-            Some((sp, fp)) => {
-                let sec = sp.parse().map_err(|_| bad())?;
-                let mut micros = 0i64;
-                let mut scale = 100_000i64;
-                for c in fp.chars().take(6) {
-                    micros += c.to_digit(10).ok_or_else(bad)? as i64 * scale;
-                    scale /= 10;
-                }
-                (sec, micros)
-            }
-        },
-    };
-    // 24:00:00 is the one hour-24 time PostgreSQL accepts.
-    let hour_ok = (0..24).contains(&h) || (h == 24 && m == 0 && sec == 0 && micros == 0);
-    if !hour_ok || !(0..60).contains(&m) || !(0..61).contains(&sec) {
-        return Err(sql_err!(
-            sqlstate::DATETIME_FIELD_OVERFLOW,
-            "date/time field value out of range: \"{}\"",
-            s
-        ));
-    }
-    Ok(((h * 3600 + m * 60 + sec) * 1_000_000 + micros, zone))
-}
-
-/// `±HH`, `±HH:MM` or `±HH:MM:SS` as seconds east of UTC.
-fn parse_zone_offset(zone: &str) -> Option<i32> {
-    let sign = match zone.as_bytes().first()? {
-        b'+' => 1i32,
-        b'-' => -1,
-        _ => return None,
-    };
-    let mut parts = zone[1..].split(':');
-    let h: i32 = parts.next()?.parse().ok()?;
-    let m: i32 = match parts.next() {
-        Some(p) => p.parse().ok()?,
-        None => 0,
-    };
-    let sec: i32 = match parts.next() {
-        Some(p) => p.parse().ok()?,
-        None => 0,
-    };
-    if parts.next().is_some()
-        || !(0..=15).contains(&h)
-        || !(0..60).contains(&m)
-        || !(0..60).contains(&sec)
-    {
-        return None;
-    }
-    Some(sign * (h * 3600 + m * 60 + sec))
 }
 
 /// Formats microseconds since midnight as `HH:MM:SS[.ffffff]` (PostgreSQL
@@ -2380,12 +1974,13 @@ pub enum DateFormat {
     German,
 }
 
-/// Field order. YMD collapses to MDY for *output* (PostgreSQL only distinguishes
-/// DMY from the rest when rendering).
+/// DateStyle's field order: how input reads ambiguous numbers. Output
+/// distinguishes only DMY; YMD renders like MDY, as in PostgreSQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldOrder {
     Mdy,
     Dmy,
+    Ymd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2434,7 +2029,8 @@ pub fn format_date_styled(days: i32, style: DateStyle) -> StackStr<16> {
     if days == DATE_NEG_INFINITY {
         return StackStr::from_str("-infinity");
     }
-    let (y, m, d) = civil_from_days(days as i64 + PG_EPOCH_DAYS);
+    let (year, m, d) = civil_from_days(days as i64 + PG_EPOCH_DAYS);
+    let (y, bc) = era_year(year);
     let dmy = style.order == FieldOrder::Dmy;
     let mut out = StackStr::<16>::new();
     use core::fmt::Write;
@@ -2446,7 +2042,19 @@ pub fn format_date_styled(days: i32, style: DateStyle) -> StackStr<16> {
         DateFormat::Sql if dmy => write!(out, "{d:02}/{m:02}/{y:04}"),
         DateFormat::Sql => write!(out, "{m:02}/{d:02}/{y:04}"),
     };
+    if bc {
+        let _ = out.write_str(" BC");
+    }
     out
+}
+
+/// The year as written with an era: year 0 is 1 BC, as PostgreSQL prints it.
+fn era_year(year: i64) -> (i64, bool) {
+    if year > 0 {
+        (year, false)
+    } else {
+        (1 - year, true)
+    }
 }
 
 fn write_frac(out: &mut impl core::fmt::Write, frac: i64) {
@@ -2489,7 +2097,8 @@ pub fn format_timestamp_styled(
     let local = micros + timezone_offset_seconds as i64 * 1_000_000;
     let days = local.div_euclid(DAY_US);
     let in_day = local.rem_euclid(DAY_US);
-    let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    let (year, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    let (y, bc) = era_year(year);
     let seconds = in_day / 1_000_000;
     let frac = in_day % 1_000_000;
     let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
@@ -2534,6 +2143,9 @@ pub fn format_timestamp_styled(
             }
         }
     }
+    if bc {
+        let _ = out.write_str(" BC");
+    }
     out
 }
 
@@ -2552,7 +2164,8 @@ pub fn format_timestamp_json(micros: i64, with_timezone: bool) -> StackStr<48> {
     }
     let days = micros.div_euclid(DAY_US);
     let in_day = micros.rem_euclid(DAY_US);
-    let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    let (year, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    let (y, bc) = era_year(year);
     let seconds = in_day / 1_000_000;
     let frac = in_day % 1_000_000;
     let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
@@ -2562,6 +2175,9 @@ pub fn format_timestamp_json(micros: i64, with_timezone: bool) -> StackStr<48> {
     write_frac(&mut out, frac);
     if with_timezone {
         let _ = out.write_str("+00:00");
+    }
+    if bc {
+        let _ = out.write_str(" BC");
     }
     out
 }
@@ -2663,42 +2279,6 @@ pub fn statement_micros() -> i64 {
 pub fn transaction_micros() -> i64 {
     let at = TRANSACTION_START.with(|t| t.get());
     if at == 0 { statement_micros() } else { at }
-}
-
-/// PostgreSQL's special date and timestamp inputs that name a day.
-#[derive(Clone, Copy)]
-enum SpecialDay {
-    Now,
-    Today,
-    Tomorrow,
-    Yesterday,
-}
-
-fn special_day(text: &str) -> Option<SpecialDay> {
-    [
-        ("now", SpecialDay::Now),
-        ("today", SpecialDay::Today),
-        ("tomorrow", SpecialDay::Tomorrow),
-        ("yesterday", SpecialDay::Yesterday),
-    ]
-    .into_iter()
-    .find_map(|(name, day)| text.eq_ignore_ascii_case(name).then_some(day))
-}
-
-/// The session-zone wall time a special input denotes: the transaction's
-/// timestamp for `now`, else midnight of the named day.
-fn special_local_micros(day: SpecialDay) -> Option<i64> {
-    const DAY: i64 = 86_400_000_000;
-    let now = transaction_micros();
-    let local =
-        now.checked_add(i64::from(super::timezone::session().resolve(now).0) * 1_000_000)?;
-    let midnight = local.div_euclid(DAY) * DAY;
-    match day {
-        SpecialDay::Now => Some(local),
-        SpecialDay::Today => Some(midnight),
-        SpecialDay::Tomorrow => midnight.checked_add(DAY),
-        SpecialDay::Yesterday => midnight.checked_sub(DAY),
-    }
 }
 
 /// `clock_timestamp()`: the actual wall clock, read afresh each call.

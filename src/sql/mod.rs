@@ -22,6 +22,7 @@ pub(crate) mod column_suggestion;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
+pub mod datetime_input;
 pub mod encoding;
 pub(crate) mod enum_values;
 pub(crate) mod error_context;
@@ -4179,7 +4180,7 @@ impl Engine {
         );
         let role = guc.current_identity().refresh(&self.storage, txn.txid);
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         self.publish_session_context(guc, txn, role.as_str())
     }
 
@@ -8121,7 +8122,7 @@ impl Engine {
             .storage
             .compute_path(guc.search_path().as_str(), role.as_str(), txn.txid);
         let prior = self.storage.swap_path(path);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         if let Some(database) = self
             .storage
             .database_slot_by_oid(self.storage.current_database_oid(), txn.txid)
@@ -12214,7 +12215,7 @@ impl Engine {
         eval::funcs::system::set_session_user(guc.session_identity());
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         responder.set_render(guc.render());
         Ok(scope)
     }
@@ -14714,7 +14715,7 @@ impl Engine {
                 if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                     return Ok(Err(error));
                 }
-                timezone::set_session(guc.timezone());
+                guc.publish_datetime_input();
                 parser.capture_type_inputs();
                 loop {
                     match parser.next_stmt() {
@@ -14968,7 +14969,7 @@ impl Engine {
         eval::funcs::system::set_session_user(guc.session_identity());
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         Ok(())
     }
 
@@ -19804,7 +19805,7 @@ impl Engine {
             role
         };
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         // Cleanup must not replace the body's SQL or wire error.
         match outcome {
@@ -20221,7 +20222,7 @@ impl Engine {
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
             }
-            timezone::set_session(guc.timezone());
+            guc.publish_datetime_input();
             let bindings = if check_body
                 && routine.language == ast::RoutineLanguage::Sql
                 && let ast::RoutineBody::String(body) = routine.body
@@ -20334,7 +20335,7 @@ impl Engine {
             ))
         })();
         let role = eval::funcs::system::current_user_owned();
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         let validated = match result {
             Err(error) => return Err(error),
@@ -21144,7 +21145,7 @@ impl Engine {
         if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
             return Ok(Err(error));
         }
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let encoded_arguments = match pending.arguments(input_arena) {
             Ok(arguments) => arguments,
             Err(error) => return Ok(Err(error)),
@@ -21970,7 +21971,7 @@ impl Engine {
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
             }
-            timezone::set_session(guc.timezone());
+            guc.publish_datetime_input();
             // pg_stat_user_functions counts each completed procedure call.
             let track = match guc.track_functions() {
                 guc::TrackFunctions::None => false,
@@ -22437,7 +22438,7 @@ impl Engine {
             role
         };
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         match outcome {
             Err(error) => Err(error),
@@ -23253,7 +23254,7 @@ impl Engine {
         let statement_clock = datetime::statement_clock();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         // Render output with the current session settings (a SET earlier in the
         // same batch takes effect here).
         responder.set_render(guc.render());

@@ -7906,7 +7906,9 @@ fn scan_source_mode<'a>(
         let hash_loop = nodes.hash.start();
         let build_loop = nodes.build.start();
         let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
-        let original_buckets = buckets_len;
+        // `EXPLAIN ANALYZE` sizes the rows as PostgreSQL's table holds them.
+        let hash_columns = nodes.hash.hash_columns();
+        let mut tuple_bytes = hash_columns.map(|_| 0usize);
         // Every array the table allocates, those it outgrows included.
         let table_bytes = |entries: usize, buckets: usize| {
             entries * (core::mem::size_of::<HashEntry<'_>>() + core::mem::size_of::<u32>())
@@ -7956,6 +7958,18 @@ fn scan_source_mode<'a>(
                 // PostgreSQL's hash reports the NULL-keyed rows it keeps for
                 // returning unmatched too.
                 nodes.hash.row();
+                if let Some(columns) = &hash_columns {
+                    tuple_bytes = tuple_bytes.and_then(|bytes| {
+                        Some(
+                            bytes
+                                + instrument::hashed_row_bytes(
+                                    columns.as_slice(),
+                                    values,
+                                    build_schema,
+                                )?,
+                        )
+                    });
+                }
                 if n == entries.len() {
                     // Double the entries and rehash them into twice as many
                     // buckets. Chains keep their order: later rows first.
@@ -8107,9 +8121,9 @@ fn scan_source_mode<'a>(
         let next = &*next;
         let buckets = &*buckets;
         nodes.hash.hash_table(instrument::HashTable {
-            buckets: buckets_len,
-            original_buckets,
-            bytes: allocated,
+            tuples: n as u64,
+            tuple_bytes,
+            own_bytes: allocated,
         });
         drop(build_loop);
         drop(hash_loop);

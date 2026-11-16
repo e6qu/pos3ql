@@ -15,7 +15,9 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
-use crate::sql::query::instrument::{BlockId, NodeCounters, NodeKey, Role, Segment, Slot};
+use crate::sql::query::instrument::{
+    BlockId, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
+};
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
@@ -73,6 +75,8 @@ struct PlanNode {
     /// The node's identity in execution, for the nodes whose work
     /// `EXPLAIN ANALYZE` measures.
     key: Option<NodeKey>,
+    /// A `Hash` node's row values, which size its table as PostgreSQL's.
+    hash_columns: Option<HashColumns>,
     /// Qualifications as `VERBOSE` prints them, where that differs: with
     /// every column qualified by its relation.
     verbose_quals: [(QualLabel, StackStr<512>); 3],
@@ -353,6 +357,7 @@ impl PlanNode {
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::new(),
         subplan: None,
@@ -513,7 +518,9 @@ impl<'a> Plan<'a> {
         }
         let nodes = &self.nodes[..self.count];
         let slots = arena
-            .alloc_slice_with(self.count, |index| Slot::new(nodes[index].key))
+            .alloc_slice_with(self.count, |index| {
+                Slot::new(nodes[index].key).with_hash_columns(nodes[index].hash_columns)
+            })
             .map_err(|_| query::arena_full_pub())?;
         let result = query::instrument::analyze(slots, timing, execute);
         let counters = arena
@@ -3821,6 +3828,7 @@ fn scan_node<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema,
         subplan: None,
@@ -5907,6 +5915,10 @@ fn plan_pulled_select<'a>(
                         } else {
                             Role::Materialize(position_role)
                         }),
+                        hash_columns: block_targets
+                            .as_ref()
+                            .filter(|_| hash_join)
+                            .and_then(|found| found.hashed_columns(table)),
                         depth: scan.depth,
                         total_cost: scan.total_cost,
                         rows: scan.rows,
@@ -7636,6 +7648,7 @@ fn physical_scan_node(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
         subplan: None,
@@ -7805,6 +7818,7 @@ fn push_set_tree(
                     PlanKeys::NONE
                 },
                 key: Some(NodeKey::new(block, role)),
+                hash_columns: None,
                 verbose_quals: NO_QUALS,
                 schema: StackStr::new(),
                 subplan: None,
@@ -8405,6 +8419,7 @@ fn plan_write<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: Some(NodeKey::new(block, Role::Modify)),
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: relation_slot(storage, txid, target.schema, target.name)
             .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
@@ -9326,6 +9341,48 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
 
 /// The hash table a `Hash` node built while `EXPLAIN ANALYZE` ran: pos3ql
 /// builds it in one batch, in the arrays whose bytes it reports.
+/// A `Hash` node's table as PostgreSQL reports it: `ExecChooseHashTableSize`
+/// sizes its buckets from the node's row estimate, `ExecHashTableInsert`
+/// doubles them while the rows outnumber them, and its memory is its rows'
+/// bytes and its bucket pointers. The rows' bytes are pos3ql's own when a
+/// hashed value has no PostgreSQL size here.
+struct PostgresHashTable {
+    buckets: u64,
+    original_buckets: u64,
+    bytes: usize,
+}
+
+impl PostgresHashTable {
+    fn of(node: &PlanNode, table: query::instrument::HashTable) -> Self {
+        /// `MaxAllocSize / sizeof(HashJoinTuple)`.
+        const MAX_ALLOC_POINTERS: u64 = 0x3fff_ffff / 8;
+        // `get_hash_memory_limit`: work_mem times the default
+        // hash_mem_multiplier of 2, which pos3ql does not let a session change.
+        let memory_limit = u64::try_from(crate::sql::guc::work_mem_kilobytes())
+            .unwrap_or(0)
+            .saturating_mul(1024 * 2);
+        let pointers = (memory_limit / 8).clamp(1, MAX_ALLOC_POINTERS);
+        let max_pointers = (1u64 << pointers.ilog2()).min(i32::MAX as u64 / 2 + 1);
+        let estimated = if node.rows == 0 { 1000 } else { node.rows };
+        let original = estimated.min(max_pointers).max(1024).next_power_of_two();
+        let mut buckets = original;
+        // A row inserted while the rows before it outnumber the buckets
+        // doubles them.
+        while table.tuples.saturating_sub(1) > buckets
+            && buckets <= i32::MAX as u64 / 2
+            && buckets * 2 <= MAX_ALLOC_POINTERS
+        {
+            buckets *= 2;
+        }
+        let rows = table.tuple_bytes.unwrap_or(table.own_bytes);
+        Self {
+            buckets,
+            original_buckets: original,
+            bytes: rows.saturating_add(buckets as usize * 8),
+        }
+    }
+}
+
 fn hash_table(actual: NodeActual) -> Option<query::instrument::HashTable> {
     match actual {
         NodeActual::Ran(counters) => counters.hash,
@@ -9539,6 +9596,7 @@ pub(super) fn visit_text_rows<E>(
             emit(line.as_str())?;
         }
         if let Some(table) = hash_table(node_actual) {
+            let table = PostgresHashTable::of(node, table);
             let mut line = StackStr::<256>::new();
             for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
@@ -10444,6 +10502,7 @@ fn structured_node(
         document.text("One-Time Filter", "false");
     }
     if let Some(table) = hash_table(node_actual) {
+        let table = PostgresHashTable::of(node, table);
         document.number("Hash Buckets", table.buckets);
         document.number("Original Hash Buckets", table.original_buckets);
         document.number("Hash Batches", 1);
@@ -10759,22 +10818,20 @@ pub(super) fn analyze_rewritten<'a, R>(
         RewrittenQuery::Notify => 0,
     };
     let total: usize = queries.iter().map(planned).sum();
-    let key_at = |mut index: usize| {
+    let slot_at = |mut index: usize| {
         for query in queries.iter() {
             if let RewrittenQuery::Planned(plan) = query {
                 if index < plan.count {
-                    return plan.nodes[index].key;
+                    let node = &plan.nodes[index];
+                    return Slot::new(node.key).with_hash_columns(node.hash_columns);
                 }
                 index -= plan.count;
             }
         }
-        None
+        Slot::new(None)
     };
     let slots = arena
-        .alloc_slice_with(total, key_at)
-        .map_err(|_| query::arena_full_pub())?;
-    let slots = arena
-        .alloc_slice_with(total, |index| Slot::new(slots[index]))
+        .alloc_slice_with(total, slot_at)
         .map_err(|_| query::arena_full_pub())?;
     let result = query::instrument::analyze_queries(slots, timing, execute);
     let mut start = 0;
@@ -10935,7 +10992,7 @@ pub(super) fn emit_plan(
     not(feature = "sql-fixture-suite")
 ))]
 mod tests {
-    use super::{PlanNode, object_request_cost, structured_node_name};
+    use super::{PlanNode, PostgresHashTable, object_request_cost, query, structured_node_name};
     use crate::store::BlockIoStats;
     use crate::util::StackStr;
 
@@ -10974,5 +11031,36 @@ mod tests {
             structured_node_name(&node),
             ("Index Scan", Some("accounts_pkey"))
         );
+    }
+
+    #[test]
+    fn hash_tables_size_buckets_as_postgresql() {
+        let table = |rows, tuples| {
+            PostgresHashTable::of(
+                &PlanNode {
+                    rows,
+                    ..PlanNode::EMPTY
+                },
+                query::instrument::HashTable {
+                    tuples,
+                    tuple_bytes: Some(1000),
+                    own_bytes: 7,
+                },
+            )
+        };
+        // At least 1024 buckets, doubled once the rows before an insert
+        // outnumber them.
+        let small = table(15, 1025);
+        assert_eq!((small.buckets, small.original_buckets), (1024, 1024));
+        assert_eq!(small.bytes, 1000 + 1024 * 8);
+        let grown = table(15, 3000);
+        assert_eq!((grown.buckets, grown.original_buckets), (4096, 1024));
+        let estimated = table(1500, 1500);
+        assert_eq!(
+            (estimated.buckets, estimated.original_buckets),
+            (2048, 2048)
+        );
+        // A relation with no estimate is taken as 1000 rows.
+        assert_eq!(table(0, 1).original_buckets, 1024);
     }
 }

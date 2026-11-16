@@ -384,19 +384,155 @@ impl SortSpace {
     }
 }
 
-/// The hash table a `Hash` node built: its final and first bucket counts
-/// and the bytes its arrays took, every array it outgrew included.
+/// The hash table a `Hash` node built.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct HashTable {
-    pub(crate) buckets: usize,
-    pub(crate) original_buckets: usize,
-    pub(crate) bytes: usize,
+    /// The rows it holds, which size PostgreSQL's buckets.
+    pub(crate) tuples: u64,
+    /// The bytes PostgreSQL's table holds for those rows: each row's
+    /// `HashJoinTuple` header and minimal tuple. `None` when a hashed value
+    /// has no PostgreSQL size here.
+    pub(crate) tuple_bytes: Option<usize>,
+    /// The bytes pos3ql's own arrays took, every array it outgrew included.
+    pub(crate) own_bytes: usize,
+}
+
+/// A value the rows of a `Hash` node hold, which sizes it as PostgreSQL
+/// stores it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HashColumn {
+    /// The build relation's column at this position.
+    Column(u16),
+    /// The build relation's `tableoid`.
+    TableOid,
+    /// The row identity (`ctid`) a locking clause reads.
+    RowIdentity,
+}
+
+/// The most values a sized `Hash` row holds.
+const MAX_HASH_COLUMNS: usize = 64;
+
+/// The values of a `Hash` node's rows, in its target list's order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct HashColumns {
+    columns: [HashColumn; MAX_HASH_COLUMNS],
+    count: u8,
+}
+
+impl HashColumns {
+    pub(crate) const EMPTY: Self = Self {
+        columns: [HashColumn::TableOid; MAX_HASH_COLUMNS],
+        count: 0,
+    };
+
+    /// Appends a value; `None` past the most a layout holds.
+    pub(crate) fn push(&mut self, column: HashColumn) -> Option<()> {
+        let slot = self.columns.get_mut(usize::from(self.count))?;
+        *slot = column;
+        self.count += 1;
+        Some(())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[HashColumn] {
+        &self.columns[..usize::from(self.count)]
+    }
+}
+
+/// `HJTUPLE_OVERHEAD`: a hash table entry's next pointer and hash value.
+const HASH_TUPLE_OVERHEAD: usize = 16;
+/// `SizeofMinimalTupleHeader`.
+const MINIMAL_TUPLE_HEADER: usize = 15;
+/// `VARATT_SHORT_MAX`: the largest varlena with a one-byte header.
+const SHORT_VARLENA_MAX: usize = 127;
+
+const fn align_to(offset: usize, alignment: u8) -> usize {
+    let by = match alignment {
+        b'd' => 8,
+        b'i' => 4,
+        b's' => 2,
+        _ => 1,
+    };
+    offset.div_ceil(by) * by
+}
+
+/// The bytes of a varlena value's data after its header, as PostgreSQL
+/// stores it uncompressed; `None` for types sized differently from pos3ql.
+fn varlena_payload(value: &crate::sql::types::Datum<'_>) -> Option<usize> {
+    use crate::sql::numeric::Sign;
+    use crate::sql::types::Datum;
+    Some(match value {
+        Datum::Text(text) | Datum::Bpchar(text) | Datum::Xml(text) => text.len(),
+        Datum::Json { text, jsonb: false } => text.len(),
+        Datum::Bytea(bytes) => bytes.len(),
+        // `NumericShort` (a two-byte header) when the weight and display
+        // scale fit, else the long form, then base-10000 digits.
+        Datum::Numeric(value) => match value.sign {
+            Sign::Pos | Sign::Neg => {
+                let short = value.dscale <= 63 && (-64..=63).contains(&value.weight);
+                (if short { 2 } else { 4 }) + 2 * value.ndigits()
+            }
+            Sign::NaN | Sign::PosInf | Sign::NegInf => 2,
+        },
+        _ => return None,
+    })
+}
+
+/// The bytes PostgreSQL's hash table holds for one row: its `HashJoinTuple`
+/// header and the minimal tuple (`heap_form_minimal_tuple`) of `columns`
+/// read from the build row `values` of types `schema`. `None` when a value
+/// has no PostgreSQL size here.
+pub(crate) fn hashed_row_bytes(
+    columns: &[HashColumn],
+    values: &[crate::sql::types::Datum<'_>],
+    schema: &[crate::sql::types::ColType],
+) -> Option<usize> {
+    let mut data = 0usize;
+    let mut has_null = false;
+    for &column in columns {
+        let (length, alignment, storage, value) = match column {
+            HashColumn::Column(index) => {
+                let index = usize::from(index);
+                let value = values.get(index)?;
+                if value.is_null() {
+                    has_null = true;
+                    continue;
+                }
+                let layout = schema.get(index)?.physical_layout();
+                (layout.length, layout.alignment, layout.storage, Some(value))
+            }
+            HashColumn::TableOid => (4, b'i', b'p', None),
+            HashColumn::RowIdentity => (6, b's', b'p', None),
+        };
+        if length > 0 {
+            data = align_to(data, alignment) + length as usize;
+            continue;
+        }
+        if length != -1 {
+            return None;
+        }
+        let payload = varlena_payload(value?)?;
+        // A packable value short enough takes a one-byte header and no
+        // alignment; others a four-byte header at the type's alignment.
+        if storage != b'p' && payload < SHORT_VARLENA_MAX {
+            data += payload + 1;
+        } else {
+            data = align_to(data, alignment) + payload + 4;
+        }
+    }
+    let bitmap = if has_null {
+        columns.len().div_ceil(8)
+    } else {
+        0
+    };
+    Some(HASH_TUPLE_OVERHEAD + align_to(MINIMAL_TUPLE_HEADER + bitmap, b'd') + data)
 }
 
 /// One plan node's counters while the statement runs.
 #[derive(Clone, Copy)]
 pub(crate) struct Slot {
     key: Option<NodeKey>,
+    /// A `Hash` node's row values, which size its table as PostgreSQL's.
+    hash_columns: Option<HashColumns>,
     counters: NodeCounters,
     /// Nested starts of the open loop; only the outermost one counts.
     open: u32,
@@ -413,6 +549,7 @@ impl Slot {
     pub(crate) const fn new(key: Option<NodeKey>) -> Self {
         Self {
             key,
+            hash_columns: None,
             counters: NodeCounters {
                 loops: 0,
                 rows: 0,
@@ -436,9 +573,15 @@ impl Slot {
     /// Restarts the counters for `attempt`, which reached the node after an
     /// earlier attempt counted it, keeping the rows the earlier attempts'
     /// write finished.
+    /// The slot of a `Hash` node whose rows hold `columns`.
+    pub(crate) const fn with_hash_columns(mut self, columns: Option<HashColumns>) -> Self {
+        self.hash_columns = columns;
+        self
+    }
+
     fn restart(&mut self, attempt: u32) {
         let carried = self.carried;
-        *self = Self::new(self.key);
+        *self = Self::new(self.key).with_hash_columns(self.hash_columns);
         self.attempt = attempt;
         if let Some((rows, filtered)) = carried {
             self.carried = carried;
@@ -734,16 +877,29 @@ impl Node {
         });
     }
 
-    /// Records the hash table the node built; a later build of a rescan
-    /// replaces it, keeping the largest memory use, as PostgreSQL keeps its
-    /// peak.
+    /// The values of the rows this `Hash` node holds, when the plan sized
+    /// them.
+    pub(crate) fn hash_columns(self) -> Option<HashColumns> {
+        let mut columns = None;
+        self.with(|slot, _| columns = slot.hash_columns);
+        columns
+    }
+
+    /// Records the hash table the node built; across the builds of rescans
+    /// PostgreSQL reports the largest table.
     pub(crate) fn hash_table(self, table: HashTable) {
         self.with(|slot, _| {
-            let bytes = slot
-                .counters
-                .hash
-                .map_or(table.bytes, |held| held.bytes.max(table.bytes));
-            slot.counters.hash = Some(HashTable { bytes, ..table });
+            slot.counters.hash = Some(match slot.counters.hash {
+                None => table,
+                Some(held) => HashTable {
+                    tuples: held.tuples.max(table.tuples),
+                    tuple_bytes: held
+                        .tuple_bytes
+                        .zip(table.tuple_bytes)
+                        .map(|(held, built)| held.max(built)),
+                    own_bytes: held.own_bytes.max(table.own_bytes),
+                },
+            });
         });
     }
 
@@ -1024,6 +1180,79 @@ impl Drop for Loops<'_> {
 #[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashed_rows_take_postgresql_minimal_tuple_sizes() {
+        use crate::sql::numeric::{Numeric, Sign};
+        use crate::sql::types::{ColType, Datum};
+        let schema = [
+            ColType::Int4,
+            ColType::Text,
+            ColType::Numeric,
+            ColType::Int8,
+        ];
+        let mut columns = HashColumns::EMPTY;
+        for column in [0, 1, 2, 3] {
+            columns.push(HashColumn::Column(column)).unwrap();
+        }
+        let digits = [0x34, 0x12, 0x01, 0x00];
+        let numeric = Numeric {
+            sign: Sign::Pos,
+            weight: 1,
+            dscale: 2,
+            digits: &digits,
+        };
+        let long = "x".repeat(130);
+        crate::mem::guard::forbid_alloc(|| {
+            // An int, a short text with a one-byte header, a short numeric
+            // (2-byte header, two digits) and an int8 aligned to 8.
+            let values = [
+                Datum::Int4(7),
+                Datum::Text("ab"),
+                Datum::Numeric(numeric),
+                Datum::Int8(1),
+            ];
+            assert_eq!(
+                hashed_row_bytes(columns.as_slice(), &values, &schema),
+                // 4 + 3 + 7 bytes, padded to 16, then 8.
+                Some(16 + 16 + 24)
+            );
+            // A NULL adds the null bitmap; a long text takes a four-byte
+            // header at four-byte alignment.
+            let values = [
+                Datum::Null,
+                Datum::Text(&long),
+                Datum::Numeric(Numeric::NAN),
+                Datum::Int8(1),
+            ];
+            assert_eq!(
+                hashed_row_bytes(columns.as_slice(), &values, &schema),
+                // 134 + 3 bytes, padded to 144, then 8.
+                Some(16 + 16 + 152)
+            );
+            let mut identity = HashColumns::EMPTY;
+            identity.push(HashColumn::TableOid).unwrap();
+            identity.push(HashColumn::RowIdentity).unwrap();
+            assert_eq!(
+                hashed_row_bytes(identity.as_slice(), &[], &[]),
+                Some(16 + 16 + 10)
+            );
+            let array = [Datum::Array {
+                element: crate::sql::types::ArrElem::Int4,
+                raw: &[],
+            }];
+            let mut first = HashColumns::EMPTY;
+            first.push(HashColumn::Column(0)).unwrap();
+            assert_eq!(
+                hashed_row_bytes(
+                    first.as_slice(),
+                    &array,
+                    &[ColType::Array(crate::sql::types::ArrElem::Int4)]
+                ),
+                None
+            );
+        });
+    }
 
     #[test]
     fn counts_reach_only_the_named_node_of_the_current_block() {

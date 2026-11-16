@@ -17,6 +17,7 @@ use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{Expr, Returning, Select, SelectItem};
 use crate::sql::catalog::deparse::{Column, Columns, Context, Destination, Joined};
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
+use crate::sql::query::instrument::{HashColumn, HashColumns};
 use crate::sql::query::{self, QueryScope, ResolvedColumn};
 use crate::sql_err;
 use crate::storage::{Storage, TableDef};
@@ -102,7 +103,9 @@ pub(super) struct BlockTargets<'a> {
     /// Per relation, the columns needed above its scan in the order its
     /// target list (`reltarget`) holds them, with the join position above
     /// which each is last needed (`usize::MAX`: by the query's output).
-    needed: &'a [(usize, Entry<'a>, usize)],
+    /// Each also names the value it holds, which sizes it as PostgreSQL
+    /// stores it.
+    needed: &'a [(usize, Entry<'a>, usize, HashColumn)],
     /// Per relation, its physical columns; None when it must project
     /// (row identities or whole-row references are read).
     physical: &'a [Option<&'a [Entry<'a>]>],
@@ -638,7 +641,7 @@ impl<'a> BlockTargets<'a> {
         let position_of = |table: usize| order.iter().position(|&held| held == table);
         let need = |expression: &Expr<'_>,
                     above: usize,
-                    needed_list: &mut ArenaList<'a, (usize, Entry<'a>, usize)>,
+                    needed_list: &mut ArenaList<'a, (usize, Entry<'a>, usize, HashColumn)>,
                     whole_row: &mut [bool]|
          -> Result<(), Fail> {
             let mut failed = None;
@@ -680,22 +683,25 @@ impl<'a> BlockTargets<'a> {
                     return;
                 };
                 let result = (|| -> Result<(), Fail> {
-                    let entry = match index {
-                        Some(index) => column_entry(table, index)?,
-                        None => deparse(column)?,
+                    let (entry, value) = match index {
+                        Some(index) => (
+                            column_entry(table, index)?,
+                            HashColumn::Column(u16::try_from(index).map_err(|_| unsupported())?),
+                        ),
+                        None => (deparse(column)?, HashColumn::TableOid),
                     };
                     match needed_list
                         .as_slice()
                         .iter()
-                        .position(|(_, held, _)| held.text == entry.text)
+                        .position(|(_, held, ..)| held.text == entry.text)
                     {
                         Some(at) => {
-                            let (_, held, last) = needed_list.as_slice()[at];
+                            let (_, held, last, value) = needed_list.as_slice()[at];
                             needed_list.as_mut_slice().map_err(|_| arena_full())?[at] =
-                                (table, held, last.max(above));
+                                (table, held, last.max(above), value);
                         }
                         None => needed_list
-                            .push((table, entry, above))
+                            .push((table, entry, above, value))
                             .map_err(|_| arena_full())?,
                     }
                     Ok(())
@@ -712,7 +718,7 @@ impl<'a> BlockTargets<'a> {
                     need(expression, usize::MAX, &mut needed_list, whole_row)?;
                 }
                 (None, Some(table)) => needed_list
-                    .push((table, target.entry, usize::MAX))
+                    .push((table, target.entry, usize::MAX, HashColumn::RowIdentity))
                     .map_err(|_| arena_full())?,
                 (None, None) => {}
             }
@@ -987,7 +993,7 @@ impl<'a> BlockTargets<'a> {
             return render(self.scan_join);
         }
         let mut output = Output::new();
-        for (_, entry, _) in self.needed.iter().filter(|(held, ..)| *held == table) {
+        for (_, entry, ..) in self.needed.iter().filter(|(held, ..)| *held == table) {
             if !output.is_empty() {
                 let _ = output.write_str(", ");
             }
@@ -996,13 +1002,24 @@ impl<'a> BlockTargets<'a> {
         checked(output)
     }
 
+    /// The values `table`'s scan returns under a `Hash` (`CP_SMALL_TLIST`),
+    /// in order: the columns needed above it, or its physical columns when
+    /// it may return them. `None` when they exceed what a layout holds.
+    pub(super) fn hashed_columns(&self, table: usize) -> Option<HashColumns> {
+        let mut columns = HashColumns::EMPTY;
+        for &(_, _, _, value) in self.needed.iter().filter(|(held, ..)| *held == table) {
+            columns.push(value)?;
+        }
+        Some(columns)
+    }
+
     /// The output of the join adding the relation at `position` of the join
     /// order, below the top join: the columns of its relations needed above
     /// it, outer relation first.
     pub(super) fn join(&self, position: usize) -> Result<Output, SqlError> {
         let mut output = Output::new();
         for &table in &self.order[..=position] {
-            for (_, entry, last) in self.needed.iter().filter(|(held, ..)| *held == table) {
+            for (_, entry, last, _) in self.needed.iter().filter(|(held, ..)| *held == table) {
                 if *last > position {
                     if !output.is_empty() {
                         let _ = output.write_str(", ");

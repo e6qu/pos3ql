@@ -707,11 +707,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Timetz(local.rem_euclid(86_400_000_000), zone)
             }
             Datum::Text(s) => {
-                let (t, zone) = crate::sql::datetime::parse_timetz(s)?;
-                Datum::Timetz(
-                    t,
-                    zone.unwrap_or_else(|| session_zone_at(crate::sql::datetime::now_micros())),
-                )
+                let time = crate::sql::datetime::parse_timetz(s)?;
+                Datum::Timetz(time.micros, time.east)
             }
             _ => return Err(cast_unsupported(&v, "time with time zone")),
         },

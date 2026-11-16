@@ -874,6 +874,21 @@ Dates and times:
   ([PostgreSQL rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251),
   [bounds](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/localtime.c#L667)).
   `NaN` returns `0A000`.
+- Date and time input decodes text as PostgreSQL 18.6 does
+  ([`datetime.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/datetime.c)).
+  Numbers read in the `DateStyle` field order: `'05/01/2024'::date` is May 1
+  under `MDY` (the default) and January 5 under `DMY`; `YMD` reads `24/05/01`
+  as 2024-05-01. A year of three or more digits, a month name (`Jan 5 2024`,
+  `5-Jan-2024`), a Julian day (`J2451187`), run-together digits (`20240105`,
+  `20240105T123456`), a day of the year (`2024.005`), `BC`/`AD`, `AM`/`PM`,
+  zone names, abbreviations and offsets, and the words `epoch`, `infinity`,
+  `now`, `today`, `tomorrow`, `yesterday` and `allballs` work in any order.
+  Errors carry PostgreSQL's SQLSTATE and message: `'13/01/2024'::date` fails
+  with `22008` and the hint `Perhaps you need a different "DateStyle"
+  setting.`; an unknown zone name such as `Mars/Olympus` fails with `22023`.
+  BC dates print with a ` BC` suffix (`0044-03-15 BC`). A POSIX zone
+  specification (`UTC+3`, `xyz5`) is not a zone name pos3ql knows: input and
+  `SET TimeZone` reject it.
 
 ### Statements that cannot yet pause
 
@@ -1144,6 +1159,14 @@ The value does not size memory in pos3ql. Each query runs in a workspace of
 files: a sort, grouping or hash table that outgrows the workspace fails with
 `54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
 file and restart to let larger sorts run.
+
+`EXPLAIN ANALYZE` reports a hash join's `Hash` node as PostgreSQL sizes its
+table: at least 1024 buckets, the next power of two above the node's row
+estimate, doubled while the rows outnumber them, and `Memory Usage` counting
+each row as PostgreSQL stores it plus 8 bytes per bucket. For example, a
+1,500-row build reports `Buckets: 2048  Batches: 1`. It always reports one
+batch: a build larger than `work_mem` times 2 (PostgreSQL's default
+`hash_mem_multiplier`), which PostgreSQL splits into batches, still runs whole.
 
 ### Planner settings
 

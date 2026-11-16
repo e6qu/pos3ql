@@ -826,7 +826,7 @@ impl Engine {
         let current_role = guc.current_role();
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, current_role.as_str())?;
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         responder.set_render(guc.render());
         Ok(())
     }

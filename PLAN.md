@@ -757,10 +757,15 @@ evaluation, set operations, derived tables, `VALUES` lists, a write's target
 scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
 (its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
 and the `ProjectSet` that expands set-returning calls, which also appears
-over scans), in all four formats. A hash join's `Hash` node reports the table pos3ql
-built: its bucket count (and the count it started with when it grew), one
-batch, and the bytes of its arrays as `Memory Usage`, which differ from
-PostgreSQL's allocator figures. A query without FROM drops sort, grouping
+over scans), in all four formats. A hash join's `Hash` node reports the table PostgreSQL
+would build: buckets sized from the node's row estimate (at least 1024) and
+doubled while its rows outnumber them, one batch, and `Memory Usage` from each
+row's minimal tuple (as PostgreSQL stores the values the node returns) and the
+bucket pointers. Remaining: PostgreSQL's skew buckets for an outer key with
+most-common-value statistics, its batches for a build larger than `work_mem`
+times 2, and values it stores compressed or out of line (rows over about
+2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
+`jsonb`, ranges, records) reports pos3ql's own table bytes. A query without FROM drops sort, grouping
 and distinct keys that are planner constants, as PostgreSQL does (a constant
 `DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
 the constants the planner folds them into (`'2'::double precision`). Times are measured
@@ -1068,9 +1073,11 @@ table joined with other FROM items is read whole before the join (a right
 or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
-batch where PostgreSQL fetches only what the reads need. Date input reads
-`YYYY-MM-DD` and the special values; PostgreSQL's other forms (`05/01/2024`
-read in the `DateStyle` field order, month names) fail with `22007`. COPY FROM into a foreign table queues its rows
+batch where PostgreSQL fetches only what the reads need. Date and time input
+follows PostgreSQL's decoder, but a POSIX zone specification (`UTC+3`,
+`xyz5`) fails with `22023` in input and `SET TimeZone`, where PostgreSQL
+parses it; an error message quoting input longer than about 150 bytes is cut
+at pos3ql's 192-byte message limit. COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup
@@ -1143,9 +1150,11 @@ emptied inheritance tree; a foreign member that ships only some of its
 conditions, and `VERBOSE` over foreign members; a whole-row reference to an
 inheritance child with columns of its own. Joins and grouping over
 partitioned tables use pos3ql's join and aggregation methods, which differ
-from PostgreSQL's cost choices as they do for plain tables, and `EXPLAIN
-ANALYZE` of a hash join reports pos3ql's own hash table (16 buckets for a
-small build) where PostgreSQL's holds at least 1024; a derived table that
+from PostgreSQL's cost choices as they do for plain tables. A `WHERE`
+conjunct that can raise an error (`id % 2 = 0`) runs above a join rather than
+at its relation's scan, so `EXPLAIN ANALYZE` counts its rows in the join and
+hashes them; and a hash join whose build is empty still reads its outer
+relation, where PostgreSQL reads at most its first row; a derived table that
 PostgreSQL pulls up into an outer join still prints under its own name. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve

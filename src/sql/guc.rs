@@ -1279,7 +1279,7 @@ impl GucValues {
             extra_float_digits: 1,
             lock_timeout: 0,
             statement_timeout: 0,
-            work_mem: 4096,
+            work_mem: WORK_MEM_DEFAULT,
             row_security: StackStr::new(),
             event_triggers: true,
             bytea_escape: false,
@@ -3896,15 +3896,19 @@ impl GucState {
         self.store.borrow().current.parsed_timezone
     }
 
+    /// Publishes the settings datetime input reads for the statement about
+    /// to run: TimeZone and DateStyle's field order.
+    pub fn publish_datetime_input(&self) {
+        let state = self.store.borrow();
+        super::timezone::set_session(state.current.parsed_timezone);
+        let (_, order) = parse_full(state.current.datestyle.as_str());
+        super::datetime_input::set_session_field_order(order);
+    }
+
     pub fn render(&self) -> RenderContext {
         let state = self.store.borrow();
         let values = &state.current;
-        let (format, ord) = parse_full(values.datestyle.as_str());
-        let order = if ord == Order3::Dmy {
-            FieldOrder::Dmy
-        } else {
-            FieldOrder::Mdy
-        };
+        let (format, order) = parse_full(values.datestyle.as_str());
         RenderContext {
             datestyle: DateStyle { format, order },
             intervalstyle: values.intervalstyle,
@@ -4110,6 +4114,8 @@ struct IntSetting {
     max: i32,
 }
 
+/// PostgreSQL's default `work_mem`, in kilobytes.
+const WORK_MEM_DEFAULT: i32 = 4096;
 const WORK_MEM: IntSetting = IntSetting {
     name: "work_mem",
     unit: SettingUnit::Kilobytes,
@@ -4515,6 +4521,19 @@ pub(crate) fn planner_setting_metadata(name: &str) -> Option<PlannerSettingMetad
     })
 }
 
+/// The active session's `work_mem` in kilobytes; PostgreSQL's default
+/// outside a session.
+pub(crate) fn work_mem_kilobytes() -> i32 {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return WORK_MEM_DEFAULT;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }.store.borrow().current.work_mem
+    })
+}
+
 /// The plan methods the active session allows; PostgreSQL's defaults
 /// outside a session (background work runs with them).
 pub(crate) fn planner_methods() -> PlannerMethods {
@@ -4571,17 +4590,8 @@ fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError>
     Ok(())
 }
 
-/// Field order as PostgreSQL tracks it (YMD is preserved for SHOW even though
-/// output renders it like MDY).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Order3 {
-    Mdy,
-    Dmy,
-    Ymd,
-}
-
 /// Parses a stored canonical DateStyle string (always well-formed).
-fn parse_full(s: &str) -> (DateFormat, Order3) {
+fn parse_full(s: &str) -> (DateFormat, FieldOrder) {
     let (style, order) = s
         .split_once(", ")
         .expect("stored DateStyle has both canonical components");
@@ -4593,9 +4603,9 @@ fn parse_full(s: &str) -> (DateFormat, Order3) {
         _ => panic!("stored DateStyle has a validated output style"),
     };
     let order = match order {
-        "MDY" => Order3::Mdy,
-        "DMY" => Order3::Dmy,
-        "YMD" => Order3::Ymd,
+        "MDY" => FieldOrder::Mdy,
+        "DMY" => FieldOrder::Dmy,
+        "YMD" => FieldOrder::Ymd,
         _ => panic!("stored DateStyle has a validated field order"),
     };
     (style, order)
@@ -4605,10 +4615,10 @@ fn parse_full(s: &str) -> (DateFormat, Order3) {
 /// explicitly selected. German implies DMY at its own position in the list;
 /// DEFAULT after German can therefore replace that implied order.
 fn apply_datestyle(
-    current: (DateFormat, Order3),
-    reset: (DateFormat, Order3),
+    current: (DateFormat, FieldOrder),
+    reset: (DateFormat, FieldOrder),
     value: &str,
-) -> Result<(DateFormat, Order3), SqlError> {
+) -> Result<(DateFormat, FieldOrder), SqlError> {
     use core::fmt::Write as _;
     let (mut format, mut order) = current;
     let (mut have_style, mut have_order) = (false, false);
@@ -4656,19 +4666,19 @@ fn apply_datestyle(
             format = selected;
             have_style = true;
             if selected == DateFormat::German && !have_order {
-                order = Order3::Dmy;
+                order = FieldOrder::Dmy;
             }
             continue;
         }
         let selected_order = if token.eq_ignore_ascii_case("ymd") {
-            Some(Order3::Ymd)
+            Some(FieldOrder::Ymd)
         } else if token.eq_ignore_ascii_case("dmy") || starts("euro") {
-            Some(Order3::Dmy)
+            Some(FieldOrder::Dmy)
         } else if token.eq_ignore_ascii_case("mdy")
             || token.eq_ignore_ascii_case("us")
             || starts("noneuro")
         {
-            Some(Order3::Mdy)
+            Some(FieldOrder::Mdy)
         } else {
             None
         };
@@ -4693,7 +4703,7 @@ fn apply_datestyle(
     Ok((format, order))
 }
 
-fn canonical_datestyle(fmt: DateFormat, ord: Order3) -> StackStr<24> {
+fn canonical_datestyle(fmt: DateFormat, ord: FieldOrder) -> StackStr<24> {
     let f = match fmt {
         DateFormat::Iso => "ISO",
         DateFormat::Postgres => "Postgres",
@@ -4701,9 +4711,9 @@ fn canonical_datestyle(fmt: DateFormat, ord: Order3) -> StackStr<24> {
         DateFormat::German => "German",
     };
     let o = match ord {
-        Order3::Mdy => "MDY",
-        Order3::Dmy => "DMY",
-        Order3::Ymd => "YMD",
+        FieldOrder::Mdy => "MDY",
+        FieldOrder::Dmy => "DMY",
+        FieldOrder::Ymd => "YMD",
     };
     let mut s = StackStr::new();
     let _ = write!(s, "{f}, {o}");

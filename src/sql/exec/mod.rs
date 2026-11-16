@@ -82393,24 +82393,36 @@ fn copy_out_rows(
 /// an empty range).
 type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
 
-/// Per-field plan for binary COPY output. Scalars, arrays and bit strings
-/// encode arena-free (`Direct`); ranges and multiranges are pre-parsed into
-/// arena datums up front so the retry-safe emission closure never allocates
-/// or fails.
+/// Per-field plan for binary output. Scalars, arrays of scalars and bit
+/// strings encode arena-free (`Direct`); composites, arrays of composites and
+/// ranges are materialized up front, at every nesting depth, so the
+/// retry-safe emission closure never allocates or fails. A composite stored
+/// as text inside an array or another composite is decoded too: PostgreSQL's
+/// `record_send` and `array_send` call each member's binary send function.
 #[derive(Clone, Copy)]
 pub(crate) enum BinaryFieldPlan<'a> {
     Direct,
     /// Cursor capture prepares both formats. This placeholder is never sent:
     /// binary FETCH detects the unavailable send function from its type OID.
     Unavailable,
-    Composite(Datum<'a>),
+    Record(&'a [BinaryMember<'a>]),
     Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
     Multirange(&'a [RangeBinaryParts<'a>]),
-    CompositeArray(
-        crate::sql::types::ArrElem,
-        crate::sql::array::Shape,
-        &'a [Datum<'a>],
-    ),
+    Array {
+        element_oid: i32,
+        shape: crate::sql::array::Shape,
+        has_null: bool,
+        elements: &'a [BinaryMember<'a>],
+    },
+}
+
+/// One planned member of a composite or array: its type OID (sent before a
+/// record field), its value and that value's own plan.
+#[derive(Clone, Copy)]
+pub(crate) struct BinaryMember<'a> {
+    type_oid: i32,
+    value: Datum<'a>,
+    plan: BinaryFieldPlan<'a>,
 }
 
 /// Writes one already-planned binary field. Planning performs every fallible
@@ -82428,7 +82440,15 @@ pub(crate) fn encode_binary_field_plan(
             // another per-row bitmap.
             m.i32(0);
         }
-        BinaryFieldPlan::Composite(value) => Responder::encode_value_binary(m, &value),
+        BinaryFieldPlan::Record(fields) => {
+            m.field(|m| {
+                m.i32(fields.len() as i32);
+                for field in fields {
+                    m.i32(field.type_oid);
+                    encode_binary_field_plan(m, &field.value, field.plan);
+                }
+            });
+        }
         BinaryFieldPlan::Range(flags, lower, upper) => {
             m.field(|m| encode_range_binary(m, flags, lower, upper));
         }
@@ -82440,17 +82460,22 @@ pub(crate) fn encode_binary_field_plan(
                 }
             });
         }
-        BinaryFieldPlan::CompositeArray(element, shape, elements) => {
+        BinaryFieldPlan::Array {
+            element_oid,
+            shape,
+            has_null,
+            elements,
+        } => {
             m.field(|m| {
                 m.i32(shape.dimension_count() as i32);
-                m.i32(i32::from(elements.iter().any(Datum::is_null)));
-                m.i32(element.element_oid());
+                m.i32(i32::from(has_null));
+                m.i32(element_oid);
                 for index in 0..shape.dimension_count() {
                     m.i32(shape.dimension(index).unwrap() as i32);
                     m.i32(shape.lower_bound(index).unwrap());
                 }
                 for element in elements {
-                    Responder::encode_value_binary(m, element);
+                    encode_binary_field_plan(m, &element.value, element.plan);
                 }
             });
         }
@@ -82473,14 +82498,27 @@ pub(crate) fn binary_field_plan<'a>(
             slot,
             physical_fields,
             text,
-        } => Ok(BinaryFieldPlan::Composite(decode_stored_composite_text(
-            text,
-            *slot,
-            *physical_fields,
-            storage,
-            txid,
-            arena,
-        )?)),
+        } => {
+            let decoded =
+                decode_stored_composite_text(text, *slot, *physical_fields, storage, txid, arena)?;
+            binary_field_plan(&decoded, storage, txid, arena)
+        }
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            let members = arena
+                .alloc_slice_with(fields.len(), |_| BinaryMember {
+                    type_oid: 0,
+                    value: Datum::Null,
+                    plan: BinaryFieldPlan::Direct,
+                })
+                .map_err(|_| binary_plan_arena_full())?;
+            for (member, field) in members.iter_mut().zip(fields.iter()) {
+                *member = binary_member(field.type_oid, field.value, storage, txid, arena)?;
+                if matches!(member.plan, BinaryFieldPlan::Unavailable) {
+                    return Ok(BinaryFieldPlan::Unavailable);
+                }
+            }
+            Ok(BinaryFieldPlan::Record(members))
+        }
         Datum::Range { text, kind } => {
             let (flags, lower, upper) = parse_range_bounds(text, *kind, arena)?;
             Ok(BinaryFieldPlan::Range(flags, lower, upper))
@@ -82507,40 +82545,69 @@ pub(crate) fn binary_field_plan<'a>(
             ) =>
         {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-            let values = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            let elements = arena
+                .alloc_slice_with(shape.element_count(), |_| BinaryMember {
+                    type_oid: 0,
+                    value: Datum::Null,
+                    plan: BinaryFieldPlan::Direct,
+                })
+                .map_err(|_| binary_plan_arena_full())?;
+            let mut has_null = false;
             if *element == crate::sql::types::ArrElem::Record {
-                for (value, payload) in values
+                for (member, payload) in elements
                     .iter_mut()
                     .zip(crate::sql::array::element_payloads(raw))
                 {
-                    *value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
+                    let value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
+                    has_null |= value.is_null();
+                    *member = binary_member(0, value, storage, txid, arena)?;
                 }
             } else {
-                for (value, decoded) in values
+                for (member, value) in elements
                     .iter_mut()
                     .zip(crate::sql::array::elements(raw, *element))
                 {
-                    *value = match decoded {
-                        Datum::CompositeText {
-                            slot,
-                            physical_fields,
-                            text,
-                        } => decode_stored_composite_text(
-                            text,
-                            slot,
-                            physical_fields,
-                            storage,
-                            txid,
-                            arena,
-                        )?,
-                        value => value,
-                    };
+                    has_null |= value.is_null();
+                    *member = binary_member(0, value, storage, txid, arena)?;
                 }
             }
-            Ok(BinaryFieldPlan::CompositeArray(*element, shape, values))
+            if elements
+                .iter()
+                .any(|member| matches!(member.plan, BinaryFieldPlan::Unavailable))
+            {
+                return Ok(BinaryFieldPlan::Unavailable);
+            }
+            Ok(BinaryFieldPlan::Array {
+                element_oid: element.element_oid(),
+                shape,
+                has_null,
+                elements,
+            })
         }
         _ => Ok(BinaryFieldPlan::Direct),
     }
+}
+
+fn binary_member<'a>(
+    type_oid: i32,
+    value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<BinaryMember<'a>, SqlError> {
+    let plan = binary_field_plan(&value, storage, txid, arena)?;
+    Ok(BinaryMember {
+        type_oid,
+        value,
+        plan,
+    })
+}
+
+fn binary_plan_arena_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "binary output value exceeds the statement arena"
+    )
 }
 
 /// Parses a canonical range text into its PostgreSQL binary flags byte plus the

@@ -127,6 +127,82 @@ def run_result_case(conn, sql):
     return cur.fetchall()
 
 
+class BinaryShape:
+    """Decodes a binary value into a server-independent tree: user type OIDs
+    differ between servers, so each OID becomes its type name and each record
+    field and array element is decoded by its own type."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.types = {}
+
+    def type_info(self, oid):
+        if oid not in self.types:
+            row = self.conn.execute(
+                "SELECT format_type(t.oid, NULL), t.typtype, t.typelem, t.typbasetype, "
+                "t.typcategory FROM pg_type t WHERE t.oid = %s",
+                (oid,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("binary value names unknown type OID %d" % oid)
+            self.types[oid] = row
+        return self.types[oid]
+
+    def decode(self, oid, data):
+        if data is None:
+            return None
+        name, typtype, element, base, category = self.type_info(oid)
+        if typtype == "d":
+            return (name, self.decode(base, data))
+        if typtype == "c" or oid == 2249:
+            count = int.from_bytes(data[0:4], "big", signed=True)
+            at, fields = 4, []
+            for _ in range(count):
+                field_oid = int.from_bytes(data[at:at + 4], "big")
+                length = int.from_bytes(data[at + 4:at + 8], "big", signed=True)
+                at += 8
+                value = None if length < 0 else data[at:at + length]
+                at += max(length, 0)
+                fields.append(self.decode(field_oid, value))
+            return (name, fields)
+        if category == "A" and element:
+            dims = int.from_bytes(data[0:4], "big", signed=True)
+            element_oid = int.from_bytes(data[8:12], "big")
+            at, shape = 12, []
+            for _ in range(dims):
+                shape.append(data[at:at + 8].hex())
+                at += 8
+            items = []
+            while at < len(data):
+                length = int.from_bytes(data[at:at + 4], "big", signed=True)
+                at += 4
+                items.append(self.decode(element_oid, None if length < 0 else data[at:at + length]))
+                at += max(length, 0)
+            return (name, self.type_info(element_oid)[0], shape, items)
+        return (name, bytes(data).hex())
+
+
+def binary_shape(conn, shapes, sql):
+    cur = conn.cursor(binary=True)
+    cur.execute(sql)
+    result = cur.pgresult
+    return [
+        [shapes.decode(result.ftype(column), result.get_value(row, column))
+         for column in range(result.nfields)]
+        for row in range(result.ntuples)
+    ]
+
+
+# Composites nested in arrays, domains over arrays and other composites are
+# sent with each member's binary send function, at every depth.
+NESTED_RESULT_CASES = [
+    "SELECT points FROM binary_nested_rows",
+    "SELECT holder FROM binary_nested_rows",
+    "SELECT holders FROM binary_nested_rows",
+    "SELECT ROW(holder, points) FROM binary_nested_rows",
+]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pg", type=int, required=True)
@@ -170,7 +246,18 @@ def main():
         "CREATE FUNCTION binary_pending_table(input_value anyelement) RETURNS TABLE "
         "(value anyelement,marker integer) LANGUAGE sql VOLATILE AS 'INSERT INTO "
         "binary_pending_audit VALUES (4); SELECT $1,8'; "
-        "CREATE SEQUENCE binary_result_sequence START WITH 7"
+        "CREATE SEQUENCE binary_result_sequence START WITH 7; "
+        "CREATE DOMAIN binary_nested_points AS binary_result_pair[]; "
+        "CREATE TYPE binary_nested_holder AS (id integer, points binary_nested_points, "
+        "spans int4range[]); "
+        "CREATE TABLE binary_nested_rows (points binary_nested_points, "
+        "holder binary_nested_holder, holders binary_nested_holder[]); "
+        "INSERT INTO binary_nested_rows VALUES "
+        "(ARRAY[ROW(1,'one')::binary_result_pair, NULL]::binary_nested_points, "
+        "ROW(5, ARRAY[ROW(2,'two')::binary_result_pair]::binary_nested_points, "
+        "ARRAY[int4range(1,3)])::binary_nested_holder, "
+        "ARRAY[ROW(6, ARRAY[ROW(3,'three')::binary_result_pair]::binary_nested_points, "
+        "NULL)::binary_nested_holder])"
     )
     pg.execute(setup)
     p3.execute(setup)
@@ -221,6 +308,19 @@ def main():
                 print("      PostgreSQL error: %s" % pg_error)
             if p3_error is not None:
                 print("      pos3ql error: %s" % p3_error)
+
+    pg_shapes, p3_shapes = BinaryShape(pg), BinaryShape(p3)
+    for sql in NESTED_RESULT_CASES:
+        try:
+            r_pg = binary_shape(pg, pg_shapes, sql)
+            r_p3 = binary_shape(p3, p3_shapes, sql)
+        except Exception as e:
+            r_pg, r_p3 = "ERROR", repr(e)
+        if r_pg == r_p3:
+            print("ok:   %-34s -> %s" % (sql, r_pg))
+        else:
+            fails += 1
+            print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
 
     print("binary-composite: %d check(s) failed" % fails)
     sys.exit(1 if fails else 0)

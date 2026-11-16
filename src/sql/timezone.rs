@@ -348,7 +348,7 @@ impl Timezone {
     pub fn name(&self) -> Abbreviation {
         match self {
             Self::Posix(zone) => zone.name,
-            Self::Tzif(slot) => Abbreviation::from_str(super::tzif::name(*slot).as_str()),
+            Self::Tzif(slot) => Abbreviation::from_str(super::tzif::name(*slot)),
             Self::Abbreviation { name, .. } => *name,
         }
     }
@@ -641,7 +641,7 @@ mod tests {
     }
 
     fn zone(name: &str) -> Timezone {
-        super::super::tzif::init_catalog();
+        super::super::tzif::init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         lookup(name).expect("installed TZif zone")
     }
 

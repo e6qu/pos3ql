@@ -867,9 +867,12 @@ Dates and times:
   [Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
   (checksum-pinned at build) and the session zone: `2021-06-01 12:00 EST` is
   17:00 UTC; with `TimeZone = 'Asia/Shanghai'`, `CST` means UTC+8.
-  `timezone_abbreviations` cannot be changed. Named zones need
-  `/usr/share/zoneinfo`; on Debian and Ubuntu, legacy names such as `PST8PDT`
-  and `US/Eastern` come from the `tzdata-legacy` package.
+  `timezone_abbreviations` cannot be changed. The named zones are
+  PostgreSQL 18.6's 598 (checksum-pinned at build); their TZif files come from
+  the required `timezone_directory` setting, and startup fails naming any zone
+  the directory lacks. On Debian and Ubuntu, `/usr/share/zoneinfo` holds the
+  legacy names such as `PST8PDT` and `US/Eastern` only with the
+  `tzdata-legacy` package.
 - Numeric time zones are hours east of UTC (`SET timezone TO '2.5'` is
   UTC+02:30), within ±167:59:59; month/day interval fields return `22023`
   ([PostgreSQL rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251),

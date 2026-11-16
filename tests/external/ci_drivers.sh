@@ -90,6 +90,7 @@ index_statistics_slots = 4096
 trigger_event_spill_bytes = 64MiB
 error_text_bytes = 1MiB
 error_text_leases = 64
+timezone_directory = /usr/share/zoneinfo
 max_value_indexes = 64
 memtable_bytes = 256MiB
 max_prepared = 64

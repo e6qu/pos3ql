@@ -73,8 +73,7 @@ jobs:
           .ci-bin/psql --version
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
-      - if: ${{ !startsWith(matrix.shards, 'lib:') }}
-        uses: ./.github/actions/zoneinfo
+      - uses: ./.github/actions/zoneinfo
       - name: Python venv for the differential harnesses
         if: ${{ !startsWith(matrix.shards, 'lib:') }}
         uses: ./.github/actions/python-test-environment

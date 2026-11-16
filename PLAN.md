@@ -1074,7 +1074,9 @@ a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
 batch where PostgreSQL fetches only what the reads need. Date and time input
 and `SET TimeZone` follow PostgreSQL's decoder and its POSIX zone
-specifications. Error messages longer than 192 bytes are kept whole in the
+specifications. The named zones are PostgreSQL 18.6's, pinned at build, but
+their TZif contents come from `timezone_directory`, so a host's tzdata
+release, not PostgreSQL's 2026c, decides historical and future offsets. Error messages longer than 192 bytes are kept whole in the
 `error_text_bytes` pool; DETAIL and HINT text is still bounded at 12 KiB
 (`54000` past it) rather than drawing from that pool. Invalid `json` and
 `jsonb` input reports no `Token "..." is invalid.` DETAIL or `JSON data,

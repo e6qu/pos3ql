@@ -2368,7 +2368,7 @@ mod tests {
 
     #[test]
     fn timestamptz_interval_keeps_local_civil_time_across_dst() {
-        crate::sql::tzif::init_catalog();
+        crate::sql::tzif::init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         let zone = crate::sql::timezone::lookup("America/New_York").unwrap();
         crate::sql::timezone::set_session(zone);
         let before = parse_timestamp("2024-03-09 12:00:00-05", true).unwrap();

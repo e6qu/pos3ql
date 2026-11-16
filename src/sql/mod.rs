@@ -86,6 +86,7 @@ pub(crate) mod statistics;
 pub(crate) mod text_parser;
 pub mod timezone;
 mod timezone_abbreviation_data;
+mod timezone_name_data;
 pub mod to_char;
 pub mod trigger_events;
 pub(crate) mod two_phase;
@@ -310,6 +311,8 @@ pub enum EngineSetupError {
     Storage(SqlError),
     ForeignTransport(String),
     TriggerEventSpill(trigger_events::TriggerEventSpillError),
+    /// `timezone_directory` cannot serve PostgreSQL's named zones.
+    ZoneDatabase(crate::sql::tzif::ZoneDatabaseError),
 }
 
 impl From<SqlError> for EngineSetupError {
@@ -329,6 +332,7 @@ impl std::fmt::Display for EngineSetupError {
             Self::Storage(e) => write!(f, "{}", e.message.as_str()),
             Self::ForeignTransport(e) => write!(f, "{e}"),
             Self::TriggerEventSpill(e) => write!(f, "{e}"),
+            Self::ZoneDatabase(e) => write!(f, "{e}"),
         }
     }
 }
@@ -4999,7 +5003,8 @@ impl Engine {
             ));
         }
 
-        crate::sql::tzif::init_catalog();
+        crate::sql::tzif::init_catalog(&config.timezone_directory)
+            .map_err(EngineSetupError::ZoneDatabase)?;
         budget.draw(
             exec::record_shape_pool_bytes(config.max_composites),
             "record_shapes",

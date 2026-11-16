@@ -316,6 +316,7 @@ index_statistics_slots = $INDEX_STATISTICS_SLOTS
 trigger_event_spill_bytes = 64MiB
 error_text_bytes = 1MiB
 error_text_leases = 64
+timezone_directory = /usr/share/zoneinfo
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16

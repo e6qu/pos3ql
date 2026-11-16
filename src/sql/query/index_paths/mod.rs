@@ -1111,19 +1111,7 @@ impl<'s, 'a> Planner<'s, 'a> {
         let scan = self
             .storage
             .captured_row_scan_in(self.slot, self.txid, self.arena)?;
-        let _ = scan.for_each_overlay(&mut |rowid, home| {
-            self.storage
-                .with_row_bytes(self.slot, rowid, home, |bytes| {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
-                    let mark = self.arena.mark();
-                    observe(self.row_value(column, &values[..n_columns]));
-                    // SAFETY: the evaluated key was copied out above.
-                    unsafe { self.arena.rewind_to(mark) };
-                    Ok(())
-                })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(self.arena, true, None, &mut |batch| {
             for row in batch {
                 let mut values = [Datum::Null; MAX_COLUMNS];
@@ -1141,6 +1129,19 @@ impl<'s, 'a> Planner<'s, 'a> {
                 // SAFETY: the evaluated key was copied out above.
                 unsafe { self.arena.rewind_to(mark) };
             }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let _ = scan.for_each_resident_physically(self.arena, &mut |rowid, home| {
+            self.storage
+                .with_row_bytes(self.slot, rowid, home, |bytes| {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
+                    let mark = self.arena.mark();
+                    observe(self.row_value(column, &values[..n_columns]));
+                    // SAFETY: the evaluated key was copied out above.
+                    unsafe { self.arena.rewind_to(mark) };
+                    Ok(())
+                })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         drop(scan);
@@ -1210,16 +1211,6 @@ impl<'s, 'a> Planner<'s, 'a> {
         let scan = self
             .storage
             .captured_row_scan_in(self.slot, self.txid, self.arena)?;
-        let _ = scan.for_each_overlay(&mut |rowid, home| {
-            self.storage
-                .with_row_bytes(self.slot, rowid, home, |bytes| {
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
-                    check(&values[..n_columns]);
-                    Ok(())
-                })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
         scan.for_each_spilled_row_batch(self.arena, true, None, &mut |batch| {
             for row in batch {
                 let mut values = [Datum::Null; MAX_COLUMNS];
@@ -1231,6 +1222,16 @@ impl<'s, 'a> Planner<'s, 'a> {
                     crate::storage::SpilledRowRepresentation::Values(values) => check(values),
                 }
             }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        let _ = scan.for_each_resident_physically(self.arena, &mut |rowid, home| {
+            self.storage
+                .with_row_bytes(self.slot, rowid, home, |bytes| {
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    crate::storage::rowenc::decode(bytes, schema, &mut values)?;
+                    check(&values[..n_columns]);
+                    Ok(())
+                })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         drop(scan);

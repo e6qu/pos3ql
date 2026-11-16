@@ -215,28 +215,43 @@ impl CatalogNameClash {
 
 /// Names a new table's NOT NULL constraints in PostgreSQL's
 /// `AddRelationNotNullConstraints` order: the constraints the statement
-/// declares, in column order, then those only inherited. A declared name
-/// (in `not_null_name_edits`) repeating an earlier declared one is a 42710
-/// error. An undeclared one is chosen to avoid the table's CHECK constraints,
-/// the NOT NULL names chosen before it and `namespace_taken`, the names the
-/// schema's other constraints hold. An inherited name is kept unless the
-/// table already uses it. The first name repeating a constraint stored before
-/// it is returned for the caller to report with the table's OID; the
+/// declares, as `order` lists them and then in column order, then those only
+/// inherited. A declared name (in `not_null_name_edits`) repeating an earlier
+/// declared one is a 42710 error. An undeclared one is chosen to avoid the
+/// table's CHECK constraints, the NOT NULL names chosen before it and
+/// `namespace_taken`, the names the schema's other constraints hold. An
+/// inherited name is kept unless the statement's own CHECK constraints
+/// (`created_check`: those it does not merge into inherited ones) or earlier
+/// NOT NULL constraints use it. The first name repeating a constraint stored
+/// before it is returned for the caller to report with the table's OID; the
 /// remaining columns are still named.
 pub(crate) fn created_table(
     definition: &mut super::TableDefBuilder,
+    order: &[u16],
+    created_check: &dyn Fn(&super::CheckConstraint) -> bool,
     namespace_taken: &dyn Fn(SqlName) -> bool,
 ) -> Result<Option<CatalogNameClash>, SqlError> {
     let columns = definition.n_columns;
     let declared = definition.not_null_name_edits;
     let mut names = [None; super::MAX_COLUMNS];
+    let mut named = super::ColumnSet::EMPTY;
     let mut clash = None;
-    for inherited_only in [false, true] {
-        for position in 0..columns {
+    let ordered = order
+        .iter()
+        .map(|&column| (false, usize::from(column)))
+        .filter(|&(_, column)| column < columns);
+    let local = (0..columns).map(|column| (false, column));
+    let inherited = (0..columns).map(|column| (true, column));
+    for (inherited_only, position) in ordered.chain(local).chain(inherited) {
+        {
             let column = definition.columns[position];
-            if !column.not_null.is_required() || column.not_null.is_local() == inherited_only {
+            if named.contains(position)
+                || !column.not_null.is_required()
+                || column.not_null.is_local() == inherited_only
+            {
                 continue;
             }
+            named.insert(position);
             let stored = |name: SqlName, names: &[Option<SqlName>]| {
                 names.contains(&Some(name))
                     || definition
@@ -258,7 +273,19 @@ pub(crate) fn created_table(
                     }
                     name
                 }
-                Some(name) if inherited_only && !stored(name, &names[..columns]) => name,
+                // An inherited name gives way only to the statement's own
+                // CHECK constraints and earlier NOT NULL names; repeating an
+                // inherited CHECK name fails on the catalog below.
+                Some(name)
+                    if inherited_only
+                        && !names[..columns].contains(&Some(name))
+                        && !definition
+                            .checks()
+                            .iter()
+                            .any(|check| check.name == name && created_check(check)) =>
+                {
+                    name
+                }
                 _ => choose(
                     definition.name.as_str(),
                     Some(column.name.as_str()),

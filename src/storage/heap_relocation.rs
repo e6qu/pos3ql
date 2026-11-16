@@ -72,6 +72,54 @@ impl HeapReferencePosition {
     }
 }
 
+/// The location `source` takes in the heap of `generation`: the copied tail
+/// keeps its order after the packed rows, and every other retained row moves
+/// to its packed destination. Packing visits rows by source offset, so the
+/// mapping preserves the heap's order.
+fn relocated_location(
+    entries: &[HeapRelocationEntry],
+    packed_bytes: usize,
+    source: RowLoc,
+    generation: u64,
+    tail: Option<(usize, usize)>,
+) -> Result<RowLoc, SqlError> {
+    if source.generation.checked_add(1) != Some(generation) {
+        return Err(sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "heap relocation encountered a replaced row allocation"
+        ));
+    }
+    let destination = if let Some((frontier, copied_tail)) = tail
+        && source.offset as usize >= frontier
+    {
+        let end = (source.offset as usize).checked_add(source.len as usize);
+        if end.is_none_or(|end| end > frontier + copied_tail) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "heap relocation row exceeds its copied tail"
+            ));
+        }
+        packed_bytes + (source.offset as usize - frontier)
+    } else {
+        let index = entries
+            .binary_search_by_key(&(source.offset, source.len), |entry| {
+                (entry.source.offset, entry.source.len)
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "heap relocation row was not retained during capture"
+                )
+            })?;
+        entries[index].destination as usize
+    };
+    Ok(RowLoc {
+        offset: destination as u32,
+        len: source.len,
+        generation,
+    })
+}
+
 struct HeapRemapPlan {
     source_id: usize,
     generation: u64,
@@ -87,6 +135,29 @@ pub(super) struct HeapRemap {
 }
 
 impl HeapRemap {
+    /// The offset `location` has, or takes, in the heap this published
+    /// remap fills. Relocation keeps the heap's order, so these offsets order
+    /// a row map's heap rows by position while some still name the old heap.
+    pub(super) fn ordered_offset(&self, location: RowLoc) -> Result<u32, SqlError> {
+        let plan = self.plan.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "published heap remap has no relocation plan"
+            )
+        })?;
+        if location.generation == plan.generation {
+            return Ok(location.offset);
+        }
+        relocated_location(
+            self.entries.as_slice(),
+            plan.packed_bytes,
+            location,
+            plan.generation,
+            Some((plan.frontier, plan.copied_tail)),
+        )
+        .map(|relocated| relocated.offset)
+    }
+
     pub(super) fn matches_copy(
         &self,
         copy: &HeapCopy,
@@ -257,42 +328,13 @@ impl<'scratch> RelocationPlan<'scratch> {
         generation: u64,
         tail: Option<(usize, usize)>,
     ) -> Result<RowLoc, SqlError> {
-        if source.generation.checked_add(1) != Some(generation) {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "heap relocation encountered a replaced row allocation"
-            ));
-        }
-        let destination = if let Some((frontier, copied_tail)) = tail
-            && source.offset as usize >= frontier
-        {
-            let end = (source.offset as usize).checked_add(source.len as usize);
-            if end.is_none_or(|end| end > frontier + copied_tail) {
-                return Err(sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "heap relocation row exceeds its copied tail"
-                ));
-            }
-            self.packed_bytes + (source.offset as usize - frontier)
-        } else {
-            let index = self
-                .entries
-                .binary_search_by_key(&(source.offset, source.len), |entry| {
-                    (entry.source.offset, entry.source.len)
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "heap relocation row was not retained during capture"
-                    )
-                })?;
-            self.entries[index].destination as usize
-        };
-        Ok(RowLoc {
-            offset: destination as u32,
-            len: source.len,
+        relocated_location(
+            self.entries.as_slice(),
+            self.packed_bytes,
+            source,
             generation,
-        })
+            tail,
+        )
     }
 
     fn preflight(
@@ -679,11 +721,10 @@ impl HeapRelocationWorkspace {
                 "row heap relocation is already active"
             ));
         }
+        // Read views taken during the last remap order rows by its plan; the
+        // next relocation waits until they release it.
         if Arc::strong_count(&self.map) != 1 || Arc::weak_count(&self.map) != 0 {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "heap relocation scratch is retained by publication"
-            ));
+            return Ok(MaintenanceStep::WaitingForOwner);
         }
         let Some(progress) = storage.start_heap_relocation(mode)? else {
             return Ok(MaintenanceStep::WaitingForOwner);
@@ -1501,6 +1542,61 @@ mod tests {
             }
             assert!(storage.resident_row_state(table, 65).unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn sequential_scans_keep_heap_order_while_a_remap_is_published() {
+        let (mut storage, table, original) = fixture();
+        add_preparation_rows(&mut storage, table);
+        let mut work = workspace(128);
+        let mut arena_budget = Budget::new(64 << 10);
+        let arena =
+            crate::mem::arena::Arena::new(&mut arena_budget, "remap scan order", 64 << 10).unwrap();
+        work.begin(&storage, MaintenanceMode::Background).unwrap();
+        reach_heap_cutover(&storage, &mut work);
+        // Row 1 moves into the new heap; rows 2..=64 still name the old one.
+        assert_eq!(
+            work.step(
+                &storage,
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                MaintenanceMode::Background
+            )
+            .unwrap(),
+            MaintenanceStep::Advanced
+        );
+        // A row written after the cutover follows every relocated row.
+        let appended = storage
+            .heap
+            .append_row(&[Datum::Int4(65), Datum::Text("late")])
+            .unwrap();
+        storage.tables[table]
+            .rows
+            .insert(65, RowState::committed_only_at(appended, 7))
+            .unwrap();
+        assert_eq!(
+            location(&storage, table, 1, 0).generation,
+            appended.generation
+        );
+        assert_eq!(
+            location(&storage, table, 2, 0).generation,
+            original.generation
+        );
+        let scan = storage.captured_row_scan_in(table, 0, &arena).unwrap();
+        let mut order = [0u64; 65];
+        let mut visited = 0;
+        let flow = scan
+            .for_each_home_physically(&arena, &mut |rowid, _| {
+                order[visited] = rowid;
+                visited += 1;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert!(flow.is_continue());
+        assert_eq!(visited, 65);
+        assert!(order.iter().copied().eq(1..=65), "{order:?}");
+        drop(scan);
+        finish_bounded_capture(&storage, &mut work);
     }
 
     #[test]

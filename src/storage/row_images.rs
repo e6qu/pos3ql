@@ -106,6 +106,10 @@ pub(super) struct CapturedRowRecord {
     version: u64,
     offset_or_member: u32,
     len: u32,
+    /// A heap row's offset in the newest heap: its own, or the one a
+    /// published relocation moves it to. Relocation keeps the heap's order,
+    /// so this orders heap rows by position whichever heap they still name.
+    heap_order: u32,
     kind: CapturedRowKind,
 }
 
@@ -121,20 +125,18 @@ enum CapturedRowKind {
 }
 
 impl CapturedRowRecord {
-    /// The record's place in a sequential scan, as
-    /// [`OrderedRowSnapshot::sort_key`] orders retained rows: saved rows by
-    /// row identity, then primary and secondary heap rows by heap position.
+    /// The record's place in a sequential scan: saved rows by row identity,
+    /// then heap rows by heap position, as PostgreSQL appends a new tuple
+    /// version after the heap's earlier tuples.
     pub(super) fn physical_order(&self) -> (u8, u64, u32) {
         match self.kind {
             CapturedRowKind::CommittedSpilled
             | CapturedRowKind::LookupSaved
             | CapturedRowKind::Invisible => (0, self.rowid, 0),
-            CapturedRowKind::PendingPrimaryHeap | CapturedRowKind::CommittedPrimaryHeap => {
-                (1, 0, self.offset_or_member)
-            }
-            CapturedRowKind::PendingSecondaryHeap | CapturedRowKind::CommittedSecondaryHeap => {
-                (2, 0, self.offset_or_member)
-            }
+            CapturedRowKind::PendingPrimaryHeap
+            | CapturedRowKind::CommittedPrimaryHeap
+            | CapturedRowKind::PendingSecondaryHeap
+            | CapturedRowKind::CommittedSecondaryHeap => (1, 0, self.heap_order),
         }
     }
 
@@ -143,6 +145,7 @@ impl CapturedRowRecord {
         version: 0,
         offset_or_member: 0,
         len: 0,
+        heap_order: 0,
         kind: CapturedRowKind::Invisible,
     };
     fn empty(rowid: u64, kind: CapturedRowKind) -> Self {
@@ -151,6 +154,7 @@ impl CapturedRowRecord {
             version: 0,
             offset_or_member: 0,
             len: 0,
+            heap_order: 0,
             kind,
         }
     }
@@ -346,13 +350,16 @@ impl<'arena> TableRowSnapshot<'arena> {
                 )
             }
         };
-        Ok(OrderedRowSnapshot {
+        let row = OrderedRowSnapshot {
             source: OrderedRowSource::new(self, kind),
             rowid,
             version,
             offset_or_member,
             len,
-        })
+        };
+        // Check the heap order here, so ordering retained rows cannot fail.
+        row.heap_order()?;
+        Ok(row)
     }
 
     pub(super) fn capture_selection(
@@ -425,6 +432,7 @@ impl<'arena> TableRowSnapshot<'arena> {
             version: row.version,
             offset_or_member: row.offset_or_member,
             len: row.len,
+            heap_order: row.heap_order()?,
             kind: match row.source.kind() {
                 OrderedVersionKind::PendingPrimaryHeap => CapturedRowKind::PendingPrimaryHeap,
                 OrderedVersionKind::CommittedPrimaryHeap => CapturedRowKind::CommittedPrimaryHeap,
@@ -570,15 +578,43 @@ impl OrderedRowSnapshot<'_, '_> {
         self.rowid
     }
 
+    /// The row's place in a sequential scan: saved rows by row identity,
+    /// then heap rows by heap position, as PostgreSQL appends a new tuple
+    /// version after the heap's earlier tuples.
     pub(crate) fn sort_key(self) -> (u8, u64, u32) {
         match self.source.kind() {
             OrderedVersionKind::CommittedSpilled => (0, self.rowid, 0),
+            _ => (
+                1,
+                0,
+                self.heap_order()
+                    .expect("retained heap rows have a checked heap order"),
+            ),
+        }
+    }
+
+    /// A heap row's offset in the newest heap, which orders heap rows by
+    /// position even while a published remap leaves some in the old heap.
+    fn heap_order(self) -> Result<u32, SqlError> {
+        let slot = match self.source.kind() {
             OrderedVersionKind::PendingPrimaryHeap | OrderedVersionKind::CommittedPrimaryHeap => {
-                (1, 0, self.offset_or_member)
+                HeapReadSlot::Primary
             }
             OrderedVersionKind::PendingSecondaryHeap
-            | OrderedVersionKind::CommittedSecondaryHeap => (2, 0, self.offset_or_member),
-        }
+            | OrderedVersionKind::CommittedSecondaryHeap => HeapReadSlot::Secondary,
+            OrderedVersionKind::CommittedSpilled => return Ok(0),
+        };
+        let heap = self
+            .source
+            .owner()
+            .heap
+            .as_ref()
+            .expect("retained heap row has an owner");
+        heap.ordered_offset(RowLoc {
+            offset: self.offset_or_member,
+            len: self.len,
+            generation: heap.generation(slot)?,
+        })
     }
 
     pub(crate) fn read(self) -> Result<VisibleRowHome, SqlError> {

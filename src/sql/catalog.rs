@@ -15897,7 +15897,9 @@ fn inherited_foreign_key_parent(
         .copied()
 }
 
-fn check_inheritance_count(
+/// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
+/// `child_slot`: how many of its parents define it.
+pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
@@ -18431,7 +18433,12 @@ fn pg_stats<'a>(
                 .number(column)
                 .and_then(|attribute| statistics.distribution(attribute))
             {
-                Some(distribution) => statistics_slots(distribution, metadata.ctype, arena)?,
+                Some(distribution) => statistics_slots(
+                    distribution,
+                    metadata.ctype,
+                    statistics_element(storage, txid, metadata)?,
+                    arena,
+                )?,
                 None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
             };
             rows[count] = row(
@@ -18519,7 +18526,20 @@ fn pg_stats<'a>(
                 };
                 let (most_common, frequencies, histogram, correlation) =
                     match statistics.columns.distribution(*record) {
-                        Some(distribution) => statistics_slots(distribution, ctype, arena)?,
+                        Some(distribution) => {
+                            let element = match ctype {
+                                ColType::Array(inner) => super::types::ArrElem::nested(inner),
+                                scalar => super::types::ArrElem::from_coltype(scalar),
+                            }
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "statistics of type {} cannot be shown",
+                                    ctype.name()
+                                )
+                            })?;
+                            statistics_slots(distribution, ctype, element, arena)?
+                        }
                         None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
                     };
                 rows[count] = row(
@@ -18551,21 +18571,53 @@ fn pg_stats<'a>(
     finish(def, &rows[..count], arena)
 }
 
-/// `pg_stats`' `most_common_vals`, `most_common_freqs`, `histogram_bounds`
-/// and `correlation` of a column of type `ctype`.
-fn statistics_slots<'a>(
-    distribution: crate::storage::ColumnDistribution<'_>,
-    ctype: ColType,
-    arena: &'a Arena,
-) -> Result<(Datum<'a>, Datum<'a>, Datum<'a>, Datum<'a>), SqlError> {
+/// The element type of a column's `pg_stats` value arrays: the column's
+/// declared type, as PostgreSQL's `stavalues` arrays carry it. A domain
+/// column keeps its domain identity over the stored base values, and an
+/// array column's values are themselves arrays.
+fn statistics_element(
+    storage: &Storage,
+    txid: u32,
+    metadata: &crate::storage::ColumnMeta,
+) -> Result<super::types::ArrElem, SqlError> {
     use super::types::ArrElem;
-    let element = ArrElem::from_coltype(ctype).ok_or_else(|| {
+    let ctype = metadata.ctype;
+    let domain = metadata
+        .user_type
+        .and_then(|_| storage.routine_type_oid(ctype, metadata.user_type, txid))
+        .and_then(crate::storage::NamedTypeKind::from_oid)
+        .and_then(|(kind, creation, array)| {
+            (kind == crate::storage::NamedTypeKind::Domain && !array).then_some(creation)
+        });
+    let element = match (domain, ctype) {
+        // An array element cannot name a domain over an array of a named
+        // type, so such a column's values are shown as the arrays they are.
+        // The text matches PostgreSQL; binary output names the array type
+        // where PostgreSQL names the domain.
+        (Some(_), ColType::Array(inner)) if inner.is_named() => ArrElem::nested(inner),
+        (Some(domain), base) => ArrElem::domain(domain, base),
+        (None, ColType::Array(inner)) => ArrElem::nested(inner),
+        (None, scalar) => ArrElem::from_coltype(scalar),
+    };
+    element.ok_or_else(|| {
         sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "statistics of type {} cannot be shown",
             ctype.name()
         )
-    })?;
+    })
+}
+
+/// `pg_stats`' `most_common_vals`, `most_common_freqs`, `histogram_bounds`
+/// and `correlation` of a column of type `ctype`, whose value arrays have
+/// `element` members.
+fn statistics_slots<'a>(
+    distribution: crate::storage::ColumnDistribution<'_>,
+    ctype: ColType,
+    element: super::types::ArrElem,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, Datum<'a>, Datum<'a>, Datum<'a>), SqlError> {
+    use super::types::ArrElem;
     let array = |values: &[Datum<'_>]| -> Result<Datum<'a>, SqlError> {
         Ok(Datum::Array {
             element,
@@ -22518,7 +22570,6 @@ fn pg_constraint_values<'a>(
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
             let inheritance_count = check_inheritance_count(storage, txid, slot, check);
-            let inherited = inheritance_count != 0;
             let table = storage.table_def(slot, txid);
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
             // PostgreSQL's `StoreRelCheck` lists each distinct variable in
@@ -22568,7 +22619,7 @@ fn pg_constraint_values<'a>(
                         txid,
                     )),
                     text(" ", arena)?,
-                    Datum::Bool(!inherited),
+                    Datum::Bool(check.local),
                     Datum::Int4(inheritance_count as i32),
                     Datum::Bool(check.no_inherit),
                     Datum::Null,

@@ -6076,11 +6076,12 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many chk lines"));
                     }
                     let validation: u8 = parse_field(words.next(), "chk validation")?;
-                    let no_inherit = match parse_field::<u8>(words.next(), "chk inheritance")? {
-                        0 => false,
-                        1 => true,
-                        _ => return Err(CheckpointSetupError::Corrupt("bad chk inheritance")),
-                    };
+                    let (no_inherit, local) =
+                        crate::storage::CheckConstraint::from_inheritance_code(parse_field::<u8>(
+                            words.next(),
+                            "chk inheritance",
+                        )?)
+                        .ok_or(CheckpointSetupError::Corrupt("bad chk inheritance"))?;
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
@@ -6092,6 +6093,7 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("bad chk validation"))?;
                     check.name = sql_name(&decode_hex_name(hex_name)?)?;
                     check.no_inherit = no_inherit;
+                    check.local = local;
                     let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
                     let _ = write!(check.expression, "{expression}");
@@ -8347,6 +8349,7 @@ impl Checkpointer {
                             validation,
                             // Domain constraints are never inherited.
                             no_inherit: false,
+                            local: true,
                         };
                     }
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
@@ -11330,7 +11333,7 @@ impl Checkpointer {
                     format_args!(
                         "chk2 {} {} {} {}",
                         check.validation.code(),
-                        u8::from(check.no_inherit),
+                        check.inheritance_code(),
                         hex_name.as_str(),
                         hexpr.as_str()
                     ),

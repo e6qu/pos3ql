@@ -3611,12 +3611,87 @@ pub enum ArrElem {
         base_code: u8,
         base_identity: Option<crate::storage::TypeCreation>,
     },
+    /// An element that is itself an array, built only by [`ArrElem::nested`].
+    /// PostgreSQL's `pg_stats` shows an array column's most common values and
+    /// histogram bounds as an `anyarray` whose members are that column's
+    /// arrays (`{"{1,2}","{3}"}`); no SQL or stored type has this element.
+    /// `domain` identifies an array of domain values, whose base is
+    /// `base_code`; otherwise `base_code` is the inner element's [`ColType`]
+    /// code, bound by `base_identity` for an enum or composite.
+    Nested {
+        domain: Option<crate::storage::TypeCreation>,
+        base_code: u8,
+        base_identity: Option<crate::storage::TypeCreation>,
+    },
 }
 
 impl ArrElem {
     const ENUM_CODE_BASE: u8 = 32;
     const DOMAIN_CODE_BASE: u8 = 68;
     const COMPOSITE_CODE_BASE: u8 = 100;
+    /// [`ArrElem::Nested`] is never stored; its code decodes to nothing.
+    const NESTED_CODE: u8 = 170;
+
+    /// The element of an array whose members are arrays of `inner`, or `None`
+    /// for an inner element that is unbound, a record or already nested.
+    pub fn nested(inner: ArrElem) -> Option<Self> {
+        match inner {
+            ArrElem::Domain {
+                identity: Some(domain),
+                base_code,
+                base_identity,
+            } => Some(Self::Nested {
+                domain: Some(domain),
+                base_code,
+                base_identity,
+            }),
+            ArrElem::Domain { identity: None, .. }
+            | ArrElem::Enum(None)
+            | ArrElem::Composite(None)
+            | ArrElem::Record
+            | ArrElem::Nested { .. } => None,
+            other => Some(Self::Nested {
+                domain: None,
+                base_code: other.to_coltype().code(),
+                base_identity: other.user_type_identity(),
+            }),
+        }
+    }
+
+    /// The element of a nested element's member arrays; `None` for any
+    /// other element.
+    pub fn nested_member(self) -> Option<ArrElem> {
+        match self {
+            ArrElem::Nested {
+                domain,
+                base_code,
+                base_identity,
+            } => Some(Self::nested_inner(domain, base_code, base_identity)),
+            _ => None,
+        }
+    }
+
+    /// The array element of a nested element's member arrays.
+    fn nested_inner(
+        domain: Option<crate::storage::TypeCreation>,
+        base_code: u8,
+        base_identity: Option<crate::storage::TypeCreation>,
+    ) -> ArrElem {
+        if domain.is_some() {
+            return ArrElem::Domain {
+                identity: domain,
+                base_code,
+                base_identity,
+            };
+        }
+        let inner = match ColType::from_code(base_code).expect("nested array carries a valid code")
+        {
+            ColType::Enum(_) => ColType::Enum(base_identity),
+            ColType::Composite(_) => ColType::Composite(base_identity),
+            inner => inner,
+        };
+        ArrElem::from_coltype(inner).expect("nested array carries an array element")
+    }
 
     /// Every catalog-defined built-in element type that pos3ql stores and
     /// transmits as an array. This is the single inventory for OID decoding
@@ -3813,6 +3888,7 @@ impl ArrElem {
             ArrElem::Enum(_) => "_enum",
             ArrElem::Composite(_) => "_record",
             ArrElem::Domain { .. } => "_domain",
+            ArrElem::Nested { .. } => "anyarray",
         }
     }
 
@@ -3905,6 +3981,7 @@ impl ArrElem {
             ArrElem::Enum(_) => "enum[]",
             ArrElem::Composite(_) => "record[]",
             ArrElem::Domain { .. } => "domain[]",
+            ArrElem::Nested { .. } => "anyarray",
         }
     }
 
@@ -4137,6 +4214,11 @@ impl ArrElem {
                     base => base,
                 }
             }
+            ArrElem::Nested {
+                domain,
+                base_code,
+                base_identity,
+            } => ColType::Array(Self::nested_inner(domain, base_code, base_identity)),
         }
     }
 
@@ -4210,6 +4292,7 @@ impl ArrElem {
             ArrElem::Enum(slot) => oid::enum_array_oid(slot?),
             ArrElem::Composite(slot) => oid::composite_array_oid(slot?),
             ArrElem::Domain { identity, .. } => oid::domain_array_oid(identity?),
+            ArrElem::Nested { .. } => oid::ANYARRAY,
         })
     }
 
@@ -4299,6 +4382,7 @@ impl ArrElem {
             ArrElem::Enum(_) => Self::ENUM_CODE_BASE,
             ArrElem::Domain { .. } => Self::DOMAIN_CODE_BASE,
             ArrElem::Composite(_) => Self::COMPOSITE_CODE_BASE,
+            ArrElem::Nested { .. } => Self::NESTED_CODE,
         }
     }
 

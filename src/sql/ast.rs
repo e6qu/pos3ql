@@ -4434,6 +4434,17 @@ pub enum TableConstraint<'a> {
         timing: ConstraintTiming,
         validation: ConstraintValidation,
     },
+    /// PostgreSQL 18's table-level `NOT NULL column`.
+    NotNull {
+        source_position: SourcePosition,
+        name: Option<&'a str>,
+        column: &'a str,
+        /// `NOT VALID` written where it leaves the constraint unvalidated
+        /// (`ALTER TABLE ... ADD`); CREATE TABLE validates it.
+        not_valid: bool,
+        /// `NO INHERIT`: the constraint stays local to its table.
+        no_inherit: bool,
+    },
     Exclusion {
         source_position: SourcePosition,
         name: Option<&'a str>,
@@ -4460,6 +4471,9 @@ impl TableConstraint<'_> {
                 source_position, ..
             }
             | Self::ForeignKey {
+                source_position, ..
+            }
+            | Self::NotNull {
                 source_position, ..
             }
             | Self::Exclusion {

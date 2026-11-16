@@ -7888,6 +7888,7 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
                     | Tok::Ident("exclude")
+                    | Tok::Ident("not")
             ) {
                 return self.alter_table_add_constraint(None, constraint_at);
             }

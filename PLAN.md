@@ -647,7 +647,11 @@ conditions and skip arrays, `cost_bitmap_heap_scan` over the bitmap
 `ORDER BY` and `create_limit_path` under `LIMIT`) from the statistics ANALYZE
 gathers, and returns or changes its rows in that scan's order: an index scan
 by key (backward for the reverse order), a bitmap heap scan and a sequential
-scan by heap position (`differential_exact/691`, `692`, `720`-`723`). The
+scan by heap position (`differential_exact/691`, `692`, `720`-`723`): rows
+saved to object storage first, then the resident versions written since,
+also while a heap compaction is moving rows between memtable buffers.
+Constraint validation, index builds, `VACUUM` and `ANALYZE` read rows in the
+same order. The
 model reads B-tree indexes of several key columns and pattern classes,
 partial indexes whose predicate the conditions imply (`predicate_implied_by`
 for comparisons with constants, NULL tests, `IN` lists and their AND and
@@ -1138,23 +1142,33 @@ batch where PostgreSQL fetches only what the reads need. The exact-error
 fixtures compare every DETAIL, HINT, QUERY and CONTEXT line. The comparator
 masks one value: the new table's OID in the `Key (conrelid, contypid,
 conname)=(...)` DETAIL of a CREATE TABLE that repeats a constraint name,
-which each server draws from its own counter. A unique B-tree index build
-(CREATE UNIQUE INDEX, REINDEX) over duplicate keys names the first equal
-pair PostgreSQL's in-memory quicksort compares, reading rows in a sequential
-scan's physical order; REINDEX of a table reports the first index, by OID,
-whose rebuild fails. A build PostgreSQL would sort in parallel or beyond its
-default `maintenance_work_mem` (64 MB) fails with `0A000` when it finds
-duplicates; pos3ql estimates both conservatively from its own row sizes,
-and treats a parent's inherited NOT NULL name that repeats an inherited CHECK
-name as taken, where PostgreSQL keeps it and fails on the catalog index.
-Remaining: a table-level NOT NULL constraint (`CONSTRAINT n NOT NULL col` in
-CREATE TABLE or ALTER TABLE ADD) is a syntax error; ALTER TABLE ADD
-CONSTRAINT UNIQUE and table rewrites over duplicates name the first
-duplicate pos3ql's row scan meets; a routine argument of a composite type
-does not accept a `ROW(...)` value (`42883`); and a PL/pgSQL record variable
-assigned a `ROW(...)` value resolves `(r).f1`, which PostgreSQL rejects as
-a field of an anonymous record, and a bound cursor's query sees variables
-declared after the cursor.
+which each server draws from its own counter. Every unique B-tree index build (CREATE UNIQUE INDEX, REINDEX, ALTER TABLE
+ADD UNIQUE or PRIMARY KEY, a table rewrite's rebuild of its indexes, with
+the constraints ALTER COLUMN TYPE recreates last, a partition's cloned keys,
+ATTACH PARTITION) sorts its keys with
+PostgreSQL's in-memory quicksort, reading rows in a sequential scan's
+physical order, so it takes O(n log n) comparisons and names the first
+equal pair PostgreSQL compares; ALTER TABLE builds a new key before its
+other row checks, which report `contains null values` and `is violated by
+some row` as PostgreSQL's table rewrite does. A build PostgreSQL would sort
+in parallel or beyond its default `maintenance_work_mem` (64 MB) fails with
+`0A000` when it finds duplicates; pos3ql estimates both conservatively from
+its own row sizes, and a build whose keys outgrow the statement arena fails
+with `54000`. Table-level NOT NULL constraints (`[CONSTRAINT n] NOT NULL
+col [NO INHERIT]`) merge with column constraints in CREATE TABLE and adjust
+an existing constraint in ALTER TABLE ADD, as PostgreSQL 18 does; CHECK
+constraints record `conislocal` apart from their inheritance count. A
+composite routine parameter accepts a `ROW(...)` argument, a PL/pgSQL
+`record` variable holding an anonymous record rejects `(r).f1`, and a bound
+cursor's query sees only the variables declared before the cursor.
+Remaining: `ALTER TABLE ... ADD NOT NULL col NOT VALID` on a column without
+a NOT NULL constraint fails with `0A000` (pos3ql has no NOT VALID NOT NULL
+state); an exclusion constraint's rebuild still compares every pair of rows;
+CREATE TABLE merges a named CHECK into an inherited one only when their
+stored predicate texts match, where PostgreSQL compares the analysed
+expressions; a cursor declared in a nested block's DECLARE section fails
+with `0A000`; and `(r).*` of a PL/pgSQL record variable fails with `0A000`
+where PostgreSQL raises `42809`.
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
@@ -1283,10 +1297,17 @@ relation, where PostgreSQL reads at most its first row; a derived table that
 PostgreSQL pulls up into an outer join still prints under its own name.
 ANALYZE gathers PostgreSQL's column statistics (`compute_scalar_stats`: most
 common values, histogram bounds, correlation and `n_distinct`) from the same
-sample PostgreSQL reads (`differential_exact/690`). Remaining: the element
-statistics of arrays and `tsvector` columns, range and multirange histograms,
-`compute_distinct_stats` for types without an ordering, and the widths of
-values PostgreSQL compresses; a table larger than 300 rows per unit of the
+sample PostgreSQL reads (`differential_exact/690`). `pg_stats` shows them as
+an `anyarray` of the column's declared type, in text and binary form: enum,
+domain and composite values, and an array column's values as an array of
+arrays. Range, multirange and `tsvector` columns count every value distinct
+and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
+`compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
+do. Remaining: the element statistics of arrays and `tsvector` columns, range
+and multirange histograms, `compute_distinct_stats` for types without an
+ordering, the widths of values PostgreSQL compresses, and the binary element
+type of a domain over an array of an enum or composite, which names the
+array type where PostgreSQL names the domain; a table larger than 300 rows per unit of the
 statistics target is sampled at random, as PostgreSQL samples it, so its
 figures differ from run to run. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which

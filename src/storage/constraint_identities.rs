@@ -418,13 +418,15 @@ pub(crate) enum DeclaredKey {
 const MAX_DECLARED_KEYS: usize = super::MAX_COLUMNS + super::MAX_UNIQUES + super::MAX_EXCLUSIONS;
 
 /// The order CREATE TABLE declared its NOT NULL, key and exclusion
-/// constraints in, by which PostgreSQL numbers them: NOT NULL constraints
-/// declared on a column in column order, then a table primary key's other
-/// columns; the primary key, then the other keys and exclusion constraints
-/// as written.
+/// constraints in, by which PostgreSQL names and numbers them: NOT NULL
+/// constraints declared on a column or the table, as written, then a table
+/// primary key's other columns; the primary key, then the other keys and
+/// exclusion constraints as written.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ConstraintDeclarationOrder {
     declared_not_null: super::ColumnSet,
+    not_null_order: [u16; super::MAX_COLUMNS],
+    not_null_count: usize,
     keys: [DeclaredKey; MAX_DECLARED_KEYS],
     count: usize,
 }
@@ -433,15 +435,27 @@ impl ConstraintDeclarationOrder {
     pub(crate) const fn new() -> Self {
         Self {
             declared_not_null: super::ColumnSet::EMPTY,
+            not_null_order: [0; super::MAX_COLUMNS],
+            not_null_count: 0,
             keys: [DeclaredKey::Column(0); MAX_DECLARED_KEYS],
             count: 0,
         }
     }
 
-    /// Column `column` is NOT NULL by its own definition (`NOT NULL` or
-    /// `PRIMARY KEY`).
+    /// Column `column` is NOT NULL by a declaration of the statement (`NOT
+    /// NULL` or `PRIMARY KEY` on it, or a table `NOT NULL`); the first
+    /// declaration orders it.
     pub(crate) fn declare_not_null(&mut self, column: usize) {
+        if !self.declared_not_null.contains(column) && self.not_null_count < super::MAX_COLUMNS {
+            self.not_null_order[self.not_null_count] = column as u16;
+            self.not_null_count += 1;
+        }
         self.declared_not_null.insert(column);
+    }
+
+    /// The columns of the declared NOT NULL constraints, as written.
+    pub(crate) fn not_null_order(&self) -> &[u16] {
+        &self.not_null_order[..self.not_null_count]
     }
 
     /// Appends the next declared key; a repeat keeps its first position.
@@ -681,7 +695,20 @@ impl Storage {
                 reserve(&mut key.identity)?;
             }
         }
-        // Local NOT NULL constraints, then (for a new table) inherited ones.
+        // Local NOT NULL constraints, those declared first as written, then
+        // (for a new table) inherited ones.
+        let attribute_of = |definition: &super::TableDefBuilder, column: u16| {
+            (0..attributes)
+                .find(|&attribute| live_column(definition, attribute) == Some(usize::from(column)))
+        };
+        for &column in declared.map_or(&[][..], ConstraintDeclarationOrder::not_null_order) {
+            if let Some(attribute) = attribute_of(definition, column)
+                && not_null(definition, attribute).is_some()
+                && (!creating || definition.columns[usize::from(column)].not_null.is_local())
+            {
+                reserve(&mut definition.attribute_identities[attribute].not_null)?;
+            }
+        }
         for local_pass in [true, false] {
             for attribute in 0..attributes {
                 if not_null(definition, attribute).is_some_and(|column| {

@@ -118,7 +118,8 @@ pub use view_write::{
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
-    bind_expression as bind_procedural_expression, bind_statement as bind_procedural_statement,
+    anonymous_record_variable, bind_expression as bind_procedural_expression,
+    bind_statement as bind_procedural_statement,
 };
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
@@ -4156,6 +4157,24 @@ impl StorageCatalog<'_, '_, '_, '_> {
             let supplied = mapping[..arguments.len()]
                 .iter()
                 .position(|mapped| usize::from(*mapped) == input_index);
+            // `coerce_record_to_complex`: only a row constructor or a whole
+            // row converts from `record` to a composite parameter.
+            if let Some(call_index) = supplied
+                && argument_type_oids[call_index] == super::types::oid::RECORD
+                && let Expr::Cast { operand, .. } = arguments[call_index]
+                && !operand.is_row_constructor()
+                && let Some(target) = self
+                    .storage
+                    .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+                    .filter(|&target| target != super::types::oid::RECORD)
+            {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type record to {}",
+                    crate::sql::catalog::format_type_name(self.storage, self.txid, target)?
+                        .as_str()
+                ));
+            }
             input_type_oids[input_index] = match supplied {
                 Some(call_index) if !expanded_variadic => argument_type_oids[call_index],
                 _ => self

@@ -49,6 +49,9 @@ pub(crate) struct Restriction<'a> {
     /// The clause's position among the distinct conditions of the query
     /// (`find_list_position`): equal clauses share one.
     pub(super) id: usize,
+    /// An index condition derived from another restriction (a `LIKE`
+    /// pattern's prefix range), which the scan rechecks: that restriction.
+    pub(super) lossy_of: Option<&'a Expr<'a>>,
 }
 
 /// A restriction's form.
@@ -86,6 +89,18 @@ pub(super) enum Clause<'a> {
     },
     /// An `OR` of its arms, each a list of conditions.
     Or(&'a [&'a [Restriction<'a>]]),
+    /// `column LIKE 'pattern'` (or `NOT LIKE`), a text column matched with
+    /// a constant pattern and the default escape.
+    Like {
+        column: usize,
+        pattern: &'a str,
+        negated: bool,
+        /// The index conditions its fixed prefix gives a key of the column's
+        /// default class (`= prefix`, or `>= prefix` and `< greater`), and
+        /// of a pattern class (`~>=~` and `~<~`).
+        plain: &'a [Restriction<'a>],
+        pattern_class: &'a [Restriction<'a>],
+    },
     /// A condition the model has no form for, reading the columns of the
     /// mask (columns past 63 set bit 63); `indexable` when an index on one
     /// of them might apply it.
@@ -104,7 +119,8 @@ impl Clause<'_> {
         match *self {
             Self::Compare { column, .. }
             | Self::NullTest { column, .. }
-            | Self::Array { column, .. } => Some(column),
+            | Self::Array { column, .. }
+            | Self::Like { column, .. } => Some(column),
             Self::Or(_) | Self::Other { .. } => None,
         }
     }
@@ -115,7 +131,8 @@ impl Clause<'_> {
         match *self {
             Self::Compare { column, .. }
             | Self::NullTest { column, .. }
-            | Self::Array { column, .. } => column_bit(column),
+            | Self::Array { column, .. }
+            | Self::Like { column, .. } => column_bit(column),
             Self::Or(arms) => arms
                 .iter()
                 .flat_map(|arm| arm.iter())
@@ -212,7 +229,11 @@ pub(super) struct Analyzer<'p, 's, 'a> {
 
 impl<'a> Analyzer<'_, '_, 'a> {
     /// The column `expression` is, or the index key expression it matches.
+    /// A binary-compatible cast of a column (`RelabelType`) is the column.
     fn column_of(&self, expression: &'a Expr<'a>) -> Result<Option<usize>, SqlError> {
+        if let Some(column) = self.relabeled(expression) {
+            return Ok(Some(column));
+        }
         let Expr::Column { qualifier, name } = expression else {
             return self
                 .planner
@@ -223,6 +244,35 @@ impl<'a> Analyzer<'_, '_, 'a> {
             Ok(ResolvedColumn::Table(0, column)) => Some(column),
             _ => None,
         })
+    }
+
+    /// A cast of a column PostgreSQL keeps as the column: from `varchar` to
+    /// `text`, a `RelabelType` printed as written. (A cast to the column's
+    /// own type, which PostgreSQL's parser drops, is printed and costed as
+    /// written here, so stays outside the model.)
+    fn relabeled(&self, expression: &'a Expr<'a>) -> Option<usize> {
+        let Expr::Cast {
+            operand,
+            type_name,
+            type_mod: -1,
+            ..
+        } = expression
+        else {
+            return None;
+        };
+        let Expr::Column { qualifier, name } = operand else {
+            return None;
+        };
+        let Ok(ResolvedColumn::Table(0, column)) = self.scope.find_column(*qualifier, name) else {
+            return None;
+        };
+        let text = type_name
+            .trim_start_matches("pg_catalog.")
+            .eq_ignore_ascii_case("text");
+        match self.planner.column_type(column) {
+            ColType::Varchar if text => Some(column),
+            _ => None,
+        }
     }
 
     /// The constant `expression` compared with `column`.
@@ -370,6 +420,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
             selectivity,
             cost: self.cost(conjunct, &clause),
             id,
+            lossy_of: None,
         }))
     }
 
@@ -482,6 +533,17 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     boolean: None,
                 }
             }
+            Expr::Like {
+                operand,
+                pattern,
+                negated,
+                case_insensitive: false,
+                escape: None,
+            } => match self.like(conjunct, operand, pattern, *negated)? {
+                Ok(Some(clause)) => clause,
+                Ok(None) => other(self, "a LIKE the model does not read"),
+                Err(shape) => return Ok(Err(shape)),
+            },
             Expr::IsNull { operand, negated } => match self.column_of(operand)? {
                 Some(column) => Clause::NullTest {
                     column,
@@ -648,6 +710,171 @@ impl<'a> Analyzer<'_, '_, 'a> {
         }))
     }
 
+    /// `column LIKE 'pattern'` on a text column, with the index conditions
+    /// its fixed prefix gives (`match_pattern_prefix`); `None` for another
+    /// shape.
+    fn like(
+        &mut self,
+        conjunct: &'a Expr<'a>,
+        operand: &'a Expr<'a>,
+        pattern: &'a Expr<'a>,
+        negated: bool,
+    ) -> Result<Result<Option<Clause<'a>>, &'static str>, SqlError> {
+        let Some(column) = self.column_of(operand)? else {
+            return Ok(Ok(None));
+        };
+        if !matches!(
+            self.planner.column_type(column),
+            ColType::Text | ColType::Varchar
+        ) {
+            return Ok(Ok(None));
+        }
+        let Some(Datum::Text(text)) = self.constant(pattern, column) else {
+            return Ok(Ok(None));
+        };
+        if super::like::escapes(text) {
+            return Ok(Ok(None));
+        }
+        let text = &*self
+            .arena
+            .alloc_str(text)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        if negated {
+            return Ok(Ok(Some(Clause::Like {
+                column,
+                pattern: text,
+                negated,
+                plain: &[],
+                pattern_class: &[],
+            })));
+        }
+        let fixed = super::like::fixed_prefix(text);
+        let (plain, pattern_class) = match fixed.prefix {
+            Some(prefix) => {
+                let prefix = &*self
+                    .arena
+                    .alloc_str(prefix)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                // A prefix past ASCII has a greater string the model does not
+                // build.
+                if !prefix.is_ascii() {
+                    return Ok(Err("a LIKE prefix of non-ASCII characters"));
+                }
+                let mut plain = [None::<Restriction<'a>>; 2];
+                let mut pattern_ops = [None::<Restriction<'a>>; 2];
+                let mut count = 0;
+                let bounds: [(Comparison, Option<&'a str>); 2] = if fixed.exact {
+                    [(Comparison::Eq, Some(prefix)), (Comparison::Lt, None)]
+                } else {
+                    [
+                        (Comparison::Ge, Some(prefix)),
+                        (
+                            Comparison::Lt,
+                            super::like::greater_string(prefix, self.arena)?,
+                        ),
+                    ]
+                };
+                for (comparison, bound) in bounds {
+                    let Some(bound) = bound else {
+                        continue;
+                    };
+                    for (pattern_operator, out) in [(false, &mut plain), (true, &mut pattern_ops)] {
+                        // A pattern class compares equality with `=`.
+                        let pattern_operator = pattern_operator && comparison != Comparison::Eq;
+                        match self.derived(
+                            conjunct,
+                            operand,
+                            column,
+                            comparison,
+                            bound,
+                            pattern_operator,
+                        )? {
+                            Ok(restriction) => out[count] = Some(restriction),
+                            Err(shape) => return Ok(Err(shape)),
+                        }
+                    }
+                    count += 1;
+                }
+                let plain = &*self
+                    .arena
+                    .alloc_slice_with(count, |at| plain[at].expect("derived"))
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let pattern_ops = &*self
+                    .arena
+                    .alloc_slice_with(count, |at| pattern_ops[at].expect("derived"))
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                (plain, pattern_ops)
+            }
+            None => (&[][..], &[][..]),
+        };
+        Ok(Ok(Some(Clause::Like {
+            column,
+            pattern: text,
+            negated,
+            plain,
+            pattern_class,
+        })))
+    }
+
+    /// The index condition `operand comparison bound` derived from the
+    /// `LIKE` restriction `like`.
+    fn derived(
+        &mut self,
+        like: &'a Expr<'a>,
+        operand: &'a Expr<'a>,
+        column: usize,
+        comparison: Comparison,
+        bound: &'a str,
+        pattern: bool,
+    ) -> Result<Result<Restriction<'a>, &'static str>, SqlError> {
+        let arena_full = crate::sql::eval::arena_full;
+        let constant = self
+            .arena
+            .alloc(Expr::Str(bound))
+            .map_err(|_| arena_full())?;
+        let source = &*self
+            .arena
+            .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                operator: if pattern {
+                    match comparison {
+                        Comparison::Lt => BinaryOp::PatternLt,
+                        _ => BinaryOp::PatternGtEq,
+                    }
+                } else {
+                    comparison.binary()
+                },
+                left: operand,
+                right: constant,
+            })
+            .map_err(|_| arena_full())?;
+        let clause = Clause::Compare {
+            column,
+            comparison,
+            constant: Some(Datum::Text(bound)),
+            key: operand,
+            operand: constant,
+            pattern,
+            boolean: None,
+        };
+        let selectivity = match self.selectivity(&clause)? {
+            Ok(selectivity) => selectivity,
+            Err(shape) => return Ok(Err(shape)),
+        };
+        let id = match self.identity(source) {
+            Ok(id) => id,
+            Err(shape) => return Ok(Err(shape)),
+        };
+        Ok(Ok(Restriction {
+            source,
+            clause,
+            selectivity,
+            cost: self.cost(source, &clause),
+            id,
+            lossy_of: Some(like),
+        }))
+    }
+
     /// `clause_selectivity`, or the shape whose selectivity the model does
     /// not compute.
     fn selectivity(&self, clause: &Clause<'a>) -> Result<Result<f64, &'static str>, SqlError> {
@@ -711,6 +938,15 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 }
                 selectivity
             }
+            Clause::Like {
+                column,
+                pattern,
+                negated,
+                ..
+            } => match planner.like_selectivity(column, pattern, negated)? {
+                Ok(selectivity) => selectivity,
+                Err(shape) => return Ok(Err(shape)),
+            },
             // Unknown; a plan that depends on it is outside the model.
             Clause::Other { .. } => f64::NAN,
         }))

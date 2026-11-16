@@ -302,6 +302,40 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         ))
     }
 
+    /// The index conditions a `LIKE` restriction's fixed prefix gives key
+    /// `position` of `index`: equality with an exact pattern, else the
+    /// prefix's range, by the key's class's operators; none for another
+    /// column, or a default class of a collation other than `C`.
+    fn prefix_quals(
+        &self,
+        restriction: &'a Restriction<'a>,
+        index: usize,
+        position: usize,
+    ) -> &'a [Restriction<'a>] {
+        let Clause::Like {
+            column,
+            plain,
+            pattern_class,
+            ..
+        } = restriction.clause
+        else {
+            return &[];
+        };
+        let info = &self.index(index).catalog;
+        if usize::from(info.columns[position]) != column {
+            return &[];
+        }
+        if info.pattern_keys[position] {
+            pattern_class
+        } else if info.column_collation[position]
+            && super::c_collation(self.planner.column_collation(column))
+        {
+            plain
+        } else {
+            &[]
+        }
+    }
+
     /// `match_clause_to_indexcol`.
     fn match_clause(
         &self,
@@ -465,6 +499,29 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                     .flatten()
                     .any(|clause| core::ptr::eq(clause.restriction, restriction))
                 {
+                    continue;
+                }
+                if let Clause::Like { .. } = restriction.clause {
+                    // `match_pattern_prefix`: the pattern's prefix bounds the
+                    // first key column it can bound.
+                    for position in 0..keys {
+                        let derived = self.prefix_quals(restriction, index, position);
+                        if derived.is_empty() {
+                            continue;
+                        }
+                        for derived in derived {
+                            if let Some(clause) =
+                                outside!(self.match_clause(derived, index, position)?)
+                            {
+                                if count == MAX_INDEX_CLAUSES {
+                                    return Ok(Err("more than 32 index conditions"));
+                                }
+                                matched[count] = Some(clause);
+                                count += 1;
+                            }
+                        }
+                        break;
+                    }
                     continue;
                 }
                 for position in 0..keys {
@@ -1364,6 +1421,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 selectivity,
                 cost,
                 id,
+                lossy_of: None,
             })
             .map_err(|_| crate::sql::eval::arena_full())?;
         Ok(Ok(&*group))
@@ -1478,7 +1536,9 @@ impl<'a> Paths<'_, '_, 'a> {
             }
             let info = &self.index(index).catalog;
             for position in 0..info.n_cols {
-                if outside!(self.match_clause(restriction, index, position)?).is_some() {
+                if outside!(self.match_clause(restriction, index, position)?).is_some()
+                    || !self.prefix_quals(restriction, index, position).is_empty()
+                {
                     return Ok(Ok(true));
                 }
                 if let Clause::Other {
@@ -2966,7 +3026,10 @@ fn bitmap_plan<'a>(
             let quals = arena
                 .alloc_slice_with(clause_count + predicate.len(), |at| {
                     if at < clause_count {
-                        index_path.clauses[at].restriction.source
+                        // A lossy condition rechecks the restriction it
+                        // comes from.
+                        let restriction = index_path.clauses[at].restriction;
+                        restriction.lossy_of.unwrap_or(restriction.source)
                     } else {
                         &Expr::Null
                     }

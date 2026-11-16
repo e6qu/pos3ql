@@ -3062,12 +3062,15 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     let mut index_cond = None;
     let mut verbose_index_cond = None;
     // A heap scan that rechecks its conditions as written passes its
-    // bitmap index scan the `Index Cond` it holds.
+    // bitmap index scan the `Index Cond` it holds; so does the scan of a
+    // planner-costed bitmap whose conditions are all lossy, which has no
+    // recheck of its own.
     if !bitmap_index.as_str().is_empty()
-        && scan
-            .quals
-            .iter()
-            .any(|(label, _)| *label == QualLabel::RecheckCond)
+        && (scan.bitmap_index_estimate.is_some()
+            || scan
+                .quals
+                .iter()
+                .any(|(label, _)| *label == QualLabel::RecheckCond))
     {
         for (quals, held) in [
             (&mut scan.quals, &mut index_cond),

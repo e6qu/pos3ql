@@ -26,6 +26,7 @@ use super::scope::{QueryScope, ResolvedColumn};
 
 mod clauses;
 mod expressions;
+mod like;
 mod paths;
 mod predicate;
 
@@ -900,7 +901,7 @@ impl<'s, 'a> Planner<'s, 'a> {
 
     /// `ineq_histogram_selectivity`: `None` without a histogram; `Err`
     /// when PostgreSQL's interpolation is outside the model.
-    fn histogram_selectivity(
+    pub(super) fn histogram_selectivity(
         &self,
         variable: &VariableStatistics<'_>,
         column: usize,
@@ -1381,8 +1382,8 @@ impl<'s, 'a> Planner<'s, 'a> {
     }
 
     /// `scalarineqsel` of a pattern operator (`~<~` and its kin): its most
-    /// common values compared byte by byte, and half of the rest, since
-    /// the column's histogram follows another operator family.
+    /// common values and its histogram's entries compared byte by byte, the
+    /// histogram following another operator family.
     pub(super) fn pattern_selectivity(
         &self,
         column: usize,
@@ -1415,7 +1416,24 @@ impl<'s, 'a> Planner<'s, 'a> {
                 common += frequency;
             }
         }
-        let selectivity = (1.0 - variable.null_fraction - common) * 0.5 + mcv_selectivity;
+        // `ineq_histogram_selectivity` of a histogram sorted another way:
+        // the share of its entries the comparison accepts, else half.
+        let mut histogram = 0.5;
+        if let Some(distribution) = variable.distribution.filter(|d| d.histogram_len() > 1) {
+            let mut matched = 0usize;
+            for index in 0..distribution.histogram_len() {
+                let value = distribution.histogram_value(index, variable.ctype)?;
+                let (Some(value), Some(constant)) = (string_bytes(&value), string_bytes(&constant))
+                else {
+                    return Ok(Err("a pattern comparison of a non-string type"));
+                };
+                if comparison.holds(value.cmp(constant)) {
+                    matched += 1;
+                }
+            }
+            histogram = matched as f64 / distribution.histogram_len() as f64;
+        }
+        let selectivity = (1.0 - variable.null_fraction - common) * histogram + mcv_selectivity;
         Ok(Ok(clamp_probability(selectivity)))
     }
 
@@ -1985,9 +2003,14 @@ fn projection<'a>(
         if expression.contains_subquery() {
             return None;
         }
-        let (type_oid, type_mod) =
-            crate::sql::exec::infer_type_catalog(expression, Some(definition), storage, txid, arena)
-                .ok()?;
+        let (type_oid, type_mod) = crate::sql::exec::infer_type_catalog(
+            expression,
+            Some(definition),
+            storage,
+            txid,
+            arena,
+        )
+        .ok()?;
         let Some((ctype, None)) = crate::sql::exec::catalog_column_type(storage, txid, type_oid)
         else {
             return None;

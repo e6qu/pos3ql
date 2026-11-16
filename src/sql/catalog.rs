@@ -16146,6 +16146,9 @@ pub fn constraint_def_text<'a>(
                 if !column.not_null_inheritable {
                     let _ = rendered.write_str(" NO INHERIT");
                 }
+                if !column.not_null_validated {
+                    let _ = rendered.write_str(" NOT VALID");
+                }
                 return Ok(Some(alloc_rendered(
                     &rendered,
                     "NOT NULL definition is too long",
@@ -22605,7 +22608,7 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     Datum::Bool(false),
                     Datum::Bool(true),
-                    Datum::Bool(true),
+                    Datum::Bool(column.not_null_validated),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
@@ -23991,6 +23994,7 @@ fn pg_attribute<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -31369,6 +31373,7 @@ fn info_column_type_usage<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

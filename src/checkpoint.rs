@@ -4532,7 +4532,9 @@ impl Checkpointer {
                     }
                     let not_null_inheritable: u8 =
                         parse_field(words.next(), "col not-null inheritable")?;
-                    if not_null_inheritable > 3 {
+                    if not_null_inheritable > 7
+                        || (not_null_inheritable & 4 != 0 && not_null & 3 == 0)
+                    {
                         return Err(CheckpointSetupError::Corrupt(
                             "invalid NOT NULL inheritance",
                         ));
@@ -4668,6 +4670,7 @@ impl Checkpointer {
                         not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
                             .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
                         not_null_inheritable: not_null_inheritable & 1 != 0,
+                        not_null_validated: not_null_inheritable & 4 == 0,
                         local: not_null_inheritable & 2 != 0,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
@@ -11224,7 +11227,9 @@ impl Checkpointer {
                         c.default
                             .generation()
                             .map_or(0, crate::storage::Generation::code),
-                        u8::from(c.not_null_inheritable) | (u8::from(c.local) << 1),
+                        u8::from(c.not_null_inheritable)
+                            | (u8::from(c.local) << 1)
+                            | (u8::from(!c.proven_not_null() && c.not_null.is_required()) << 2),
                         not_null_name_hex.as_str(),
                         c.type_mod,
                         default_hex.as_str(),
@@ -20161,6 +20166,7 @@ fn empty_column() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,

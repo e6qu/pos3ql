@@ -5025,6 +5025,8 @@ fn build_partitioned_table_def(
                     column.not_null = crate::storage::NotNullOrigin::Nullable;
                     *name = None;
                 }
+                // A new partition has no rows to leave unchecked.
+                column.not_null_validated = true;
             }
             partition_column_options(storage, &mut def, statement.columns, txid, arena)?;
             for index in 0..def.n_uniques {
@@ -5321,6 +5323,8 @@ fn build_inherited_table_def(
                 } else {
                     crate::storage::NotNullOrigin::Nullable
                 };
+            // A new table has no rows to leave unchecked.
+            inherited.not_null_validated = true;
             // A child has its own physical rows and its own identity-sequence
             // ownership. PostgreSQL does not make the parent's sequence an
             // implicit writable dependency of the child relation.
@@ -62126,6 +62130,7 @@ pub fn create_table_as(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -89270,6 +89275,7 @@ pub(crate) fn view_trigger_definition<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -98629,6 +98635,12 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
             crate::sql::ast::TableConstraint::Check { no_inherit, .. }
             | crate::sql::ast::TableConstraint::NotNull { no_inherit, .. },
         ) => !no_inherit,
+        AlterAction::ValidateConstraint(name) | AlterAction::DropConstraint { name, .. }
+            if not_null_column(definition, name).is_some() =>
+        {
+            not_null_column(definition, name)
+                .is_some_and(|column| definition.columns()[column].not_null_inheritable)
+        }
         AlterAction::DropConstraint { name, .. }
         | AlterAction::RenameConstraint { from: name, .. }
         | AlterAction::ValidateConstraint(name) => definition
@@ -98637,6 +98649,22 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
             .any(|check| !check.no_inherit && check.name.as_str() == *name),
         _ => false,
     }
+}
+
+/// The column whose NOT NULL constraint `definition` names `name`.
+fn not_null_column<Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+) -> Option<usize> {
+    definition
+        .columns()
+        .iter()
+        .enumerate()
+        .position(|(column, meta)| {
+            meta.not_null.is_required()
+                && definition.not_null_names.as_ref()[column]
+                    .is_some_and(|named| named.as_str() == name)
+        })
 }
 
 /// PostgreSQL's refusals of a column change to only a partitioned table that
@@ -99178,6 +99206,19 @@ fn add_not_null_constraint(
                 "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.",
             ));
         }
+        // A valid constraint cannot merge into a NOT VALID one
+        // (`AdjustNotNullInheritance`).
+        if !not_valid && !current.not_null_validated {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "incompatible NOT VALID constraint \"{}\" on relation \"{}\"",
+                    existing.as_str(),
+                    definition.name.as_str()
+                ),
+                "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+            ));
+        }
         if !propagated
             && let Some(name) = name
             && name != existing.as_str()
@@ -99197,12 +99238,8 @@ fn add_not_null_constraint(
             ));
         }
     } else {
-        if not_valid {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "NOT VALID not-null constraints are not supported"
-            ));
-        }
+        // A NOT VALID constraint checks new rows only.
+        definition.columns[index].not_null_validated = !not_valid;
         let name = match name {
             Some(name) if !propagated => Some(SqlName::parse(name)?),
             _ if propagated => inherited_not_null_name(storage, definition, column, txid),
@@ -103316,6 +103353,8 @@ fn alter_table_relation(
                 } else {
                     new_def.columns[i].not_null = new_def.columns[i].not_null.add_local();
                 }
+                // `SET NOT NULL` validates a NOT VALID constraint.
+                new_def.columns[i].not_null_validated = true;
                 validate_definition = true;
             }
             AlterAction::DropNotNull { column } => {
@@ -103350,6 +103389,7 @@ fn alter_table_relation(
                     }
                     new_def.not_null_names[i] = None;
                     new_def.not_null_name_edits.insert(i);
+                    new_def.columns[i].not_null_validated = true;
                 }
             }
             AlterAction::SetStatistics { column, target } => {
@@ -103967,6 +104007,13 @@ fn alter_table_relation(
                         new_def.fkeys[index].validation =
                             crate::storage::ConstraintValidation::EnforcedValidated;
                     }
+                } else if let Some(column) = not_null_column(&new_def, name) {
+                    // Validating checks the stored rows below, against the
+                    // now validated constraint.
+                    if !new_def.columns[column].not_null_validated {
+                        new_def.columns[column].not_null_validated = true;
+                        validate_definition = true;
+                    }
                 } else if !new_def.has_constraint_named(name) {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -103988,6 +104035,44 @@ fn alter_table_relation(
                 if_exists,
                 cascade,
             } => {
+                // A NOT NULL constraint drops as `DROP NOT NULL` of its
+                // column does, except that an inherited one is refused.
+                if let Some(i) = not_null_column(&new_def, name) {
+                    let in_primary_key = new_def.columns[i].primary
+                        || new_def.uniques[..new_def.n_uniques]
+                            .iter()
+                            .any(|k| k.kind.is_primary() && k.columns().contains(&(i as u16)));
+                    if inheritance_scope == AlterInheritanceScope::Propagated {
+                        new_def.columns[i].not_null = new_def.columns[i].not_null.drop_inherited();
+                    } else if new_def.columns[i].not_null.is_inherited() {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot drop inherited constraint \"{}\" of relation \"{}\"",
+                            name,
+                            def.name.as_str()
+                        ));
+                    } else if in_primary_key {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "column \"{}\" is in a primary key",
+                            new_def.columns[i].name.as_str()
+                        ));
+                    } else {
+                        new_def.columns[i].not_null = new_def.columns[i].not_null.drop_local();
+                    }
+                    if !new_def.columns[i].not_null.is_required() {
+                        if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
+                            source[i]
+                        {
+                            let attribute = usize::from(def.attribute_number(original) - 1);
+                            new_def.attribute_identities[attribute].not_null = None;
+                        }
+                        new_def.not_null_names[i] = None;
+                        new_def.not_null_name_edits.insert(i);
+                        new_def.columns[i].not_null_validated = true;
+                    }
+                    continue;
+                }
                 // A child's CHECK survives its parent's when the child defines
                 // it too or another parent still does; dropped directly, an
                 // inherited one is refused.
@@ -109478,6 +109563,7 @@ fn coerce_composite_value_inner<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -110524,7 +110610,11 @@ fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
     description: constraints::RowDescription,
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
-        if c.not_null.is_required() && values[i].is_null() {
+        // A row being written satisfies every NOT NULL constraint; rows
+        // already stored only the validated ones.
+        let checked = c.not_null.is_required()
+            && (c.not_null_validated || description != constraints::RowDescription::Existing);
+        if checked && values[i].is_null() {
             if description == constraints::RowDescription::Existing {
                 crate::sql::eval::stash_object_diagnostic(
                     None,

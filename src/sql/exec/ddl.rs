@@ -238,6 +238,7 @@ fn empty_meta() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -506,6 +507,7 @@ pub(super) fn build_column(
         compression: c.compression,
         not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
         not_null_inheritable: c.not_null_inheritable,
+        not_null_validated: true,
         unique: c.unique,
         primary: c.primary,
         auto_increment,
@@ -2092,6 +2094,49 @@ pub(super) fn attach_constraints(
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
                 reject_virtual_columns(def, &indices[..n], "primary keys")?;
+                // `ATPrepAddPrimaryKey` reuses a column's NOT NULL
+                // constraint only when it suits a key
+                // (`verifyNotNullPKCompatible`).
+                if !merge_equivalent {
+                    for &column_index in &indices[..n] {
+                        let column = def.columns[column_index as usize];
+                        if !column.not_null.is_required()
+                            || (column.not_null_inheritable && column.not_null_validated)
+                        {
+                            continue;
+                        }
+                        let constraint =
+                            def.not_null_names[column_index as usize].unwrap_or(SqlName::EMPTY);
+                        let (marked, hint) = if column.not_null_inheritable {
+                            (
+                                "NOT VALID",
+                                "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+                            )
+                        } else {
+                            (
+                                "NO INHERIT",
+                                "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.",
+                            )
+                        };
+                        return Err(crate::sql::error_position::with_hint(
+                            crate::sql::error_position::with_detail(
+                                sql_err!(
+                                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                                    "cannot create primary key on column \"{}\"",
+                                    column.name.as_str()
+                                ),
+                                format_args!(
+                                    "The constraint \"{}\" on column \"{}\" of table \"{}\", marked {}, is incompatible with a primary key.",
+                                    constraint.as_str(),
+                                    column.name.as_str(),
+                                    def.name.as_str(),
+                                    marked
+                                ),
+                            ),
+                            hint,
+                        ));
+                    }
+                }
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();

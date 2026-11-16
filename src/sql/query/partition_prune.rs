@@ -2059,7 +2059,7 @@ impl<'a> Context<'_, 'a> {
             .map_err(|_| arena_full())?;
         let mut constraints = ArenaList::new(self.arena);
         for column in definition.columns() {
-            if column.not_null.is_required()
+            if column.proven_not_null()
                 && let Some(position) = self.root_column(column.name.as_str())
             {
                 constraints

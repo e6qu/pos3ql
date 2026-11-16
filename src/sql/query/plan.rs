@@ -513,10 +513,9 @@ pub(super) fn fold_null<'a>(
                 .find_column(*qualifier, name)
                 .ok()
                 .and_then(|entry| match entry {
-                    ResolvedColumn::Table(t, c) => scope
-                        .defs
-                        .get(t)
-                        .map(|d| d.columns[c].not_null.is_required()),
+                    ResolvedColumn::Table(t, c) => {
+                        scope.defs.get(t).map(|d| d.columns[c].proven_not_null())
+                    }
                     ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                 })
                 .unwrap_or(false)

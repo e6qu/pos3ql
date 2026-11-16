@@ -2829,6 +2829,7 @@ fn finish_derived_definition<'a, 'd>(
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,

@@ -121,11 +121,13 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 27: version byte, ten-byte catalog
+- **Table definition payload** is version 28: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. Each
-  column's NOT NULL inheritance byte carries inheritability in bit 0 and
-  PostgreSQL's `attislocal` in bit 1; other bits are rejected. The manifest's
-  `col5` line carries the same byte. Each CHECK constraint's inheritance byte
+  column's NOT NULL inheritance byte carries inheritability in bit 0,
+  PostgreSQL's `attislocal` in bit 1 and, in bit 2, that the column's NOT NULL
+  constraint was added `NOT VALID` and not yet validated (PostgreSQL's
+  `convalidated` false); bit 2 on a nullable column and other bits are
+  rejected. The manifest's `col5` line carries the same byte. Each CHECK constraint's inheritance byte
   carries `NO INHERIT` in bit 0 and, in bit 1, that the table only inherits
   it (PostgreSQL's `conislocal` false); other bits are rejected. The
   manifest's `chk2` line carries the same byte. Each column carries a generation-kind

@@ -347,11 +347,27 @@ enum ArrayElementIdentity {
         domain: TypeCreation,
         base: TypeCreation,
     },
+    /// A domain over an array of the enum `base`.
+    DomainEnumArray {
+        domain: TypeCreation,
+        base: TypeCreation,
+    },
+    /// A domain over an array of the composite type `base`.
+    DomainCompositeArray {
+        domain: TypeCreation,
+        base: TypeCreation,
+    },
 }
 
-/// A checked six-byte descriptor for inline cached array defaults.
+/// The bytes of a [`CachedArrayElement`].
+pub(crate) const CACHED_ARRAY_ELEMENT_BYTES: usize = 8;
+
+/// A checked eight-byte descriptor of an array's element type, for inline
+/// cached array defaults and projected rows: room for a domain identity
+/// and its base's named identity, also when the base is an array of a
+/// named type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CachedArrayElement([u8; 6]);
+pub struct CachedArrayElement([u8; CACHED_ARRAY_ELEMENT_BYTES]);
 
 impl CachedArrayElement {
     pub(crate) fn from_element(element: crate::sql::types::ArrElem) -> Result<Self, SqlError> {
@@ -378,6 +394,14 @@ impl CachedArrayElement {
                         base: base_identity.ok_or_else(invalid)?,
                     },
                     ColType::Composite(_) => DomainComposite {
+                        domain,
+                        base: base_identity.ok_or_else(invalid)?,
+                    },
+                    ColType::Array(ArrElem::Enum(_)) => DomainEnumArray {
+                        domain,
+                        base: base_identity.ok_or_else(invalid)?,
+                    },
+                    ColType::Array(ArrElem::Composite(_)) => DomainCompositeArray {
                         domain,
                         base: base_identity.ok_or_else(invalid)?,
                     },
@@ -412,10 +436,20 @@ impl CachedArrayElement {
                 base_code: ColType::Composite(None).code(),
                 base_identity: Some(base),
             },
+            DomainEnumArray { domain, base } => ArrElem::Domain {
+                identity: Some(domain),
+                base_code: ColType::Array(ArrElem::Enum(None)).code(),
+                base_identity: Some(base),
+            },
+            DomainCompositeArray { domain, base } => ArrElem::Domain {
+                identity: Some(domain),
+                base_code: ColType::Array(ArrElem::Composite(None)).code(),
+                base_identity: Some(base),
+            },
         }
     }
 
-    pub(crate) fn bytes(self) -> [u8; 6] {
+    pub(crate) fn bytes(self) -> [u8; CACHED_ARRAY_ELEMENT_BYTES] {
         self.0
     }
 
@@ -424,7 +458,10 @@ impl CachedArrayElement {
     const DOMAIN_BUILTIN: u64 = Self::COMPOSITE + MAX_TYPE_CREATION;
     const DOMAIN_ENUM: u64 = Self::DOMAIN_BUILTIN + MAX_TYPE_CREATION * 256;
     const DOMAIN_COMPOSITE: u64 = Self::DOMAIN_ENUM + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
-    const END: u64 = Self::DOMAIN_COMPOSITE + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
+    const DOMAIN_ENUM_ARRAY: u64 = Self::DOMAIN_COMPOSITE + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
+    const DOMAIN_COMPOSITE_ARRAY: u64 =
+        Self::DOMAIN_ENUM_ARRAY + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
+    const END: u64 = Self::DOMAIN_COMPOSITE_ARRAY + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
 
     fn builtin(code: u8) -> bool {
         use crate::sql::types::ArrElem;
@@ -477,17 +514,25 @@ impl CachedArrayElement {
                     + base.created_at()
                     - 1
             }
+            DomainEnumArray { domain, base } => {
+                Self::DOMAIN_ENUM_ARRAY
+                    + (domain.created_at() - 1) * MAX_TYPE_CREATION
+                    + base.created_at()
+                    - 1
+            }
+            DomainCompositeArray { domain, base } => {
+                Self::DOMAIN_COMPOSITE_ARRAY
+                    + (domain.created_at() - 1) * MAX_TYPE_CREATION
+                    + base.created_at()
+                    - 1
+            }
             _ => return None,
         };
-        let bytes = value.to_le_bytes();
-        Some(Self([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-        ]))
+        Some(Self(value.to_le_bytes()))
     }
 
     fn value(self) -> u64 {
-        let [a, b, c, d, e, f] = self.0;
-        u64::from_le_bytes([a, b, c, d, e, f, 0, 0])
+        u64::from_le_bytes(self.0)
     }
 
     fn decode(value: u64) -> Option<ArrayElementIdentity> {
@@ -509,24 +554,29 @@ impl CachedArrayElement {
                 base_code,
             });
         }
-        let (start, composite) = if value < Self::DOMAIN_COMPOSITE {
-            (Self::DOMAIN_ENUM, false)
+        let start = if value < Self::DOMAIN_COMPOSITE {
+            Self::DOMAIN_ENUM
+        } else if value < Self::DOMAIN_ENUM_ARRAY {
+            Self::DOMAIN_COMPOSITE
+        } else if value < Self::DOMAIN_COMPOSITE_ARRAY {
+            Self::DOMAIN_ENUM_ARRAY
         } else if value < Self::END {
-            (Self::DOMAIN_COMPOSITE, true)
+            Self::DOMAIN_COMPOSITE_ARRAY
         } else {
             return None;
         };
         let offset = value - start;
         let domain = TypeCreation::parse(offset / MAX_TYPE_CREATION + 1)?;
         let base = TypeCreation::parse(offset % MAX_TYPE_CREATION + 1)?;
-        Some(if composite {
-            DomainComposite { domain, base }
-        } else {
-            DomainEnum { domain, base }
+        Some(match start {
+            Self::DOMAIN_ENUM => DomainEnum { domain, base },
+            Self::DOMAIN_COMPOSITE => DomainComposite { domain, base },
+            Self::DOMAIN_ENUM_ARRAY => DomainEnumArray { domain, base },
+            _ => DomainCompositeArray { domain, base },
         })
     }
 
-    pub(crate) fn from_bytes(bytes: [u8; 6]) -> Option<Self> {
+    pub(crate) fn from_bytes(bytes: [u8; CACHED_ARRAY_ELEMENT_BYTES]) -> Option<Self> {
         let encoded = Self(bytes);
         Self::decode(encoded.value())?;
         Some(encoded)
@@ -537,8 +587,7 @@ impl CachedArrayElement {
     }
 }
 
-const _: [(); 6] = [(); core::mem::size_of::<CachedArrayElement>()];
-const _: () = assert!(CachedArrayElement::END <= 1 << 48);
+const _: [(); CACHED_ARRAY_ELEMENT_BYTES] = [(); core::mem::size_of::<CachedArrayElement>()];
 
 #[cfg(all(
     test,
@@ -547,6 +596,36 @@ const _: () = assert!(CachedArrayElement::END <= 1 << 48);
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_domain_over_a_named_array_keeps_both_identities() {
+        use crate::sql::types::{ArrElem, ColType};
+        let domain = TypeCreation::parse(MAX_TYPE_CREATION).unwrap();
+        let base = TypeCreation::parse(MAX_TYPE_CREATION - 1).unwrap();
+        for inner in [ArrElem::Enum(Some(base)), ArrElem::Composite(Some(base))] {
+            let element = ArrElem::domain(domain, ColType::Array(inner)).unwrap();
+            assert_eq!(element.to_coltype(), ColType::Array(inner));
+            assert_eq!(
+                element.element_oid(),
+                crate::sql::types::oid::domain_oid(domain)
+            );
+            let cached = CachedArrayElement::from_element(element).unwrap();
+            assert_eq!(cached.element(), element);
+            assert_eq!(
+                CachedArrayElement::from_bytes(cached.bytes())
+                    .unwrap()
+                    .element(),
+                element
+            );
+        }
+        // An array of a domain would need a third identity.
+        let nested = ArrElem::Domain {
+            identity: Some(base),
+            base_code: ColType::Int4.code(),
+            base_identity: None,
+        };
+        assert!(ArrElem::domain(domain, ColType::Array(nested)).is_none());
+    }
 
     #[test]
     fn cached_array_descriptors_preserve_maximum_creation_identities_without_allocation() {
@@ -589,6 +668,8 @@ mod tests {
                     let base = TypeCreation::parse(base).unwrap();
                     check(ArrayElementIdentity::DomainEnum { domain, base });
                     check(ArrayElementIdentity::DomainComposite { domain, base });
+                    check(ArrayElementIdentity::DomainEnumArray { domain, base });
+                    check(ArrayElementIdentity::DomainCompositeArray { domain, base });
                 }
                 for base in [
                     crate::sql::types::ColType::Bool,
@@ -639,7 +720,7 @@ mod tests {
                     sqlstate::UNDEFINED_OBJECT
                 );
             }
-            assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
+            assert!(CachedArrayElement::from_bytes([255; CACHED_ARRAY_ELEMENT_BYTES]).is_none());
             let invalid_builtin = crate::sql::types::ArrElem::Enum(None).code();
             assert!(
                 CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(invalid_builtin))

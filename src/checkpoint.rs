@@ -4513,7 +4513,7 @@ impl Checkpointer {
                     }
                     def.persistence = code;
                 }
-                Some("col5") => {
+                Some("col6") => {
                     let Some((_, _, def, seen)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
@@ -11221,7 +11221,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col5 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.default

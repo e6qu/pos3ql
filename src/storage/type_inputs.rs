@@ -522,7 +522,7 @@ fn validate_representation(
 ) -> Result<(), SqlError> {
     if binding.encoded[2] == 200 {
         let descriptor = super::CachedArrayElement::from_bytes(
-            binding.encoded[3..9]
+            binding.encoded[3..3 + super::CACHED_ARRAY_ELEMENT_BYTES]
                 .try_into()
                 .expect("validated array descriptor"),
         )
@@ -667,7 +667,7 @@ impl super::Storage {
                 return Ok(());
             }
             let descriptor = super::CachedArrayElement::from_bytes(
-                binding.encoded[3..9]
+                binding.encoded[3..3 + super::CACHED_ARRAY_ELEMENT_BYTES]
                     .try_into()
                     .expect("validated input descriptor"),
             )
@@ -675,7 +675,9 @@ impl super::Storage {
             let element = descriptor.element();
             self.validate_template_input_oid(element.array_oid(), source, transaction)?;
             self.validate_template_input_oid(element.to_coltype().oid(), source, transaction)?;
-            for payload in crate::sql::array::element_payloads(&binding.encoded[13..]) {
+            for payload in crate::sql::array::element_payloads(
+                &binding.encoded[7 + super::CACHED_ARRAY_ELEMENT_BYTES..],
+            ) {
                 let mut value = [crate::sql::types::Datum::Null];
                 super::rowenc::decode(payload, &[element.to_coltype()], &mut value)
                     .map_err(|_| invalid())?;

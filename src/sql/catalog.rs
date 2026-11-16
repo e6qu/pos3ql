@@ -18469,11 +18469,6 @@ fn statistics_element(
             (kind == crate::storage::NamedTypeKind::Domain && !array).then_some(creation)
         });
     let element = match (domain, ctype) {
-        // An array element cannot name a domain over an array of a named
-        // type, so such a column's values are shown as the arrays they are.
-        // The text matches PostgreSQL; binary output names the array type
-        // where PostgreSQL names the domain.
-        (Some(_), ColType::Array(inner)) if inner.is_named() => ArrElem::nested(inner),
         (Some(domain), base) => ArrElem::domain(domain, base),
         (None, ColType::Array(inner)) => ArrElem::nested(inner),
         (None, scalar) => ArrElem::from_coltype(scalar),

@@ -155,7 +155,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::{CACHED_ARRAY_ELEMENT_BYTES, CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};

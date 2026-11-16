@@ -127,7 +127,7 @@ Other payload rules:
   PostgreSQL's `attislocal` in bit 1 and, in bit 2, that the column's NOT NULL
   constraint was added `NOT VALID` and not yet validated (PostgreSQL's
   `convalidated` false); bit 2 on a nullable column and other bits are
-  rejected. The manifest's `col5` line carries the same byte. Each CHECK constraint's inheritance byte
+  rejected. The manifest's `col6` line carries the same byte. Each CHECK constraint's inheritance byte
   carries `NO INHERIT` in bit 0 and, in bit 1, that the table only inherits
   it (PostgreSQL's `conislocal` false); other bits are rejected. The
   manifest's `chk2` line carries the same byte. Each column carries a generation-kind
@@ -217,7 +217,7 @@ inserts a missing writer.
 | `mv6` | Materialized-view catalog position and backing-table position. |
 | `vw16` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, then the security, barrier, check-option and query-origin codes (query origin: 0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`; it decides whether `pg_get_viewdef` qualifies columns), the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
-| `col5` | Type, flags, then the generation kind, the field `col5` adds (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `col6` | Type, flags, then the generation kind, the field `col5` added (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `xdep <hex>` | One [expression dependency](#expression-dependencies) of the preceding table, in its journal encoding; at most 64 per table. Index owners are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
 | `implicit_index POSITION CREATED_AT` | Constraint-created index identities, including the current TOAST index. |
@@ -511,8 +511,8 @@ Labels follow PostgreSQL's
 | Row enum value | High bit of the u32 label length marks a following u32 member identity |
 | Composite field count | Bit 15 marks enum leaves holding member ordinals (nested records and arrays included) |
 | Frozen enum default | Tag 201 (member identity) or 202 (label binding), each with a four-byte type stamp; tags 12/42 rejected |
-| Cached array default | Tag 200 with a six-byte element descriptor; tags 21/41 rejected |
-| Spill values | Arrays use the six-byte descriptor; named scalars carry a four-byte stamp |
+| Cached array default | Tag 200 with an eight-byte element descriptor, which also names a domain over an enum or composite array; tags 21/41 rejected |
+| Spill values | Arrays use the eight-byte descriptor; named scalars carry a four-byte stamp |
 | Object-reference default | Full type and target OIDs; at most 130 bytes including a 120-byte cached name; unknown type OIDs fail (set per [PostgreSQL 18](https://www.postgresql.org/docs/18/datatype-oid.html)) |
 | Enum indexes | Key hashes use member identities; label-hashed index generations are retired and replaced |
 
@@ -524,8 +524,8 @@ Labels follow PostgreSQL's
 | `pos3ql-bound-query-v1` | View SQL with its written spacing and comments dropped; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M, and a literal the query did not cast is followed by a cast to its type. Unknown versions and invalid bindings fail. |
 | `pos3ql-enum-check-v1` | Domain CHECK/DEFAULT on enum bases: `/*p3c:M*/` member, `/*p3a*/` member array, `/*p3t:N*/` N-token cast type, `/*p3o:TEXT*/` original default text (`%25`, `%2f` escaped). |
 | Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete read and written column sets, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
-| `TIP2` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value. Ordered by span and kind. `TIP1` rejected. |
-| `STI1` | Groups `TIP2` maps by owner fragment: eight-byte header (identity, section count); each section has a two-byte kind, two-byte parameter/attribute number and eight-byte length. Nonempty images charge `table_metadata_bytes`. |
+| `TIP3` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value, whose arrays carry the eight-byte element descriptor. Ordered by span and kind. `TIP1` and `TIP2` rejected. |
+| `STI1` | Groups `TIP3` maps by owner fragment: eight-byte header (identity, section count); each section has a two-byte kind, two-byte parameter/attribute number and eight-byte length. Nonempty images charge `table_metadata_bytes`. |
 | Record values | Tags `19`/`202` use one-byte counts and name lengths; wide tags `51`/`204` use two bytes; `202`/`204` add a four-byte type stamp. Record array elements use the same tags inside `AR01`. |
 | `pg_rewrite` images | Nine typed fields: six public, `tableoid`, private view definition text, private text array (condition, then actions). |
 

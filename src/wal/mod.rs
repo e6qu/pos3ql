@@ -12924,7 +12924,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
-        Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
+        Some(OwnedDatum::Array { len, .. }) => {
+            1 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES + *len as usize
+        }
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
             5 + *len as usize
         }
@@ -13365,11 +13367,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             len,
             bytes,
         }) => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             out[0] = 200;
-            out[1..7].copy_from_slice(&element.bytes());
-            out[7] = *len;
-            out[8..8 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            8 + *len as usize
+            out[1..1 + D].copy_from_slice(&element.bytes());
+            out[1 + D] = *len;
+            out[2 + D..2 + D + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + D + *len as usize
         }
         Some(OwnedDatum::Range {
             kind,
@@ -13683,11 +13686,12 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             })
         }
         200 => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             let element = crate::storage::CachedArrayElement::from_bytes(
-                payload.get(*at..*at + 6)?.try_into().ok()?,
+                payload.get(*at..*at + D)?.try_into().ok()?,
             )?;
-            let len = *payload.get(*at + 6)? as usize;
-            *at += 7;
+            let len = *payload.get(*at + D)? as usize;
+            *at += D + 1;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(OwnedDatum::Array {
                 element,

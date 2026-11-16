@@ -2101,6 +2101,7 @@ pub(crate) fn project_window_rows<'a>(
             storage,
             txid,
             &order_exprs[..k],
+            outer,
         )?;
         collations[k] = scope.expression_collation(storage, arena, key.expression)?;
         order_exprs[k] = Some(key);
@@ -2443,7 +2444,7 @@ fn projected_width<'a>(
             SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
-                record_star_width(base, Some(scope), storage, txid, arena)?
+                record_star_width(base, Some(scope), None, storage, txid, arena)?
             }
             SelectItem::Expr { .. } => 1,
         };
@@ -2517,6 +2518,7 @@ pub(crate) fn external_window_into<'a>(
             storage,
             txid,
             &order_exprs[..k],
+            outer,
         )?);
     }
     let win_ptrs: &[*const Expr] = arena

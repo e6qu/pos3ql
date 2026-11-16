@@ -1273,13 +1273,14 @@ log n) comparisons and names the first conflicting row in heap order
 for a GiST constraint PostgreSQL names the partner its index scan finds
 first, where pos3ql names the first in heap order. Remaining: PostgreSQL
 compares merged CHECK predicates as analysed trees, so `a > 0::integer`
-and `a > 0` merge there but not here. A PL/pgSQL `record` variable (one not
-declared with a row type) expands under `(r).*` from its current value, where
-PostgreSQL reports `42809 record type has not been registered`; and inside a
-derived table (`SELECT s.a FROM (SELECT (r).*) s`) any row or record variable
-is not found (`42703`), where PostgreSQL expands a row-typed one. The
-variable's value reaches the outer statement's expansion but not the derived
-table's scope, which needs PL/pgSQL row variables in subquery analysis.
+and `a > 0` merge there but not here. PL/pgSQL row and record variables (a
+trigger's `NEW` and `OLD` among them) are visible to analysis at every query
+level of a statement: `(r).*`, `r.*` and `ROW(r.*)` expand a row-typed
+variable, or a record variable holding a named composite value, inside derived
+tables, `WITH` queries, set operations, grouped, `DISTINCT` and ordered levels;
+a record variable holding an anonymous record or none fails with `42809`, and
+`r.*` naming both a FROM item and a variable follows
+`plpgsql.variable_conflict` (`differential_exact/780`).
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in

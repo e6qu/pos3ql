@@ -245,6 +245,7 @@ impl<'a> SortState<'a> {
                 storage,
                 txid,
                 clause,
+                None,
             )?;
             *target = expression;
             *key = SortKey {

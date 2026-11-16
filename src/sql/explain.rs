@@ -5717,6 +5717,7 @@ fn plan_pulled_select<'a>(
             statement.items,
             statement.order_by,
             arena,
+            outer,
         )?
     } else {
         None

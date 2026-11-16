@@ -171,7 +171,8 @@ pub(super) fn admit_grouping<'a>(
     {
         return Ok(None);
     }
-    let Ok(statement) = super::resolve_group_ordinals(statement, Some(scope), arena, storage, txid)
+    let Ok(statement) =
+        super::resolve_group_ordinals(statement, Some(scope), arena, storage, txid, None)
     else {
         return Ok(None);
     };
@@ -292,6 +293,7 @@ pub(super) fn admit_grouping<'a>(
             arena,
             storage,
             txid,
+            None,
         ) else {
             return Ok(None);
         };

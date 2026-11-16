@@ -63,6 +63,21 @@ impl Level<'_, '_> {
         }
         false
     }
+
+    /// Whether `name` is a FROM item of this level or an enclosing one.
+    fn has_source(&self, name: &str) -> bool {
+        let mut level = Some(self);
+        while let Some(current) = level {
+            if current
+                .scope
+                .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
+            {
+                return true;
+            }
+            level = current.parent;
+        }
+        false
+    }
 }
 
 /// A failure while rebuilding: an SQL error or an exhausted statement arena.
@@ -93,6 +108,10 @@ struct Check<'a, 's> {
     /// query or a derived table): the earlier `WITH` queries its FROM items
     /// may name. `None` where the statement's row is in scope.
     detached: core::cell::Cell<Option<&'a [Cte<'a>]>>,
+    /// Only resolves `name.*` of row and record variables, leaving every
+    /// reference as written: the pass analysis runs on a statement before
+    /// its execution binds the variables.
+    wildcards_only: bool,
 }
 
 /// Applies `plpgsql.variable_conflict` to `statement`: reports the first
@@ -113,6 +132,7 @@ pub(crate) fn bind_statement<'a>(
         arena,
         variables,
         detached: core::cell::Cell::new(None),
+        wildcards_only: false,
     }
     .statement(statement)
     .map_err(|Failure(error)| error)
@@ -133,6 +153,49 @@ pub(crate) fn bind_expression<'a>(
         arena,
         variables,
         detached: core::cell::Cell::new(None),
+        wildcards_only: false,
+    }
+    .expression(expression, &Level::root())
+    .map_err(|Failure(error)| error)
+}
+
+/// Resolves each `name.*` of a PL/pgSQL row or record variable in
+/// `statement` to a record expansion of the variable, at every query
+/// level, for the analysis that runs before the statement executes.
+pub(crate) fn bind_variable_wildcards<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    variables: &dyn ColumnLookup<'a>,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    Check {
+        storage,
+        txid,
+        arena,
+        variables,
+        detached: core::cell::Cell::new(None),
+        wildcards_only: true,
+    }
+    .statement(statement)
+    .map_err(|Failure(error)| error)
+}
+
+/// [`bind_variable_wildcards`] for a PL/pgSQL expression.
+pub(crate) fn bind_expression_wildcards<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    variables: &dyn ColumnLookup<'a>,
+) -> Result<&'a Expr<'a>, SqlError> {
+    Check {
+        storage,
+        txid,
+        arena,
+        variables,
+        detached: core::cell::Cell::new(None),
+        wildcards_only: true,
     }
     .expression(expression, &Level::root())
     .map_err(|Failure(error)| error)
@@ -477,6 +540,9 @@ impl<'a: 's, 's> Check<'a, 's> {
         name: &'a str,
         level: &Level<'_, 's>,
     ) -> Bound<Option<&'a Expr<'a>>> {
+        if self.wildcards_only {
+            return Ok(None);
+        }
         match self.variables.procedural_variable(qualifier, name) {
             Some(VariableConflict::Error) if level.has_column(qualifier, name) => Err(Failure(
                 crate::sql::eval::ambiguous_procedural_reference(qualifier, name),
@@ -584,6 +650,44 @@ impl<'a: 's, 's> Check<'a, 's> {
             {
                 Err(Failure(record_type_not_registered()))
             }
+            // `ROW(name.*)` expands a row variable's fields.
+            Expr::Call {
+                kind: crate::sql::ast::CallKind::SqlSyntax,
+                name: row,
+                args,
+                ..
+            } if row.eq_ignore_ascii_case("row")
+                && args.iter().any(
+                    |argument| matches!(argument, Expr::WholeRow(name) if !level.has_source(name)),
+                ) =>
+            {
+                let copy = self.arena.alloc_slice_copy(args)?;
+                let mut changed = false;
+                for argument in copy.iter_mut() {
+                    let new = match *argument {
+                        Expr::WholeRow(name) => match self.row_variable_star(name, level)? {
+                            Some(variable) => self.arena.alloc(Expr::Field {
+                                base: variable,
+                                field: "*",
+                            })?,
+                            None => *argument,
+                        },
+                        other => self.expression(other, level)?,
+                    };
+                    changed |= !core::ptr::eq(new, *argument);
+                    *argument = new;
+                }
+                if !changed {
+                    return Ok(None);
+                }
+                let mut call = *node;
+                if let Expr::Call { args, .. } = &mut call {
+                    *args = copy;
+                }
+                Ok(Some(&*self.arena.alloc(call)?))
+            }
+            // `name.*` of a row variable elsewhere is its whole value.
+            Expr::WholeRow(name) => self.row_variable_star(name, level),
             Expr::Subquery(select) => self.subquery(select, level, Expr::Subquery),
             Expr::Exists(select) => self.subquery(select, level, Expr::Exists),
             Expr::ArraySubquery(select) => self.subquery(select, level, Expr::ArraySubquery),
@@ -722,22 +826,16 @@ impl<'a: 's, 's> Check<'a, 's> {
                         alias: *alias,
                     })
                 }
-                SelectItem::RecordStar(expression) => {
-                    // Expanding a record variable's fields needs its type,
-                    // which an anonymous record does not register.
-                    if let Expr::Column {
-                        qualifier: None,
-                        name,
-                    } = expression
-                        && !level.has_column(None, name)
-                        && unregistered_record_variable(self.variables, name)
-                    {
-                        return Err(Failure(record_type_not_registered()));
-                    }
-                    let new = self.expression(expression, level)?;
-                    (!core::ptr::eq(new, *expression)).then_some(SelectItem::RecordStar(new))
-                }
-                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+                SelectItem::RecordStar(expression) => self
+                    .record_star(expression, level)?
+                    .map(SelectItem::RecordStar),
+                SelectItem::TableWildcard(name) => match self.row_variable_star(name, level)? {
+                    Some(expression) => Some(SelectItem::RecordStar(
+                        self.record_star(expression, level)?.unwrap_or(expression),
+                    )),
+                    None => None,
+                },
+                SelectItem::Wildcard(_) => None,
             };
             if let Some(new) = new {
                 let copy = match rebuilt.as_deref_mut() {
@@ -754,6 +852,77 @@ impl<'a: 's, 's> Check<'a, 's> {
             }
             None => items,
         })
+    }
+
+    /// The rebuilt `(expression).*` select item, or `None` when unchanged.
+    fn record_star(
+        &self,
+        expression: &'a Expr<'a>,
+        level: &Level<'_, 's>,
+    ) -> Bound<Option<&'a Expr<'a>>> {
+        // Expanding a record variable's fields needs its type, which an
+        // anonymous record does not register.
+        if let Expr::Column {
+            qualifier: None,
+            name,
+        } = expression
+            && !level.has_column(None, name)
+            && unregistered_record_variable(self.variables, name)
+        {
+            return Err(Failure(record_type_not_registered()));
+        }
+        let new = self.expression(expression, level)?;
+        Ok((!core::ptr::eq(new, expression)).then_some(new))
+    }
+
+    /// `name.*` naming a PL/pgSQL row or record variable rather than a FROM
+    /// item: the variable as the base of a record expansion, as PL/pgSQL's
+    /// column reference hook resolves it. A name that is both is ambiguous
+    /// under `error`, the variable under `use_variable` and the FROM item
+    /// under `use_column`.
+    fn row_variable_star(
+        &self,
+        name: &'a str,
+        level: &Level<'_, 's>,
+    ) -> Bound<Option<&'a Expr<'a>>> {
+        let conflict = self.variables.procedural_variable(None, name);
+        let row = match conflict {
+            Some(_) => matches!(
+                self.variables.col_type(None, name),
+                Some(crate::sql::types::ColType::Record | crate::sql::types::ColType::Composite(_))
+            ),
+            // A trigger's `NEW` and `OLD` rows are row variables too.
+            None => self.variables.whole_row_type(name).is_some(),
+        };
+        if !row {
+            return Ok(None);
+        }
+        if level.has_source(name) {
+            match conflict.unwrap_or(VariableConflict::UseColumn) {
+                VariableConflict::Error => {
+                    crate::sql::eval::stash_diagnostic(
+                        Some(crate::sql::eval::DiagnosticText::copy(
+                            "It could refer to either a PL/pgSQL variable or a table column.",
+                        )),
+                        None,
+                    );
+                    return Err(Failure(crate::sql::error_position::at_reference(
+                        crate::sql_err!(
+                            crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                            "column reference \"{}.*\" is ambiguous",
+                            name
+                        ),
+                        name,
+                    )));
+                }
+                VariableConflict::UseColumn => return Ok(None),
+                VariableConflict::UseVariable => {}
+            }
+        }
+        Ok(Some(self.arena.alloc(Expr::Column {
+            qualifier: None,
+            name,
+        })?))
     }
 
     fn returning(
@@ -927,6 +1096,16 @@ impl<'a: 's, 's> Check<'a, 's> {
         let scope = match &select.from {
             Some(from) => {
                 rebuilt.from = Some(self.join_sources(*from, parent, &mut changed)?);
+                // The level's FROM schema is that of its rebuilt items, whose
+                // derived tables may expand variables.
+                let select: &'a Select<'a> = if changed {
+                    self.arena.alloc(Select {
+                        from: rebuilt.from,
+                        ..*select
+                    })?
+                } else {
+                    select
+                };
                 let expanded = self.quietly(|| {
                     let select = match self.detached.get() {
                         Some(earlier) if !earlier.is_empty() => {

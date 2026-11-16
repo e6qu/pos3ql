@@ -2103,8 +2103,15 @@ pub(crate) fn query_shape<'a>(
         query_variables(storage, txid, scope, arena)?
     };
     for order in order_by {
-        let target =
-            super::resolve_order_target(order.expression, items, scope, arena, storage, txid)?;
+        let target = super::resolve_order_target(
+            order.expression,
+            items,
+            scope,
+            arena,
+            storage,
+            txid,
+            None,
+        )?;
         // A constant key orders nothing (its pathkey is redundant).
         if target.is_constant(false) && !target.calls_routine() {
             continue;
@@ -2243,8 +2250,15 @@ fn projection<'a>(
     }
     // A sort key the select list lacks joins the target list unnamed.
     for order in order_by {
-        let target =
-            super::resolve_order_target(order.expression, items, scope, arena, storage, txid)?;
+        let target = super::resolve_order_target(
+            order.expression,
+            items,
+            scope,
+            arena,
+            storage,
+            txid,
+            None,
+        )?;
         let listed = items.iter().any(|item| match item {
             SelectItem::Expr { expression, .. } => **expression == *target,
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {

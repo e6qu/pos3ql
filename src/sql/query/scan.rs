@@ -3265,6 +3265,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
     items: &'a [SelectItem<'a>],
     order: &'a [OrderBy<'a>],
     arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<Option<OrderedIndexAccessPlan<'a>>, SqlError> {
     // With index scans disabled the result is sorted after another scan,
     // unless every scan is disabled (`enable_seqscan` too).
@@ -3309,8 +3310,15 @@ pub(crate) fn ordered_index_access_plan<'a>(
     let mut order_columns = [None; MAX_INDEX_COLS];
     let mut order_targets = [&Expr::Null; MAX_INDEX_COLS];
     for (position, requested) in order.iter().enumerate() {
-        let expression =
-            super::resolve_order_target(requested.expression, items, scope, arena, storage, txid)?;
+        let expression = super::resolve_order_target(
+            requested.expression,
+            items,
+            scope,
+            arena,
+            storage,
+            txid,
+            outer,
+        )?;
         order_targets[position] = expression;
         order_columns[position] = resolve_column(expression)
             .filter(|column| *column != WHOLE_ROW_KEY)

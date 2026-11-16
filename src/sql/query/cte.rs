@@ -3731,6 +3731,7 @@ pub(crate) fn filter_view_rows<'a>(
                 storage,
                 txid,
                 "view output",
+                None,
             )?)
             .map_err(|_| arena_full())?;
         names
@@ -3799,6 +3800,7 @@ pub(crate) fn filter_view_rows<'a>(
                     storage,
                     txid,
                     "DISTINCT ON",
+                    None,
                 )? == **expression;
             }
             safe_columns[index] &= in_distinct;

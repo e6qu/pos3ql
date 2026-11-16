@@ -69,9 +69,10 @@ pub use scan::JoinRow;
 pub(crate) use scan::predicate_is_implied;
 pub(crate) use scan::select_hash_join_plan;
 pub(crate) use scan::{
-    IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index, dml_index_access_plan,
-    dml_indexed_candidates, index_access_plan, index_leading_columns, ordered_index_access_plan,
-    parameterized_index_access_plan, rowless_one_time_filter_passes,
+    ChosenConditions, IndexAccessPlan, OrderedIndexAccessPlan, dml_condition_reaches_index,
+    dml_index_access_plan, dml_indexed_candidates, index_access_plan, index_key_order,
+    index_leading_columns, ordered_index_access_plan, parameterized_index_access_plan,
+    rowless_one_time_filter_passes,
 };
 use scan::{
     PaxReadDemand, pax_column_demand, scan_source_recycling_retaining_match_with_pax_columns,
@@ -118,7 +119,8 @@ mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
     anonymous_record_variable, bind_expression as bind_procedural_expression,
-    bind_statement as bind_procedural_statement,
+    bind_statement as bind_procedural_statement, record_type_not_registered,
+    unregistered_record_variable,
 };
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
@@ -13293,7 +13295,10 @@ pub(crate) fn select_query_resumable<'a>(
         let shape = if windowed {
             None
         } else if aggregated {
-            Some(index_paths::QueryShape::default())
+            Some(index_paths::QueryShape {
+                only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                ..index_paths::QueryShape::default()
+            })
         } else {
             match index_paths::query_shape(
                 storage,
@@ -13306,8 +13311,19 @@ pub(crate) fn select_query_resumable<'a>(
                 params,
                 arena,
             ) {
-                Ok(shape) => shape.map(|shape| index_paths::QueryShape {
+                Ok(shape) => Some(index_paths::QueryShape {
                     stop_at_limit: statement.locking.is_empty(),
+                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    // The scan returns the columns the select list and
+                    // ordering read, as EXPLAIN plans it.
+                    output: streaming_pax_columns_ordered(
+                        &scope,
+                        from,
+                        statement.items,
+                        None,
+                        statement.order_by,
+                    )
+                    .selected_mask(0),
                     ..shape
                 }),
                 Err(error) => return sql_fail(error),

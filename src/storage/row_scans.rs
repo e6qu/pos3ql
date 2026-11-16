@@ -635,7 +635,15 @@ mod tests {
                 .unwrap();
             let before = storage.table_statistics(table, 0);
             let failed = storage
-                .analyze_table(table, 0, &[], 100, &small)
+                .analyze_table(
+                    table,
+                    0,
+                    &[],
+                    100,
+                    &crate::storage::NoIndexExpressions,
+                    &[],
+                    &small,
+                )
                 .unwrap_err();
             assert_eq!(failed.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(storage.read_snapshot(), 1);

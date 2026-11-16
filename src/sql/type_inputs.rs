@@ -537,7 +537,7 @@ pub(crate) fn validate_restored_candidates(
     Ok(())
 }
 
-const MAGIC: &[u8; 4] = b"TIP2";
+const MAGIC: &[u8; 4] = b"TIP3";
 /// A prepared statement's in-memory map, which also holds built-in values
 /// converted at `PREPARE`. It is never stored durably.
 const SESSION_MAGIC: &[u8; 4] = b"TIPS";
@@ -578,16 +578,21 @@ fn validate_value(encoded: &[u8]) -> Result<(), SqlError> {
     }
     match encoded[2] {
         0 if encoded.len() == 3 => Ok(()),
-        200 if encoded.len() >= 13 => {
+        200 if encoded.len() >= 7 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES => {
             let descriptor = crate::storage::CachedArrayElement::from_bytes(
-                encoded[3..9].try_into().expect("checked array descriptor"),
+                encoded[3..3 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES]
+                    .try_into()
+                    .expect("checked array descriptor"),
             )
             .ok_or_else(invalid)?;
-            let length =
-                u32::from_le_bytes(encoded[9..13].try_into().expect("checked array header"))
-                    as usize;
+            let length = u32::from_le_bytes(
+                encoded[3 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES
+                    ..7 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES]
+                    .try_into()
+                    .expect("checked array header"),
+            ) as usize;
             let raw = encoded
-                .get(13..)
+                .get(7 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES..)
                 .filter(|raw| raw.len() == length)
                 .ok_or_else(invalid)?;
             super::array::shape(raw).ok_or_else(invalid)?;
@@ -629,7 +634,7 @@ fn validate_binding(binding: Binding<'_>, owner: Owner) -> Result<(), SqlError> 
     validate_value(binding.encoded)?;
     if binding.encoded[2] == 200 {
         let descriptor = crate::storage::CachedArrayElement::from_bytes(
-            binding.encoded[3..9]
+            binding.encoded[3..3 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES]
                 .try_into()
                 .expect("validated array descriptor"),
         )

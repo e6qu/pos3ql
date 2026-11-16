@@ -4,7 +4,7 @@ mod columns;
 pub(crate) mod distribution;
 pub(crate) mod heap_layout;
 pub(crate) mod scalar;
-pub(crate) use columns::{AnalyzedColumn, ColumnImages};
+pub(crate) use columns::{AnalyzedColumn, ColumnImages, INHERITED};
 
 use core::mem::size_of;
 use core::num::NonZeroU64;
@@ -23,13 +23,19 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// The pages of an analyzed partitioned table, which holds none itself:
+/// `pg_class.relpages` -1.
+pub(crate) const PARTITIONED_PAGES: u64 = u64::MAX;
+
 impl TableStatistics {
     pub(crate) fn relation_tuples(&self) -> f64 {
         if self.valid { self.rows as f64 } else { -1.0 }
     }
 
     pub(crate) fn relation_pages(&self) -> i32 {
-        if self.valid {
+        if self.pages == PARTITIONED_PAGES {
+            -1
+        } else if self.valid {
             self.pages.min(i32::MAX as u64) as i32
         } else {
             0
@@ -446,10 +452,12 @@ impl Storage {
         &self,
         count: usize,
     ) -> Result<crate::mem::lease_pool::MutableSlice<AnalyzedColumn>, SqlError> {
-        if count > super::MAX_RELATION_COLUMNS {
+        if count > super::MAX_STATISTICS_RECORDS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "statistics column count exceeds the relation attribute limit"
+                "statistics record count exceeds {} (the relation attribute limit and {} index expression keys)",
+                super::MAX_STATISTICS_RECORDS,
+                super::MAX_INDEX_STATISTICS
             ));
         }
         self.statistics_pool
@@ -502,16 +510,20 @@ impl Storage {
         statistics: &TableStatistics,
     ) -> Result<(), SqlError> {
         let definition = self.table_def(table, transaction);
-        let mut previous = 0;
+        let mut previous = None;
         for column in statistics.columns.iter() {
-            let attribute = column.attribute();
-            if attribute <= previous || definition.attributes.column(attribute).is_none() {
+            // An index's records name its key positions; the index may have
+            // been dropped since, which readers check.
+            if previous.is_some_and(|previous| column.key() <= previous)
+                || (column.index() == 0
+                    && definition.attributes.column(column.attribute()).is_none())
+            {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "column statistics do not match the table's live attributes"
                 ));
             }
-            previous = attribute;
+            previous = Some(column.key());
         }
         Ok(())
     }
@@ -928,7 +940,27 @@ impl Storage {
         let source = state.pending.map_or(&state.committed.columns, |head| {
             &versions[head.tail].columns
         });
+        // A changed column type or collation rebuilds the indexes that
+        // read it, whose statistics PostgreSQL drops with their old
+        // identities: an index's records survive only an unchanged table.
+        let columns_unchanged = invalidated.is_empty()
+            && before.columns.iter().enumerate().all(|(column, old)| {
+                before
+                    .attributes
+                    .number(column)
+                    .and_then(|attribute| after.attributes.column(attribute))
+                    .is_none_or(|new| {
+                        let new = &after.columns[new];
+                        old.ctype == new.ctype
+                            && old.user_type == new.user_type
+                            && old.type_mod == new.type_mod
+                            && old.collation == new.collation
+                    })
+            });
         let retain = |record: &&AnalyzedColumn| {
+            if record.index() != 0 {
+                return columns_unchanged;
+            }
             let attribute = record.attribute();
             let (Some(old), Some(new)) = (
                 before.attributes.column(attribute),
@@ -1745,7 +1777,7 @@ mod tests {
     #[test]
     fn shared_statistics_definition_admission_precedes_shape_changes_and_undo_preserves_analyze() {
         let mut config = super::super::tests::test_config();
-        config.statistics_bytes = 192;
+        config.statistics_bytes = 256;
         config.statistics_leases = 3;
         let mut budget = super::super::tests::test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -1846,7 +1878,7 @@ mod tests {
     #[test]
     fn shared_statistics_definition_depth_exhaustion_precedes_payload_reservation() {
         let mut config = super::super::tests::test_config();
-        config.statistics_bytes = 128;
+        config.statistics_bytes = 192;
         config.statistics_leases = 2;
         let mut budget = super::super::tests::test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();

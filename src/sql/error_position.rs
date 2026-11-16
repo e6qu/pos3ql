@@ -896,6 +896,14 @@ pub(crate) fn expression_error(
                 _ => at_expression(error, typed),
             }
         }
+        // A `.*` outside a target list is reported where its selection
+        // starts.
+        Expr::Field { field: "*", .. }
+            if state == sqlstate::FEATURE_NOT_SUPPORTED
+                && message == "row expansion via \"*\" is not supported here" =>
+        {
+            at_expression(error, expression)
+        }
         // A field selection PostgreSQL cannot resolve is reported at its
         // base expression.
         Expr::Field { base, field }

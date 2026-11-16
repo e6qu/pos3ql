@@ -1029,20 +1029,59 @@ describe output with PostgreSQL 18.6.
 | GIN | Array, full-text, JSONB, and jsonpath bitmap predicates |
 | SP-GiST | Built-in network, range, geometry, text ordering/prefix, and geometric distance ordering |
 
-A query reading one ordinary table whose indexes are single-column B-trees,
-with conditions that compare a column with a constant (`k = 17`, `id < 50`,
-`d BETWEEN '2021-01-01' AND '2021-02-01'`) or test it for NULL, chooses its
-scan as PostgreSQL 18 does: it costs the sequential scan, each index's index
-or index-only scan and a bitmap heap scan with PostgreSQL's formulas and the
-statistics `ANALYZE` gathers, including for `ORDER BY` one column and
-`LIMIT`. `EXPLAIN` then shows the same `Seq Scan`, `Index Scan` (or `Index
-Scan Backward`), `Index Only Scan` or `Bitmap Heap Scan` over `Bitmap Index
-Scan`, and the rows come back in that scan's order. For example, after
-`ANALYZE orders`, `SELECT * FROM orders WHERE customer = 17` on a
-non-unique index reads a bitmap heap scan and returns the rows by heap
-position, as PostgreSQL does. Other queries (joins, several indexes combined,
-multi-column or expression indexes, `IN` lists and `OR` conditions) keep
-pos3ql's own choice, whose plans and row order can differ.
+A query reading one ordinary table, and the scan of an `UPDATE`'s or
+`DELETE`'s target, choose their scan as PostgreSQL 18 does. pos3ql costs the
+sequential scan, each B-tree index's index and index-only scans and the
+bitmap heap scan with PostgreSQL's formulas and the statistics `ANALYZE`
+gathers. The model covers:
+
+- B-tree indexes of one or several key columns, including descending keys,
+  `NULLS FIRST`, `INCLUDE` columns and pattern classes (`text_pattern_ops`);
+- expression indexes: a condition or `ORDER BY` on the indexed expression,
+  such as `WHERE lower(email) = 'a@b.org'` with an index on `lower(email)`,
+  reads the statistics `ANALYZE` gathered for the expression (shown in
+  `pg_stats` under the index's name) and uses the index, whose scan returns
+  rows in the expression's order;
+- partial indexes whose predicate the query's conditions imply, such as an
+  index `WHERE status = 'open'` for `WHERE status = 'open' AND k = 5`, or one
+  `WHERE k < 10` for `WHERE k = 5`;
+- conditions that compare a column with constants: `=`, `<>`, `<`, `<=`,
+  `>`, `>=`, the pattern operators (`~<~`), `IN` and `NOT IN` lists,
+  `op ANY (array)`, NULL tests, a boolean column tested by itself
+  (`WHERE active`, `WHERE NOT active`), and `OR` combinations of these;
+- `LIKE` on a `text` or `varchar` column: a fixed prefix (`name LIKE
+  'abc%'`) becomes the index conditions `name >= 'abc' AND name < 'abd'`
+  under the `C` collation (`~>=~` and `~<~` for a pattern class), the
+  `LIKE` itself staying a filter, with PostgreSQL's pattern selectivity; a
+  `varchar` column cast to `text` counts as the column;
+- `BitmapAnd` and `BitmapOr` combinations of several indexes;
+- `ORDER BY` of several columns in any direction, served by an index scan,
+  an incremental sort over an index's leading columns or a sort;
+- `LIMIT` and `OFFSET`.
+
+`EXPLAIN` then shows the same plan, and the rows come back in that scan's
+order. For example, after `ANALYZE orders`, `SELECT * FROM orders WHERE
+customer = 17 OR id = 5` reads a bitmap heap scan over a `BitmapOr` of two
+bitmap index scans and returns the rows by heap position, as PostgreSQL
+does.
+
+When a table has no index path for the query, its sequential scan is the
+plan whatever the conditions are, so `EXPLAIN` shows it for any condition.
+Where the model would have to choose among index paths for a shape it does
+not cover, `EXPLAIN` fails with `0A000` and names the shape, for example
+`EXPLAIN of a scan of one table with a GiST index is not supported`. Not
+covered yet: hash, GiST, SP-GiST, GIN and BRIN indexes the query could use,
+an expression index over a user-defined routine or type, `ILIKE`, regular
+expressions and `LIKE` with an escape or a non-ASCII prefix on indexed
+columns, other casts of indexed columns, extended statistics, and
+partitioned tables or inheritance trees whose members have index paths.
+Estimates (not plans) stay approximate for a sequential scan whose
+conditions read an expression no index holds, and index sizes are computed
+as `CREATE INDEX` lays out the current rows, not as later out-of-order
+inserts split its pages. `EXPLAIN
+ANALYZE` also fails with `0A000` for an index scan that searches an array
+or skips a key column over an index of several leaf pages, whose number of
+index descents depends on PostgreSQL's page layout.
 
 Index names describe SQL behavior, not PostgreSQL's page layout; native index
 callbacks are not available. MVCC visibility and SQL rechecks decide every

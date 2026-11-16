@@ -5221,6 +5221,14 @@ pub(crate) fn builtin_cast_context(
         .and_then(|cast| crate::storage::CastContext::from_code(cast.context))
 }
 
+/// Whether a built-in cast from `source` to `target` is binary coercible
+/// (`castmethod` `b`): the planner relabels the value, at no cost.
+pub(crate) fn builtin_binary_cast(source: i32, target: i32) -> bool {
+    builtin_properties::CASTS
+        .iter()
+        .any(|cast| cast.source == source && cast.target == target && cast.method == b'b')
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO
@@ -10165,9 +10173,17 @@ pub(crate) struct PlannerIndex {
     pub(crate) unique: bool,
     pub(crate) descending: [bool; crate::storage::MAX_INDEX_COLS],
     pub(crate) nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
-    /// Every key is a plain column with its column's collation and its
-    /// type's default operator class, and the index has no predicate.
-    pub(crate) plain: bool,
+    /// The index has a predicate.
+    pub(crate) partial: bool,
+    /// Which keys are expressions.
+    pub(crate) expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Which keys use their column's own collation.
+    pub(crate) column_collation: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Which keys use a pattern operator class (`text_pattern_ops`).
+    pub(crate) pattern_keys: [bool; crate::storage::MAX_INDEX_COLS],
+    /// A key uses a class defined in the catalog, or the index backs an
+    /// exclusion constraint.
+    pub(crate) catalog_classes: bool,
 }
 
 /// Visits each index of the table in `table_slot`.
@@ -10188,26 +10204,29 @@ pub(crate) fn planner_indexes(
             if index.table_slot != table_slot {
                 return;
             }
-            let plain = index.predicate.is_none()
-                && !index.is_exclusion
-                && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
-                && index.columns[..index.n_cols]
-                    .iter()
-                    .enumerate()
-                    .all(|(position, column)| {
-                        !index.explicit_collations[position]
-                            || index.collations[position]
-                                == definition.columns[*column as usize].collation
-                    })
-                && !index.resolved_operator_classes[..index.n_cols].iter().any(
-                    |class| match class {
-                        Some(crate::storage::IndexOperatorClass::Catalog(_)) => true,
-                        Some(crate::storage::IndexOperatorClass::Btree(class)) => {
-                            class.is_pattern()
-                        }
-                        _ => false,
-                    },
-                );
+            // A key of a pattern class (`text_pattern_ops`) serves `=` and
+            // the `~<~` operators only; a catalog class is outside the model.
+            let mut pattern_keys = [false; crate::storage::MAX_INDEX_COLS];
+            let mut catalog_classes = index.is_exclusion;
+            for (position, class) in index.resolved_operator_classes[..index.n_cols]
+                .iter()
+                .enumerate()
+            {
+                match class {
+                    Some(crate::storage::IndexOperatorClass::Catalog(_)) => catalog_classes = true,
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                        pattern_keys[position] = class.is_pattern();
+                    }
+                    _ => {}
+                }
+            }
+            let mut column_collation = [true; crate::storage::MAX_INDEX_COLS];
+            for (position, &column) in index.columns[..index.n_cols].iter().enumerate() {
+                column_collation[position] = index.expression_keys[position]
+                    || !index.explicit_collations[position]
+                    || index.collations[position]
+                        == definition.columns[usize::from(column)].collation;
+            }
             visit(PlannerIndex {
                 oid: index.oid,
                 name: index.name,
@@ -10219,7 +10238,11 @@ pub(crate) fn planner_indexes(
                 unique: index.is_unique || index.is_primary,
                 descending: index.descending,
                 nulls_first: index.nulls_first,
-                plain,
+                partial: index.predicate.is_some(),
+                expression_keys: index.expression_keys,
+                column_collation,
+                pattern_keys,
+                catalog_classes,
             });
         },
     );
@@ -15883,7 +15906,8 @@ fn inherited_foreign_key_parent(
 }
 
 /// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
-/// `child_slot`: how many of its parents define it.
+/// `child_slot`: how many of its parents define an inheritable one of its
+/// name, which merging required to have the same predicate.
 pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
@@ -15896,11 +15920,7 @@ pub(crate) fn check_inheritance_count(
             .table_def(usize::from(attachment.parent), txid)
             .checks()
             .iter()
-            .any(|parent| {
-                !parent.no_inherit
-                    && parent.name == child.name
-                    && parent.expression == child.expression
-            })
+            .any(|parent| !parent.no_inherit && parent.name == child.name)
     }));
     partition_count
         + definition
@@ -15912,11 +15932,7 @@ pub(crate) fn check_inheritance_count(
                     .table_def(usize::from(**parent), txid)
                     .checks()
                     .iter()
-                    .any(|parent| {
-                        !parent.no_inherit
-                            && parent.name == child.name
-                            && parent.expression == child.expression
-                    })
+                    .any(|parent| !parent.no_inherit && parent.name == child.name)
             })
             .count()
 }
@@ -16152,6 +16168,9 @@ pub fn constraint_def_text<'a>(
                 write_identifier(&mut rendered, column.name.as_str());
                 if !column.not_null_inheritable {
                     let _ = rendered.write_str(" NO INHERIT");
+                }
+                if !column.not_null_validated {
+                    let _ = rendered.write_str(" NOT VALID");
                 }
                 return Ok(Some(alloc_rendered(
                     &rendered,
@@ -18396,11 +18415,23 @@ fn pg_stats<'a>(
             continue;
         }
         let table_definition = storage.table_def(slot, txid);
-        for (column, metadata) in table_definition.columns().iter().enumerate() {
+        // Each column's own statistics, then those over the table and its
+        // descendants (`stainherit`).
+        for (inherited, (column, metadata)) in
+            [0, crate::storage::INHERITED].into_iter().flat_map(|key| {
+                table_definition
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(move |column| (key, column))
+            })
+        {
+            let key = inherited;
+            let inherited = key == crate::storage::INHERITED;
             let Some(column_statistics) = table_definition
                 .attributes
                 .number(column)
-                .and_then(|attribute| statistics.column(attribute))
+                .and_then(|attribute| statistics.index_column(key, attribute))
             else {
                 continue;
             };
@@ -18416,7 +18447,7 @@ fn pg_stats<'a>(
             let (most_common, frequencies, histogram, correlation) = match table_definition
                 .attributes
                 .number(column)
-                .and_then(|attribute| statistics.distribution(attribute))
+                .and_then(|attribute| statistics.index_distribution(key, attribute))
             {
                 Some(distribution) => statistics_slots(
                     distribution,
@@ -18431,7 +18462,7 @@ fn pg_stats<'a>(
                     text(table_definition.schema.as_str(), arena)?,
                     text(table_definition.name.as_str(), arena)?,
                     text(metadata.name.as_str(), arena)?,
-                    Datum::Bool(false),
+                    Datum::Bool(inherited),
                     Datum::Float4(column_statistics.null_fraction),
                     Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
                     Datum::Float4(distinct),
@@ -18449,6 +18480,108 @@ fn pg_stats<'a>(
                 arena,
             )?;
             count += 1;
+        }
+        // The statistics of the table's index expressions, which PostgreSQL
+        // keys to the index and names by the index's attributes.
+        for index in storage.indexes_for_slot(slot, txid) {
+            if !statistics
+                .columns
+                .iter()
+                .any(|record| record.index() == index.created_at)
+            {
+                continue;
+            }
+            let mut names = super::exec::IndexColumnNames::new();
+            for position in 0..index.n_cols {
+                match index.expressions[position] {
+                    Some(source) => {
+                        let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                        let expression = crate::sql::parser::parse_expr(source, arena)?;
+                        names.push(super::exec::index_expression_column_name(expression))?;
+                    }
+                    None => names.push(
+                        table_definition.columns()[usize::from(index.columns[position])]
+                            .name
+                            .as_str(),
+                    )?,
+                }
+            }
+            for record in statistics
+                .columns
+                .iter()
+                .filter(|record| record.index() == index.created_at)
+            {
+                let position = usize::from(record.attribute()) - 1;
+                let Some(source) = index.expressions.get(position).copied().flatten() else {
+                    continue;
+                };
+                let Some((_, ctype)) = super::exec::analyze_indexes::expression_key(
+                    storage,
+                    txid,
+                    &table_definition,
+                    &index,
+                    position,
+                    source.as_str(),
+                    arena,
+                )?
+                else {
+                    continue;
+                };
+                if count == rows.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "pg_stats exceeds {} rows",
+                        rows.len()
+                    ));
+                }
+                let column_statistics = record.statistics();
+                let distinct = if column_statistics.distinct_fraction != 0.0 {
+                    -column_statistics.distinct_fraction
+                } else {
+                    column_statistics.distinct_values as f32
+                };
+                let (most_common, frequencies, histogram, correlation) =
+                    match statistics.columns.distribution(*record) {
+                        Some(distribution) => {
+                            let element = match ctype {
+                                ColType::Array(inner) => super::types::ArrElem::nested(inner),
+                                scalar => super::types::ArrElem::from_coltype(scalar),
+                            }
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "statistics of type {} cannot be shown",
+                                    ctype.name()
+                                )
+                            })?;
+                            statistics_slots(distribution, ctype, element, arena)?
+                        }
+                        None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
+                    };
+                rows[count] = row(
+                    &[
+                        text(index.schema.as_str(), arena)?,
+                        text(index.name_for(txid).as_str(), arena)?,
+                        text(names.get(position), arena)?,
+                        Datum::Bool(false),
+                        Datum::Float4(column_statistics.null_fraction),
+                        Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
+                        Datum::Float4(distinct),
+                        most_common,
+                        frequencies,
+                        histogram,
+                        correlation,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?;
+                count += 1;
+            }
         }
     }
     finish(def, &rows[..count], arena)
@@ -18473,11 +18606,6 @@ fn statistics_element(
             (kind == crate::storage::NamedTypeKind::Domain && !array).then_some(creation)
         });
     let element = match (domain, ctype) {
-        // An array element cannot name a domain over an array of a named
-        // type, so such a column's values are shown as the arrays they are.
-        // The text matches PostgreSQL; binary output names the array type
-        // where PostgreSQL names the domain.
-        (Some(_), ColType::Array(inner)) if inner.is_named() => ArrElem::nested(inner),
         (Some(domain), base) => ArrElem::domain(domain, base),
         (None, ColType::Array(inner)) => ArrElem::nested(inner),
         (None, scalar) => ArrElem::from_coltype(scalar),
@@ -20547,7 +20675,7 @@ fn pg_replication_slots<'a>(
                 Datum::Oid(storage.current_database_oid().get() as u32),
                 text(database_definition.name.as_str(), arena)?,
                 Datum::Bool(false),
-                Datum::Bool(slot.active),
+                Datum::Bool(slot.active()),
                 slot.active_pid.map_or(Datum::Null, Datum::Int4),
                 Datum::Null,
                 Datum::Null,
@@ -20656,13 +20784,13 @@ fn pg_stat_replication<'a>(
         arena,
         storage
             .replication_slots_with_slots()
-            .filter(|(_, slot)| slot.active)
+            .filter(|(_, slot)| slot.active())
             .count(),
     )?;
     let mut count = 0;
     for (_, slot) in storage
         .replication_slots_with_slots()
-        .filter(|(_, slot)| slot.active)
+        .filter(|(_, slot)| slot.active())
     {
         if count == rows.len() {
             return Err(sql_err!(
@@ -22612,7 +22740,7 @@ fn pg_constraint_values<'a>(
                     Datum::Bool(false),
                     Datum::Bool(false),
                     Datum::Bool(true),
-                    Datum::Bool(true),
+                    Datum::Bool(column.not_null_validated),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,
@@ -23998,6 +24126,7 @@ fn pg_attribute<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -31376,6 +31505,7 @@ fn info_column_type_usage<'a>(
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

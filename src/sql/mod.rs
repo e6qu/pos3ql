@@ -82,6 +82,7 @@ pub mod sha512;
 pub mod snapshot;
 pub(crate) mod snowball;
 mod spgist_catalog;
+pub(crate) mod stack_depth;
 pub(crate) mod statistics;
 pub(crate) mod text_parser;
 pub mod timezone;
@@ -291,11 +292,10 @@ pub(crate) struct SubscriptionRuntime {
     pub behavior: crate::storage::SubscriptionBehavior,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct SubscriptionCleanupRuntime {
-    pub created_at: u64,
-    pub name: SqlName,
-    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
+pub(crate) struct SubscriptionSlotDropRuntime {
+    /// An error when the connection string names no endpoint this server
+    /// can reach, which fails the drop as a connection failure.
+    pub endpoint: Result<crate::pg::replication_client::SubscriptionEndpoint, SqlError>,
     pub slot: SqlName,
 }
 
@@ -1011,6 +1011,8 @@ pub enum StatementWait {
     ClientOutput,
     /// `pg_sleep` waits until the session's recorded wake time.
     Timer,
+    /// `DROP_REPLICATION_SLOT ... WAIT` waits for the slot's release.
+    ReplicationSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3859,56 +3861,31 @@ impl Engine {
         }
     }
 
-    pub(crate) fn subscription_cleanup_runtime(
+    /// The publisher slot drop a DROP SUBSCRIPTION statement is waiting
+    /// for, which the server starts now.
+    pub(crate) fn start_subscription_slot_drop(
         &self,
         slot: usize,
-    ) -> Option<SubscriptionCleanupRuntime> {
-        let (created_at, name, connection, remote_slot) =
-            self.storage.subscription_cleanup(slot)?;
-        Some(SubscriptionCleanupRuntime {
-            created_at,
-            name,
-            endpoint: connection.endpoint_for(name)?,
+    ) -> Option<SubscriptionSlotDropRuntime> {
+        let (name, connection, remote_slot) =
+            self.storage.requested_subscription_slot_drop(slot)?;
+        self.storage.start_subscription_slot_drop(slot);
+        Some(SubscriptionSlotDropRuntime {
+            endpoint: connection.require_endpoint_for(name),
             slot: remote_slot,
         })
     }
 
-    pub(crate) fn complete_subscription_cleanup(
-        &mut self,
+    pub(crate) fn subscription_slot_drop_pending(&self, slot: usize) -> bool {
+        self.storage.subscription_slot_drop_pending(slot)
+    }
+
+    pub(crate) fn finish_subscription_slot_drop(
+        &self,
         slot: usize,
-        created_at: u64,
-        name: SqlName,
-    ) -> Result<(), SqlError> {
-        // A committed record must apply: check before journaling it.
-        self.storage.check_subscription_cleanup(slot, created_at)?;
-        let transaction_id = self.allocate_transaction_id()?;
-        let lsn =
-            self.storage.lsn().checked_add(1).ok_or_else(|| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
-            })?;
-        if let Err(error) = self.wal.stage(
-            transaction_id,
-            lsn,
-            &WalOp::CompleteSubscriptionCleanup {
-                name: name.as_str(),
-                created_at,
-            },
-        ) {
-            self.wal.discard_stage(transaction_id);
-            return Err(error);
-        }
-        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
-            Ok(lsn) => lsn,
-            Err(error) => {
-                self.wal.discard_stage(transaction_id);
-                return Err(error);
-            }
-        };
-        self.finish_atomic_journal(|storage| {
-            storage.complete_subscription_cleanup(slot, created_at)?;
-            storage.observe_lsn(commit_lsn);
-            Ok(())
-        })
+        failure: Option<crate::storage::SlotDropFailure>,
+    ) {
+        self.storage.finish_subscription_slot_drop(slot, failure);
     }
 
     pub(crate) fn fail_subscription(
@@ -3946,8 +3923,13 @@ impl Engine {
                 return Err(error);
             }
         };
+        // A DROP or ALTER SUBSCRIPTION that commits while this record is
+        // published follows it in the journal, so the failure of the replaced
+        // definition has nothing left to mark.
         self.finish_atomic_journal(|storage| {
-            storage.fail_subscription(stream, failure)?;
+            if storage.check_subscription_failure(stream).is_ok() {
+                storage.fail_subscription(stream, failure)?;
+            }
             storage.observe_lsn(commit_lsn);
             Ok(())
         })
@@ -3958,8 +3940,11 @@ impl Engine {
             .subscriptions_with_slots_visible_to(Some(self.storage.current_database_oid()), 0)
             .find(|(index, _subscription)| *index == slot)
             .filter(|(_, subscription)| {
-                (subscription.failure.is_none()
-                    || (!subscription.behavior.disable_on_error && subscription.enabled_to(0)))
+                // DROP SUBSCRIPTION stops the worker until its transaction
+                // ends: its publisher slot may already be gone.
+                subscription.ddl_state.pending_drop_txid().is_none()
+                    && (subscription.failure.is_none()
+                        || (!subscription.behavior.disable_on_error && subscription.enabled_to(0)))
                     && (subscription.enabled_to(0)
                         || !matches!(
                             subscription.bootstrap,
@@ -5550,13 +5535,6 @@ impl Engine {
                     source_name.as_str()
                 )
             })?;
-        if source.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                source_name.as_str()
-            ));
-        }
         if source.behavior.two_phase {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5643,12 +5621,8 @@ impl Engine {
                     name.as_str()
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
@@ -5694,12 +5668,8 @@ impl Engine {
                     name.as_str()
                 )
             })?;
-        if current.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if current.active() {
+            return Err(current.in_use_error());
         }
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
@@ -5808,6 +5778,10 @@ impl Engine {
 
     pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
         self.storage.deactivate_replication_slot(name);
+    }
+
+    pub(crate) fn replication_slot_releases(&self) -> u64 {
+        self.storage.replication_slot_releases()
     }
 
     /// Validates pgoutput's publication set before a replication slot is made
@@ -10334,13 +10308,24 @@ impl Engine {
                     self.work.reset();
                     let started = datetime::now_micros();
                     let previous = self.storage.table_statistics(slot, txn.txid);
+                    let indexes = exec::analyze_indexes::AnalyzedIndexes::of_table(
+                        &self.storage,
+                        slot,
+                        txn.txid,
+                        guc::default_statistics_target(),
+                        &self.work,
+                    )?;
+                    let members = analyzed_members(&self.storage, slot, txn.txid, &self.work)?;
                     let statistics = self.storage.analyze_table(
                         slot,
                         txn.txid,
                         &[],
                         guc::default_statistics_target(),
+                        &indexes,
+                        members,
                         &self.work,
                     )?;
+                    drop(indexes);
                     if statistics.relation_estimates_changed(&previous) {
                         txn.record_statistics_plan_change(&self.storage, slot as u32);
                     }
@@ -10391,13 +10376,24 @@ impl Engine {
                 self.work.reset();
                 let started = datetime::now_micros();
                 let previous = self.storage.table_statistics(slot, txn.txid);
+                let indexes = exec::analyze_indexes::AnalyzedIndexes::of_table(
+                    &self.storage,
+                    slot,
+                    txn.txid,
+                    guc::default_statistics_target(),
+                    &self.work,
+                )?;
+                let members = analyzed_members(&self.storage, slot, txn.txid, &self.work)?;
                 let statistics = self.storage.analyze_table(
                     slot,
                     txn.txid,
                     &selected[..selected_count],
                     guc::default_statistics_target(),
+                    &indexes,
+                    members,
                     &self.work,
                 );
+                drop(indexes);
                 let statistics = statistics?;
                 if statistics.relation_estimates_changed(&previous) {
                     txn.record_statistics_plan_change(&self.storage, slot as u32);
@@ -12023,6 +12019,7 @@ impl Engine {
             StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
             StatementWait::ClientOutput | StatementWait::Timer => 0,
+            StatementWait::ReplicationSlot => self.storage.replication_slot_releases(),
         }
     }
 
@@ -12195,6 +12192,7 @@ impl Engine {
 
     pub(crate) fn cancel_backend_wait(&self, pid: i32) {
         self.storage.cancel_backend_wait(pid);
+        self.storage.abandon_subscription_slot_drops(pid);
     }
 
     pub(crate) fn take_backend_signal(&self) -> Option<crate::storage::BackendSignal> {
@@ -12203,6 +12201,7 @@ impl Engine {
 
     /// Drops a closing connection's LISTEN registrations.
     pub fn drop_connection(&mut self, conn_id: i32) {
+        self.storage.abandon_subscription_slot_drops(conn_id);
         foreign::drop_backend_connections(&self.storage, conn_id);
         self.storage.unregister_backend(conn_id);
         self.notify.drop_conn(conn_id);
@@ -23685,17 +23684,27 @@ impl Engine {
                     } else {
                         params
                     };
+                    let generic = matches!(statement, Stmt::ExecutePrepared { .. }) && !custom_plan;
                     let mut run = || {
                         with_prepared_parameter_types(parameter_types, || {
-                            self.execute_explained_statement(
-                                planned_statement,
-                                arena,
-                                execution_params,
-                                txn,
-                                (&mut *sqlprep, &mut *cursors),
-                                guc,
-                                &mut *responder,
-                            )
+                            let mut execute = || {
+                                self.execute_explained_statement(
+                                    planned_statement,
+                                    arena,
+                                    execution_params,
+                                    txn,
+                                    (&mut *sqlprep, &mut *cursors),
+                                    guc,
+                                    &mut *responder,
+                                )
+                            };
+                            // A generic plan's access paths know no
+                            // argument's value.
+                            if generic {
+                                eval::with_generic_plan_parameters(execution_params, execute)
+                            } else {
+                                execute()
+                            }
                         })
                     };
                     // The plan counts what each of its nodes does as the
@@ -24609,12 +24618,17 @@ impl Engine {
                 *action,
                 responder,
             ),
-            Stmt::DropSubscription { names, if_exists } => exec::drop_subscription(
+            Stmt::DropSubscription { name, if_exists } => exec::drop_subscription(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                names,
+                name,
                 *if_exists,
+                if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic {
+                    exec::SubscriptionDropContext::TransactionBlock
+                } else {
+                    exec::SubscriptionDropContext::TopLevel
+                },
                 responder,
             ),
             Stmt::CreateTrigger(trigger) => exec::create_trigger(
@@ -26106,21 +26120,30 @@ impl Engine {
                                 {
                                     return Ok(Err(error));
                                 }
-                                sqlprep.choose_plan(name, guc.plan_cache_mode());
-                                exec::with_bound_parameter_types(parameter_oids, || {
-                                    self.execute_stmt(
-                                        &statement,
-                                        arena,
-                                        inner_params,
-                                        txn,
-                                        sqlprep,
-                                        cursors,
-                                        guc,
-                                        exec::PlpgsqlTransactionContext::Atomic,
-                                        responder,
-                                        StatementTimeoutEntry::Nested,
-                                    )
-                                })
+                                let choice = sqlprep.choose_plan(name, guc.plan_cache_mode());
+                                let mut run = || {
+                                    exec::with_bound_parameter_types(parameter_oids, || {
+                                        self.execute_stmt(
+                                            &statement,
+                                            arena,
+                                            inner_params,
+                                            txn,
+                                            sqlprep,
+                                            cursors,
+                                            guc,
+                                            exec::PlpgsqlTransactionContext::Atomic,
+                                            responder,
+                                            StatementTimeoutEntry::Nested,
+                                        )
+                                    })
+                                };
+                                // A generic plan's access paths know no
+                                // argument's value.
+                                if choice == prep::PlanChoice::Generic {
+                                    eval::with_generic_plan_parameters(inner_params, run)
+                                } else {
+                                    run()
+                                }
                             }
                             Ok(None) => Ok(Ok(())),
                             Err(e) => Ok(Err(SqlError::formatted(
@@ -32672,21 +32695,6 @@ fn apply_wal_op(
             storage.stage_subscription_relation(stream, schema, table, 0)?;
             storage.commit_subscription_relation_refresh(0);
         }
-        WalOp::CompleteSubscriptionCleanup { name, created_at } => {
-            let slot = storage
-                .subscriptions_with_slots_durable()
-                .find(|(_, subscription)| {
-                    subscription.name.as_str() == name && subscription.created_at == created_at
-                })
-                .map(|(slot, _)| slot)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "journal cleanup completion targets an unknown subscription"
-                    )
-                })?;
-            storage.complete_subscription_cleanup(slot, created_at)?;
-        }
         WalOp::FailSubscription {
             name,
             created_at,
@@ -34579,4 +34587,36 @@ fn canonical_text_search_config(
         crate::sql::eval::args::quote_identifier(definition.name().as_str()).as_str()
     );
     Ok(canonical)
+}
+
+/// The relations whose rows the inherited statistics of `slot` cover: a
+/// partitioned table's leaf partitions, or an inheritance parent with its
+/// descendants; none for a table without descendants. A foreign member's
+/// rows are its server's.
+fn analyzed_members<'a>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a [usize], SqlError> {
+    if !storage.table_def(slot, txid).partition.is_partitioned()
+        && !storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(&[]);
+    }
+    let all = exec::relation_leaves_in_order(storage, slot, txid, arena)?;
+    let members = arena
+        .alloc_slice_with(all.len(), |_| 0usize)
+        .map_err(|_| eval::arena_full())?;
+    let mut count = 0;
+    for &member in all {
+        let definition = storage.table_def(member, txid);
+        if definition.kind == crate::storage::TableKind::Local
+            && !definition.partition.is_partitioned()
+        {
+            members[count] = member;
+            count += 1;
+        }
+    }
+    Ok(&members[..count])
 }

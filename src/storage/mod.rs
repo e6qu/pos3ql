@@ -155,7 +155,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::{CACHED_ARRAY_ELEMENT_BYTES, CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -206,7 +206,9 @@ mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 pub(crate) use statistics::distribution::ColumnDistribution;
 pub(crate) use statistics::heap_layout;
-pub(crate) use statistics::{AnalyzedColumn, ColumnImages, StatisticsOrigin};
+pub(crate) use statistics::{
+    AnalyzedColumn, ColumnImages, INHERITED, PARTITIONED_PAGES, StatisticsOrigin,
+};
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
 use snapshot_leases::{
@@ -1526,6 +1528,11 @@ pub struct ColumnMeta {
     /// Whether this column's local NOT NULL constraint participates in
     /// ordinary table inheritance. It is irrelevant for a nullable column.
     pub not_null_inheritable: bool,
+    /// PostgreSQL's `convalidated` of the column's NOT NULL constraint:
+    /// false for one added `NOT VALID`, which new rows satisfy but existing
+    /// ones were not checked against, so nothing may assume them non-null.
+    /// True for a nullable column.
+    pub not_null_validated: bool,
     pub unique: bool,
     pub primary: bool,
     /// Implicit identity generation in stored shapes. The SQL builder also
@@ -1733,6 +1740,12 @@ pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
 pub(crate) const MAX_VIEW_DEFAULTS: usize = 64;
 
 impl ColumnMeta {
+    /// Whether every row of the column is known to be non-null: a validated
+    /// NOT NULL constraint, which a proof may rely on.
+    pub const fn proven_not_null(&self) -> bool {
+        self.not_null.is_required() && self.not_null_validated
+    }
+
     pub const EMPTY: Self = ColumnMeta {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
@@ -1742,6 +1755,7 @@ impl ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -4096,21 +4110,104 @@ impl TableStatistics {
     };
 
     pub(crate) fn column(&self, attribute: u16) -> Option<ColumnStatistics> {
-        self.columns
-            .binary_search_by_key(&attribute, |column| column.attribute())
-            .ok()
-            .map(|index| self.columns[index].statistics())
+        self.index_column(0, attribute)
     }
 
-    /// The value distribution ANALYZE recorded for `attribute`, if any.
-    pub(crate) fn distribution(&self, attribute: u16) -> Option<ColumnDistribution<'_>> {
-        let index = self
+    /// The statistics of key column `attribute` (from 1) of the index created
+    /// at `index`; `index` 0 names the table's own column.
+    pub(crate) fn index_column(&self, index: u64, attribute: u16) -> Option<ColumnStatistics> {
+        self.columns
+            .binary_search_by_key(&(index, attribute), |column| column.key())
+            .ok()
+            .map(|at| self.columns[at].statistics())
+    }
+
+    /// The value distribution of key column `attribute` of the index created
+    /// at `index` (0 for the table's own column), if any.
+    pub(crate) fn index_distribution(
+        &self,
+        index: u64,
+        attribute: u16,
+    ) -> Option<ColumnDistribution<'_>> {
+        let at = self
             .columns
-            .binary_search_by_key(&attribute, |column| column.attribute())
+            .binary_search_by_key(&(index, attribute), |column| column.key())
             .ok()?;
-        self.columns.distribution(self.columns[index])
+        self.columns.distribution(self.columns[at])
     }
 }
+
+/// An expression key of an index ANALYZE samples: its key position (from
+/// 1), type, collation and statistics target.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampledIndexKey {
+    pub(crate) attribute: u16,
+    pub(crate) ctype: ColType,
+    pub(crate) collation: Collation,
+    pub(crate) target: usize,
+}
+
+/// The expression indexes of a table ANALYZE gathers statistics for
+/// (`compute_index_stats`): each one's expression keys, evaluated over
+/// sampled rows by the SQL layer that binds them.
+pub(crate) trait IndexExpressionSampler<'w> {
+    fn len(&self) -> usize;
+    /// The index's creation stamp.
+    fn stamp(&self, index: usize) -> u64;
+    fn keys(&self, index: usize) -> &[SampledIndexKey];
+    /// The index has a predicate.
+    fn partial(&self, index: usize) -> bool;
+    /// Whether `row` meets the predicate of partial index `index`.
+    fn passes(&self, storage: &Storage, index: usize, row: &[Datum<'w>]) -> Result<bool, SqlError>;
+    /// Evaluates the expression keys of `index` over `row` into `out`, in
+    /// [`Self::keys`] order.
+    fn evaluate(
+        &self,
+        storage: &Storage,
+        index: usize,
+        row: &[Datum<'w>],
+        out: &mut [Datum<'w>],
+    ) -> Result<(), SqlError>;
+}
+
+/// No expression indexes.
+#[cfg(test)]
+pub(crate) struct NoIndexExpressions;
+
+#[cfg(test)]
+impl<'w> IndexExpressionSampler<'w> for NoIndexExpressions {
+    fn len(&self) -> usize {
+        0
+    }
+    fn stamp(&self, _: usize) -> u64 {
+        unreachable!("no expression indexes")
+    }
+    fn keys(&self, _: usize) -> &[SampledIndexKey] {
+        &[]
+    }
+    fn partial(&self, _: usize) -> bool {
+        false
+    }
+    fn passes(&self, _: &Storage, _: usize, _: &[Datum<'w>]) -> Result<bool, SqlError> {
+        Ok(false)
+    }
+    fn evaluate(
+        &self,
+        _: &Storage,
+        _: usize,
+        _: &[Datum<'w>],
+        _: &mut [Datum<'w>],
+    ) -> Result<(), SqlError> {
+        Ok(())
+    }
+}
+
+/// The most index key columns whose statistics one table's image holds.
+pub(crate) const MAX_INDEX_STATISTICS: usize = 256;
+
+/// The most records one table's statistics image holds: its columns, its
+/// indexes' analyzed expression keys and its columns' inherited statistics.
+pub(crate) const MAX_STATISTICS_RECORDS: usize = 2 * MAX_RELATION_COLUMNS + MAX_INDEX_STATISTICS;
 
 /// The implicit index identities addressable by one table's inline, UNIQUE,
 /// and exclusion constraints. Named value bindings use the configured shared
@@ -7980,9 +8077,9 @@ pub(crate) struct ReplicationSlotDef {
     pub restart_lsn: u64,
     pub confirmed_flush_lsn: u64,
     pub behavior: ReplicationSlotBehavior,
-    pub active: bool,
-    /// Transient publisher backend identity. PostgreSQL does not persist slot
-    /// activity across restart, whereas the slot cursor above is durable.
+    /// Transient publisher backend identity, present while the slot is
+    /// active. PostgreSQL does not persist slot activity across restart,
+    /// whereas the slot cursor above is durable.
     pub active_pid: Option<i32>,
     pub sent_lsn: u64,
     /// Startup-bounded statistics for transactions actually emitted to a
@@ -7994,13 +8091,26 @@ pub(crate) struct ReplicationSlotDef {
 }
 
 impl ReplicationSlotDef {
+    pub(crate) const fn active(&self) -> bool {
+        self.active_pid.is_some()
+    }
+
+    /// PostgreSQL's refusal to acquire a slot another backend holds.
+    pub(crate) fn in_use_error(&self) -> SqlError {
+        sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "replication slot \"{}\" is active for PID {}",
+            self.name.as_str(),
+            self.active_pid.expect("an active slot records its backend")
+        )
+    }
+
     const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         name: SqlName::EMPTY,
         restart_lsn: 0,
         confirmed_flush_lsn: 0,
         behavior: ReplicationSlotBehavior::DEFAULT,
-        active: false,
         active_pid: None,
         sent_lsn: 0,
         total_txns: 0,
@@ -8062,7 +8172,9 @@ pub(crate) struct SubscriptionDef {
     pub bootstrap: SubscriptionBootstrap,
     pending_bootstrap: Option<PendingSubscriptionBootstrap>,
     pending_relation_refresh: Option<u32>,
-    pub(crate) cleanup: SubscriptionCleanup,
+    /// Transient: DROP SUBSCRIPTION's remote slot removal, which the server
+    /// performs on the publisher while the requesting statement waits.
+    pub(crate) slot_drop: SubscriptionSlotDrop,
     pub(crate) failure: Option<SubscriptionFailure>,
     /// Transient PostgreSQL-compatible worker counters. Durable apply
     /// position remains `confirmed_lsn`; statistics restart with the server.
@@ -8559,10 +8671,54 @@ pub(crate) enum SubscriptionBootstrap {
     Ready,
 }
 
+/// DROP SUBSCRIPTION removes the publisher slot before it commits, as
+/// PostgreSQL does. The statement parks while the server stops the apply
+/// worker and runs `DROP_REPLICATION_SLOT ... WAIT`; the backend that asked
+/// receives the outcome when it resumes. A requester that is cancelled or
+/// disconnects abandons its request: a running drop still completes on the
+/// publisher, and the subscription stays, as after an aborted PostgreSQL drop.
+// Each subscription catalog entry, sized at startup, holds one in place.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SubscriptionCleanup {
-    None,
-    DropManagedSlot,
+pub(crate) enum SubscriptionSlotDrop {
+    Idle,
+    Requested {
+        owner: SlotDropOwner,
+    },
+    Running {
+        owner: Option<SlotDropOwner>,
+    },
+    Finished {
+        owner: SlotDropOwner,
+        failure: Option<SlotDropFailure>,
+    },
+}
+
+impl SubscriptionSlotDrop {
+    /// The transaction that other DDL on this subscription waits for.
+    const fn owner_txid(self) -> Option<u32> {
+        match self {
+            Self::Requested { owner }
+            | Self::Running { owner: Some(owner) }
+            | Self::Finished { owner, .. } => Some(owner.txid),
+            Self::Idle | Self::Running { owner: None } => None,
+        }
+    }
+}
+
+/// The backend statement waiting for a slot drop, and its transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotDropOwner {
+    pub pid: i32,
+    pub txid: u32,
+}
+
+/// Why a publisher slot drop failed, with libpq's text for the failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotDropFailure {
+    /// The connection failed before the command ran.
+    pub connect: bool,
+    pub message: StackStr<512>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8618,7 +8774,7 @@ impl SubscriptionDef {
         bootstrap: SubscriptionBootstrap::Deferred,
         pending_bootstrap: None,
         pending_relation_refresh: None,
-        cleanup: SubscriptionCleanup::None,
+        slot_drop: SubscriptionSlotDrop::Idle,
         failure: None,
         apply_error_count: 0,
         sync_error_count: 0,
@@ -18092,6 +18248,8 @@ pub struct Storage {
     extended_statistics_catalog: Mutex<ExtendedStatisticsCatalog>,
     publications: Mutex<FixedVec<PublicationDef>>,
     replication_slots: Mutex<FixedVec<ReplicationSlotDef>>,
+    /// Counts slot releases, which wake `DROP_REPLICATION_SLOT ... WAIT`.
+    replication_slot_releases: u64,
     subscription_catalog: Mutex<SubscriptionCatalog>,
     foreign: Mutex<foreign::ForeignCatalog>,
     foreign_sessions: ForeignSessionPool,
@@ -21157,10 +21315,17 @@ impl Storage {
             None
         };
         let wait = match reason {
+            // DROP SUBSCRIPTION waits for the publisher, not object storage.
+            crate::sql::StatementWait::ObjectIo if self.awaits_subscription_slot_drop(pid) => {
+                (Some("Client"), Some("LibPQWalReceiverReceive"))
+            }
             crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
             crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
             crate::sql::StatementWait::ClientOutput => (Some("Client"), Some("ClientWrite")),
             crate::sql::StatementWait::Timer => (Some("Timeout"), Some("PgSleep")),
+            crate::sql::StatementWait::ReplicationSlot => {
+                (Some("IPC"), Some("ReplicationSlotDrop"))
+            }
             crate::sql::StatementWait::Lock => {
                 lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
             }
@@ -24572,6 +24737,7 @@ impl Storage {
             }),
             publications: Mutex::new(publications),
             replication_slots: Mutex::new(replication_slots),
+            replication_slot_releases: 0,
             subscription_catalog: Mutex::new(SubscriptionCatalog {
                 definitions: subscriptions,
                 relations: subscription_relations,
@@ -29699,9 +29865,7 @@ impl Storage {
             catalog: &self.subscription_catalog,
             next_slot: 0,
         }
-        .filter(|(_, value)| {
-            value.ddl_state.committed_exists() || value.cleanup != SubscriptionCleanup::None
-        })
+        .filter(|(_, value)| value.ddl_state.committed_exists())
     }
 
     pub(crate) fn checkpoint_matviews(&self) -> impl Iterator<Item = (usize, MatviewDef)> + '_ {
@@ -38277,6 +38441,21 @@ impl Storage {
         self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
 
+    /// Whether a row of the table has a pending version of `txid`: its own
+    /// changes moved the row since the transaction began.
+    pub(crate) fn table_has_own_pending(&self, table_slot: usize, txid: u32) -> bool {
+        let (versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_read_for_batch()?,
+                self.tables[table_slot].rows.try_read_for_batch()?,
+            ))
+        });
+        rows.iter().any(|(_, &state)| {
+            pending_last(&versions.pending_row_versions, state.pending)
+                .is_some_and(|pending| pending.txid == txid)
+        })
+    }
+
     /// Cache probes need only this verdict while their saved block is borrowed;
     /// copy no row bytes or root owners and release metadata guards immediately.
     pub(crate) fn row_has_own_pending(&self, table_slot: usize, rowid: u64, txid: u32) -> bool {
@@ -38615,41 +38794,28 @@ impl Storage {
     /// column statistics are replaced while table cardinality and row width
     /// are always refreshed. A column whose statistics target is 0 keeps its
     /// statistics. `default_target` is `default_statistics_target`.
-    pub(crate) fn analyze_table(
+    ///
+    /// Without selected columns ANALYZE also gathers, as
+    /// `compute_index_stats` does, the statistics of each expression key of
+    /// the indexes `indexes` describes, over the sampled rows a partial
+    /// index's predicate keeps; an index whose predicate keeps no sampled
+    /// row keeps its earlier statistics. Statistics of dropped indexes are
+    /// discarded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the analyzed relation is explicit"
+    )]
+    pub(crate) fn analyze_table<'w>(
         &mut self,
         table_slot: usize,
         txid: u32,
         selected_columns: &[usize],
         default_target: usize,
-        arena: &crate::mem::arena::Arena,
+        indexes: &dyn IndexExpressionSampler<'w>,
+        members: &[usize],
+        arena: &'w crate::mem::arena::Arena,
     ) -> Result<TableStatistics, SqlError> {
         let _snapshot = self.analyze_snapshot();
-        const REGISTERS: usize = 64;
-
-        fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
-            let index = (hash as usize) & (REGISTERS - 1);
-            let tail = hash >> REGISTERS.trailing_zeros();
-            let rank = tail.leading_zeros().saturating_add(1).min(63) as u8;
-            registers[index] = registers[index].max(rank);
-        }
-
-        fn distinct_estimate(registers: &[u8; REGISTERS]) -> u64 {
-            let mut inverse_sum = 0.0f64;
-            let mut zeros = 0usize;
-            for &register in registers {
-                inverse_sum += 2.0f64.powi(-i32::from(register));
-                zeros += usize::from(register == 0);
-            }
-            let count = REGISTERS as f64;
-            let raw = 0.709 * count * count / inverse_sum;
-            let corrected = if raw <= 2.5 * count && zeros > 0 {
-                count * (count / zeros as f64).ln()
-            } else {
-                raw
-            };
-            corrected.round().max(0.0) as u64
-        }
-
         let arena_full = crate::sql::eval::arena_full;
         let definition = (*self.table_def(table_slot, txid)).clone();
         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -38676,11 +38842,23 @@ impl Storage {
             // `attstattarget` 0 leaves a column's statistics alone.
             *chosen &= target(column) != 0;
         }
+        // Index expressions are analyzed only with the whole table.
+        let index_count = if selected_columns.is_empty() {
+            indexes.len()
+        } else {
+            0
+        };
+        let mut index_target = 0;
+        for index in 0..index_count {
+            for key in indexes.keys(index) {
+                index_target = index_target.max(300 * key.target);
+            }
+        }
         // `std_typanalyze`'s `minrows`, at least the default 100 rows.
         let sample_target = (0..n_columns)
             .filter(|&column| selected[column])
             .map(|column| 300 * target(column))
-            .fold(100, usize::max);
+            .fold(100.max(index_target), usize::max);
 
         // Pass one counts the rows and picks the sample by reservoir
         // sampling, recording each sampled row's position and length. While
@@ -38817,20 +38995,74 @@ impl Storage {
         let analyzed_generation = scan.publication_generation(self, table_slot)?;
         drop(scan);
         let sample_rows = &*copies;
+        // The rows of the table and its descendants as the table's rows
+        // (`acquire_inherited_sample_rows`), for its inherited statistics.
+        let (inherited_rows, inherited_total) =
+            self.inherited_sample(&definition, members, sample_target, txid, arena)?;
 
         let mut statistics = self.table_statistics(table_slot, txid);
-        // Without sampled rows PostgreSQL leaves every column's statistics.
+        // The sampled rows each analyzed index's predicate keeps.
+        let index_rows = arena
+            .alloc_slice_with(index_count, |_| 0usize)
+            .map_err(|_| arena_full())?;
+        if rows != 0 {
+            for (index, kept) in index_rows.iter_mut().enumerate() {
+                if !indexes.partial(index) {
+                    *kept = sample_rows.len();
+                    continue;
+                }
+                for &row in sample_rows {
+                    crate::sql::query::check_timeout()?;
+                    let mark = arena.mark();
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(row, &schema[..n_columns], &mut values)?;
+                    *kept += usize::from(indexes.passes(self, index, &values[..n_columns])?);
+                    // SAFETY: the predicate's results were allocated after
+                    // `mark` and are dead here.
+                    unsafe { arena.rewind_to(mark) };
+                }
+            }
+        }
+        let recomputed = |stamp: u64| {
+            (0..index_count).any(|index| indexes.stamp(index) == stamp && index_rows[index] > 0)
+        };
+        let live = |stamp: u64| {
+            self.indexes_for_slot(table_slot, txid)
+                .any(|index| index.created_at == stamp)
+        };
+        // Without sampled rows PostgreSQL leaves every column's statistics;
+        // an index's survive while it does, unless recomputed.
+        let column_selected = |attribute: u16| {
+            (0..n_columns).any(|column| {
+                selected[column] && definition.attributes.number(column) == Some(attribute)
+            })
+        };
         let retained = |record: &&AnalyzedColumn| {
+            if record.index() == INHERITED {
+                return inherited_total == 0 || !column_selected(record.attribute());
+            }
+            if record.index() != 0 {
+                return live(record.index()) && (rows == 0 || !recomputed(record.index()));
+            }
             definition.columns().iter().enumerate().any(|(column, _)| {
                 (!selected[column] || rows == 0)
                     && definition.attributes.number(column) == Some(record.attribute())
             })
         };
         let retained_count = statistics.columns.iter().filter(retained).count();
+        let selected_count = selected[..n_columns].iter().filter(|&&value| value).count();
         let analyzed_count = if rows == 0 {
             0
         } else {
-            selected[..n_columns].iter().filter(|&&value| value).count()
+            selected_count
+                + (0..index_count)
+                    .filter(|&index| index_rows[index] > 0)
+                    .map(|index| indexes.keys(index).len())
+                    .sum::<usize>()
+        } + if inherited_total == 0 {
+            0
+        } else {
+            selected_count
         };
         let mut columns = self.reserve_statistics_columns(retained_count + analyzed_count)?;
         let retained_bytes: usize = statistics
@@ -38897,149 +39129,22 @@ impl Storage {
                 continue;
             }
             let metadata = &definition.columns()[column];
-            let ctype = schema[column];
-            let layout = ctype.physical_layout();
-            let varlena = layout.length < 0;
-            let scalar = ctype.has_builtin_ordering()
-                && !matches!(
-                    ctype,
-                    ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
-                );
             let mark = arena.mark();
-            let items = arena
-                .alloc_slice_with(sample_rows.len(), |_| (Datum::Null, 0u32))
-                .map_err(|_| arena_full())?;
-            let mut count = 0usize;
-            let mut null_count = 0usize;
-            let mut toowide_count = 0usize;
-            let mut total_width = 0.0f64;
-            let mut registers = [0u8; REGISTERS];
-            let mut decoded = [Datum::Null; MAX_COLUMNS];
-            for &row in sample_rows {
-                crate::sql::query::check_timeout()?;
-                rowenc::decode(row, &schema[..n_columns], &mut decoded)?;
-                let value = decoded[column];
-                if value.is_null() {
-                    null_count += 1;
-                    continue;
-                }
-                if !scalar {
-                    let index = [column as u16];
-                    add_distinct(
-                        &mut registers,
-                        hash_key_catalog(self, txid, &decoded[..n_columns], &index)?,
-                    );
-                }
-                if varlena {
-                    let raw = statistics::scalar::raw_value_length(&value);
-                    total_width += statistics::scalar::stored_value_width(raw) as f64;
-                    if raw + 4 > statistics::scalar::WIDTH_THRESHOLD {
-                        toowide_count += 1;
-                        continue;
-                    }
-                }
-                items[count] = (value, count as u32);
-                count += 1;
-            }
-            let nonnull_count = sample_rows.len() - null_count;
-            let width = if varlena {
-                Ok(total_width)
-            } else {
-                Err(i32::from(layout.length))
-            };
-            let mut distribution: &[u8] = &[];
-            let image = if scalar {
-                let computed = statistics::scalar::compute(
-                    statistics::scalar::SampleColumn {
-                        values: &mut items[..count],
-                        null_count,
-                        nonnull_count,
-                        toowide_count,
-                        total_width: width,
-                    },
-                    sample_rows.len(),
-                    rows as f64,
-                    target(column),
-                    &mut |left, right| {
-                        crate::sql::eval::compare_datums_collated(
-                            self,
-                            txid,
-                            metadata.collation,
-                            left,
-                            right,
-                        )
-                    },
-                    arena,
-                )?
-                .expect("a sampled table has rows");
-                if !computed.mcv.is_empty()
-                    || !computed.histogram.is_empty()
-                    || computed.correlation.is_some()
-                {
-                    let length =
-                        statistics::distribution::encoded_len(computed.mcv, computed.histogram);
-                    let bytes = arena
-                        .alloc_slice_with(length, |_| 0u8)
-                        .map_err(|_| arena_full())?;
-                    statistics::distribution::encode(
-                        computed.correlation,
-                        computed.mcv,
-                        computed.histogram,
-                        bytes,
-                    );
-                    distribution = bytes;
-                }
-                ColumnStatistics {
-                    valid: true,
-                    null_fraction: computed.null_fraction,
-                    distinct_values: if computed.distinct > 0.0 {
-                        computed.distinct as u64
-                    } else {
-                        0
-                    },
-                    distinct_fraction: if computed.distinct < 0.0 {
-                        -computed.distinct
-                    } else {
-                        0.0
-                    },
-                    average_width: computed.width.max(0) as u32,
-                }
-            } else {
-                let null_fraction = (null_count as f64 / sample_rows.len() as f64) as f32;
-                let (distinct_values, distinct_fraction) = if matches!(
-                    ctype,
-                    ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
-                ) {
-                    // PostgreSQL's compute_range_stats and compute_tsvector_stats
-                    // assume every non-null value is distinct.
-                    (0, 1.0 - null_fraction)
-                } else if !ctype.has_default_equality() {
-                    // compute_trivial_stats: without an equality operator the
-                    // distinct count stays unknown.
-                    (0, 0.0)
-                } else {
-                    let distinct_values = distinct_estimate(&registers).min(nonnull_count as u64);
-                    (
-                        distinct_values,
-                        if distinct_values.saturating_mul(10) > rows {
-                            (distinct_values as f64 / rows as f64).min(1.0) as f32
-                        } else {
-                            0.0
-                        },
-                    )
-                };
-                ColumnStatistics {
-                    valid: true,
-                    null_fraction,
-                    distinct_values,
-                    distinct_fraction,
-                    average_width: match width {
-                        Ok(total) if nonnull_count > 0 => (total / nonnull_count as f64) as u32,
-                        Ok(_) => 0,
-                        Err(length) => length.max(0) as u32,
-                    },
-                }
-            };
+            let (image, distribution) = self.analyzed_values(
+                txid,
+                schema[column],
+                metadata.collation,
+                target(column),
+                sample_rows.len(),
+                rows,
+                false,
+                &mut |row| {
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(sample_rows[row], &schema[..n_columns], &mut decoded)?;
+                    Ok(decoded[column])
+                },
+                arena,
+            )?;
             let record = AnalyzedColumn::new(
                 definition
                     .attributes
@@ -39058,10 +39163,418 @@ impl Storage {
             // distribution were allocated after `mark` and are dead here.
             unsafe { arena.rewind_to(mark) };
         }
-        columns.sort_unstable_by_key(|column| column.attribute());
+        for (index, &kept) in index_rows.iter().enumerate() {
+            if rows == 0 || kept == 0 {
+                continue;
+            }
+            let keys = indexes.keys(index);
+            let width = keys.len();
+            let mark = arena.mark();
+            // Each kept row's key values, row after row.
+            let keyed = arena
+                .alloc_slice_with(kept * width, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            let mut filled = 0;
+            for &row in sample_rows {
+                crate::sql::query::check_timeout()?;
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(row, &schema[..n_columns], &mut decoded)?;
+                if indexes.partial(index) && !indexes.passes(self, index, &decoded[..n_columns])? {
+                    continue;
+                }
+                indexes.evaluate(
+                    self,
+                    index,
+                    &decoded[..n_columns],
+                    &mut keyed[filled * width..(filled + 1) * width],
+                )?;
+                filled += 1;
+            }
+            if filled != kept {
+                return Err(changed_sample());
+            }
+            // `totalindexrows`: the kept fraction of the table's rows.
+            let index_total = (kept as f64 / sample_rows.len() as f64 * rows as f64).ceil() as u64;
+            for (at, key) in keys.iter().enumerate() {
+                let column_mark = arena.mark();
+                let (image, distribution) = self.analyzed_values(
+                    txid,
+                    key.ctype,
+                    key.collation,
+                    key.target,
+                    kept,
+                    index_total,
+                    true,
+                    &mut |row| Ok(keyed[row * width + at]),
+                    arena,
+                )?;
+                let record = AnalyzedColumn::of_index(indexes.stamp(index), key.attribute, image)?
+                    .with_distribution(values.len(), distribution.len())?;
+                values
+                    .extend_from_slice(distribution)
+                    .map_err(lease_error)?;
+                columns
+                    .push_reserved(record)
+                    .expect("statistics merge reserved its index records");
+                // SAFETY: the key's scratch and encoded distribution were
+                // allocated after `column_mark` and are dead here.
+                unsafe { arena.rewind_to(column_mark) };
+            }
+            // SAFETY: the sampled keys were allocated after `mark` and are
+            // dead here.
+            unsafe { arena.rewind_to(mark) };
+        }
+        // Each column's statistics over the table and its descendants.
+        for column in 0..n_columns {
+            if !selected[column] || inherited_total == 0 {
+                continue;
+            }
+            let metadata = &definition.columns()[column];
+            let mark = arena.mark();
+            let (image, distribution) = self.analyzed_values(
+                txid,
+                schema[column],
+                metadata.collation,
+                target(column),
+                inherited_rows.len(),
+                inherited_total,
+                false,
+                &mut |row| {
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(inherited_rows[row], &schema[..n_columns], &mut decoded)?;
+                    Ok(decoded[column])
+                },
+                arena,
+            )?;
+            let record = AnalyzedColumn::inherited(
+                definition
+                    .attributes
+                    .number(column)
+                    .expect("analyzed live column has an attribute"),
+                image,
+            )?
+            .with_distribution(values.len(), distribution.len())?;
+            values
+                .extend_from_slice(distribution)
+                .map_err(lease_error)?;
+            columns
+                .push_reserved(record)
+                .expect("statistics merge reserved its inherited records");
+            // SAFETY: the column's sample values, scratch and encoded
+            // distribution were allocated after `mark` and are dead here.
+            unsafe { arena.rewind_to(mark) };
+        }
+        // A partitioned table holds no rows itself: `pg_class` counts its
+        // partitions' rows and no pages.
+        if definition.partition.is_partitioned() && !members.is_empty() {
+            statistics.rows = inherited_total;
+            statistics.pages = PARTITIONED_PAGES;
+            statistics.all_visible_pages = 0;
+        }
+        columns.sort_unstable_by_key(|column| column.key());
         statistics.columns = ColumnImages::new(columns.freeze(), values.freeze())?;
         self.write_table_statistics(table_slot, txid, statistics.clone())?;
         Ok(statistics)
+    }
+
+    /// A sample of up to `target` rows of the relations `members` (a
+    /// table's descendants, and the table itself when it holds rows), each
+    /// converted to the layout of `definition` and copied to the arena's
+    /// persistent tail, and the members' row count.
+    fn inherited_sample<'w>(
+        &self,
+        definition: &TableDef,
+        members: &[usize],
+        target: usize,
+        txid: u32,
+        arena: &'w crate::mem::arena::Arena,
+    ) -> Result<(&'w [&'w [u8]], u64), SqlError> {
+        let arena_full = crate::sql::eval::arena_full;
+        if members.is_empty() {
+            return Ok((&[], 0));
+        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = definition.schema(&mut schema);
+        // Each member's rows in a sequential scan's order, as the tree's.
+        let each_row = |member: usize,
+                        visit: &mut dyn FnMut(&[Datum<'_>]) -> Result<(), SqlError>|
+         -> Result<(), SqlError> {
+            let physical = (*self.table_def(member, txid)).clone();
+            let mut member_schema = [ColType::Bool; MAX_COLUMNS];
+            let width = physical.schema(&mut member_schema);
+            let mapping = RelationColumnMap::new(definition, &physical, arena)?;
+            let scan = self.captured_row_scan_in(member, txid, arena)?;
+            let mut project = |values: &[Datum<'_>]| {
+                let mut logical = [Datum::Null; MAX_COLUMNS];
+                mapping.project(values, &mut logical[..n_columns]);
+                visit(&logical[..n_columns])
+            };
+            scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+                for row in batch {
+                    crate::sql::query::check_timeout()?;
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    let values = match row.representation {
+                        SpilledRowRepresentation::Encoded(bytes) => {
+                            rowenc::decode(bytes, &member_schema[..width], &mut decoded)?;
+                            &decoded[..width]
+                        }
+                        SpilledRowRepresentation::Values(values) => values,
+                    };
+                    project(values)?;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            let _ = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+                crate::sql::query::check_timeout()?;
+                self.with_row_bytes(member, rowid, home, |bytes| {
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, &member_schema[..width], &mut decoded)?;
+                    project(&decoded[..width])
+                })?;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            Ok(())
+        };
+        // Pass one counts the rows and picks the sampled positions.
+        let positions = arena
+            .alloc_slice_with(target, |_| 0u64)
+            .map_err(|_| arena_full())?;
+        let mut total = 0u64;
+        let mut sampled = 0usize;
+        let mut random = crate::prng::Pcg32::new(
+            crate::sql::datetime::now_micros() as u64,
+            members.len() as u64,
+        );
+        for &member in members {
+            each_row(member, &mut |_| {
+                let position = total;
+                total += 1;
+                if sampled < positions.len() {
+                    positions[sampled] = position;
+                    sampled += 1;
+                } else {
+                    let draw = (u64::from(random.next_u32()) << 32) | u64::from(random.next_u32());
+                    let slot = (draw % (position + 1)) as usize;
+                    if slot < positions.len() {
+                        positions[slot] = position;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let positions = &mut positions[..sampled];
+        positions.sort_unstable();
+        // Pass two copies them in the tree's layout.
+        let copies = arena
+            .alloc_slice_with(sampled, |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let mut position = 0u64;
+        let mut next = 0usize;
+        for &member in members {
+            each_row(member, &mut |values| {
+                let this = position;
+                position += 1;
+                if next < positions.len() && positions[next] == this {
+                    let length = rowenc::encoded_len(values);
+                    let out = arena
+                        .alloc_persistent_slice_with(length, |_| 0u8)
+                        .map_err(|_| arena_full())?;
+                    rowenc::encode(values, out);
+                    copies[next] = out;
+                    next += 1;
+                }
+                Ok(())
+            })?;
+        }
+        if next != positions.len() {
+            return Err(changed_sample());
+        }
+        Ok((copies, total))
+    }
+
+    /// The statistics `compute_scalar_stats` (or, for a type without a
+    /// default ordering, a distinct-value count) gathers from `sampled`
+    /// values of type `ctype` under `collation`, `value_at(row)` reading
+    /// each, of a relation of `total_rows` rows; the encoded distribution
+    /// lies in `arena`. A `computed` value (an index expression's) has the
+    /// four-byte length header of a value built in memory, where a stored
+    /// short value has a one-byte header.
+    #[expect(clippy::too_many_arguments, reason = "the sampled column is explicit")]
+    fn analyzed_values<'w>(
+        &self,
+        txid: u32,
+        ctype: ColType,
+        collation: Collation,
+        target: usize,
+        sampled: usize,
+        total_rows: u64,
+        computed: bool,
+        value_at: &mut dyn FnMut(usize) -> Result<Datum<'w>, SqlError>,
+        arena: &'w crate::mem::arena::Arena,
+    ) -> Result<(ColumnStatistics, &'w [u8]), SqlError> {
+        const REGISTERS: usize = 64;
+
+        fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
+            let index = (hash as usize) & (REGISTERS - 1);
+            let tail = hash >> REGISTERS.trailing_zeros();
+            let rank = tail.leading_zeros().saturating_add(1).min(63) as u8;
+            registers[index] = registers[index].max(rank);
+        }
+
+        fn distinct_estimate(registers: &[u8; REGISTERS]) -> u64 {
+            let mut inverse_sum = 0.0f64;
+            let mut zeros = 0usize;
+            for &register in registers {
+                inverse_sum += 2.0f64.powi(-i32::from(register));
+                zeros += usize::from(register == 0);
+            }
+            let count = REGISTERS as f64;
+            let raw = 0.709 * count * count / inverse_sum;
+            let corrected = if raw <= 2.5 * count && zeros > 0 {
+                count * (count / zeros as f64).ln()
+            } else {
+                raw
+            };
+            corrected.round().max(0.0) as u64
+        }
+
+        let arena_full = crate::sql::eval::arena_full;
+        let layout = ctype.physical_layout();
+        let varlena = layout.length < 0;
+        let scalar = ctype.has_builtin_ordering()
+            && !matches!(
+                ctype,
+                ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
+            );
+        let items = arena
+            .alloc_slice_with(sampled, |_| (Datum::Null, 0u32))
+            .map_err(|_| arena_full())?;
+        let mut count = 0usize;
+        let mut null_count = 0usize;
+        let mut toowide_count = 0usize;
+        let mut total_width = 0.0f64;
+        let mut registers = [0u8; REGISTERS];
+        for row in 0..sampled {
+            crate::sql::query::check_timeout()?;
+            let value = value_at(row)?;
+            if value.is_null() {
+                null_count += 1;
+                continue;
+            }
+            if !scalar {
+                add_distinct(
+                    &mut registers,
+                    hash_key_catalog(self, txid, core::slice::from_ref(&value), &[0])?,
+                );
+            }
+            if varlena {
+                let raw = statistics::scalar::raw_value_length(&value);
+                total_width += if computed {
+                    raw + 4
+                } else {
+                    statistics::scalar::stored_value_width(raw)
+                } as f64;
+                if raw + 4 > statistics::scalar::WIDTH_THRESHOLD {
+                    toowide_count += 1;
+                    continue;
+                }
+            }
+            items[count] = (value, count as u32);
+            count += 1;
+        }
+        let nonnull_count = sampled - null_count;
+        let width = if varlena {
+            Ok(total_width)
+        } else {
+            Err(i32::from(layout.length))
+        };
+        let mut distribution: &[u8] = &[];
+        let image = if scalar {
+            let computed = statistics::scalar::compute(
+                statistics::scalar::SampleColumn {
+                    values: &mut items[..count],
+                    null_count,
+                    nonnull_count,
+                    toowide_count,
+                    total_width: width,
+                },
+                sampled,
+                total_rows as f64,
+                target,
+                &mut |left, right| {
+                    crate::sql::eval::compare_datums_collated(self, txid, collation, left, right)
+                },
+                arena,
+            )?
+            .expect("a sampled relation has rows");
+            if !computed.mcv.is_empty()
+                || !computed.histogram.is_empty()
+                || computed.correlation.is_some()
+            {
+                let length =
+                    statistics::distribution::encoded_len(computed.mcv, computed.histogram);
+                let bytes = arena
+                    .alloc_slice_with(length, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                statistics::distribution::encode(
+                    computed.correlation,
+                    computed.mcv,
+                    computed.histogram,
+                    bytes,
+                );
+                distribution = bytes;
+            }
+            ColumnStatistics {
+                valid: true,
+                null_fraction: computed.null_fraction,
+                distinct_values: if computed.distinct > 0.0 {
+                    computed.distinct as u64
+                } else {
+                    0
+                },
+                distinct_fraction: if computed.distinct < 0.0 {
+                    -computed.distinct
+                } else {
+                    0.0
+                },
+                average_width: computed.width.max(0) as u32,
+            }
+        } else {
+            let null_fraction = (null_count as f64 / sampled as f64) as f32;
+            let (distinct_values, distinct_fraction) = if matches!(
+                ctype,
+                ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
+            ) {
+                // `compute_range_stats` and `compute_tsvector_stats` count
+                // every non-NULL value as distinct.
+                (0, 1.0 - null_fraction)
+            } else if !ctype.has_default_equality() {
+                // `compute_trivial_stats` records no distinct count.
+                (0, 0.0)
+            } else {
+                let distinct_values = distinct_estimate(&registers).min(nonnull_count as u64);
+                (
+                    distinct_values,
+                    if distinct_values.saturating_mul(10) > total_rows {
+                        (distinct_values as f64 / total_rows as f64).min(1.0) as f32
+                    } else {
+                        0.0
+                    },
+                )
+            };
+            ColumnStatistics {
+                valid: true,
+                null_fraction,
+                distinct_values,
+                distinct_fraction,
+                average_width: match width {
+                    Ok(total) if nonnull_count > 0 => (total / nonnull_count as f64) as u32,
+                    Ok(_) => 0,
+                    Err(length) => length.max(0) as u32,
+                },
+            }
+        };
+        Ok((image, distribution))
     }
 
     /// Retained row bytes belong to the fixed statement arena; heap owners end
@@ -44532,7 +45045,6 @@ impl Storage {
             restart_lsn,
             confirmed_flush_lsn,
             behavior,
-            active: false,
             active_pid: None,
             sent_lsn: confirmed_flush_lsn,
             total_txns: 0,
@@ -44584,12 +45096,8 @@ impl Storage {
                     name.as_str()
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         slot.behavior = behavior;
         Ok(())
@@ -44651,12 +45159,8 @@ impl Storage {
                 name
             ));
         };
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         *slot = ReplicationSlotDef::EMPTY;
         Ok(())
@@ -44734,14 +45238,9 @@ impl Storage {
                     name
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
-        slot.active = true;
         slot.active_pid = Some(backend_pid);
         slot.sent_lsn = slot.confirmed_flush_lsn;
         Ok(slot.confirmed_flush_lsn)
@@ -44809,9 +45308,13 @@ impl Storage {
         if let Some(slot) = replication_slots.iter_mut().find(|slot| {
             slot.database == current_database() && slot.live && slot.name.as_str() == name
         }) {
-            slot.active = false;
             slot.active_pid = None;
+            self.replication_slot_releases += 1;
         }
+    }
+
+    pub(crate) fn replication_slot_releases(&self) -> u64 {
+        self.replication_slot_releases
     }
 
     pub(crate) fn subscriptions_with_slots_visible_to(
@@ -44856,20 +45359,6 @@ impl Storage {
             .lock()
             .expect("subscription catalog lock poisoned")
             .definitions[slot]
-    }
-
-    pub(crate) fn subscriptions_with_slots_durable(
-        &self,
-    ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
-        SubscriptionIter {
-            catalog: &self.subscription_catalog,
-            next_slot: 0,
-        }
-        .filter(|(_, subscription)| {
-            subscription.database == current_database()
-                && (subscription.ddl_state == CatalogDdlState::Present
-                    || subscription.cleanup != SubscriptionCleanup::None)
-        })
     }
 
     pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, SubscriptionDef)> {
@@ -44956,10 +45445,11 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = catalog.definitions.iter().position(|subscription| {
-            subscription.ddl_state == CatalogDdlState::Absent
-                && subscription.cleanup == SubscriptionCleanup::None
-        }) else {
+        let Some(slot) = catalog
+            .definitions
+            .iter()
+            .position(|subscription| subscription.ddl_state == CatalogDdlState::Absent)
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many subscriptions (limit {})",
@@ -44988,7 +45478,7 @@ impl Storage {
             bootstrap: spec.bootstrap,
             pending_bootstrap: None,
             pending_relation_refresh: None,
-            cleanup: SubscriptionCleanup::None,
+            slot_drop: SubscriptionSlotDrop::Idle,
             failure: None,
             apply_error_count: 0,
             sync_error_count: 0,
@@ -45296,84 +45786,133 @@ impl Storage {
                 *relation = SubscriptionRelation::EMPTY;
             }
         }
-        let cleanup = match catalog.definitions[slot].slot {
-            SubscriptionSlot::Managed(_) => SubscriptionCleanup::DropManagedSlot,
-            SubscriptionSlot::Absent | SubscriptionSlot::External(_) => SubscriptionCleanup::None,
-        };
-        if cleanup == SubscriptionCleanup::None {
-            catalog.definitions[slot] = SubscriptionDef::EMPTY;
-        } else {
-            catalog.definitions[slot].cleanup = cleanup;
-            catalog.definitions[slot].ddl_state = catalog.definitions[slot].ddl_state.commit_drop();
-        }
+        catalog.definitions[slot] = SubscriptionDef::EMPTY;
         drop(catalog);
         self.drop_comments_by_subid(CommentClass::Subscription, created_at as u32);
     }
 
-    pub(crate) fn subscription_cleanup(
+    fn subscription_slot_drop_entry<T>(
         &self,
         slot: usize,
-    ) -> Option<(u64, SqlName, SubscriptionConnInfo, SqlName)> {
-        let catalog = self
+        visit: impl FnOnce(&mut SubscriptionDef) -> T,
+    ) -> T {
+        let mut catalog = self
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get(slot)?;
-        let SubscriptionCleanup::DropManagedSlot = subscription.cleanup else {
-            return None;
-        };
-        let SubscriptionSlot::Managed(remote_slot) = subscription.slot else {
-            unreachable!("managed cleanup retains a managed slot")
-        };
-        Some((
-            subscription.created_at,
-            subscription.name,
-            subscription.connection,
-            remote_slot.sql_name(),
-        ))
+        visit(&mut catalog.definitions[slot])
     }
 
-    /// Checks that `slot` still holds the dropped subscription `created_at`
-    /// whose managed slot cleanup [`Self::complete_subscription_cleanup`]
-    /// completes; callers check before journaling the completion.
-    pub(crate) fn check_subscription_cleanup(
+    /// The publisher slot removal the server must start for `slot`: its
+    /// endpoint identity, connection and remote slot name.
+    pub(crate) fn requested_subscription_slot_drop(
         &self,
         slot: usize,
-        created_at: u64,
-    ) -> Result<(), SqlError> {
-        let catalog = self
-            .subscription_catalog
-            .lock()
-            .expect("subscription catalog lock poisoned");
-        let subscription = catalog.definitions.get(slot).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription cleanup slot is invalid"
-            )
-        })?;
-        if subscription.ddl_state != CatalogDdlState::Absent
-            || subscription.created_at != created_at
-            || subscription.cleanup != SubscriptionCleanup::DropManagedSlot
-        {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "subscription cleanup identity changed"
-            ));
-        }
-        Ok(())
+    ) -> Option<(SqlName, SubscriptionConnInfo, SqlName)> {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            let SubscriptionSlotDrop::Requested { .. } = subscription.slot_drop else {
+                return None;
+            };
+            Some((
+                subscription.name,
+                subscription.connection,
+                subscription.slot.name()?.sql_name(),
+            ))
+        })
     }
 
-    pub(crate) fn complete_subscription_cleanup(
-        &mut self,
+    /// Whether the apply worker of `slot` must stay stopped for a slot drop.
+    pub(crate) fn subscription_slot_drop_pending(&self, slot: usize) -> bool {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            subscription.slot_drop != SubscriptionSlotDrop::Idle
+        })
+    }
+
+    /// Asks the server to drop the publisher slot of `slot` for `owner`.
+    /// Returns the finished outcome once, or `None` while it is pending.
+    pub(crate) fn poll_subscription_slot_drop(
+        &self,
         slot: usize,
-        created_at: u64,
-    ) -> Result<(), SqlError> {
-        self.check_subscription_cleanup(slot, created_at)?;
+        owner: SlotDropOwner,
+    ) -> Option<Option<SlotDropFailure>> {
+        self.subscription_slot_drop_entry(slot, |subscription| match subscription.slot_drop {
+            SubscriptionSlotDrop::Idle => {
+                subscription.slot_drop = SubscriptionSlotDrop::Requested { owner };
+                None
+            }
+            SubscriptionSlotDrop::Finished {
+                owner: finished,
+                failure,
+            } if finished == owner => {
+                subscription.slot_drop = SubscriptionSlotDrop::Idle;
+                Some(failure)
+            }
+            SubscriptionSlotDrop::Requested { .. }
+            | SubscriptionSlotDrop::Running { .. }
+            | SubscriptionSlotDrop::Finished { .. } => None,
+        })
+    }
+
+    pub(crate) fn start_subscription_slot_drop(&self, slot: usize) {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            if let SubscriptionSlotDrop::Requested { owner } = subscription.slot_drop {
+                subscription.slot_drop = SubscriptionSlotDrop::Running { owner: Some(owner) };
+            }
+        });
+    }
+
+    /// Records a running drop's outcome for its owner, or forgets it when the
+    /// owner abandoned it.
+    pub(crate) fn finish_subscription_slot_drop(
+        &self,
+        slot: usize,
+        failure: Option<SlotDropFailure>,
+    ) {
+        self.subscription_slot_drop_entry(slot, |subscription| {
+            subscription.slot_drop = match subscription.slot_drop {
+                SubscriptionSlotDrop::Running { owner: Some(owner) } => {
+                    SubscriptionSlotDrop::Finished { owner, failure }
+                }
+                _ => SubscriptionSlotDrop::Idle,
+            };
+        });
+    }
+
+    fn awaits_subscription_slot_drop(&self, pid: i32) -> bool {
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
-            .definitions[slot] = SubscriptionDef::EMPTY;
-        Ok(())
+            .definitions
+            .iter()
+            .any(|subscription| match subscription.slot_drop {
+                SubscriptionSlotDrop::Requested { owner }
+                | SubscriptionSlotDrop::Running { owner: Some(owner) }
+                | SubscriptionSlotDrop::Finished { owner, .. } => owner.pid == pid,
+                SubscriptionSlotDrop::Idle | SubscriptionSlotDrop::Running { owner: None } => false,
+            })
+    }
+
+    /// Abandons every slot drop requested by backend `pid`, whose statement
+    /// ended without consuming the outcome.
+    pub(crate) fn abandon_subscription_slot_drops(&self, pid: i32) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for subscription in catalog.definitions.iter_mut() {
+            subscription.slot_drop = match subscription.slot_drop {
+                SubscriptionSlotDrop::Requested { owner }
+                | SubscriptionSlotDrop::Finished { owner, .. }
+                    if owner.pid == pid =>
+                {
+                    SubscriptionSlotDrop::Idle
+                }
+                SubscriptionSlotDrop::Running { owner: Some(owner) } if owner.pid == pid => {
+                    SubscriptionSlotDrop::Running { owner: None }
+                }
+                state => state,
+            };
+        }
     }
 
     pub(crate) fn rollback_subscription_create(&mut self, slot: usize) {
@@ -45438,6 +45977,7 @@ impl Storage {
             subscription.pending_relation_refresh,
             subscription.pending_definition.map(|pending| pending.txid),
             subscription.ownership.pending.map(|pending| pending.txid),
+            subscription.slot_drop.owner_txid(),
         ]
         .into_iter()
         .flatten()
@@ -61428,6 +61968,7 @@ pub(crate) mod tests {
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 33;
+pub(crate) const RECORD_VERSION: u8 = 34;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -58,9 +58,12 @@ const TABLE_STATISTICS_V3: u8 = u8::MAX - 1;
 const TABLE_STATISTICS_V4: u8 = u8::MAX - 2;
 #[cfg(test)]
 const TABLE_STATISTICS_V5: u8 = 251;
-/// Each analyzed column carries its value distribution's bytes, after the
-/// relation's heap and all-visible page counts.
+#[cfg(test)]
 const TABLE_STATISTICS_V6: u8 = 250;
+/// Each analyzed column carries the creation stamp of the index whose key it
+/// is (0 for a table column) and its value distribution's bytes, after the
+/// relation's heap and all-visible page counts.
+const TABLE_STATISTICS_V7: u8 = 249;
 /// Format, validity, rows, width, generation, pages, all-visible pages and
 /// the column count.
 const STATISTICS_HEADER: usize = 1 + 1 + 8 + 4 + 8 + 8 + 8 + 2;
@@ -201,7 +204,6 @@ wal_record_kinds! {
     KIND_SET_SUBSCRIPTION_BOOTSTRAP = 61;
     KIND_RESET_SUBSCRIPTION_RELATIONS = 62;
     KIND_ADD_SUBSCRIPTION_RELATION = 63;
-    KIND_COMPLETE_SUBSCRIPTION_CLEANUP = 64;
     KIND_FAIL_SUBSCRIPTION = 65;
     KIND_SET_SUBSCRIPTION_OWNER = 66;
     KIND_RENAME_SUBSCRIPTION = 67;
@@ -277,7 +279,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 27;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 28;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -639,7 +641,8 @@ impl WalTableStatistics<'_> {
                         .columns
                         .iter()
                         .map(|record| {
-                            2 + 4
+                            8 + 2
+                                + 4
                                 + 8
                                 + 4
                                 + 4
@@ -656,7 +659,7 @@ impl WalTableStatistics<'_> {
         match self {
             Self::Captured(statistics) => {
                 let valid_columns = statistics.columns.len();
-                let mut ok = buffer.append(&[TABLE_STATISTICS_V6])
+                let mut ok = buffer.append(&[TABLE_STATISTICS_V7])
                     && buffer.append(&[u8::from(statistics.valid)])
                     && buffer.append(&statistics.rows.to_le_bytes())
                     && buffer.append(&statistics.average_row_width.to_le_bytes())
@@ -666,7 +669,8 @@ impl WalTableStatistics<'_> {
                     && buffer.append(&(valid_columns as u16).to_le_bytes());
                 for record in statistics.columns.iter() {
                     let column = record.statistics();
-                    ok &= buffer.append(&record.attribute().to_le_bytes())
+                    ok &= buffer.append(&record.index().to_le_bytes())
+                        && buffer.append(&record.attribute().to_le_bytes())
                         && buffer.append(&column.null_fraction.to_bits().to_le_bytes())
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction.to_bits().to_le_bytes())
@@ -1580,8 +1584,11 @@ fn append_table_payload<B: DefinitionBacking>(
             | (u8::from(c.user_type.is_some()) << 7);
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
-        // NOT NULL inheritability in bit 0, `attislocal` in bit 1.
-        ok &= buffer.append(&[u8::from(c.not_null_inheritable) | (u8::from(c.local) << 1)]);
+        // NOT NULL inheritability in bit 0, `attislocal` in bit 1, a NOT
+        // VALID NOT NULL constraint in bit 2.
+        ok &= buffer.append(&[u8::from(c.not_null_inheritable)
+            | (u8::from(c.local) << 1)
+            | (u8::from(!c.proven_not_null() && c.not_null.is_required()) << 2)]);
         // The generation kind (`pg_attribute.attgenerated`), zero when none.
         ok &= buffer.append(&[c
             .default
@@ -2026,10 +2033,6 @@ pub(crate) enum WalOp<'a> {
         definition_generation: u64,
         schema: &'a str,
         table: &'a str,
-    },
-    CompleteSubscriptionCleanup {
-        name: &'a str,
-        created_at: u64,
     },
     FailSubscription {
         name: &'a str,
@@ -3605,7 +3608,6 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetSubscriptionBootstrap { .. } => KIND_SET_SUBSCRIPTION_BOOTSTRAP,
         WalOp::ResetSubscriptionRelations { .. } => KIND_RESET_SUBSCRIPTION_RELATIONS,
         WalOp::AddSubscriptionRelation { .. } => KIND_ADD_SUBSCRIPTION_RELATION,
-        WalOp::CompleteSubscriptionCleanup { .. } => KIND_COMPLETE_SUBSCRIPTION_CLEANUP,
         WalOp::FailSubscription { .. } => KIND_FAIL_SUBSCRIPTION,
         WalOp::AlterSubscription { .. } => KIND_ALTER_SUBSCRIPTION,
         WalOp::SetSubscriptionOwner { .. } => KIND_SET_SUBSCRIPTION_OWNER,
@@ -4086,7 +4088,6 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             ..
         } => 1 + name.len() + 8 + 8 + 1 + schema.len() + 1 + table.len(),
-        WalOp::CompleteSubscriptionCleanup { name, .. } => 1 + name.len() + 8,
         WalOp::FailSubscription { name, message, .. } => {
             1 + name.len() + 8 + 8 + 5 + 1 + message.len()
         }
@@ -5940,9 +5941,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
         }
-        WalOp::CompleteSubscriptionCleanup { name, created_at } => {
-            name_bytes(buffer, name) && buffer.append(&created_at.to_le_bytes())
-        }
         WalOp::FailSubscription {
             name,
             created_at,
@@ -7575,6 +7573,8 @@ fn decode_statistics_column<'p>(
     payload: &'p [u8],
     at: &mut usize,
 ) -> Option<(crate::storage::AnalyzedColumn, &'p [u8])> {
+    let index = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+    *at += 8;
     let attribute = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
     let null_fraction = f32::from_bits(u32::from_le_bytes(
@@ -7596,23 +7596,20 @@ fn decode_statistics_column<'p>(
     if length != 0 && crate::storage::ColumnDistribution::parse(distribution).is_none() {
         return None;
     }
-    let record = crate::storage::AnalyzedColumn::new(
-        attribute,
-        ColumnStatistics {
-            valid: true,
-            null_fraction,
-            distinct_values,
-            distinct_fraction,
-            average_width,
-        },
-    )
-    .ok()?;
+    let statistics = ColumnStatistics {
+        valid: true,
+        null_fraction,
+        distinct_values,
+        distinct_fraction,
+        average_width,
+    };
+    let record = crate::storage::AnalyzedColumn::keyed(index, attribute, statistics).ok()?;
     Some((record, distribution))
 }
 
 /// The column count and distribution bytes of a valid payload.
 fn validate_table_statistics_payload(payload: &[u8]) -> Option<(usize, usize)> {
-    if payload.len() < STATISTICS_HEADER || payload[0] != TABLE_STATISTICS_V6 || payload[1] > 1 {
+    if payload.len() < STATISTICS_HEADER || payload[0] != TABLE_STATISTICS_V7 || payload[1] > 1 {
         return None;
     }
     let count = usize::from(u16::from_le_bytes(
@@ -7620,18 +7617,18 @@ fn validate_table_statistics_payload(payload: &[u8]) -> Option<(usize, usize)> {
             .try_into()
             .ok()?,
     ));
-    if count > crate::storage::MAX_RELATION_COLUMNS {
+    if count > crate::storage::MAX_STATISTICS_RECORDS {
         return None;
     }
     let mut at = STATISTICS_HEADER;
-    let mut previous = 0;
+    let mut previous = None;
     let mut values = 0usize;
     for _ in 0..count {
         let (column, distribution) = decode_statistics_column(payload, &mut at)?;
-        if column.attribute() <= previous {
+        if previous.is_some_and(|previous| column.key() <= previous) {
             return None;
         }
-        previous = column.attribute();
+        previous = Some(column.key());
         values += distribution.len();
     }
     (at == payload.len()).then_some((count, values))
@@ -7657,7 +7654,7 @@ fn decode_table_statistics(
         image.columns.iter().all(|column| {
             decode_statistics_column(payload, &mut at).is_some_and(|(decoded, distribution)| {
                 decoded.statistics() == column.statistics()
-                    && decoded.attribute() == column.attribute()
+                    && decoded.key() == column.key()
                     && distribution == image.columns.distribution_bytes(*column)
             })
         })
@@ -8671,11 +8668,16 @@ fn decode_op_inner<'a>(
                 let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
                 at += 1;
                 let column_flags = *payload.get(at)?;
-                if column_flags & !3 != 0 {
+                if column_flags & !7 != 0 {
                     return None;
                 }
                 let not_null_inheritable = column_flags & 1 != 0;
                 let local = column_flags & 2 != 0;
+                let not_null_validated = column_flags & 4 == 0;
+                // Only a NOT NULL constraint can be NOT VALID.
+                if !not_null_validated && !not_null.is_required() {
+                    return None;
+                }
                 at += 1;
                 let generation = match *payload.get(at)? {
                     0 => None,
@@ -8753,6 +8755,7 @@ fn decode_op_inner<'a>(
                     compression,
                     not_null,
                     not_null_inheritable,
+                    not_null_validated,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -9841,12 +9844,6 @@ fn decode_op_inner<'a>(
                 schema,
                 table,
             })
-        }),
-        KIND_COMPLETE_SUBSCRIPTION_CLEANUP => decode_large_op(|| {
-            let name = take_name(&mut at)?;
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
-            (at == payload.len()).then_some(WalOp::CompleteSubscriptionCleanup { name, created_at })
         }),
         KIND_FAIL_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
@@ -12915,7 +12912,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
-        Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
+        Some(OwnedDatum::Array { len, .. }) => {
+            1 + crate::storage::CACHED_ARRAY_ELEMENT_BYTES + *len as usize
+        }
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
             5 + *len as usize
         }
@@ -13356,11 +13355,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             len,
             bytes,
         }) => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             out[0] = 200;
-            out[1..7].copy_from_slice(&element.bytes());
-            out[7] = *len;
-            out[8..8 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            8 + *len as usize
+            out[1..1 + D].copy_from_slice(&element.bytes());
+            out[1 + D] = *len;
+            out[2 + D..2 + D + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + D + *len as usize
         }
         Some(OwnedDatum::Range {
             kind,
@@ -13674,11 +13674,12 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             })
         }
         200 => {
+            const D: usize = crate::storage::CACHED_ARRAY_ELEMENT_BYTES;
             let element = crate::storage::CachedArrayElement::from_bytes(
-                payload.get(*at..*at + 6)?.try_into().ok()?,
+                payload.get(*at..*at + D)?.try_into().ok()?,
             )?;
-            let len = *payload.get(*at + 6)? as usize;
-            *at += 7;
+            let len = *payload.get(*at + D)? as usize;
+            *at += D + 1;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
             Some(OwnedDatum::Array {
                 element,
@@ -14279,7 +14280,7 @@ mod tests {
     #[test]
     fn compact_catalog_defaults_keep_postgresql_label_and_reference_types() {
         use crate::sql::types::Datum;
-        assert!(core::mem::size_of::<OwnedDatum>() <= 128);
+        assert!(core::mem::size_of::<OwnedDatum>() <= 136);
         let label = "é".repeat(31) + "a";
         let too_long = "é".repeat(32);
         let mut encoded = [0u8; MAX_DEFAULT_ENCODED];
@@ -15793,6 +15794,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -15813,6 +15815,7 @@ mod tests {
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -16394,6 +16397,35 @@ mod tests {
                 assert!(incompatible.append(&current.readable()[1..]));
                 assert!(decode_table_payload(incompatible.readable()).is_none());
             }
+        });
+    }
+
+    #[test]
+    fn table_payload_keeps_a_not_valid_not_null_constraint_only_on_its_column() {
+        let mut definition = sample_def();
+        definition.columns[0].not_null_validated = false;
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "not valid payload", 4096).unwrap();
+        let mut encode = |definition: &TableDefBuilder| {
+            payload.clear();
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: definition.into(),
+                }
+            ));
+            let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
+            (
+                restored.columns[0].not_null_validated,
+                restored.columns[1].not_null_validated,
+            )
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(encode(&definition), (false, true));
+            // A nullable column encodes no NOT VALID bit, whatever it holds.
+            definition.columns[1].not_null_validated = false;
+            assert_eq!(encode(&definition), (false, true));
         });
     }
 
@@ -19160,29 +19192,29 @@ mod tests {
         statistics.rows = 7;
         statistics.average_row_width = 12;
         statistics.analyzed_generation = 9;
-        let mut columns = pool.lease(1).unwrap();
+        let mut columns = pool.lease(2).unwrap();
+        let column = ColumnStatistics {
+            valid: true,
+            null_fraction: 0.125,
+            distinct_values: 6,
+            distinct_fraction: 0.0,
+            average_width: 4,
+        };
         columns
-            .push_reserved(
-                crate::storage::AnalyzedColumn::new(
-                    1600,
-                    ColumnStatistics {
-                        valid: true,
-                        null_fraction: 0.125,
-                        distinct_values: 6,
-                        distinct_fraction: 0.0,
-                        average_width: 4,
-                    },
-                )
-                .unwrap(),
-            )
+            .push_reserved(crate::storage::AnalyzedColumn::new(1600, column).unwrap())
             .unwrap();
+        columns
+            .push_reserved(crate::storage::AnalyzedColumn::of_index(77, 32, column).unwrap())
+            .unwrap();
+        assert!(crate::storage::AnalyzedColumn::of_index(77, 33, column).is_err());
+        assert!(crate::storage::AnalyzedColumn::of_index(0, 1, column).is_err());
         statistics.columns = crate::storage::ColumnImages::new(
             columns.freeze(),
             crate::mem::lease_pool::SharedSlice::EMPTY,
         )
         .unwrap();
-        let mut tight_budget = Budget::new(LeasePool::budget_bytes(64, 1));
-        let tight_pool = LeasePool::new(&mut tight_budget, Purpose::STATISTICS, 64, 1).unwrap();
+        let mut tight_budget = Budget::new(LeasePool::budget_bytes(128, 1));
+        let tight_pool = LeasePool::new(&mut tight_budget, Purpose::STATISTICS, 128, 1).unwrap();
         let mut admitted = statistics.clone();
         admitted.columns = crate::storage::ColumnImages::new(
             tight_pool.copy_slice(&statistics.columns).unwrap(),
@@ -19193,7 +19225,7 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "wide table statistics", 1024).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             assert!(WalTableStatistics::Captured(&statistics).append(&mut payload));
-            assert_eq!(payload.readable()[0], TABLE_STATISTICS_V6);
+            assert_eq!(payload.readable()[0], TABLE_STATISTICS_V7);
             assert_eq!(
                 WalTableStatistics::Encoded(payload.readable())
                     .materialize(&pool, None)
@@ -19214,6 +19246,7 @@ mod tests {
                 TABLE_STATISTICS_V3,
                 TABLE_STATISTICS_V4,
                 TABLE_STATISTICS_V5,
+                TABLE_STATISTICS_V6,
             ] {
                 let mut bytes = [0u8; 24];
                 bytes[0] = old;
@@ -19223,33 +19256,51 @@ mod tests {
                         .is_err()
                 );
             }
-            let mut malformed = [0u8; 66];
+            assert_eq!(payload.len(), 108);
+            let mut malformed = [0u8; 108];
             malformed.copy_from_slice(payload.readable());
             for attribute in [0u16, 1601] {
-                malformed[40..42].copy_from_slice(&attribute.to_le_bytes());
+                malformed[48..50].copy_from_slice(&attribute.to_le_bytes());
                 assert!(
                     WalTableStatistics::Encoded(&malformed)
                         .materialize(&pool, None)
                         .is_err()
                 );
             }
+            // An index's key position past the index's 32 keys, and records
+            // out of (index, attribute) order.
             malformed.copy_from_slice(payload.readable());
-            malformed[42..46].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+            malformed[82..84].copy_from_slice(&33u16.to_le_bytes());
             assert!(
                 WalTableStatistics::Encoded(&malformed)
                     .materialize(&pool, None)
                     .is_err()
             );
-            let mut duplicate = [0u8; 92];
-            duplicate[..66].copy_from_slice(payload.readable());
-            duplicate[66..].copy_from_slice(&payload.readable()[40..]);
-            duplicate[38..40].copy_from_slice(&2u16.to_le_bytes());
+            malformed.copy_from_slice(payload.readable());
+            malformed[40..74].copy_from_slice(&payload.readable()[74..108]);
+            malformed[74..108].copy_from_slice(&payload.readable()[40..74]);
+            assert!(
+                WalTableStatistics::Encoded(&malformed)
+                    .materialize(&pool, None)
+                    .is_err()
+            );
+            malformed.copy_from_slice(payload.readable());
+            malformed[50..54].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+            assert!(
+                WalTableStatistics::Encoded(&malformed)
+                    .materialize(&pool, None)
+                    .is_err()
+            );
+            let mut duplicate = [0u8; 142];
+            duplicate[..108].copy_from_slice(payload.readable());
+            duplicate[108..].copy_from_slice(&payload.readable()[74..]);
+            duplicate[38..40].copy_from_slice(&3u16.to_le_bytes());
             assert!(
                 WalTableStatistics::Encoded(&duplicate)
                     .materialize(&pool, None)
                     .is_err()
             );
-            assert!(validate_table_statistics_payload(&payload.readable()[..65]).is_none());
+            assert!(validate_table_statistics_payload(&payload.readable()[..107]).is_none());
             payload.clear();
             assert!(WalTableStatistics::Captured(&TableStatistics::EMPTY).append(&mut payload));
             assert_eq!(

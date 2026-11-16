@@ -238,6 +238,7 @@ fn empty_meta() -> ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -506,6 +507,7 @@ pub(super) fn build_column(
         compression: c.compression,
         not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
         not_null_inheritable: c.not_null_inheritable,
+        not_null_validated: true,
         unique: c.unique,
         primary: c.primary,
         auto_increment,
@@ -1121,6 +1123,224 @@ pub(crate) fn plain_column_reference<Definition0: crate::storage::DefinitionBack
         }
         _ => Ok(None),
     }
+}
+
+/// Whether two stored CHECK predicates are the same expression, as
+/// PostgreSQL's `equal()` compares their analyzed trees when it merges a
+/// constraint with an inherited one: their parsed forms, regardless of
+/// spacing, redundant parentheses, keyword case or quoting.
+pub(crate) fn same_check_expression(
+    left: &str,
+    right: &str,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    if left == right {
+        return Ok(true);
+    }
+    let mark = arena.mark();
+    let same = (|| -> Result<bool, SqlError> {
+        let left = arena
+            .alloc_str(left)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let right = arena
+            .alloc_str(right)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        Ok(crate::sql::parser::parse_expr(left, arena)?
+            == crate::sql::parser::parse_expr(right, arena)?)
+    })();
+    // SAFETY: the comparison retains nothing of the arena.
+    unsafe { arena.rewind_to(mark) };
+    same
+}
+
+/// PostgreSQL's analysis of a CHECK predicate when the constraint is
+/// defined on `def`: its names resolve and its result is boolean. Returns
+/// the one column it reads, if one. CREATE TABLE (`positioned`) positions an
+/// unknown column as PostgreSQL does; ALTER TABLE reports it without one.
+pub(crate) fn analyse_check_expression<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
+    def: &crate::storage::TableDefinition<Definition0>,
+    expression: &Expr<'_>,
+    positioned: bool,
+    arena: &Arena,
+) -> Result<Option<usize>, SqlError> {
+    let single_column = if positioned {
+        crate::sql::error_position::with_analysis(|| expression_variables(expression, def))?
+    } else {
+        expression_variables(expression, def)?
+    }
+    .single_column();
+    let analyse = || -> Result<(), SqlError> {
+        let mark = arena.mark();
+        let analysed = super::infer_type_res(
+            expression,
+            &super::CatalogCols {
+                remote_ctid: false,
+                definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
+        )
+        .and_then(|(type_oid, _)| {
+            if type_oid == ColType::Bool.oid() || type_oid == crate::sql::types::oid::UNKNOWN {
+                return Ok(());
+            }
+            Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "argument of CHECK must be type boolean, not type {}",
+                    crate::sql::catalog::format_type_name(storage, txid, type_oid)?.as_str()
+                ),
+                expression,
+            ))
+        });
+        // Only the verdict leaves; analysis scratch is discarded.
+        unsafe { arena.rewind_to(mark) };
+        analysed
+    };
+    if positioned {
+        crate::sql::error_position::with_analysis(analyse)?;
+    } else {
+        analyse().inspect_err(|error| {
+            crate::sql::error_position::take_position(error);
+        })?;
+    }
+    Ok(single_column)
+}
+
+/// A CHECK constraint being added to a relation that already has one of
+/// the same name (`MergeWithExistingConstraint`).
+#[derive(Clone, Copy)]
+pub(crate) struct CheckAddition<'a> {
+    /// The predicate as stored.
+    pub(crate) stored: &'a str,
+    pub(crate) validation: crate::sql::ast::ConstraintValidation,
+    /// Whether the relation defines it itself, rather than receiving it from
+    /// a parent the statement adds it to.
+    pub(crate) local: bool,
+    pub(crate) no_inherit: bool,
+    /// Whether the statement may merge it with an existing definition.
+    pub(crate) allow_merge: bool,
+}
+
+/// Whether PostgreSQL merges `addition` into the same-named CHECK
+/// `existing` of `relation` (a partition when `partition`), which
+/// `inherited` relations' constraints it receives: `Ok` merges, with the
+/// notice the caller reports; otherwise the conflict's error.
+pub(crate) fn merge_with_existing_check(
+    existing: &crate::storage::CheckConstraint,
+    inherited: bool,
+    relation: &str,
+    partition: bool,
+    addition: CheckAddition<'_>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let name = existing.name.as_str();
+    let found = same_check_expression(existing.expression.as_str(), addition.stored, arena)?;
+    // A purely inherited constraint merges a local definition, so a parent
+    // and its child may add it in either order; a partition's never does.
+    let allow_merge = addition.allow_merge || (addition.local && !existing.local && !partition);
+    if !found || !allow_merge {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "constraint \"{}\" for relation \"{}\" already exists",
+            name,
+            relation
+        ));
+    }
+    if existing.no_inherit {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with non-inherited constraint on relation \"{}\"",
+            name,
+            relation
+        ));
+    }
+    if inherited && addition.no_inherit {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with inherited constraint on relation \"{}\"",
+            name,
+            relation
+        ));
+    }
+    let enforced = addition.validation.enforced();
+    if addition.validation == crate::sql::ast::ConstraintValidation::EnforcedValidated
+        && existing.validation == crate::storage::ConstraintValidation::EnforcedNotValid
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with NOT VALID constraint on relation \"{}\"",
+            name,
+            relation
+        ));
+    }
+    if (!addition.local && enforced && !existing.validation.enforced())
+        || (addition.local && !enforced && existing.validation.enforced())
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with NOT ENFORCED constraint on relation \"{}\"",
+            name,
+            relation
+        ));
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `MergeConstraintsIntoExisting` for one CHECK `parent` of a
+/// relation becoming the parent of `child`, which already has the
+/// same-named `existing`: `Ok` when it takes the parent's.
+pub(crate) fn merge_check_into_existing(
+    parent: &crate::storage::CheckConstraint,
+    existing: &crate::storage::CheckConstraint,
+    child: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let name = parent.name.as_str();
+    if !same_check_expression(
+        existing.expression.as_str(),
+        parent.expression.as_str(),
+        arena,
+    )? {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "child table \"{}\" has different definition for check constraint \"{}\"",
+            child,
+            name
+        ));
+    }
+    if existing.no_inherit {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
+            name,
+            child
+        ));
+    }
+    if parent.validation.validated()
+        && existing.validation == crate::storage::ConstraintValidation::EnforcedNotValid
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with NOT VALID constraint on child table \"{}\"",
+            name,
+            child
+        ));
+    }
+    if parent.validation.enforced() && !existing.validation.enforced() {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "constraint \"{}\" conflicts with NOT ENFORCED constraint on child table \"{}\"",
+            name,
+            child
+        ));
+    }
+    Ok(())
 }
 
 /// The stored spelling of a validated single-relation expression (a CHECK
@@ -1874,6 +2094,49 @@ pub(super) fn attach_constraints(
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
                 reject_virtual_columns(def, &indices[..n], "primary keys")?;
+                // `ATPrepAddPrimaryKey` reuses a column's NOT NULL
+                // constraint only when it suits a key
+                // (`verifyNotNullPKCompatible`).
+                if !merge_equivalent {
+                    for &column_index in &indices[..n] {
+                        let column = def.columns[column_index as usize];
+                        if !column.not_null.is_required()
+                            || (column.not_null_inheritable && column.not_null_validated)
+                        {
+                            continue;
+                        }
+                        let constraint =
+                            def.not_null_names[column_index as usize].unwrap_or(SqlName::EMPTY);
+                        let (marked, hint) = if column.not_null_inheritable {
+                            (
+                                "NOT VALID",
+                                "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+                            )
+                        } else {
+                            (
+                                "NO INHERIT",
+                                "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.",
+                            )
+                        };
+                        return Err(crate::sql::error_position::with_hint(
+                            crate::sql::error_position::with_detail(
+                                sql_err!(
+                                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                                    "cannot create primary key on column \"{}\"",
+                                    column.name.as_str()
+                                ),
+                                format_args!(
+                                    "The constraint \"{}\" on column \"{}\" of table \"{}\", marked {}, is incompatible with a primary key.",
+                                    constraint.as_str(),
+                                    column.name.as_str(),
+                                    def.name.as_str(),
+                                    marked
+                                ),
+                            ),
+                            hint,
+                        ));
+                    }
+                }
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();
@@ -1996,62 +2259,14 @@ pub(super) fn attach_constraints(
                         def.name.as_str()
                     ));
                 }
-                // CREATE TABLE (the only caller merging equivalent
-                // constraints) positions a CHECK's unknown column as
-                // PostgreSQL does; ALTER TABLE reports it without one.
-                let single_column = if merge_equivalent {
-                    crate::sql::error_position::with_analysis(|| {
-                        expression_variables(expression, def)
-                    })?
-                } else {
-                    expression_variables(expression, def)?
-                }
-                .single_column();
-                // PostgreSQL analyses the predicate when the constraint is
-                // defined: its names resolve and its result is boolean.
-                let analyse = || -> Result<(), SqlError> {
-                    let mark = arena.mark();
-                    let analysed = super::infer_type_res(
-                        expression,
-                        &super::CatalogCols {
-                            remote_ctid: false,
-                            definition: Some(crate::storage::RelationDefinition::from_definition(
-                                def,
-                            )),
-                            alias: None,
-                            output_aliases: &[],
-                            storage,
-                            txid,
-                            arena,
-                        },
-                    )
-                    .and_then(|(type_oid, _)| {
-                        if type_oid == ColType::Bool.oid()
-                            || type_oid == crate::sql::types::oid::UNKNOWN
-                        {
-                            return Ok(());
-                        }
-                        Err(crate::sql::error_position::at_expression(
-                            sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "argument of CHECK must be type boolean, not type {}",
-                                crate::sql::catalog::format_type_name(storage, txid, type_oid)?
-                                    .as_str()
-                            ),
-                            expression,
-                        ))
-                    });
-                    // Only the verdict leaves; analysis scratch is discarded.
-                    unsafe { arena.rewind_to(mark) };
-                    analysed
-                };
-                if merge_equivalent {
-                    crate::sql::error_position::with_analysis(analyse)?;
-                } else {
-                    analyse().inspect_err(|error| {
-                        crate::sql::error_position::take_position(error);
-                    })?;
-                }
+                let single_column = analyse_check_expression(
+                    storage,
+                    txid,
+                    def,
+                    expression,
+                    merge_equivalent,
+                    arena,
+                )?;
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,

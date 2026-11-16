@@ -474,6 +474,7 @@ impl PlannerValues {
             nestloop: self.flag("enable_nestloop"),
             material: self.flag("enable_material"),
             sort: self.flag("enable_sort"),
+            incremental_sort: self.flag("enable_incremental_sort"),
             hashagg: self.flag("enable_hashagg"),
         }
     }
@@ -529,6 +530,7 @@ pub(crate) struct PlannerMethods {
     pub(crate) nestloop: bool,
     pub(crate) material: bool,
     pub(crate) sort: bool,
+    pub(crate) incremental_sort: bool,
     pub(crate) hashagg: bool,
 }
 
@@ -542,6 +544,7 @@ impl PlannerMethods {
         nestloop: true,
         material: true,
         sort: true,
+        incremental_sort: true,
         hashagg: true,
     };
 }

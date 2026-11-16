@@ -4951,6 +4951,15 @@ pub(crate) fn generic_plan_parameters<'v>() -> &'v [Datum<'v>] {
     unsafe { core::slice::from_raw_parts(values.cast::<Datum<'v>>(), len) }
 }
 
+/// Whether the plan being planned or run is a prepared statement's generic
+/// plan, which knows no parameter's value.
+pub(crate) fn generic_plan_active() -> bool {
+    !GENERIC_PLAN_PARAMETERS
+        .with(core::cell::Cell::get)
+        .0
+        .is_null()
+}
+
 /// Whether a custom plan being planned binds `$index` to a value, which
 /// makes it a planner constant.
 pub(crate) fn custom_plan_binds(index: u32) -> bool {
@@ -4959,7 +4968,7 @@ pub(crate) fn custom_plan_binds(index: u32) -> bool {
 }
 
 /// The custom plan's parameter values, or none outside one.
-fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
+pub(crate) fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
     let (values, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
     if values.is_null() {
         return NO_PARAMS;
@@ -5513,7 +5522,9 @@ fn runs_on_evaluation(expression: &Expr<'_>, evaluation: Option<ExpressionEvalua
         match expression {
             Expr::Collate { .. } => found.1 = true,
             Expr::Call { .. } if !expression.is_row_constructor() => found.0 = true,
-            Expr::Cast { .. } | Expr::Binary { .. } => found.0 = true,
+            // `eval_const_expressions` folds an `ARRAY[...]` of constants
+            // into one array constant.
+            Expr::Cast { .. } | Expr::Binary { .. } | Expr::Array(_) => found.0 = true,
             // A negated number is a constant as written (`-5`).
             Expr::Unary {
                 operator: super::ast::UnaryOp::Neg,
@@ -9149,9 +9160,12 @@ fn eval_full_inner<'a>(
             // A `.*` that survived to a value position was not a top-level
             // select item — PostgreSQL refuses it there.
             if *field == *"*" {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "row expansion via \"*\" is not supported here"
+                return Err(crate::sql::error_position::expression_error(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "row expansion via \"*\" is not supported here"
+                    ),
+                    expression,
                 ));
             }
             if let Expr::Call {

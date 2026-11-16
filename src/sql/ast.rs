@@ -940,9 +940,9 @@ pub enum Stmt<'a> {
         name: &'a str,
         action: AlterSubscriptionAction<'a>,
     },
-    /// DROP SUBSCRIPTION [IF EXISTS] name [, ...].
+    /// DROP SUBSCRIPTION [IF EXISTS] name [CASCADE | RESTRICT].
     DropSubscription {
-        names: &'a [&'a str],
+        name: &'a str,
         if_exists: bool,
     },
     /// A row trigger definition.  Its timing, event set, target relation and

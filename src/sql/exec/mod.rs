@@ -33113,6 +33113,8 @@ fn classify_planning(
     }
     // Names resolve while PostgreSQL analyzes the expression.
     if record_reference_error(&error)
+        || (error.sqlstate == sqlstate::WRONG_OBJECT_TYPE
+            && error.message.as_str() == "record type has not been registered")
         || matches!(
             error.sqlstate.as_str(),
             sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
@@ -33421,6 +33423,9 @@ fn eval_procedural_expression<'a>(
         if !kept {
             check_procedural_record_fields(context, expression, row)?;
         }
+        if let Expr::Field { base, field: "*" } = expression {
+            return expand_procedural_record(context, base, row, text);
+        }
         eval_procedural_expression_in(context, expression, row, continuation)
     });
     // An assignment keeps its plan once the whole statement is planned.
@@ -33461,7 +33466,46 @@ fn check_procedural_record_fields<'a>(
         row,
         catalog: Some(&catalog),
     };
+    // The expression is the target list of the query PostgreSQL makes of
+    // it, which expands a record's fields only as its whole: elsewhere a
+    // `.*` fails analysis at its position.
+    if let Expr::Field { base, field: "*" } = expression {
+        if let Expr::Column {
+            qualifier: None,
+            name,
+        } = base
+            && super::query::unregistered_record_variable(row, name)
+        {
+            return Err(super::query::record_type_not_registered());
+        }
+        return visit(base, &mut |selection, base, field| {
+            check_record_field(selection, base, field, row, &columns)
+        });
+    }
     visit(expression, &mut |selection, base, field| {
+        check_record_field(selection, base, field, row, &columns)
+    })
+}
+
+/// [`check_procedural_record_fields`] of the field selection `selection`,
+/// `field` of `base`; `*` expands no field here.
+fn check_record_field<'a>(
+    selection: &'a Expr<'a>,
+    base: &'a Expr<'a>,
+    field: &str,
+    row: &TriggerLocalScope<'_, 'a>,
+    columns: &super::eval::RuntimeColumnTypes<'_, 'a>,
+) -> Result<(), SqlError> {
+    if field == "*" {
+        return Err(crate::sql::error_position::expression_error(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "row expansion via \"*\" is not supported here"
+            ),
+            selection,
+        ));
+    }
+    {
         if let Expr::Column {
             qualifier: None,
             name,
@@ -33473,10 +33517,59 @@ fn check_procedural_record_fields<'a>(
                 selection,
             ));
         }
-        super::exec::record_field_metadata(base, field, &columns)
+        super::exec::record_field_metadata(base, field, columns)
             .map(|_| ())
             .map_err(|error| crate::sql::error_position::expression_error(error, selection))
-    })
+    }
+}
+
+/// A PL/pgSQL expression `(base).*`: the one field of the record `base`
+/// as the query's one column, or PostgreSQL's error when the record has
+/// another count of fields.
+fn expand_procedural_record<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    base: &'a Expr<'a>,
+    row: &TriggerLocalScope<'_, 'a>,
+    text: &str,
+) -> Result<Datum<'a>, SqlError> {
+    let arena = context.arena;
+    let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&catalog),
+    };
+    let mut first: Option<&'a str> = None;
+    let mut full = false;
+    let count = super::exec::record_shape_metadata(base, &columns, |name, _| {
+        if first.is_none() {
+            match arena.alloc_str(name) {
+                Ok(name) => first = Some(name),
+                Err(_) => full = true,
+            }
+        }
+    })?
+    .ok_or_else(super::query::record_type_not_registered)?;
+    if full {
+        return Err(arena_full());
+    }
+    if count != 1 {
+        return Err(crate::sql::error_context::with_line(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "query returned {} column{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            format_args!("query: {text}"),
+        ));
+    }
+    let field = arena
+        .alloc(Expr::Field {
+            base,
+            field: first.expect("a record of one field names it"),
+        })
+        .map_err(|_| arena_full())?;
+    eval_procedural_expression_in(context, field, row, None)
 }
 
 /// The backend PL/pgSQL instance running `row`'s routine and the body

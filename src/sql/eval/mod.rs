@@ -9149,9 +9149,12 @@ fn eval_full_inner<'a>(
             // A `.*` that survived to a value position was not a top-level
             // select item — PostgreSQL refuses it there.
             if *field == *"*" {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "row expansion via \"*\" is not supported here"
+                return Err(crate::sql::error_position::expression_error(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "row expansion via \"*\" is not supported here"
+                    ),
+                    expression,
                 ));
             }
             if let Expr::Call {

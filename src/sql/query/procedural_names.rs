@@ -553,10 +553,36 @@ impl<'a: 's, 's> Check<'a, 's> {
             } if !level.has_column(None, name)
                 && anonymous_record_variable(self.variables, name) =>
             {
+                // A `.*` outside a target list or `ROW(...)` expands nothing.
                 Err(Failure(crate::sql::error_position::expression_error(
-                    crate::sql::exec::could_not_identify(field),
+                    if *field == "*" {
+                        crate::sql_err!(
+                            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                            "row expansion via \"*\" is not supported here"
+                        )
+                    } else {
+                        crate::sql::exec::could_not_identify(field)
+                    },
                     node,
                 )))
+            }
+            // `ROW(...)` expands a `.*` argument's fields, which needs the
+            // record's type.
+            Expr::Call {
+                kind: crate::sql::ast::CallKind::SqlSyntax,
+                name: row,
+                args,
+                ..
+            } if row.eq_ignore_ascii_case("row")
+                && args.iter().any(|argument| {
+                    matches!(argument, Expr::Field {
+                        base: Expr::Column { qualifier: None, name },
+                        field: "*",
+                    } if !level.has_column(None, name)
+                        && unregistered_record_variable(self.variables, name))
+                }) =>
+            {
+                Err(Failure(record_type_not_registered()))
             }
             Expr::Subquery(select) => self.subquery(select, level, Expr::Subquery),
             Expr::Exists(select) => self.subquery(select, level, Expr::Exists),
@@ -697,6 +723,17 @@ impl<'a: 's, 's> Check<'a, 's> {
                     })
                 }
                 SelectItem::RecordStar(expression) => {
+                    // Expanding a record variable's fields needs its type,
+                    // which an anonymous record does not register.
+                    if let Expr::Column {
+                        qualifier: None,
+                        name,
+                    } = expression
+                        && !level.has_column(None, name)
+                        && unregistered_record_variable(self.variables, name)
+                    {
+                        return Err(Failure(record_type_not_registered()));
+                    }
                     let new = self.expression(expression, level)?;
                     (!core::ptr::eq(new, *expression)).then_some(SelectItem::RecordStar(new))
                 }
@@ -1005,6 +1042,32 @@ pub(crate) fn anonymous_record_variable<'a>(variables: &dyn ColumnLookup<'a>, na
             variables.lookup(None, name),
             Ok(crate::sql::types::Datum::Record(_))
         )
+}
+
+/// Whether `name` is a `record` variable without a named composite value:
+/// one holding an anonymous record or none. PL/pgSQL passes it to a query
+/// as a parameter of type `record`, so expanding its fields (`(name).*`)
+/// fails parse analysis (`get_expr_result_tupdesc`).
+pub(crate) fn unregistered_record_variable<'a>(
+    variables: &dyn ColumnLookup<'a>,
+    name: &str,
+) -> bool {
+    variables.procedural_variable(None, name).is_some()
+        && variables.col_type(None, name) == Some(crate::sql::types::ColType::Record)
+        && !matches!(
+            variables.lookup_unsuggested(None, name),
+            Ok(crate::sql::types::Datum::Composite { .. }
+                | crate::sql::types::Datum::CompositeText { .. })
+        )
+}
+
+/// PostgreSQL's error expanding the fields of a `record` value whose type
+/// it cannot look up.
+pub(crate) fn record_type_not_registered() -> SqlError {
+    crate::sql_err!(
+        crate::sql::eval::sqlstate::WRONG_OBJECT_TYPE,
+        "record type has not been registered"
+    )
 }
 
 /// The declared fields of an unassigned row variable `name` of type

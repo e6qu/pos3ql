@@ -74418,26 +74418,26 @@ fn validate_index_rows(
         )
     };
     let mut exclusion = |position: usize| {
-        scan_index_rows(
+        let mut rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+            for_each_index_build_row(
+                storage,
+                table_index,
+                txid,
+                &definition,
+                ordered,
+                arena,
+                visit,
+            )
+        };
+        constraints::check_exclusion_build(
             storage,
             table_index,
             txid,
+            &definition,
+            position,
+            &mut rows,
             arena,
-            &mut |rowid, schema, values| {
-                constraints::check_rebuilt_exclusion(
-                    storage,
-                    table_index,
-                    &definition,
-                    schema,
-                    values,
-                    rowid,
-                    txid,
-                    arena,
-                    position,
-                )
-            },
         )
-        .map(|_| ())
     };
     let selected = constraints::check_sorted_builds(
         storage,
@@ -97164,8 +97164,8 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
 }
 
 /// Builds `def`'s selected unique keys over the rows of `table`, a relation
-/// with `def`'s columns, as PostgreSQL builds their indexes. Exclusion
-/// constraints are left to the row checks.
+/// with `def`'s columns, as PostgreSQL builds their indexes, the exclusion
+/// constraints among them too.
 fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table: usize,
@@ -97185,7 +97185,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             )
         })?;
     }
-    let mut rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+    let rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
         for_each_index_build_row(
             storage,
             table,
@@ -97202,6 +97202,22 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             },
         )
     };
+    // A deferrable exclusion constraint's conflicts are queued by the row
+    // checks; another is checked as building its index checks it.
+    let mut exclusion = |position: usize| {
+        if def.exclusions()[position].timing.is_deferrable() {
+            return Ok(());
+        }
+        constraints::check_exclusion_build(
+            storage,
+            table,
+            txid,
+            def,
+            position,
+            &mut { rows },
+            arena,
+        )
+    };
     constraints::check_sorted_builds(
         storage,
         table,
@@ -97209,8 +97225,8 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
         def,
         keys,
         ColumnSet::EMPTY,
-        &mut rows,
-        &mut |_| Ok(()),
+        &mut { rows },
+        &mut exclusion,
         arena,
     )?;
     Ok(())
@@ -98405,72 +98421,6 @@ fn drop_column_constraints(
         }
     }
     Ok(removed_count)
-}
-
-/// Whether two rewritten rows conflict under the exclusion constraint at
-/// `position`, whose parsed predicate `expressions` holds.
-#[allow(clippy::too_many_arguments)]
-fn rewritten_exclusion_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
-    storage: &Storage,
-    transaction: u32,
-    table_index: usize,
-    new_def: &crate::storage::TableDefinition<Definition0>,
-    expressions: &ParsedChecks,
-    scan: &constraints::ExclusionScan<'_, 'a>,
-    position: usize,
-    a: &[Datum<'a>],
-    b: &[Datum<'a>],
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    let catalog = super::query::storage_catalog(storage, arena, transaction);
-    let hooks = EvalHooks {
-        catalog: Some(&catalog),
-        ..super::eval::NO_HOOKS
-    };
-    if let Some(predicate) = expressions[crate::storage::MAX_CHECKS + position] {
-        let left = RowCtx {
-            table_oid: None,
-            def: crate::storage::RelationDefinition::from_definition(new_def),
-            values: a,
-            alias: None,
-        };
-        let right = RowCtx {
-            table_oid: None,
-            def: crate::storage::RelationDefinition::from_definition(new_def),
-            values: b,
-            alias: None,
-        };
-        if !matches!(
-            eval_full(predicate, arena, &[], &left, &hooks)?,
-            Datum::Bool(true)
-        ) || !matches!(
-            eval_full(predicate, arena, &[], &right, &hooks)?,
-            Datum::Bool(true)
-        ) {
-            return Ok(());
-        }
-    }
-    let mark = arena.mark();
-    let result = (|| {
-        let left = scan.keys(storage, transaction, new_def, a, arena)?;
-        let right = scan.keys(storage, transaction, new_def, b, arena)?;
-        if scan.conflicts(storage, transaction, &left, &right, arena)? {
-            return Err(constraints::index_build_exclusion_violation(
-                scan,
-                storage,
-                transaction,
-                table_index,
-                new_def,
-                &right,
-                &left,
-                arena,
-            ));
-        }
-        Ok(())
-    })();
-    // SAFETY: both rows' keys are consumed; only an owned error escapes.
-    unsafe { arena.rewind_to(mark) };
-    result
 }
 
 /// Forgets the stamp of a column default that this ALTER replaces, so table
@@ -104663,21 +104613,6 @@ fn alter_table_relation(
     // old rows still installed in storage: PostgreSQL rebuilds every index of
     // the rewritten table, in OID order.
     if has_rewrite {
-        let exclusion_scans = match arena
-            .alloc_slice_with(new_def.n_exclusions, |_| constraints::ExclusionScan::EMPTY)
-        {
-            Ok(scans) => scans,
-            Err(_) => return sql_fail(crate::sql::eval::arena_full()),
-        };
-        for (scan, exclusion) in exclusion_scans.iter_mut().zip(new_def.exclusions()) {
-            *scan = match constraints::ExclusionScan::new(
-                exclusion, storage, txn.txid, &new_def, arena,
-            ) {
-                Ok(scan) => scan,
-                Err(error) => return sql_fail(error),
-            };
-        }
-        let exclusion_scans = &*exclusion_scans;
         let images = &rewritten_images;
         // The rewritten images are in the copied heap's order.
         let mut rows = |_: bool, visit: &mut constraints::BuildRowVisit<'_>| {
@@ -104689,31 +104624,27 @@ fn alter_table_relation(
             }
             Ok(())
         };
-        // Each exclusion constraint compares every pair of rewritten rows.
+        // Each exclusion constraint checks the rewritten rows as its
+        // rebuilt index does.
         let mut exclusion = |position: usize| {
-            for (a, image) in images.iter().enumerate() {
-                let abytes = image.as_ref().expect("rewritten input retained");
-                let mut avals = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(abytes, new_schema, &mut avals)?;
-                for image in images.iter().skip(a + 1) {
-                    let bbytes = image.as_ref().expect("rewritten input retained");
-                    let mut bvals = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bbytes, new_schema, &mut bvals)?;
-                    rewritten_exclusion_conflict(
-                        storage,
-                        txn.txid,
-                        table_index,
-                        &new_def,
-                        &checks,
-                        &exclusion_scans[position],
-                        position,
-                        &avals[..new_def.n_columns],
-                        &bvals[..new_def.n_columns],
-                        arena,
-                    )?;
+            let mut rows = |_: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+                for image in images.iter() {
+                    let bytes = image.as_ref().expect("rewritten input retained");
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, new_schema, &mut values)?;
+                    visit(0, &values[..new_def.n_columns], bytes.len())?;
                 }
-            }
-            Ok(())
+                Ok(())
+            };
+            constraints::check_exclusion_build(
+                storage,
+                table_index,
+                txn.txid,
+                &new_def,
+                position,
+                &mut rows,
+                arena,
+            )
         };
         let mut retyped = ColumnSet::EMPTY;
         for (column, source) in source[..new_def.n_columns].iter().enumerate() {

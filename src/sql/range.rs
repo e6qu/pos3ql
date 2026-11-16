@@ -792,6 +792,20 @@ pub fn cmp_ranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlErro
     )
 }
 
+/// Orders two non-empty ranges by their upper bounds, an infinite one
+/// last, as `range_cmp_bounds` does.
+pub fn cmp_upper_bounds(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
+    let (parsed_a, parsed_b) = (parse(a)?, parse(b)?);
+    cmp_bound(
+        parsed_a.upper,
+        parsed_a.upper_inc,
+        parsed_b.upper,
+        parsed_b.upper_inc,
+        false,
+        kind,
+    )
+}
+
 /// Compares one bound of two ranges. `None` value denotes an infinite bound;
 /// `lower` selects the direction so infinities and inclusivity ties resolve the
 /// way PostgreSQL's `range_cmp_bounds` does.

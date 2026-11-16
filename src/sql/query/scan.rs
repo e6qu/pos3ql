@@ -1540,6 +1540,18 @@ pub(crate) struct IndexAccessPlan<'a> {
     prune_blocks: bool,
     /// EXPLAIN prints the conditions as the query wrote them.
     as_written: bool,
+    /// The conditions of the path PostgreSQL's costs chose.
+    chosen: Option<ChosenConditions<'a>>,
+}
+
+/// The conditions of a path PostgreSQL's costs chose, as EXPLAIN prints
+/// them: an index scan's index conditions, a bitmap heap scan's recheck,
+/// and the restrictions neither filter repeats.
+#[derive(Clone, Copy)]
+pub(crate) struct ChosenConditions<'a> {
+    pub(crate) conditions: &'a [super::index_paths::IndexCondition<'a>],
+    pub(crate) recheck: &'a [&'a Expr<'a>],
+    pub(crate) absorbed: &'a [&'a Expr<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -1588,55 +1600,51 @@ impl<'a> OrderedIndexAccessPlan<'a> {
 }
 
 impl<'a> IndexAccessPlan<'a> {
-    /// The index conditions of the index path PostgreSQL chose, for EXPLAIN
-    /// to print: `None` when they do not fit one key column's two bounds
-    /// (an equality and a range, or two ranges).
-    pub(crate) fn chosen(
-        path: &super::index_paths::ScanPath<'a>,
-        definition: &TableDef,
-    ) -> Option<Self> {
-        let column = path.index_column;
-        let meta = definition.columns().get(column)?;
-        let mut constraints = [None; MAX_INDEX_COLS];
-        let mut additional_constraints = [None; MAX_INDEX_COLS];
-        for (position, condition) in path.conditions().enumerate() {
-            // A null test prints as written: its source is its own operand.
-            let constraint = IndexConstraint {
-                operand: condition.operand.unwrap_or(condition.source),
-                operator: condition.operator.unwrap_or(BinaryOp::Eq),
-                key: condition.key,
-                source: condition.source,
-            };
-            match position {
-                0 => constraints[0] = Some(constraint),
-                1 => additional_constraints[0] = Some(constraint),
-                _ => return None,
-            }
-        }
-        let mut columns = [0u16; MAX_INDEX_COLS];
-        columns[0] = u16::try_from(column).ok()?;
-        let mut key_types = [ColType::Bool; MAX_INDEX_COLS];
-        key_types[0] = meta.ctype;
-        let mut collations = [Collation::None; MAX_INDEX_COLS];
-        collations[0] = meta.collation;
-        Some(Self {
+    /// The conditions of the path PostgreSQL chose, for EXPLAIN to print:
+    /// an index scan's index conditions or a bitmap heap scan's recheck.
+    pub(crate) fn chosen(path: &super::index_paths::ScanPath<'a>) -> Self {
+        Self::chosen_conditions(ChosenConditions {
+            conditions: path.conditions,
+            recheck: path.recheck,
+            absorbed: path.absorbed,
+        })
+        .with_identity(path.index_oid, path.index_name)
+    }
+
+    /// A plan carrying `conditions` alone, for EXPLAIN to print.
+    pub(crate) fn chosen_conditions(conditions: ChosenConditions<'a>) -> Self {
+        Self {
             binding: usize::MAX,
             method: crate::sql::ast::IndexAccessMethod::Btree,
-            index_oid: path.index_oid,
-            index_name: path.index_name,
+            index_oid: 0,
+            index_name: StackStr::new(),
             include_mask: ColumnSet::EMPTY,
             expression_mask: 0,
-            columns,
-            key_types,
-            collations,
-            constraints,
-            additional_constraints,
-            n_columns: 1,
-            n_constraints: usize::from(constraints[0].is_some()),
+            columns: [0; MAX_INDEX_COLS],
+            key_types: [ColType::Bool; MAX_INDEX_COLS],
+            collations: [Collation::None; MAX_INDEX_COLS],
+            constraints: [None; MAX_INDEX_COLS],
+            additional_constraints: [None; MAX_INDEX_COLS],
+            n_columns: 0,
+            n_constraints: 0,
             exact: false,
             prune_blocks: false,
             as_written: false,
-        })
+            chosen: Some(conditions),
+        }
+    }
+
+    fn with_identity(self, index_oid: i32, index_name: StackStr<64>) -> Self {
+        Self {
+            index_oid,
+            index_name,
+            ..self
+        }
+    }
+
+    /// The chosen path's conditions, when this plan carries them.
+    pub(crate) const fn chosen_parts(&self) -> Option<ChosenConditions<'a>> {
+        self.chosen
     }
 
     /// This plan, its conditions printed as the query wrote them.
@@ -2614,6 +2622,7 @@ fn index_access_plan_for_binding<'a>(
         exact,
         prune_blocks: true,
         as_written: false,
+        chosen: None,
     })
 }
 
@@ -2882,6 +2891,7 @@ where
                 !gist && !gin && !spgist
             },
             as_written: false,
+            chosen: None,
         };
         if let Some((targets, order)) = required_order {
             if knn_required.is_some() {
@@ -7647,8 +7657,12 @@ impl DepthNodes {
 #[derive(Clone, Copy)]
 struct ChosenScanCounts {
     /// The index conditions, which live as long as the scan.
-    conditions: [*const Expr<'static>; 2],
-    condition_count: usize,
+    conditions: *const [super::index_paths::IndexCondition<'static>],
+    /// A partial index's predicate, which every row it reaches meets.
+    predicate: *const [&'static Expr<'static>],
+    /// A bitmap tree's nodes, in plan order, with each node's counts.
+    tree: *const [super::index_paths::BitmapPlanNode<'static>],
+    tree_nodes: *const [instrument::Node],
     kind: super::index_paths::ScanKind,
     scan: instrument::Node,
     bitmap: instrument::Node,
@@ -7730,12 +7744,28 @@ fn chosen_scan_reaches<'a>(
     let Some(counts) = CHOSEN_SCAN.with(core::cell::Cell::get) else {
         return Ok(true);
     };
-    if !passed {
-        for &condition in &counts.conditions[..counts.condition_count] {
-            // SAFETY: the conditions are the scan's own conjuncts; the scope
-            // that installed them ends with the scan.
-            let condition = unsafe { &*condition.cast::<Expr<'a>>() };
-            if !super::plan::where_passes(condition, arena, params, row, hooks)? {
+    // SAFETY: the conditions and the tree are the scan's own, in its arena;
+    // the scope that installed them ends with the scan.
+    let tree = unsafe { &*counts.tree };
+    if !tree.is_empty() {
+        // SAFETY: as above.
+        let nodes = unsafe { &*counts.tree_nodes };
+        let (reached, _) = bitmap_tree_reaches(tree, nodes, 0, arena, params, row, hooks)?;
+        if !reached && !passed {
+            return Ok(false);
+        }
+    } else if !passed {
+        // SAFETY: as above.
+        let conditions = unsafe { &*counts.conditions };
+        for condition in conditions {
+            if !super::plan::where_passes(condition.source, arena, params, row, hooks)? {
+                return Ok(false);
+            }
+        }
+        // SAFETY: as above.
+        let predicate = unsafe { &*counts.predicate };
+        for part in predicate {
+            if !super::plan::where_passes(part, arena, params, row, hooks)? {
                 return Ok(false);
             }
         }
@@ -7767,8 +7797,63 @@ fn chosen_scan_reaches<'a>(
     Ok(true)
 }
 
+/// Whether the row passes the bitmap tree node at `at` and the position
+/// after its subtree, counting each bitmap index scan's row.
+fn bitmap_tree_reaches<'a>(
+    tree: &[super::index_paths::BitmapPlanNode<'a>],
+    nodes: &[instrument::Node],
+    at: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(bool, usize), SqlError> {
+    use super::index_paths::BitmapPlanKind;
+    let node = tree[at];
+    match node.kind {
+        BitmapPlanKind::Index {
+            conditions,
+            predicate,
+            ..
+        } => {
+            let mut reached = true;
+            for condition in conditions {
+                if !super::plan::where_passes(condition.source, arena, params, row, hooks)? {
+                    reached = false;
+                    break;
+                }
+            }
+            for part in predicate {
+                if reached && !super::plan::where_passes(part, arena, params, row, hooks)? {
+                    reached = false;
+                }
+            }
+            if reached {
+                nodes[at].row();
+            }
+            Ok((reached, at + 1))
+        }
+        BitmapPlanKind::And | BitmapPlanKind::Or => {
+            let and = matches!(node.kind, BitmapPlanKind::And);
+            let mut reached = and;
+            let mut next = at + 1;
+            while next < tree.len() && tree[next].depth > node.depth {
+                let (child, after) =
+                    bitmap_tree_reaches(tree, nodes, next, arena, params, row, hooks)?;
+                reached = if and {
+                    reached && child
+                } else {
+                    reached || child
+                };
+                next = after;
+            }
+            Ok((reached, next))
+        }
+    }
+}
+
 /// Orders `rows`, in row identity order, as the index scan of `path` reads
-/// them: by the index key in the index's order, equal keys by identity.
+/// them: by the index keys in the index's order, equal keys by identity.
 fn sort_by_index_key<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
@@ -7781,69 +7866,103 @@ fn sort_by_index_key<'a>(
     let definition = scope.defs.stored(0).expect("a chosen path scans a table");
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     let n_columns = definition.schema(&mut schema);
-    let collation = definition.columns()[path.index_column].collation;
-    let keys = arena
-        .alloc_slice_with(rows.len(), |_| (Datum::Null, 0usize))
+    let width = path.keys.len();
+    let values = arena
+        .alloc_slice_with(rows.len() * width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (position, row) in rows.iter().enumerate() {
         let row = row.expect("row snapshots are initialized");
         let bytes = storage.row_bytes(slot, row.rowid(), row.read()?, arena)?;
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-        keys[position] = (values[path.index_column], position);
+        let mut decoded = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+        for (at, key) in path.keys.iter().enumerate() {
+            values[position * width + at] = decoded[key.column];
+        }
     }
+    let order = index_key_order(
+        storage,
+        txid,
+        definition,
+        path.keys,
+        path.backward,
+        path.deduplicated,
+        values,
+        arena,
+    )?;
+    let original = arena
+        .alloc_slice_with(rows.len(), |position| rows[position])
+        .map_err(|_| arena_full())?;
+    for (position, &from) in order.iter().enumerate() {
+        rows[position] = original[from];
+    }
+    Ok(())
+}
+
+/// The order in which an index scan of the index `keys` (read `backward`
+/// when set; equal keys in posting lists when `deduplicated`) reads rows
+/// given in row identity order, each with its index key values in `values`
+/// (row after row): by the keys in the index's order, equal keys by
+/// identity.
+#[expect(clippy::too_many_arguments, reason = "the scan's order is explicit")]
+pub(crate) fn index_key_order<'a>(
+    storage: &Storage,
+    txid: u32,
+    definition: &TableDef,
+    keys: &[super::index_paths::IndexKeyOrder],
+    backward: bool,
+    deduplicated: bool,
+    values: &[Datum<'_>],
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let width = keys.len().max(1);
+    let order = arena
+        .alloc_slice_with(values.len() / width, |position| position)
+        .map_err(|_| arena_full())?;
     let mut failure = None;
-    // A backward scan reads the index's order reversed, equal keys too.
-    let descending = path.descending != path.backward;
-    let nulls_first = path.nulls_first != path.backward;
     // Equal keys keep identity order through the position tie-break; the
     // unstable sort allocates nothing.
-    keys.sort_unstable_by(|left, right| {
-        let order = match (left.0.is_null(), right.0.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => {
-                if nulls_first {
-                    core::cmp::Ordering::Less
-                } else {
-                    core::cmp::Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if nulls_first {
-                    core::cmp::Ordering::Greater
-                } else {
-                    core::cmp::Ordering::Less
-                }
-            }
-            (false, false) => {
-                match crate::sql::eval::compare_datums_collated(
-                    storage, txid, collation, &left.0, &right.0,
-                ) {
-                    Ok(order) if descending => order.reverse(),
-                    Ok(order) => order,
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                        core::cmp::Ordering::Equal
+    order.sort_unstable_by(|&left, &right| {
+        let mut order = core::cmp::Ordering::Equal;
+        for (at, key) in keys.iter().enumerate() {
+            // A backward scan reads the index's order reversed, equal keys
+            // too.
+            let descending = key.descending != backward;
+            let nulls_first = key.nulls_first != backward;
+            let (left, right) = (values[left * width + at], values[right * width + at]);
+            order = match (left.is_null(), right.is_null()) {
+                (true, true) => core::cmp::Ordering::Equal,
+                (true, false) if nulls_first => core::cmp::Ordering::Less,
+                (true, false) => core::cmp::Ordering::Greater,
+                (false, true) if nulls_first => core::cmp::Ordering::Greater,
+                (false, true) => core::cmp::Ordering::Less,
+                (false, false) => {
+                    let collation = definition.columns()[key.column].collation;
+                    match crate::sql::eval::compare_datums_collated(
+                        storage, txid, collation, &left, &right,
+                    ) {
+                        Ok(order) if descending => order.reverse(),
+                        Ok(order) => order,
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                            core::cmp::Ordering::Equal
+                        }
                     }
                 }
+            };
+            if order.is_ne() {
+                break;
             }
-        };
-        order.then(if path.backward && !path.deduplicated {
-            right.1.cmp(&left.1)
+        }
+        order.then(if backward && !deduplicated {
+            right.cmp(&left)
         } else {
-            left.1.cmp(&right.1)
+            left.cmp(&right)
         })
     });
     if let Some(error) = failure {
         return Err(error);
     }
-    let original = arena
-        .alloc_slice_with(rows.len(), |position| rows[position])
-        .map_err(|_| arena_full())?;
-    for (position, &(_, from)) in keys.iter().enumerate() {
-        rows[position] = original[from];
-    }
-    Ok(())
+    Ok(order)
 }
 
 /// `(row identity, heap page)` pairs.
@@ -9810,7 +9929,8 @@ fn scan_source_mode<'a>(
                             params,
                             arena,
                             shape,
-                        )?,
+                        )?
+                        .chosen(),
                         None => None,
                     }
                 } else {
@@ -9836,6 +9956,7 @@ fn scan_source_mode<'a>(
                 let _stop_after =
                     StopAfterScope::enter(slot, chosen.and_then(|path| path.stop_after));
                 let _bitmap_loop;
+                let _tree_loops;
                 let _chosen_scope = match chosen {
                     Some(path) if instrument::active() => {
                         use super::index_paths::ScanKind;
@@ -9845,15 +9966,25 @@ fn scan_source_mode<'a>(
                             instrument::Node::NONE
                         };
                         _bitmap_loop = bitmap.start();
-                        let mut conditions = [core::ptr::null::<Expr<'static>>(); 2];
-                        let mut condition_count = 0;
-                        for condition in path.conditions() {
-                            if condition_count < conditions.len() {
-                                conditions[condition_count] =
-                                    (condition.source as *const Expr<'a>).cast::<Expr<'static>>();
-                                condition_count += 1;
-                            }
-                        }
+                        // A bitmap tree counts each of its nodes.
+                        let tree_nodes = arena
+                            .alloc_slice_with(path.bitmap.len(), |at| {
+                                if path.bitmap.len() > 1 {
+                                    instrument::node(instrument::Role::BitmapNode(
+                                        u16::try_from(at).unwrap_or(u16::MAX),
+                                    ))
+                                } else {
+                                    instrument::Node::NONE
+                                }
+                            })
+                            .map_err(|_| arena_full())?;
+                        _tree_loops = instrument::Loops::start(tree_nodes);
+                        let tree: &[super::index_paths::BitmapPlanNode<'a>] =
+                            if path.bitmap.len() > 1 {
+                                path.bitmap
+                            } else {
+                                &[]
+                            };
                         let (pages, page_count, visible_pages) =
                             if matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
                                 let (pages, page_count) =
@@ -9875,8 +10006,16 @@ fn scan_source_mode<'a>(
                             .alloc_slice_with(page_count.div_ceil(64) as usize, |_| 0u64)
                             .map_err(|_| arena_full())?;
                         Some(ChosenScanScope::enter(Some(ChosenScanCounts {
-                            conditions,
-                            condition_count,
+                            conditions: core::ptr::slice_from_raw_parts(
+                                path.conditions.as_ptr().cast(),
+                                path.conditions.len(),
+                            ),
+                            predicate: core::ptr::slice_from_raw_parts(
+                                path.predicate.as_ptr().cast(),
+                                path.predicate.len(),
+                            ),
+                            tree: core::ptr::slice_from_raw_parts(tree.as_ptr().cast(), tree.len()),
+                            tree_nodes: tree_nodes as *const [instrument::Node],
                             kind: path.kind,
                             scan: depth_nodes[0].scan,
                             bitmap,

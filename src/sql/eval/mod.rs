@@ -5513,7 +5513,9 @@ fn runs_on_evaluation(expression: &Expr<'_>, evaluation: Option<ExpressionEvalua
         match expression {
             Expr::Collate { .. } => found.1 = true,
             Expr::Call { .. } if !expression.is_row_constructor() => found.0 = true,
-            Expr::Cast { .. } | Expr::Binary { .. } => found.0 = true,
+            // `eval_const_expressions` folds an `ARRAY[...]` of constants
+            // into one array constant.
+            Expr::Cast { .. } | Expr::Binary { .. } | Expr::Array(_) => found.0 = true,
             // A negated number is a constant as written (`-5`).
             Expr::Unary {
                 operator: super::ast::UnaryOp::Neg,

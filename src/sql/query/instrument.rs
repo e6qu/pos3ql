@@ -87,6 +87,10 @@ pub(crate) enum Role {
     Scan(u16),
     /// The `Bitmap Index Scan` under the FROM position's bitmap heap scan.
     BitmapIndex(u16),
+    /// The node at this position of the bitmap tree (`BitmapAnd`,
+    /// `BitmapOr` and their bitmap index scans) under the bitmap heap scan
+    /// of a query's one relation.
+    BitmapNode(u16),
     /// The scan of one member of the partitioned table or inheritance tree
     /// at the FROM position, by the member's storage slot.
     Member(u16, u32),

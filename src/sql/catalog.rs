@@ -10165,9 +10165,17 @@ pub(crate) struct PlannerIndex {
     pub(crate) unique: bool,
     pub(crate) descending: [bool; crate::storage::MAX_INDEX_COLS],
     pub(crate) nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
-    /// Every key is a plain column with its column's collation and its
-    /// type's default operator class, and the index has no predicate.
-    pub(crate) plain: bool,
+    /// The index has a predicate.
+    pub(crate) partial: bool,
+    /// Which keys are expressions.
+    pub(crate) expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Which keys use their column's own collation.
+    pub(crate) column_collation: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Which keys use a pattern operator class (`text_pattern_ops`).
+    pub(crate) pattern_keys: [bool; crate::storage::MAX_INDEX_COLS],
+    /// A key uses a class defined in the catalog, or the index backs an
+    /// exclusion constraint.
+    pub(crate) catalog_classes: bool,
 }
 
 /// Visits each index of the table in `table_slot`.
@@ -10188,26 +10196,29 @@ pub(crate) fn planner_indexes(
             if index.table_slot != table_slot {
                 return;
             }
-            let plain = index.predicate.is_none()
-                && !index.is_exclusion
-                && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
-                && index.columns[..index.n_cols]
-                    .iter()
-                    .enumerate()
-                    .all(|(position, column)| {
-                        !index.explicit_collations[position]
-                            || index.collations[position]
-                                == definition.columns[*column as usize].collation
-                    })
-                && !index.resolved_operator_classes[..index.n_cols].iter().any(
-                    |class| match class {
-                        Some(crate::storage::IndexOperatorClass::Catalog(_)) => true,
-                        Some(crate::storage::IndexOperatorClass::Btree(class)) => {
-                            class.is_pattern()
-                        }
-                        _ => false,
-                    },
-                );
+            // A key of a pattern class (`text_pattern_ops`) serves `=` and
+            // the `~<~` operators only; a catalog class is outside the model.
+            let mut pattern_keys = [false; crate::storage::MAX_INDEX_COLS];
+            let mut catalog_classes = index.is_exclusion;
+            for (position, class) in index.resolved_operator_classes[..index.n_cols]
+                .iter()
+                .enumerate()
+            {
+                match class {
+                    Some(crate::storage::IndexOperatorClass::Catalog(_)) => catalog_classes = true,
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                        pattern_keys[position] = class.is_pattern();
+                    }
+                    _ => {}
+                }
+            }
+            let mut column_collation = [true; crate::storage::MAX_INDEX_COLS];
+            for (position, &column) in index.columns[..index.n_cols].iter().enumerate() {
+                column_collation[position] = index.expression_keys[position]
+                    || !index.explicit_collations[position]
+                    || index.collations[position]
+                        == definition.columns[usize::from(column)].collation;
+            }
             visit(PlannerIndex {
                 oid: index.oid,
                 name: index.name,
@@ -10219,7 +10230,11 @@ pub(crate) fn planner_indexes(
                 unique: index.is_unique || index.is_primary,
                 descending: index.descending,
                 nulls_first: index.nulls_first,
-                plain,
+                partial: index.predicate.is_some(),
+                expression_keys: index.expression_keys,
+                column_collation,
+                pattern_keys,
+                catalog_classes,
             });
         },
     );

@@ -105743,6 +105743,63 @@ pub(super) fn collect_matches<'a>(
         DmlSelection::Qualified => (where_clause, row_security),
         DmlSelection::Candidates => (None, None),
     };
+    // The scan PostgreSQL's costs choose for the target sets the order the
+    // rows change in: an index scan's key order, else heap order. A resumed
+    // attempt of the statement keeps its first attempt's choice, as
+    // PostgreSQL plans a statement once.
+    let memo_key: WriteScanKey = (
+        table_index,
+        txid,
+        capture.command(),
+        where_clause.map(|condition| core::ptr::from_ref(condition).cast::<Expr<'static>>()),
+    );
+    let remembered = WRITE_SCAN_ORDER.with(|memo| {
+        memo.get()
+            .filter(|(key, _)| *key == memo_key)
+            .map(|(_, order)| order)
+    });
+    let chosen = if let Some(order) = remembered {
+        order
+    } else if transition.is_none()
+        && def.kind != crate::storage::TableKind::Foreign
+        && !storage.relation_has_descendants(table_index, txid)
+        && crate::sql::query::index_paths::has_indexes(storage, txid, table_index)
+    {
+        let schema = arena
+            .alloc_str(def.schema.as_str())
+            .map_err(|_| arena_full())?;
+        let name = arena
+            .alloc_str(def.name.as_str())
+            .map_err(|_| arena_full())?;
+        let alias = match alias {
+            Some(alias) => Some(arena.alloc_str(alias).map_err(|_| arena_full())?),
+            None => None,
+        };
+        crate::sql::query::index_paths::write_scan_path(
+            storage,
+            txid,
+            QualName {
+                schema: Some(schema),
+                name,
+            },
+            alias,
+            where_clause,
+            params,
+            arena,
+        )?
+        .chosen()
+        .map(|path| WriteScanOrder::of(&path))
+    } else {
+        None
+    };
+    WRITE_SCAN_ORDER.with(|memo| memo.set(Some((memo_key, chosen))));
+    let key_order = chosen.filter(|order| {
+        matches!(
+            order.kind,
+            crate::sql::query::index_paths::ScanKind::Index
+                | crate::sql::query::index_paths::ScanKind::IndexOnly
+        )
+    });
     let indexed = if transition.is_none()
         && def.kind != crate::storage::TableKind::Foreign
         && !storage.relation_has_descendants(table_index, txid)
@@ -105765,9 +105822,24 @@ pub(super) fn collect_matches<'a>(
     // entries, which keep an updated row's first position as its heap chain
     // does in PostgreSQL: rows go in row identity order. Otherwise the rows
     // go in a sequential scan's physical order, as a SELECT reads them.
-    let index_order = indexed.is_some()
-        || (def.kind != crate::storage::TableKind::Foreign
-            && super::query::dml_condition_reaches_index(storage, &def, alias, txid, where_clause));
+    // A sequential scan keeps the selection order a resumed attempt
+    // reproduces: row identity order when the condition reaches an index,
+    // else physical order.
+    let index_order =
+        match chosen.filter(|order| order.kind != crate::sql::query::index_paths::ScanKind::Seq) {
+            Some(_) => true,
+            None => {
+                indexed.is_some()
+                    || (def.kind != crate::storage::TableKind::Foreign
+                        && super::query::dml_condition_reaches_index(
+                            storage,
+                            &def,
+                            alias,
+                            txid,
+                            where_clause,
+                        ))
+            }
+        };
     // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
     // visible row it matched or its filter removed, and each member's share
     // when the target is a partitioned table or inheritance tree.
@@ -105921,8 +105993,104 @@ pub(super) fn collect_matches<'a>(
         if index_order {
             scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
         }
+        if let Some(path) = key_order.filter(|_| leaf == table_index) {
+            order_by_index_key(
+                storage, leaf, txid, &physical, &path, scratch, leaf_start, arena,
+            )?;
+        }
     }
     images.finish()
+}
+
+/// The order an `UPDATE` or `DELETE` changes its target's rows in: the kind
+/// of the scan PostgreSQL's costs chose and, for an index scan, its keys.
+#[derive(Clone, Copy)]
+struct WriteScanOrder {
+    kind: crate::sql::query::index_paths::ScanKind,
+    keys: [crate::sql::query::index_paths::IndexKeyOrder; crate::storage::MAX_INDEX_COLS],
+    n_keys: usize,
+    backward: bool,
+    deduplicated: bool,
+}
+
+impl WriteScanOrder {
+    fn of(path: &crate::sql::query::index_paths::ScanPath<'_>) -> Self {
+        let mut keys = [crate::sql::query::index_paths::IndexKeyOrder {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }; crate::storage::MAX_INDEX_COLS];
+        keys[..path.keys.len()].copy_from_slice(path.keys);
+        Self {
+            kind: path.kind,
+            keys,
+            n_keys: path.keys.len(),
+            backward: path.backward,
+            deduplicated: path.deduplicated,
+        }
+    }
+}
+
+/// The key of a write's chosen scan order: the target, the transaction, the
+/// command and the condition.
+type WriteScanKey = (usize, u32, u32, Option<*const Expr<'static>>);
+
+thread_local! {
+    /// The scan order the running write chose, which its resumed attempts
+    /// keep.
+    static WRITE_SCAN_ORDER: core::cell::Cell<Option<(WriteScanKey, Option<WriteScanOrder>)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Reorders the rows `scratch` holds from `start`, in row identity order,
+/// as the index scan of `order` reads them.
+#[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
+fn order_by_index_key(
+    storage: &Storage,
+    slot: usize,
+    txid: u32,
+    definition: &crate::storage::TableDef,
+    order: &WriteScanOrder,
+    scratch: &mut DmlScratch,
+    start: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let rows = &mut scratch[start..];
+    let keys = &order.keys[..order.n_keys];
+    let width = keys.len();
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    let n_columns = definition.schema(&mut schema);
+    let values = arena
+        .alloc_slice_with(rows.len() * width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (position, row) in rows.iter().enumerate() {
+        // The version the write selected, which its own changes may have
+        // replaced since.
+        let (_, rowid, snapshot) = row.local_parts();
+        let bytes = storage.row_bytes(slot, rowid, snapshot, arena)?;
+        let mut decoded = [Datum::Null; MAX_COLUMNS];
+        crate::storage::rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+        for (at, key) in keys.iter().enumerate() {
+            values[position * width + at] = decoded[key.column];
+        }
+    }
+    let order = crate::sql::query::index_key_order(
+        storage,
+        txid,
+        definition,
+        keys,
+        order.backward,
+        order.deduplicated,
+        values,
+        arena,
+    )?;
+    let original = arena
+        .alloc_slice_with(rows.len(), |position| rows[position])
+        .map_err(|_| arena_full())?;
+    for (position, &from) in order.iter().enumerate() {
+        rows[position] = original[from];
+    }
+    Ok(())
 }
 
 /// The FROM item rows a target hash join offers the target row `target`.

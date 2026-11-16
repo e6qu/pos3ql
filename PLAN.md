@@ -638,21 +638,35 @@ subscription's applied row by the applying role's privileges with no written
 columns, as PostgreSQL's apply worker writes. Revoking a table privilege revokes it on
 each column too.
 A
-query reading one plain table chooses its sequential, index, index-only or
-bitmap heap scan by PostgreSQL's costs (`cost_index` with `btcostestimate`
-and the column's correlation, `cost_bitmap_heap_scan`, `cost_seqscan`,
-`add_path` with its pathkeys, a sort's cost under `ORDER BY` and
-`create_limit_path` under `LIMIT`) from the statistics ANALYZE gathers, and
-returns its rows in that scan's order: an index scan by key (backward for the
-reverse order), a bitmap heap scan and a sequential scan by heap position
-(`differential_exact/691`, `692`). `EXPLAIN ANALYZE` counts what the chosen
-scan reads: rows its index conditions reach, `Rows Removed by Filter`, a
-bitmap heap scan's `Heap Blocks` and an index-only scan's `Heap Fetches`, and
-each index scan's `Index Searches`. Remaining: multi-column, expression,
-partial and non-btree indexes, a `BitmapAnd` of several indexes, conditions
-other than a column compared with a constant or tested for NULL (`IN`, `OR`,
-`LIKE`, functions), more than one ordering column, grouping or `DISTINCT`
-above the scan, joins, data changes and partitioned tables, which keep the
+query reading one plain table, and an `UPDATE`'s or `DELETE`'s scan of its
+target, chooses its sequential, index, index-only or bitmap heap scan by
+PostgreSQL's costs (`cost_index` with `btcostestimate`, its boundary
+conditions and skip arrays, `cost_bitmap_heap_scan` over the bitmap
+`choose_bitmap_and` and `generate_bitmap_or_paths` build, `cost_seqscan`,
+`add_path` with its pathkeys, `cost_sort` and `cost_incremental_sort` under
+`ORDER BY` and `create_limit_path` under `LIMIT`) from the statistics ANALYZE
+gathers, and returns or changes its rows in that scan's order: an index scan
+by key (backward for the reverse order), a bitmap heap scan and a sequential
+scan by heap position (`differential_exact/691`, `692`, `720`-`723`). The
+model reads B-tree indexes of several key columns and pattern classes,
+partial indexes whose predicate the conditions imply (`predicate_implied_by`
+for comparisons with constants, NULL tests, `IN` lists and their AND and
+OR), comparisons with constants, `IN` lists, `op ANY (array)`, NULL tests,
+boolean columns tested by themselves and their `OR`, and an `ORDER BY` of
+several columns. `EXPLAIN ANALYZE`
+counts what the chosen scan reads: rows its index conditions (and a partial
+index's predicate) reach, `Rows Removed by Filter`, each bitmap index scan
+of a `BitmapAnd` or `BitmapOr`, a bitmap heap scan's `Heap Blocks` and an
+index-only scan's `Heap Fetches`, and each index scan's `Index Searches`. A
+table without index paths for the query keeps its sequential scan whatever
+its conditions. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+shape whenever PostgreSQL could choose an index path: expression indexes
+(with ANALYZE's statistics of index expressions), other index access
+methods, conditions on expressions of indexed columns (`LIKE` prefixes,
+functions), extended statistics, partitioned tables and inheritance trees
+whose members have index paths (per-member paths and `Merge Append`), and,
+under `EXPLAIN ANALYZE`, `Index Searches` of an array or skip-array scan over
+several leaf pages. Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM

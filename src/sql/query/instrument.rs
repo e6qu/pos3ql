@@ -558,6 +558,29 @@ pub(crate) fn hashed_row_bytes(
     Some(HASH_TUPLE_OVERHEAD + align_to(MINIMAL_TUPLE_HEADER + bitmap, b'd') + data)
 }
 
+/// The bytes a `Materialize` node's tuplestore charges for one row holding
+/// `columns` of `values` (of types `schema`): its minimal tuple, maxaligned,
+/// in a memory chunk with its 8-byte header.
+pub(crate) fn materialized_row_bytes(
+    columns: &[HashColumn],
+    values: &[crate::sql::types::Datum<'_>],
+    schema: &[crate::sql::types::ColType],
+) -> Option<usize> {
+    hashed_row_bytes(columns, values, schema)
+        .map(|bytes| align_to(bytes - HASH_TUPLE_OVERHEAD, b'd') + 8)
+}
+
+/// The most memory a tuplestore of `rows` rows of `row_bytes` in total
+/// uses (`tuplestore_get_stats`): the rows and its array of row pointers,
+/// 2048 at first and doubled as it fills, in a chunk with its header.
+pub(crate) fn tuplestore_bytes(rows: u64, row_bytes: usize) -> usize {
+    let mut slots = 2048u64;
+    while rows >= slots - 1 {
+        slots *= 2;
+    }
+    row_bytes + slots as usize * core::mem::size_of::<u64>() + 8
+}
+
 /// The bytes of the composite datum of a row `values` of types `schema`
 /// (`heap_form_tuple`): the tuple header with its null bitmap, aligned,
 /// then each non-null value at its type's alignment.
@@ -1036,6 +1059,13 @@ impl Node {
     pub(crate) fn join_filtered(self) {
         self.with(|slot, _| {
             slot.counters.join_filtered = slot.counters.join_filtered.saturating_add(1);
+        });
+    }
+
+    /// Counts `count` rows the node's `Join Filter` removed.
+    pub(crate) fn add_join_filtered(self, count: u64) {
+        self.with(|slot, _| {
+            slot.counters.join_filtered = slot.counters.join_filtered.saturating_add(count);
         });
     }
 

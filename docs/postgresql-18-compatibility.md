@@ -1178,6 +1178,18 @@ each row as PostgreSQL stores it plus 8 bytes per bucket. For example, a
 1,500-row build reports `Buckets: 2048  Batches: 1`. It always reports one
 batch: a build larger than `work_mem` times 2 (PostgreSQL's default
 `hash_mem_multiplier`), which PostgreSQL splits into batches, still runs whole.
+A `Materialize` node reports the memory PostgreSQL's tuplestore holds:
+`Storage: Memory  Maximum Storage: 18kB` for 40 small rows, mostly its
+initial array of 2048 row pointers.
+
+An `UPDATE ... FROM` or `DELETE ... USING` of one analyzed table joins the
+way PostgreSQL's costs choose: for example, `UPDATE accounts SET rate =
+r.rate FROM rates r WHERE accounts.tier = r.tier` hashes the smaller
+relation, and `EXPLAIN ANALYZE` counts each node of that join. The rows
+change in the join's order, so `RETURNING` and row triggers see them as in
+PostgreSQL. PostgreSQL estimates a table from its current size on disk, so
+a table that rolled-back or deleted rows grew since its last `ANALYZE` (or
+`VACUUM`) can make it pick the other order.
 
 ### Planner settings
 

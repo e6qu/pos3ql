@@ -51,7 +51,8 @@ mod joined_from;
 #[cfg(test)]
 pub(crate) use joined_from::target_hash_builds;
 pub(crate) use joined_from::{
-    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, merge_join_plan,
+    JoinedFromRow, JoinedWriteJoin, JoinedWriteMethod, JoinedWritePairs, TargetHash,
+    TargetHashPlan, joined_from_match, joined_write_join, joined_write_pairs, merge_join_plan,
     recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
 mod materialize;

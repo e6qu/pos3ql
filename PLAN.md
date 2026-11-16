@@ -478,7 +478,10 @@ PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
 `text` where PostgreSQL reports `42804`. `DROP SUBSCRIPTION` drops the
-publisher slot before it returns, as PostgreSQL does, but `CREATE
+publisher slot before it returns, as PostgreSQL does, and keeps the apply
+worker stopped until its transaction ends; a synchronization slot an
+interrupted initial copy left on the publisher is dropped before the copy
+starts again, as PostgreSQL's table synchronization does. `CREATE
 SUBSCRIPTION` with `connect = true` still creates its slot and copies its
 tables in the background: PostgreSQL connects during the statement, reports
 `NOTICE: created replication slot "s" on publisher` (or fails the statement),

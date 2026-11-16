@@ -3923,8 +3923,13 @@ impl Engine {
                 return Err(error);
             }
         };
+        // A DROP or ALTER SUBSCRIPTION that commits while this record is
+        // published follows it in the journal, so the failure of the replaced
+        // definition has nothing left to mark.
         self.finish_atomic_journal(|storage| {
-            storage.fail_subscription(stream, failure)?;
+            if storage.check_subscription_failure(stream).is_ok() {
+                storage.fail_subscription(stream, failure)?;
+            }
             storage.observe_lsn(commit_lsn);
             Ok(())
         })
@@ -3935,8 +3940,11 @@ impl Engine {
             .subscriptions_with_slots_visible_to(Some(self.storage.current_database_oid()), 0)
             .find(|(index, _subscription)| *index == slot)
             .filter(|(_, subscription)| {
-                (subscription.failure.is_none()
-                    || (!subscription.behavior.disable_on_error && subscription.enabled_to(0)))
+                // DROP SUBSCRIPTION stops the worker until its transaction
+                // ends: its publisher slot may already be gone.
+                subscription.ddl_state.pending_drop_txid().is_none()
+                    && (subscription.failure.is_none()
+                        || (!subscription.behavior.disable_on_error && subscription.enabled_to(0)))
                     && (subscription.enabled_to(0)
                         || !matches!(
                             subscription.bootstrap,

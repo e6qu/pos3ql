@@ -7852,6 +7852,662 @@ fn bitmap_tree_reaches<'a>(
     }
 }
 
+/// One member of a partition or inheritance tree scanned under the path
+/// chosen over the tree.
+#[derive(Clone, Copy)]
+struct TreeMember<'a> {
+    leaf: usize,
+    /// Its rows in the order its scan returns them; once a sort over it
+    /// ran, the rows that passed the conditions in the sort's order.
+    rows: &'a [u64],
+    /// Each row's values of the tree's sort keys, `keys` per row, when the
+    /// rows are sorted or merged.
+    keys: &'a [Datum<'a>],
+    /// Its physical row layout.
+    schema: &'a [ColType],
+    /// Its columns in the tree's numbering.
+    mapping: crate::storage::RelationColumnMap<'a>,
+    leaf_oid: Datum<'a>,
+    node: instrument::Node,
+    sort_node: instrument::Node,
+    counts: Option<ChosenScanCounts>,
+    /// A sort reads the scan's rows before the `Append` or `Merge Append`
+    /// reads any.
+    sort: bool,
+    /// The sort ran.
+    sorted: bool,
+    /// The next row it reads.
+    next: usize,
+    /// The row a `Merge Append` holds of it.
+    head: usize,
+}
+
+/// One execution of a tree member's scan and of the nodes above and below
+/// it: its sort, its bitmap index scan or bitmap tree.
+#[allow(dead_code, reason = "the loops end when dropped")]
+struct MemberLoops<'a>(
+    instrument::Loop,
+    instrument::Loop,
+    instrument::Loop,
+    instrument::Loops<'a>,
+);
+
+impl<'a> TreeMember<'a> {
+    fn start(&self) -> MemberLoops<'a> {
+        let (bitmap, tree): (instrument::Node, &'a [instrument::Node]) = match self.counts {
+            // SAFETY: the tree's nodes live in the statement arena for the
+            // scan.
+            Some(counts) => (counts.bitmap, unsafe { &*counts.tree_nodes }),
+            None => (instrument::Node::NONE, &[]),
+        };
+        MemberLoops(
+            self.sort_node.start(),
+            self.node.start(),
+            bitmap.start(),
+            instrument::Loops::start(tree),
+        )
+    }
+}
+
+/// The scan of a partition or inheritance tree under its chosen path.
+struct TreeScan<'s, 'h, 'a> {
+    storage: &'a Storage,
+    txid: u32,
+    scope: &'s QueryScope<'a>,
+    logical: &'s crate::storage::TableDef,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &'s [Datum<'a>],
+    hooks: &'s EvalHooks<'h, 'a>,
+    outer: Option<&'s dyn ColumnLookup<'a>>,
+    order: &'a [super::index_paths::OrderKey],
+    collations: &'a [crate::sql::ast::Collation],
+    /// The rows a `LIMIT` above takes, which bounds each member's sort.
+    bound: Option<u64>,
+    arena: &'a Arena,
+}
+
+impl<'s, 'h, 'a> TreeScan<'s, 'h, 'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        storage: &'a Storage,
+        txid: u32,
+        scope: &'s QueryScope<'a>,
+        logical: &'s crate::storage::TableDef,
+        where_clause: Option<&'a Expr<'a>>,
+        params: &'s [Datum<'a>],
+        hooks: &'s EvalHooks<'h, 'a>,
+        outer: Option<&'s dyn ColumnLookup<'a>>,
+        tree: &super::index_paths::TreePath<'a>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        use super::index_paths::OrderKey;
+        let collations = arena
+            .alloc_slice_with(tree.order.len(), |at| match tree.order[at] {
+                OrderKey::Column { column, .. } => logical.columns()[column].collation,
+                OrderKey::Expression => logical.columns()[0].collation,
+            })
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            storage,
+            txid,
+            scope,
+            logical,
+            where_clause,
+            params,
+            hooks,
+            outer,
+            order: tree.order,
+            collations,
+            bound: tree.stop_after,
+            arena,
+        })
+    }
+
+    /// The member `chosen` describes, its rows in its scan's order.
+    fn member(
+        &self,
+        chosen: &super::index_paths::MemberPath<'a>,
+        physical: &crate::storage::TableDef,
+        table: u16,
+        tree: &super::index_paths::TreePath<'a>,
+    ) -> Result<TreeMember<'a>, SqlError> {
+        let storage = self.storage;
+        let arena = self.arena;
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let width = physical.schema(&mut schema);
+        let schema = &*arena
+            .alloc_slice_copy(&schema[..width])
+            .map_err(|_| arena_full())?;
+        let leaf_role = u32::try_from(chosen.leaf).unwrap_or(u32::MAX);
+        let node = instrument::node(instrument::Role::Member(table, leaf_role));
+        let counts = if instrument::active() {
+            Some(member_scan_counts(
+                storage,
+                self.txid,
+                table,
+                chosen.leaf,
+                &chosen.path,
+                node,
+                arena,
+            )?)
+        } else {
+            None
+        };
+        let mut member = TreeMember {
+            leaf: chosen.leaf,
+            rows: member_rows_in_order(
+                storage,
+                self.txid,
+                chosen.leaf,
+                &chosen.path,
+                self.scope.names[0],
+                arena,
+            )?,
+            keys: &[],
+            schema,
+            mapping: crate::storage::RelationColumnMap::new(self.logical, physical, arena)?,
+            leaf_oid: Datum::Oid(crate::sql::catalog::user_table_oid(storage, chosen.leaf) as u32),
+            node,
+            sort_node: if chosen.sort.is_some() {
+                instrument::node(instrument::Role::MemberSort(table, leaf_role))
+            } else {
+                instrument::Node::NONE
+            },
+            counts,
+            sort: chosen.sort.is_some(),
+            sorted: false,
+            next: 0,
+            head: 0,
+        };
+        // A merged member's rows carry their sort keys.
+        if tree.kind == super::index_paths::AppendKind::Merge && !member.sort {
+            member.keys = self.keys_of(&member, member.rows)?;
+        }
+        Ok(member)
+    }
+
+    /// The tree's sort key values of each of `rows` of `member`.
+    fn keys_of(&self, member: &TreeMember<'a>, rows: &[u64]) -> Result<&'a [Datum<'a>], SqlError> {
+        use super::index_paths::OrderKey;
+        let count = self.order.len();
+        let keys = self
+            .arena
+            .alloc_slice_with(rows.len() * count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (at, &rowid) in rows.iter().enumerate() {
+            if let Some(values) = self.row(member, rowid)? {
+                for (key_at, key) in self.order.iter().enumerate() {
+                    if let OrderKey::Column { column, .. } = key {
+                        keys[at * count + key_at] = values[*column];
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The row `rowid` of `member`, decoded into the tree's columns with the
+    /// member's oid after them.
+    fn row(
+        &self,
+        member: &TreeMember<'a>,
+        rowid: u64,
+    ) -> Result<Option<&'a mut [Datum<'a>]>, SqlError> {
+        let storage = self.storage;
+        let Some(state) = storage.row_state(member.leaf, rowid)? else {
+            return Ok(None);
+        };
+        let Some(home) = storage.visible_row_home(member.leaf, rowid, state, self.txid)? else {
+            return Ok(None);
+        };
+        let bytes = storage.row_bytes(member.leaf, rowid, home, self.arena)?;
+        let mut physical = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, member.schema, &mut physical[..member.schema.len()])?;
+        let columns = self.logical.n_columns;
+        let values = self
+            .arena
+            .alloc_slice_with(columns + 1, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        member
+            .mapping
+            .project(&physical[..member.schema.len()], &mut values[..columns]);
+        values[columns] = member.leaf_oid;
+        Ok(Some(values))
+    }
+
+    /// The encoded length of the row `rowid` of `member`.
+    fn row_length(&self, member: &TreeMember<'a>, rowid: u64) -> Result<usize, SqlError> {
+        let storage = self.storage;
+        let Some(state) = storage.row_state(member.leaf, rowid)? else {
+            return Ok(0);
+        };
+        let Some(home) = storage.visible_row_home(member.leaf, rowid, state, self.txid)? else {
+            return Ok(0);
+        };
+        Ok(storage
+            .row_bytes(member.leaf, rowid, home, self.arena)?
+            .len())
+    }
+
+    /// Whether `rowid` of `member` passes the scan's conditions, counted as
+    /// the member's scan counts the rows its path reaches.
+    fn passes(&self, member: &TreeMember<'a>, rowid: u64) -> Result<Option<bool>, SqlError> {
+        let Some(values) = self.row(member, rowid)? else {
+            return Ok(None);
+        };
+        let row = crate::sql::exec::RowCtx {
+            def: crate::storage::RelationDefinition::from_definition(self.logical),
+            values: &values[..self.logical.n_columns],
+            alias: Some(self.scope.names[0]),
+            table_oid: match member.leaf_oid {
+                Datum::Oid(oid) => Some(oid),
+                _ => None,
+            },
+        };
+        let chained = Chained {
+            inner: &row,
+            outer: self.outer,
+        };
+        let passed = match self.where_clause {
+            Some(condition) => {
+                where_passes(condition, self.arena, self.params, &chained, self.hooks)?
+            }
+            None => true,
+        };
+        let _chosen_scope = ChosenScanScope::enter(member.counts);
+        if chosen_scan_reaches(
+            Some(rowid),
+            passed,
+            self.arena,
+            self.params,
+            &chained,
+            self.hooks,
+        )? {
+            if passed {
+                member.node.row();
+            } else {
+                member.node.filtered();
+            }
+        }
+        Ok(Some(passed))
+    }
+
+    /// Opens `member`: a sort over its scan reads every row and keeps
+    /// those that pass, in the sort's order.
+    fn open(&self, member: &mut TreeMember<'a>) -> Result<(), SqlError> {
+        if !member.sort || member.sorted {
+            return Ok(());
+        }
+        let rows = member.rows;
+        let passing = self
+            .arena
+            .alloc_slice_with(rows.len(), |_| 0u64)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        let mut bytes = 0usize;
+        for &rowid in rows {
+            if self.passes(member, rowid)? == Some(true) {
+                passing[count] = rowid;
+                count += 1;
+                // The rows the sort holds, as pos3ql encodes them, and the
+                // array ordering them.
+                bytes += core::mem::size_of::<&[u8]>() + self.row_length(member, rowid)?;
+            }
+        }
+        let passing = &mut passing[..count];
+        let keys = self.keys_of(member, passing)?;
+        let key_count = self.order.len();
+        let positions = self
+            .arena
+            .alloc_slice_with(count, |at| at)
+            .map_err(|_| arena_full())?;
+        crate::mem::arena::try_stable_sort_via(
+            self.arena,
+            positions,
+            |&left, &right| {
+                compare_tree_keys(
+                    self.storage,
+                    self.txid,
+                    self.order,
+                    self.collations,
+                    &keys[left * key_count..(left + 1) * key_count],
+                    &keys[right * key_count..(right + 1) * key_count],
+                )
+            },
+            |_| arena_full(),
+        )?;
+        member.rows = &*self
+            .arena
+            .alloc_slice_with(count, |at| passing[positions[at]])
+            .map_err(|_| arena_full())?;
+        member.keys = &*self
+            .arena
+            .alloc_slice_with(keys.len(), |at| {
+                keys[positions[at / key_count] * key_count + at % key_count]
+            })
+            .map_err(|_| arena_full())?;
+        member.sorted = true;
+        let bounded = self.bound.is_some_and(|bound| count as u64 > 2 * bound);
+        member.sort_node.sorted(instrument::SortSpace {
+            method: if bounded {
+                instrument::SortMethod::TopNHeapsort
+            } else {
+                instrument::SortMethod::Quicksort
+            },
+            bytes,
+        });
+        Ok(())
+    }
+
+    /// `ExecProcNode` of a merged member: its next row that passes the
+    /// conditions, which it now holds; the rows it reads to find it that
+    /// fail count as its scan's.
+    fn pull(&self, member: &mut TreeMember<'a>) -> Result<Option<usize>, SqlError> {
+        while member.next < member.rows.len() {
+            let at = member.next;
+            member.next += 1;
+            if member.sorted {
+                member.head = at;
+                return Ok(Some(at));
+            }
+            let Some(values) = self.row(member, member.rows[at])? else {
+                continue;
+            };
+            let row = crate::sql::exec::RowCtx {
+                def: crate::storage::RelationDefinition::from_definition(self.logical),
+                values: &values[..self.logical.n_columns],
+                alias: Some(self.scope.names[0]),
+                table_oid: match member.leaf_oid {
+                    Datum::Oid(oid) => Some(oid),
+                    _ => None,
+                },
+            };
+            let chained = Chained {
+                inner: &row,
+                outer: self.outer,
+            };
+            let passed = match self.where_clause {
+                Some(condition) => {
+                    where_passes(condition, self.arena, self.params, &chained, self.hooks)?
+                }
+                None => true,
+            };
+            if passed {
+                member.head = at;
+                return Ok(Some(at));
+            }
+            let _chosen_scope = ChosenScanScope::enter(member.counts);
+            if chosen_scan_reaches(
+                Some(member.rows[at]),
+                false,
+                self.arena,
+                self.params,
+                &chained,
+                self.hooks,
+            )? {
+                member.node.filtered();
+            }
+        }
+        Ok(None)
+    }
+
+    /// Counts the row a merged member holds when the `Limit` above stops.
+    fn count_held(&self, member: &TreeMember<'a>) -> Result<(), SqlError> {
+        if member.sorted {
+            member.sort_node.row();
+            return Ok(());
+        }
+        let rowid = member.rows[member.head];
+        let Some(values) = self.row(member, rowid)? else {
+            return Ok(());
+        };
+        let row = crate::sql::exec::RowCtx {
+            def: crate::storage::RelationDefinition::from_definition(self.logical),
+            values: &values[..self.logical.n_columns],
+            alias: Some(self.scope.names[0]),
+            table_oid: None,
+        };
+        let chained = Chained {
+            inner: &row,
+            outer: self.outer,
+        };
+        let _chosen_scope = ChosenScanScope::enter(member.counts);
+        chosen_scan_reaches(
+            Some(rowid),
+            true,
+            self.arena,
+            self.params,
+            &chained,
+            self.hooks,
+        )?;
+        member.node.row();
+        Ok(())
+    }
+
+    /// `heap_compare_slots`: the heap keeps the member with the least row
+    /// first.
+    fn heap_compare(
+        &self,
+        members: &[Option<TreeMember<'a>>],
+        left: usize,
+        right: usize,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        let count = self.order.len();
+        let keys = |at: usize| {
+            let member = members[at].as_ref().expect("dense members");
+            &member.keys[member.head * count..(member.head + 1) * count]
+        };
+        Ok(compare_tree_keys(
+            self.storage,
+            self.txid,
+            self.order,
+            self.collations,
+            keys(left),
+            keys(right),
+        )?
+        .reverse())
+    }
+
+    /// `binaryheap.c`'s `sift_down` of the node at `node`.
+    fn sift_down(
+        &self,
+        members: &[Option<TreeMember<'a>>],
+        heap: &mut [usize],
+        mut node: usize,
+    ) -> Result<(), SqlError> {
+        let value = heap[node];
+        loop {
+            let left = 2 * node + 1;
+            let right = left + 1;
+            let mut swap = left;
+            if right < heap.len() && self.heap_compare(members, heap[left], heap[right])?.is_lt() {
+                swap = right;
+            }
+            if left >= heap.len() || self.heap_compare(members, value, heap[swap])?.is_ge() {
+                break;
+            }
+            heap[node] = heap[swap];
+            node = swap;
+        }
+        heap[node] = value;
+        Ok(())
+    }
+}
+
+/// The visible rows of `leaf` in the order its scan `path` reads them: heap
+/// order, or an index scan's key order.
+fn member_rows_in_order<'a>(
+    storage: &Storage,
+    txid: u32,
+    leaf: usize,
+    path: &super::index_paths::ScanPath<'a>,
+    exposed: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [u64], SqlError> {
+    let count = storage.visible_row_count(leaf, txid)?;
+    let snapshot = storage.table_row_snapshot(leaf, Some(arena))?;
+    let ordered = arena
+        .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+        .map_err(|_| arena_full())?;
+    let mut fill = 0usize;
+    storage.for_each_row_state(leaf, &mut |rowid, state| {
+        if let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? {
+            if fill == ordered.len() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "member rows changed during the scan"
+                ));
+            }
+            ordered[fill] = Some(snapshot.retain(rowid, &home)?);
+            fill += 1;
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    let ordered = &mut ordered[..fill];
+    use super::index_paths::ScanKind;
+    match path.kind {
+        ScanKind::Index | ScanKind::IndexOnly => {
+            ordered.sort_unstable_by_key(|row| row.expect("row snapshots are initialized").rowid());
+            let member_scope =
+                super::index_paths::member_scope(storage, txid, leaf, exposed, arena)?;
+            sort_by_index_key(storage, &member_scope, txid, path, ordered, arena)?;
+        }
+        ScanKind::Seq | ScanKind::Bitmap => {
+            ordered
+                .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").sort_key());
+        }
+    }
+    Ok(&*arena
+        .alloc_slice_with(fill, |at| ordered[at].expect("filled rows").rowid())
+        .map_err(|_| arena_full())?)
+}
+
+/// Compares two rows' values of the tree's sort `keys`, as `ORDER BY`
+/// orders them.
+fn compare_tree_keys(
+    storage: &Storage,
+    txid: u32,
+    keys: &[super::index_paths::OrderKey],
+    collations: &[crate::sql::ast::Collation],
+    left: &[Datum<'_>],
+    right: &[Datum<'_>],
+) -> Result<core::cmp::Ordering, SqlError> {
+    use core::cmp::Ordering;
+    for (at, key) in keys.iter().enumerate() {
+        let super::index_paths::OrderKey::Column {
+            descending,
+            nulls_first,
+            ..
+        } = *key
+        else {
+            continue;
+        };
+        let order = match (
+            matches!(left[at], Datum::Null),
+            matches!(right[at], Datum::Null),
+        ) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let order = crate::sql::eval::compare_datums_collated(
+                    storage,
+                    txid,
+                    collations[at],
+                    &left[at],
+                    &right[at],
+                )?;
+                if descending { order.reverse() } else { order }
+            }
+        };
+        if order != Ordering::Equal {
+            return Ok(order);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// The counts the chosen `path` of member `leaf` keeps while its rows are
+/// read: its index conditions, bitmap and heap pages.
+fn member_scan_counts<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: u16,
+    leaf: usize,
+    path: &super::index_paths::ScanPath<'a>,
+    node: instrument::Node,
+    arena: &'a Arena,
+) -> Result<ChosenScanCounts, SqlError> {
+    use super::index_paths::ScanKind;
+    let leaf_role = u32::try_from(leaf).unwrap_or(u32::MAX);
+    let bitmap = if path.kind == ScanKind::Bitmap {
+        instrument::node(instrument::Role::MemberBitmapIndex(table, leaf_role))
+    } else {
+        instrument::Node::NONE
+    };
+    let tree: &[super::index_paths::BitmapPlanNode<'a>] = if path.bitmap.len() > 1 {
+        path.bitmap
+    } else {
+        &[]
+    };
+    let tree_nodes = arena
+        .alloc_slice_with(tree.len(), |at| {
+            instrument::node(instrument::Role::MemberBitmapNode(
+                table,
+                leaf_role,
+                u16::try_from(at).unwrap_or(u16::MAX),
+            ))
+        })
+        .map_err(|_| arena_full())?;
+    let (pages, page_count, visible_pages) =
+        if matches!(path.kind, ScanKind::Bitmap | ScanKind::IndexOnly) {
+            let (pages, page_count) = heap_pages_of_rows(storage, leaf, txid, arena)?;
+            let statistics = storage.table_statistics(leaf, txid);
+            let activity = storage.relation_cumulative_statistics(leaf);
+            let visible = if activity.n_dead_tup != 0 {
+                0
+            } else {
+                statistics.relation_all_visible_pages().max(0) as u64
+            };
+            (pages as *const [(u64, u64)], page_count, visible)
+        } else {
+            (&[][..] as *const [(u64, u64)], 0, 0)
+        };
+    let seen = arena
+        .alloc_slice_with(page_count.div_ceil(64) as usize, |_| 0u64)
+        .map_err(|_| arena_full())?;
+    Ok(ChosenScanCounts {
+        conditions: core::ptr::slice_from_raw_parts(
+            path.conditions.as_ptr().cast(),
+            path.conditions.len(),
+        ),
+        predicate: core::ptr::slice_from_raw_parts(
+            path.predicate.as_ptr().cast(),
+            path.predicate.len(),
+        ),
+        tree: core::ptr::slice_from_raw_parts(tree.as_ptr().cast(), tree.len()),
+        tree_nodes: tree_nodes as *const [instrument::Node],
+        kind: path.kind,
+        scan: node,
+        bitmap,
+        pages,
+        seen: seen as *mut [u64],
+        visible_pages,
+    })
+}
+
 /// Orders `rows`, in row identity order, as the index scan of `path` reads
 /// them: by the index keys in the index's order, equal keys by identity.
 fn sort_by_index_key<'a>(
@@ -9823,6 +10479,170 @@ fn scan_source_mode<'a>(
                         .defs
                         .stored(order[depth])
                         .expect("resolved logical relation");
+                    // The path PostgreSQL chooses over a tree the query reads
+                    // alone sets the members' order, each member's rows'
+                    // order and what EXPLAIN ANALYZE counts.
+                    let tree = if depth == 0 && scope.n == 1 && matched[depth].members.is_none() {
+                        match super::index_paths::running_query(slot, where_clause) {
+                            Some((shape, needed)) => super::index_paths::scan_path(
+                                storage,
+                                scope,
+                                txid,
+                                where_clause,
+                                needed,
+                                params,
+                                arena,
+                                shape,
+                            )?
+                            .tree(),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(tree) = tree {
+                        let _stop_after = StopAfterScope::enter(slot, tree.stop_after);
+                        let scan = TreeScan::new(
+                            storage,
+                            txid,
+                            scope,
+                            logical,
+                            where_clause,
+                            params,
+                            hooks,
+                            outer,
+                            &tree,
+                            arena,
+                        )?;
+                        let table_role = u16::try_from(table).unwrap_or(u16::MAX);
+                        let mut members = [None::<TreeMember<'a>>; 256];
+                        let mut count = 0usize;
+                        for chosen in tree.members {
+                            if !leaves.contains(&chosen.leaf) {
+                                continue;
+                            }
+                            if count == members.len() {
+                                return Err(sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "a tree scan reads at most 256 members"
+                                ));
+                            }
+                            let physical = definitions.definition(storage, chosen.leaf, txid)?;
+                            members[count] =
+                                Some(scan.member(chosen, physical, table_role, &tree)?);
+                            count += 1;
+                        }
+                        let members = &mut members[..count];
+                        let merge = tree.kind == super::index_paths::AppendKind::Merge;
+                        // Each member's scan, and the sort over it, runs once.
+                        let mut loops: [Option<MemberLoops<'a>>; 256] =
+                            core::array::from_fn(|_| None);
+                        // Emits a member's row to the query, counted by the
+                        // member's scan, or by its sort when one reads the scan.
+                        macro_rules! emit_tree_row {
+                            ($at:expr, $position:expr) => {{
+                                let member = members[$at].expect("dense members");
+                                let rowid = member.rows[$position];
+                                check_timeout()?;
+                                storage.record_relation_tuple_read(txid, member.leaf, None)?;
+                                let sorted = member.sort;
+                                let _member_counts = MemberCounts::new(
+                                    append,
+                                    if sorted {
+                                        member.sort_node
+                                    } else {
+                                        member.node
+                                    },
+                                );
+                                let _chosen_scope = ChosenScanScope::enter(if sorted {
+                                    None
+                                } else {
+                                    member.counts
+                                });
+                                let this = index;
+                                index += 1;
+                                recycled(arena, recycle_rows, retain_match, || {
+                                    let Some(values) = scan.row(&member, rowid)? else {
+                                        return Ok(true);
+                                    };
+                                    refresh_catalog_object_names(
+                                        storage,
+                                        txid,
+                                        &mut values[..logical.n_columns],
+                                        arena,
+                                    )?;
+                                    visit_candidate!(this, BoundRow::Values(values), Some(rowid))
+                                })?
+                            }};
+                        }
+                        if merge {
+                            // `ExecMergeAppend`: the first row of every member,
+                            // then a binary heap of the members by their rows.
+                            let mut heap = [0usize; 256];
+                            let mut size = 0usize;
+                            for at in 0..members.len() {
+                                let member = members[at].as_mut().expect("dense members");
+                                loops[at] = Some(member.start());
+                                scan.open(member)?;
+                                if scan.pull(member)?.is_some() {
+                                    heap[size] = at;
+                                    size += 1;
+                                }
+                            }
+                            let mut stopped = false;
+                            if size > 1 {
+                                let mut node = (size as i64 - 2) / 2;
+                                while node >= 0 {
+                                    scan.sift_down(members, &mut heap[..size], node as usize)?;
+                                    node -= 1;
+                                }
+                            }
+                            while size > 0 {
+                                let at = heap[0];
+                                let head = members[at].expect("dense members").head;
+                                if !emit_tree_row!(at, head) {
+                                    stopped = true;
+                                    break;
+                                }
+                                let member = members[at].as_mut().expect("dense members");
+                                if scan.pull(member)?.is_some() {
+                                    if size > 1 {
+                                        scan.sift_down(members, &mut heap[..size], 0)?;
+                                    }
+                                } else {
+                                    size -= 1;
+                                    heap[0] = heap[size];
+                                    if size > 1 {
+                                        scan.sift_down(members, &mut heap[..size], 0)?;
+                                    }
+                                }
+                            }
+                            // The `Limit` stops before the member whose row it
+                            // took last reads again; every other member has
+                            // read the row it holds.
+                            if stopped {
+                                for &at in &heap[1..size] {
+                                    let member = members[at].expect("dense members");
+                                    scan.count_held(&member)?;
+                                }
+                            }
+                        } else {
+                            'members: for at in 0..members.len() {
+                                {
+                                    let member = members[at].as_mut().expect("dense members");
+                                    loops[at] = Some(member.start());
+                                    scan.open(member)?;
+                                }
+                                for position in 0..members[at].expect("dense members").rows.len() {
+                                    if !emit_tree_row!(at, position) {
+                                        break 'members;
+                                    }
+                                }
+                            }
+                        }
+                        drop(loops);
+                        break 'scanned;
+                    }
                     for &leaf in leaves {
                         // A RIGHT or FULL join knows a member's rows by their
                         // ordinal across every member.

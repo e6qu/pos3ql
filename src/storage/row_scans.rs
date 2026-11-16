@@ -641,6 +641,7 @@ mod tests {
                     &[],
                     100,
                     &crate::storage::NoIndexExpressions,
+                    &[],
                     &small,
                 )
                 .unwrap_err();

@@ -93957,6 +93957,7 @@ pub(crate) fn update<'a>(
             outer_lookup,
             selection,
             foreign_modify.as_ref(),
+            statement.assignments,
         )
     };
     let retained_rows = match collect {
@@ -95748,6 +95749,7 @@ pub(crate) fn delete<'a>(
             outer_lookup,
             selection,
             foreign_modify.as_ref(),
+            &[],
         )
     };
     let retained_rows = match collect {
@@ -106300,6 +106302,7 @@ pub(super) fn collect_matches<'a>(
     transition: Option<&dyn ColumnLookup<'a>>,
     selection: DmlSelection,
     planned: Option<&crate::sql::foreign::deparse::ForeignModifyScan<'_>>,
+    assignments: &[(&str, &'a Expr<'a>)],
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
@@ -106352,6 +106355,7 @@ pub(super) fn collect_matches<'a>(
             },
             alias,
             where_clause,
+            assignments,
             params,
             arena,
         )?
@@ -106361,6 +106365,28 @@ pub(super) fn collect_matches<'a>(
         None
     };
     WRITE_SCAN_ORDER.with(|memo| memo.set(Some((memo_key, chosen))));
+    // A tree's members each read their rows as the path PostgreSQL's costs
+    // chose for them; a resumed attempt describes its first attempt's
+    // choices again.
+    let member_orders = if transition.is_none()
+        && def.kind != crate::storage::TableKind::Foreign
+        && storage.relation_has_descendants(table_index, txid)
+    {
+        tree_write_orders(
+            storage,
+            table_index,
+            &def,
+            alias,
+            txid,
+            where_clause,
+            assignments,
+            params,
+            memo_key,
+            arena,
+        )?
+    } else {
+        None
+    };
     let key_order = chosen.filter(|order| {
         matches!(
             order.kind,
@@ -106444,6 +106470,27 @@ pub(super) fn collect_matches<'a>(
         let _member = member.start();
         // Each leaf's rows follow its own order; leaves keep theirs.
         let leaf_start = scratch.len();
+        let member_order = member_orders.and_then(|orders| {
+            orders
+                .iter()
+                .find(|(member, _)| *member == leaf)
+                .map(|(_, order)| *order)
+        });
+        let index_order = match (member_orders, member_order) {
+            (Some(_), Some(order)) => order.kind != crate::sql::query::index_paths::ScanKind::Seq,
+            (Some(_), None) => false,
+            (None, _) => index_order,
+        };
+        let key_order = match member_order {
+            Some(order) => Some(order).filter(|order| {
+                matches!(
+                    order.kind,
+                    crate::sql::query::index_paths::ScanKind::Index
+                        | crate::sql::query::index_paths::ScanKind::IndexOnly
+                )
+            }),
+            None => key_order.filter(|_| leaf == table_index),
+        };
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
             let layout =
@@ -106563,7 +106610,7 @@ pub(super) fn collect_matches<'a>(
         if index_order {
             scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
         }
-        if let Some(path) = key_order.filter(|_| leaf == table_index) {
+        if let Some(path) = key_order {
             order_by_index_key(
                 storage, leaf, txid, &physical, &path, scratch, leaf_start, arena,
             )?;
@@ -106609,11 +106656,143 @@ impl WriteScanOrder {
 /// command and the condition.
 type WriteScanKey = (usize, u32, u32, Option<*const Expr<'static>>);
 
+/// The members of a tree a write can plan.
+const MAX_WRITE_MEMBERS: usize = 256;
+
+/// The paths the running write of a tree chose for its members: each
+/// member's slot, path kind and number among its paths.
+struct WriteTreeOrder {
+    key: Option<WriteScanKey>,
+    members: [(usize, crate::sql::query::index_paths::ScanKind, usize); MAX_WRITE_MEMBERS],
+    /// `None` when the members have no index paths.
+    count: Option<usize>,
+}
+
+/// Each member of the tree `table_index` an `UPDATE` (with `assignments`)
+/// or `DELETE` writes, with the order its chosen path reads its rows in:
+/// the first attempt's choice, planned again for a resumed one. `None`
+/// when PostgreSQL scans the members without index paths.
+#[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
+fn tree_write_orders<'a>(
+    storage: &'a Storage,
+    table_index: usize,
+    def: &crate::storage::TableDef,
+    alias: Option<&str>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    assignments: &[(&str, &'a Expr<'a>)],
+    params: &[Datum<'a>],
+    key: WriteScanKey,
+    arena: &'a Arena,
+) -> Result<Option<&'a [(usize, WriteScanOrder)]>, SqlError> {
+    use crate::sql::query::index_paths;
+    let schema = arena
+        .alloc_str(def.schema.as_str())
+        .map_err(|_| arena_full())?;
+    let name = arena
+        .alloc_str(def.name.as_str())
+        .map_err(|_| arena_full())?;
+    let alias = match alias {
+        Some(alias) => Some(arena.alloc_str(alias).map_err(|_| arena_full())?),
+        None => None,
+    };
+    let target = QualName {
+        schema: Some(schema),
+        name,
+    };
+    let (scope, shape) =
+        index_paths::write_shape(storage, txid, target, alias, assignments, arena)?;
+    let _ = table_index;
+    let remembered = WRITE_TREE_ORDER.with(|memo| {
+        let memo = memo.borrow();
+        (memo.key == Some(key)).then(|| {
+            let mut members = [(0, index_paths::ScanKind::Seq, 0); MAX_WRITE_MEMBERS];
+            let count = memo.count.filter(|&count| count <= MAX_WRITE_MEMBERS);
+            if let Some(count) = count {
+                members[..count].copy_from_slice(&memo.members[..count]);
+            }
+            (members, count)
+        })
+    });
+    let (members, count) = match remembered {
+        Some(remembered) => remembered,
+        None => {
+            let tree = index_paths::scan_path(
+                storage,
+                &scope,
+                txid,
+                where_clause,
+                None,
+                params,
+                arena,
+                shape,
+            )?
+            .tree();
+            let mut members = [(0, index_paths::ScanKind::Seq, 0); MAX_WRITE_MEMBERS];
+            let count = tree.map_or(0, |tree| tree.members.len().min(MAX_WRITE_MEMBERS));
+            if let Some(tree) = tree {
+                for (at, member) in tree.members.iter().take(count).enumerate() {
+                    members[at] = (member.leaf, member.kind_path.0, member.kind_path.1);
+                }
+            }
+            WRITE_TREE_ORDER.with(|memo| {
+                let mut memo = memo.borrow_mut();
+                memo.key = Some(key);
+                memo.members[..count].copy_from_slice(&members[..count]);
+                memo.count = tree.is_some().then_some(count);
+            });
+            (members, tree.is_some().then_some(count))
+        }
+    };
+    // `None` when the members have no index paths.
+    let Some(count) = count else {
+        return Ok(None);
+    };
+    let orders = arena
+        .alloc_slice_with(count, |_| None::<(usize, WriteScanOrder)>)
+        .map_err(|_| arena_full())?;
+    for (at, &(leaf, kind, path)) in members[..count].iter().enumerate() {
+        let Some(chosen) = index_paths::member_path(
+            storage,
+            &scope,
+            txid,
+            where_clause,
+            params,
+            arena,
+            shape,
+            leaf,
+            (kind, path),
+        )?
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a write's member path is no longer planned"
+            ));
+        };
+        orders[at] = Some((leaf, WriteScanOrder::of(&chosen)));
+    }
+    Ok(Some(
+        &*arena
+            .alloc_slice_with(count, |at| orders[at].expect("dense member orders"))
+            .map_err(|_| arena_full())?,
+    ))
+}
+
 thread_local! {
     /// The scan order the running write chose, which its resumed attempts
     /// keep.
     static WRITE_SCAN_ORDER: core::cell::Cell<Option<(WriteScanKey, Option<WriteScanOrder>)>> =
         const { core::cell::Cell::new(None) };
+    /// The member paths the running write of a tree chose, which its
+    /// resumed attempts keep.
+    static WRITE_TREE_ORDER: core::cell::RefCell<WriteTreeOrder> =
+        const {
+            core::cell::RefCell::new(WriteTreeOrder {
+                key: None,
+                members: [(0, crate::sql::query::index_paths::ScanKind::Seq, 0); MAX_WRITE_MEMBERS],
+                count: None,
+            })
+        };
 }
 
 /// Reorders the rows `scratch` holds from `start`, in row identity order,

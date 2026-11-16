@@ -24,6 +24,7 @@ use crate::storage::{ColumnDistribution, MAX_COLUMNS, Storage, TableDef, TableSt
 
 use super::scope::{QueryScope, ResolvedColumn};
 
+mod append;
 mod clauses;
 mod expressions;
 mod like;
@@ -32,6 +33,7 @@ mod predicate;
 
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
+pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use paths::scan_path;
 
 /// Whether the table in `slot` has an index.
@@ -44,15 +46,32 @@ pub(crate) fn has_indexes(storage: &Storage, txid: u32, slot: usize) -> bool {
 /// The path PostgreSQL chooses for an `UPDATE`'s or `DELETE`'s scan of its
 /// target `target`, written `alias`, under `condition`: its rows' identity
 /// is read too, so no index-only scan serves it.
+#[expect(clippy::too_many_arguments, reason = "the write's parts are explicit")]
 pub(crate) fn write_scan_path<'a>(
     storage: &'a Storage,
     txid: u32,
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
     condition: Option<&'a Expr<'a>>,
+    assignments: &[(&str, &'a Expr<'a>)],
     params: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Result<Planned<'a>, SqlError> {
+    let (scope, shape) = write_shape(storage, txid, target, alias, assignments, arena)?;
+    scan_path(storage, &scope, txid, condition, None, params, arena, shape)
+}
+
+/// The scope an `UPDATE` (with its `assignments`) or `DELETE` of `target`
+/// reads, and the shape of its scan: the new values and the row identity
+/// it returns.
+pub(crate) fn write_shape<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    target: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    assignments: &[(&str, &'a Expr<'a>)],
+    arena: &'a Arena,
+) -> Result<(QueryScope<'a>, QueryShape), SqlError> {
     let from = arena
         .alloc(crate::sql::ast::FromClause {
             base: super::dml_target_ref(target, alias),
@@ -60,19 +79,117 @@ pub(crate) fn write_scan_path<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-    scan_path(
-        storage,
-        &scope,
-        txid,
-        condition,
-        None,
-        params,
-        arena,
+    let tree = scope.slots[0] != usize::MAX
+        && (storage
+            .table_def(scope.slots[0], txid)
+            .partition
+            .is_partitioned()
+            || storage.relation_has_descendants(scope.slots[0], txid));
+    // `ctid`, and `tableoid` naming a tree's member.
+    let identity_width = if tree { 6 + 4 } else { 6 };
+    let projection = write_projection(storage, txid, &scope, assignments, identity_width, arena)?;
+    // The columns the new values read (`reltarget`).
+    let mut read = 0u64;
+    for &(_, expression) in assignments {
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            if let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(qualifier, name) {
+                read |= if column < 64 { 1 << column } else { 1 << 63 };
+            }
+        });
+    }
+    let output = projection.map(|_| read);
+    Ok((
+        scope,
         QueryShape {
             target: true,
+            output,
+            projection,
+            identity_width,
             ..QueryShape::default()
         },
-    )
+    ))
+}
+
+/// The target list a write's scan computes: an `UPDATE`'s new values,
+/// then the row identity of `identity_width` bytes.
+fn write_projection<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    assignments: &[(&str, &'a Expr<'a>)],
+    identity_width: u32,
+    arena: &'a Arena,
+) -> Result<Option<Projection>, SqlError> {
+    if scope.n != 1 || scope.slots[0] == usize::MAX {
+        return Ok(None);
+    }
+    let Some(definition) = scope.defs.stored(0) else {
+        return Ok(None);
+    };
+    let statistics = storage.table_statistics(scope.slots[0], txid);
+    let mut projection = Projection {
+        width: identity_width,
+        per_tuple: 0.0,
+        expression_width: identity_width,
+        columns: [0; 64],
+        wide: false,
+        plain: true,
+    };
+    let costs = Costs::current();
+    for &(target, expression) in assignments {
+        if expression.contains_subquery() {
+            return Ok(None);
+        }
+        // A column of the relation, or an expression coerced to the
+        // assigned column's type.
+        let (width, cost, column) = match expression {
+            Expr::Column { qualifier, name }
+                if let Ok(ResolvedColumn::Table(0, column)) =
+                    scope.find_column(*qualifier, name) =>
+            {
+                (
+                    output_width(definition, &statistics, Some(1 << column.min(63))),
+                    0.0,
+                    Some(column),
+                )
+            }
+            _ => {
+                let Some(assigned) = definition
+                    .columns()
+                    .iter()
+                    .find(|column| column.name.as_str() == target)
+                else {
+                    return Ok(None);
+                };
+                let columns = crate::sql::exec::AliasedDefCols {
+                    definition: crate::storage::RelationDefinition::from_definition(definition),
+                    alias: None,
+                    output_aliases: &[],
+                    remote_ctid: false,
+                };
+                (
+                    type_average_width(assigned.ctype, assigned.type_mod) as u32,
+                    super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
+                        * costs.cpu_operator,
+                    None,
+                )
+            }
+        };
+        projection.width += width;
+        projection.per_tuple += cost;
+        match column {
+            Some(column) if column < 64 => {
+                projection.columns[column] += 1;
+                projection.plain &= projection.columns[column] == 1;
+            }
+            Some(_) => projection.wide = true,
+            None => {
+                projection.plain = false;
+                projection.expression_width += width;
+            }
+        }
+    }
+    Ok(Some(projection))
 }
 
 /// `selfuncs.h`' default selectivities.
@@ -579,10 +696,6 @@ pub(crate) struct ScanPath<'a> {
 
 /// What the model makes of a query's scan of one relation.
 #[derive(Clone, Copy)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a plan is returned once per scan, never held in bulk"
-)]
 pub(crate) enum Planned<'a> {
     /// The path PostgreSQL chooses.
     Chosen(ScanPath<'a>),
@@ -596,13 +709,30 @@ pub(crate) enum Planned<'a> {
     /// PostgreSQL plans the scan in a way the model does not cover; the
     /// text names the shape.
     Outside(&'static str),
+    /// The paths of a member of a tree ([`Member::Paths`]).
+    Members(paths::RelPaths<'a>),
+    /// The `Append` or `Merge Append` PostgreSQL chooses over the members
+    /// of a partition or inheritance tree.
+    Tree(append::TreePath<'a>),
 }
 
 impl<'a> Planned<'a> {
     pub(crate) fn chosen(self) -> Option<ScanPath<'a>> {
         match self {
             Self::Chosen(path) => Some(path),
-            Self::NotTable | Self::SeqOnly | Self::Outside(_) => None,
+            Self::NotTable
+            | Self::SeqOnly
+            | Self::Outside(_)
+            | Self::Members(_)
+            | Self::Tree(_) => None,
+        }
+    }
+
+    /// The path chosen over a partition or inheritance tree.
+    pub(crate) fn tree(self) -> Option<append::TreePath<'a>> {
+        match self {
+            Self::Tree(path) => Some(path),
+            _ => None,
         }
     }
 }
@@ -654,6 +784,9 @@ pub(super) struct Planner<'s, 'a> {
     pub(super) slot: usize,
     pub(super) definition: &'s TableDef,
     pub(super) statistics: &'s TableStatistics,
+    /// The key of the statistics its columns read: the table's own (0), or
+    /// those over a tree ([`crate::storage::INHERITED`]).
+    pub(super) statistics_key: u64,
     pub(super) size: RelationSize,
     pub(super) costs: Costs,
     /// Every index of the table, newest first.
@@ -704,7 +837,8 @@ impl<'s, 'a> Planner<'s, 'a> {
         }
         let meta = &self.definition.columns()[column];
         let attribute = self.definition.attributes.number(column);
-        let analyzed = attribute.and_then(|attribute| self.statistics.column(attribute));
+        let analyzed = attribute
+            .and_then(|attribute| self.statistics.index_column(self.statistics_key, attribute));
         // `has_unique_index`.
         let unique = self.indexes.iter().any(|index| {
             let index = &index.catalog;
@@ -731,7 +865,10 @@ impl<'s, 'a> Planner<'s, 'a> {
             distinct: analyzed.map_or(0.0, |column| {
                 f64::from(crate::storage::column_distinct_catalog_value(meta, column))
             }),
-            distribution: attribute.and_then(|attribute| self.statistics.distribution(attribute)),
+            distribution: attribute.and_then(|attribute| {
+                self.statistics
+                    .index_distribution(self.statistics_key, attribute)
+            }),
             ctype: meta.ctype,
             collation: meta.collation,
             unique,
@@ -1787,6 +1924,23 @@ pub(crate) struct QueryShape {
     /// The target list the scan computes, when the model reads it: its
     /// width and the per-row cost of its expressions.
     pub(crate) projection: Option<Projection>,
+    /// The scan is of one member of a partition or inheritance tree.
+    pub(crate) member: Member,
+    /// The width of the row identity a write's scan returns beside its
+    /// columns: `ctid`, and `tableoid` for a tree's member.
+    pub(crate) identity_width: u32,
+}
+
+/// What the planning of one member of a partition or inheritance tree
+/// returns to the tree's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Member {
+    /// The relation is planned on its own.
+    No,
+    /// Its paths, as [`Planned::Members`].
+    Paths,
+    /// The scan of the one of its paths the tree chose.
+    Describe(paths::Candidate),
 }
 
 /// The scan's target list (`apply_scanjoin_target_to_paths`): the select
@@ -1797,6 +1951,26 @@ pub(crate) struct QueryShape {
 pub(crate) struct Projection {
     pub(crate) width: u32,
     pub(crate) per_tuple: f64,
+    /// The width of its entries that are not columns of the relation.
+    pub(crate) expression_width: u32,
+    /// How often each of the relation's first 64 columns is an entry.
+    pub(crate) columns: [u8; 64],
+    /// An entry is a column past the 64th.
+    pub(crate) wide: bool,
+    /// Every entry is a distinct column of the relation: the list is the
+    /// relation's own (`scanjoin_target_same_exprs`).
+    pub(crate) plain: bool,
+}
+
+impl Projection {
+    /// The list's width with each column `column_width` wide.
+    pub(super) fn width_with(&self, column_width: &dyn Fn(usize) -> f64) -> u32 {
+        let mut width = f64::from(self.expression_width);
+        for (column, &count) in self.columns.iter().enumerate() {
+            width += f64::from(count) * column_width(column);
+        }
+        width as u32
+    }
 }
 
 impl Default for QueryShape {
@@ -1812,6 +1986,8 @@ impl Default for QueryShape {
             output: None,
             probe: false,
             projection: None,
+            member: Member::No,
+            identity_width: 0,
         }
     }
 }
@@ -1982,57 +2158,53 @@ fn projection<'a>(
         return Ok(None);
     };
     let statistics = storage.table_statistics(scope.slots[0], txid);
-    let costs = Costs::current();
     let mut width = 0u32;
     let mut per_tuple = 0.0;
-    // An entry's width and per-row cost.
-    let entry = |expression: &'a Expr<'a>| -> Option<(u32, f64)> {
-        if let Expr::Column { qualifier, name } = expression
-            && let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(*qualifier, name)
-        {
-            return Some((
-                output_width(definition, &statistics, Some(1 << column.min(63))),
-                0.0,
-            ));
+    let mut expression_width = 0u32;
+    let mut columns = [0u8; 64];
+    let mut wide = false;
+    let mut plain = true;
+    fn count_column(columns: &mut [u8; 64], plain: &mut bool, wide: &mut bool, column: usize) {
+        match columns.get_mut(column) {
+            Some(count) => {
+                *count = count.saturating_add(1);
+                *plain &= *count == 1;
+            }
+            None => *wide = true,
         }
-        if expression.contains_subquery() {
-            return None;
-        }
-        let (type_oid, type_mod) = crate::sql::exec::infer_type_catalog(
-            expression,
-            Some(definition),
+    }
+    let entry = |expression: &'a Expr<'a>| {
+        target_entry(
             storage,
             txid,
+            scope,
+            definition,
+            &statistics,
+            expression,
             arena,
         )
-        .ok()?;
-        let Some((ctype, None)) = crate::sql::exec::catalog_column_type(storage, txid, type_oid)
-        else {
-            return None;
-        };
-        let columns = crate::sql::exec::AliasedDefCols {
-            definition: crate::storage::RelationDefinition::from_definition(definition),
-            alias: None,
-            output_aliases: &[],
-            remote_ctid: false,
-        };
-        Some((
-            type_average_width(ctype, i32::from(type_mod)) as u32,
-            super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
-                * costs.cpu_operator,
-        ))
     };
     for item in items {
         match item {
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                 width += output_width(definition, &statistics, None);
+                for column in 0..definition.n_columns {
+                    count_column(&mut columns, &mut plain, &mut wide, column);
+                }
             }
             SelectItem::Expr { expression, .. } => {
-                let Some((entry_width, cost)) = entry(expression) else {
+                let Some((entry_width, cost, column)) = entry(expression) else {
                     return Ok(None);
                 };
                 width += entry_width;
                 per_tuple += cost;
+                match column {
+                    Some(column) => count_column(&mut columns, &mut plain, &mut wide, column),
+                    None => {
+                        plain = false;
+                        expression_width += entry_width;
+                    }
+                }
             }
             SelectItem::RecordStar(_) => return Ok(None),
         }
@@ -2051,13 +2223,72 @@ fn projection<'a>(
         if listed || (target.is_constant(false) && !target.calls_routine()) {
             continue;
         }
-        let Some((entry_width, cost)) = entry(target) else {
+        let Some((entry_width, cost, column)) = entry(target) else {
             return Ok(None);
         };
         width += entry_width;
         per_tuple += cost;
+        match column {
+            Some(column) => count_column(&mut columns, &mut plain, &mut wide, column),
+            None => {
+                plain = false;
+                expression_width += entry_width;
+            }
+        }
     }
-    Ok(Some(Projection { width, per_tuple }))
+    Ok(Some(Projection {
+        width,
+        per_tuple,
+        expression_width,
+        columns,
+        wide,
+        plain,
+    }))
+}
+
+/// A target list entry's width and per-row evaluation cost, and the
+/// column of the relation it is; `None` for an entry the model does not
+/// read (a subquery, or an expression of a catalog-defined type).
+fn target_entry<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    definition: &TableDef,
+    statistics: &TableStatistics,
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Option<(u32, f64, Option<usize>)> {
+    let costs = Costs::current();
+    if let Expr::Column { qualifier, name } = expression
+        && let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(*qualifier, name)
+    {
+        return Some((
+            output_width(definition, statistics, Some(1 << column.min(63))),
+            0.0,
+            Some(column),
+        ));
+    }
+    if expression.contains_subquery() {
+        return None;
+    }
+    let (type_oid, type_mod) =
+        crate::sql::exec::infer_type_catalog(expression, Some(definition), storage, txid, arena)
+            .ok()?;
+    let Some((ctype, None)) = crate::sql::exec::catalog_column_type(storage, txid, type_oid) else {
+        return None;
+    };
+    let columns = crate::sql::exec::AliasedDefCols {
+        definition: crate::storage::RelationDefinition::from_definition(definition),
+        alias: None,
+        output_aliases: &[],
+        remote_ctid: false,
+    };
+    Some((
+        type_average_width(ctype, i32::from(type_mod)) as u32,
+        super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
+            * costs.cpu_operator,
+        None,
+    ))
 }
 
 /// The key expressions of the indexes of the one plain table `scope` reads.

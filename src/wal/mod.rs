@@ -7610,12 +7610,7 @@ fn decode_statistics_column<'p>(
         distinct_fraction,
         average_width,
     };
-    let record = if index == 0 {
-        crate::storage::AnalyzedColumn::new(attribute, statistics)
-    } else {
-        crate::storage::AnalyzedColumn::of_index(index, attribute, statistics)
-    }
-    .ok()?;
+    let record = crate::storage::AnalyzedColumn::keyed(index, attribute, statistics).ok()?;
     Some((record, distribution))
 }
 

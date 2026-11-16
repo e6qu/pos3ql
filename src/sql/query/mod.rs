@@ -13313,6 +13313,16 @@ pub(crate) fn select_query_resumable<'a>(
                 Ok(shape) => Some(index_paths::QueryShape {
                     stop_at_limit: statement.locking.is_empty(),
                     only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    // The scan returns the columns the select list and
+                    // ordering read, as EXPLAIN plans it.
+                    output: streaming_pax_columns_ordered(
+                        &scope,
+                        from,
+                        statement.items,
+                        None,
+                        statement.order_by,
+                    )
+                    .selected_mask(0),
                     ..shape
                 }),
                 Err(error) => return sql_fail(error),

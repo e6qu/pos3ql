@@ -4,6 +4,10 @@ use super::super::{ColumnStatistics, MAX_RELATION_COLUMNS, SharedSlice};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// The key of a table column's statistics over the table and its
+/// descendants, after every index's: no index's creation stamp reaches it.
+pub(crate) const INHERITED: u64 = u64::MAX;
+
 /// Every stored record is analyzed and names a stable PostgreSQL attribute:
 /// a column of its table, or a key column of one of the table's indexes
 /// (`index`, the index's creation stamp, nonzero), as `pg_statistic` keys an
@@ -45,6 +49,33 @@ impl AnalyzedColumn {
         })
     }
 
+    /// The statistics of column `attribute` over the table and all its
+    /// descendants (`stainherit`), as ANALYZE of a partitioned table or an
+    /// inheritance parent gathers them.
+    pub(crate) fn inherited(
+        attribute: u16,
+        statistics: ColumnStatistics,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            index: INHERITED,
+            ..Self::new(attribute, statistics)?
+        })
+    }
+
+    /// The record of `attribute` keyed `index`: a table column (0), its
+    /// inherited statistics ([`INHERITED`]) or an index's key column.
+    pub(crate) fn keyed(
+        index: u64,
+        attribute: u16,
+        statistics: ColumnStatistics,
+    ) -> Result<Self, SqlError> {
+        match index {
+            0 => Self::new(attribute, statistics),
+            INHERITED => Self::inherited(attribute, statistics),
+            _ => Self::of_index(index, attribute, statistics),
+        }
+    }
+
     /// The statistics of key column `attribute` (from 1) of the index
     /// created at `index`.
     pub(crate) fn of_index(
@@ -52,7 +83,8 @@ impl AnalyzedColumn {
         attribute: u16,
         statistics: ColumnStatistics,
     ) -> Result<Self, SqlError> {
-        if index == 0 || usize::from(attribute) > super::super::MAX_INDEX_COLS {
+        if index == 0 || index == INHERITED || usize::from(attribute) > super::super::MAX_INDEX_COLS
+        {
             return Err(invalid());
         }
         Ok(Self {

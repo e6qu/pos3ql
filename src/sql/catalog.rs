@@ -18411,11 +18411,23 @@ fn pg_stats<'a>(
             continue;
         }
         let table_definition = storage.table_def(slot, txid);
-        for (column, metadata) in table_definition.columns().iter().enumerate() {
+        // Each column's own statistics, then those over the table and its
+        // descendants (`stainherit`).
+        for (inherited, (column, metadata)) in
+            [0, crate::storage::INHERITED].into_iter().flat_map(|key| {
+                table_definition
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(move |column| (key, column))
+            })
+        {
+            let key = inherited;
+            let inherited = key == crate::storage::INHERITED;
             let Some(column_statistics) = table_definition
                 .attributes
                 .number(column)
-                .and_then(|attribute| statistics.column(attribute))
+                .and_then(|attribute| statistics.index_column(key, attribute))
             else {
                 continue;
             };
@@ -18431,7 +18443,7 @@ fn pg_stats<'a>(
             let (most_common, frequencies, histogram, correlation) = match table_definition
                 .attributes
                 .number(column)
-                .and_then(|attribute| statistics.distribution(attribute))
+                .and_then(|attribute| statistics.index_distribution(key, attribute))
             {
                 Some(distribution) => statistics_slots(
                     distribution,
@@ -18446,7 +18458,7 @@ fn pg_stats<'a>(
                     text(table_definition.schema.as_str(), arena)?,
                     text(table_definition.name.as_str(), arena)?,
                     text(metadata.name.as_str(), arena)?,
-                    Datum::Bool(false),
+                    Datum::Bool(inherited),
                     Datum::Float4(column_statistics.null_fraction),
                     Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
                     Datum::Float4(distinct),

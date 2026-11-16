@@ -169,10 +169,13 @@ Other payload rules:
   checked-default input section follows the constraint identities (an empty
   section is explicit).
 - **Table statistics** use V7 marker 249 and a declared record count of at
-  most 1,856: the table's columns and up to 256 index expression keys. Each
+  most 3,456: the table's columns, up to 256 index expression keys and the
+  columns' inherited statistics. Each
   record starts with an eight-byte index creation stamp (0 for a table
-  column, else the index whose key it describes, as `pg_statistic` keys an
-  index expression's statistics to the index) and a two-byte attribute
+  column, all ones for a column's statistics over the table and its
+  descendants, `pg_statistic.stainherit`, else the index whose key it
+  describes, as `pg_statistic` keys an index expression's statistics to
+  the index) and a two-byte attribute
   number (a column number 1–1,600, or a key position 1–32); records are
   strictly increasing by stamp, then attribute. Each record stores its null and
   distinct fractions as IEEE-754 `float4` bits and ends with a four-byte

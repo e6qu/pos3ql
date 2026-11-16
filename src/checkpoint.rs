@@ -4782,12 +4782,10 @@ impl Checkpointer {
                         distinct_fraction: f32::from_bits(distinct_fraction),
                         average_width,
                     };
-                    let record = if index == 0 {
-                        crate::storage::AnalyzedColumn::new(column, statistics)
-                    } else {
-                        crate::storage::AnalyzedColumn::of_index(index, column, statistics)
-                    }
-                    .map_err(|_| CheckpointSetupError::Corrupt("statistics column out of range"))?;
+                    let record = crate::storage::AnalyzedColumn::keyed(index, column, statistics)
+                        .map_err(|_| {
+                        CheckpointSetupError::Corrupt("statistics column out of range")
+                    })?;
                     loaded
                         .records
                         .push_reserved(record)

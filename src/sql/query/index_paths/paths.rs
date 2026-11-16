@@ -28,7 +28,7 @@ const FUZZ_FACTOR: f64 = 1.01;
 /// The index paths one query builds.
 const MAX_INDEX_PATHS: usize = 256;
 /// The candidate paths `add_path` weighs at once.
-const MAX_CANDIDATES: usize = 2 * MAX_INDEXES + 2;
+pub(super) const MAX_CANDIDATES: usize = 2 * MAX_INDEXES + 2;
 /// The children of one `BitmapAnd` or `BitmapOr`.
 const MAX_CHILDREN: usize = 64;
 /// The index clauses of one index path.
@@ -149,20 +149,21 @@ struct BitmapNode<'a> {
 /// One candidate path of the relation, or of its ordered or limited
 /// result.
 #[derive(Clone, Copy, Debug)]
-struct Candidate {
-    kind: ScanKind,
-    /// The index path, or the bitmap node of a bitmap heap scan.
-    path: usize,
-    startup: f64,
-    total: f64,
-    disabled: u32,
+pub(crate) struct Candidate {
+    pub(super) kind: ScanKind,
+    /// The index path, or the bitmap node of a bitmap heap scan; for a
+    /// path of a partition or inheritance tree, its append path.
+    pub(super) path: usize,
+    pub(super) startup: f64,
+    pub(super) total: f64,
+    pub(super) disabled: u32,
     /// The path's pathkeys are the first this many of the query's.
-    presorted: usize,
-    sort: SortKind,
+    pub(super) presorted: usize,
+    pub(super) sort: SortKind,
 }
 
 impl Candidate {
-    fn same_scan(&self, other: &Self) -> bool {
+    pub(super) fn same_scan(&self, other: &Self) -> bool {
         (self.kind, self.path) == (other.kind, other.path)
     }
 }
@@ -1651,7 +1652,7 @@ fn fuzzily_better(
 /// `add_path` over paths of one relation with the same rows and
 /// parameterization, whose pathkeys are prefixes of the query's: the kept
 /// paths, cheapest total first.
-fn add_paths(
+pub(super) fn add_paths(
     paths: &[Candidate],
     consider_startup: bool,
     kept: &mut [Option<Candidate>; MAX_CANDIDATES],
@@ -1724,7 +1725,7 @@ fn cheapest_total(paths: &[Option<Candidate>]) -> Option<Candidate> {
 }
 
 /// `estimate_num_groups` of the relation's `columns` over its `rows`.
-fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows: f64) -> f64 {
+pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows: f64) -> f64 {
     let input = clamp_row_est(rows);
     let mut groups = 1.0;
     let mut product = 1.0;
@@ -1823,6 +1824,15 @@ pub(crate) fn scan_path<'a>(
     arena: &'a Arena,
     shape: QueryShape,
 ) -> Result<Planned<'a>, SqlError> {
+    // A generic plan knows no parameter's value; a custom plan knows the
+    // values it was planned for.
+    let params = if crate::sql::eval::generic_plan_active() {
+        &[]
+    } else if params.is_empty() {
+        crate::sql::eval::custom_plan_parameters()
+    } else {
+        params
+    };
     if scope.n != 1 || scope.derived[0].is_some() || scope.lateral[0] {
         return Ok(Planned::NotTable);
     }
@@ -1836,82 +1846,13 @@ pub(crate) fn scan_path<'a>(
     if definition.kind != crate::storage::TableKind::Local {
         return Ok(Planned::NotTable);
     }
-    // A tree whose members PostgreSQL scans without index paths is scanned
-    // member by member sequentially.
+    // A partition or inheritance tree is planned member by member.
     if definition.partition.is_partitioned()
         || (!shape.only && storage.relation_has_descendants(slot, txid))
     {
-        let exposed = arena
-            .alloc_str(scope.names[0])
-            .map_err(|_| crate::sql::eval::arena_full())?;
-        for &leaf in crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)? {
-            let member = storage.table_def(leaf, txid);
-            if member.kind != crate::storage::TableKind::Local {
-                continue;
-            }
-            let schema = arena
-                .alloc_str(member.schema.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            let name = arena
-                .alloc_str(member.name.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            // The member's own numbering of the columns read.
-            let member_needed = needed.map(|needed| {
-                let mut mask = 0u64;
-                for (column, meta) in definition.columns().iter().enumerate() {
-                    if column < 64 && needed & (1 << column) != 0 {
-                        match member.column_index(meta.name.as_str()) {
-                            Some(at) if at < 64 => mask |= 1 << at,
-                            _ => mask |= 1 << 63,
-                        }
-                    }
-                }
-                mask
-            });
-            drop(member);
-            let from = arena
-                .alloc(crate::sql::ast::FromClause {
-                    base: super::super::dml_target_ref(
-                        crate::sql::ast::QualName {
-                            schema: Some(schema),
-                            name,
-                        },
-                        Some(exposed),
-                    ),
-                    joins: &[],
-                })
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            let member_scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-            match scan_path(
-                storage,
-                &member_scope,
-                txid,
-                condition,
-                member_needed,
-                params,
-                arena,
-                QueryShape {
-                    only: true,
-                    probe: true,
-                    ..shape
-                },
-            )? {
-                Planned::NotTable | Planned::SeqOnly => {}
-                Planned::Chosen(_) => {}
-                Planned::Outside(shape) => {
-                    return Ok(Planned::Outside(if shape == "index paths" {
-                        if definition.partition.is_partitioned() {
-                            "a partitioned table whose partitions have index paths"
-                        } else {
-                            "an inheritance tree whose members have index paths"
-                        }
-                    } else {
-                        shape
-                    }));
-                }
-            }
-        }
-        return Ok(Planned::SeqOnly);
+        return super::append::tree_path(
+            storage, scope, txid, condition, needed, params, arena, shape, slot, definition,
+        );
     }
     // Extended statistics change PostgreSQL's selectivities in ways the
     // model leaves out, which matters only among index paths.
@@ -1964,6 +1905,7 @@ pub(crate) fn scan_path<'a>(
         slot,
         definition,
         statistics: &statistics,
+        statistics_key: 0,
         size,
         costs: Costs::current(),
         indexes,
@@ -2325,7 +2267,7 @@ pub(crate) fn scan_path<'a>(
         needed,
         rows,
     )? {
-        Ok(path) => Ok(Planned::Chosen(path)),
+        Ok(planned) => Ok(planned),
         Err(shape) => Ok(Planned::Outside(shape)),
     }
 }
@@ -2417,7 +2359,8 @@ fn scope_ref<'p>(scope: &'p QueryScope<'_>) -> &'p QueryScope<'p> {
     unsafe { &*(scope as *const QueryScope<'_>).cast::<QueryScope<'p>>() }
 }
 
-/// Builds the relation's paths and chooses among them.
+/// Builds the relation's paths and chooses among them, or, for a member of
+/// a partition or inheritance tree, returns its paths or describes one.
 fn build<'a>(
     paths: &mut Paths<'_, '_, 'a>,
     all: &'a [&'a Restriction<'a>],
@@ -2425,7 +2368,90 @@ fn build<'a>(
     definition: &crate::storage::TableDef,
     needed: Option<u64>,
     rows: f64,
-) -> Built<ScanPath<'a>> {
+) -> Built<Planned<'a>> {
+    let planner = paths.planner;
+    let arena = paths.arena;
+    let kept = outside!(rel_candidates(paths, all, shape, rows)?);
+    let width = f64::from(shape.projection.map_or_else(
+        || {
+            super::output_width(definition, planner.statistics, shape.output.or(needed))
+                + shape.identity_width
+        },
+        |projection| projection.width,
+    ));
+    match shape.member {
+        super::Member::Paths => {
+            return Ok(Ok(Planned::Members(RelPaths {
+                rows,
+                tuples: planner.size.tuples,
+                width,
+                fixed: paths.fixed,
+                kept,
+            })));
+        }
+        super::Member::Describe(candidate) => {
+            let path = outside!(describe(
+                paths, &candidate, &candidate, shape, definition, needed, rows
+            )?);
+            return Ok(Ok(Planned::Chosen(path)));
+        }
+        super::Member::No => {}
+    }
+    let order = paths.order;
+    let groups = |presorted: usize| {
+        let mut columns = [0usize; super::MAX_ORDER_KEYS];
+        for (at, key) in order[..presorted].iter().enumerate() {
+            if let OrderKey::Column { column, .. } = key {
+                columns[at] = *column;
+            }
+        }
+        estimate_groups(planner, &columns[..presorted], rows)
+    };
+    let upper = upper_paths(
+        kept,
+        rows,
+        width,
+        order.len(),
+        shape,
+        planner.costs,
+        &groups,
+        arena,
+    )?;
+    let mut path = outside!(describe(
+        paths,
+        &upper.chosen,
+        &upper.scan,
+        shape,
+        definition,
+        needed,
+        rows
+    )?);
+    path.sort_cost = upper.sort_cost;
+    path.limit_cost = upper.limit_cost;
+    Ok(Ok(Planned::Chosen(path)))
+}
+
+/// A relation's paths as `add_path` keeps them, cheapest total first, each
+/// with the cost of the target list it computes, and the relation's size.
+#[derive(Clone, Copy)]
+pub(crate) struct RelPaths<'a> {
+    pub(super) rows: f64,
+    pub(super) tuples: f64,
+    pub(super) width: f64,
+    /// The columns a condition fixes to a constant, whose sort keys the
+    /// paths leave out.
+    pub(super) fixed: u64,
+    pub(super) kept: &'a [Candidate],
+}
+
+/// The relation's paths (`set_plain_rel_pathlist` through `add_path`), each
+/// charged the target list's evaluation.
+fn rel_candidates<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    all: &'a [&'a Restriction<'a>],
+    shape: QueryShape,
+    rows: f64,
+) -> Built<&'a [Candidate]> {
     let methods = crate::sql::guc::planner_methods();
     let planner = paths.planner;
     let costs = planner.costs;
@@ -2537,11 +2563,8 @@ fn build<'a>(
             candidates[at].expect("dense candidates")
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
-    let consider_startup = shape
-        .limit
-        .is_some_and(|(count, _)| count.is_some_and(|count| count > 0.0));
     let mut kept = [None::<Candidate>; MAX_CANDIDATES];
-    let kept_count = add_paths(candidates, consider_startup, &mut kept);
+    let kept_count = add_paths(candidates, consider_startup(shape), &mut kept);
     // The target list's expressions are evaluated by the scan below any
     // sort.
     if let Some(projection) = shape.projection {
@@ -2549,18 +2572,56 @@ fn build<'a>(
             path.total += projection.per_tuple * rows;
         }
     }
-    let cheapest = cheapest_total(&kept[..kept_count]).expect("the sequential path is kept");
-    let width = f64::from(shape.projection.map_or_else(
-        || super::output_width(definition, planner.statistics, shape.output.or(needed)),
-        |projection| projection.width,
-    ));
+    Ok(Ok(&*arena
+        .alloc_slice_with(kept_count, |at| kept[at].expect("dense kept paths"))
+        .map_err(|_| crate::sql::eval::arena_full())?))
+}
+
+/// `rel->consider_startup`: a `LIMIT` gives the query a tuple fraction.
+fn consider_startup(shape: QueryShape) -> bool {
+    shape
+        .limit
+        .is_some_and(|(count, _)| count.is_some_and(|count| count > 0.0))
+}
+
+/// The path the query chooses above a relation's `kept` paths, and the
+/// figures of the sort and limit over it.
+pub(super) struct Upper {
+    pub(super) chosen: Candidate,
+    /// The chosen relation path, under any sort and limit.
+    pub(super) scan: Candidate,
+    pub(super) sort_cost: Option<(f64, f64)>,
+    pub(super) limit_cost: Option<(f64, f64, f64)>,
+}
+
+/// `create_ordered_paths` and `create_limit_path` over the relation's
+/// `kept` paths of `rows` rows of `width` bytes, then the cheapest
+/// (`get_cheapest_fractional_path` as `add_path` leaves it); `groups` is
+/// `estimate_num_groups` of the first that many query sort keys.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+pub(super) fn upper_paths(
+    kept: &[Candidate],
+    rows: f64,
+    width: f64,
+    order_len: usize,
+    shape: QueryShape,
+    costs: super::Costs,
+    groups: &dyn Fn(usize) -> f64,
+    arena: &Arena,
+) -> Result<Upper, SqlError> {
+    let methods = crate::sql::guc::planner_methods();
+    let consider_startup = consider_startup(shape);
+    let kept_options = arena
+        .alloc_slice_with(kept.len(), |at| Some(kept[at]))
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let cheapest = cheapest_total(kept_options).expect("the relation keeps a path");
     let limit_tuples = shape
         .limit
         .and_then(|(count, offset)| count.map(|count| count + offset));
     // `create_ordered_paths`.
     let mut finals = [None::<Candidate>; MAX_CANDIDATES];
     let mut final_count = 0;
-    for path in kept[..kept_count].iter().flatten() {
+    for path in kept {
         let mut path = *path;
         if order_len > 0 && path.presorted < order_len {
             let incremental = path.presorted > 0 && methods.incremental_sort;
@@ -2568,13 +2629,7 @@ fn build<'a>(
                 continue;
             }
             if incremental {
-                let mut columns = [0usize; super::MAX_ORDER_KEYS];
-                for (at, key) in paths.order[..path.presorted].iter().enumerate() {
-                    if let OrderKey::Column { column, .. } = key {
-                        columns[at] = *column;
-                    }
-                }
-                let groups = estimate_groups(planner, &columns[..path.presorted], rows);
+                let groups = groups(path.presorted);
                 let input_tuples = rows.max(2.0);
                 let group_tuples = input_tuples / groups;
                 let input_run = path.total - path.startup;
@@ -2607,8 +2662,10 @@ fn build<'a>(
                 };
             }
         }
-        finals[final_count] = Some(path);
-        final_count += 1;
+        if final_count < MAX_CANDIDATES {
+            finals[final_count] = Some(path);
+            final_count += 1;
+        }
     }
     let finals = arena
         .alloc_slice_with(final_count, |at| finals[at].expect("dense finals"))
@@ -2642,25 +2699,22 @@ fn build<'a>(
     let final_paths_count = add_paths(limited, consider_startup, &mut final_paths);
     let chosen = cheapest_total(&final_paths[..final_paths_count]).expect("a path is kept");
     // The scan's own costs, under any sort and limit.
-    let scan = kept[..kept_count]
+    let scan = kept
         .iter()
-        .flatten()
         .find(|path| path.same_scan(&chosen))
         .copied()
         .unwrap_or(chosen);
-    let mut path = outside!(describe(
-        paths, &chosen, &scan, shape, definition, needed, rows
-    )?);
     // The sort's and the limit's own figures.
-    if chosen.sort != SortKind::None
-        && let Some(sorted) = ordered[..ordered_count]
+    let sort_cost = if chosen.sort == SortKind::None {
+        None
+    } else {
+        ordered[..ordered_count]
             .iter()
             .flatten()
             .find(|path| path.same_scan(&chosen))
-    {
-        path.sort_cost = Some((sorted.startup, sorted.total));
-    }
-    if let Some((count, offset)) = shape.limit {
+            .map(|sorted| (sorted.startup, sorted.total))
+    };
+    let limit_cost = shape.limit.map(|(count, offset)| {
         let mut limit_rows = rows;
         if offset > 0.0 {
             limit_rows = (limit_rows - clamp_row_est(offset).min(limit_rows)).max(1.0);
@@ -2668,9 +2722,14 @@ fn build<'a>(
         if let Some(count) = count {
             limit_rows = clamp_row_est(count).min(limit_rows);
         }
-        path.limit_cost = Some((chosen.startup, chosen.total, limit_rows));
-    }
-    Ok(Ok(path))
+        (chosen.startup, chosen.total, limit_rows)
+    });
+    Ok(Upper {
+        chosen,
+        scan,
+        sort_cost,
+        limit_cost,
+    })
 }
 
 /// The chosen path as EXPLAIN and execution read it.
@@ -2696,7 +2755,10 @@ fn describe<'a>(
         absorbed: &[],
         rows,
         width: shape.projection.map_or_else(
-            || super::output_width(definition, planner.statistics, shape.output.or(needed)),
+            || {
+                super::output_width(definition, planner.statistics, shape.output.or(needed))
+                    + shape.identity_width
+            },
             |projection| projection.width,
         ),
         startup_cost: scan.startup,
@@ -2715,7 +2777,8 @@ fn describe<'a>(
             Some((Some(count), offset))
                 if !paths.order.is_empty()
                     && chosen.sort == SortKind::None
-                    && shape.stop_at_limit =>
+                    && shape.stop_at_limit
+                    && matches!(shape.member, super::Member::No) =>
             {
                 Some((count.max(0.0) + offset.max(0.0)) as u64)
             }

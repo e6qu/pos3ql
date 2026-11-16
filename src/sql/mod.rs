@@ -10341,12 +10341,14 @@ impl Engine {
                         guc::default_statistics_target(),
                         &self.work,
                     )?;
+                    let members = analyzed_members(&self.storage, slot, txn.txid, &self.work)?;
                     let statistics = self.storage.analyze_table(
                         slot,
                         txn.txid,
                         &[],
                         guc::default_statistics_target(),
                         &indexes,
+                        members,
                         &self.work,
                     )?;
                     drop(indexes);
@@ -10407,12 +10409,14 @@ impl Engine {
                     guc::default_statistics_target(),
                     &self.work,
                 )?;
+                let members = analyzed_members(&self.storage, slot, txn.txid, &self.work)?;
                 let statistics = self.storage.analyze_table(
                     slot,
                     txn.txid,
                     &selected[..selected_count],
                     guc::default_statistics_target(),
                     &indexes,
+                    members,
                     &self.work,
                 );
                 drop(indexes);
@@ -23703,17 +23707,27 @@ impl Engine {
                     } else {
                         params
                     };
+                    let generic = matches!(statement, Stmt::ExecutePrepared { .. }) && !custom_plan;
                     let mut run = || {
                         with_prepared_parameter_types(parameter_types, || {
-                            self.execute_explained_statement(
-                                planned_statement,
-                                arena,
-                                execution_params,
-                                txn,
-                                (&mut *sqlprep, &mut *cursors),
-                                guc,
-                                &mut *responder,
-                            )
+                            let mut execute = || {
+                                self.execute_explained_statement(
+                                    planned_statement,
+                                    arena,
+                                    execution_params,
+                                    txn,
+                                    (&mut *sqlprep, &mut *cursors),
+                                    guc,
+                                    &mut *responder,
+                                )
+                            };
+                            // A generic plan's access paths know no
+                            // argument's value.
+                            if generic {
+                                eval::with_generic_plan_parameters(execution_params, execute)
+                            } else {
+                                execute()
+                            }
                         })
                     };
                     // The plan counts what each of its nodes does as the
@@ -26124,21 +26138,30 @@ impl Engine {
                                 {
                                     return Ok(Err(error));
                                 }
-                                sqlprep.choose_plan(name, guc.plan_cache_mode());
-                                exec::with_bound_parameter_types(parameter_oids, || {
-                                    self.execute_stmt(
-                                        &statement,
-                                        arena,
-                                        inner_params,
-                                        txn,
-                                        sqlprep,
-                                        cursors,
-                                        guc,
-                                        exec::PlpgsqlTransactionContext::Atomic,
-                                        responder,
-                                        StatementTimeoutEntry::Nested,
-                                    )
-                                })
+                                let choice = sqlprep.choose_plan(name, guc.plan_cache_mode());
+                                let mut run = || {
+                                    exec::with_bound_parameter_types(parameter_oids, || {
+                                        self.execute_stmt(
+                                            &statement,
+                                            arena,
+                                            inner_params,
+                                            txn,
+                                            sqlprep,
+                                            cursors,
+                                            guc,
+                                            exec::PlpgsqlTransactionContext::Atomic,
+                                            responder,
+                                            StatementTimeoutEntry::Nested,
+                                        )
+                                    })
+                                };
+                                // A generic plan's access paths know no
+                                // argument's value.
+                                if choice == prep::PlanChoice::Generic {
+                                    eval::with_generic_plan_parameters(inner_params, run)
+                                } else {
+                                    run()
+                                }
                             }
                             Ok(None) => Ok(Ok(())),
                             Err(e) => Ok(Err(SqlError::formatted(
@@ -34597,4 +34620,36 @@ fn canonical_text_search_config(
         crate::sql::eval::args::quote_identifier(definition.name().as_str()).as_str()
     );
     Ok(canonical)
+}
+
+/// The relations whose rows the inherited statistics of `slot` cover: a
+/// partitioned table's leaf partitions, or an inheritance parent with its
+/// descendants; none for a table without descendants. A foreign member's
+/// rows are its server's.
+fn analyzed_members<'a>(
+    storage: &crate::storage::Storage,
+    slot: usize,
+    txid: u32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a [usize], SqlError> {
+    if !storage.table_def(slot, txid).partition.is_partitioned()
+        && !storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(&[]);
+    }
+    let all = exec::relation_leaves_in_order(storage, slot, txid, arena)?;
+    let members = arena
+        .alloc_slice_with(all.len(), |_| 0usize)
+        .map_err(|_| eval::arena_full())?;
+    let mut count = 0;
+    for &member in all {
+        let definition = storage.table_def(member, txid);
+        if definition.kind == crate::storage::TableKind::Local
+            && !definition.partition.is_partitioned()
+        {
+            members[count] = member;
+            count += 1;
+        }
+    }
+    Ok(&members[..count])
 }

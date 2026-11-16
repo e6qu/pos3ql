@@ -4951,6 +4951,15 @@ pub(crate) fn generic_plan_parameters<'v>() -> &'v [Datum<'v>] {
     unsafe { core::slice::from_raw_parts(values.cast::<Datum<'v>>(), len) }
 }
 
+/// Whether the plan being planned or run is a prepared statement's generic
+/// plan, which knows no parameter's value.
+pub(crate) fn generic_plan_active() -> bool {
+    !GENERIC_PLAN_PARAMETERS
+        .with(core::cell::Cell::get)
+        .0
+        .is_null()
+}
+
 /// Whether a custom plan being planned binds `$index` to a value, which
 /// makes it a planner constant.
 pub(crate) fn custom_plan_binds(index: u32) -> bool {
@@ -4959,7 +4968,7 @@ pub(crate) fn custom_plan_binds(index: u32) -> bool {
 }
 
 /// The custom plan's parameter values, or none outside one.
-fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
+pub(crate) fn custom_plan_parameters<'v>() -> &'v [Datum<'v>] {
     let (values, len) = CUSTOM_PLAN_PARAMETERS.with(core::cell::Cell::get);
     if values.is_null() {
         return NO_PARAMS;

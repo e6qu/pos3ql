@@ -4,7 +4,7 @@ mod columns;
 pub(crate) mod distribution;
 pub(crate) mod heap_layout;
 pub(crate) mod scalar;
-pub(crate) use columns::{AnalyzedColumn, ColumnImages};
+pub(crate) use columns::{AnalyzedColumn, ColumnImages, INHERITED};
 
 use core::mem::size_of;
 use core::num::NonZeroU64;
@@ -23,13 +23,19 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// The pages of an analyzed partitioned table, which holds none itself:
+/// `pg_class.relpages` -1.
+pub(crate) const PARTITIONED_PAGES: u64 = u64::MAX;
+
 impl TableStatistics {
     pub(crate) fn relation_tuples(&self) -> f64 {
         if self.valid { self.rows as f64 } else { -1.0 }
     }
 
     pub(crate) fn relation_pages(&self) -> i32 {
-        if self.valid {
+        if self.pages == PARTITIONED_PAGES {
+            -1
+        } else if self.valid {
             self.pages.min(i32::MAX as u64) as i32
         } else {
             0

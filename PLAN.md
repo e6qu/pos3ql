@@ -669,6 +669,33 @@ equality) as lossy index conditions under `C` or a pattern class, with
 column (`731`). The scan's cost and width include its target list
 (`apply_scanjoin_target_to_paths`): each expression's type width and
 evaluation cost, and sort keys the select list lacks.
+A partitioned table or inheritance tree read alone, or written by an
+`UPDATE` or `DELETE` joining nothing, is planned member by member
+(`set_append_rel_pathlist`, `differential_exact/750`, `751`): each member
+from its own statistics and indexes, then an `Append` of their cheapest
+paths (`cost_append`, its startup path under a `LIMIT`), an ordered
+`Append` of range or non-interleaved list partitions whose paths return
+the query's order (`partitions_are_ordered`, reversed for a descending
+order), or a `Merge Append` (`cost_merge_append`) sorting members whose
+paths lack it; a partitioned table's members compute a select list they
+do not return, an inheritance tree's `Result` above the `Append` does, and
+the `Append`'s width weighs each member's by its rows. Execution follows
+the plan: each member's rows in its path's order (sorted when the plan
+sorts it), members in the `Append`'s order or merged through
+`ExecMergeAppend`'s binary heap, members run-time pruning removes skipped,
+and `EXPLAIN ANALYZE` counts each member's scan, sort and bitmap, a
+`Merge Append` under a `LIMIT` counting the row each other member holds.
+A write's resumed attempt describes its first attempt's member paths
+again. ANALYZE of a partitioned table or inheritance parent records each
+column's statistics over the table and its descendants (`pg_stats`
+`inherited`), from a sample of their rows, which estimates the groups an
+incremental sort above the `Append` reads; a partitioned table's
+`reltuples` counts its partitions' rows and its `relpages` is -1. A
+foreign member's rows are not sampled. A write's scan returns its new
+values and row identity (`ctid`, and `tableoid` for a tree's member),
+whose width and evaluation its costs include, and the write costs what
+its input does. A prepared statement's generic plan chooses paths without
+its arguments' values, at execution too.
 `EXPLAIN ANALYZE`
 counts what the chosen scan reads: rows its index conditions (and a partial
 index's predicate) reach, `Rows Removed by Filter`, each bitmap index scan
@@ -679,10 +706,10 @@ its conditions. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes over user-defined routines or types, `ILIKE`,
 regular expressions, `LIKE` with an escape or a non-ASCII prefix and other
-casts of indexed columns, extended statistics, partitioned tables and
-inheritance trees whose members have index paths (per-member paths,
-`Append` and `Merge Append` with run-time pruning, which execution must
-follow), and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
+casts of indexed columns, extended statistics, a sub-partitioned table
+whose partitions have index paths, an `ORDER BY` of an index expression
+of a tree, a tree with a foreign member whose other members have index
+paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. Remaining inexact without
 `0A000`: a sequential scan's estimates when a condition reads an expression
 no index holds (PostgreSQL's defaults for an unanalyzed expression), btree

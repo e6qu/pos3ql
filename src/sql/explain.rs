@@ -2710,6 +2710,27 @@ fn reads_column<'e>(
     found
 }
 
+/// Whether the planner's path model chooses the scan of the one relation
+/// `statement` reads: no join, grouping, `DISTINCT`, window or
+/// set-returning select list above it.
+fn single_relation_planned(
+    storage: &Storage,
+    txid: u32,
+    statement: &Select<'_>,
+    scope: &QueryScope<'_>,
+) -> bool {
+    statement.from.as_ref().is_some_and(|from| {
+        scope.n == 1
+            && from.joins.is_empty()
+            && from.base.sample.is_none()
+            && statement.group_by.is_empty()
+            && !statement.distinct
+            && statement.distinct_on.is_empty()
+            && !has_window(statement)
+            && !query::has_set_returning_items(statement.items, storage, txid)
+    })
+}
+
 /// Per FROM position of `scope`, the members its scan reads when it is a
 /// partitioned table or an inheritance parent with children.
 fn relation_expansions<'a>(
@@ -2829,7 +2850,11 @@ fn relation_expansions<'a>(
                 .chain(statement.having);
             aggregated || reads_column(read, &own, name)
         };
-        reject_member_indexes(storage, txid, planned.leaves, &indexed)?;
+        // The planner chooses each member's path of a query reading the
+        // tree alone.
+        if !single_relation_planned(storage, txid, statement, scope) {
+            reject_member_indexes(storage, txid, planned.leaves, &indexed)?;
+        }
         // postgres_fdw plans a foreign member as a foreign table scanned on
         // its own; a condition it keeps local is outside this plan.
         let own = query::partition_prune::own_restrictions(scope, conditions, table, arena)?;
@@ -2922,6 +2947,7 @@ fn push_members(
     names: &mut RangeTableNames<'_>,
     member_key: &dyn Fn(usize) -> Option<NodeKey>,
     projection: Option<(targets::Output, bool)>,
+    tree: Option<&ChosenTree<'_>>,
 ) -> Result<(), SqlError> {
     if scan.name.as_str() != "Seq Scan" || !scan.bitmap_index.as_str().is_empty() {
         return Err(sql_err!(
@@ -2932,12 +2958,15 @@ fn push_members(
     }
     let result = match projection {
         Some((output, output_unprintable)) => {
+            let (startup_cost, total_cost) = tree
+                .and_then(|tree| tree.path.result_cost)
+                .unwrap_or((scan.startup_cost, scan.total_cost));
             plan.push(PlanNode {
                 name: StackStr::from_str("Result"),
                 depth: scan.depth,
                 shift: scan.shift,
-                startup_cost: scan.startup_cost,
-                total_cost: scan.total_cost,
+                startup_cost,
+                total_cost,
                 rows: scan.rows,
                 width: scan.width,
                 output,
@@ -3000,6 +3029,19 @@ fn push_members(
         }
         Ok(node)
     };
+    if let Some(tree) = tree {
+        return push_tree_members(
+            plan,
+            scan,
+            expansion,
+            nominal_named,
+            names,
+            member_key,
+            result,
+            tree,
+            &member,
+        );
+    }
     let planned = expansion.planned.leaves;
     // One member is scanned in place of the `Append`. It takes the
     // relation's name, unless a write names the relation itself.
@@ -3053,6 +3095,317 @@ fn push_members(
     Ok(())
 }
 
+/// The path chosen over a partition or inheritance tree, with each
+/// member's conditions as its scan prints them and the `Merge Append`'s
+/// sort keys.
+#[derive(Clone, Copy)]
+struct ChosenTree<'a> {
+    path: query::index_paths::TreePath<'a>,
+    /// Per member of `path`, in its order.
+    quals: &'a [MemberQuals<'a>],
+    keys: PlanKeys,
+}
+
+/// A member scan's conditions as printed without and with `VERBOSE`: its
+/// `Index Cond` and `Filter`, a bitmap heap scan's `Recheck Cond` and the
+/// conditions of each bitmap index scan of its tree.
+#[derive(Clone, Copy, Default)]
+struct MemberQuals<'a> {
+    index_cond: LeafQuals,
+    filter: LeafQuals,
+    recheck: LeafQuals,
+    tree: &'a [LeafQuals],
+}
+
+/// Pushes the scan of a tree whose members `tree` chose paths for: one
+/// member's subtree in place of the `Append`, or an `Append` or `Merge
+/// Append` of each started member's, each member under a sort when the
+/// order needs one.
+#[allow(clippy::too_many_arguments)]
+fn push_tree_members(
+    plan: &mut Plan<'_>,
+    scan: PlanNode,
+    expansion: Expansion<'_>,
+    nominal_named: bool,
+    names: &mut RangeTableNames<'_>,
+    member_key: &dyn Fn(usize) -> Option<NodeKey>,
+    result: Option<usize>,
+    tree: &ChosenTree<'_>,
+    member: &dyn Fn(usize, &str) -> Result<PlanNode, SqlError>,
+) -> Result<(), SqlError> {
+    use query::index_paths::{AppendKind, ScanKind};
+    let exposed = StackStr::<96>::from_str(scan.exposed_name());
+    let members = tree.path.members;
+    // One member's scan, under its sort, at `depth`.
+    let push_member = |plan: &mut Plan<'_>,
+                       at: usize,
+                       alias: &str,
+                       depth: u8,
+                       key: Option<NodeKey>|
+     -> Result<(), SqlError> {
+        let chosen = &members[at];
+        let path = &chosen.path;
+        let quals = tree.quals.get(at).copied().unwrap_or_default();
+        let mut depth = depth;
+        if let Some((startup, total)) = chosen.sort {
+            let mut keys = tree.keys;
+            keys.plain = requalified(&keys.plain, exposed.as_str(), alias);
+            keys.verbose = requalified(&keys.verbose, exposed.as_str(), alias);
+            plan.push(PlanNode {
+                name: StackStr::from_str("Sort"),
+                depth,
+                shift: scan.shift,
+                key: key.and_then(|key| match key.role {
+                    Role::Member(position, leaf) => {
+                        Some(NodeKey::new(key.block, Role::MemberSort(position, leaf)))
+                    }
+                    _ => None,
+                }),
+                startup_cost: startup,
+                total_cost: total,
+                rows: path.rows as u64,
+                width: path.width,
+                keys,
+                ..PlanNode::EMPTY
+            })?;
+            depth += 1;
+        }
+        let mut node = member(chosen.leaf, alias)?;
+        node.depth = depth;
+        node.key = key;
+        node.startup_cost = path.startup_cost;
+        node.total_cost = path.total_cost;
+        node.rows = path.rows as u64;
+        node.width = path.width;
+        let mut name = StackStr::new();
+        match path.kind {
+            ScanKind::Seq => {
+                let _ = write!(name, "Seq Scan");
+            }
+            ScanKind::Index | ScanKind::IndexOnly => {
+                let _ = write!(
+                    name,
+                    "Index {}Scan {}using {}",
+                    if path.kind == ScanKind::IndexOnly {
+                        "Only "
+                    } else {
+                        ""
+                    },
+                    if path.backward { "Backward " } else { "" },
+                    path.index_name.as_str()
+                );
+            }
+            ScanKind::Bitmap => {
+                let _ = write!(name, "Bitmap Heap Scan");
+                if let [only] = path.bitmap
+                    && let query::index_paths::BitmapPlanKind::Index { index_name, .. } = only.kind
+                {
+                    node.bitmap_index = index_name;
+                }
+                node.bitmap_index_estimate = match path.bitmap {
+                    [only] => Some((only.total_cost, only.rows as u64)),
+                    _ => None,
+                };
+            }
+        }
+        node.name = name;
+        if path.kind != ScanKind::Seq {
+            let requalify = |text: Option<StackStr<512>>| {
+                text.map(|text| requalified(&text, exposed.as_str(), alias))
+            };
+            node.quals = NO_QUALS;
+            node.verbose_quals = NO_QUALS;
+            node = node
+                .with_qual(QualLabel::IndexCond, requalify(quals.index_cond.0))
+                .with_qual(QualLabel::Filter, requalify(quals.filter.0))
+                .with_verbose_qual(QualLabel::IndexCond, requalify(quals.index_cond.1))
+                .with_verbose_qual(QualLabel::Filter, requalify(quals.filter.1));
+            if path.kind == ScanKind::Bitmap {
+                node = node
+                    .with_qual(QualLabel::RecheckCond, requalify(quals.recheck.0))
+                    .with_verbose_qual(QualLabel::RecheckCond, requalify(quals.recheck.1));
+            }
+        }
+        node.analyze_unsupported = path.searches_unmodeled.then_some(
+            "EXPLAIN ANALYZE of an index scan searching an array or skipping a key column over several leaf pages is not supported",
+        );
+        push_scan(plan, node)?;
+        if path.kind == ScanKind::Bitmap && path.bitmap.len() > 1 {
+            let leaf_quals = arena_requalified(quals.tree, exposed.as_str(), alias);
+            push_bitmap_tree_keyed(
+                plan,
+                path.bitmap,
+                &leaf_quals[..quals.tree.len().min(leaf_quals.len())],
+                depth,
+                &|at| {
+                    key.and_then(|key| match key.role {
+                        Role::Member(position, leaf) => Some(NodeKey::new(
+                            key.block,
+                            Role::MemberBitmapNode(position, leaf, at),
+                        )),
+                        _ => None,
+                    })
+                },
+            )?;
+        }
+        Ok(())
+    };
+    // Members are named in the order planning lists them; started ones
+    // only, as EXPLAIN names the relations its plan reads.
+    let mut aliases = [StackStr::<96>::new(); 256];
+    let mut alias_leaves = [usize::MAX; 256];
+    let mut alias_count = 0;
+    let started = |leaf: usize| expansion.started.contains(&leaf);
+    if members.len() == 1 {
+        let alias = if nominal_named {
+            names.take(exposed.as_str())?
+        } else {
+            exposed
+        };
+        if let Some(result) = result
+            && alias != exposed
+        {
+            plan.nodes[result].requalify(exposed.as_str(), alias.as_str());
+        }
+        return push_member(plan, 0, alias.as_str(), scan.depth, scan.key);
+    }
+    for &leaf in expansion.planned.leaves {
+        if started(leaf) && members.iter().any(|chosen| chosen.leaf == leaf) {
+            if alias_count == aliases.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "EXPLAIN range table exceeds {} relations",
+                    aliases.len()
+                ));
+            }
+            aliases[alias_count] = names.take(exposed.as_str())?;
+            alias_leaves[alias_count] = leaf;
+            alias_count += 1;
+        }
+    }
+    let started_count = members.iter().filter(|chosen| started(chosen.leaf)).count();
+    let merge = tree.path.kind == AppendKind::Merge;
+    plan.push(PlanNode {
+        name: StackStr::from_str(if merge { "Merge Append" } else { "Append" }),
+        depth: scan.depth,
+        shift: scan.shift,
+        key: scan.key,
+        startup_cost: scan.startup_cost,
+        total_cost: scan.total_cost,
+        rows: scan.rows,
+        width: scan.width,
+        object_requests: scan.object_requests,
+        cache_blocks: scan.cache_blocks,
+        output: scan.output,
+        output_unprintable: scan.output_unprintable,
+        keys: if merge { tree.keys } else { PlanKeys::NONE },
+        subplans_removed: Some(
+            u32::try_from(members.len() - started_count).map_err(|_| arena_full())?,
+        ),
+        scan_pruned: expansion.planned.scan_pruned,
+        ..PlanNode::EMPTY
+    })?;
+    for (at, chosen) in members.iter().enumerate() {
+        if !started(chosen.leaf) {
+            continue;
+        }
+        let alias = aliases[..alias_count]
+            .iter()
+            .zip(&alias_leaves[..alias_count])
+            .find(|(_, held)| **held == chosen.leaf)
+            .map(|(alias, _)| *alias)
+            .unwrap_or(exposed);
+        push_member(
+            plan,
+            at,
+            alias.as_str(),
+            scan.depth + 1,
+            member_key(chosen.leaf),
+        )?;
+    }
+    Ok(())
+}
+
+/// The conditions each member of `tree` prints, read by the parent's
+/// `exposed` name: an index scan's `Index Cond` and `Filter`, a bitmap
+/// heap scan's `Recheck Cond` and its bitmap index scans' conditions.
+#[allow(clippy::too_many_arguments)]
+fn tree_member_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    exposed: &'a str,
+    scanned: Option<&'a Expr<'a>>,
+    security: &[&'a Expr<'a>],
+    tree: &query::index_paths::TreePath<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [MemberQuals<'a>], SqlError> {
+    use query::index_paths::ScanKind;
+    let definitions = storage.table_definition_images();
+    let quals = arena
+        .alloc_slice_with(tree.members.len(), |_| MemberQuals::default())
+        .map_err(|_| arena_full())?;
+    for (at, member) in tree.members.iter().enumerate() {
+        let path = &member.path;
+        if path.kind == ScanKind::Seq {
+            continue;
+        }
+        let definition = definitions.definition(storage, member.leaf, txid)?;
+        let print = |index: &query::IndexAccessPlan<'a>, verbose: bool| {
+            single_relation_quals(
+                storage,
+                txid,
+                exposed,
+                definition,
+                scanned,
+                security,
+                Some(index),
+                verbose,
+                arena,
+            )
+        };
+        let index = query::IndexAccessPlan::chosen(path);
+        let plain = print(&index, false)?;
+        let verbose = print(&index, true)?;
+        quals[at].index_cond = (plain.0, verbose.0);
+        quals[at].filter = (plain.1, verbose.1);
+        if path.kind == ScanKind::Bitmap {
+            let written = index.written();
+            quals[at].recheck = (print(&written, false)?.0, print(&written, true)?.0);
+            if path.bitmap.len() > 1 {
+                let tree_quals = arena
+                    .alloc_slice_with(path.bitmap.len(), |_| (None, None))
+                    .map_err(|_| arena_full())?;
+                for (node_at, node) in path.bitmap.iter().enumerate() {
+                    let query::index_paths::BitmapPlanKind::Index { conditions, .. } = node.kind
+                    else {
+                        continue;
+                    };
+                    let leaf = query::IndexAccessPlan::chosen_conditions(query::ChosenConditions {
+                        conditions,
+                        recheck: &[],
+                        absorbed: &[],
+                    });
+                    tree_quals[node_at] = (print(&leaf, false)?.0, print(&leaf, true)?.0);
+                }
+                quals[at].tree = tree_quals;
+            }
+        }
+    }
+    Ok(quals)
+}
+
+/// `quals` with `old` renamed `new`.
+fn arena_requalified(quals: &[LeafQuals], old: &str, new: &str) -> [LeafQuals; 64] {
+    let mut renamed = [(None, None); 64];
+    for (at, (plain, verbose)) in quals.iter().take(64).enumerate() {
+        renamed[at] = (
+            plain.map(|text| requalified(&text, old, new)),
+            verbose.map(|text| requalified(&text, old, new)),
+        );
+    }
+    renamed
+}
+
 fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     let bitmap_index = scan.bitmap_index;
     let bitmap_depth = scan.depth.saturating_add(1);
@@ -3104,6 +3457,10 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     // The bitmap index scan counts under its heap scan's position.
     let bitmap_key = scan.key.and_then(|key| match key.role {
         Role::Scan(position) => Some(NodeKey::new(key.block, Role::BitmapIndex(position))),
+        Role::Member(position, leaf) => Some(NodeKey::new(
+            key.block,
+            Role::MemberBitmapIndex(position, leaf),
+        )),
         _ => None,
     });
     plan.push(scan)?;
@@ -3136,35 +3493,31 @@ fn chosen_write_scan<'a>(
     target: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
     predicate: Option<&'a Expr<'a>>,
+    assignments: &[(&str, &'a Expr<'a>)],
     arena: &'a Arena,
 ) -> Result<Option<(query::index_paths::ScanPath<'a>, QueryScope<'a>)>, SqlError> {
-    let from = arena
-        .alloc(crate::sql::ast::FromClause {
-            base: query::dml_target_ref(target, alias),
-            joins: &[],
-        })
-        .map_err(|_| arena_full())?;
-    let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-    match query::index_paths::scan_path(
-        storage,
-        &scope,
-        txid,
-        predicate,
-        None,
-        &[],
-        arena,
-        query::index_paths::QueryShape {
-            target: true,
-            ..query::index_paths::QueryShape::default()
-        },
-    )? {
+    let (scope, shape) =
+        query::index_paths::write_shape(storage, txid, target, alias, assignments, arena)?;
+    match query::index_paths::scan_path(storage, &scope, txid, predicate, None, &[], arena, shape)?
+    {
         query::index_paths::Planned::Chosen(path) => Ok(Some((path, scope))),
         query::index_paths::Planned::Outside(shape) => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "EXPLAIN of a scan of one table with {} is not supported",
             shape
         )),
-        query::index_paths::Planned::NotTable | query::index_paths::Planned::SeqOnly => Ok(None),
+        query::index_paths::Planned::NotTable
+        | query::index_paths::Planned::SeqOnly
+        | query::index_paths::Planned::Members(_)
+        | query::index_paths::Planned::Tree(_) => Ok(None),
+    }
+}
+
+/// The assignments of an `UPDATE`; none for another write.
+fn write_assignments<'e>(statement: &Stmt<'e>) -> &'e [(&'e str, &'e Expr<'e>)] {
+    match statement {
+        Stmt::Update(update) => update.assignments,
+        _ => &[],
     }
 }
 
@@ -3181,6 +3534,19 @@ fn push_bitmap_tree(
     quals: &[LeafQuals],
     depth: u8,
     block: crate::sql::query::instrument::BlockId,
+) -> Result<(), SqlError> {
+    push_bitmap_tree_keyed(plan, nodes, quals, depth, &|at| {
+        Some(NodeKey::new(block, Role::BitmapNode(at)))
+    })
+}
+
+/// [`push_bitmap_tree`] with each node's key by its position.
+fn push_bitmap_tree_keyed(
+    plan: &mut Plan<'_>,
+    nodes: &[query::index_paths::BitmapPlanNode<'_>],
+    quals: &[LeafQuals],
+    depth: u8,
+    key: &dyn Fn(u16) -> Option<NodeKey>,
 ) -> Result<(), SqlError> {
     use query::index_paths::BitmapPlanKind;
     for (at, node) in nodes.iter().enumerate() {
@@ -3200,10 +3566,7 @@ fn push_bitmap_tree(
         plan.push(
             PlanNode {
                 name,
-                key: Some(NodeKey::new(
-                    block,
-                    Role::BitmapNode(u16::try_from(at).map_err(|_| arena_full())?),
-                )),
+                key: key(u16::try_from(at).map_err(|_| arena_full())?),
                 depth: depth.saturating_add(node.depth),
                 total_cost: node.total_cost,
                 rows: node.rows as u64,
@@ -5364,17 +5727,9 @@ fn plan_pulled_select<'a>(
 
     // The path PostgreSQL's planner chooses for a query reading one table
     // without grouping, for its ordering and row limit.
+    let mut chosen_tree = None;
     let chosen_path = match (scope.as_ref(), statement.from.as_ref()) {
-        (Some(scope), Some(from))
-            if scope.n == 1
-                && from.joins.is_empty()
-                && from.base.sample.is_none()
-                && statement.group_by.is_empty()
-                && !statement.distinct
-                && statement.distinct_on.is_empty()
-                && !has_window(statement)
-                && !query::has_set_returning_items(statement.items, storage, txid) =>
-        {
+        (Some(scope), Some(from)) if single_relation_planned(storage, txid, statement, scope) => {
             let only = from.base.inheritance == crate::sql::ast::RelationInheritance::Only;
             let shape = if aggregate {
                 query::index_paths::QueryShape {
@@ -5432,6 +5787,10 @@ fn plan_pulled_select<'a>(
                         "EXPLAIN of a scan of one table with {} is not supported",
                         shape
                     ));
+                }
+                query::index_paths::Planned::Tree(tree) => {
+                    chosen_tree = Some(tree);
+                    Some(tree.top())
                 }
                 planned => planned.chosen(),
             }
@@ -6013,6 +6372,8 @@ fn plan_pulled_select<'a>(
     let mut bitmap_recheck = None;
     // A chosen bitmap tree's nodes and each bitmap index scan's conditions.
     let mut bitmap_tree: Option<(&[query::index_paths::BitmapPlanNode<'_>], &[LeafQuals])> = None;
+    // Each tree member's conditions.
+    let mut member_quals: &[MemberQuals<'_>] = &[];
     let index_conds = arena
         .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
         .map_err(|_| arena_full())?;
@@ -6259,6 +6620,11 @@ fn plan_pulled_select<'a>(
                     }
                     bitmap_tree = Some((path.bitmap, &*quals));
                 }
+            }
+            // Each member of a tree prints its own scan's conditions.
+            if let Some(tree) = chosen_tree {
+                member_quals =
+                    tree_member_quals(storage, txid, exposed, scanned, security, &tree, arena)?;
             }
         } else if scope.n == 1
             && let Some(definition) = scope.defs.get(0)
@@ -6828,6 +7194,23 @@ fn plan_pulled_select<'a>(
                         ))
                     },
                     projection.map(|(target, _)| (target, false)),
+                    match chosen_tree.filter(|_| n == 1) {
+                        Some(tree) => Some(ChosenTree {
+                            path: tree,
+                            quals: member_quals,
+                            keys: plan_keys(
+                                storage,
+                                txid,
+                                Some(scope),
+                                statement,
+                                KeyLabel::Sort,
+                                &sorted_keys[..tree.order.len().min(sorted_keys.len())],
+                                arena,
+                            )?,
+                        }),
+                        None => None,
+                    }
+                    .as_ref(),
                 )?,
                 None => {
                     let depth = scan.depth;
@@ -9727,6 +10110,7 @@ fn plan_write<'a>(
                 &mut fresh_names()?,
                 &|_| None,
                 None,
+                None,
             )?;
             // One member scanned in place of the `Append` names the
             // target's columns in the join's conditions.
@@ -9927,7 +10311,17 @@ fn plan_write<'a>(
             }
         } else if let Some((path, scope)) = (!joined
             && !storage.relation_has_descendants(slot, txid))
-        .then(|| chosen_write_scan(storage, txid, target, alias, predicate, arena))
+        .then(|| {
+            chosen_write_scan(
+                storage,
+                txid,
+                target,
+                alias,
+                predicate,
+                write_assignments(statement),
+                arena,
+            )
+        })
         .transpose()?
         .flatten()
         {
@@ -9997,6 +10391,7 @@ fn plan_write<'a>(
                     let depth = scan.depth;
                     push_scan(&mut plan, scan)?;
                     push_bitmap_tree(&mut plan, path.bitmap, leaves, depth, block)?;
+                    plan.nodes[0].startup_cost = scan.startup_cost;
                     plan.nodes[0].total_cost = scan.total_cost;
                     plan.planning_micros =
                         started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -10084,6 +10479,8 @@ fn plan_write<'a>(
         plan.push(child)?;
         child
     };
+    // `create_modifytable_path`: the write costs what its input does.
+    plan.nodes[0].startup_cost = child.startup_cost;
     plan.nodes[0].total_cost = child.total_cost;
     plan.nodes[0].object_requests = child.object_requests;
     plan.nodes[0].cache_blocks = child.cache_blocks;
@@ -10374,6 +10771,7 @@ fn plan_joined_write<'a, 'e>(
                             Role::Member(0, u32::try_from(leaf).unwrap_or(u32::MAX)),
                         ))
                     },
+                    None,
                     None,
                 )?;
                 // One member scanned in place of the `Append` names the
@@ -11028,6 +11426,7 @@ fn plan_merge<'a, 'e>(
                         ))
                     },
                     None,
+                    None,
                 )?;
                 // One member scanned in place of the `Append` names the
                 // target's columns in the join's conditions.
@@ -11199,6 +11598,52 @@ fn expanded_write<'e>(
     scan.alias = plan.nodes[0].alias;
     scan.key = Some(NodeKey::new(block, Role::Scan(0)));
     let security = write_security_quals(storage, statement, slot, &definition, txid, arena)?;
+    // The members' paths PostgreSQL's costs choose.
+    let tree = {
+        let (target, write_alias) = match statement {
+            Stmt::Update(update) => (update.table, update.alias),
+            Stmt::Delete(delete) => (delete.table, delete.alias),
+            _ => unreachable!("an expanded write is an UPDATE or DELETE"),
+        };
+        let (scope, shape) = query::index_paths::write_shape(
+            storage,
+            txid,
+            target,
+            write_alias,
+            write_assignments(statement),
+            arena,
+        )?;
+        match query::index_paths::scan_path(
+            storage,
+            &scope,
+            txid,
+            predicate,
+            None,
+            &[],
+            arena,
+            shape,
+        )? {
+            query::index_paths::Planned::Tree(tree) => Some(tree),
+            query::index_paths::Planned::Outside(shape) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN of a scan of one table with {} is not supported",
+                    shape
+                ));
+            }
+            _ => None,
+        }
+    };
+    if let Some(tree) = tree {
+        scan.startup_cost = tree.startup_cost;
+        scan.total_cost = tree.total_cost;
+        scan.rows = tree.rows as u64;
+        scan.width = tree.width;
+    }
+    let member_quals = match tree {
+        Some(tree) => tree_member_quals(storage, txid, exposed, predicate, security, &tree, arena)?,
+        None => &[],
+    };
     let (_, filter) = single_relation_quals(
         storage,
         txid,
@@ -11224,7 +11669,10 @@ fn expanded_write<'e>(
     // An `UPDATE` of an inheritance tree computes its new values in a
     // `Result` above the members' `Append`, which cannot project; a
     // partitioned table's members compute them (`apply_scanjoin_target_to_paths`).
-    let projects = matches!(statement, Stmt::Update(_)) && !definition.partition.is_partitioned();
+    let projects = match tree {
+        Some(tree) => tree.result_cost.is_some(),
+        None => matches!(statement, Stmt::Update(_)) && !definition.partition.is_partitioned(),
+    };
     let (returned, modified, read) = {
         let (assignments, returning): (&[(&str, &Expr<'_>)], _) = match statement {
             Stmt::Update(update) => (update.assignments, update.returning),
@@ -11325,8 +11773,23 @@ fn expanded_write<'e>(
             ))
         },
         projection.map(|result| (result.output, result.output_unprintable)),
+        tree.map(|path| ChosenTree {
+            path,
+            quals: member_quals,
+            keys: PlanKeys::NONE,
+        })
+        .as_ref(),
     )?;
-    Ok(scan)
+    // The write reads the `Result` computing its new values, when there is
+    // one.
+    Ok(match tree.and_then(|tree| tree.result_cost) {
+        Some((startup_cost, total_cost)) if projects => PlanNode {
+            startup_cost,
+            total_cost,
+            ..scan
+        },
+        _ => scan,
+    })
 }
 
 /// The members an `UPDATE` or `DELETE` of the partitioned table or
@@ -11371,10 +11834,14 @@ fn target_members<'e>(
         PruneStage::Plan,
         arena,
     )?;
-    let own = |qualifier: Option<&str>, _: &str| qualifier.is_none_or(|q| q == exposed);
-    reject_member_indexes(storage, txid, planned.leaves, &|name| {
-        reads_column(conditions.iter().copied(), &own, name)
-    })?;
+    // The planner chooses each member's path of a write that joins no
+    // other relation.
+    if joined {
+        let own = |qualifier: Option<&str>, _: &str| qualifier.is_none_or(|q| q == exposed);
+        reject_member_indexes(storage, txid, planned.leaves, &|name| {
+            reads_column(conditions.iter().copied(), &own, name)
+        })?;
+    }
     if planned.leaves.is_empty() {
         return Ok(None);
     }

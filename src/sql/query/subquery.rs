@@ -2246,7 +2246,9 @@ fn subquery_exists<'a>(
 }
 
 /// Whether a subquery needs the general row-source executor rather than the
-/// single-scan paths here: grouping, `DISTINCT`, or a nested subquery that
+/// single-scan paths here: grouping, `DISTINCT`, an ordered `LIMIT` (which
+/// stops an index scan returning rows in its order at the limit, where the
+/// single-scan paths read and sort every row), or a nested subquery that
 /// must run per row or per group of this one (the single-scan paths run
 /// nested subqueries once, against the enclosing row only).
 fn needs_row_source<'a>(
@@ -2258,6 +2260,7 @@ fn needs_row_source<'a>(
     if !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
+        || (!select.order_by.is_empty() && select.limit.is_some())
         || super::aggregate_levels::select_owns_nested_aggregates(select)
     {
         return Ok(true);
@@ -2323,7 +2326,7 @@ pub(crate) fn subquery_node_correlated<'a>(
 }
 
 /// Whether `select` references a column of a query level around it.
-fn select_correlated<'a>(
+pub(super) fn select_correlated<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -2523,7 +2526,7 @@ fn select_has_outer_ref<'a>(
     }
     for item in select.items {
         if match item {
-            SelectItem::Expr { expression, .. } => {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 expr_has_outer_ref(expression, chain, storage, txid, arena)?
             }
             _ => false,

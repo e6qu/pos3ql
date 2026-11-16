@@ -5290,19 +5290,12 @@ fn plan_select_with_ctes<'a>(
     {
         return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
     }
-    // `min` and `max` of a local table are explained as PostgreSQL plans
-    // them when an index orders them. Execution aggregates the rows, and a
-    // subquery's ordered `LIMIT` reads every row, so the InitPlans' counts
-    // would differ.
+    // `min` and `max` of a local table are planned, and executed, as
+    // PostgreSQL plans them when an index orders them.
     if outer.is_none()
         && let Some(rewritten) = query::local_minmax_subquery(storage, txid, statement, arena)?
     {
-        let plan = plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena)?;
-        if plan.count > 0 {
-            plan.nodes[0].analyze_unsupported =
-                Some("EXPLAIN ANALYZE of min or max read through an index is not supported");
-        }
-        return Ok(plan);
+        return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
     }
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
@@ -6496,9 +6489,7 @@ fn plan_pulled_select<'a>(
                         width: grouped.path.width,
                         object_requests,
                         cache_blocks,
-                        analyze_unsupported: Some(
-                            "EXPLAIN ANALYZE of a sorted grouping is not supported",
-                        ),
+                        key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
                         ..PlanNode::EMPTY
                     },
                 )?;
@@ -13612,6 +13603,10 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
         "HashAggregate" => {
             kind.node_type = "Aggregate";
             kind.strategy = Some("Hashed");
+        }
+        "GroupAggregate" => {
+            kind.node_type = "Aggregate";
+            kind.strategy = Some("Sorted");
         }
         "Nested Loop" | "Hash Join" => kind.join_type = Some("Inner"),
         // `Nested Loop Left Join`, `Hash Right Semi Join`, ...: the node

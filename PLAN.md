@@ -950,11 +950,11 @@ startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
 PostgreSQL's `preprocess_minmax_aggregates` plans them: each an InitPlan
 reading the first row of the index scan ordered by its column with nulls
 excluded, when those scans cost less than the aggregate
-(`differential_exact/791`). Execution still aggregates the rows, since a
-subquery's ordered `LIMIT` reads and sorts every row rather than stopping an
-ordered index scan, so `EXPLAIN ANALYZE` of such a plan fails with `0A000`;
-a written scalar subquery's `ORDER BY ... LIMIT` over an index reports every
-row its scan reads where PostgreSQL's stops at the limit. Remaining there: a stable expression the model cannot evaluate
+(`differential_exact/791`). Execution runs those InitPlans, and a nested
+query's `ORDER BY ... LIMIT` over a scan returning rows in its order stops
+at the limit as PostgreSQL's `Limit` does, so `EXPLAIN ANALYZE` counts one
+row per InitPlan and the rows a filtered scan passed over
+(`differential_exact/795`). Remaining there: a stable expression the model cannot evaluate
 (a user-defined function) leaves the crude estimate. A built-in function's
 argument of another type than it declares is charged its cast function
 (`length(name)` reads `text(name)`), unless the types are binary coercible,
@@ -973,8 +973,10 @@ against a `HashAggregate` with its spill model (`hash_agg_entry_size`,
 `hash_agg_set_limits`, `Planned Partitions`) and the `ORDER BY` sort above
 either, the grouping taking the `ORDER BY`'s key order
 (`preprocess_groupclause`) and the groups `estimate_num_groups`.
-`EXPLAIN ANALYZE` of a `GroupAggregate` fails with `0A000`, as execution
-does not sort its input. Remaining: grouping sets (PostgreSQL's `Hash Key`
+Under `EXPLAIN ANALYZE` a `GroupAggregate`'s `Sort` returns every input row
+and the aggregate one row per group in the sort's key order, and the JSON
+form names it an `Aggregate` of strategy `Sorted` (`differential_exact/794`).
+Remaining: grouping sets (PostgreSQL's `Hash Key`
 lists and `MixedAggregate` from `consider_groupingsets_paths`, which pos3ql
 prints as one `Group Key`), `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
 `ORDER BY` inputs, user-defined aggregates, a select list computing

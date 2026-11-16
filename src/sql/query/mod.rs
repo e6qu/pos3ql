@@ -13236,6 +13236,101 @@ pub fn select_query<'a>(
     )
 }
 
+/// Enters the scan context of a query of one relation: its scan follows
+/// the path PostgreSQL chooses for the query's ordering and row limit, and
+/// stops when an ordered path has the rows its limit needs.
+#[allow(clippy::too_many_arguments)]
+fn enter_scan_context<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    params: &[Datum<'a>],
+    resolved_columns: &dyn super::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<index_paths::ScanContextScope>, SqlError> {
+    Ok(
+        if scope.n == 1
+            && statement
+                .where_clause
+                .is_none_or(|condition| !condition.contains_subquery())
+            && from.joins.is_empty()
+            && from.base.sample.is_none()
+            && statement.group_by.is_empty()
+            && !statement.distinct
+            && statement.distinct_on.is_empty()
+            && !statement
+                .order_by
+                .iter()
+                .any(|order| expr_has_window(order.expression))
+            && !has_set_returning_items(statement.items, storage, txid)
+        {
+            let aggregated = statement.having.is_some()
+                || statement.items.iter().any(|item| match item {
+                    SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                        expr_has_aggregate(expression, storage, txid, resolved_columns)
+                            .unwrap_or(true)
+                    }
+                    _ => false,
+                });
+            let windowed = statement.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
+        });
+            let shape = if windowed {
+                None
+            } else if aggregated {
+                Some(index_paths::QueryShape {
+                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    ..index_paths::QueryShape::default()
+                })
+            } else {
+                let shape = index_paths::query_shape(
+                    storage,
+                    txid,
+                    scope,
+                    statement.items,
+                    statement.order_by,
+                    statement.limit,
+                    statement.offset,
+                    params,
+                    arena,
+                )?;
+                Some(index_paths::QueryShape {
+                    stop_at_limit: statement.locking.is_empty(),
+                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    // The scan returns the columns the select list and
+                    // ordering read, as EXPLAIN plans it.
+                    output: streaming_pax_columns_ordered(
+                        scope,
+                        from,
+                        statement.items,
+                        None,
+                        statement.order_by,
+                    )
+                    .selected_mask(0),
+                    ..shape
+                })
+            };
+            Some(index_paths::enter_query(
+                scope.slots[0],
+                statement.where_clause,
+                streaming_pax_columns_ordered(
+                    scope,
+                    from,
+                    statement.items,
+                    statement.where_clause,
+                    statement.order_by,
+                )
+                .selected_mask(0),
+                shape,
+            ))
+        } else {
+            None
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_query_resumable<'a>(
     storage: &'a Storage,
@@ -13356,6 +13451,25 @@ pub(crate) fn select_query_resumable<'a>(
         Ok(None) => {}
         Err(error) => return sql_fail(error),
     }
+    // `min` and `max` of a local table read the first row of each ordered
+    // index scan when the planner prefers those InitPlans.
+    match local_minmax_subquery(storage, txid, statement, arena) {
+        Ok(Some(rewritten)) => {
+            return constant_select_resumable(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return sql_fail(error),
+    }
     // A query of one foreign table sends its shippable conditions, order and
     // limit to the server; the rest runs here over the rows it returns.
     let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {
@@ -13402,83 +13516,18 @@ pub(crate) fn select_query_resumable<'a>(
     };
     // The scan of one relation follows the path PostgreSQL chooses for the
     // query's ordering and row limit.
-    let _scan_context = if scope.n == 1
-        && statement
-            .where_clause
-            .is_none_or(|condition| !condition.contains_subquery())
-        && from.joins.is_empty()
-        && from.base.sample.is_none()
-        && statement.group_by.is_empty()
-        && !statement.distinct
-        && statement.distinct_on.is_empty()
-        && !statement
-            .order_by
-            .iter()
-            .any(|order| expr_has_window(order.expression))
-        && !has_set_returning_items(statement.items, storage, txid)
-    {
-        let aggregated = statement.having.is_some()
-            || statement.items.iter().any(|item| match item {
-                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                    expr_has_aggregate(expression, storage, txid, &resolved_columns).unwrap_or(true)
-                }
-                _ => false,
-            });
-        let windowed = statement.items.iter().any(|item| {
-            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
-        });
-        let shape = if windowed {
-            None
-        } else if aggregated {
-            Some(index_paths::QueryShape {
-                only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
-                ..index_paths::QueryShape::default()
-            })
-        } else {
-            match index_paths::query_shape(
-                storage,
-                txid,
-                &scope,
-                statement.items,
-                statement.order_by,
-                statement.limit,
-                statement.offset,
-                params,
-                arena,
-            ) {
-                Ok(shape) => Some(index_paths::QueryShape {
-                    stop_at_limit: statement.locking.is_empty(),
-                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
-                    // The scan returns the columns the select list and
-                    // ordering read, as EXPLAIN plans it.
-                    output: streaming_pax_columns_ordered(
-                        &scope,
-                        from,
-                        statement.items,
-                        None,
-                        statement.order_by,
-                    )
-                    .selected_mask(0),
-                    ..shape
-                }),
-                Err(error) => return sql_fail(error),
-            }
-        };
-        Some(index_paths::enter_query(
-            scope.slots[0],
-            statement.where_clause,
-            streaming_pax_columns_ordered(
-                &scope,
-                from,
-                statement.items,
-                statement.where_clause,
-                statement.order_by,
-            )
-            .selected_mask(0),
-            shape,
-        ))
-    } else {
-        None
+    let _scan_context = match enter_scan_context(
+        storage,
+        txid,
+        statement,
+        &scope,
+        from,
+        params,
+        &resolved_columns,
+        arena,
+    ) {
+        Ok(context) => context,
+        Err(error) => return sql_fail(error),
     };
     let relation_mode = if statement.locking.is_empty() {
         crate::sql::ast::TableLockMode::AccessShare
@@ -14979,6 +15028,23 @@ fn select_into_rows_mode<'a>(
 ) -> Result<(), SqlError> {
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
+    // `min` and `max` of a local table read the first row of each ordered
+    // index scan when the planner prefers those InitPlans.
+    if outer.is_none()
+        && let Some(rewritten) = local_minmax_subquery(storage, txid, statement, arena)?
+    {
+        return select_into_rows_mode(
+            storage,
+            txid,
+            rewritten,
+            arena,
+            params,
+            outer,
+            seq,
+            recycle_rows,
+            emit,
+        );
+    }
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {
@@ -15536,6 +15602,28 @@ fn select_into_rows_mode<'a>(
             txid,
             arena,
         },
+    };
+    // Under a limit, or when EXPLAIN ANALYZE counts it, the scan of one
+    // relation follows the path PostgreSQL chooses for the query's ordering
+    // and row limit, stopping when an ordered path has the limit's rows. A
+    // query reading an enclosing query's or routine's names keeps its own
+    // scan.
+    let _scan_context = if (!instrument::active()
+        && (statement.order_by.is_empty() || statement.limit.is_none()))
+        || (outer.is_some() && subquery::select_correlated(statement, storage, txid, arena)?)
+    {
+        None
+    } else {
+        enter_scan_context(
+            storage,
+            txid,
+            statement,
+            &scope,
+            from,
+            params,
+            &resolved_columns,
+            arena,
+        )?
     };
     let join_subqueries = ProceduralSubqueries { storage, txid };
     let row_schema = ScopeSchema(&scope);

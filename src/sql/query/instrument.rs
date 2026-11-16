@@ -108,6 +108,8 @@ pub(crate) enum Role {
     Materialize(u16),
     /// The block's aggregation or grouping.
     Aggregate,
+    /// The sort of the input a `GroupAggregate` groups.
+    GroupSort,
     /// The block's window evaluation: its last window clause's.
     Window,
     /// The evaluation of the window clause at this position of the

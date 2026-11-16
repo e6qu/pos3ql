@@ -6386,7 +6386,7 @@ fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedC
 /// The collation `=` compares two join-key columns with: PostgreSQL's
 /// implicit-collation rule, where a non-default collation beats the
 /// database default and two different non-default ones conflict (`None`).
-fn join_key_collation(
+pub(super) fn join_key_collation(
     scope: &QueryScope<'_>,
     (left_table, left_column): (usize, usize),
     (right_table, right_column): (usize, usize),
@@ -6401,7 +6401,7 @@ fn join_key_collation(
 }
 
 /// Up to eight (probe column, build column) join key pairs and their count.
-type JoinKeyPairs = ([(usize, usize); 8], usize);
+pub(super) type JoinKeyPairs = ([(usize, usize); 8], usize);
 
 /// Whether `conjunct` equates the column `(table, column)` with a literal.
 pub(crate) fn fixes_column(
@@ -6435,7 +6435,7 @@ pub(crate) fn fixes_column(
 /// Returns the matched pairs (probe column, build column). The keys only
 /// generate candidates — the full ON and WHERE still run at the leaf, so a
 /// missed extraction never changes a result, only the access path.
-fn hash_join_keys<'a>(
+pub(super) fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
@@ -6932,13 +6932,18 @@ impl<'a> HashJoinPlan<'a> {
 /// Selects the hash implementation only when its fixed build table and
 /// equi-key representation can execute this join exactly and hash joins are
 /// enabled. Every other shape selects the ordinary nested-loop
-/// implementation before execution.
+/// implementation before execution. `tree_probe` is the position of a
+/// write's partitioned or inheritance target, which the caller reads member
+/// by member as the probe side; any other tree leaves the join to a nested
+/// loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_hash_join_plan<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     where_clause: Option<&'a Expr<'a>>,
     order: &[usize],
+    tree_probe: Option<usize>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
@@ -6977,7 +6982,8 @@ pub(crate) fn select_hash_join_plan<'a>(
     // do not read. Derived sources have no storage slot, so classify that
     // boundary before asking storage for descendants.
     let reads_tree = |source: usize| -> Result<bool, SqlError> {
-        Ok(scope.derived[source].is_none()
+        Ok(tree_probe != Some(source)
+            && scope.derived[source].is_none()
             && storage.relation_has_descendants(scope.slots[source], txid)
             && !super::partition_prune::plans_no_partition(
                 storage,
@@ -7054,6 +7060,9 @@ pub(crate) fn select_hash_join_plan<'a>(
     else {
         return Ok(None);
     };
+    if tree_probe.is_some_and(|tree| tree != probe_table) {
+        return Ok(None);
+    }
     let on = join.on.or(scope.join_on[0]);
     let filter_join = join.kind.is_semi_or_anti().then_some(FilterJoin {
         anti: join.kind == JoinKind::Anti,
@@ -9919,6 +9928,7 @@ fn scan_source_mode<'a>(
             from,
             planning_where_clause,
             order,
+            None,
             txid,
             arena,
         )?

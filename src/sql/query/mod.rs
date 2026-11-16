@@ -51,8 +51,8 @@ mod joined_from;
 #[cfg(test)]
 pub(crate) use joined_from::target_hash_builds;
 pub(crate) use joined_from::{
-    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, recheck_joined_from_match,
-    target_hash_plan, with_joined_from_row,
+    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, merge_join_plan,
+    recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
 mod materialize;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
@@ -396,7 +396,7 @@ pub(crate) use dependencies::collect_routine_signature_row_types;
 pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
-    for_each_dml_assignment, require_dml_builtin_execute, undefined_set_target,
+    dml_join_scope, for_each_dml_assignment, require_dml_builtin_execute, undefined_set_target,
     validate_dml_assignment_casts, visit_dml_assignment_types, visit_projection_types,
 };
 

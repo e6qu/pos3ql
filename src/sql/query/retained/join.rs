@@ -515,6 +515,7 @@ pub(super) fn join_shape<'a>(
         from,
         where_clause,
         order,
+        None,
         txid,
         arena,
     )? {

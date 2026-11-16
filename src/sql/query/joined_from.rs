@@ -587,7 +587,8 @@ fn project_items<'a>(
 }
 
 /// The hash join of a data-modifying statement's target with its only FROM
-/// item: the target probes, and the FROM item, a table without descendants,
+/// item: the target, or each member of a partitioned or inheritance target
+/// in turn, probes, and the FROM item, a table without descendants,
 /// row security or sampling, is hashed once on its join keys. The SELECT
 /// planner's choice decides it, so EXPLAIN and execution agree.
 #[derive(Clone, Copy)]
@@ -666,8 +667,16 @@ pub(crate) fn target_hash_plan<'a>(
     if super::index_access_plan(storage, &source, txid, where_clause, arena)?.is_some() {
         return Ok(None);
     }
-    let Some(plan) =
-        super::select_hash_join_plan(storage, &scope, joined, where_clause, &[0, 1], txid, arena)?
+    let Some(plan) = super::select_hash_join_plan(
+        storage,
+        &scope,
+        joined,
+        where_clause,
+        &[0, 1],
+        Some(0),
+        txid,
+        arena,
+    )?
     else {
         return Ok(None);
     };
@@ -706,6 +715,163 @@ pub(crate) fn target_hash_plan<'a>(
 #[cfg(test)]
 std::thread_local! {
     static TARGET_HASH_BUILDS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// How a `MERGE` joins its target and source, as PostgreSQL's costs choose
+/// for relations of different sizes: a hash join builds on the side with
+/// fewer planned rows and the other side probes it, and without an
+/// equi-key a nested loop rescans the smaller side for each row of the
+/// larger. A join that keeps the unmatched rows of one side only reads that
+/// side as its outer relation when sizes tie (`Hash Left Join`), and always
+/// in a nested loop. EXPLAIN and execution share the decision.
+#[derive(Clone, Copy)]
+pub(crate) struct MergeJoinPlan<'a> {
+    /// Unmatched source rows reach a `NOT MATCHED [BY TARGET]` action.
+    pub(crate) preserves_source: bool,
+    /// Unmatched target rows reach a `NOT MATCHED BY SOURCE` action.
+    pub(crate) preserves_target: bool,
+    /// The hash join's keys: (target column, source column name).
+    keys: [(usize, &'a str); 8],
+    key_count: usize,
+    collations: [crate::sql::ast::Collation; 8],
+}
+
+impl<'a> MergeJoinPlan<'a> {
+    /// The equi-key pairs (target column, source column name) a hash join
+    /// builds on; empty for a nested loop.
+    pub(crate) fn keys(&self) -> &[(usize, &'a str)] {
+        &self.keys[..self.key_count]
+    }
+
+    pub(crate) fn collations(&self) -> &[crate::sql::ast::Collation] {
+        &self.collations[..self.key_count]
+    }
+
+    /// Whether the join is a hash join.
+    pub(crate) fn hashed(&self) -> bool {
+        self.key_count != 0
+    }
+
+    /// The join without its hash keys: the nested loop over the source rows
+    /// a `MERGE` of relations without statistics runs.
+    pub(crate) fn unplanned(self) -> Self {
+        Self {
+            key_count: 0,
+            ..self
+        }
+    }
+
+    /// Whether the source rows are the outer relation, the target's being
+    /// hashed or rescanned, for `target_rows` and `source_rows` planned rows.
+    pub(crate) fn source_outer(&self, target_rows: u64, source_rows: u64) -> bool {
+        match (self.preserves_source, self.preserves_target) {
+            // A nested loop reads the side it keeps as its outer relation.
+            (true, false) if !self.hashed() => true,
+            (false, true) | (true, true) if !self.hashed() => false,
+            // The smaller side is hashed; a tie hashes the source, unless
+            // only unmatched source rows are kept.
+            (true, false) => source_rows >= target_rows,
+            // The smaller side is hashed, or rescanned by an inner nested
+            // loop.
+            _ => source_rows > target_rows,
+        }
+    }
+}
+
+/// Plans `statement`'s join of its target and source. A join that keeps
+/// both sides' unmatched rows needs an equality between them, as
+/// PostgreSQL's full join does (`0A000`).
+pub(crate) fn merge_join_plan<'a>(
+    storage: &Storage,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<MergeJoinPlan<'a>, SqlError> {
+    use crate::sql::ast::{MergeActionRef, MergeMatchKind};
+    // `DO NOTHING` needs no row, so only other actions keep unmatched rows.
+    let preserves = |kind: MergeMatchKind| {
+        statement
+            .whens
+            .iter()
+            .any(|when| when.kind() == kind && !matches!(when.action(), MergeActionRef::DoNothing))
+    };
+    let mut plan = MergeJoinPlan {
+        preserves_source: preserves(MergeMatchKind::NotMatchedByTarget),
+        preserves_target: preserves(MergeMatchKind::NotMatchedBySource),
+        keys: [(0, ""); 8],
+        key_count: 0,
+        collations: [crate::sql::ast::Collation::None; 8],
+    };
+    let source_from = &*arena
+        .alloc(FromClause {
+            base: statement.source,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let (scope, _) = super::dependencies::dml_join_scope(
+        storage,
+        statement.target,
+        statement.target_alias,
+        Some(source_from),
+        txid,
+        arena,
+        None,
+    )?;
+    if scope.n != 2 {
+        return Ok(plan);
+    }
+    if plan.preserves_source && plan.preserves_target {
+        // An equality whose sides each read one relation hashes or merges.
+        let mut conjuncts = [statement.on; super::plan::MAX_CONJUNCTS];
+        let mut count = 0;
+        let conjuncts: &[&Expr<'_>] =
+            if super::plan::flatten_and(statement.on, &mut conjuncts, &mut count) {
+                &conjuncts[..count]
+            } else {
+                core::slice::from_ref(&statement.on)
+            };
+        let joinable = conjuncts.iter().any(|conjunct| {
+            let Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } = conjunct
+            else {
+                return false;
+            };
+            matches!(
+                (
+                    super::plan::expr_tables(left, &scope),
+                    super::plan::expr_tables(right, &scope)
+                ),
+                (Some(1), Some(2)) | (Some(2), Some(1))
+            )
+        });
+        if !joinable {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"
+            ));
+        }
+    }
+    if crate::sql::guc::planner_methods().hashjoin
+        && let Some((pairs, count)) =
+            super::scan::hash_join_keys(&scope, Some(statement.on), None, 0, 1)?
+    {
+        let source = scope.defs.get(1).expect("resolved source");
+        for (index, &(target_column, source_column)) in pairs[..count].iter().enumerate() {
+            let name = arena
+                .alloc_str(source.columns[source_column].name.as_str())
+                .map_err(|_| arena_full())?;
+            plan.keys[index] = (target_column, name);
+            plan.collations[index] =
+                super::scan::join_key_collation(&scope, (0, target_column), (1, source_column))
+                    .expect("hash keys have a collation");
+        }
+        plan.key_count = count;
+    }
+    Ok(plan)
 }
 
 /// Target hash joins this thread built, for tests of the selected plan.

@@ -640,7 +640,7 @@ pub const PUBLISHER_DIAGNOSTIC_FIELD_BYTES: usize = 2048;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublisherDiagnostic {
     pub sqlstate: crate::sql::eval::SqlState,
-    pub message: StackStr<192>,
+    pub message: StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>,
     pub detail: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,
     pub hint: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,
     pub context: Option<StackStr<PUBLISHER_DIAGNOSTIC_FIELD_BYTES>>,

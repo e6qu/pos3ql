@@ -131,7 +131,7 @@ impl WriterProbe {
             Ok(()) => Ok(()),
             Err(error) => Err(SqlError {
                 sqlstate: error.sqlstate,
-                message: error.message,
+                message: error.message.clone(),
             }),
         };
         self.release(ticket.1);

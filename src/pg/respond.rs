@@ -2645,86 +2645,88 @@ impl<'b> Responder<'b> {
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
+        if diagnostic
+            .as_ref()
+            .is_some_and(crate::sql::eval::Diagnostic::is_truncated)
+        {
+            let error = crate::sql::eval::diagnostic_too_long();
+            return self.error_severity(severity, error.sqlstate.as_str(), &error.message, None);
+        }
         // An analysis error positions its subject in the statement text.
         let annotation = crate::sql::error_position::take_annotation(sqlstate, message);
         let cursor = cursor.or_else(|| annotation.position.and_then(CursorPosition::from_position));
         let analysis_hint = annotation
             .hint
             .filter(|_| diagnostic.as_ref().is_none_or(|d| d.hint.is_none()));
-        crate::sql::error_position::with_full_message(sqlstate, message, |full_message| {
-            crate::sql::error_context::with_reported(sqlstate, message, |reported| {
-                self.control(|buffer| {
-                    let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
-                    m.u8(b'S');
-                    m.cstr(severity);
-                    m.u8(b'V');
-                    m.cstr(severity);
-                    m.u8(b'C');
-                    m.cstr(sqlstate);
-                    m.u8(b'M');
-                    match full_message {
-                        Some(full_message) => m.cstr(full_message),
-                        None => m.cstr_display(message),
-                    };
-                    if let Some(d) = &diagnostic {
-                        if let Some(detail) = &d.detail {
-                            m.u8(b'D');
-                            m.cstr(detail.as_str());
-                        }
-                        if let Some(h) = &d.hint {
-                            m.u8(b'H');
-                            m.cstr(h.as_str());
-                        }
+        crate::sql::error_context::with_reported(sqlstate, message, |reported| {
+            self.control(|buffer| {
+                let mut m = MsgOut::begin(buffer, wire::MSG_ERROR_RESPONSE);
+                m.u8(b'S');
+                m.cstr(severity);
+                m.u8(b'V');
+                m.cstr(severity);
+                m.u8(b'C');
+                m.cstr(sqlstate);
+                m.u8(b'M');
+                m.cstr_display(message);
+                if let Some(d) = &diagnostic {
+                    if let Some(detail) = &d.detail {
+                        m.u8(b'D');
+                        m.cstr(detail.as_str());
                     }
-                    match &annotation.note {
-                        Some(crate::sql::error_position::AnalysisNote::Detail(detail))
-                            if diagnostic.as_ref().is_none_or(|d| d.detail.is_none()) =>
-                        {
-                            m.u8(b'D');
-                            m.cstr(detail.as_str());
-                        }
-                        Some(
-                            crate::sql::error_position::AnalysisNote::Hint(hint)
-                            | crate::sql::error_position::AnalysisNote::Suggestion(hint),
-                        ) if analysis_hint.is_none()
-                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
-                        {
-                            m.u8(b'H');
-                            m.cstr(hint.as_str());
-                        }
-                        _ => {}
-                    }
-                    if let Some(hint) = analysis_hint {
+                    if let Some(h) = &d.hint {
                         m.u8(b'H');
-                        m.cstr(hint);
+                        m.cstr(h.as_str());
                     }
-                    // PostgreSQL's field order: context and object names, then
-                    // the cursor and internal query.
-                    if let Some(reported) = &reported
-                        && !reported.context.is_empty()
+                }
+                match &annotation.note {
+                    Some(crate::sql::error_position::AnalysisNote::Detail(detail))
+                        if diagnostic.as_ref().is_none_or(|d| d.detail.is_none()) =>
                     {
-                        m.u8(b'W');
-                        m.cstr(reported.context);
+                        m.u8(b'D');
+                        m.cstr(detail.as_str());
                     }
-                    if let Some(d) = &diagnostic {
-                        for (code, value) in d.objects.fields() {
-                            m.u8(code);
-                            m.cstr(value);
-                        }
+                    Some(
+                        crate::sql::error_position::AnalysisNote::Hint(hint)
+                        | crate::sql::error_position::AnalysisNote::Suggestion(hint),
+                    ) if analysis_hint.is_none()
+                        && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                    {
+                        m.u8(b'H');
+                        m.cstr(hint.as_str());
                     }
-                    if let Some(cursor) = cursor {
-                        m.u8(b'P');
-                        m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+                    _ => {}
+                }
+                if let Some(hint) = analysis_hint {
+                    m.u8(b'H');
+                    m.cstr(hint);
+                }
+                // PostgreSQL's field order: context and object names, then
+                // the cursor and internal query.
+                if let Some(reported) = &reported
+                    && !reported.context.is_empty()
+                {
+                    m.u8(b'W');
+                    m.cstr(reported.context);
+                }
+                if let Some(d) = &diagnostic {
+                    for (code, value) in d.objects.fields() {
+                        m.u8(code);
+                        m.cstr(value);
                     }
-                    if let Some((query, position)) = reported.as_ref().and_then(|r| r.internal) {
-                        m.u8(b'p');
-                        m.cstr(stack_format!(20, "{}", position).as_str());
-                        m.u8(b'q');
-                        m.cstr(query);
-                    }
-                    m.u8(0);
-                    m.finish()
-                })
+                }
+                if let Some(cursor) = cursor {
+                    m.u8(b'P');
+                    m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
+                }
+                if let Some((query, position)) = reported.as_ref().and_then(|r| r.internal) {
+                    m.u8(b'p');
+                    m.cstr(stack_format!(20, "{}", position).as_str());
+                    m.u8(b'q');
+                    m.cstr(query);
+                }
+                m.u8(0);
+                m.finish()
             })
         })
     }

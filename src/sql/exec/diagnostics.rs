@@ -86,8 +86,6 @@ pub(super) struct PendingError {
 
 struct PendingDiagnostic {
     bytes: MutableSlice<u8>,
-    /// The complete message of an error whose inline message is its start.
-    message: Option<Span>,
     detail: Option<Span>,
     hint: Option<Span>,
     objects: [Option<Span>; 5],
@@ -116,65 +114,66 @@ impl PendingError {
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Option<PendingDiagnostic>, SqlError> {
         let diagnostic = crate::sql::eval::take_diagnostic();
-        crate::sql::error_position::peek_full_message(error, |message| {
-            crate::sql::error_context::take(error, |reported| {
-                if diagnostic.is_none() && reported.is_none() && message.is_none() {
-                    return Ok(None);
-                }
-                let detail = diagnostic
-                    .as_ref()
-                    .and_then(|d| d.detail.as_ref().map(StackStr::as_str));
-                let hint = diagnostic
-                    .as_ref()
-                    .and_then(|d| d.hint.as_ref().map(StackStr::as_str));
-                let objects = diagnostic
-                    .as_ref()
-                    .map_or([None; 5], |d| object_texts(&d.objects));
-                let context = reported.as_ref().map(|reported| reported.context);
-                let internal = reported.as_ref().and_then(|reported| reported.internal);
-                let length = message.map_or(0, str::len)
-                    + detail.map_or(0, str::len)
-                    + hint.map_or(0, str::len)
-                    + objects
-                        .iter()
-                        .map(|text| text.map_or(0, str::len))
-                        .sum::<usize>()
-                    + context.map_or(0, str::len)
-                    + internal.map_or(0, |(query, _)| query.len());
-                let mut bytes = pool.lease(length).map_err(exhausted)?;
-                let mut copy = |text: Option<&str>| -> Result<Option<Span>, SqlError> {
-                    text.map(|text| {
-                        let span = Span {
-                            start: bytes.len(),
-                            len: text.len(),
-                        };
-                        bytes
-                            .extend_from_slice(text.as_bytes())
-                            .map_err(exhausted)?;
-                        Ok(span)
-                    })
-                    .transpose()
-                };
-                let message = copy(message)?;
-                let detail = copy(detail)?;
-                let hint = copy(hint)?;
-                let mut object_spans = [None; 5];
-                for (span, text) in object_spans.iter_mut().zip(objects) {
-                    *span = copy(text)?;
-                }
-                let context = copy(context)?;
-                let internal_query = copy(internal.map(|(query, _)| query))?;
-                Ok(Some(PendingDiagnostic {
-                    bytes,
-                    message,
-                    detail,
-                    hint,
-                    objects: object_spans,
-                    context,
-                    internal_query,
-                    internal_position: internal.map(|(_, position)| position),
-                }))
-            })
+        if diagnostic
+            .as_ref()
+            .is_some_and(crate::sql::eval::Diagnostic::is_truncated)
+        {
+            return Err(crate::sql::eval::diagnostic_too_long());
+        }
+        crate::sql::error_context::take(error, |reported| {
+            if diagnostic.is_none() && reported.is_none() {
+                return Ok(None);
+            }
+            let detail = diagnostic
+                .as_ref()
+                .and_then(|d| d.detail.as_ref().map(StackStr::as_str));
+            let hint = diagnostic
+                .as_ref()
+                .and_then(|d| d.hint.as_ref().map(StackStr::as_str));
+            let objects = diagnostic
+                .as_ref()
+                .map_or([None; 5], |d| object_texts(&d.objects));
+            let context = reported.as_ref().map(|reported| reported.context);
+            let internal = reported.as_ref().and_then(|reported| reported.internal);
+            let length = detail.map_or(0, str::len)
+                + hint.map_or(0, str::len)
+                + objects
+                    .iter()
+                    .map(|text| text.map_or(0, str::len))
+                    .sum::<usize>()
+                + context.map_or(0, str::len)
+                + internal.map_or(0, |(query, _)| query.len());
+            let mut bytes = pool.lease(length).map_err(exhausted)?;
+            let mut copy = |text: Option<&str>| -> Result<Option<Span>, SqlError> {
+                text.map(|text| {
+                    let span = Span {
+                        start: bytes.len(),
+                        len: text.len(),
+                    };
+                    bytes
+                        .extend_from_slice(text.as_bytes())
+                        .map_err(exhausted)?;
+                    Ok(span)
+                })
+                .transpose()
+            };
+            let detail = copy(detail)?;
+            let hint = copy(hint)?;
+            let mut object_spans = [None; 5];
+            for (span, text) in object_spans.iter_mut().zip(objects) {
+                *span = copy(text)?;
+            }
+            let context = copy(context)?;
+            let internal_query = copy(internal.map(|(query, _)| query))?;
+            Ok(Some(PendingDiagnostic {
+                bytes,
+                detail,
+                hint,
+                objects: object_spans,
+                context,
+                internal_query,
+                internal_position: internal.map(|(_, position)| position),
+            }))
         })
     }
 
@@ -183,7 +182,6 @@ impl PendingError {
         // could not be saved, fail outside that block rather than entering its
         // handler with an unrelated capacity error.
         let diagnostic = self.diagnostic?;
-        let message = diagnostic.as_ref().and_then(|d| d.text(d.message));
         let detail = diagnostic.as_ref().and_then(|d| d.text(d.detail));
         let hint = diagnostic.as_ref().and_then(|d| d.text(d.hint));
         let objects = diagnostic
@@ -199,7 +197,6 @@ impl PendingError {
         }
         buffers.capture_fields(
             &self.error,
-            message,
             detail,
             hint,
             context.unwrap_or(""),
@@ -217,9 +214,6 @@ impl PendingError {
             Err(capacity_error) => return capacity_error,
         };
         if let Some(diagnostic) = diagnostic {
-            if let Some(message) = diagnostic.text(diagnostic.message) {
-                crate::sql::error_position::keep_full_message(&self.error, message);
-            }
             let mut objects = crate::sql::eval::ErrorObjects::default();
             for (field, span) in objects_mut(&mut objects)
                 .into_iter()
@@ -361,7 +355,6 @@ impl DiagnosticBuffers {
     ) -> Result<(), SqlError> {
         self.capture_fields(
             error,
-            None,
             diagnostic.and_then(|value| value.detail.as_ref().map(StackStr::as_str)),
             diagnostic.and_then(|value| value.hint.as_ref().map(StackStr::as_str)),
             context,
@@ -370,16 +363,9 @@ impl DiagnosticBuffers {
         )
     }
 
-    /// `message` is the error's complete message when its inline one is only
-    /// its start.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a caught error's fields are copied together into one image"
-    )]
     fn capture_fields(
         &mut self,
         error: &SqlError,
-        message: Option<&str>,
         detail: Option<&str>,
         hint: Option<&str>,
         context: &str,
@@ -394,7 +380,7 @@ impl DiagnosticBuffers {
         })?;
         let fields = [
             Some(error.sqlstate.as_str()),
-            Some(message.unwrap_or(error.message.as_str())),
+            Some(error.message.as_str()),
             detail,
             hint,
             Some(context),

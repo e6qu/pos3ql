@@ -321,7 +321,9 @@ fn sql_function_statements_keep_writes_child_calls_settings_and_selected_source(
             let mut config =
                 test_config(&format!("sql-function-progress-{mode:?}-{rows}-{atomic}"));
             config.transaction_mode = mode;
-            config.execution_control_bytes = 64 << 10;
+            // Each saved setting level holds a session time zone, whose
+            // POSIX name may take `TZ_STRLEN_MAX` bytes.
+            config.execution_control_bytes = 96 << 10;
             config.execution_control_leases = 64;
             config.row_work_bytes = 128 << 10;
             config.row_work_leases = 64;

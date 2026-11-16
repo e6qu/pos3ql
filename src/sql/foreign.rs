@@ -168,10 +168,10 @@ fn client_error(error: ClientError) -> SqlError {
                 command,
             };
             match crate::sql::error_context::within(&frame, || {
-                Err::<core::convert::Infallible, _>(SqlError {
-                    sqlstate: diagnostic.sqlstate,
-                    message: diagnostic.message,
-                })
+                Err::<core::convert::Infallible, _>(SqlError::new(
+                    diagnostic.sqlstate,
+                    diagnostic.message.as_str(),
+                ))
             }) {
                 Err(error) => error,
                 Ok(never) => match never {},

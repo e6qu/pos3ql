@@ -867,9 +867,12 @@ Dates and times:
   [Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
   (checksum-pinned at build) and the session zone: `2021-06-01 12:00 EST` is
   17:00 UTC; with `TimeZone = 'Asia/Shanghai'`, `CST` means UTC+8.
-  `timezone_abbreviations` cannot be changed. Named zones need
-  `/usr/share/zoneinfo`; on Debian and Ubuntu, legacy names such as `PST8PDT`
-  and `US/Eastern` come from the `tzdata-legacy` package.
+  `timezone_abbreviations` cannot be changed. The named zones are
+  PostgreSQL 18.6's 598 (checksum-pinned at build); their TZif files come from
+  the required `timezone_directory` setting, and startup fails naming any zone
+  the directory lacks. On Debian and Ubuntu, `/usr/share/zoneinfo` holds the
+  legacy names such as `PST8PDT` and `US/Eastern` only with the
+  `tzdata-legacy` package.
 - Numeric time zones are hours east of UTC (`SET timezone TO '2.5'` is
   UTC+02:30), within ±167:59:59; month/day interval fields return `22023`
   ([PostgreSQL rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251),
@@ -887,9 +890,15 @@ Dates and times:
   Errors carry PostgreSQL's SQLSTATE and message: `'13/01/2024'::date` fails
   with `22008` and the hint `Perhaps you need a different "DateStyle"
   setting.`; an unknown zone name such as `Mars/Olympus` fails with `22023`.
-  BC dates print with a ` BC` suffix (`0044-03-15 BC`). A POSIX zone
-  specification (`UTC+3`, `xyz5`) is not a zone name pos3ql knows: input and
-  `SET TimeZone` reject it.
+  BC dates print with a ` BC` suffix (`0044-03-15 BC`). A name that is not an
+  installed zone is read as a POSIX zone specification, as PostgreSQL reads
+  it, in input, `AT TIME ZONE` and `SET TimeZone`: the offset counts hours
+  *west* of UTC, so `UTC+3` is three hours behind UTC and `xyz5` five; a
+  daylight-time name follows (`EST5EDT`, an hour ahead unless an offset is
+  given) with rules such as `,M3.2.0,M11.1.0` (`Mm.w.d`, `Jn` or `n`, with an
+  optional `/time`), the United States rules when none are given. `SHOW
+  TimeZone` reports the specification upper-cased (`XYZ5`), whose letters are
+  also the zone's abbreviations.
 
 ### Statements that cannot yet pause
 
@@ -1123,6 +1132,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
 | `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
+| `error_text_bytes`, `error_text_leases` | Error messages longer than 192 bytes, kept whole; one that does not fit fails with `54000` |
 | `definition_image_slots` | Schema pins held by executing statements |
 | `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
 | `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |

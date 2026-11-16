@@ -61,6 +61,7 @@ fn numeric_scope_owners_outlive_layout_and_syntax_without_borrowing_their_memory
 
 #[test]
 fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservations() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(64 << 10);
     let parse = Arena::new(&mut budget, "numeric control syntax", 16 << 10).unwrap();
     let arena = Arena::new(&mut budget, "numeric control values", 16 << 10).unwrap();

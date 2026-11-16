@@ -1,23 +1,18 @@
-//! The IANA time-zone database, read from the system's TZif files (RFC 8536).
+//! The IANA time-zone database, read from TZif files (RFC 8536).
 //!
-//! Postgres resolves named zones through the full tz database — historical
-//! transitions included. A zone name is matched case-insensitively against
-//! a catalog of the installed zone names (walked once at startup, before the
-//! allocator freezes), its TZif file parsed into a fixed-size cache slot, and
-//! an instant resolved by binary search over the real transition history, with
-//! the file's POSIX footer rule covering instants past the last transition.
-//!
-//! Static-memory discipline: the catalog and cache are fixed pools in
-//! thread-local storage, const-initialized (no heap); parsing reads the file
-//! into a fixed scratch buffer; running out of cache slots is a loud error,
-//! never growth. TZif files are small (the largest installed here is under
-//! 4 KiB with 242 transitions); the pools carry generous margins and refuse
-//! loudly beyond them.
+//! PostgreSQL resolves named zones through the full tz database, historical
+//! transitions included. The zone names are PostgreSQL 18.6's, pinned at
+//! build (`timezone_name_data`); their TZif files come from the explicitly
+//! configured `timezone_directory`. Startup parses every one into a fixed
+//! table, and a missing or malformed file is a named startup error, so a
+//! session can resolve every zone PostgreSQL knows and no other. An instant
+//! resolves by binary search over the transition history, with the file's
+//! POSIX footer rule covering instants past the last transition.
 
 use core::cell::RefCell;
-use core::fmt::Write as _;
 use std::io::Read as _;
 
+use super::timezone::Abbreviation;
 use crate::util::StackStr;
 
 /// Seconds between the Unix epoch and PostgreSQL's 2000-01-01 epoch.
@@ -31,12 +26,12 @@ const MAX_TRANSITIONS: usize = 512;
 const MAX_TYPES: usize = 32;
 pub(crate) const MAX_ABBREVIATIONS: usize = MAX_TYPES + 2;
 
-/// Distinct TZif zones one server lifetime can load. Exceeding it is a loud
-/// error; sessions use a handful.
-const MAX_CACHED: usize = 64;
+/// The longest `timezone_directory` path.
+pub(crate) const DIRECTORY_BYTES: usize = 1024;
 
-/// Installed zone names the startup catalog can hold.
-const MAX_CATALOG: usize = 1024;
+/// `TZ_MAX_CHARS`: PostgreSQL refuses a TZif file whose abbreviations take
+/// more bytes than this.
+const TZ_MAX_CHARS: usize = 50;
 
 /// A cache entry returned only after a TZif zone has been parsed and retained.
 /// Its index is private so a caller cannot manufacture a stale zone state.
@@ -47,7 +42,7 @@ pub struct TzifSlot(u16);
 #[derive(Clone, Copy)]
 struct TypeInfo {
     utoff: i32,
-    abbrev: StackStr<8>,
+    abbrev: StackStr<TZ_MAX_CHARS>,
     is_dst: bool,
 }
 
@@ -83,107 +78,106 @@ const EMPTY_ZONE: ZoneData = ZoneData {
     footer: None,
 };
 
-struct Cache {
-    names: [StackStr<48>; MAX_CACHED],
-    zones: [ZoneData; MAX_CACHED],
-    n: usize,
-    /// File-read scratch: the largest installed TZif is under 4 KiB; 64 KiB
-    /// covers any plausible tzdata release.
-    file_buf: [u8; 64 * 1024],
-}
-
-struct Catalog {
-    names: [StackStr<48>; MAX_CATALOG],
-    n: usize,
+/// Every pinned zone, parsed at startup; a slot indexes `NAMES`.
+struct Zones {
+    directory: String,
+    zones: Box<[ZoneData]>,
 }
 
 std::thread_local! {
     // Boxed, not inline: glibc places static TLS inside each thread's stack
-    // allocation, and half a megabyte of inline pools overflowed a 2 MiB test
-    // thread. The boxes are allocated in `init_catalog`, before the allocator
-    // freezes; a thread that never initialized (no zoneinfo, or the catalog
-    // was skipped) resolves no named zones.
-    static CACHE: RefCell<Option<Box<Cache>>> = const { RefCell::new(None) };
-    static CATALOG: RefCell<Option<Box<Catalog>>> = const { RefCell::new(None) };
+    // allocation. The table is allocated in `init_catalog`, before the
+    // allocator freezes, on the thread that runs SQL.
+    static ZONES: RefCell<Option<Zones>> = const { RefCell::new(None) };
 }
 
-/// Walks the system zoneinfo directory into the name catalog. Called once at
-/// startup, before the allocator freezes (`read_dir` allocates); a missing
-/// directory leaves the catalog empty and named-zone lookup rejects the name.
-pub fn init_catalog() {
-    let root = std::path::Path::new(zoneinfo_root());
-    CATALOG.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.is_some() {
-            return;
-        }
-        let mut catalog = Box::new(Catalog {
-            names: [StackStr::new(); MAX_CATALOG],
-            n: 0,
-        });
-        let mut prefix = String::new();
-        walk(&mut catalog, root, &mut prefix);
-        catalog.names[..catalog.n]
-            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        *c = Some(catalog);
-    });
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.is_none() {
-            *c = Some(Box::new(Cache {
-                names: [StackStr::new(); MAX_CACHED],
-                zones: [EMPTY_ZONE; MAX_CACHED],
-                n: 0,
-                file_buf: [0; 64 * 1024],
-            }));
-        }
-    });
+/// Why the configured zone database cannot serve PostgreSQL's zones.
+#[derive(Debug)]
+pub enum ZoneDatabaseError {
+    /// `timezone_directory` lacks the TZif file of one or more pinned zones.
+    Missing {
+        directory: String,
+        missing: usize,
+        first: &'static str,
+    },
+    /// A pinned zone's file is not a TZif file pos3ql can hold.
+    Malformed {
+        directory: String,
+        zone: &'static str,
+    },
 }
 
-fn zoneinfo_root() -> &'static str {
-    "/usr/share/zoneinfo"
-}
-
-fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // Skip the metadata files and legacy right/posix duplicates.
-        if name.starts_with('.')
-            || name.contains('.')
-            || name == "posixrules"
-            || name == "leapseconds"
-            || name == "right"
-            || name == "posix"
-        {
-            continue;
+impl core::fmt::Display for ZoneDatabaseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Missing {
+                directory,
+                missing,
+                first,
+            } => write!(
+                f,
+                "timezone_directory {directory:?} lacks {missing} of PostgreSQL 18.6's {} zones, among them {first:?}",
+                super::timezone_name_data::NAMES.len()
+            ),
+            Self::Malformed { directory, zone } => write!(
+                f,
+                "timezone_directory {directory:?} holds no readable TZif file for zone {zone:?}"
+            ),
         }
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let saved = prefix.len();
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(name);
-        if kind.is_dir() {
-            walk(catalog, &entry.path(), prefix);
-        } else if catalog.n < MAX_CATALOG && prefix.len() <= 48 && is_tzif_file(&entry.path()) {
-            let mut s = StackStr::new();
-            let _ = write!(s, "{prefix}");
-            catalog.names[catalog.n] = s;
-            catalog.n += 1;
-        }
-        prefix.truncate(saved);
     }
 }
 
+impl std::error::Error for ZoneDatabaseError {}
+
+/// Parses every zone PostgreSQL 18.6 names from `directory`. Startup only,
+/// on the thread that runs SQL, before the allocator freezes.
+pub fn init_catalog(directory: &str) -> Result<(), ZoneDatabaseError> {
+    if ZONES.with(|zones| {
+        zones
+            .borrow()
+            .as_ref()
+            .is_some_and(|zones| zones.directory == directory)
+    }) {
+        return Ok(());
+    }
+    let names = super::timezone_name_data::NAMES;
+    let root = std::path::Path::new(directory);
+    let mut missing = 0usize;
+    let mut first = None;
+    for &name in names {
+        if !is_tzif_file(&root.join(name)) {
+            missing += 1;
+            first.get_or_insert(name);
+        }
+    }
+    if let Some(first) = first {
+        return Err(ZoneDatabaseError::Missing {
+            directory: directory.to_string(),
+            missing,
+            first,
+        });
+    }
+    let mut zones = (0..names.len()).map(|_| EMPTY_ZONE).collect::<Vec<_>>();
+    for (zone, &name) in zones.iter_mut().zip(names) {
+        let parsed = std::fs::read(root.join(name)).is_ok_and(|data| parse_tzif(&data, zone));
+        if !parsed {
+            return Err(ZoneDatabaseError::Malformed {
+                directory: directory.to_string(),
+                zone: name,
+            });
+        }
+    }
+    ZONES.with(|slot| {
+        *slot.borrow_mut() = Some(Zones {
+            directory: directory.to_string(),
+            zones: zones.into_boxed_slice(),
+        })
+    });
+    Ok(())
+}
+
 /// Zoneinfo installations contain several extensionless metadata files beside
-/// real zones. Identify a zone by the format's required magic instead of
-/// maintaining a platform-specific denylist that inevitably goes stale.
+/// real zones. Identify a zone by the format's required magic.
 fn is_tzif_file(path: &std::path::Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
@@ -192,95 +186,43 @@ fn is_tzif_file(path: &std::path::Path) -> bool {
     file.read_exact(&mut magic).is_ok() && magic == *b"TZif"
 }
 
-/// Case-insensitive catalog match: the canonical installed name for `name`,
-/// or `None` when no installed zone matches (or no catalog was built).
-fn canonical_name(name: &str) -> Option<StackStr<48>> {
-    CATALOG.with(|c| {
-        let c = c.borrow();
-        let c = c.as_ref()?;
-        c.names[..c.n]
-            .iter()
-            .find(|n| n.as_str().eq_ignore_ascii_case(name))
-            .copied()
-    })
-}
-
-/// Loads (or finds cached) the zone named `name`, returning its retained slot.
-/// `None` when the name is not an installed zone or its file fails to parse.
+/// The zone named `name`, matched case-insensitively against PostgreSQL's
+/// zone names. `None` when PostgreSQL has no such zone, or on a thread whose
+/// engine loaded no zones.
 pub fn load(name: &str) -> Option<TzifSlot> {
-    let canonical = canonical_name(name)?;
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let cache = cache.as_mut()?;
-        if let Some(i) = cache.names[..cache.n]
-            .iter()
-            .position(|name| name.as_str() == canonical.as_str())
-        {
-            return Some(TzifSlot(i as u16));
-        }
-        if cache.n == MAX_CACHED {
-            // A loud limit, not an eviction: a session-visible zone must stay
-            // resolvable for the server's lifetime.
-            let message = crate::stack_format!(
-                256,
-                "pos3ql: time-zone cache full ({MAX_CACHED} zones); refusing {name}\n"
-            );
-            crate::util::stderr_line(message.as_str());
-            return None;
-        }
-        let mut path = StackStr::<128>::new();
-        let _ = write!(path, "{}/{}", zoneinfo_root(), canonical.as_str());
-        let n_read = {
-            let mut file = std::fs::File::open(path.as_str()).ok()?;
-            let mut total = 0usize;
-            loop {
-                let n = file.read(&mut cache.file_buf[total..]).ok()?;
-                if n == 0 {
-                    break;
-                }
-                total += n;
-                if total == cache.file_buf.len() {
-                    return None; // larger than any real TZif; refuse
-                }
-            }
-            total
-        };
-        let slot = cache.n;
-        let Cache {
-            zones, file_buf, ..
-        } = &mut **cache;
-        if !parse_tzif(&file_buf[..n_read], &mut zones[slot]) {
-            return None;
-        }
-        cache.names[slot] = canonical;
-        cache.n += 1;
-        Some(TzifSlot(slot as u16))
-    })
+    if ZONES.with(|zones| zones.borrow().is_none()) {
+        return None;
+    }
+    super::timezone_name_data::NAMES
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(name))
+        .map(|slot| TzifSlot(slot as u16))
 }
 
 /// The offset (seconds east) and abbreviation zone `slot` has at `utc`
 /// (microseconds since 2000).
-pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
+pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, Abbreviation) {
     let (offset, abbreviation, _) = resolve_info(slot, utc_micros);
     (offset, abbreviation)
 }
 
+/// The zone's name, spelled as PostgreSQL spells it.
+pub fn name(slot: TzifSlot) -> &'static str {
+    super::timezone_name_data::NAMES[usize::from(slot.0)]
+}
+
 /// The callback cannot retain a reference beyond ownership of the cache.
 fn with_zone<T>(slot: TzifSlot, read: impl FnOnce(&ZoneData) -> T) -> T {
-    CACHE.with(|cache| {
-        let cache = cache.borrow();
-        let cache = cache
+    ZONES.with(|zones| {
+        let zones = zones.borrow();
+        let zones = zones
             .as_ref()
-            .expect("a TZif slot requires the initialized cache");
-        let zone = cache
-            .zones
-            .get(slot.0 as usize)
-            .expect("a TZif slot is retained for the server lifetime");
-        read(zone)
+            .expect("a TZif slot requires the loaded zones");
+        read(&zones.zones[usize::from(slot.0)])
     })
 }
 
-pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, Abbreviation, bool) {
     with_zone(slot, |zone| resolve_zone(zone, utc_micros))
 }
 
@@ -327,7 +269,7 @@ pub(crate) fn abbreviation_meaning(slot: TzifSlot, name: &str) -> Option<Abbrevi
 
 /// PostgreSQL's pg_interpret_timezone_abbrev selects the latest matching era
 /// before the instant, or the earliest matching era when it was used only later.
-fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, StackStr<8>, bool)> {
+fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, Abbreviation, bool)> {
     let unix = utc.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
     let count = zone.n_transitions;
     if (count == 0 || unix >= zone.times[count - 1])
@@ -343,7 +285,7 @@ fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, StackS
         let kind = zone.types[usize::from(kind)];
         kind.abbrev.as_str().eq_ignore_ascii_case(name).then_some((
             kind.utoff,
-            kind.abbrev,
+            Abbreviation::from_str(kind.abbrev.as_str()),
             kind.is_dst,
         ))
     })
@@ -353,14 +295,14 @@ pub(crate) fn resolve_abbreviation(
     slot: TzifSlot,
     name: &str,
     utc: i64,
-) -> Option<(i32, StackStr<8>, bool)> {
+) -> Option<(i32, Abbreviation, bool)> {
     with_zone(slot, |zone| abbreviation_at(zone, name, utc))
 }
 
 pub(crate) fn visit_abbreviations(
     slot: TzifSlot,
     utc: i64,
-    mut visit: impl FnMut(StackStr<8>, i32, bool),
+    mut visit: impl FnMut(Abbreviation, i32, bool),
 ) {
     with_zone(slot, |zone| {
         for (index, kind) in zone.types.iter().enumerate() {
@@ -379,7 +321,11 @@ pub(crate) fn visit_abbreviations(
         }
         if let Some(footer) = zone.footer {
             footer.visit_abbreviations(|abbreviation, offset, is_dst| {
-                if zone.types.iter().any(|kind| kind.abbrev == abbreviation) {
+                if zone
+                    .types
+                    .iter()
+                    .any(|kind| kind.abbrev.as_str() == abbreviation.as_str())
+                {
                     return;
                 }
                 visit(abbreviation, offset, is_dst);
@@ -388,63 +334,35 @@ pub(crate) fn visit_abbreviations(
     });
 }
 
-/// Visits every installed zone at one instant without consuming retained
-/// cache slots. The shared read buffer and one stack zone keep the operation
-/// inside startup-bounded memory.
+/// Visits every zone at one instant, in name order; false on a thread whose
+/// engine loaded no zones.
 pub(crate) fn visit_current(
     utc_micros: i64,
-    mut visitor: impl FnMut(&str, i32, StackStr<8>, bool),
+    mut visitor: impl FnMut(&str, i32, Abbreviation, bool),
 ) -> bool {
-    CATALOG.with(|catalog| {
-        let catalog = catalog.borrow();
-        let Some(catalog) = catalog.as_ref() else {
+    ZONES.with(|zones| {
+        let zones = zones.borrow();
+        let Some(zones) = zones.as_ref() else {
             return false;
         };
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let Some(cache) = cache.as_mut() else {
-                return false;
-            };
-            for name in &catalog.names[..catalog.n] {
-                let mut path = StackStr::<128>::new();
-                let _ = write!(path, "{}/{}", zoneinfo_root(), name.as_str());
-                let n_read = {
-                    let Ok(mut file) = std::fs::File::open(path.as_str()) else {
-                        return false;
-                    };
-                    let mut total = 0usize;
-                    loop {
-                        let Ok(read) = file.read(&mut cache.file_buf[total..]) else {
-                            return false;
-                        };
-                        if read == 0 {
-                            break;
-                        }
-                        total += read;
-                        if total == cache.file_buf.len() {
-                            return false;
-                        }
-                    }
-                    total
-                };
-                let mut zone = EMPTY_ZONE;
-                if !parse_tzif(&cache.file_buf[..n_read], &mut zone) {
-                    return false;
-                }
-                let (offset, abbreviation, is_dst) = resolve_zone(&zone, utc_micros);
-                visitor(name.as_str(), offset, abbreviation, is_dst);
-            }
-            true
-        })
+        for (zone, &name) in zones.zones.iter().zip(super::timezone_name_data::NAMES) {
+            let (offset, abbreviation, is_dst) = resolve_zone(zone, utc_micros);
+            visitor(name, offset, abbreviation, is_dst);
+        }
+        true
     })
 }
 
-fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, Abbreviation, bool) {
     let unix = utc_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
     let n = zone.n_transitions;
     if n == 0 || unix < zone.times[0] {
         let value = zone.types[zone.first_type as usize];
-        return (value.utoff, value.abbrev, value.is_dst);
+        return (
+            value.utoff,
+            Abbreviation::from_str(value.abbrev.as_str()),
+            value.is_dst,
+        );
     }
     if unix >= zone.times[n - 1]
         && let Some(footer) = &zone.footer
@@ -453,7 +371,11 @@ fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, StackStr<8>, bool) {
     }
     let index = zone.times[..n].partition_point(|&time| time <= unix) - 1;
     let value = zone.types[zone.type_after[index] as usize];
-    (value.utoff, value.abbrev, value.is_dst)
+    (
+        value.utoff,
+        Abbreviation::from_str(value.abbrev.as_str()),
+        value.is_dst,
+    )
 }
 
 /// Parses a TZif file (RFC 8536): the version-1 block is skipped when a
@@ -529,6 +451,9 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
     if timecnt > MAX_TRANSITIONS || typecnt > MAX_TYPES || typecnt == 0 {
         return false;
     }
+    if h.charcnt as usize > TZ_MAX_CHARS {
+        return false;
+    }
     let need = h.data_len(time_size);
     if d.len() < need {
         return false;
@@ -559,15 +484,17 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         let is_dst = d[at + 4] != 0;
         let abbrind = d[at + 5] as usize;
         at += 6;
-        let mut abbrev = StackStr::new();
-        if let Some(tail) = abbrevs.get(abbrind..) {
-            for &b in tail {
-                if b == 0 {
-                    break;
-                }
-                let _ = abbrev.write_char(b as char);
-            }
-        }
+        let Some(tail) = abbrevs.get(abbrind..) else {
+            return false;
+        };
+        let length = tail
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(tail.len());
+        let Ok(text) = core::str::from_utf8(&tail[..length]) else {
+            return false;
+        };
+        let abbrev = StackStr::from_str(text);
         *slot = TypeInfo {
             utoff,
             abbrev,
@@ -583,10 +510,9 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
     true
 }
 
-/// Parses the TZif footer's POSIX TZ string (between its newlines) into the
-/// embedded rule machinery. `None` for an empty or unsupported footer — the
-/// zone then freezes at its last transition's offset, which is what an empty
-/// footer means.
+/// Parses the TZif footer's POSIX TZ string (between its newlines) with
+/// `tzparse`. `None` for an empty footer or one `tzparse` refuses: the zone
+/// then keeps its last transition's offset, as PostgreSQL's `tzload` does.
 fn parse_footer(d: &[u8]) -> Option<super::timezone::PosixZone> {
     let s = core::str::from_utf8(d).ok()?;
     let s = s.trim_matches(['\n', '\r', ' ']);
@@ -609,8 +535,17 @@ mod tests {
         (days_from_civil(y, month, d) - PG_EPOCH_DAYS) * 86_400_000_000 + h * 3_600_000_000
     }
 
+    #[test]
+    fn a_directory_without_postgresql_zones_is_a_named_error() {
+        let error = init_catalog("/nonexistent-zoneinfo").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "timezone_directory \"/nonexistent-zoneinfo\" lacks 598 of PostgreSQL 18.6's 598 zones, among them \"Africa/Abidjan\""
+        );
+    }
+
     fn load_or_skip(name: &str) -> Option<TzifSlot> {
-        init_catalog();
+        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         load(name)
     }
 
@@ -677,7 +612,7 @@ mod tests {
         if !std::path::Path::new("/usr/share/zoneinfo").is_dir() {
             return;
         }
-        init_catalog();
+        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         assert!(
             load("America/New_York").is_some(),
             "zoneinfo present but load failed"
@@ -686,7 +621,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_and_unknown_names() {
-        init_catalog();
+        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         if load("America/New_York").is_none() {
             return; // no zoneinfo on this host
         }

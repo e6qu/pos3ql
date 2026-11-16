@@ -246,7 +246,7 @@ pub(crate) fn lookup_routine<'a>(
                     crate::sql::eval::stash_diagnostic(
                         None,
                         Some(crate::stack_format!(
-                            128,
+                            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
                             "Specify the argument list to select the {} unambiguously.",
                             kind.noun()
                         )),

@@ -57,7 +57,7 @@ enum StatementEffectResult {
 #[derive(Clone, Copy)]
 struct StatementEffectError {
     state: super::eval::SqlState,
-    message: crate::util::StackStr<192>,
+    message: ArenaSliceHandle<u8>,
     detail: Option<ArenaSliceHandle<u8>>,
     hint: Option<ArenaSliceHandle<u8>>,
     objects: super::eval::ErrorObjects,
@@ -1181,7 +1181,7 @@ fn retain_effect_error(
     let saved = arena
         .retain(StatementEffectError {
             state: error.sqlstate,
-            message: error.message,
+            message: copy(error.message.as_str())?,
             detail,
             hint,
             objects,
@@ -1199,6 +1199,15 @@ fn restore_effect_error(
     handle: ArenaHandle<StatementEffectError>,
 ) -> Result<SqlError, SqlError> {
     let saved = arena.retained(handle).ok_or_else(replay_changed)?;
+    let message = {
+        let message = arena
+            .retained_slice_mut(saved.message)
+            .map_err(|_| replay_changed())?;
+        SqlError::new(
+            saved.state,
+            core::str::from_utf8(&message).map_err(|_| replay_changed())?,
+        )
+    };
     let detail = if let Some(detail) = saved.detail {
         let detail = arena
             .retained_slice_mut(detail)
@@ -1227,10 +1236,7 @@ fn restore_effect_error(
             objects: saved.objects,
         });
     }
-    Ok(SqlError {
-        sqlstate: saved.state,
-        message: saved.message,
-    })
+    Ok(message)
 }
 
 // Capture only sources changed inside this subtree. Values are read after the

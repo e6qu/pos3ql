@@ -2091,9 +2091,15 @@ pub fn format_timestamp_styled(
     let (timezone_offset_seconds, abbrev) = if with_timezone {
         timezone.resolve(micros)
     } else {
-        (0, StackStr::<8>::new())
+        (0, super::timezone::Abbreviation::new())
     };
-    let timezone_abbreviation = abbrev.as_str();
+    // `EncodeDateTime` prints at most `MAXTZLEN` bytes of the abbreviation.
+    const MAXTZLEN: usize = 10;
+    let mut shown = abbrev.len().min(MAXTZLEN);
+    while !abbrev.as_str().is_char_boundary(shown) {
+        shown -= 1;
+    }
+    let timezone_abbreviation = &abbrev.as_str()[..shown];
     let local = micros + timezone_offset_seconds as i64 * 1_000_000;
     let days = local.div_euclid(DAY_US);
     let in_day = local.rem_euclid(DAY_US);
@@ -2362,7 +2368,7 @@ mod tests {
 
     #[test]
     fn timestamptz_interval_keeps_local_civil_time_across_dst() {
-        crate::sql::tzif::init_catalog();
+        crate::sql::tzif::init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
         let zone = crate::sql::timezone::lookup("America/New_York").unwrap();
         crate::sql::timezone::set_session(zone);
         let before = parse_timestamp("2024-03-09 12:00:00-05", true).unwrap();

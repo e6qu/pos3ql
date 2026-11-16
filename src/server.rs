@@ -2634,9 +2634,10 @@ impl Server {
             let retry = binding.is_none_or(|binding| !binding.behavior.disable_on_error);
             self.unbind_subscription(slot);
             if let (Some(stream), Some(failure)) = (stream, publisher_failure) {
+                // The durable record keeps the start of the publisher's message.
                 let failure = crate::storage::SubscriptionFailure {
                     sqlstate: failure.sqlstate,
-                    message: failure.message,
+                    message: crate::util::StackStr::from_str(failure.message.as_str()),
                 };
                 if let Err(error) = self.engine.fail_subscription(stream, failure) {
                     log_subscription_error(Some(stream.name()), &error);
@@ -2951,15 +2952,17 @@ impl Server {
                 log_subscription_error(self.subscriptions[slot].name, failure);
             }
             self.unbind_subscription(slot);
+            // The durable record keeps the start of the message, which is
+            // logged whole above; no client reads it back.
             let durable_failure = local_failure
                 .map(|failure| crate::storage::SubscriptionFailure {
                     sqlstate: failure.sqlstate,
-                    message: failure.message,
+                    message: crate::util::StackStr::from_str(failure.message.as_str()),
                 })
                 .or_else(|| {
                     publisher_failure.map(|failure| crate::storage::SubscriptionFailure {
                         sqlstate: failure.sqlstate,
-                        message: failure.message,
+                        message: crate::util::StackStr::from_str(failure.message.as_str()),
                     })
                 });
             if let (Some(stream), Some(failure)) = (stream, durable_failure)

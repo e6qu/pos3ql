@@ -671,14 +671,11 @@ pub(crate) fn capture_transaction(
         })();
         // record copies keys and row images into the startup-sized history owner.
         unsafe { arena.rewind_to(mark) };
-        result.map_err(|error: SqlError| SqlError {
-            sqlstate: error.sqlstate,
-            message: crate::stack_format!(
-                192,
-                "catalog history {}: {}",
-                relation.name,
-                error.message
-            ),
+        result.map_err(|error: SqlError| {
+            SqlError::formatted(
+                error.sqlstate,
+                format_args!("catalog history {}: {}", relation.name, error.message),
+            )
         })?;
     }
     // SAFETY: the table selection is the only allocation kept since the mark.

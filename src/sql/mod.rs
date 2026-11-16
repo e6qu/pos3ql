@@ -1105,8 +1105,13 @@ fn calls_routines_outside_queries(statement: &Stmt<'_>, txn: &TxnState) -> bool 
         | Stmt::Analyze(_)
         | Stmt::Vacuum { .. }
         | Stmt::RefreshMaterializedView { .. }
-        | Stmt::CreateTableAs { .. }
-        | Stmt::AlterTable(_) => true,
+        | Stmt::CreateTableAs { .. } => true,
+        // A partition detach evaluates nothing and runs its concurrent form
+        // across transactions of its own.
+        Stmt::AlterTable(alter) => !alter
+            .actions
+            .iter()
+            .any(|action| matches!(action, ast::AlterAction::DetachPartition { .. })),
         _ => false,
     }
 }
@@ -23495,7 +23500,6 @@ impl Engine {
         Ok(Ok(()))
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Prepares, as the statement that wrote them ends, the index keys of the
     /// rows it touched in tables with expression or partial indexes, which
     /// PostgreSQL computes as each row is stored. A routine such a key calls
@@ -23669,6 +23673,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_stmt_with_snapshot<'capture>(
         &mut self,
         statement: &Stmt,

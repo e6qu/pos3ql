@@ -723,15 +723,27 @@ dummy relation's `Result` is as wide as the select list's expressions. An
 in heap order and reads no index; a resumed attempt reads the same order
 under the statement's snapshot. A btree's distinct keys are counted as
 `estimate_num_groups` clamps a product of columns' distinct values.
-Remaining, which `EXPLAIN` rejects with `0A000` naming the
+An index key or predicate may call a PL/pgSQL function
+(`differential_exact/755`): a utility statement that evaluates outside a
+query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
+`ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a
+call in the engine and runs again replaying the results in their order, and
+a write prepares the keys of the rows it stored as it ends, one row at a
+time. Each replay runs the statement again, so a build calling one per row
+costs time quadratic in its rows; the build also evaluates each key once to
+validate it and once more to fill the value caches, so a function's notices
+repeat. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
-methods, expression indexes over user-defined routines or types (PostgreSQL
-inlines a simple SQL function's body, `inline_function`, into the index
-expression, the query and what `EXPLAIN` prints, which pos3ql does not do
-anywhere yet; and `CREATE INDEX` cannot evaluate a PL/pgSQL function, which
-needs the resumable executor), a regular
+methods, expression indexes over user-defined routines or types, a call
+of a SQL function PostgreSQL inlines (`inline_function` puts a body of one
+plain expression in the call's place, so it prints, costs, estimates and
+matches index keys as that expression; pos3ql refuses `EXPLAIN` of any
+statement calling one), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-extended statistics, a sub-partitioned table
+conditions on two or more keys of a statistics object (ANALYZE stores
+approximations, not `statext_ndistinct_build`, `statext_dependencies_build`
+and `statext_mcv_build` over PostgreSQL's sample, and the planner does not
+apply them), a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or

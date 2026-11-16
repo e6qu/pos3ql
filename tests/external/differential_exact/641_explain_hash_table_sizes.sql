@@ -1,13 +1,14 @@
 -- EXPLAIN ANALYZE reports a hash join's table as PostgreSQL sizes it: at
 -- least 1024 buckets, more for a larger row estimate, doubled while the rows
 -- outnumber them, and memory counting each row's minimal tuple and the
--- bucket pointers.
+-- bucket pointers. The rows stay under the forced-spill run's 256 KiB
+-- memtable.
 SET timezone = 'UTC';
 CREATE TABLE hs_build (id int, small text, big text, n numeric, d date, ts timestamptz, f float8, b bool, i8 bigint);
 CREATE TABLE hs_probe (id int, note text);
-INSERT INTO hs_build SELECT g, 'v' || g, repeat('x', 100 + g % 60), g * 1.5, DATE '2024-01-01' + g, TIMESTAMPTZ '2024-01-01 00:00+00' + g * INTERVAL '1 hour', g / 3.0, g % 2 = 0, g * 1000000000::bigint FROM generate_series(1, 1500) g;
+INSERT INTO hs_build SELECT g, 'v' || g, CASE WHEN g % 10 = 0 THEN repeat('x', 100 + g % 60) ELSE 'w' || g END, g * 1.5, DATE '2024-01-01' + g, TIMESTAMPTZ '2024-01-01 00:00+00' + g * INTERVAL '1 hour', g / 3.0, g % 2 = 0, g * 1000000000::bigint FROM generate_series(1, 1500) g;
 UPDATE hs_build SET small = NULL WHERE id % 7 = 0;
-INSERT INTO hs_probe SELECT g, 'q' || g FROM generate_series(1, 4000) g;
+INSERT INTO hs_probe SELECT g, 'q' || g FROM generate_series(1, 2000) g;
 ANALYZE hs_build;
 ANALYZE hs_probe;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT hs_probe.note, hs_build.small FROM hs_probe JOIN hs_build ON hs_build.id = hs_probe.id;

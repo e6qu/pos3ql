@@ -73,6 +73,8 @@ jobs:
           .ci-bin/psql --version
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
+      - if: ${{ !startsWith(matrix.shards, 'lib:') }}
+        uses: ./.github/actions/zoneinfo
       - name: Python venv for the differential harnesses
         if: ${{ !startsWith(matrix.shards, 'lib:') }}
         uses: ./.github/actions/python-test-environment
@@ -133,6 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/zoneinfo
       - name: Python venv for crash torture
         uses: ./.github/actions/python-test-environment
       - name: Run crash torture against the PostgreSQL 18 service
@@ -279,6 +282,7 @@ jobs:
           test -n "$postgres_container"
           docker exec "$postgres_container" mkdir -p /tmp/pos3ql-extensions
           docker cp tests/external/extensions/. "$postgres_container":/tmp/pos3ql-extensions/
+      - uses: ./.github/actions/zoneinfo
       - name: Python venv for differential oracles
         uses: ./.github/actions/python-test-environment
       - name: Run forced-spill differential
@@ -378,6 +382,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: ./.github/actions/zoneinfo
       - name: Python venv for the differential harnesses
         uses: ./.github/actions/python-test-environment
       - name: Measure

@@ -86209,7 +86209,7 @@ impl<'h> MergeCursor<'h> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod merge_cursor_tests {
     use super::{MergeCursor, MergeEvent};
 

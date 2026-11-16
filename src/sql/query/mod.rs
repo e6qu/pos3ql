@@ -84,6 +84,7 @@ pub(crate) use scan::{
     row_security_passes,
 };
 
+pub(crate) mod index_paths;
 mod scope;
 pub(crate) use cte::{
     bind_dml_materialized_relations, bind_materialized_expression, bind_materialized_relations,
@@ -116,7 +117,8 @@ pub use view_write::{
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
-    bind_expression as bind_procedural_expression, bind_statement as bind_procedural_statement,
+    anonymous_record_variable, bind_expression as bind_procedural_expression,
+    bind_statement as bind_procedural_statement,
 };
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
@@ -4154,6 +4156,24 @@ impl StorageCatalog<'_, '_, '_, '_> {
             let supplied = mapping[..arguments.len()]
                 .iter()
                 .position(|mapped| usize::from(*mapped) == input_index);
+            // `coerce_record_to_complex`: only a row constructor or a whole
+            // row converts from `record` to a composite parameter.
+            if let Some(call_index) = supplied
+                && argument_type_oids[call_index] == super::types::oid::RECORD
+                && let Expr::Cast { operand, .. } = arguments[call_index]
+                && !operand.is_row_constructor()
+                && let Some(target) = self
+                    .storage
+                    .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+                    .filter(|&target| target != super::types::oid::RECORD)
+            {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type record to {}",
+                    crate::sql::catalog::format_type_name(self.storage, self.txid, target)?
+                        .as_str()
+                ));
+            }
             input_type_oids[input_index] = match supplied {
                 Some(call_index) if !expanded_variadic => argument_type_oids[call_index],
                 _ => self
@@ -13242,6 +13262,72 @@ pub(crate) fn select_query_resumable<'a>(
         storage,
         txid,
         arena,
+    };
+    // The scan of one relation follows the path PostgreSQL chooses for the
+    // query's ordering and row limit.
+    let _scan_context = if scope.n == 1
+        && statement
+            .where_clause
+            .is_none_or(|condition| !condition.contains_subquery())
+        && from.joins.is_empty()
+        && from.base.sample.is_none()
+        && statement.group_by.is_empty()
+        && !statement.distinct
+        && statement.distinct_on.is_empty()
+        && !statement
+            .order_by
+            .iter()
+            .any(|order| expr_has_window(order.expression))
+        && !has_set_returning_items(statement.items, storage, txid)
+    {
+        let aggregated = statement.having.is_some()
+            || statement.items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    expr_has_aggregate(expression, storage, txid, &resolved_columns).unwrap_or(true)
+                }
+                _ => false,
+            });
+        let windowed = statement.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
+        });
+        let shape = if windowed {
+            None
+        } else if aggregated {
+            Some(index_paths::QueryShape::default())
+        } else {
+            match index_paths::query_shape(
+                storage,
+                txid,
+                &scope,
+                statement.items,
+                statement.order_by,
+                statement.limit,
+                statement.offset,
+                params,
+                arena,
+            ) {
+                Ok(shape) => shape.map(|shape| index_paths::QueryShape {
+                    stop_at_limit: statement.locking.is_empty(),
+                    ..shape
+                }),
+                Err(error) => return sql_fail(error),
+            }
+        };
+        Some(index_paths::enter_query(
+            scope.slots[0],
+            statement.where_clause,
+            streaming_pax_columns_ordered(
+                &scope,
+                from,
+                statement.items,
+                statement.where_clause,
+                statement.order_by,
+            )
+            .selected_mask(0),
+            shape,
+        ))
+    } else {
+        None
     };
     let relation_mode = if statement.locking.is_empty() {
         crate::sql::ast::TableLockMode::AccessShare

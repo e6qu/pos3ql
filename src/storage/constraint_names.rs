@@ -81,17 +81,40 @@ impl super::TableDefBuilder {
     }
 }
 
-pub(crate) fn table(definition: &mut super::TableDefBuilder) -> Result<(), SqlError> {
+/// Where a NOT NULL constraint name an altered table generates must also be
+/// free.
+#[derive(Clone, Copy)]
+pub(crate) enum GeneratedNames<'n> {
+    /// Free in the table and among the schema's other constraints, which
+    /// `taken` reports, as PostgreSQL's `ChooseConstraintName` requires.
+    InSchema(&'n dyn Fn(SqlName) -> bool),
+    /// None: a stored or already admitted definition names every constraint.
+    Assigned,
+}
+
+/// Names each required column's NOT NULL constraint that has none, as ALTER
+/// TABLE does, and rejects a name another constraint of the table holds.
+pub(crate) fn table(
+    definition: &mut super::TableDefBuilder,
+    generated: GeneratedNames<'_>,
+) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
         if !column.not_null.is_required() {
             definition.not_null_names[position] = None;
         } else if definition.not_null_names[position].is_none() {
+            let GeneratedNames::InSchema(schema_taken) = generated else {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored NOT NULL constraint name is missing or unexpected"
+                ));
+            };
             let name = choose(
                 definition.name.as_str(),
                 Some(column.name.as_str()),
                 |name| {
-                    definition.not_null_names[..definition.n_columns].contains(&Some(name))
+                    schema_taken(name)
+                        || definition.not_null_names[..definition.n_columns].contains(&Some(name))
                         || definition
                             .inline_key_names()
                             .iter()
@@ -142,28 +165,173 @@ pub(crate) fn table(definition: &mut super::TableDefBuilder) -> Result<(), SqlEr
                     .any(|constraint| constraint.name == name)
                 || definition.not_null_names[..position].contains(&Some(name)))
         {
-            if definition.checks().iter().any(|check| check.name == name) {
-                // PostgreSQL reports this mixed collision through its catalog index.
-                return Err(sql_err!(
-                    sqlstate::UNIQUE_VIOLATION,
-                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\""
-                ));
-            }
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "constraint \"{}\" for relation \"{}\" already exists",
-                name.as_str(),
-                definition.name.as_str()
-            ));
+            return Err(already_exists(definition, name));
         }
     }
     Ok(())
+}
+
+fn already_exists(definition: &super::TableDefBuilder, name: SqlName) -> SqlError {
+    sql_err!(
+        sqlstate::DUPLICATE_OBJECT,
+        "constraint \"{}\" for relation \"{}\" already exists",
+        name.as_str(),
+        definition.name.as_str()
+    )
+}
+
+/// A NOT NULL constraint name CREATE TABLE repeats. PostgreSQL stores the new
+/// table's CHECK constraints first, then its NOT NULL constraints one at a
+/// time, so the repeat fails the catalog's unique index on `pg_constraint`,
+/// whose DETAIL names the new table's OID: it is reported once the table has
+/// that OID.
+#[must_use]
+pub(crate) struct CatalogNameClash(SqlName);
+
+impl CatalogNameClash {
+    pub(crate) fn error(self, relation_oid: i32) -> SqlError {
+        let mut detail = StackStr::<160>::new();
+        // A constraint name fits with the fixed wording.
+        let _ = write!(
+            detail,
+            "Key (conrelid, contypid, conname)=({}, 0, {}) already exists.",
+            relation_oid as u32,
+            self.0.as_str()
+        );
+        crate::sql::eval::stash_object_diagnostic(
+            Some(detail.as_str()),
+            crate::sql::eval::ErrorObjects::table_constraint(
+                "pg_catalog",
+                "pg_constraint",
+                "pg_constraint_conrelid_contypid_conname_index",
+            ),
+        );
+        sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\""
+        )
+    }
+}
+
+/// Names a new table's NOT NULL constraints in PostgreSQL's
+/// `AddRelationNotNullConstraints` order: the constraints the statement
+/// declares, as `order` lists them and then in column order, then those only
+/// inherited. A declared name (in `not_null_name_edits`) repeating an earlier
+/// declared one is a 42710 error. An undeclared one is chosen to avoid the
+/// table's CHECK constraints, the NOT NULL names chosen before it and
+/// `namespace_taken`, the names the schema's other constraints hold. An
+/// inherited name is kept unless the statement's own CHECK constraints
+/// (`created_check`: those it does not merge into inherited ones) or earlier
+/// NOT NULL constraints use it. The first name repeating a constraint stored
+/// before it is returned for the caller to report with the table's OID; the
+/// remaining columns are still named.
+pub(crate) fn created_table(
+    definition: &mut super::TableDefBuilder,
+    order: &[u16],
+    created_check: &dyn Fn(&super::CheckConstraint) -> bool,
+    namespace_taken: &dyn Fn(SqlName) -> bool,
+) -> Result<Option<CatalogNameClash>, SqlError> {
+    let columns = definition.n_columns;
+    let declared = definition.not_null_name_edits;
+    let mut names = [None; super::MAX_COLUMNS];
+    let mut named = super::ColumnSet::EMPTY;
+    let mut clash = None;
+    let ordered = order
+        .iter()
+        .map(|&column| (false, usize::from(column)))
+        .filter(|&(_, column)| column < columns);
+    let local = (0..columns).map(|column| (false, column));
+    let inherited = (0..columns).map(|column| (true, column));
+    for (inherited_only, position) in ordered.chain(local).chain(inherited) {
+        {
+            let column = definition.columns[position];
+            if named.contains(position)
+                || !column.not_null.is_required()
+                || column.not_null.is_local() == inherited_only
+            {
+                continue;
+            }
+            named.insert(position);
+            let stored = |name: SqlName, names: &[Option<SqlName>]| {
+                names.contains(&Some(name))
+                    || definition
+                        .checks()
+                        .iter()
+                        .any(|constraint| constraint.name == name)
+            };
+            let proposed = definition.not_null_names[position];
+            let name = match proposed {
+                Some(name) if !inherited_only && declared.contains(position) => {
+                    if clash.is_none()
+                        && (0..columns).any(|other| {
+                            names[other] == Some(name)
+                                && declared.contains(other)
+                                && definition.columns[other].not_null.is_local()
+                        })
+                    {
+                        return Err(already_exists(definition, name));
+                    }
+                    name
+                }
+                // An inherited name gives way only to the statement's own
+                // CHECK constraints and earlier NOT NULL names; repeating an
+                // inherited CHECK name fails on the catalog below.
+                Some(name)
+                    if inherited_only
+                        && !names[..columns].contains(&Some(name))
+                        && !definition
+                            .checks()
+                            .iter()
+                            .any(|check| check.name == name && created_check(check)) =>
+                {
+                    name
+                }
+                _ => choose(
+                    definition.name.as_str(),
+                    Some(column.name.as_str()),
+                    |name| stored(name, &names[..columns]) || namespace_taken(name),
+                )?,
+            };
+            if clash.is_none() && stored(name, &names[..columns]) {
+                clash = Some(CatalogNameClash(name));
+            }
+            names[position] = Some(name);
+        }
+    }
+    definition.not_null_names = names;
+    if clash.is_none() {
+        // Keys and exclusion constraints are created after the NOT NULL
+        // constraints, and fail on a name those already hold.
+        for name in names[..columns].iter().flatten() {
+            if definition
+                .inline_key_names()
+                .iter()
+                .any(|key| key.name == *name)
+                || definition
+                    .uniques()
+                    .iter()
+                    .any(|constraint| constraint.name == *name)
+                || definition
+                    .fkeys()
+                    .iter()
+                    .any(|constraint| constraint.name == *name)
+                || definition
+                    .exclusions()
+                    .iter()
+                    .any(|constraint| constraint.name == *name)
+            {
+                return Err(already_exists(definition, *name));
+            }
+        }
+    }
+    Ok(clash)
 }
 
 pub(crate) fn remap_table<B: super::DefinitionBacking>(
     previous: &super::TableDefinition<B>,
     definition: &mut super::TableDefBuilder,
     mapping: &[Option<SqlName>; super::MAX_COLUMNS],
+    generated: GeneratedNames<'_>,
 ) -> Result<(), SqlError> {
     let mut names = [None; super::MAX_COLUMNS];
     for (column, destination) in mapping[..previous.n_columns].iter().enumerate() {
@@ -186,7 +354,7 @@ pub(crate) fn remap_table<B: super::DefinitionBacking>(
     }
     definition.not_null_names = names;
     definition.retain_active_inline_key_names()?;
-    table(definition)?;
+    table(definition, generated)?;
     // Later admission may remap the same draft again; these names are canonical.
     definition.not_null_name_edits = super::ColumnSet::all(definition.n_columns);
     Ok(())
@@ -254,7 +422,7 @@ mod tests {
         original.columns[0].name = SqlName::parse("removed").unwrap();
         original.columns[1].name = SqlName::parse("retained").unwrap();
         original.columns[1].not_null = NotNullOrigin::Local;
-        table(&mut original).unwrap();
+        table(&mut original, GeneratedNames::InSchema(&|_| false)).unwrap();
         let retained_name = original.not_null_names[1];
         let mut replacement = original.clone();
         replacement.name = SqlName::parse("renamed").unwrap();
@@ -267,7 +435,13 @@ mod tests {
         let mut mapping = [None; MAX_COLUMNS];
         mapping[1] = Some(replacement.columns[0].name);
         crate::mem::guard::forbid_alloc(|| {
-            remap_table(&original, &mut replacement, &mapping).unwrap();
+            remap_table(
+                &original,
+                &mut replacement,
+                &mapping,
+                GeneratedNames::InSchema(&|_| false),
+            )
+            .unwrap();
             assert_eq!(replacement.not_null_names[0], retained_name);
             assert_eq!(
                 replacement.not_null_names[1].unwrap().as_str(),
@@ -278,7 +452,13 @@ mod tests {
             assert_eq!(original.not_null_names[1], retained_name);
             let explicit = SqlName::parse("explicit_added_name").unwrap();
             replacement.set_not_null_constraint_name(1, explicit);
-            remap_table(&original, &mut replacement, &mapping).unwrap();
+            remap_table(
+                &original,
+                &mut replacement,
+                &mapping,
+                GeneratedNames::InSchema(&|_| false),
+            )
+            .unwrap();
             assert_eq!(replacement.not_null_names[0], retained_name);
             assert_eq!(replacement.not_null_names[1], Some(explicit));
             assert_eq!(

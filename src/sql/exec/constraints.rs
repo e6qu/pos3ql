@@ -20,6 +20,9 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, 
 
 use super::{RowCtx, check_not_null};
 
+mod build_sort;
+pub(crate) use build_sort::{BuildKeys, BuildRowVisit, RebuildPhase, check_sorted_builds};
+
 /// The longest prefix of one value PostgreSQL shows in a row description
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
 const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
@@ -72,7 +75,7 @@ fn write_described_value(out: &mut DetailWriter, value: Datum<'_>) {
 }
 
 /// Whose row a NOT NULL, CHECK or view check option violation describes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowDescription {
     /// A row the current user's statement writes to the table in slot
     /// `table`, giving values to the `written` columns.
@@ -89,6 +92,9 @@ pub(crate) enum RowDescription {
     },
     /// A row a maintenance command rewrites, described in full.
     Maintenance,
+    /// A stored row ALTER TABLE checks against a new or rewritten table
+    /// (`ATRewriteTable`), whose violation names no row.
+    Existing,
 }
 
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
@@ -110,7 +116,9 @@ pub(crate) fn failing_row_detail(
     let mut shown = crate::storage::ColumnSet::all(values.len());
     let mut named = false;
     let (object, target, written) = match description {
-        RowDescription::Maintenance => (None, None, crate::storage::ColumnSet::EMPTY),
+        RowDescription::Maintenance | RowDescription::Existing => {
+            (None, None, crate::storage::ColumnSet::EMPTY)
+        }
         RowDescription::Write { table, written } => {
             let Some(role) = storage.current_role_slot(txid) else {
                 return Ok(None);
@@ -344,20 +352,7 @@ pub(super) unsafe fn for_each_validation_row(
             unsafe { arena.rewind_to(row_mark) };
             result
         };
-        let flow = scan.for_each_overlay(&mut |rowid, home| {
-            storage.with_row_bytes(table, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, schema, &mut values)?;
-                validate(rowid, &values[..schema.len()])
-            })?;
-            Ok(core::ops::ControlFlow::Continue(()))
-        })?;
-        if flow.is_break() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "constraint validation stopped before completing the scan"
-            ));
-        }
+        // A sequential scan's order: saved rows, then resident rows.
         scan.for_each_spilled_row_batch(arena, true, None, &mut |rows| {
             for row in rows {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
@@ -371,7 +366,22 @@ pub(super) unsafe fn for_each_validation_row(
                 validate(row.rowid, values)?;
             }
             Ok(core::ops::ControlFlow::Continue(()))
-        })
+        })?;
+        let flow = scan.for_each_resident_physically(arena, &mut |rowid, home| {
+            storage.with_row_bytes(table, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                validate(rowid, &values[..schema.len()])
+            })?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        if flow.is_break() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint validation stopped before completing the scan"
+            ));
+        }
+        Ok(())
     })();
     // SAFETY: every row callback and retained scan has ended; only owned errors
     // or success escape. Persistent tail allocations are preserved.
@@ -1064,28 +1074,6 @@ pub(crate) fn index_build_exclusion_violation<'a>(
     }
 }
 
-/// The index-build unique violation for `values`' key `columns`.
-pub(crate) fn index_build_unique_violation(
-    storage: &Storage,
-    table: usize,
-    txid: u32,
-    name: SqlName,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    columns: &[u16],
-    values: &[Datum],
-) -> SqlError {
-    unique_violation(
-        storage,
-        table,
-        txid,
-        DuplicateKey::IndexBuild,
-        name,
-        def,
-        columns,
-        values,
-    )
-}
-
 /// Whether the row `rowid`'s committed key equals `values` under this index's
 /// NULL-equality rule.
 #[expect(
@@ -1402,6 +1390,59 @@ pub(crate) fn index_key_values<'a>(
     Ok(keys)
 }
 
+/// The unique violation of index or key `name` for the key `keys`, its
+/// columns named as `pg_get_indexdef_columns` names them: each expression key
+/// deparsed from its binding.
+#[allow(clippy::too_many_arguments)]
+fn index_key_violation(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    name: SqlName,
+    columns: &[u16],
+    expressions: &[Option<&Expr<'_>>],
+    expression_texts: &[Option<&str>],
+    keys: &[Datum],
+    duplicate: DuplicateKey,
+    arena: &Arena,
+) -> SqlError {
+    let mut displays = [None; crate::storage::MAX_INDEX_COLS];
+    for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
+        if let (Some(expression), Some(source)) =
+            (expressions[position], expression_texts[position])
+        {
+            match crate::sql::catalog::index_key_display(
+                storage,
+                txid,
+                table_index,
+                expression,
+                source,
+                arena,
+            ) {
+                Ok(text) => *display = Some(text),
+                Err(error) => return error,
+            }
+        }
+    }
+    let names = columns.iter().enumerate().map(|(position, column)| {
+        displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
+    });
+    let values = keys.iter().copied();
+    let visible = key_values_visible(
+        storage,
+        table_index,
+        txid,
+        &mut columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| expressions[position].is_none().then_some(*column)),
+    );
+    duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut {
+        values
+    })
+}
+
 /// Enforces a unique expression index without manufacturing a column-only
 /// cache key. Expressions and an optional predicate are evaluated against the
 /// authoritative committed and pending images with one parser representation.
@@ -1437,42 +1478,19 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let violation = || {
-        // `pg_get_indexdef_columns`: each expression key deparsed from its
-        // binding.
-        let mut displays = [None; crate::storage::MAX_INDEX_COLS];
-        for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
-            if let (Some(expression), Some(source)) =
-                (expressions[position], expression_texts[position])
-            {
-                match crate::sql::catalog::index_key_display(
-                    storage,
-                    txid,
-                    table_index,
-                    expression,
-                    source,
-                    arena,
-                ) {
-                    Ok(text) => *display = Some(text),
-                    Err(error) => return error,
-                }
-            }
-        }
-        let names = columns.iter().enumerate().map(|(position, column)| {
-            displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
-        });
-        let values = keys[..columns.len()].iter().copied();
-        let visible = key_values_visible(
+        index_key_violation(
             storage,
             table_index,
             txid,
-            &mut columns
-                .iter()
-                .enumerate()
-                .map(|(position, column)| expressions[position].is_none().then_some(*column)),
-        );
-        duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut {
-            values
-        })
+            def,
+            name,
+            columns,
+            expressions,
+            expression_texts,
+            &keys[..columns.len()],
+            duplicate,
+            arena,
+        )
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -1563,38 +1581,9 @@ fn enforce_key_uniqueness(
     nulls_not_distinct: bool,
     name: SqlName,
     duplicate: DuplicateKey,
-    source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
-    }
-    if matches!(source, UniqueKeySource::Rows) {
-        committed_scan_uniqueness(
-            storage,
-            table_index,
-            schema,
-            columns,
-            nulls_not_distinct,
-            values,
-            self_rowid,
-            txid,
-            def,
-            name,
-            duplicate,
-        )?;
-        return pending_scan_uniqueness(
-            storage,
-            table_index,
-            schema,
-            columns,
-            nulls_not_distinct,
-            values,
-            self_rowid,
-            txid,
-            def,
-            name,
-            duplicate,
-        );
     }
     if storage.has_pending_table_def(table_index, txid) {
         if !storage.pending_table_rows_rewritten(table_index, txid) {
@@ -1732,12 +1721,6 @@ fn enforce_key_uniqueness(
         name,
         duplicate,
     )
-}
-
-#[derive(Clone, Copy)]
-enum UniqueKeySource {
-    Cache,
-    Rows,
 }
 
 /// The committed-image check when a key has no value-cache binding: a full
@@ -2110,8 +2093,10 @@ fn check_row_keys(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let self_rowid = row.excluded();
-    // Existing rows meeting a new key are its index being built.
-    let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
+    // Existing rows meeting a new key are its index being built; a unique
+    // key's build sorts them all at once (`check_sorted_builds`).
+    let existing = matches!(row, ConstraintRow::Existing { .. });
+    let duplicate = if existing {
         DuplicateKey::IndexBuild
     } else {
         DuplicateKey::Write
@@ -2151,6 +2136,7 @@ fn check_row_keys(
             Err(error)
         };
     for_each_row_key(storage, def, txid, &mut |key| match key {
+        RowKey::Column(_) | RowKey::Table(_) | RowKey::Index(_) if existing => Ok(()),
         RowKey::Column(column) => {
             let name = def.column_key_name(column).ok_or_else(|| {
                 sql_err!(
@@ -2170,7 +2156,6 @@ fn check_row_keys(
                 false,
                 name,
                 duplicate,
-                UniqueKeySource::Cache,
             )
         }
         RowKey::Table(key) => {
@@ -2186,7 +2171,6 @@ fn check_row_keys(
                 key.kind.nulls_not_distinct(),
                 key.name,
                 duplicate,
-                UniqueKeySource::Cache,
             );
             if key.timing.is_deferrable() {
                 defer_on_conflict(key.name, checked)
@@ -2225,7 +2209,6 @@ fn check_row_keys(
             self_rowid,
             txid,
             arena,
-            UniqueIndexCheck::Cache,
             index,
         ),
     })
@@ -2451,14 +2434,10 @@ fn check_index_tuple_sizes_inner(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub enum UniqueIndexCheck {
-    Cache,
-    Rebuild { selected: Option<i32> },
-}
-
+/// Checks the exclusion constraint at `position` of `def` for one existing
+/// row against the others, as rebuilding its index does.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn check_reindex_constraints(
+pub(crate) fn check_rebuilt_exclusion(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -2467,132 +2446,35 @@ pub(crate) fn check_reindex_constraints(
     rowid: u64,
     txid: u32,
     arena: &Arena,
-    selected: Option<i32>,
+    position: usize,
 ) -> Result<(), SqlError> {
-    let unselected = |identity: Option<crate::storage::RelationIdentity>| {
-        selected.is_some_and(|oid| identity.is_none_or(|identity| identity.oid() != oid))
-    };
-    for_each_row_key(storage, def, txid, &mut |key| match key {
-        RowKey::Column(column) => {
-            if unselected(def.column_index_identity(column)) {
-                return Ok(());
-            }
-            let name = def.column_key_name(column).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "inline unique key has no admitted name"
-                )
-            })?;
-            enforce_key_uniqueness(
-                storage,
-                table_index,
-                def,
-                schema,
-                values,
-                Some(rowid),
-                txid,
-                &[column as u16],
-                false,
-                name,
-                DuplicateKey::IndexBuild,
-                UniqueKeySource::Rows,
-            )
-        }
-        RowKey::Table(key) => {
-            if unselected(key.index_identity) {
-                return Ok(());
-            }
-            enforce_key_uniqueness(
-                storage,
-                table_index,
-                def,
-                schema,
-                values,
-                Some(rowid),
-                txid,
-                key.columns(),
-                key.kind.nulls_not_distinct(),
-                key.name,
-                DuplicateKey::IndexBuild,
-                UniqueKeySource::Rows,
-            )
-        }
-        RowKey::Exclusion(position) => {
-            let exclusion = &def.exclusions()[position];
-            if unselected(exclusion.index_identity) {
-                return Ok(());
-            }
-            let predicate = exclusion
-                .predicate
-                .map(|source| {
-                    let source = arena
-                        .alloc_str(source.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?;
-                    crate::sql::parser::parse_expr(source, arena)
-                })
-                .transpose()?;
-            enforce_exclusion_constraint(
-                storage,
-                table_index,
-                def,
-                schema,
-                values,
-                Some(rowid),
-                txid,
-                exclusion,
-                predicate,
-                arena,
-                Some(storage.validation_read()),
-                DuplicateKey::IndexBuild,
-            )
-        }
-        RowKey::Index(index) => check_unique_index(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            Some(rowid),
-            txid,
-            arena,
-            UniqueIndexCheck::Rebuild { selected },
-            index,
-        ),
-    })
+    let exclusion = &def.exclusions()[position];
+    let predicate = exclusion
+        .predicate
+        .map(|source| {
+            let source = arena
+                .alloc_str(source.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            crate::sql::parser::parse_expr(source, arena)
+        })
+        .transpose()?;
+    enforce_exclusion_constraint(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        Some(rowid),
+        txid,
+        exclusion,
+        predicate,
+        arena,
+        Some(storage.validation_read()),
+        DuplicateKey::IndexBuild,
+    )
 }
 
-/// Normal writes may probe the derived cache. Explicit rebuilding validates
-/// only its selected indexes against authoritative rows, including own writes.
-#[allow(clippy::too_many_arguments)]
-pub fn check_unique_indexes(
-    storage: &Storage,
-    table_index: usize,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    schema: &[ColType],
-    values: &[Datum],
-    self_rowid: Option<u64>,
-    txid: u32,
-    arena: &Arena,
-    check: UniqueIndexCheck,
-) -> Result<(), SqlError> {
-    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        check_unique_index(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            arena,
-            check,
-            &index,
-        )?;
-    }
-    Ok(())
-}
-
-/// One unique index's check of a row, as [`check_unique_indexes`] runs it.
+/// One unique index's check of a written row.
 #[allow(clippy::too_many_arguments)]
 fn check_unique_index(
     storage: &Storage,
@@ -2603,17 +2485,12 @@ fn check_unique_index(
     self_rowid: Option<u64>,
     txid: u32,
     arena: &Arena,
-    check: UniqueIndexCheck,
     index: &crate::storage::IndexDef,
 ) -> Result<(), SqlError> {
     {
-        if matches!(check, UniqueIndexCheck::Cache) && !index.mutable_for(txid).immediate {
+        if !index.mutable_for(txid).immediate {
             // The constraint's own timing controls checks. A detached REINDEX
             // replacement has no check trigger until the atomic link swap.
-            return Ok(());
-        }
-        if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(index))
-        {
             return Ok(());
         }
         let icols = &index.columns[..index.n_cols];
@@ -2648,8 +2525,7 @@ fn check_unique_index(
                 .any(|(position, column)| {
                     index.collations[position] != def.columns()[*column as usize].collation
                 });
-        if matches!(check, UniqueIndexCheck::Rebuild { .. })
-            || custom
+        if custom
             || custom_collation
             || index.expressions[..index.n_cols]
                 .iter()
@@ -2690,10 +2566,7 @@ fn check_unique_index(
                 index.nulls_not_distinct,
                 name,
                 predicate,
-                match check {
-                    UniqueIndexCheck::Cache => DuplicateKey::Write,
-                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
-                },
+                DuplicateKey::Write,
                 arena,
             )?;
             return Ok(());
@@ -2718,10 +2591,7 @@ fn check_unique_index(
                 icols,
                 index.nulls_not_distinct,
                 name,
-                match check {
-                    UniqueIndexCheck::Cache => DuplicateKey::Write,
-                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
-                },
+                DuplicateKey::Write,
                 expression,
                 arena,
             )?;
@@ -2737,11 +2607,7 @@ fn check_unique_index(
                 icols,
                 index.nulls_not_distinct,
                 name,
-                match check {
-                    UniqueIndexCheck::Cache => DuplicateKey::Write,
-                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
-                },
-                UniqueKeySource::Cache,
+                DuplicateKey::Write,
             )?;
         }
     }
@@ -3218,6 +3084,22 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
+            if description == RowDescription::Existing {
+                crate::sql::eval::stash_object_diagnostic(
+                    None,
+                    crate::sql::eval::ErrorObjects::table_constraint(
+                        def.schema.as_str(),
+                        def.name.as_str(),
+                        c.name.as_str(),
+                    ),
+                );
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                    "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                    c.name.as_str(),
+                    def.name.as_str()
+                ));
+            }
             let detail = failing_row_detail(
                 storage,
                 txid,
@@ -4019,7 +3901,6 @@ pub(crate) fn validate_constraint_obligation(
                     key.kind.nulls_not_distinct(),
                     key.name,
                     DuplicateKey::Write,
-                    UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
                 if foreign_key.validation.enforced()

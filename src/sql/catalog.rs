@@ -10152,6 +10152,79 @@ pub(crate) fn index_statistics_source(
 /// Resolves the catalog identity of the plain-column value index selected by
 /// the storage probe path. Duplicate indexes must not all receive credit for
 /// one physical scan.
+/// One index of a table as the planner's `get_relation_info` describes it.
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerIndex {
+    pub(crate) oid: i32,
+    pub(crate) name: StackStr<64>,
+    pub(crate) method: crate::sql::ast::IndexAccessMethod,
+    pub(crate) columns: [u16; crate::storage::MAX_INDEX_COLS],
+    pub(crate) n_cols: usize,
+    pub(crate) include_columns: [u16; crate::storage::MAX_INDEX_COLS],
+    pub(crate) n_include_cols: usize,
+    pub(crate) unique: bool,
+    pub(crate) descending: [bool; crate::storage::MAX_INDEX_COLS],
+    pub(crate) nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Every key is a plain column with its column's collation and its
+    /// type's default operator class, and the index has no predicate.
+    pub(crate) plain: bool,
+}
+
+/// Visits each index of the table in `table_slot`.
+pub(crate) fn planner_indexes(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    visit: &mut dyn FnMut(PlannerIndex),
+) {
+    let definition = storage.table_def(table_slot, txid);
+    visit_indexes(
+        storage,
+        txid,
+        None,
+        TableSelection::Table(table_slot),
+        ExplicitIndexes::Scanned,
+        |index| {
+            if index.table_slot != table_slot {
+                return;
+            }
+            let plain = index.predicate.is_none()
+                && !index.is_exclusion
+                && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
+                && index.columns[..index.n_cols]
+                    .iter()
+                    .enumerate()
+                    .all(|(position, column)| {
+                        !index.explicit_collations[position]
+                            || index.collations[position]
+                                == definition.columns[*column as usize].collation
+                    })
+                && !index.resolved_operator_classes[..index.n_cols].iter().any(
+                    |class| match class {
+                        Some(crate::storage::IndexOperatorClass::Catalog(_)) => true,
+                        Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                            class.is_pattern()
+                        }
+                        _ => false,
+                    },
+                );
+            visit(PlannerIndex {
+                oid: index.oid,
+                name: index.name,
+                method: index.method,
+                columns: index.columns,
+                n_cols: index.n_cols,
+                include_columns: index.include_columns,
+                n_include_cols: index.n_include_cols,
+                unique: index.is_unique || index.is_primary,
+                descending: index.descending,
+                nulls_first: index.nulls_first,
+                plain,
+            });
+        },
+    );
+}
+
 pub(crate) fn value_index_identity(
     storage: &Storage,
     txid: u32,
@@ -15809,7 +15882,9 @@ fn inherited_foreign_key_parent(
         .copied()
 }
 
-fn check_inheritance_count(
+/// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
+/// `child_slot`: how many of its parents define it.
+pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
@@ -18203,6 +18278,8 @@ fn finish_with_hidden<'a>(
                     | ColType::PgDependencies
                     | ColType::PgMcvList
             ) && matches!(value, Datum::Text(_))
+                // An `anyarray` column holds arrays of any element type.
+                || (*column_type == ColType::AnyArray && matches!(value, Datum::Array { .. }))
             {
                 value
             } else {
@@ -18336,19 +18413,32 @@ fn pg_stats<'a>(
             }
             let distinct =
                 crate::storage::column_distinct_catalog_value(metadata, column_statistics);
+            let (most_common, frequencies, histogram, correlation) = match table_definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.distribution(attribute))
+            {
+                Some(distribution) => statistics_slots(
+                    distribution,
+                    metadata.ctype,
+                    statistics_element(storage, txid, metadata)?,
+                    arena,
+                )?,
+                None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
+            };
             rows[count] = row(
                 &[
                     text(table_definition.schema.as_str(), arena)?,
                     text(table_definition.name.as_str(), arena)?,
                     text(metadata.name.as_str(), arena)?,
                     Datum::Bool(false),
-                    Datum::Float4(column_statistics.null_fraction_ppm as f32 / 1_000_000.0),
+                    Datum::Float4(column_statistics.null_fraction),
                     Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
                     Datum::Float4(distinct),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Null,
+                    most_common,
+                    frequencies,
+                    histogram,
+                    correlation,
                     Datum::Null,
                     Datum::Null,
                     Datum::Null,
@@ -18362,6 +18452,92 @@ fn pg_stats<'a>(
         }
     }
     finish(def, &rows[..count], arena)
+}
+
+/// The element type of a column's `pg_stats` value arrays: the column's
+/// declared type, as PostgreSQL's `stavalues` arrays carry it. A domain
+/// column keeps its domain identity over the stored base values, and an
+/// array column's values are themselves arrays.
+fn statistics_element(
+    storage: &Storage,
+    txid: u32,
+    metadata: &crate::storage::ColumnMeta,
+) -> Result<super::types::ArrElem, SqlError> {
+    use super::types::ArrElem;
+    let ctype = metadata.ctype;
+    let domain = metadata
+        .user_type
+        .and_then(|_| storage.routine_type_oid(ctype, metadata.user_type, txid))
+        .and_then(crate::storage::NamedTypeKind::from_oid)
+        .and_then(|(kind, creation, array)| {
+            (kind == crate::storage::NamedTypeKind::Domain && !array).then_some(creation)
+        });
+    let element = match (domain, ctype) {
+        // An array element cannot name a domain over an array of a named
+        // type, so such a column's values are shown as the arrays they are.
+        // The text matches PostgreSQL; binary output names the array type
+        // where PostgreSQL names the domain.
+        (Some(_), ColType::Array(inner)) if inner.is_named() => ArrElem::nested(inner),
+        (Some(domain), base) => ArrElem::domain(domain, base),
+        (None, ColType::Array(inner)) => ArrElem::nested(inner),
+        (None, scalar) => ArrElem::from_coltype(scalar),
+    };
+    element.ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "statistics of type {} cannot be shown",
+            ctype.name()
+        )
+    })
+}
+
+/// `pg_stats`' `most_common_vals`, `most_common_freqs`, `histogram_bounds`
+/// and `correlation` of a column of type `ctype`, whose value arrays have
+/// `element` members.
+fn statistics_slots<'a>(
+    distribution: crate::storage::ColumnDistribution<'_>,
+    ctype: ColType,
+    element: super::types::ArrElem,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, Datum<'a>, Datum<'a>, Datum<'a>), SqlError> {
+    use super::types::ArrElem;
+    let array = |values: &[Datum<'_>]| -> Result<Datum<'a>, SqlError> {
+        Ok(Datum::Array {
+            element,
+            raw: super::array::build(values, arena)?,
+        })
+    };
+    let (mut most_common, mut frequencies, mut histogram) = (Datum::Null, Datum::Null, Datum::Null);
+    if distribution.mcv_len() != 0 {
+        let values = arena
+            .alloc_slice_with(distribution.mcv_len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let numbers = arena
+            .alloc_slice_with(distribution.mcv_len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for index in 0..distribution.mcv_len() {
+            values[index] = distribution.mcv_value(index, ctype)?;
+            numbers[index] = Datum::Float4(distribution.mcv_frequency(index));
+        }
+        most_common = array(values)?;
+        frequencies = Datum::Array {
+            element: ArrElem::Float4,
+            raw: super::array::build(numbers, arena)?,
+        };
+    }
+    if distribution.histogram_len() != 0 {
+        let values = arena
+            .alloc_slice_with(distribution.histogram_len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = distribution.histogram_value(index, ctype)?;
+        }
+        histogram = array(values)?;
+    }
+    let correlation = distribution
+        .correlation()
+        .map_or(Datum::Null, Datum::Float4);
+    Ok((most_common, frequencies, histogram, correlation))
 }
 
 fn policy_command_name(command: PolicyCommandKind) -> &'static str {
@@ -18778,7 +18954,7 @@ fn extended_statistics_expression_row(
     rows: u64,
 ) -> StackStr<512> {
     use core::fmt::Write as _;
-    let null_fraction = f64::from(column.null_fraction_ppm) / 1_000_000.0;
+    let null_fraction = f64::from(column.null_fraction);
     let distinct = if rows != 0 && column.distinct_values > rows / 10 {
         -(column.distinct_values as f64 / rows as f64)
     } else {
@@ -19098,8 +19274,8 @@ fn pg_stats_ext_exprs<'a>(
             if !column.valid {
                 continue;
             }
-            let distinct = if column.distinct_fraction_ppm != 0 {
-                -(column.distinct_fraction_ppm as f32 / 1_000_000.0)
+            let distinct = if column.distinct_fraction != 0.0 {
+                -column.distinct_fraction
             } else {
                 column.distinct_values as f32
             };
@@ -19112,7 +19288,7 @@ fn pg_stats_ext_exprs<'a>(
                     text(owner.as_str(), arena)?,
                     text(expression.as_str(), arena)?,
                     Datum::Bool(data.inherited),
-                    Datum::Float4(column.null_fraction_ppm as f32 / 1_000_000.0),
+                    Datum::Float4(column.null_fraction),
                     Datum::Int4(column.average_width.min(i32::MAX as u32) as i32),
                     Datum::Float4(distinct),
                     Datum::Null,
@@ -22277,7 +22453,6 @@ fn pg_constraint_values<'a>(
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
             let inheritance_count = check_inheritance_count(storage, txid, slot, check);
-            let inherited = inheritance_count != 0;
             let table = storage.table_def(slot, txid);
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
             // PostgreSQL's `StoreRelCheck` lists each distinct variable in
@@ -22327,7 +22502,7 @@ fn pg_constraint_values<'a>(
                         txid,
                     )),
                     text(" ", arena)?,
-                    Datum::Bool(!inherited),
+                    Datum::Bool(check.local),
                     Datum::Int4(inheritance_count as i32),
                     Datum::Bool(check.no_inherit),
                     Datum::Null,

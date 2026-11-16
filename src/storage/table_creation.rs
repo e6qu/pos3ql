@@ -30,12 +30,61 @@ pub(super) fn allocate(
             "invalid column attribute layout"
         ));
     }
-    super::constraint_names::table(&mut def)?;
-    def.not_null_name_edits = super::ColumnSet::EMPTY;
     let transaction = match creation {
         TableCreation::Committed => 0,
         TableCreation::Pending(transaction) => transaction,
     };
+    // A statement's new table names its NOT NULL constraints as PostgreSQL
+    // stores them; a restored table keeps its stored names.
+    let name_clash = match (allocation, creation) {
+        (super::CatalogAllocation::New, TableCreation::Pending(_)) => {
+            let schema = def.schema;
+            let parents = def.partition.attachment.map(|attachment| attachment.parent);
+            let inheritance = def.inheritance;
+            super::constraint_names::created_table(
+                &mut def,
+                declared.map_or(&[][..], super::ConstraintDeclarationOrder::not_null_order),
+                &|check| {
+                    check.local
+                        && !parents
+                            .iter()
+                            .chain(inheritance.parents_ref())
+                            .any(|parent| {
+                                storage
+                                    .table_def(usize::from(*parent), transaction)
+                                    .checks()
+                                    .iter()
+                                    .any(|inherited| {
+                                        !inherited.no_inherit
+                                            && inherited.name == check.name
+                                            && inherited.expression == check.expression
+                                    })
+                            })
+                },
+                &|name| storage.schema_constraint_name_taken(schema, name, transaction, None),
+            )?
+        }
+        // A committed table keeps the names it carries and names only the
+        // constraints it has none for.
+        (super::CatalogAllocation::New, TableCreation::Committed) => {
+            let schema = def.schema;
+            super::constraint_names::table(
+                &mut def,
+                super::constraint_names::GeneratedNames::InSchema(&|name| {
+                    storage.schema_constraint_name_taken(schema, name, transaction, None)
+                }),
+            )?;
+            None
+        }
+        (super::CatalogAllocation::Restore(_), _) => {
+            super::constraint_names::table(
+                &mut def,
+                super::constraint_names::GeneratedNames::Assigned,
+            )?;
+            None
+        }
+    };
+    def.not_null_name_edits = super::ColumnSet::EMPTY;
     let ownership = storage.initial_ownership(transaction)?;
     loop {
         let names = storage
@@ -186,6 +235,17 @@ pub(super) fn allocate(
                 position.created_at()
             }
         };
+        if let Some(clash) = name_clash {
+            let oid = super::RelationIdentity::parse(created_at)
+                .map(super::RelationIdentity::oid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "bounded creation stamp is not a relation identity"
+                    )
+                })?;
+            return Err(clash.error(oid));
+        }
         match allocation {
             super::CatalogAllocation::New => {
                 def.attribute_identities

@@ -145,6 +145,10 @@ pub(super) struct HeapReadView {
     heap: Arc<HeapAllocations>,
     primary: HeapRowRead,
     secondary: OnceLock<HeapRowRead>,
+    /// The remap published when the view was taken. Relocation steps need
+    /// exclusive storage, so it stays published while the view's rows are
+    /// captured and ordered.
+    remap: Option<Arc<Mutex<HeapRemap>>>,
 }
 
 impl HeapReadView {
@@ -207,6 +211,19 @@ impl HeapReadView {
         // An owned image proves that this allocation is initialized and retained.
         self.bind_secondary(image.clone())?;
         Ok(HeapReadSlot::Secondary)
+    }
+
+    /// `location`'s offset in the newest heap: its own, or the one the
+    /// published remap moves it to. Relocation keeps the heap's order, so
+    /// these offsets order rows by heap position whichever heap they name.
+    pub(super) fn ordered_offset(&self, location: RowLoc) -> Result<u32, SqlError> {
+        match &self.remap {
+            Some(remap) => remap
+                .lock()
+                .expect("heap remap lock poisoned")
+                .ordered_offset(location),
+            None => Ok(location.offset),
+        }
     }
 
     pub(super) fn generation(&self, slot: HeapReadSlot) -> Result<u64, SqlError> {
@@ -293,14 +310,19 @@ impl RowHeap {
                 },
             }
         };
+        let remap = match &publication.maintenance {
+            HeapMaintenance::Remapping(map) => Some(Arc::clone(map)),
+            HeapMaintenance::Idle | HeapMaintenance::Copying { .. } => None,
+        };
         HeapReadView {
             heap: Arc::clone(&self.inner),
             primary: retain(&self.inner.buffers[active]),
-            secondary: if matches!(&publication.maintenance, HeapMaintenance::Remapping(_)) {
+            secondary: if remap.is_some() {
                 OnceLock::from(retain(&self.inner.buffers[1 - active]))
             } else {
                 OnceLock::new()
             },
+            remap,
         }
     }
 

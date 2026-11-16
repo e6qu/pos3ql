@@ -837,6 +837,21 @@ PostgreSQL's analyzed form for the expression shapes listed in
 
 ANALYZE reads committed rows plus the caller's changes. As in PostgreSQL, a
 rollback can leave `reltuples` changed while column estimates revert.
+Each column's `pg_stats` row is computed as PostgreSQL's ANALYZE computes it
+(`compute_scalar_stats`): from a sample of 300 rows per unit of the statistics
+target (30,000 by default), which is the whole table, in physical order, when
+the table is no larger. For example, after `ANALYZE orders` on a 2,000-row
+table, `pg_stats` shows the same `null_frac`, `avg_width`, `n_distinct`,
+`most_common_vals`, `most_common_freqs`, `histogram_bounds` and `correlation`
+as PostgreSQL. A larger table's sample is random, as PostgreSQL's is, so its
+figures vary between runs. `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS`
+and `default_statistics_target` set how many values are kept; a target of 0
+leaves the column's statistics as they are, and an empty table keeps its
+earlier statistics. Limits: a value PostgreSQL would compress counts at its
+uncompressed width in `avg_width`; ranges, multiranges, `tsvector`, and
+types without a default ordering keep only `null_frac`, `avg_width` and an
+approximate `n_distinct`; array element statistics (`most_common_elems`) are
+not gathered.
 `pg_class.relhasindex` is a hint that can stay true after `DROP INDEX`; VACUUM
 clears it. `pg_index` lists the actual indexes.
 

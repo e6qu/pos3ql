@@ -104,7 +104,10 @@ jobs:
           name: native-tests-${{ matrix.target }}-${{ matrix.suite }}-${{ github.sha }}
           path: ${{ runner.temp }}/native-test-artifact/
           if-no-files-found: error
-          compression-level: 0
+          # Compressed, the test executable is about a quarter of its size
+          # (156 MB to 38 MB in 3 s), so each downstream job's download is
+          # four times shorter; storage stalls once took 7 minutes uncompressed.
+          compression-level: 6
           retention-days: 1
 
   native-build:
@@ -426,6 +429,9 @@ jobs:
 
       - name: CI timeout guard
         run: bash tools/check-ci-timeouts.sh
+
+      - name: Library test suite source guard
+        run: bash tools/check-test-suites.sh
 
       - name: Tool guard tests
         run: >-

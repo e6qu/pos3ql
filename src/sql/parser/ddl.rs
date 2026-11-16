@@ -84,6 +84,13 @@ impl ConstraintAttributeRules {
         not_valid: true,
         no_inherit: true,
     };
+    pub(super) const NOT_NULL: Self = Self {
+        kind: "NOT NULL",
+        defer: false,
+        enforce: false,
+        not_valid: true,
+        no_inherit: true,
+    };
     pub(super) const FOREIGN_KEY: Self = Self {
         kind: "FOREIGN KEY",
         defer: true,
@@ -8364,7 +8371,7 @@ impl<'a> Parser<'a> {
             };
             if matches!(
                 self.peeked,
-                Tok::Ident("primary" | "unique" | "check" | "foreign" | "exclude")
+                Tok::Ident("primary" | "unique" | "check" | "foreign" | "exclude" | "not")
             ) {
                 let constraint = self.table_constraint(
                     constraint_name,
@@ -8585,8 +8592,11 @@ impl<'a> Parser<'a> {
         let mut pending_first_col = None;
         let first_at = self.peek_at;
         if matches!(self.peeked, Tok::Ident(w)
-            if !matches!(w, "like" | "constraint" | "primary" | "unique" | "check" | "foreign"))
-        {
+        if !matches!(
+            w,
+            "like" | "constraint" | "primary" | "unique" | "check" | "foreign" | "exclude"
+                | "not"
+        )) {
             let first_ident = self.col_ident("column name")?;
             if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
                 let mut list = ArenaList::new(self.arena);
@@ -8651,7 +8661,8 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                // Table-level constraints: PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
+                // Table-level constraints: PRIMARY KEY / UNIQUE / CHECK /
+                // NOT NULL / FOREIGN KEY.
                 if matches!(
                     self.peeked,
                     Tok::Ident("primary")
@@ -8659,6 +8670,7 @@ impl<'a> Parser<'a> {
                         | Tok::Ident("check")
                         | Tok::Ident("foreign")
                         | Tok::Ident("exclude")
+                        | Tok::Ident("not")
                 ) {
                     let constraint = self.table_constraint(
                         cons_name,
@@ -9117,19 +9129,42 @@ impl<'a> Parser<'a> {
                 if null_clause == Some(false) {
                     return Err(self.conflicting_null_declarations(constraint_at, column, table));
                 }
+                let inheritable = if self.eat_ident("no")? {
+                    self.expect_ident("inherit")?;
+                    false
+                } else {
+                    true
+                };
+                // A repeated NOT NULL must agree with the first
+                // (`transformColumnDefinition`).
+                if clauses.not_null {
+                    if let (Some(previous), Some(name)) = (clauses.not_null_name, name)
+                        && previous != name
+                    {
+                        let mut error = ParseError::new(constraint_at, "");
+                        error.message = stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "conflicting not-null constraint names \"{}\" and \"{}\"",
+                            previous,
+                            name
+                        );
+                        error.sqlstate = sqlstate::INTERNAL_ERROR;
+                        return Err(error);
+                    }
+                    if clauses.not_null_inheritable != inheritable {
+                        let mut error = ParseError::new(constraint_at, "");
+                        error.message = stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "conflicting NO INHERIT declarations for not-null constraints on column \"{}\"",
+                            column
+                        );
+                        return Err(error);
+                    }
+                }
                 null_clause = Some(true);
                 clauses.not_null = true;
-                if self.eat_ident("no")? {
-                    self.expect_ident("inherit")?;
-                    clauses.not_null_inheritable = false;
-                }
+                clauses.not_null_inheritable = inheritable;
                 if let Some(name) = name {
-                    if clauses
-                        .not_null_name
-                        .is_some_and(|previous| previous != name)
-                    {
-                        return Err(self.err_here("conflicting not-null constraint names"));
-                    }
                     clauses.not_null_name = Some(name);
                 }
             } else if self.eat_ident("null")? {
@@ -9339,7 +9374,8 @@ impl<'a> Parser<'a> {
         Ok((timing, validation))
     }
 
-    /// A table-level PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY constraint.
+    /// A table-level PRIMARY KEY / UNIQUE / CHECK / NOT NULL / FOREIGN KEY
+    /// constraint.
     pub(super) fn table_constraint(
         &mut self,
         name: Option<&'a str>,
@@ -9371,6 +9407,19 @@ impl<'a> Parser<'a> {
             self.check_constraint(name, source_position, site)
         } else if self.eat_ident("exclude")? {
             self.exclusion_constraint(name, source_position)
+        } else if self.eat_ident("not")? {
+            self.expect_ident("null")?;
+            let column = self.col_ident("column name")?;
+            let attributes = self.constraint_attributes(ConstraintAttributeRules::NOT_NULL)?;
+            Ok(TableConstraint::NotNull {
+                source_position,
+                name,
+                column,
+                // Only an added constraint stays not valid.
+                not_valid: site == ConstraintSite::AlterTable
+                    && attributes.validation == ConstraintValidation::EnforcedNotValid,
+                no_inherit: attributes.no_inherit,
+            })
         } else {
             self.expect_ident("foreign")?;
             self.expect_ident("key")?;

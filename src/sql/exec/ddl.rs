@@ -1822,7 +1822,7 @@ pub(super) fn reject_foreign_table_constraint(
         TableConstraint::Unique { .. } => "unique",
         TableConstraint::ForeignKey { .. } => "foreign key",
         TableConstraint::Exclusion { .. } => "exclusion",
-        TableConstraint::Check { .. } => return Ok(()),
+        TableConstraint::Check { .. } | TableConstraint::NotNull { .. } => return Ok(()),
     };
     Err(crate::sql::error_position::at_source_position(
         sql_err!(
@@ -1855,6 +1855,9 @@ pub(super) fn attach_constraints(
             reject_foreign_table_constraint(con)?;
         }
         match con {
+            // CREATE TABLE merges NOT NULL constraints with its columns'
+            // own; ALTER TABLE adds one to an existing column.
+            TableConstraint::NotNull { .. } => {}
             TableConstraint::PrimaryKey {
                 source_position: _,
                 name,
@@ -2081,6 +2084,7 @@ pub(super) fn attach_constraints(
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),
                     no_inherit: *no_inherit,
+                    local: true,
                 };
                 let stored = stored_relation_expression(text, def, arena)?;
                 let _ = core::fmt::Write::write_str(&mut c.expression, stored);
@@ -2222,8 +2226,9 @@ pub(super) fn attach_constraints(
             }
         }
     }
-    def.attributes.initialize(def.n_columns)?;
-    crate::storage::constraint_names::table(def)
+    // NOT NULL constraints are named when the table is created or altered,
+    // in PostgreSQL's order relative to these constraints.
+    def.attributes.initialize(def.n_columns)
 }
 
 /// One `EXCLUDE` element resolved as PostgreSQL's `ComputeIndexAttrs` does:

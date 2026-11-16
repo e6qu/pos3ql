@@ -55,9 +55,11 @@ impl ProgramSource {
             )
         })?;
         let program = match written {
-            Some(written) => crate::sql::error_position::with_copied_source(written, text, || {
-                parse_routine_program(text, parsing, self.kind, self.positionals)
-            }),
+            Some(written) => crate::sql::error_position::with_copied_source(
+                written,
+                crate::sql::error_position::CopiedText::of(text),
+                || parse_routine_program(text, parsing, self.kind, self.positionals),
+            ),
             None => parse_routine_program(text, parsing, self.kind, self.positionals),
         }?;
         let code = CompiledProgram::new(self.clone(), text, program.body, program.locals, parsing)?;

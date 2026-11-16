@@ -24,6 +24,22 @@ AUXILIARY = re.compile(
 )
 # The auxiliary fields `full` compares, each with its continuation lines.
 FULL_FIELDS = ("detail", "hint", "query", "context")
+# CREATE TABLE repeating a constraint name fails pg_constraint's unique index,
+# whose DETAIL names the new table's OID. Each server draws that OID from its
+# own counter, so only that one number is masked, and only in that DETAIL.
+CATALOG_NAME_KEY = (
+    'duplicate key value violates unique constraint "pg_constraint_conrelid_contypid_conname_index"',
+    re.compile(r"^(Key \(conrelid, contypid, conname\)=\()[0-9]+(, 0, )"),
+)
+
+
+def mask_server_oids(message, name, text):
+    if name == "detail" and message == CATALOG_NAME_KEY[0]:
+        masked, count = CATALOG_NAME_KEY[1].subn(r"\1<relation oid>\2", text)
+        if count != 1:
+            raise ValueError(f"catalog unique violation DETAIL has no relation OID: {text}")
+        return masked
+    return text
 
 
 def copy_line_positions(source, filename):
@@ -36,17 +52,13 @@ def copy_line_positions(source, filename):
     }
 
 
-def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnostics, omit=()):
+def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnostics):
     if diagnostics not in ("sqlstate", "verbose", "full"):
         raise ValueError(f"unknown corpus diagnostics {diagnostics}")
     if input_diagnostics not in ("sqlstate", "verbose"):
         raise ValueError(f"unknown input diagnostics {input_diagnostics}")
     if diagnostics != "sqlstate" and input_diagnostics != "verbose":
         raise ValueError(f"{diagnostics} comparison requires verbose input diagnostics")
-    if omit and diagnostics != "full":
-        raise ValueError("only full comparison omits fields")
-    if any(name not in FULL_FIELDS for name in omit):
-        raise ValueError(f"unknown omitted fields {', '.join(omit)}")
     result = []
     current = None
     # The auxiliary field the current line continues, or None for the
@@ -68,8 +80,9 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
         elif diagnostics == "full":
             record["message"] = "\n".join(current["message"])
             for name in FULL_FIELDS:
-                if name in current["fields"] and name not in omit:
-                    record[name] = "\n".join(current["fields"][name])
+                if name in current["fields"]:
+                    record[name] = mask_server_oids(
+                        record["message"], name, "\n".join(current["fields"][name]))
         result.append(record)
 
     lines = stderr.split("\n")
@@ -123,9 +136,9 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
 
 
 def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output, *,
-                     input_diagnostics, omit=()):
+                     input_diagnostics):
     records = normalize_diagnostics(stderr, diagnostics, copy_positions,
-                                    input_diagnostics=input_diagnostics, omit=omit)
+                                    input_diagnostics=input_diagnostics)
     # Length framing keeps data that resembles these markers unambiguous.
     output.write(f"STDOUT {byte_count} bytes\n".encode())
     copied = 0
@@ -146,8 +159,6 @@ def main():
     parser.add_argument("--stderr", type=Path, required=True)
     parser.add_argument("--diagnostics", choices=("sqlstate", "verbose", "full"), required=True)
     parser.add_argument("--input-diagnostics", choices=("sqlstate", "verbose"), required=True)
-    parser.add_argument("--omit", action="append", default=[], choices=FULL_FIELDS,
-                        help="a full-comparison field left out, for a known difference")
     arguments = parser.parse_args()
     try:
         with arguments.stdout.open("rb") as stdout:
@@ -162,7 +173,6 @@ def main():
                 ),
                 sys.stdout.buffer,
                 input_diagnostics=arguments.input_diagnostics,
-                omit=tuple(arguments.omit),
             )
     except (OSError, ValueError) as error:
         parser.exit(1, f"FAIL: corpus transcript: {error}\n")

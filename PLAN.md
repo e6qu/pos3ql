@@ -637,13 +637,36 @@ described by the view's privileges and the columns the statement wrote, and a
 subscription's applied row by the applying role's privileges with no written
 columns, as PostgreSQL's apply worker writes. Revoking a table privilege revokes it on
 each column too.
-Row order
-without `ORDER BY` follows a model of PostgreSQL's access path rather than
-its cost-based plan: a query or data change on one table whose condition
-constrains an index's leading column takes rows in their first-insertion
-order, as an index or bitmap scan reaches an updated row at its first
-position, and any other takes them in physical order. A table with saved row
-files read without index candidates keeps physical order.
+A
+query reading one plain table chooses its sequential, index, index-only or
+bitmap heap scan by PostgreSQL's costs (`cost_index` with `btcostestimate`
+and the column's correlation, `cost_bitmap_heap_scan`, `cost_seqscan`,
+`add_path` with its pathkeys, a sort's cost under `ORDER BY` and
+`create_limit_path` under `LIMIT`) from the statistics ANALYZE gathers, and
+returns its rows in that scan's order: an index scan by key (backward for the
+reverse order), a bitmap heap scan and a sequential scan by heap position
+(`differential_exact/691`, `692`): rows saved to object storage first, then
+the resident versions written since, also while a heap compaction is moving
+rows between memtable buffers. Constraint validation, index builds,
+`VACUUM` and `ANALYZE` read rows in the same order. `EXPLAIN ANALYZE` counts what the chosen
+scan reads: rows its index conditions reach, `Rows Removed by Filter`, a
+bitmap heap scan's `Heap Blocks` and an index-only scan's `Heap Fetches`, and
+each index scan's `Index Searches`. Remaining: multi-column, expression,
+partial and non-btree indexes, a `BitmapAnd` of several indexes, conditions
+other than a column compared with a constant or tested for NULL (`IN`, `OR`,
+`LIKE`, functions), more than one ordering column, grouping or `DISTINCT`
+above the scan, joins, data changes and partitioned tables, which keep the
+access model below. The heap and btree layouts PostgreSQL's costs read are
+emulated: rows packed in physical order, an index laid out as CREATE INDEX
+builds it, and a visibility map whose pages stay all-visible after VACUUM
+until an update or delete (`relallvisible` then counts none) or an insert
+(pages from the first inserted row's on). Rows without such a chosen scan
+follow a model of PostgreSQL's access path rather than its cost-based plan:
+a query or data change on one table whose condition constrains an index's
+leading column takes rows in their first-insertion order, as an index or
+bitmap scan reaches an updated row at its first position, and any other
+takes them in physical order. A table with saved row files read without
+index candidates keeps physical order.
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;
@@ -1101,16 +1124,36 @@ or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
 batch where PostgreSQL fetches only what the reads need. The exact-error
-fixtures compare every DETAIL, HINT, QUERY and CONTEXT line, except the
-fields `tests/external/exact-diagnostics-gaps.tsv` names for 3 fixtures that
-still differ: a unique index built over duplicates names the first duplicate
-pos3ql's row scan meets, where PostgreSQL names the first pair its tuplesort
-(quicksort in memory, merged runs beyond `maintenance_work_mem`) compares
-equal; a CREATE TABLE whose NOT NULL constraint repeats a CHECK constraint's
-name has no DETAIL, because the DETAIL's key names the new table's OID,
-which pos3ql assigns only after it names the constraints; and a PL/pgSQL
-`OPEN` of a static query selecting a field of an anonymous record value
-reports `could not identify column` without the query as its QUERY.
+fixtures compare every DETAIL, HINT, QUERY and CONTEXT line. The comparator
+masks one value: the new table's OID in the `Key (conrelid, contypid,
+conname)=(...)` DETAIL of a CREATE TABLE that repeats a constraint name,
+which each server draws from its own counter. Every unique B-tree index build (CREATE UNIQUE INDEX, REINDEX, ALTER TABLE
+ADD UNIQUE or PRIMARY KEY, a table rewrite's rebuild of its indexes, with
+the constraints ALTER COLUMN TYPE recreates last, a partition's cloned keys,
+ATTACH PARTITION) sorts its keys with
+PostgreSQL's in-memory quicksort, reading rows in a sequential scan's
+physical order, so it takes O(n log n) comparisons and names the first
+equal pair PostgreSQL compares; ALTER TABLE builds a new key before its
+other row checks, which report `contains null values` and `is violated by
+some row` as PostgreSQL's table rewrite does. A build PostgreSQL would sort
+in parallel or beyond its default `maintenance_work_mem` (64 MB) fails with
+`0A000` when it finds duplicates; pos3ql estimates both conservatively from
+its own row sizes, and a build whose keys outgrow the statement arena fails
+with `54000`. Table-level NOT NULL constraints (`[CONSTRAINT n] NOT NULL
+col [NO INHERIT]`) merge with column constraints in CREATE TABLE and adjust
+an existing constraint in ALTER TABLE ADD, as PostgreSQL 18 does; CHECK
+constraints record `conislocal` apart from their inheritance count. A
+composite routine parameter accepts a `ROW(...)` argument, a PL/pgSQL
+`record` variable holding an anonymous record rejects `(r).f1`, and a bound
+cursor's query sees only the variables declared before the cursor.
+Remaining: `ALTER TABLE ... ADD NOT NULL col NOT VALID` on a column without
+a NOT NULL constraint fails with `0A000` (pos3ql has no NOT VALID NOT NULL
+state); an exclusion constraint's rebuild still compares every pair of rows;
+CREATE TABLE merges a named CHECK into an inherited one only when their
+stored predicate texts match, where PostgreSQL compares the analysed
+expressions; a cursor declared in a nested block's DECLARE section fails
+with `0A000`; and `(r).*` of a PL/pgSQL record variable fails with `0A000`
+where PostgreSQL raises `42809`.
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
@@ -1236,7 +1279,22 @@ conjunct that can raise an error (`id % 2 = 0`) runs above a join rather than
 at its relation's scan, so `EXPLAIN ANALYZE` counts its rows in the join and
 hashes them; and a hash join whose build is empty still reads its outer
 relation, where PostgreSQL reads at most its first row; a derived table that
-PostgreSQL pulls up into an outer join still prints under its own name. A btree index may use
+PostgreSQL pulls up into an outer join still prints under its own name.
+ANALYZE gathers PostgreSQL's column statistics (`compute_scalar_stats`: most
+common values, histogram bounds, correlation and `n_distinct`) from the same
+sample PostgreSQL reads (`differential_exact/690`). `pg_stats` shows them as
+an `anyarray` of the column's declared type, in text and binary form: enum,
+domain and composite values, and an array column's values as an array of
+arrays. Range, multirange and `tsvector` columns count every value distinct
+and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
+`compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
+do. Remaining: the element statistics of arrays and `tsvector` columns, range
+and multirange histograms, `compute_distinct_stats` for types without an
+ordering, the widths of values PostgreSQL compresses, and the binary element
+type of a domain over an array of an enum or composite, which names the
+array type where PostgreSQL names the domain; a table larger than 300 rows per unit of the
+statistics target is sampled at random, as PostgreSQL samples it, so its
+figures differ from run to run. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family
@@ -1245,12 +1303,11 @@ operator, as PostgreSQL's operator families do. It does not yet turn a
 `C`, `>=`/`<`) index range with the pattern kept as a filter, nor scan a
 pattern-class key for an explicit `~<~`-family range: those keys get their
 own physical binding, whose range plans need PostgreSQL's prefix and
-histogram selectivity to choose its bitmap scan. Any B-tree range (`id >= 5
-AND id < 9`, also under `enable_seqscan = off`) is planned as a sequential
-scan until its value binding is durably complete, so a range derived from a
-prefix would show only on spilled tables. `=` on a B-tree key whose columns
-cover the query shows `Index Scan` where PostgreSQL shows `Index Only Scan`;
-EXPLAIN names an index-only scan only for an ordered plan. A routine parameter or result written with `%TYPE` may name a
+histogram selectivity to choose its bitmap scan. Outside the chosen scans
+above, a B-tree range (`id >= 5 AND id < 9`, also under `enable_seqscan =
+off`) is planned as a sequential scan until its value binding is durably
+complete, and `=` on a B-tree key whose columns cover the query shows `Index
+Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). When a block label and a row variable share the
 first word, the variable wins only when it is declared at least as deep as
 the labelled block's variable, where PostgreSQL compares block by block. A literal passed to a function's `regclass`

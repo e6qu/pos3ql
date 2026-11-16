@@ -34790,6 +34790,52 @@ fn uncommitted_drop_view_stays_visible_to_other_sessions() {
 }
 
 #[test]
+fn unique_builds_sort_their_keys_within_a_statement_deadline() {
+    // Probing each row against every other compares O(n^2) pairs: 7,500 rows
+    // took minutes in a debug build, far past this deadline. Sorting the
+    // keys compares O(n log n).
+    let mut config = test_config("unique-build-sort-deadline");
+    config.txn_rows = 16_384;
+    config.wal_buffer_bytes = 8 << 20;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 20);
+    session.success(
+        &mut engine,
+        "CREATE TABLE sorted_build (id integer, label text); \
+         INSERT INTO sorted_build SELECT g, 'v' || g FROM generate_series(1, 7500) g; \
+         INSERT INTO sorted_build VALUES (17, 'V17'); \
+         SET statement_timeout = '60s'",
+        true,
+    );
+    for (statement, detail) in [
+        (
+            "CREATE UNIQUE INDEX sorted_build_lower ON sorted_build (lower(label))",
+            "Key (lower(label))=(v17) is duplicated.",
+        ),
+        (
+            "ALTER TABLE sorted_build ADD CONSTRAINT sorted_build_id UNIQUE (id)",
+            "Key (id)=(17) is duplicated.",
+        ),
+    ] {
+        let failed = session.execute(&mut engine, statement, true);
+        let failed = String::from_utf8_lossy(&failed);
+        assert!(
+            failed.contains("23505") && failed.contains(detail),
+            "{failed}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "CREATE UNIQUE INDEX sorted_build_label ON sorted_build (label); \
+         ALTER TABLE sorted_build ADD CONSTRAINT sorted_build_pair UNIQUE (id, label); \
+         REINDEX TABLE sorted_build",
+        true,
+    );
+}
+
+#[test]
 fn uncommitted_create_index_is_invisible_to_other_sessions() {
     let (mut e, mut b) = test_engine();
     let mut a = TxnState::new(&mut b, 256).unwrap();
@@ -66168,8 +66214,10 @@ fn partition_index_validation_reclaims_sources_between_tables_in_a_fixed_arena()
             true,
         );
     }
+    // Each partition's build sorts its 256 keys in the arena, which holds
+    // one partition's sort and scan but not all three.
     let mut limited =
-        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 16 << 10);
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 40 << 10);
     limited.success(&mut engine, "CREATE UNIQUE INDEX partition_capacity_key ON partition_capacity(bucket, (value + 1)) WHERE value >= 0", true);
     assert_eq!(data_rows(&setup.success(&mut engine,
         "SELECT count(*) FROM pg_indexes WHERE tablename IN \

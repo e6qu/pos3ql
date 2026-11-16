@@ -39,9 +39,30 @@ pub(super) fn allocate(
     let name_clash = match (allocation, creation) {
         (super::CatalogAllocation::New, TableCreation::Pending(_)) => {
             let schema = def.schema;
-            super::constraint_names::created_table(&mut def, &|name| {
-                storage.schema_constraint_name_taken(schema, name, transaction, None)
-            })?
+            let parents = def.partition.attachment.map(|attachment| attachment.parent);
+            let inheritance = def.inheritance;
+            super::constraint_names::created_table(
+                &mut def,
+                declared.map_or(&[][..], super::ConstraintDeclarationOrder::not_null_order),
+                &|check| {
+                    check.local
+                        && !parents
+                            .iter()
+                            .chain(inheritance.parents_ref())
+                            .any(|parent| {
+                                storage
+                                    .table_def(usize::from(*parent), transaction)
+                                    .checks()
+                                    .iter()
+                                    .any(|inherited| {
+                                        !inherited.no_inherit
+                                            && inherited.name == check.name
+                                            && inherited.expression == check.expression
+                                    })
+                            })
+                },
+                &|name| storage.schema_constraint_name_taken(schema, name, transaction, None),
+            )?
         }
         // A committed table keeps the names it carries and names only the
         // constraints it has none for.

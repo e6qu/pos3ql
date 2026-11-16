@@ -251,6 +251,8 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
         self.source.retain(rowid, home)
     }
 
+    /// Visits the scan's rows: resident rows first, then saved ones.
+    #[cfg(test)]
     pub(crate) fn for_each_home(
         &self,
         each: &mut dyn FnMut(u64, VisibleRowHome) -> Result<ControlFlow<()>, SqlError>,

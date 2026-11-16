@@ -15809,7 +15809,9 @@ fn inherited_foreign_key_parent(
         .copied()
 }
 
-fn check_inheritance_count(
+/// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
+/// `child_slot`: how many of its parents define it.
+pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
@@ -22277,7 +22279,6 @@ fn pg_constraint_values<'a>(
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
             let inheritance_count = check_inheritance_count(storage, txid, slot, check);
-            let inherited = inheritance_count != 0;
             let table = storage.table_def(slot, txid);
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
             // PostgreSQL's `StoreRelCheck` lists each distinct variable in
@@ -22327,7 +22328,7 @@ fn pg_constraint_values<'a>(
                         txid,
                     )),
                     text(" ", arena)?,
-                    Datum::Bool(!inherited),
+                    Datum::Bool(check.local),
                     Datum::Int4(inheritance_count as i32),
                     Datum::Bool(check.no_inherit),
                     Datum::Null,

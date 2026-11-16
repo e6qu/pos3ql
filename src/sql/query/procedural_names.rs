@@ -543,6 +543,21 @@ impl<'a: 's, 's> Check<'a, 's> {
     fn expression(&self, expression: &'a Expr<'a>, level: &Level<'_, 's>) -> Bound<&'a Expr<'a>> {
         crate::sql::ast::rewrite_expression(expression, self.arena, &mut |node| match node {
             Expr::Column { qualifier, name } => self.reference(node, *qualifier, name, level),
+            Expr::Field {
+                base:
+                    Expr::Column {
+                        qualifier: None,
+                        name,
+                    },
+                field,
+            } if !level.has_column(None, name)
+                && anonymous_record_variable(self.variables, name) =>
+            {
+                Err(Failure(crate::sql::error_position::expression_error(
+                    crate::sql::exec::could_not_identify(field),
+                    node,
+                )))
+            }
             Expr::Subquery(select) => self.subquery(select, level, Expr::Subquery),
             Expr::Exists(select) => self.subquery(select, level, Expr::Exists),
             Expr::ArraySubquery(select) => self.subquery(select, level, Expr::ArraySubquery),
@@ -976,6 +991,20 @@ impl<'a: 's, 's> Check<'a, 's> {
         rebuilt.offset = self.optional(select.offset, &level, &mut changed)?;
         keep(select, rebuilt, changed, self.arena)
     }
+}
+
+/// Whether `name` is a `record` variable holding an anonymous record
+/// (`ROW(...)`, a `SELECT ... INTO`): PL/pgSQL passes it to a query as a
+/// parameter of type `record`, whose fields parse analysis cannot name, so
+/// `(name).field` fails there. A variable holding a named composite value
+/// passes that type.
+pub(crate) fn anonymous_record_variable<'a>(variables: &dyn ColumnLookup<'a>, name: &str) -> bool {
+    variables.procedural_variable(None, name).is_some()
+        && variables.col_type(None, name) == Some(crate::sql::types::ColType::Record)
+        && matches!(
+            variables.lookup(None, name),
+            Ok(crate::sql::types::Datum::Record(_))
+        )
 }
 
 /// The declared fields of an unassigned row variable `name` of type

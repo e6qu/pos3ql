@@ -787,7 +787,9 @@ Functions and expressions:
   hint `CASE statement is missing ELSE part.`).
 - PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
   query` in `DECLARE`) open with `OPEN c` or `OPEN c(2, hi := 3)`; arguments
-  convert to their declared types and the query reads them by name. As in
+  convert to their declared types and the query reads them by name, with
+  the variables declared before the cursor (a cursor declared in a nested
+  block's `DECLARE` section fails with `0A000`). As in
   PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
   argument mistakes fail with `42601` when the routine is created.
   `FOR rec IN c LOOP` (or `FOR rec IN c(2) LOOP`) opens the cursor as a

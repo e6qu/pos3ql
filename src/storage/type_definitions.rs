@@ -743,6 +743,7 @@ mod tests {
                     expression: crate::util::StackStr::from_str("VALUE > 0"),
                     validation: ConstraintValidation::EnforcedValidated,
                     no_inherit: false,
+                    local: true,
                 };
                 storage.create_domain(
                     schema,

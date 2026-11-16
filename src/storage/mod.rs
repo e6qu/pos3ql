@@ -2222,6 +2222,9 @@ pub struct CheckConstraint {
     pub validation: ConstraintValidation,
     /// `NO INHERIT`: the table's children neither receive nor need it.
     pub no_inherit: bool,
+    /// PostgreSQL's `conislocal`: the table defines the constraint itself, as
+    /// opposed to only receiving it from its inheritance parents.
+    pub local: bool,
 }
 
 impl CheckConstraint {
@@ -2231,7 +2234,22 @@ impl CheckConstraint {
         expression: StackStr::new(),
         validation: ConstraintValidation::EnforcedValidated,
         no_inherit: false,
+        local: true,
     };
+
+    /// The journal and checkpoint byte of `no_inherit` (bit 0) and of a
+    /// constraint the table only inherits (bit 1).
+    pub(crate) const fn inheritance_code(&self) -> u8 {
+        (self.no_inherit as u8) | ((!self.local as u8) << 1)
+    }
+
+    /// `no_inherit` and `local` from [`Self::inheritance_code`].
+    pub(crate) const fn from_inheritance_code(code: u8) -> Option<(bool, bool)> {
+        if code > 3 {
+            return None;
+        }
+        Some((code & 1 != 0, code & 2 == 0))
+    }
 }
 
 /// The unique index of the referenced table a foreign key depends on
@@ -50111,6 +50129,19 @@ impl Storage {
         if expected_oid == oid::RECORD && matches!(actual.ctype, ColType::Composite(_)) {
             return true;
         }
+        // `can_coerce_type`: an anonymous record (`ROW(...)`) coerces to any
+        // composite type, or a domain over one; the value's fields are
+        // checked when it is converted. (`record[]` to an array of one is
+        // not implemented there.)
+        let composite = |ctype: ColType| match ctype {
+            ColType::Composite(_) => true,
+            _ => self
+                .domain_base_type_for_oid(ctype.oid(), txid)
+                .is_some_and(|base| matches!(base, ColType::Composite(_))),
+        };
+        if actual.ctype == ColType::Record && composite(expected.ctype) {
+            return true;
+        }
         // Resolve domain candidates through their base types. Execution still
         // checks the declared domain before the routine receives the value.
         let actual_base = actual.ctype.oid();
@@ -50119,7 +50150,8 @@ impl Storage {
             return self.routine_implicit_cast(actual_base, expected_base, txid);
         }
         if let (ColType::Array(actual), ColType::Array(expected)) = (actual.ctype, expected.ctype) {
-            return self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);
+            return actual.to_coltype() != ColType::Record
+                && self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);
         }
         if self
             .cast_for_oids(actual_oid, expected_oid, txid)

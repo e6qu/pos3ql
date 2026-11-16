@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 26;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 27;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1596,7 +1596,7 @@ fn append_table_payload<B: DefinitionBacking>(
     for check in def.checks() {
         ok &= name_bytes(buffer, check.name.as_str());
         let e = check.expression.as_str();
-        ok &= buffer.append(&[check.validation.code(), u8::from(check.no_inherit)]);
+        ok &= buffer.append(&[check.validation.code(), check.inheritance_code()]);
         ok &= buffer.append(&(e.len() as u16).to_le_bytes());
         ok &= buffer.append(e.as_bytes());
     }
@@ -8745,11 +8745,8 @@ fn decode_op_inner<'a>(
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
-                let no_inherit = match *payload.get(at + 1)? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                };
+                let (no_inherit, local) =
+                    CheckConstraint::from_inheritance_code(*payload.get(at + 1)?)?;
                 at += 2;
                 let elen =
                     u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
@@ -8761,6 +8758,7 @@ fn decode_op_inner<'a>(
                 check.name = SqlName::parse(constraint_name).ok()?;
                 check.validation = validation;
                 check.no_inherit = no_inherit;
+                check.local = local;
                 core::fmt::Write::write_str(&mut check.expression, text).ok()?;
                 if check.expression.is_truncated() {
                     return None;
@@ -10918,6 +10916,7 @@ fn decode_op_inner<'a>(
                     validation,
                     // Domain constraints are never inherited.
                     no_inherit: false,
+                    local: true,
                 };
             }
             for check in checks.iter_mut().take(n_checks) {

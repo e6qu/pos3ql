@@ -3735,12 +3735,13 @@ struct CostedRelation {
 #[allow(clippy::too_many_arguments)]
 fn costed_relation<'a>(
     storage: &Storage,
-    scope: &mut QueryScope<'a>,
+    scope: &mut QueryScope<'_>,
     table: usize,
     slots: &[usize],
     condition: Option<&'a Expr<'a>>,
-    keys: &[usize],
+    keys: &[Option<usize>],
     params: &[Datum<'a>],
+    routine: Option<crate::sql::exec::RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<CostedRelation>, SqlError> {
@@ -3765,6 +3766,7 @@ fn costed_relation<'a>(
                     scope.names[table],
                     condition,
                     params,
+                    routine,
                     txid,
                     arena,
                 )? {
@@ -3782,6 +3784,23 @@ fn costed_relation<'a>(
         let statistics = storage.table_statistics(slot, txid);
         let definition = storage.table_def(slot, txid);
         for (distinct, &column) in costed.distinct.iter_mut().zip(keys) {
+            // `get_variable_numdistinct` of an expression without
+            // statistics: the relation's rows when fewer than
+            // `DEFAULT_NUM_DISTINCT`, otherwise that default.
+            let Some(column) = column else {
+                let values = (tuples < 200.0).then(|| clamp_row_estimate(tuples));
+                *distinct = match (*distinct, values) {
+                    (Some(sum), Some(values)) => Some(
+                        sum + if tuples > 0.0 && rows < tuples {
+                            clamp_row_estimate(values * rows / tuples)
+                        } else {
+                            values
+                        },
+                    ),
+                    _ => None,
+                };
+                continue;
+            };
             let Some(column_statistics) = definition
                 .attributes
                 .number(column)
@@ -3829,18 +3848,19 @@ fn costed_relation<'a>(
 /// be estimated.
 pub(crate) fn joined_write_shape<'a>(
     storage: &Storage,
-    scope: &mut QueryScope<'a>,
+    scope: &mut QueryScope<'_>,
     leaves: &[usize],
     join: &query::JoinedWriteJoin<'a>,
     params: &[Datum<'a>],
+    routine: Option<crate::sql::exec::RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(bool, query::JoinedWriteMethod)>, SqlError> {
-    let mut target_keys = [0usize; 8];
-    let mut source_keys = [0usize; 8];
-    for (index, &(target_column, source_column)) in join.keys().iter().enumerate() {
-        target_keys[index] = target_column;
-        source_keys[index] = source_column;
+    let mut target_keys = [None; 8];
+    let mut source_keys = [None; 8];
+    for (index, key) in join.keys().iter().enumerate() {
+        target_keys[index] = key.target_column;
+        source_keys[index] = key.source_column;
     }
     let count = join.keys().len();
     let Some(target) = costed_relation(
@@ -3851,6 +3871,7 @@ pub(crate) fn joined_write_shape<'a>(
         join.conditions.target,
         &target_keys[..count],
         params,
+        routine,
         txid,
         arena,
     )?
@@ -3865,6 +3886,7 @@ pub(crate) fn joined_write_shape<'a>(
         join.conditions.source,
         &source_keys[..count],
         params,
+        routine,
         txid,
         arena,
     )?
@@ -9161,6 +9183,7 @@ fn plan_write<'a>(
             predicate,
             leaves,
             &[],
+            None,
             txid,
             arena,
         )? {

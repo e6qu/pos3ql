@@ -1127,8 +1127,8 @@ pub(crate) struct JoinedWriteJoin<'a> {
     /// The FROM table's storage slot and exposed name.
     pub(crate) source_slot: usize,
     pub(crate) source_name: &'a str,
-    /// Equi-key column pairs (target column, FROM table column).
-    keys: [(usize, usize); 8],
+    /// The hash join's keys, each an equality between the relations.
+    keys: [JoinedWriteKey<'a>; 8],
     key_count: usize,
     collations: [crate::sql::ast::Collation; 8],
     /// Whether the FROM table is the outer relation, the target being
@@ -1144,10 +1144,31 @@ pub(crate) struct JoinedWriteJoin<'a> {
     pub(crate) conditions: MergeConditions<'a>,
 }
 
+/// One hash key of a joined write: the expressions an equality between the
+/// target and its FROM table compares, each reading one relation (and
+/// routine variables or parameters), and the column each is when it is a
+/// plain column. PostgreSQL hashes on any such equality
+/// (`hash_inner_and_outer`).
+#[derive(Clone, Copy)]
+pub(crate) struct JoinedWriteKey<'a> {
+    pub(crate) target: &'a Expr<'a>,
+    pub(crate) source: &'a Expr<'a>,
+    pub(crate) target_column: Option<usize>,
+    pub(crate) source_column: Option<usize>,
+}
+
+impl JoinedWriteKey<'_> {
+    const NONE: Self = Self {
+        target: &Expr::Null,
+        source: &Expr::Null,
+        target_column: None,
+        source_column: None,
+    };
+}
+
 impl<'a> JoinedWriteJoin<'a> {
-    /// The equi-key pairs (target column, FROM table column); empty for a
-    /// nested loop.
-    pub(crate) fn keys(&self) -> &[(usize, usize)] {
+    /// The hash join's keys; empty for a nested loop.
+    pub(crate) fn keys(&self) -> &[JoinedWriteKey<'a>] {
         &self.keys[..self.key_count]
     }
 
@@ -1244,7 +1265,9 @@ impl JoinIndexReach {
 /// pruning keeps) with `from` under `where_clause`, when it is a join of
 /// two relations PostgreSQL plans from their statistics: one plain FROM
 /// table, every relation analyzed, local, without row security, and no
-/// index PostgreSQL could scan, join or merge by. `None` otherwise.
+/// index PostgreSQL could scan, join or merge by. A column neither relation
+/// has that `routine` answers for (a routine variable or parameter) is a
+/// constant of the statement. `None` otherwise.
 #[expect(clippy::too_many_arguments, reason = "the joined write's parts")]
 pub(crate) fn joined_write_join<'a>(
     storage: &Storage,
@@ -1254,6 +1277,7 @@ pub(crate) fn joined_write_join<'a>(
     where_clause: Option<&'a Expr<'a>>,
     leaves: &[usize],
     params: &[Datum<'a>],
+    routine: Option<crate::sql::exec::RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<JoinedWriteJoin<'a>>, SqlError> {
@@ -1294,6 +1318,17 @@ pub(crate) fn joined_write_join<'a>(
     {
         return Ok(None);
     }
+    // A routine variable or parameter: a name the relations lack that the
+    // routine's scope answers for.
+    let constant = |expression: &Expr<'_>| match (expression, routine) {
+        (Expr::Column { qualifier, name }, Some(routine)) => {
+            routine.lookup.lookup_unsuggested(*qualifier, name).is_ok()
+        }
+        (Expr::RoutineParam { .. }, _) => true,
+        _ => false,
+    };
+    let tables =
+        |expression: &Expr<'_>| super::plan::expr_tables_with(expression, &scope, &constant);
     // Every conjunct reads a relation and no subquery: PostgreSQL gates the
     // join on the others, or runs them as subplans.
     let mut conjuncts = [&Expr::Null; super::plan::MAX_CONJUNCTS];
@@ -1303,10 +1338,7 @@ pub(crate) fn joined_write_join<'a>(
             return Ok(None);
         }
         for &conjunct in &conjuncts[..count] {
-            if conjunct.contains_subquery()
-                || conjunct.contains_call()
-                || !matches!(super::plan::expr_tables(conjunct, &scope), Some(1..=3))
-            {
+            if conjunct.contains_subquery() || !matches!(tables(conjunct), Some(1..=3)) {
                 return Ok(None);
             }
         }
@@ -1316,7 +1348,7 @@ pub(crate) fn joined_write_join<'a>(
     let mut plan = JoinedWriteJoin {
         source_slot,
         source_name: arena.alloc_str(scope.names[1]).map_err(|_| arena_full())?,
-        keys: [(0, 0); 8],
+        keys: [JoinedWriteKey::NONE; 8],
         key_count: 0,
         collations: [crate::sql::ast::Collation::None; 8],
         source_outer: false,
@@ -1324,35 +1356,6 @@ pub(crate) fn joined_write_join<'a>(
         inner_unique: false,
         conditions: MergeConditions::default(),
     };
-    if let Some((pairs, pair_count)) =
-        super::scan::hash_join_keys(&scope, where_clause, None, 0, 1)?
-    {
-        // PostgreSQL merges by the equalities when it may not hash them.
-        if !methods.hashjoin {
-            return Ok(None);
-        }
-        // A key column the conditions equate with a constant or another
-        // column makes the join's equality implied, as PostgreSQL's
-        // equivalence classes do.
-        for (index, &(target_column, source_column)) in pairs[..pair_count].iter().enumerate() {
-            if pairs[..pair_count].iter().enumerate().any(|(other, pair)| {
-                other != index && (pair.0 == target_column || pair.1 == source_column)
-            }) || conjuncts.iter().any(|conjunct| {
-                super::scan::fixes_column(&scope, conjunct, (0, target_column))
-                    || super::scan::fixes_column(&scope, conjunct, (1, source_column))
-            }) {
-                return Ok(None);
-            }
-            plan.keys[index] = (target_column, source_column);
-            plan.collations[index] =
-                super::scan::join_key_collation(&scope, (0, target_column), (1, source_column))
-                    .expect("hash keys have a collation");
-        }
-        plan.key_count = pair_count;
-    } else if !methods.nestloop {
-        return Ok(None);
-    }
-    // Each conjunct's place in the plan.
     let column = |side: &Expr<'_>| match side {
         Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
             Ok(super::ResolvedColumn::Table(table, column)) => Some((table, column)),
@@ -1360,7 +1363,10 @@ pub(crate) fn joined_write_join<'a>(
         },
         _ => None,
     };
-    let is_key = |conjunct: &Expr<'_>| {
+    // The hash keys: each equality between an expression of the target and
+    // one of the FROM table, of one hashable type.
+    let mut is_key = [false; super::plan::MAX_CONJUNCTS];
+    for (index, &conjunct) in conjuncts.iter().enumerate() {
         let Expr::Binary {
             operator: crate::sql::ast::BinaryOp::Eq,
             left,
@@ -1368,41 +1374,103 @@ pub(crate) fn joined_write_join<'a>(
             ..
         } = conjunct
         else {
-            return false;
+            continue;
         };
-        let pair = match (column(left), column(right)) {
-            (Some((0, target)), Some((1, source))) | (Some((1, source)), Some((0, target))) => {
-                (target, source)
-            }
-            _ => return false,
+        let (target_side, source_side) = match (tables(left), tables(right)) {
+            (Some(1), Some(2)) => (*left, *right),
+            (Some(2), Some(1)) => (*right, *left),
+            _ => continue,
         };
-        plan.keys().contains(&pair)
-    };
-    let mut conditions = MergeConditions::default();
-    for &conjunct in conjuncts {
-        // PostgreSQL hashes on any equality between the two relations,
-        // which this plan's keys hold only for columns.
-        if let Expr::Binary {
-            operator: crate::sql::ast::BinaryOp::Eq,
-            left,
-            right,
-            ..
-        } = conjunct
-            && matches!(
-                (
-                    super::plan::expr_tables(left, &scope),
-                    super::plan::expr_tables(right, &scope)
-                ),
-                (Some(1), Some(2)) | (Some(2), Some(1))
-            )
-            && !is_key(conjunct)
+        // PostgreSQL hashes on any equality between the two relations; one
+        // this plan cannot hash leaves the join to the general executor.
+        let side_type = |side: &Expr<'_>| {
+            super::infer_scope_type(side, &scope)
+                .ok()
+                .and_then(|(oid, _)| crate::sql::types::ColType::from_oid(oid))
+        };
+        let (Some(target_type), Some(source_type)) =
+            (side_type(target_side), side_type(source_side))
+        else {
+            return Ok(None);
+        };
+        if !super::scan::join_key_types_compatible(target_type, source_type)
+            || plan.key_count == plan.keys.len()
         {
             return Ok(None);
         }
-        let slot = if plan.key_count != 0 && is_key(conjunct) {
+        let target_column = column(target_side).map(|(_, column)| column);
+        let source_column = column(source_side).map(|(_, column)| column);
+        let collation = match (target_column, source_column) {
+            (Some(target_column), Some(source_column)) => {
+                match super::scan::join_key_collation(
+                    &scope,
+                    (0, target_column),
+                    (1, source_column),
+                ) {
+                    Some(collation) => collation,
+                    None => return Ok(None),
+                }
+            }
+            _ if target_type.is_collatable() || source_type.is_collatable() => return Ok(None),
+            _ => crate::sql::ast::Collation::None,
+        };
+        // A key the conditions equate with a constant or another expression
+        // makes the join's equality implied, as PostgreSQL's equivalence
+        // classes do.
+        let equated = |side: &Expr<'_>| {
+            conjuncts.iter().enumerate().any(|(other, conjunct)| {
+                other != index
+                    && matches!(
+                        conjunct,
+                        Expr::Binary {
+                            operator: crate::sql::ast::BinaryOp::Eq,
+                            left,
+                            right,
+                            ..
+                        } if **left == *side || **right == *side
+                    )
+            })
+        };
+        if equated(target_side)
+            || equated(source_side)
+            || target_column.is_some_and(|column| {
+                conjuncts
+                    .iter()
+                    .any(|conjunct| super::scan::fixes_column(&scope, conjunct, (0, column)))
+            })
+            || source_column.is_some_and(|column| {
+                conjuncts
+                    .iter()
+                    .any(|conjunct| super::scan::fixes_column(&scope, conjunct, (1, column)))
+            })
+        {
+            return Ok(None);
+        }
+        plan.keys[plan.key_count] = JoinedWriteKey {
+            target: target_side,
+            source: source_side,
+            target_column,
+            source_column,
+        };
+        plan.collations[plan.key_count] = collation;
+        plan.key_count += 1;
+        is_key[index] = true;
+    }
+    if plan.key_count != 0 {
+        // PostgreSQL merges by the equalities when it may not hash them.
+        if !methods.hashjoin {
+            return Ok(None);
+        }
+    } else if !methods.nestloop {
+        return Ok(None);
+    }
+    // Each conjunct's place in the plan.
+    let mut conditions = MergeConditions::default();
+    for (index, &conjunct) in conjuncts.iter().enumerate() {
+        let slot = if is_key[index] {
             &mut conditions.hash
         } else {
-            match super::plan::expr_tables(conjunct, &scope) {
+            match tables(conjunct) {
                 Some(1) => &mut conditions.target,
                 Some(2) => &mut conditions.source,
                 _ => &mut conditions.join,
@@ -1426,24 +1494,33 @@ pub(crate) fn joined_write_join<'a>(
         })
     };
     let key_only = |table: usize, column_index: usize| {
+        let reads_column = |condition: &Expr<'_>| {
+            let mut found = false;
+            condition.for_each_column_reference(&mut |qualifier, name| {
+                found |= matches!(
+                    scope.find_column(qualifier, name),
+                    Ok(super::ResolvedColumn::Table(owner, at)) if owner == table && at == column_index
+                );
+            });
+            found
+        };
         [conditions.target, conditions.source, conditions.join]
             .into_iter()
             .flatten()
-            .all(|condition| {
-                let mut found = false;
-                condition.for_each_column_reference(&mut |qualifier, name| {
-                    found |= matches!(
-                        scope.find_column(qualifier, name),
-                        Ok(super::ResolvedColumn::Table(owner, at)) if owner == table && at == column_index
-                    );
-                });
-                !found
-            })
-            && plan.keys().iter().any(|&(target_column, source_column)| {
-                if table == 0 {
-                    target_column == column_index
+            .all(|condition| !reads_column(condition))
+            && plan.keys().iter().all(|key| {
+                let (side, side_column) = if table == 0 {
+                    (key.target, key.target_column)
                 } else {
-                    source_column == column_index
+                    (key.source, key.source_column)
+                };
+                side_column == Some(column_index) || !reads_column(side)
+            })
+            && plan.keys().iter().any(|key| {
+                if table == 0 {
+                    key.target_column == Some(column_index)
+                } else {
+                    key.source_column == Some(column_index)
                 }
             })
     };
@@ -1469,7 +1546,7 @@ pub(crate) fn joined_write_join<'a>(
         &|column| key_only(1, column),
     );
     let Some((source_outer, method)) = crate::sql::explain::joined_write_shape(
-        storage, &mut scope, leaves, &plan, params, txid, arena,
+        storage, &mut scope, leaves, &plan, params, routine, txid, arena,
     )?
     else {
         return Ok(None);

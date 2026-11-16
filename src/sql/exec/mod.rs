@@ -93855,6 +93855,7 @@ pub(crate) fn update<'a>(
             },
             params,
             &hooks,
+            outer,
             txn.txid,
             arena,
         ) {
@@ -95648,6 +95649,7 @@ pub(crate) fn delete<'a>(
             delete_capture,
             params,
             &hooks,
+            outer,
             txn.txid,
             arena,
         ) {
@@ -106762,15 +106764,27 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     images.finish()
 }
 
+/// The variables of the routine running a statement, and its evaluation
+/// hooks: a column the statement's relations lack that `lookup` answers
+/// for is a constant of the statement.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineScope<'s, 'a> {
+    pub(crate) lookup: &'s dyn ColumnLookup<'a>,
+    pub(crate) hooks: &'s super::eval::EvalHooks<'s, 'a>,
+}
+
 /// The rows of the table in `slot`, read as `alias`, that `condition`
-/// keeps, as of `txid`: the count PostgreSQL's statistics estimate for a
-/// condition on an analyzed table. `None` when evaluating it fails.
+/// keeps, as of `txid`, with the routine variables `routine` answers for: the count PostgreSQL's
+/// statistics estimate for a condition on an analyzed table. `None` when
+/// evaluating it fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn relation_rows_kept<'a>(
     storage: &Storage,
     slot: usize,
     alias: &str,
     condition: &Expr<'a>,
     params: &[Datum<'a>],
+    routine: Option<RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<u64>, SqlError> {
@@ -106794,20 +106808,36 @@ pub(crate) fn relation_rows_kept<'a>(
             let bytes = storage.row_bytes(slot, rowid, home, arena)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut values)?;
-            row_matches_values(
-                storage,
-                txid,
-                Some(slot),
-                &definition,
-                Some(alias),
-                &values[..definition.n_columns],
-                Some(condition),
-                arena,
-                params,
-                &hooks,
-                None,
-                None,
-            )
+            match routine {
+                Some(routine) => row_matches_values(
+                    storage,
+                    txid,
+                    Some(slot),
+                    &definition,
+                    Some(alias),
+                    &values[..definition.n_columns],
+                    Some(condition),
+                    arena,
+                    params,
+                    routine.hooks,
+                    None,
+                    Some(routine.lookup),
+                ),
+                None => row_matches_values(
+                    storage,
+                    txid,
+                    Some(slot),
+                    &definition,
+                    Some(alias),
+                    &values[..definition.n_columns],
+                    Some(condition),
+                    arena,
+                    params,
+                    &hooks,
+                    None,
+                    None,
+                ),
+            }
         })();
         // SAFETY: the count retains nothing of the row.
         unsafe { arena.rewind_to(mark) };
@@ -106822,6 +106852,42 @@ pub(crate) fn relation_rows_kept<'a>(
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
     Ok((!failed).then_some(kept))
+}
+
+/// `expression` evaluated over one row of the table in `slot`, read as
+/// `alias`, with the routine variables `outer` answers for.
+#[allow(clippy::too_many_arguments)]
+fn eval_row_expression<'a, Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr<'a>,
+    storage: &Storage,
+    slot: usize,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    values: &[Datum<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<Datum<'a>, SqlError> {
+    let context = RowCtx {
+        table_oid: Some(crate::sql::catalog::user_table_oid(storage, slot) as u32),
+        def: crate::storage::RelationDefinition::from_definition(def),
+        values: &values[..def.n_columns],
+        alias,
+    };
+    match outer {
+        Some(outer) => super::eval::eval_full(
+            expression,
+            arena,
+            params,
+            &TriggerDmlScope {
+                row: &context,
+                outer,
+            },
+            hooks,
+        ),
+        None => super::eval::eval_full(expression, arena, params, &context, hooks),
+    }
 }
 
 /// The plan of an `UPDATE ... FROM` or `DELETE ... USING` whose join
@@ -106842,6 +106908,7 @@ fn planned_joined_write<'a, Definition0: crate::storage::DefinitionBacking>(
     capture: DmlCapture,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(super::query::JoinedWriteJoin<'a>, &'a [usize])>, SqlError> {
@@ -106870,6 +106937,7 @@ fn planned_joined_write<'a, Definition0: crate::storage::DefinitionBacking>(
         where_clause,
         leaves,
         params,
+        outer.map(|lookup| RoutineScope { lookup, hooks }),
         txid,
         arena,
     )?
@@ -106936,6 +107004,12 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
     let target_scan = arena
         .alloc_slice_with(leaves.len(), |_| MergeScanCounts::default())
         .map_err(|_| arena_full())?;
+    // Each kept row's hash key values, `key_count` per row.
+    let keys = plan.keys();
+    let key_count = keys.len();
+    let target_keys = arena
+        .alloc_slice_with(capacity * key_count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let mut targets = 0usize;
     for (member, &leaf) in leaves.iter().enumerate() {
         let physical = (*storage.table_def(leaf, txid)).clone();
@@ -106984,6 +107058,14 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             if slot >= capacity {
                 return Err(arena_full());
             }
+            for (at, key) in keys.iter().enumerate() {
+                target_keys[slot * key_count + at] = match key.target_column {
+                    Some(column) => logical.get(column).copied().unwrap_or(Datum::Null),
+                    None => eval_row_expression(
+                        key.target, storage, leaf, def, alias, logical, arena, params, hooks, outer,
+                    )?,
+                };
+            }
             target_rows[slot] = Some(PhysicalRow::local(leaf, rowid, snapshot));
             target_values[slot] = logical;
             target_bytes[slot] = if capture_bytes { bytes } else { &[] };
@@ -107004,6 +107086,9 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
         .map_err(|_| arena_full())?;
     let source_rows = arena
         .alloc_slice_with(source_capacity, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let source_keys = arena
+        .alloc_slice_with(source_capacity * key_count, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut source_scan = MergeScanCounts::default();
     let mut sources = 0usize;
@@ -107051,6 +107136,23 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
         if sources >= source_capacity {
             return Err(arena_full());
         }
+        for (at, key) in keys.iter().enumerate() {
+            source_keys[sources * key_count + at] = match key.source_column {
+                Some(column) => values[column],
+                None => eval_row_expression(
+                    key.source,
+                    storage,
+                    source_slot,
+                    &source_def,
+                    Some(plan.source_name),
+                    &values[..source_def.n_columns],
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )?,
+            };
+        }
         source_ids[sources] = rowid;
         source_rows[sources] = encoded;
         sources += 1;
@@ -107059,15 +107161,13 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
     let source_ids = &source_ids[..sources];
     let source_rows = &source_rows[..sources];
     // Each relation's key values, as the hash join reads them.
-    let keys = plan.keys();
+    let target_keys = &*target_keys;
+    let source_keys = &*source_keys;
     let read = |is_target: bool, row: usize, key: usize| -> Datum<'a> {
         if is_target {
-            target_values[row]
-                .get(keys[key].0)
-                .copied()
-                .unwrap_or(Datum::Null)
+            target_keys[row * key_count + key]
         } else {
-            decode_projected_pub(source_rows[row], keys[key].1)
+            source_keys[row * key_count + key]
         }
     };
     // Candidate FROM rows per target row: a hash table on the FROM rows'
@@ -107078,7 +107178,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             txid,
             targets,
             sources,
-            keys.len(),
+            key_count,
             plan.collations(),
             &|outer, row, key| read(outer, row, key),
             arena,
@@ -107093,7 +107193,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             txid,
             sources,
             targets,
-            keys.len(),
+            key_count,
             plan.collations(),
             &|outer, row, key| read(!outer, row, key),
             arena,

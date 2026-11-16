@@ -26,6 +26,17 @@ pub(crate) const MAX_CONJUNCTS: usize = 128;
 /// The set of table indices (as a bitmask) an expression references. `None` if
 /// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
 pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> {
+    expr_tables_with(expression, scope, &|_| false)
+}
+
+/// [`expr_tables`] where a column the scope does not resolve, or a
+/// routine parameter, that `constant` answers for (a routine variable or
+/// parameter, fixed for the statement) reads no table.
+pub(super) fn expr_tables_with(
+    expression: &Expr,
+    scope: &QueryScope,
+    constant: &dyn Fn(&Expr) -> bool,
+) -> Option<u64> {
     if scope.n > MAX_OPTIMIZED_JOIN_TABLES {
         return None;
     }
@@ -40,49 +51,63 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
         | BitLit(_)
         | Param(_)
         | BoundLiteral { .. } => Some(0),
-        Column { qualifier, name } => match scope.find_column(*qualifier, name).ok()? {
-            ResolvedColumn::Table(t, _) | ResolvedColumn::TableOid(t) => Some(1 << t),
-            // Merged USING/NATURAL column: reads every contributing table.
-            ResolvedColumn::Merged(m) => {
-                let mc = &scope.merged[m];
-                Some(mc.parts.iter().fold(0u64, |mask, &(t, _)| mask | (1 << t)))
-            }
+        RoutineParam { .. } if constant(expression) => Some(0),
+        Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+            Err(_) if constant(expression) => Some(0),
+            Err(_) => None,
+            Ok(resolved) => match resolved {
+                ResolvedColumn::Table(t, _) | ResolvedColumn::TableOid(t) => Some(1 << t),
+                // Merged USING/NATURAL column: reads every contributing table.
+                ResolvedColumn::Merged(m) => {
+                    let mc = &scope.merged[m];
+                    Some(mc.parts.iter().fold(0u64, |mask, &(t, _)| mask | (1 << t)))
+                }
+            },
         },
         Unary { operand, .. }
         | IsNull { operand, .. }
         | Cast { operand, .. }
-        | Collate { operand, .. } => expr_tables(operand, scope),
-        Binary { left, right, .. } => Some(expr_tables(left, scope)? | expr_tables(right, scope)?),
+        | Collate { operand, .. } => expr_tables_with(operand, scope, constant),
+        Binary { left, right, .. } => Some(
+            expr_tables_with(left, scope, constant)? | expr_tables_with(right, scope, constant)?,
+        ),
         Like {
             operand, pattern, ..
         }
         | Match {
             operand, pattern, ..
-        } => Some(expr_tables(operand, scope)? | expr_tables(pattern, scope)?),
+        } => Some(
+            expr_tables_with(operand, scope, constant)?
+                | expr_tables_with(pattern, scope, constant)?,
+        ),
         InList { operand, list, .. } => {
-            let mut m = expr_tables(operand, scope)?;
+            let mut m = expr_tables_with(operand, scope, constant)?;
             for e in *list {
-                m |= expr_tables(e, scope)?;
+                m |= expr_tables_with(e, scope, constant)?;
             }
             Some(m)
         }
         Array(elements) => {
             let mut mask = 0;
             for element in *elements {
-                mask |= expr_tables(element, scope)?;
+                mask |= expr_tables_with(element, scope, constant)?;
             }
             Some(mask)
         }
-        Subscript { base, index } => Some(expr_tables(base, scope)? | expr_tables(index, scope)?),
-        Slice { base, lower, upper } => Some(
-            expr_tables(base, scope)?
-                | lower.map_or(Some(0), |bound| expr_tables(bound, scope))?
-                | upper.map_or(Some(0), |bound| expr_tables(bound, scope))?,
+        Subscript { base, index } => Some(
+            expr_tables_with(base, scope, constant)? | expr_tables_with(index, scope, constant)?,
         ),
-        Field { base, .. } | RecordFieldIndex { base, .. } => expr_tables(base, scope),
-        AnyAll { operand, array, .. } => {
-            Some(expr_tables(operand, scope)? | expr_tables(array, scope)?)
+        Slice { base, lower, upper } => Some(
+            expr_tables_with(base, scope, constant)?
+                | lower.map_or(Some(0), |bound| expr_tables_with(bound, scope, constant))?
+                | upper.map_or(Some(0), |bound| expr_tables_with(bound, scope, constant))?,
+        ),
+        Field { base, .. } | RecordFieldIndex { base, .. } => {
+            expr_tables_with(base, scope, constant)
         }
+        AnyAll { operand, array, .. } => Some(
+            expr_tables_with(operand, scope, constant)? | expr_tables_with(array, scope, constant)?,
+        ),
         // A possible aggregate conservatively disables this optimization;
         // typed query analysis alone decides whether a call groups rows.
         Call {
@@ -90,7 +115,7 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
         } if !expression.is_aggregate() => {
             let mut m = 0;
             for a in *args {
-                m |= expr_tables(a, scope)?;
+                m |= expr_tables_with(a, scope, constant)?;
             }
             Some(m)
         }

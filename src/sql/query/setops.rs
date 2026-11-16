@@ -421,10 +421,8 @@ fn reject_missing_ordering(type_oid: i32) -> Result<(), SqlError> {
         return Ok(());
     };
     if !ctype.has_builtin_ordering() {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "could not identify an ordering operator for type {}",
-            ctype.name()
+        return Err(crate::sql::error_position::missing_ordering_operator(
+            &ctype.name(),
         ));
     }
     Ok(())

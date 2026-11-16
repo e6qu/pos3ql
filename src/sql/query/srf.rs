@@ -1145,10 +1145,15 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "{} is not a function",
-                    name
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::IsProcedure,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
                 ));
             }
             _ => {
@@ -1679,10 +1684,15 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "{} is not a function",
-                    name
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::IsProcedure,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
                 ));
             }
             crate::storage::RoutineCallSelection::Stored(_) => {
@@ -3424,18 +3434,16 @@ fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
                 )?,
             )),
             crate::storage::RoutineCallSelection::Builtin { .. } => None,
-            crate::storage::RoutineCallSelection::Ambiguous => {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "function {}(...) is not unique",
-                    tref.table
-                ));
-            }
-            crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "{} is not a function",
-                    tref.table
+            failure @ (crate::storage::RoutineCallSelection::Ambiguous
+            | crate::storage::RoutineCallSelection::WrongKind { .. }) => {
+                return Err(table_function_selection_error(
+                    tref,
+                    &input_oids,
+                    failure,
+                    storage,
+                    txid,
+                    arena,
+                    columns,
                 ));
             }
             crate::storage::RoutineCallSelection::Absent => {
@@ -4364,6 +4372,60 @@ pub(super) fn is_json_each_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("jsonb_each_text")
 }
 
+/// `ParseFuncOrColumn`'s error for a FROM function whose name selects no
+/// function, several, or a procedure, positioned at the name.
+fn table_function_selection_error<'a>(
+    tref: &TableRef<'_>,
+    input_oids: &[i32],
+    failure: crate::storage::RoutineCallSelection,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    columns: &dyn ColumnLookup<'a>,
+) -> SqlError {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let mut qualified = StackStr::<128>::new();
+    let name = match tref.schema {
+        Some(schema) => {
+            if core::fmt::Write::write_fmt(&mut qualified, format_args!("{schema}.{}", tref.table))
+                .is_err()
+            {
+                return arena_full();
+            }
+            qualified.as_str()
+        }
+        None => tref.table,
+    };
+    let error = crate::sql::exec::function_lookup_error(
+        name,
+        &input_oids[..table_function_input_count(tref)],
+        tref.func_argument_names,
+        match failure {
+            crate::storage::RoutineCallSelection::Absent => {
+                crate::sql::exec::FunctionLookupFailure::Missing
+            }
+            crate::storage::RoutineCallSelection::Ambiguous => {
+                crate::sql::exec::FunctionLookupFailure::Ambiguous
+            }
+            _ => crate::sql::exec::FunctionLookupFailure::IsProcedure,
+        },
+        &crate::sql::eval::RuntimeColumnTypes {
+            row: columns,
+            catalog: Some(&catalog),
+        },
+    );
+    let error = match failure {
+        crate::storage::RoutineCallSelection::Absent => {
+            crate::sql::error_position::missing_function(error)
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            crate::sql::error_position::ambiguous_function(error)
+        }
+        _ => error,
+    };
+    crate::sql::error_position::at_source_position(error, tref.func_source_position)
+}
+
 fn table_function_input_count(tref: &TableRef<'_>) -> usize {
     let args = tref.func_args.expect("table function carries arguments");
     if matches!(
@@ -4443,25 +4505,18 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
             crate::storage::RoutineCallKind::Function,
         )
     };
-    let failure = match selection {
-        crate::storage::RoutineCallSelection::Absent => {
-            Some(crate::sql::exec::FunctionLookupFailure::Missing)
-        }
-        crate::storage::RoutineCallSelection::Ambiguous => {
-            Some(crate::sql::exec::FunctionLookupFailure::Ambiguous)
-        }
-        _ => None,
-    };
-    if let Some(failure) = failure {
-        return Err(crate::sql::exec::function_lookup_error(
-            name,
-            &argument_type_oids[..args.len()],
-            tref.func_argument_names,
-            failure,
-            &crate::sql::eval::RuntimeColumnTypes {
-                row: columns,
-                catalog: Some(&catalog),
-            },
+    if let crate::storage::RoutineCallSelection::Absent
+    | crate::storage::RoutineCallSelection::Ambiguous
+    | crate::storage::RoutineCallSelection::WrongKind { .. } = selection
+    {
+        return Err(table_function_selection_error(
+            tref,
+            &argument_type_oids,
+            selection,
+            storage,
+            txid,
+            arena,
+            columns,
         ));
     }
     Ok((selection, argument_type_oids))
@@ -4868,18 +4923,16 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     None,
                 ),
                 crate::storage::RoutineCallSelection::Builtin { oid, .. } => (None, Some(oid)),
-                crate::storage::RoutineCallSelection::Ambiguous => {
-                    return Err(sql_err!(
-                        sqlstate::AMBIGUOUS_FUNCTION,
-                        "function {}(...) is not unique",
-                        tref.table
-                    ));
-                }
-                crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                    return Err(sql_err!(
-                        sqlstate::WRONG_OBJECT_TYPE,
-                        "{} is not a function",
-                        tref.table
+                failure @ (crate::storage::RoutineCallSelection::Ambiguous
+                | crate::storage::RoutineCallSelection::WrongKind { .. }) => {
+                    return Err(table_function_selection_error(
+                        tref,
+                        &input_oids,
+                        failure,
+                        storage,
+                        txid,
+                        arena,
+                        columns,
                     ));
                 }
                 crate::storage::RoutineCallSelection::Absent => {

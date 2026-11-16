@@ -910,6 +910,9 @@ pub(crate) fn parse_cursor_command<'a>(
     validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
 ) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser
+        .record_source_copies()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.named_parameters = parameters;
     parser.set_type_inputs(inputs);
     let mut statement = None;
@@ -925,12 +928,17 @@ pub(crate) fn parse_cursor_command<'a>(
         }
     }
     if multiple || statement.is_none() {
-        return Err(crate::sql_err!(
-            sqlstate::INVALID_CURSOR_DEFINITION,
-            "cannot open multi-query plan as cursor"
+        // `SPI_cursor_open` checks the plan before it names the query.
+        return Err(crate::sql::error_context::raised_after_query(
+            crate::sql_err!(
+                sqlstate::INVALID_CURSOR_DEFINITION,
+                "cannot open multi-query plan as cursor"
+            ),
         ));
     }
     validate(&parser)?;
+    // A routine's cursor query positions its analysis errors in its text.
+    super::error_position::set_copied_internal_copies(sql, parser.source_copies(), arena)?;
     arena
         .alloc(statement.unwrap())
         .map(|statement| &*statement)
@@ -945,6 +953,44 @@ pub(crate) fn parse_cursor_command<'a>(
 /// Parses exactly one stored statement. Rewrite rules retain action text in
 /// the durable catalog and cross this boundary again only after recovery has
 /// validated the text and its captured dependencies.
+/// [`parse_stored_statement`] keeping the parser's record of the tokens it
+/// copied from `sql`, so the statement's analysis errors can point into it.
+pub(crate) fn parse_positioned_statement<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a Stmt<'a>, &'a [super::error_position::SourceCopy]), super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser
+        .record_source_copies()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    let statement = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .ok_or_else(|| {
+            crate::sql_err!(
+                super::eval::sqlstate::SYNTAX_ERROR,
+                "stored statement is empty"
+            )
+        })?;
+    if parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .is_some()
+    {
+        return Err(crate::sql_err!(
+            super::eval::sqlstate::SYNTAX_ERROR,
+            "stored action contains more than one statement"
+        ));
+    }
+    let statement = arena.alloc(statement).map_err(|_| {
+        crate::sql_err!(
+            super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "stored statement exceeds its SQL arena"
+        )
+    })?;
+    Ok((&*statement, parser.source_copies()))
+}
+
 pub(crate) fn parse_stored_statement<'a>(
     sql: &'a str,
     arena: &'a Arena,
@@ -1035,20 +1081,35 @@ pub(crate) fn parse_type_name<'a>(
     sql: &'a str,
     arena: &'a Arena,
 ) -> Result<(&'a str, i32), super::eval::SqlError> {
-    let to_sql = |m: &str| {
-        super::eval::SqlError::formatted(
-            super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
-            format_args!("invalid type name: {}", m),
-        )
-    };
-    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    let mut parser = Parser::new(sql, arena).map_err(|error| type_string_error(sql, &error))?;
     let parsed = parser
         .type_name_mod()
-        .map_err(|e| to_sql(e.message.as_str()))?;
+        .map_err(|error| type_string_error(sql, &error))?;
     if parser.peeked != Tok::Eof {
-        return Err(to_sql("trailing tokens after type name"));
+        let token = sql
+            .get(parser.peek_at..parser.lexer.token_end())
+            .unwrap_or_default();
+        return Err(super::error_context::with_line(
+            crate::sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "syntax error at or near \"{}\"",
+                token
+            ),
+            format_args!("invalid type name \"{}\"", sql),
+        ));
     }
     Ok(parsed)
+}
+
+/// A grammar error in `spelled`, a type name given as a string, with
+/// `parseTypeString`'s context line. Its cursor points into the string, not
+/// the statement, so it is dropped.
+fn type_string_error(spelled: &str, error: &ParseError) -> super::eval::SqlError {
+    let reported = super::error_position::full_message_error(error.sqlstate, |message| {
+        let _ = core::fmt::Write::write_str(message, error.message.as_str());
+        Ok(())
+    });
+    super::error_context::with_line(reported, format_args!("invalid type name \"{}\"", spelled))
 }
 
 /// [`parse_type_name`] for a PL/pgSQL declaration's type: text after a

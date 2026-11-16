@@ -22,16 +22,17 @@ fn drop_role_details_owners_and_privileges() {
     let output = run_with(&mut engine, &mut budget, "DROP ROLE holder");
     let text = String::from_utf8_lossy(&output);
     assert_eq!(error_sqlstates(&output), ["2BP01"], "{text}");
+    // PostgreSQL sorts the objects by OID: built-ins first, then creation
+    // order.
     assert!(
-        text.contains("owner of schema hs\nowner of table t")
-            && text.contains("owner of function lower(text)"),
+        text.contains("owner of function lower(text)\nowner of schema hs\nowner of table t"),
         "{text}"
     );
     let output = run_with(&mut engine, &mut budget, "DROP ROLE reader");
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains(
-            "privileges for table t\nprivileges for function upper(text)\n\
+            "privileges for function upper(text)\nprivileges for table t\n\
              privileges for column b of table t"
         ),
         "{text}"

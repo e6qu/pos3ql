@@ -10620,9 +10620,12 @@ pub(crate) fn array_constructor_type<'a>(
                 multidimensional: false,
             })
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INDETERMINATE_DATATYPE,
-                    "cannot determine type of empty array"
+                crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::INDETERMINATE_DATATYPE,
+                        "cannot determine type of empty array"
+                    ),
+                    "Explicitly cast to the desired type, for example ARRAY[]::integer[].",
                 )
             });
     }
@@ -14981,6 +14984,22 @@ struct WrittenTypeDisplay {
 /// the same spelling (`pg_catalog.foo`, `public.foo[]`), which names a
 /// missing type.
 fn written_type_name(
+    spelled: &str,
+) -> Result<(crate::util::StackStr<192>, WrittenTypeDisplay), SqlError> {
+    // `parseTypeString` names the string in a grammar error's context.
+    scan_written_type_name(spelled).map_err(|error| {
+        if error.sqlstate == sqlstate::SYNTAX_ERROR {
+            crate::sql::error_context::with_line(
+                error,
+                format_args!("invalid type name \"{}\"", spelled),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn scan_written_type_name(
     spelled: &str,
 ) -> Result<(crate::util::StackStr<192>, WrittenTypeDisplay), SqlError> {
     use core::fmt::Write as _;

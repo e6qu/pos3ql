@@ -3823,84 +3823,43 @@ impl<'d> QueryScope<'d> {
         if found.is_none() && self.hidden_members.contains(&name) {
             return Err(unreachable_entry(name));
         }
-        found.ok_or_else(|| match name.split_once('.') {
-            // A composed qualifier whose table name matches some entry is an
-            // *invalid* reference (wrong schema or an alias); one matching
-            // nothing is *missing* — PostgreSQL's two wordings.
-            Some((schema, table))
-                if self.names[..self.n].contains(&table)
-                    || (0..self.n).any(|index| {
-                        self.defs.get(index).is_some_and(|definition| {
-                            definition.schema.as_str() == schema
-                                && definition.name.as_str() == table
-                        })
-                    }) =>
-            {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    table
-                )
-            }
-            Some((_, table)) => sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                table
-            ),
-            // The name of an aliased table is hidden by its alias.
-            None if let Some(alias) = (0..self.n)
-                .find(|&index| {
-                    self.derived[index].is_none()
-                        && self.names[index] != name
-                        && self
-                            .defs
-                            .get(index)
-                            .is_some_and(|definition| definition.name.as_str() == name)
-                })
-                .map(|index| self.names[index]) =>
-            {
-                crate::sql::error_position::with_computed_hint(
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "invalid reference to FROM-clause entry for table \"{}\"",
-                        name
-                    ),
-                    format_args!(
-                        "Perhaps you meant to reference the table alias \"{}\".",
-                        alias
-                    ),
-                )
-            }
-            // A table named by its relation name while an alias hides it.
-            None => match (0..self.n).find(|&index| {
-                self.derived[index].is_none()
-                    && self.names[index] != name
-                    && self
-                        .defs
-                        .get(index)
-                        .is_some_and(|definition| definition.name.as_str() == name)
-            }) {
-                Some(aliased) => {
-                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
-                        None,
-                        Some(crate::sql::eval::DiagnosticText::format(format_args!(
+        // PostgreSQL's `errorMissingRTE`: the first entry that is the named
+        // relation or carries its name explains the miss. An alias hiding
+        // the relation's name earns a hint, any other such entry is out of
+        // this part of the query's reach.
+        found.ok_or_else(|| {
+            let (schema, table) = match name.split_once('.') {
+                Some((schema, table)) => (Some(schema), table),
+                None => (None, name),
+            };
+            let entry = (0..self.n).find(|&index| {
+                self.names[index] == table
+                    || self.defs.get(index).is_some_and(|definition| {
+                        definition.name.as_str() == table
+                            && schema.is_none_or(|schema| definition.schema.as_str() == schema)
+                    })
+            });
+            match entry {
+                Some(index) if self.names[index] != table => {
+                    crate::sql::error_position::with_computed_hint(
+                        sql_err!(
+                            sqlstate::UNDEFINED_TABLE,
+                            "invalid reference to FROM-clause entry for table \"{}\"",
+                            table
+                        ),
+                        format_args!(
                             "Perhaps you meant to reference the table alias \"{}\".",
-                            self.names[aliased]
-                        ))),
-                        crate::sql::eval::ErrorObjects::default(),
-                    ));
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "invalid reference to FROM-clause entry for table \"{}\"",
-                        name
+                            self.names[index]
+                        ),
                     )
                 }
+                Some(_) => unreachable_entry(table),
                 None => sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "missing FROM-clause entry for table \"{}\"",
-                    name
+                    table
                 ),
-            },
+            }
         })
     }
 

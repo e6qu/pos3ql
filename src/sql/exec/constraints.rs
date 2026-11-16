@@ -3546,35 +3546,41 @@ fn check_fk_child_one_at(
         return Err(missing_parent_key(storage, txid, def, fk, values));
     };
     let parent_definition = storage.table_def(parent_index, txid).clone();
-    let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
-    for (position, (&child_column, &parent_column)) in
-        fk.columns().iter().zip(fk.parent_cols()).enumerate()
-    {
-        let referencing = def.columns()[usize::from(child_column)].ctype;
-        let referenced = parent_definition.columns()[usize::from(parent_column)].ctype;
-        let equality = super::foreign_key_equality::stored_key_equality(referencing, referenced)?;
-        key[position] = super::foreign_key_equality::comparison_value(
-            equality,
-            values[usize::from(child_column)],
+    // The check query converts the referencing values to the parent's key
+    // types, then looks the key up.
+    let lookup = || {
+        let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+        let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+        for (position, (&child_column, &parent_column)) in
+            fk.columns().iter().zip(fk.parent_cols()).enumerate()
+        {
+            let referencing = def.columns()[usize::from(child_column)].ctype;
+            let referenced = parent_definition.columns()[usize::from(parent_column)].ctype;
+            let equality =
+                super::foreign_key_equality::stored_key_equality(referencing, referenced)?;
+            key[position] = super::foreign_key_equality::comparison_value(
+                equality,
+                values[usize::from(child_column)],
+                arena,
+            )?;
+            key_types[position] = match equality {
+                super::foreign_key_equality::KeyEquality::Direct => referencing,
+                super::foreign_key_equality::KeyEquality::Cast(target) => target,
+            };
+        }
+        let n_key = fk.parent_cols().len();
+        parent_has_key(
+            storage,
+            parent_index,
+            fk.parent_cols(),
+            &key[..n_key],
+            &key_types[..n_key],
+            txid,
+            read,
             arena,
-        )?;
-        key_types[position] = match equality {
-            super::foreign_key_equality::KeyEquality::Direct => referencing,
-            super::foreign_key_equality::KeyEquality::Cast(target) => target,
-        };
-    }
-    let n_key = fk.parent_cols().len();
-    match parent_has_key(
-        storage,
-        parent_index,
-        fk.parent_cols(),
-        &key[..n_key],
-        &key_types[..n_key],
-        txid,
-        read,
-        arena,
-    ) {
+        )
+    };
+    match lookup() {
         Ok(true) => Ok(()),
         Ok(false) => Err(missing_parent_key(storage, txid, def, fk, values)),
         Err(error) if error.sqlstate.internal_control().is_some() => Err(error),

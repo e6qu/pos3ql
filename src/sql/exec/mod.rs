@@ -22127,15 +22127,24 @@ struct BoundCursorArgument<'a> {
     value: &'a Expr<'a>,
 }
 
+/// A local declaration visible to the statements being parsed, with the
+/// label of the block declaring it.
+#[derive(Clone, Copy)]
+struct VisibleLocal<'a> {
+    label: Option<SqlName>,
+    local: ParsedTriggerLocalDecl<'a>,
+}
+
 thread_local! {
-    /// The bound cursors of the program being parsed, for its `OPEN`s.
+    /// The locals of the blocks around the statements being parsed,
+    /// innermost first, for their `OPEN`s and cursor loops.
     static BOUND_CURSORS: core::cell::Cell<(*const (), usize)> =
         const { core::cell::Cell::new((core::ptr::null(), 0)) };
 }
 
 /// Runs `parse` with `locals` visible to [`bound_plpgsql_cursor`].
 fn with_bound_plpgsql_cursors<'a, T>(
-    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    locals: &'a [VisibleLocal<'a>],
     parse: impl FnOnce() -> T,
 ) -> T {
     struct Restore((*const (), usize));
@@ -22149,25 +22158,65 @@ fn with_bound_plpgsql_cursors<'a, T>(
     parse()
 }
 
-/// The bound cursor declared as `name` in the program being parsed.
-fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlpgsqlCursor<'a>> {
-    plpgsql_cursor_variable(name).flatten()
-}
-
-/// The `refcursor` local declared as `name` in the program being parsed:
-/// `Some(Some(_))` when it is bound to a query, `Some(None)` when unbound.
-fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+/// The locals of the blocks around the statements being parsed.
+fn visible_plpgsql_locals<'a>() -> &'a [VisibleLocal<'a>] {
     let (pointer, len) = BOUND_CURSORS.with(core::cell::Cell::get);
     if pointer.is_null() {
-        return None;
+        return &[];
     }
     // SAFETY: `with_bound_plpgsql_cursors` publishes these declarations only
     // while the program that owns them is parsed from the same arena, and
     // restores the previous value before that borrow ends. Statements parsed
     // in that window borrow the arena for the declarations' lifetime.
-    let locals =
-        unsafe { core::slice::from_raw_parts(pointer.cast::<ParsedTriggerLocalDecl<'a>>(), len) };
-    let local = locals.iter().find(|local| local.name == name)?;
+    unsafe { core::slice::from_raw_parts(pointer.cast::<VisibleLocal<'a>>(), len) }
+}
+
+/// Runs `parse` with the locals `declarations` of a block labelled `label`
+/// visible ahead of the enclosing blocks' locals.
+fn with_block_plpgsql_cursors<'a, T>(
+    label: Option<SqlName>,
+    declarations: &'a [ParsedTriggerLocalDecl<'a>],
+    arena: &'a Arena,
+    parse: impl FnOnce() -> T,
+) -> Result<T, SqlError> {
+    let enclosing = visible_plpgsql_locals();
+    let visible = arena
+        .alloc_slice_with(
+            declarations.len() + enclosing.len(),
+            |index| match declarations.get(index) {
+                Some(&local) => VisibleLocal { label, local },
+                None => enclosing[index - declarations.len()],
+            },
+        )
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(with_bound_plpgsql_cursors(visible, parse))
+}
+
+/// The bound cursor declared as `name`, in the block labelled `label` when
+/// one is given, in the program being parsed.
+fn bound_plpgsql_cursor<'a>(
+    label: Option<SqlName>,
+    name: SqlName,
+    _arena: &'a Arena,
+) -> Option<BoundPlpgsqlCursor<'a>> {
+    plpgsql_cursor_variable_in(label, name).flatten()
+}
+
+/// The `refcursor` local declared as `name` in the program being parsed:
+/// `Some(Some(_))` when it is bound to a query, `Some(None)` when unbound.
+fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+    plpgsql_cursor_variable_in(None, name)
+}
+
+/// [`plpgsql_cursor_variable`] of the block labelled `label`, when given.
+fn plpgsql_cursor_variable_in<'a>(
+    label: Option<SqlName>,
+    name: SqlName,
+) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+    let visible = visible_plpgsql_locals().iter().find(|visible| {
+        visible.local.name == name && label.is_none_or(|label| visible.label == Some(label))
+    })?;
+    let local = visible.local;
     match (local.bound, local.ty) {
         (Some(bound), _) => Some(Some(bound)),
         (None, ParsedPlpgsqlLocalType::Named { name, .. })
@@ -25779,8 +25828,25 @@ fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
-    let assignment = trigger_assignment_operator(statement, arena)?;
-    let default = trigger_top_level_keyword(statement, "default", arena)?.map(|offset| (offset, 7));
+    // A cursor declaration's query is not an initializer, even when it
+    // holds `=` or `DEFAULT`.
+    let (_, name_end) = parse_plpgsql_identifier_prefix(statement.trim(), arena)?;
+    let after_name = statement.trim()[name_end..].trim_start();
+    let cursor_keywords = strip_trigger_keyword(after_name, "no")
+        .and_then(|rest| strip_trigger_keyword(rest.trim_start(), "scroll"))
+        .or_else(|| strip_trigger_keyword(after_name, "scroll"))
+        .map_or(after_name, str::trim_start);
+    let cursor = strip_trigger_keyword(cursor_keywords, "cursor").is_some();
+    let assignment = if cursor {
+        None
+    } else {
+        trigger_assignment_operator(statement, arena)?
+    };
+    let default = if cursor {
+        None
+    } else {
+        trigger_top_level_keyword(statement, "default", arena)?.map(|offset| (offset, 7))
+    };
     let initial = match (assignment, default) {
         (Some(assignment), Some(default)) => Some(if assignment.0 < default.0 {
             assignment
@@ -27723,13 +27789,36 @@ fn parse_plpgsql_cursor_open<'a>(
     let written = body[..split].trim_end();
     let variable = parse_plpgsql_variable_name(written, arena)?;
     let body = body[split..].trim();
-    // A label-qualified name never names a bound cursor declaration.
-    if variable.label.is_none()
-        && let Some(bound) = bound_plpgsql_cursor(variable.name, arena)
-    {
+    if let Some(bound) = bound_plpgsql_cursor(variable.label, variable.name, arena) {
         return parse_bound_cursor_open(variable, written, bound, body, arena).map(Some);
     }
     let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
+        // `OPEN` names a cursor variable (`cursor_variable`).
+        if plpgsql_cursor_variable_in(variable.label, variable.name).is_none()
+            && let Some(visible) = visible_plpgsql_locals().iter().find(|visible| {
+                visible.local.name == variable.name
+                    && variable
+                        .label
+                        .is_none_or(|label| visible.label == Some(label))
+            })
+        {
+            let error = if matches!(
+                visible.local.ty,
+                ParsedPlpgsqlLocalType::Record | ParsedPlpgsqlLocalType::Row { .. }
+            ) {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cursor variable must be a simple variable"
+                )
+            } else {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "variable \"{}\" must be of type cursor or refcursor",
+                    variable.name.as_str()
+                )
+            };
+            return Err(crate::sql::error_position::at_subject(error, written));
+        }
         return Err(unsupported_trigger_body());
     };
     let options = body[..for_at].trim();
@@ -28717,26 +28806,34 @@ fn parse_trigger_block<'a>(
             } else {
                 &[]
             };
-            let (protected, ending) = parse_trigger_block(
-                segments,
-                at,
-                arena,
-                targets,
-                inner,
-                handler_active,
-                program_kind,
-            )?;
-            let (statement, end_label) = match ending {
-                TriggerBlockEnd::Exception => {
-                    let (exception, end_label) = parse_trigger_exception_handlers(
+            // The block's cursors are visible to its statements and
+            // handlers, ahead of the enclosing blocks' of the same name.
+            let (protected, ending) =
+                with_block_plpgsql_cursors(loop_label, declarations, arena, || {
+                    parse_trigger_block(
                         segments,
                         at,
                         arena,
                         targets,
                         inner,
+                        handler_active,
                         program_kind,
-                        protected,
-                    )?;
+                    )
+                })??;
+            let (statement, end_label) = match ending {
+                TriggerBlockEnd::Exception => {
+                    let (exception, end_label) =
+                        with_block_plpgsql_cursors(loop_label, declarations, arena, || {
+                            parse_trigger_exception_handlers(
+                                segments,
+                                at,
+                                arena,
+                                targets,
+                                inner,
+                                program_kind,
+                                protected,
+                            )
+                        })??;
                     (TriggerStatement::Exception(exception), end_label)
                 }
                 TriggerBlockEnd::End(end_label) => (
@@ -29072,7 +29169,7 @@ fn parse_plpgsql_program_inner<'a>(
             is_loop: false,
         })
         .map_err(|_| super::query::arena_full_pub())?;
-    with_bound_plpgsql_cursors(locals, || {
+    with_block_plpgsql_cursors(label, locals, arena, || {
         parse_plpgsql_program_body(
             PlpgsqlProgramFrame {
                 label,
@@ -29086,7 +29183,7 @@ fn parse_plpgsql_program_inner<'a>(
             targets,
             program_kind,
         )
-    })
+    })?
 }
 
 /// The label, declarations and options that surround a PL/pgSQL program's
@@ -29776,6 +29873,8 @@ fn validate_plpgsql_variable_uses(
         label: Option<SqlName>,
         name: SqlName,
         constant: bool,
+        /// A nested block's `refcursor` or bound cursor variable.
+        cursor: bool,
         parent: Option<&'a ScopedLocal<'a>>,
     }
     fn binding_constant(
@@ -29987,11 +30086,21 @@ fn validate_plpgsql_variable_uses(
                             ),
                         },
                         Some(_) => {
+                            // The innermost nested local of the name: a
+                            // block's cursor, or another variable such as a
+                            // loop's.
                             let mut scoped = shadowed;
                             let mut loop_variable = false;
                             while let Some(local) = scoped {
-                                loop_variable |= local.name == name
-                                    && target.label.is_none_or(|label| local.label == Some(label));
+                                if local.name == name
+                                    && target.label.is_none_or(|label| local.label == Some(label))
+                                {
+                                    if local.cursor {
+                                        return Ok(());
+                                    }
+                                    loop_variable = true;
+                                    break;
+                                }
                                 scoped = local.parent;
                             }
                             match locals.iter().rfind(|local| target.names(local)) {
@@ -30130,6 +30239,7 @@ fn validate_plpgsql_variable_uses(
                             label: statement.label,
                             name: statement.target.name,
                             constant: false,
+                            cursor: false,
                             parent: shadowed,
                         };
                         validate_block(
@@ -30153,6 +30263,7 @@ fn validate_plpgsql_variable_uses(
                             label: statement.label,
                             name: statement.target.name,
                             constant: false,
+                            cursor: false,
                             parent: shadowed,
                         };
                         validate_block(
@@ -30296,12 +30407,14 @@ fn validate_plpgsql_variable_uses(
                         label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
                         constant: true,
+                        cursor: false,
                         parent: shadowed,
                     };
                     let message = ScopedLocal {
                         label: None,
                         name: SqlName::parse("sqlerrm").expect("static diagnostic name"),
                         constant: true,
+                        cursor: false,
                         parent: Some(&state),
                     };
                     for handler in statement.handlers {
@@ -30359,6 +30472,9 @@ fn validate_plpgsql_variable_uses(
                     label,
                     name: first.name,
                     constant,
+                    cursor: first.bound.is_some()
+                        || matches!(first.ty, ParsedPlpgsqlLocalType::Named { name, .. }
+                            if name.eq_ignore_ascii_case("refcursor")),
                     parent: shadowed,
                 };
                 validate_scope(

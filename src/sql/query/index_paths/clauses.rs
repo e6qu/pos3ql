@@ -156,13 +156,13 @@ pub(super) fn column_bit(column: usize) -> u64 {
     1u64 << column.min(63)
 }
 
-/// The value of a constant `expression` compared with `column`: an
-/// untyped literal takes the column's type, as the parser resolves it.
-/// `None` when the expression is not a constant the model reads.
+/// The value of a constant `expression` compared with a column or key
+/// expression of type `ctype`: an untyped literal takes that type, as the
+/// parser resolves it. `None` when the expression is not a constant the
+/// model reads.
 pub(super) fn constant_value<'a>(
-    scope: &QueryScope<'_>,
+    ctype: ColType,
     expression: &'a Expr<'a>,
-    column: usize,
     params: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Option<Datum<'a>> {
@@ -172,19 +172,11 @@ pub(super) fn constant_value<'a>(
     let value =
         crate::sql::eval::eval(expression, arena, params, &crate::sql::eval::NoColumns).ok()?;
     if matches!(expression, Expr::Str(_)) && !value.is_null() {
-        let ctype = scope
-            .defs
-            .stored(0)
-            .and_then(|definition| definition.columns().get(column))
-            .map(|meta| meta.ctype);
         // Only types whose literal input has no side effect (a notice) are
         // read here.
         return match ctype {
-            Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name) | None => {
-                Some(value)
-            }
-            Some(
-                ctype @ (ColType::Bool
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => Some(value),
+            ctype @ (ColType::Bool
                 | ColType::Int2
                 | ColType::Int4
                 | ColType::Int8
@@ -200,9 +192,8 @@ pub(super) fn constant_value<'a>(
                 | ColType::Interval
                 | ColType::Bytea
                 | ColType::Uuid
-                | ColType::Char),
-            ) => crate::sql::eval::cast_to(value, ctype, arena).ok(),
-            Some(_) => None,
+                | ColType::Char) => crate::sql::eval::cast_to(value, ctype, arena).ok(),
+            _ => None,
         };
     }
     Some(value)
@@ -220,14 +211,28 @@ pub(super) struct Analyzer<'p, 's, 'a> {
 }
 
 impl<'a> Analyzer<'_, '_, 'a> {
-    fn column_of(&self, expression: &Expr<'_>) -> Option<usize> {
+    /// The column `expression` is, or the index key expression it matches.
+    fn column_of(&self, expression: &'a Expr<'a>) -> Result<Option<usize>, SqlError> {
         let Expr::Column { qualifier, name } = expression else {
-            return None;
+            return self
+                .planner
+                .variables
+                .find(self.scope, expression, self.arena);
         };
-        match self.scope.find_column(*qualifier, name).ok()? {
-            ResolvedColumn::Table(0, column) => Some(column),
+        Ok(match self.scope.find_column(*qualifier, name) {
+            Ok(ResolvedColumn::Table(0, column)) => Some(column),
             _ => None,
-        }
+        })
+    }
+
+    /// The constant `expression` compared with `column`.
+    fn constant(&self, expression: &'a Expr<'a>, column: usize) -> Option<Datum<'a>> {
+        constant_value(
+            self.planner.column_type(column),
+            expression,
+            self.params,
+            self.arena,
+        )
     }
 
     /// The columns of the table `expression` reads.
@@ -314,7 +319,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     },
                 ) = (restriction.clause, other.clause)
                 {
-                    let collation = self.planner.definition.columns()[column].collation;
+                    let collation = self.planner.column_collation(column);
                     if self.planner.compare(collation, &left, &right)?.is_ne() {
                         return Ok(Err(CONTRADICTION));
                     }
@@ -431,7 +436,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 ..
             } => {
                 let (column, key, operand, on_left) =
-                    match (self.column_of(left), self.column_of(right)) {
+                    match (self.column_of(left)?, self.column_of(right)?) {
                         (Some(column), None) => (column, *left, *right, true),
                         (None, Some(column)) => (column, *right, *left, false),
                         _ => return Ok(Ok(other(self, "a comparison of two expressions"))),
@@ -457,7 +462,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 let constant = if matches!(operand, Expr::Param(_)) && self.params.is_empty() {
                     None
                 } else {
-                    match constant_value(self.scope, operand, column, self.params, self.arena) {
+                    match self.constant(operand, column) {
                         Some(value) => Some(value),
                         None => {
                             return Ok(Ok(other(
@@ -477,7 +482,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     boolean: None,
                 }
             }
-            Expr::IsNull { operand, negated } => match self.column_of(operand) {
+            Expr::IsNull { operand, negated } => match self.column_of(operand)? {
                 Some(column) => Clause::NullTest {
                     column,
                     is_null: !negated,
@@ -489,7 +494,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 list,
                 negated,
             } => {
-                let Some(column) = self.column_of(operand) else {
+                let Some(column) = self.column_of(operand)? else {
                     return Ok(Ok(other(self, "an IN list over an expression")));
                 };
                 // A one-element list is a plain comparison.
@@ -497,7 +502,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     let constant = if matches!(element, Expr::Param(_)) && self.params.is_empty() {
                         None
                     } else {
-                        match constant_value(self.scope, element, column, self.params, self.arena) {
+                        match self.constant(element, column) {
                             Some(value) => Some(value),
                             None => {
                                 return Ok(Ok(other(
@@ -531,7 +536,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                         known = false;
                         continue;
                     }
-                    match constant_value(self.scope, element, column, self.params, self.arena) {
+                    match self.constant(element, column) {
                         Some(value) => elements[position] = value,
                         None => {
                             return Ok(Ok(other(
@@ -559,7 +564,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 array,
                 all,
             } => {
-                let Some(column) = self.column_of(operand) else {
+                let Some(column) = self.column_of(operand)? else {
                     return Ok(Ok(other(self, "an ANY or ALL over an expression")));
                 };
                 let Some(comparison) = Comparison::of(*operator, true) else {
@@ -575,9 +580,8 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     &crate::sql::eval::NoColumns,
                 );
                 // An untyped literal takes the array type of the column.
-                let element = crate::sql::types::ArrElem::from_coltype(
-                    self.planner.definition.columns()[column].ctype,
-                );
+                let element =
+                    crate::sql::types::ArrElem::from_coltype(self.planner.column_type(column));
                 let value = match (array, value, element) {
                     (Expr::Str(_), Ok(text @ Datum::Text(_)), Some(element)) => {
                         crate::sql::eval::cast_to(text, ColType::Array(element), self.arena)
@@ -615,9 +619,8 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     } => (*operand, false),
                     _ => (conjunct, true),
                 };
-                match self.column_of(column_expression) {
-                    Some(column)
-                        if self.planner.definition.columns()[column].ctype == ColType::Bool =>
+                match self.column_of(column_expression)? {
+                    Some(column) if self.planner.column_type(column) == ColType::Bool =>
                     {
                         let operand = self
                             .arena

@@ -25,8 +25,11 @@ use crate::storage::{ColumnDistribution, MAX_COLUMNS, Storage, TableDef, TableSt
 use super::scope::{QueryScope, ResolvedColumn};
 
 mod clauses;
+mod expressions;
 mod paths;
 mod predicate;
+
+pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use paths::scan_path;
 
@@ -296,8 +299,31 @@ fn btree_layout(planner: &Planner<'_, '_>, index: &PlannerIndex, entries: f64) -
         .enumerate()
     {
         let column = usize::from(column);
+        let ctype = planner.column_type(column);
+        let layout = ctype.physical_layout();
+        if let Some(variable) = planner.variables.get(column) {
+            if layout.length > 0 {
+                let align = match layout.alignment {
+                    b'c' => 1.0,
+                    b's' => 2.0,
+                    b'i' => 4.0,
+                    _ => 8.0,
+                };
+                width = (width / align).ceil() * align + f64::from(layout.length);
+            } else {
+                // An index stores a short value with a one-byte header where
+                // ANALYZE measured the expression's four-byte one.
+                width += variable
+                    .statistics
+                    .and_then(|(index, key)| planner.statistics.index_column(index, key))
+                    .map_or(32.0, |column| f64::from(column.average_width) - 3.0);
+            }
+            if position < index.n_cols {
+                deduplicate &= deduplicates(ctype, variable.collation);
+            }
+            continue;
+        }
         let meta = &definition.columns()[column];
-        let layout = meta.ctype.physical_layout();
         if layout.length > 0 {
             let align = match layout.alignment {
                 b'c' => 1.0,
@@ -457,13 +483,35 @@ pub(crate) enum SortKind {
     Incremental(usize),
 }
 
-/// One key column of the chosen index: the column, and whether the index
-/// stores it descending and its NULLs first.
+/// One key column of the chosen index: the column (or the number of its
+/// key expression), and whether the index stores it descending and its
+/// NULLs first.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexKeyOrder {
     pub(crate) column: usize,
     pub(crate) descending: bool,
     pub(crate) nulls_first: bool,
+    /// An expression key, which [`KeyReader`] evaluates.
+    pub(crate) expression: Option<KeyExpression>,
+}
+
+/// An index key that is an expression: its key position and the collation
+/// it is ordered under.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyExpression {
+    pub(crate) position: u8,
+    pub(crate) collation: Collation,
+}
+
+impl IndexKeyOrder {
+    /// The collation the key orders under on a table defined by
+    /// `definition`.
+    pub(crate) fn collation(&self, definition: &TableDef) -> Collation {
+        self.expression.map_or_else(
+            || definition.columns()[self.column].collation,
+            |expression| expression.collation,
+        )
+    }
 }
 
 /// The path PostgreSQL chose for the relation.
@@ -578,6 +626,9 @@ impl IndexInfo {
 }
 
 pub(super) struct Planner<'s, 'a> {
+    /// The key expressions of the table's indexes, numbered after its
+    /// columns.
+    pub(super) variables: ExpressionVariables<'a>,
     pub(super) storage: &'s Storage,
     pub(super) txid: u32,
     pub(super) slot: usize,
@@ -591,7 +642,46 @@ pub(super) struct Planner<'s, 'a> {
 }
 
 impl<'s, 'a> Planner<'s, 'a> {
+    /// The type of column or key expression `column`.
+    pub(super) fn column_type(&self, column: usize) -> ColType {
+        match self.variables.get(column) {
+            Some(variable) => variable.ctype,
+            None => self.definition.columns()[column].ctype,
+        }
+    }
+
+    /// The collation column or key expression `column` compares under.
+    pub(super) fn column_collation(&self, column: usize) -> Collation {
+        match self.variables.get(column) {
+            Some(variable) => variable.collation,
+            None => self.definition.columns()[column].collation,
+        }
+    }
+
     pub(super) fn variable(&self, column: usize) -> VariableStatistics<'s> {
+        if let Some(variable) = self.variables.get(column) {
+            let analyzed = variable
+                .statistics
+                .and_then(|(index, key)| self.statistics.index_column(index, key));
+            return VariableStatistics {
+                analyzed: analyzed.is_some(),
+                null_fraction: analyzed.map_or(0.0, |column| f64::from(column.null_fraction)),
+                distinct: analyzed.map_or(0.0, |column| {
+                    if column.distinct_fraction != 0.0 {
+                        -f64::from(column.distinct_fraction)
+                    } else {
+                        column.distinct_values as f64
+                    }
+                }),
+                distribution: variable
+                    .statistics
+                    .and_then(|(index, key)| self.statistics.index_distribution(index, key)),
+                ctype: variable.ctype,
+                collation: variable.collation,
+                unique: variable.unique,
+                indexed: variable.indexed,
+            };
+        }
         let meta = &self.definition.columns()[column];
         let attribute = self.definition.attributes.number(column);
         let analyzed = attribute.and_then(|attribute| self.statistics.column(attribute));
@@ -969,7 +1059,14 @@ impl<'s, 'a> Planner<'s, 'a> {
         let (mut low_length, mut high_length) = (0usize, 0usize);
         let mut too_wide = false;
         let mut failure = None;
-        let mut observe = |value: Datum<'_>| {
+        let mut observe = |value: Result<Datum<'_>, SqlError>| {
+            let value = match value {
+                Ok(value) => value,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    return;
+                }
+            };
             if value.is_null() || too_wide || failure.is_some() {
                 return;
             }
@@ -1019,7 +1116,10 @@ impl<'s, 'a> Planner<'s, 'a> {
                 .with_row_bytes(self.slot, rowid, home, |bytes| {
                     let mut values = [Datum::Null; MAX_COLUMNS];
                     crate::storage::rowenc::decode(bytes, schema, &mut values)?;
-                    observe(values[column]);
+                    let mark = self.arena.mark();
+                    observe(self.row_value(column, &values[..n_columns]));
+                    // SAFETY: the evaluated key was copied out above.
+                    unsafe { self.arena.rewind_to(mark) };
                     Ok(())
                 })?;
             Ok(core::ops::ControlFlow::Continue(()))
@@ -1027,14 +1127,19 @@ impl<'s, 'a> Planner<'s, 'a> {
         scan.for_each_spilled_row_batch(self.arena, true, None, &mut |batch| {
             for row in batch {
                 let mut values = [Datum::Null; MAX_COLUMNS];
+                let mark = self.arena.mark();
                 let value = match row.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
                         crate::storage::rowenc::decode(bytes, schema, &mut values)?;
-                        values[column]
+                        self.row_value(column, &values[..n_columns])
                     }
-                    crate::storage::SpilledRowRepresentation::Values(values) => values[column],
+                    crate::storage::SpilledRowRepresentation::Values(values) => {
+                        self.row_value(column, values)
+                    }
                 };
                 observe(value);
+                // SAFETY: the evaluated key was copied out above.
+                unsafe { self.arena.rewind_to(mark) };
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
@@ -1061,6 +1166,22 @@ impl<'s, 'a> Planner<'s, 'a> {
             decode(&low[..low_length])?,
             decode(&high[..high_length])?,
         ))))
+    }
+
+    /// The value of column or key expression `column` in the row `values`.
+    fn row_value<'v>(&self, column: usize, values: &[Datum<'v>]) -> Result<Datum<'v>, SqlError>
+    where
+        'a: 'v,
+    {
+        expressions::row_value(
+            self.storage,
+            self.txid,
+            self.definition,
+            &self.variables,
+            column,
+            values,
+            self.arena,
+        )
     }
 
     /// The visible rows of the table that satisfy `predicate`, as a partial
@@ -1128,12 +1249,16 @@ impl<'s, 'a> Planner<'s, 'a> {
         values: &[Datum<'_>],
     ) -> Result<Option<bool>, SqlError> {
         use predicate::Prop;
+        // A key expression's value is not evaluated here.
+        if prop_reads_expression(prop, &self.variables) {
+            return Ok(None);
+        }
         let compare = |column: usize, comparison: Comparison, constant: &Datum<'_>| {
             let value = values[column];
             if value.is_null() || constant.is_null() {
                 return Ok(None);
             }
-            let collation = self.definition.columns()[column].collation;
+            let collation = self.column_collation(column);
             Ok(Some(
                 comparison.holds(self.compare(collation, &value, constant)?),
             ))
@@ -1399,6 +1524,21 @@ impl<'s, 'a> Planner<'s, 'a> {
             };
         }
         product
+    }
+}
+
+/// Whether `prop` reads a key expression, numbered past the table's
+/// columns.
+fn prop_reads_expression(prop: &predicate::Prop<'_>, variables: &ExpressionVariables<'_>) -> bool {
+    use predicate::Prop;
+    match *prop {
+        Prop::Compare { column, .. } | Prop::NullTest { column, .. } | Prop::Array { column, .. } => {
+            variables.get(column).is_some()
+        }
+        Prop::And(parts) | Prop::Or(parts) => parts
+            .iter()
+            .any(|part| prop_reads_expression(part, variables)),
+        Prop::Opaque(_) => false,
     }
 }
 
@@ -1703,6 +1843,11 @@ pub(crate) fn query_shape<'a>(
     arena: &'a Arena,
 ) -> Result<QueryShape, SqlError> {
     let mut shape = QueryShape::default();
+    let variables = if order_by.is_empty() {
+        None
+    } else {
+        query_variables(storage, txid, scope, arena)?
+    };
     for order in order_by {
         let target =
             super::resolve_order_target(order.expression, items, scope, arena, storage, txid)?;
@@ -1719,7 +1864,18 @@ pub(crate) fn query_shape<'a>(
                 },
                 _ => OrderKey::Expression,
             },
-            _ => OrderKey::Expression,
+            // An expression an index has as a key orders as that key.
+            _ => match variables {
+                Some(variables) => match variables.find(scope, target, arena)? {
+                    Some(column) => OrderKey::Column {
+                        column,
+                        descending: order.descending,
+                        nulls_first: order.nulls_first,
+                    },
+                    None => OrderKey::Expression,
+                },
+                None => OrderKey::Expression,
+            },
         };
         // A key on a column an earlier key orders is redundant.
         if let OrderKey::Column { column, .. } = key
@@ -1757,6 +1913,38 @@ pub(crate) fn query_shape<'a>(
     };
     shape.limit = (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0)));
     Ok(shape)
+}
+
+/// The key expressions of the indexes of the one plain table `scope` reads.
+fn query_variables<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    arena: &'a Arena,
+) -> Result<Option<ExpressionVariables<'a>>, SqlError> {
+    if scope.n != 1 || scope.slots[0] == usize::MAX {
+        return Ok(None);
+    }
+    let Some(definition) = scope.defs.stored(0) else {
+        return Ok(None);
+    };
+    let slot = scope.slots[0];
+    let Some(catalog) = paths::catalog_indexes(storage, txid, slot, arena)? else {
+        return Ok(None);
+    };
+    let statistics = storage.table_statistics(slot, txid);
+    Ok(Some(
+        expressions::table_expressions(
+            storage,
+            txid,
+            slot,
+            definition,
+            &statistics,
+            catalog,
+            arena,
+        )?
+        .0,
+    ))
 }
 
 /// The shape and read columns of the query whose scan of one relation is

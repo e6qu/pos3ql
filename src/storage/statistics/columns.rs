@@ -4,13 +4,18 @@ use super::super::{ColumnStatistics, MAX_RELATION_COLUMNS, SharedSlice};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-/// Every stored record is analyzed and names a stable PostgreSQL attribute.
-/// Its value distribution (`pg_statistic`'s most common values, histogram
+/// Every stored record is analyzed and names a stable PostgreSQL attribute:
+/// a column of its table, or a key column of one of the table's indexes
+/// (`index`, the index's creation stamp, nonzero), as `pg_statistic` keys an
+/// index expression's statistics to the index. Its value distribution (`pg_statistic`'s most common values, histogram
 /// and correlation slots), when ANALYZE computed one, is the byte range
 /// `distribution_at..distribution_at + distribution_len` of its image's
 /// value bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AnalyzedColumn {
+    /// The creation stamp of the index whose key column this is; 0 for a
+    /// column of the table.
+    index: u64,
     attribute: NonZeroU16,
     null_fraction_bits: u32,
     distinct_values: u64,
@@ -29,6 +34,7 @@ impl AnalyzedColumn {
             return Err(invalid());
         }
         Ok(Self {
+            index: 0,
             attribute: NonZeroU16::new(attribute).ok_or_else(invalid)?,
             null_fraction_bits: statistics.null_fraction.to_bits(),
             distinct_values: statistics.distinct_values,
@@ -36,6 +42,22 @@ impl AnalyzedColumn {
             average_width: statistics.average_width,
             distribution_at: 0,
             distribution_len: 0,
+        })
+    }
+
+    /// The statistics of key column `attribute` (from 1) of the index
+    /// created at `index`.
+    pub(crate) fn of_index(
+        index: u64,
+        attribute: u16,
+        statistics: ColumnStatistics,
+    ) -> Result<Self, SqlError> {
+        if index == 0 || usize::from(attribute) > super::super::MAX_INDEX_COLS {
+            return Err(invalid());
+        }
+        Ok(Self {
+            index,
+            ..Self::new(attribute, statistics)?
         })
     }
 
@@ -51,6 +73,18 @@ impl AnalyzedColumn {
 
     pub(crate) fn attribute(self) -> u16 {
         self.attribute.get()
+    }
+
+    /// The creation stamp of the index the record describes, 0 for a column
+    /// of the table.
+    pub(crate) fn index(self) -> u64 {
+        self.index
+    }
+
+    /// The order of records in an image: the table's columns, then each
+    /// index's key columns.
+    pub(crate) fn key(self) -> (u64, u16) {
+        (self.index, self.attribute.get())
     }
 
     pub(crate) fn statistics(self) -> ColumnStatistics {
@@ -77,7 +111,7 @@ impl AnalyzedColumn {
     }
 }
 
-/// One table's analyzed column records, ordered by attribute, and the value
+/// One table's analyzed column records, ordered by [`AnalyzedColumn::key`], and the value
 /// bytes their distributions occupy. The records and their bytes form one
 /// transactional image: ANALYZE, definition changes and recovery replace
 /// them together.

@@ -1875,6 +1875,7 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 
 mod alter_type_rebuild;
+pub(crate) mod analyze_indexes;
 pub(crate) mod constraints;
 mod foreign_key_clones;
 mod foreign_key_equality;
@@ -106011,6 +106012,8 @@ struct WriteScanOrder {
     n_keys: usize,
     backward: bool,
     deduplicated: bool,
+    /// The index, whose expression keys the order evaluates.
+    index_name: crate::util::StackStr<64>,
 }
 
 impl WriteScanOrder {
@@ -106019,6 +106022,7 @@ impl WriteScanOrder {
             column: 0,
             descending: false,
             nulls_first: false,
+            expression: None,
         }; crate::storage::MAX_INDEX_COLS];
         keys[..path.keys.len()].copy_from_slice(path.keys);
         Self {
@@ -106027,6 +106031,7 @@ impl WriteScanOrder {
             n_keys: path.keys.len(),
             backward: path.backward,
             deduplicated: path.deduplicated,
+            index_name: path.index_name,
         }
     }
 }
@@ -106063,6 +106068,14 @@ fn order_by_index_key(
     let values = arena
         .alloc_slice_with(rows.len() * width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
+    let reader = crate::sql::query::index_paths::KeyReader::new(
+        storage,
+        txid,
+        slot,
+        order.index_name.as_str(),
+        keys,
+        arena,
+    )?;
     for (position, row) in rows.iter().enumerate() {
         // The version the write selected, which its own changes may have
         // replaced since.
@@ -106070,8 +106083,16 @@ fn order_by_index_key(
         let bytes = storage.row_bytes(slot, rowid, snapshot, arena)?;
         let mut decoded = [Datum::Null; MAX_COLUMNS];
         crate::storage::rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
-        for (at, key) in keys.iter().enumerate() {
-            values[position * width + at] = decoded[key.column];
+        for at in 0..width {
+            values[position * width + at] = reader.value(
+                storage,
+                txid,
+                definition,
+                keys,
+                at,
+                &decoded[..n_columns],
+                arena,
+            )?;
         }
     }
     let order = crate::sql::query::index_key_order(

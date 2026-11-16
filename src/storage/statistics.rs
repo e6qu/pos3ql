@@ -446,10 +446,12 @@ impl Storage {
         &self,
         count: usize,
     ) -> Result<crate::mem::lease_pool::MutableSlice<AnalyzedColumn>, SqlError> {
-        if count > super::MAX_RELATION_COLUMNS {
+        if count > super::MAX_STATISTICS_RECORDS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "statistics column count exceeds the relation attribute limit"
+                "statistics record count exceeds {} (the relation attribute limit and {} index expression keys)",
+                super::MAX_STATISTICS_RECORDS,
+                super::MAX_INDEX_STATISTICS
             ));
         }
         self.statistics_pool
@@ -502,16 +504,20 @@ impl Storage {
         statistics: &TableStatistics,
     ) -> Result<(), SqlError> {
         let definition = self.table_def(table, transaction);
-        let mut previous = 0;
+        let mut previous = None;
         for column in statistics.columns.iter() {
-            let attribute = column.attribute();
-            if attribute <= previous || definition.attributes.column(attribute).is_none() {
+            // An index's records name its key positions; the index may have
+            // been dropped since, which readers check.
+            if previous.is_some_and(|previous| column.key() <= previous)
+                || (column.index() == 0
+                    && definition.attributes.column(column.attribute()).is_none())
+            {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "column statistics do not match the table's live attributes"
                 ));
             }
-            previous = attribute;
+            previous = Some(column.key());
         }
         Ok(())
     }
@@ -928,7 +934,27 @@ impl Storage {
         let source = state.pending.map_or(&state.committed.columns, |head| {
             &versions[head.tail].columns
         });
+        // A changed column type or collation rebuilds the indexes that
+        // read it, whose statistics PostgreSQL drops with their old
+        // identities: an index's records survive only an unchanged table.
+        let columns_unchanged = invalidated.is_empty()
+            && before.columns.iter().enumerate().all(|(column, old)| {
+                before
+                    .attributes
+                    .number(column)
+                    .and_then(|attribute| after.attributes.column(attribute))
+                    .is_none_or(|new| {
+                        let new = &after.columns[new];
+                        old.ctype == new.ctype
+                            && old.user_type == new.user_type
+                            && old.type_mod == new.type_mod
+                            && old.collation == new.collation
+                    })
+            });
         let retain = |record: &&AnalyzedColumn| {
+            if record.index() != 0 {
+                return columns_unchanged;
+            }
             let attribute = record.attribute();
             let (Some(old), Some(new)) = (
                 before.attributes.column(attribute),

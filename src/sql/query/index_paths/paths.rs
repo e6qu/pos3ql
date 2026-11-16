@@ -247,7 +247,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     fn prove(&self, predicate: &Prop<'a>, clause: &Prop<'a>) -> Result<bool, SqlError> {
         let planner = self.planner;
         let compare = |column: usize, left: &Datum<'_>, right: &Datum<'_>| {
-            planner.compare(planner.definition.columns()[column].collation, left, right)
+            planner.compare(planner.column_collation(column), left, right)
         };
         predicate::implied_by(predicate, clause, &compare, self.arena)
     }
@@ -283,7 +283,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             }
             let quals = Prop::And(props);
             let compare = |column: usize, left: &Datum<'_>, right: &Datum<'_>| {
-                planner.compare(planner.definition.columns()[column].collation, left, right)
+                planner.compare(planner.column_collation(column), left, right)
             };
             for part in predicate {
                 let target = Prop::of(part, arena)?;
@@ -561,11 +561,15 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         };
         let info = &self.index(index).catalog;
         let mut covered = 0u64;
-        for &column in info.columns[..info.n_cols]
+        for (position, &column) in info.columns[..info.n_cols]
             .iter()
             .chain(&info.include_columns[..info.n_include_cols])
+            .enumerate()
         {
-            if usize::from(column) < 64 {
+            // An expression key returns no column (`check_index_only`).
+            if usize::from(column) < 64
+                && (position >= info.n_cols || !info.expression_keys[position])
+            {
                 covered |= 1u64 << column;
             }
         }
@@ -1662,7 +1666,7 @@ fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows: f64) -> f
         if columns[..at].contains(&column) {
             continue;
         }
-        if planner.definition.columns()[column].ctype == ColType::Bool {
+        if planner.column_type(column) == ColType::Bool {
             groups *= 2.0;
             continue;
         }
@@ -1850,22 +1854,20 @@ pub(crate) fn scan_path<'a>(
     let statistics = storage.table_statistics(slot, txid);
     let size = super::relation_size(storage, slot, txid);
     // The table's indexes, newest first as `get_relation_info` lists them.
-    let mut catalog = [None::<PlannerIndex>; MAX_INDEXES];
-    let mut index_count = 0;
-    let mut too_many = false;
-    crate::sql::catalog::planner_indexes(storage, txid, slot, &mut |index| {
-        if index_count == MAX_INDEXES {
-            too_many = true;
-            return;
-        }
-        catalog[index_count] = Some(index);
-        index_count += 1;
-    });
-    if too_many {
+    let Some(catalog) = catalog_indexes(storage, txid, slot, arena)? else {
         return Ok(Planned::Outside("more than 32 indexes"));
-    }
-    let catalog = &mut catalog[..index_count];
-    catalog.sort_unstable_by_key(|index| core::cmp::Reverse(index.map_or(0, |index| index.oid)));
+    };
+    let index_count = catalog.len();
+    // The key expressions, each index's renumbered to them.
+    let (variables, unread_expressions) = super::expressions::table_expressions(
+        storage,
+        txid,
+        slot,
+        definition,
+        &statistics,
+        catalog,
+        arena,
+    )?;
     let entries = if statistics.valid {
         statistics.rows as f64
     } else {
@@ -1873,7 +1875,7 @@ pub(crate) fn scan_path<'a>(
     };
     let indexes = arena
         .alloc_slice_with(index_count, |position| {
-            let index = catalog[position].expect("dense indexes");
+            let index = catalog[position];
             IndexInfo {
                 catalog: index,
                 pages: 1.0,
@@ -1884,6 +1886,7 @@ pub(crate) fn scan_path<'a>(
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     let mut planner = Planner {
+        variables,
         storage,
         txid,
         slot,
@@ -1915,7 +1918,7 @@ pub(crate) fn scan_path<'a>(
             let index = &planner.indexes[position].catalog;
             index.method == IndexAccessMethod::Btree
                 && !index.catalog_classes
-                && (0..index.n_cols).all(|key| !index.expression_keys[key])
+                && unread_expressions & (1 << position.min(63)) == 0
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
     // The restrictions: conditions without the table's columns are
@@ -2002,7 +2005,7 @@ pub(crate) fn scan_path<'a>(
     // restrictions (`check_index_predicates`), and holds the rows its
     // predicate keeps.
     let compare = |column: usize, left: &Datum<'_>, right: &Datum<'_>| {
-        planner.compare(planner.definition.columns()[column].collation, left, right)
+        planner.compare(planner.column_collation(column), left, right)
     };
     let all_props = Prop::all(restrictions, arena)?;
     let mut pred_ok = [false; MAX_INDEXES];
@@ -2104,11 +2107,19 @@ pub(crate) fn scan_path<'a>(
         }
         let catalog_index = &index.catalog;
         let mut index_columns = 0u64;
+        // An expression key the model reads is the variable it was
+        // renumbered to.
+        let read_expression = |position: usize| {
+            planner
+                .variables
+                .get(usize::from(catalog_index.columns[position]))
+                .is_some()
+        };
         for (position, &column) in catalog_index.columns[..catalog_index.n_cols]
             .iter()
             .enumerate()
         {
-            if !catalog_index.expression_keys[position] {
+            if !catalog_index.expression_keys[position] || read_expression(position) {
                 index_columns |= column_bit(usize::from(column));
             }
         }
@@ -2130,9 +2141,8 @@ pub(crate) fn scan_path<'a>(
             && (catalog_index.method != IndexAccessMethod::Btree || !restrictions.is_empty());
         // An expression key serves only a condition on an expression, which
         // the model reads as no form of its own, or an ORDER BY expression.
-        let expression_served = catalog_index.expression_keys[..catalog_index.n_cols]
-            .iter()
-            .any(|&expression| expression)
+        let expression_served = (0..catalog_index.n_cols)
+            .any(|position| catalog_index.expression_keys[position] && !read_expression(position))
             && (unmodeled.is_some() || order.contains(&OrderKey::Expression));
         // A GiST or SP-GiST index may order by a distance (`<->`).
         let orders_by_distance = matches!(
@@ -2253,6 +2263,39 @@ pub(crate) fn scan_path<'a>(
         Ok(path) => Ok(Planned::Chosen(path)),
         Err(shape) => Ok(Planned::Outside(shape)),
     }
+}
+
+/// The indexes of the table in `slot`, newest first as
+/// `get_relation_info` lists them; `None` past [`MAX_INDEXES`].
+pub(super) fn catalog_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    arena: &'a Arena,
+) -> Result<Option<&'a mut [PlannerIndex]>, SqlError> {
+    let mut catalog = [None::<PlannerIndex>; MAX_INDEXES];
+    let mut index_count = 0;
+    let mut too_many = false;
+    crate::sql::catalog::planner_indexes(storage, txid, slot, &mut |index| {
+        if index_count == MAX_INDEXES {
+            too_many = true;
+            return;
+        }
+        catalog[index_count] = Some(index);
+        index_count += 1;
+    });
+    if too_many {
+        return Ok(None);
+    }
+    let catalog = &mut catalog[..index_count];
+    catalog.sort_unstable_by_key(|index| core::cmp::Reverse(index.map_or(0, |index| index.oid)));
+    Ok(Some(
+        arena
+            .alloc_slice_with(index_count, |position| {
+                catalog[position].expect("dense indexes")
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?,
+    ))
 }
 
 /// The arms of the ORs in `clause`, nested ones included.
@@ -2618,10 +2661,19 @@ fn describe<'a>(
             path.backward = index_path.backward;
             path.deduplicated = info.deduplicated;
             path.keys = arena
-                .alloc_slice_with(info.catalog.n_cols, |position| IndexKeyOrder {
-                    column: usize::from(info.catalog.columns[position]),
-                    descending: info.catalog.descending[position],
-                    nulls_first: info.catalog.nulls_first[position],
+                .alloc_slice_with(info.catalog.n_cols, |position| {
+                    let column = usize::from(info.catalog.columns[position]);
+                    IndexKeyOrder {
+                        column,
+                        descending: info.catalog.descending[position],
+                        nulls_first: info.catalog.nulls_first[position],
+                        expression: planner.variables.get(column).map(|variable| {
+                            super::KeyExpression {
+                                position: position as u8,
+                                collation: variable.collation,
+                            }
+                        }),
+                    }
                 })
                 .map_err(|_| crate::sql::eval::arena_full())?;
             // A unique index whose every key an equality fixes reaches one
@@ -2751,7 +2803,7 @@ fn implied<'a>(
     let arena = paths.arena;
     let target = Prop::of(restriction, arena)?;
     let compare = |column: usize, left: &Datum<'_>, right: &Datum<'_>| {
-        planner.compare(planner.definition.columns()[column].collation, left, right)
+        planner.compare(planner.column_collation(column), left, right)
     };
     predicate::implied_by(&target, props, &compare, arena)
 }

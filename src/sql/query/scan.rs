@@ -7870,13 +7870,29 @@ fn sort_by_index_key<'a>(
     let values = arena
         .alloc_slice_with(rows.len() * width, |_| Datum::Null)
         .map_err(|_| arena_full())?;
+    let reader = super::index_paths::KeyReader::new(
+        storage,
+        txid,
+        slot,
+        path.index_name.as_str(),
+        path.keys,
+        arena,
+    )?;
     for (position, row) in rows.iter().enumerate() {
         let row = row.expect("row snapshots are initialized");
         let bytes = storage.row_bytes(slot, row.rowid(), row.read()?, arena)?;
         let mut decoded = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
-        for (at, key) in path.keys.iter().enumerate() {
-            values[position * width + at] = decoded[key.column];
+        for at in 0..width {
+            values[position * width + at] = reader.value(
+                storage,
+                txid,
+                definition,
+                path.keys,
+                at,
+                &decoded[..n_columns],
+                arena,
+            )?;
         }
     }
     let order = index_key_order(
@@ -7936,7 +7952,7 @@ pub(crate) fn index_key_order<'a>(
                 (false, true) if nulls_first => core::cmp::Ordering::Greater,
                 (false, true) => core::cmp::Ordering::Less,
                 (false, false) => {
-                    let collation = definition.columns()[key.column].collation;
+                    let collation = key.collation(definition);
                     match crate::sql::eval::compare_datums_collated(
                         storage, txid, collation, &left, &right,
                     ) {

@@ -18458,6 +18458,95 @@ fn pg_stats<'a>(
             )?;
             count += 1;
         }
+        // The statistics of the table's index expressions, which PostgreSQL
+        // keys to the index and names by the index's attributes.
+        for index in storage.indexes_for_slot(slot, txid) {
+            if !statistics
+                .columns
+                .iter()
+                .any(|record| record.index() == index.created_at)
+            {
+                continue;
+            }
+            let mut names = super::exec::IndexColumnNames::new();
+            for position in 0..index.n_cols {
+                match index.expressions[position] {
+                    Some(source) => {
+                        let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                        let expression = crate::sql::parser::parse_expr(source, arena)?;
+                        names.push(super::exec::index_expression_column_name(expression))?;
+                    }
+                    None => names.push(
+                        table_definition.columns()[usize::from(index.columns[position])]
+                            .name
+                            .as_str(),
+                    )?,
+                }
+            }
+            for record in statistics
+                .columns
+                .iter()
+                .filter(|record| record.index() == index.created_at)
+            {
+                let position = usize::from(record.attribute()) - 1;
+                let Some(source) = index.expressions.get(position).copied().flatten() else {
+                    continue;
+                };
+                let Some((_, ctype)) = super::exec::analyze_indexes::expression_key(
+                    storage,
+                    txid,
+                    &table_definition,
+                    &index,
+                    position,
+                    source.as_str(),
+                    arena,
+                )?
+                else {
+                    continue;
+                };
+                if count == rows.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "pg_stats exceeds {} rows",
+                        rows.len()
+                    ));
+                }
+                let column_statistics = record.statistics();
+                let distinct = if column_statistics.distinct_fraction != 0.0 {
+                    -column_statistics.distinct_fraction
+                } else {
+                    column_statistics.distinct_values as f32
+                };
+                let (most_common, frequencies, histogram, correlation) =
+                    match statistics.columns.distribution(*record) {
+                        Some(distribution) => statistics_slots(distribution, ctype, arena)?,
+                        None => (Datum::Null, Datum::Null, Datum::Null, Datum::Null),
+                    };
+                rows[count] = row(
+                    &[
+                        text(index.schema.as_str(), arena)?,
+                        text(index.name_for(txid).as_str(), arena)?,
+                        text(names.get(position), arena)?,
+                        Datum::Bool(false),
+                        Datum::Float4(column_statistics.null_fraction),
+                        Datum::Int4(column_statistics.average_width.min(i32::MAX as u32) as i32),
+                        Datum::Float4(distinct),
+                        most_common,
+                        frequencies,
+                        histogram,
+                        correlation,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?;
+                count += 1;
+            }
+        }
     }
     finish(def, &rows[..count], arena)
 }

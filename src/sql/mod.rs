@@ -10328,13 +10328,22 @@ impl Engine {
                     self.work.reset();
                     let started = datetime::now_micros();
                     let previous = self.storage.table_statistics(slot, txn.txid);
+                    let indexes = exec::analyze_indexes::AnalyzedIndexes::of_table(
+                        &self.storage,
+                        slot,
+                        txn.txid,
+                        guc::default_statistics_target(),
+                        &self.work,
+                    )?;
                     let statistics = self.storage.analyze_table(
                         slot,
                         txn.txid,
                         &[],
                         guc::default_statistics_target(),
+                        &indexes,
                         &self.work,
                     )?;
+                    drop(indexes);
                     if statistics.relation_estimates_changed(&previous) {
                         txn.record_statistics_plan_change(&self.storage, slot as u32);
                     }
@@ -10385,13 +10394,22 @@ impl Engine {
                 self.work.reset();
                 let started = datetime::now_micros();
                 let previous = self.storage.table_statistics(slot, txn.txid);
+                let indexes = exec::analyze_indexes::AnalyzedIndexes::of_table(
+                    &self.storage,
+                    slot,
+                    txn.txid,
+                    guc::default_statistics_target(),
+                    &self.work,
+                )?;
                 let statistics = self.storage.analyze_table(
                     slot,
                     txn.txid,
                     &selected[..selected_count],
                     guc::default_statistics_target(),
+                    &indexes,
                     &self.work,
                 );
+                drop(indexes);
                 let statistics = statistics?;
                 if statistics.relation_estimates_changed(&previous) {
                     txn.record_statistics_plan_change(&self.storage, slot as u32);

@@ -26310,8 +26310,8 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
             .table_statistics(table, 0)
             .column(2)
             .unwrap()
-            .null_fraction_ppm,
-        500_000
+            .null_fraction,
+        0.5
     );
     let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
         "COMMENT ON TABLE relation_estimates IS 'own comment';
@@ -54018,7 +54018,10 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
         .storage
         .extended_statistics_data(extended, reader.txid);
     assert_eq!(statistics.rows, 3);
-    assert_eq!(statistics.column(4).unwrap().null_fraction_ppm, 333_333);
+    assert_eq!(
+        statistics.column(4).unwrap().null_fraction,
+        (1.0f64 / 3.0) as f32
+    );
     assert_eq!(data.rows, 3);
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(data.mcv[0].values.as_str(), "{1,1}");
@@ -54073,8 +54076,8 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
             .table_statistics(table, reader.txid)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        1_000_000
+            .null_fraction,
+        1.0
     );
     run_txn(
         &mut engine,
@@ -54106,7 +54109,8 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
 #[test]
 fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
     let mut config = test_config("analysis-target-recycling");
-    config.work_arena_bytes = 12 << 10;
+    // One target's 30,000-row sample directory fits; three do not.
+    config.work_arena_bytes = 1 << 20;
     config.max_tables = 4;
     // Three resident relations each retain 256 rows during per-target ANALYZE.
     config.row_overlay_slots = 3 * 256;
@@ -54266,8 +54270,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
             .table_statistics(table, session.transaction.txid)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        1_000_000
+            .null_fraction,
+        1.0
     );
     assert_eq!(
         engine
@@ -54289,8 +54293,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
             .table_statistics(table, 0)
             .column(4)
             .unwrap()
-            .null_fraction_ppm,
-        333_333
+            .null_fraction,
+        (1.0f64 / 3.0) as f32
     );
     assert_eq!(
         engine.storage.extended_statistics_data(extended, 0).mcv[0]
@@ -54385,9 +54389,10 @@ fn vacuum_and_analyze() {
     let statistics = e.storage.table_statistics(slot, 0);
     assert!(statistics.valid);
     assert_eq!(statistics.rows, 2);
-    assert_eq!(statistics.column(1).unwrap().distinct_values, 2);
-    assert_eq!(statistics.column(2).unwrap().distinct_values, 2);
-    assert_eq!(statistics.column(1).unwrap().null_fraction_ppm, 0);
+    // Two different values are unique: PostgreSQL's `stadistinct` of -1.
+    assert_eq!(statistics.column(1).unwrap().distinct_fraction, 1.0);
+    assert_eq!(statistics.column(2).unwrap().distinct_fraction, 1.0);
+    assert_eq!(statistics.column(1).unwrap().null_fraction, 0.0);
     assert!(statistics.average_row_width > 0);
     let inheritance = run_with(
         &mut e,
@@ -54553,18 +54558,20 @@ fn vacuum_and_analyze() {
         )),
         ["a"]
     );
+    // ANALYZE of an empty table, as of a truncated one, leaves PostgreSQL's
+    // earlier column statistics in place.
     run_with(
         &mut e,
         &mut b,
         "TRUNCATE targeted_stats; ANALYZE targeted_stats(a)",
     );
-    assert!(
+    assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut b,
             "SELECT attname FROM pg_stats WHERE tablename = 'targeted_stats'"
-        ))
-        .is_empty()
+        )),
+        ["a"]
     );
 }
 
@@ -83642,7 +83649,8 @@ fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
         .unwrap();
     let statistics = recovered.storage.table_statistics(slot, 0);
     assert_eq!(statistics.rows, 512);
-    assert!(statistics.column(2).unwrap().distinct_values > 100);
+    // Every key is distinct: PostgreSQL's `stadistinct` of -1.
+    assert_eq!(statistics.column(2).unwrap().distinct_fraction, 1.0);
     assert!(statistics.average_row_width > 8_000);
 
     let before = recovered.storage.block_io_stats();

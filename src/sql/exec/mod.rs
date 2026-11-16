@@ -72055,13 +72055,13 @@ pub(crate) fn analyze_extended_statistics(
         for key in 0..n_keys {
             data.expression_statistics[key] = ColumnStatistics {
                 valid: rows != 0,
-                null_fraction_ppm: nulls[key]
-                    .saturating_mul(1_000_000)
-                    .checked_div(rows)
-                    .unwrap_or(0)
-                    .min(u64::from(u32::MAX)) as u32,
+                null_fraction: if rows == 0 {
+                    0.0
+                } else {
+                    (nulls[key] as f64 / rows as f64) as f32
+                },
                 distinct_values: distinct_estimate(&key_registers[key]).min(non_nulls[key]),
-                distinct_fraction_ppm: 0,
+                distinct_fraction: 0.0,
                 average_width: widths[key]
                     .checked_div(non_nulls[key])
                     .unwrap_or(0)

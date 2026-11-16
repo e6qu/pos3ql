@@ -204,7 +204,8 @@ pub(crate) mod constraint_names;
 mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
-pub(crate) use statistics::{AnalyzedColumn, StatisticsOrigin};
+pub(crate) use statistics::distribution::ColumnDistribution;
+pub(crate) use statistics::{AnalyzedColumn, ColumnImages, StatisticsOrigin};
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
 use snapshot_leases::{
@@ -3933,34 +3934,53 @@ pub struct Table {
     spill_generations: SpillGenerationRoster,
 }
 
-/// Statistics for one stored column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Statistics for one stored column: `pg_statistic`'s `stanullfrac`,
+/// `stawidth` and `stadistinct`, as PostgreSQL's ANALYZE computes them.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ColumnStatistics {
     /// Whether this column was included in the latest applicable ANALYZE.
     /// Table-level statistics can be valid while a targeted ANALYZE leaves
     /// other columns without a pg_statistic row.
     pub(crate) valid: bool,
-    /// Fraction of rows that are NULL, in millionths.
-    pub(crate) null_fraction_ppm: u32,
-    /// HyperLogLog estimate over non-NULL values.
+    /// Fraction of the sampled rows that are NULL (`stanullfrac`).
+    pub(crate) null_fraction: f32,
+    /// A positive `stadistinct`: the estimated distinct non-NULL values, or 0
+    /// when unknown or stored as a fraction.
     pub(crate) distinct_values: u64,
-    /// PostgreSQL's negative `n_distinct` ratio, in millionths, when the
-    /// estimate exceeded its ratio threshold at collection time. Keeping the
+    /// The magnitude of a negative `stadistinct`: distinct values as a
+    /// fraction of the rows, 0 when the count is absolute. Keeping the
     /// sampled ratio prevents targeted ANALYZE from recomputing nonsense
     /// against a newer table row estimate.
-    pub(crate) distinct_fraction_ppm: u32,
-    /// Average encoded bytes for a non-NULL value.
+    pub(crate) distinct_fraction: f32,
+    /// Average stored bytes of a non-NULL value (`stawidth`).
     pub(crate) average_width: u32,
 }
+
+impl PartialEq for ColumnStatistics {
+    fn eq(&self, other: &Self) -> bool {
+        self.valid == other.valid
+            && self.null_fraction.to_bits() == other.null_fraction.to_bits()
+            && self.distinct_values == other.distinct_values
+            && self.distinct_fraction.to_bits() == other.distinct_fraction.to_bits()
+            && self.average_width == other.average_width
+    }
+}
+
+impl Eq for ColumnStatistics {}
 
 impl ColumnStatistics {
     pub(crate) const EMPTY: Self = Self {
         valid: false,
-        null_fraction_ppm: 0,
+        null_fraction: 0.0,
         distinct_values: 0,
-        distinct_fraction_ppm: 0,
+        distinct_fraction: 0.0,
         average_width: 0,
     };
+
+    /// Whether the fractions are ones `pg_statistic` can hold.
+    pub(crate) fn fractions_valid(&self) -> bool {
+        (0.0..=1.0).contains(&self.null_fraction) && (0.0..=1.0).contains(&self.distinct_fraction)
+    }
 }
 
 /// The planner and `pg_stats` consume the same declared override as ANALYZE.
@@ -3985,8 +4005,8 @@ pub(crate) fn column_distinct_estimate(
             value
         };
     }
-    if statistics.distinct_fraction_ppm != 0 {
-        f64::from(statistics.distinct_fraction_ppm) * rows as f64 / 1_000_000.0
+    if statistics.distinct_fraction != 0.0 {
+        f64::from(statistics.distinct_fraction) * rows as f64
     } else {
         statistics.distinct_values as f64
     }
@@ -3999,8 +4019,8 @@ pub(crate) fn column_distinct_catalog_value(
     if let Some(declared) = metadata.statistics_options.n_distinct() {
         return declared.value() as f32;
     }
-    if statistics.distinct_fraction_ppm != 0 {
-        -(statistics.distinct_fraction_ppm as f32 / 1_000_000.0)
+    if statistics.distinct_fraction != 0.0 {
+        -statistics.distinct_fraction
     } else {
         statistics.distinct_values as f32
     }
@@ -4013,7 +4033,7 @@ pub(crate) struct TableStatistics {
     pub(crate) rows: u64,
     pub(crate) average_row_width: u32,
     pub(crate) analyzed_generation: u64,
-    pub(crate) columns: SharedSlice<AnalyzedColumn>,
+    pub(crate) columns: ColumnImages,
 }
 
 impl PartialEq for TableStatistics {
@@ -4022,7 +4042,7 @@ impl PartialEq for TableStatistics {
             && self.rows == other.rows
             && self.average_row_width == other.average_row_width
             && self.analyzed_generation == other.analyzed_generation
-            && self.columns.as_ref() == other.columns.as_ref()
+            && self.columns == other.columns
     }
 }
 
@@ -4033,7 +4053,7 @@ struct PendingTableStatisticsSlot {
     used: bool,
     previous: Option<usize>,
     depth: u32,
-    columns: SharedSlice<AnalyzedColumn>,
+    columns: ColumnImages,
     owner: statistics::StatisticsVersionOwner,
 }
 
@@ -4043,7 +4063,7 @@ impl TableStatistics {
         rows: 0,
         average_row_width: 0,
         analyzed_generation: 0,
-        columns: SharedSlice::EMPTY,
+        columns: ColumnImages::EMPTY,
     };
 
     pub(crate) fn column(&self, attribute: u16) -> Option<ColumnStatistics> {
@@ -4051,6 +4071,15 @@ impl TableStatistics {
             .binary_search_by_key(&attribute, |column| column.attribute())
             .ok()
             .map(|index| self.columns[index].statistics())
+    }
+
+    /// The value distribution ANALYZE recorded for `attribute`, if any.
+    pub(crate) fn distribution(&self, attribute: u16) -> Option<ColumnDistribution<'_>> {
+        let index = self
+            .columns
+            .binary_search_by_key(&attribute, |column| column.attribute())
+            .ok()?;
+        self.columns.distribution(self.columns[index])
     }
 }
 
@@ -4063,6 +4092,15 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_RELATION_COLUMNS + MAX_UNIQUES
 /// PostgreSQL accepts more objects/keys/MCV entries; crossing one of these
 /// envelopes is an explicit capacity error rather than an incomplete object.
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
+
+/// A row ANALYZE sampled changed between its two passes over one captured
+/// scan, which holds the rows still.
+fn changed_sample() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "ANALYZE sample rows changed between passes"
+    )
+}
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
 pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
@@ -38515,15 +38553,20 @@ impl Storage {
         self.write_relation_counts(table_slot, statistics, true)
     }
 
-    /// Rebuilds statistics from current committed data and all own changes.
-    /// An empty `selected_columns` means every column; otherwise
-    /// only the named column statistics are replaced while table cardinality
-    /// and row width are always refreshed.
+    /// Rebuilds statistics from current committed data and all own changes,
+    /// as PostgreSQL's ANALYZE does: a sample of `300 * target` rows (every
+    /// row of a smaller table, in physical order), each column's
+    /// `compute_scalar_stats` for a type with a default ordering. An empty
+    /// `selected_columns` means every column; otherwise only the named
+    /// column statistics are replaced while table cardinality and row width
+    /// are always refreshed. A column whose statistics target is 0 keeps its
+    /// statistics. `default_target` is `default_statistics_target`.
     pub(crate) fn analyze_table(
         &mut self,
         table_slot: usize,
         txid: u32,
         selected_columns: &[usize],
+        default_target: usize,
         arena: &crate::mem::arena::Arena,
     ) -> Result<TableStatistics, SqlError> {
         let _snapshot = self.analyze_snapshot();
@@ -38553,6 +38596,7 @@ impl Storage {
             corrected.round().max(0.0) as u64
         }
 
+        let arena_full = crate::sql::eval::arena_full;
         let definition = (*self.table_def(table_slot, txid)).clone();
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = definition.schema(&mut schema);
@@ -38570,49 +38614,69 @@ impl Storage {
                 selected[column] = true;
             }
         }
+        let target = |column: usize| match definition.columns()[column].statistics_target {
+            target if target < 0 => default_target,
+            target => target as usize,
+        };
+        for (column, chosen) in selected.iter_mut().enumerate().take(n_columns) {
+            // `attstattarget` 0 leaves a column's statistics alone.
+            *chosen &= target(column) != 0;
+        }
+        // `std_typanalyze`'s `minrows`, at least the default 100 rows.
+        let sample_target = (0..n_columns)
+            .filter(|&column| selected[column])
+            .map(|column| 300 * target(column))
+            .fold(100, usize::max);
 
+        // Pass one counts the rows and picks the sample by reservoir
+        // sampling, recording each sampled row's position and length. While
+        // every row so far is sampled it also copies them to the arena's
+        // persistent tail, which the scan's per-batch rewinds leave alone:
+        // a table no larger than its sample is then read once.
+        let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
+        let sample = arena
+            .alloc_slice_with(sample_target, |_| (0u64, 0usize))
+            .map_err(|_| arena_full())?;
+        let copies = arena
+            .alloc_slice_with(sample_target, |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let mut copied = true;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
-        let mut nulls = [0u64; MAX_COLUMNS];
-        let mut widths = [0u64; MAX_COLUMNS];
-        let mut non_nulls = [0u64; MAX_COLUMNS];
-        let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
-        let mut observe = |values: &[Datum], encoded_len: usize| -> Result<(), SqlError> {
+        let mut sampled = 0usize;
+        let mut replaced = false;
+        let mut random =
+            crate::prng::Pcg32::new(crate::sql::datetime::now_micros() as u64, table_slot as u64);
+        let mut observe = |length: usize, write: &mut dyn FnMut(&mut [u8])| {
+            let position = rows;
             rows = rows.saturating_add(1);
-            row_bytes = row_bytes.saturating_add(encoded_len as u64);
-            for column in 0..n_columns {
-                if !selected[column] {
-                    continue;
+            row_bytes = row_bytes.saturating_add(length as u64);
+            if sampled < sample.len() {
+                sample[sampled] = (position, length);
+                if copied {
+                    match arena.alloc_persistent_slice_with(length, |_| 0u8) {
+                        Ok(copy) => {
+                            write(copy);
+                            copies[sampled] = copy;
+                        }
+                        Err(_) => copied = false,
+                    }
                 }
-                let value = values[column];
-                if value.is_null() {
-                    nulls[column] = nulls[column].saturating_add(1);
-                    continue;
+                sampled += 1;
+            } else {
+                copied = false;
+                let draw = (u64::from(random.next_u32()) << 32) | u64::from(random.next_u32());
+                let slot = (draw % (position + 1)) as usize;
+                if slot < sample.len() {
+                    sample[slot] = (position, length);
+                    replaced = true;
                 }
-                non_nulls[column] = non_nulls[column].saturating_add(1);
-                // A one-column row encoding contributes a two-byte count
-                // and one bitmap byte; remove that framing to retain the
-                // value's actual stored width.
-                let width = rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
-                widths[column] = widths[column].saturating_add(width as u64);
-                let index = [column as u16];
-                add_distinct(
-                    &mut registers[column],
-                    hash_key_catalog(self, txid, values, &index)?,
-                );
             }
-            Ok(())
         };
-        // Overlay rows carry every pending or newer committed image. Spilled
-        // rows absent from that overlay stream below with their payload from
-        // the already resident merge cursor, avoiding one object point read
-        // per row during cold ANALYZE.
-        let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
         let _ = scan.for_each_overlay(&mut |rowid, home| {
+            crate::sql::query::check_timeout()?;
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                observe(&values[..n_columns], bytes.len())?;
+                observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
                 Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
@@ -38622,24 +38686,87 @@ impl Storage {
                 crate::sql::query::check_timeout()?;
                 match row.representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
-                        let mut values = [Datum::Null; MAX_COLUMNS];
-                        rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                        observe(&values[..n_columns], bytes.len())?;
+                        observe(bytes.len(), &mut |out| out.copy_from_slice(bytes));
                     }
                     SpilledRowRepresentation::Values(values) => {
-                        observe(values, rowenc::encoded_len(values))?;
+                        observe(rowenc::encoded_len(values), &mut |out| {
+                            rowenc::encode(values, out)
+                        });
                     }
                 }
             }
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
-
+        let sample = &mut sample[..sampled];
+        if replaced {
+            sample.sort_unstable_by_key(|&(position, _)| position);
+        }
+        let copies = &mut copies[..sampled];
+        if !copied {
+            // Pass two copies the sampled rows, in physical order.
+            let mut position = 0u64;
+            let mut next = 0usize;
+            let mut copy = |length: usize,
+                            write: &mut dyn FnMut(&mut [u8]) -> Result<(), SqlError>|
+             -> Result<(), SqlError> {
+                let this = position;
+                position += 1;
+                if next < sample.len() && sample[next].0 == this {
+                    if length != sample[next].1 {
+                        return Err(changed_sample());
+                    }
+                    let out = arena
+                        .alloc_persistent_slice_with(length, |_| 0u8)
+                        .map_err(|_| arena_full())?;
+                    write(out)?;
+                    copies[next] = out;
+                    next += 1;
+                }
+                Ok(())
+            };
+            let _ = scan.for_each_overlay(&mut |rowid, home| {
+                crate::sql::query::check_timeout()?;
+                self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                    copy(bytes.len(), &mut |out| {
+                        out.copy_from_slice(bytes);
+                        Ok(())
+                    })
+                })?;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
+                for row in batch {
+                    crate::sql::query::check_timeout()?;
+                    match row.representation {
+                        SpilledRowRepresentation::Encoded(bytes) => {
+                            copy(bytes.len(), &mut |out| {
+                                out.copy_from_slice(bytes);
+                                Ok(())
+                            })?
+                        }
+                        SpilledRowRepresentation::Values(values) => {
+                            copy(rowenc::encoded_len(values), &mut |out| {
+                                rowenc::encode(values, out);
+                                Ok(())
+                            })?
+                        }
+                    }
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            if next != sample.len() {
+                return Err(changed_sample());
+            }
+        }
         let analyzed_generation = scan.publication_generation(self, table_slot)?;
         drop(scan);
+        let sample_rows = &*copies;
+
         let mut statistics = self.table_statistics(table_slot, txid);
+        // Without sampled rows PostgreSQL leaves every column's statistics.
         let retained = |record: &&AnalyzedColumn| {
             definition.columns().iter().enumerate().any(|(column, _)| {
-                !selected[column]
+                (!selected[column] || rows == 0)
                     && definition.attributes.number(column) == Some(record.attribute())
             })
         };
@@ -38650,7 +38777,18 @@ impl Storage {
             selected[..n_columns].iter().filter(|&&value| value).count()
         };
         let mut columns = self.reserve_statistics_columns(retained_count + analyzed_count)?;
+        let retained_bytes: usize = statistics
+            .columns
+            .iter()
+            .filter(retained)
+            .map(|record| record.distribution_range().len())
+            .sum();
+        let mut values = self.reserve_statistics_values(retained_bytes)?;
+        let lease_error = |error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error);
         for &record in statistics.columns.iter().filter(retained) {
+            let bytes = statistics.columns.distribution_bytes(record);
+            let record = record.with_distribution(values.len(), bytes.len())?;
+            values.extend_from_slice(bytes).map_err(lease_error)?;
             columns
                 .push_reserved(record)
                 .expect("statistics merge reserved its retained records");
@@ -38666,41 +38804,152 @@ impl Storage {
             if !selected[column] || rows == 0 {
                 continue;
             }
-            let distinct_values = distinct_estimate(&registers[column]).min(non_nulls[column]);
-            let image = ColumnStatistics {
-                valid: true,
-                null_fraction_ppm: nulls[column]
-                    .saturating_mul(1_000_000)
-                    .checked_div(rows)
-                    .unwrap_or(0)
-                    .min(u64::from(u32::MAX)) as u32,
-                distinct_values,
-                distinct_fraction_ppm: if rows != 0 && distinct_values.saturating_mul(10) > rows {
-                    distinct_values
-                        .saturating_mul(1_000_000)
-                        .checked_div(rows)
-                        .unwrap_or(0)
-                        .min(1_000_000) as u32
-                } else {
-                    0
-                },
-                average_width: widths[column]
-                    .checked_div(non_nulls[column])
-                    .unwrap_or(0)
-                    .min(u64::from(u32::MAX)) as u32,
+            let metadata = &definition.columns()[column];
+            let ctype = schema[column];
+            let layout = ctype.physical_layout();
+            let varlena = layout.length < 0;
+            let scalar = ctype.has_builtin_ordering()
+                && !matches!(
+                    ctype,
+                    ColType::Range(_) | ColType::Multirange(_) | ColType::TsVector
+                );
+            let mark = arena.mark();
+            let items = arena
+                .alloc_slice_with(sample_rows.len(), |_| (Datum::Null, 0u32))
+                .map_err(|_| arena_full())?;
+            let mut count = 0usize;
+            let mut null_count = 0usize;
+            let mut toowide_count = 0usize;
+            let mut total_width = 0.0f64;
+            let mut registers = [0u8; REGISTERS];
+            let mut decoded = [Datum::Null; MAX_COLUMNS];
+            for &row in sample_rows {
+                crate::sql::query::check_timeout()?;
+                rowenc::decode(row, &schema[..n_columns], &mut decoded)?;
+                let value = decoded[column];
+                if value.is_null() {
+                    null_count += 1;
+                    continue;
+                }
+                if !scalar {
+                    let index = [column as u16];
+                    add_distinct(
+                        &mut registers,
+                        hash_key_catalog(self, txid, &decoded[..n_columns], &index)?,
+                    );
+                }
+                if varlena {
+                    let raw = statistics::scalar::raw_value_length(&value);
+                    total_width += statistics::scalar::stored_value_width(raw) as f64;
+                    if raw + 4 > statistics::scalar::WIDTH_THRESHOLD {
+                        toowide_count += 1;
+                        continue;
+                    }
+                }
+                items[count] = (value, count as u32);
+                count += 1;
+            }
+            let nonnull_count = sample_rows.len() - null_count;
+            let width = if varlena {
+                Ok(total_width)
+            } else {
+                Err(i32::from(layout.length))
             };
+            let mut distribution: &[u8] = &[];
+            let image = if scalar {
+                let computed = statistics::scalar::compute(
+                    statistics::scalar::SampleColumn {
+                        values: &mut items[..count],
+                        null_count,
+                        nonnull_count,
+                        toowide_count,
+                        total_width: width,
+                    },
+                    sample_rows.len(),
+                    rows as f64,
+                    target(column),
+                    &mut |left, right| {
+                        crate::sql::eval::compare_datums_collated(
+                            self,
+                            txid,
+                            metadata.collation,
+                            left,
+                            right,
+                        )
+                    },
+                    arena,
+                )?
+                .expect("a sampled table has rows");
+                if !computed.mcv.is_empty()
+                    || !computed.histogram.is_empty()
+                    || computed.correlation.is_some()
+                {
+                    let length =
+                        statistics::distribution::encoded_len(computed.mcv, computed.histogram);
+                    let bytes = arena
+                        .alloc_slice_with(length, |_| 0u8)
+                        .map_err(|_| arena_full())?;
+                    statistics::distribution::encode(
+                        computed.correlation,
+                        computed.mcv,
+                        computed.histogram,
+                        bytes,
+                    );
+                    distribution = bytes;
+                }
+                ColumnStatistics {
+                    valid: true,
+                    null_fraction: computed.null_fraction,
+                    distinct_values: if computed.distinct > 0.0 {
+                        computed.distinct as u64
+                    } else {
+                        0
+                    },
+                    distinct_fraction: if computed.distinct < 0.0 {
+                        -computed.distinct
+                    } else {
+                        0.0
+                    },
+                    average_width: computed.width.max(0) as u32,
+                }
+            } else {
+                let distinct_values = distinct_estimate(&registers).min(nonnull_count as u64);
+                ColumnStatistics {
+                    valid: true,
+                    null_fraction: (null_count as f64 / sample_rows.len() as f64) as f32,
+                    distinct_values,
+                    distinct_fraction: if distinct_values.saturating_mul(10) > rows {
+                        (distinct_values as f64 / rows as f64).min(1.0) as f32
+                    } else {
+                        0.0
+                    },
+                    average_width: match width {
+                        Ok(total) if nonnull_count > 0 => (total / nonnull_count as f64) as u32,
+                        Ok(_) => 0,
+                        Err(length) => length.max(0) as u32,
+                    },
+                }
+            };
+            let record = AnalyzedColumn::new(
+                definition
+                    .attributes
+                    .number(column)
+                    .expect("analyzed live column has an attribute"),
+                image,
+            )?
+            .with_distribution(values.len(), distribution.len())?;
+            values
+                .extend_from_slice(distribution)
+                .map_err(lease_error)?;
             columns
-                .push_reserved(AnalyzedColumn::new(
-                    definition
-                        .attributes
-                        .number(column)
-                        .expect("analyzed live column has an attribute"),
-                    image,
-                )?)
+                .push_reserved(record)
                 .expect("statistics merge reserved its selected records");
+            // SAFETY: the column's sample values, scratch and encoded
+            // distribution were allocated after `mark` and are dead here.
+            unsafe { arena.rewind_to(mark) };
         }
         columns.sort_unstable_by_key(|column| column.attribute());
-        statistics.columns = columns.freeze();
+        statistics.columns = ColumnImages::new(columns.freeze(), values.freeze())?;
         self.write_table_statistics(table_slot, txid, statistics.clone())?;
         Ok(statistics)
     }

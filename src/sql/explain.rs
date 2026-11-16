@@ -3370,7 +3370,7 @@ fn column_selectivity(
     if !statistics.valid || statistics.rows == 0 {
         return default;
     }
-    let non_null = 1.0 - f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
+    let non_null = 1.0 - f64::from(column_statistics.null_fraction);
     let distinct = crate::storage::column_distinct_estimate(
         &definition.columns()[column],
         column_statistics,
@@ -3421,7 +3421,7 @@ fn expression_statistics_selectivity(
                 continue;
             }
             let column = data.expression_statistics[key];
-            let non_null = 1.0 - f64::from(column.null_fraction_ppm) / 1_000_000.0;
+            let non_null = 1.0 - f64::from(column.null_fraction);
             return Some((non_null / column.distinct_values.max(1) as f64).clamp(0.0, 1.0));
         }
     }
@@ -4040,7 +4040,7 @@ fn predicate_selectivity<'a>(
             let Some(column_statistics) = column_statistics.filter(|_| statistics.valid) else {
                 return if *negated { 0.995 } else { 0.005 };
             };
-            let fraction = f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
+            let fraction = f64::from(column_statistics.null_fraction);
             if *negated { 1.0 - fraction } else { fraction }
         }
         Expr::InList {

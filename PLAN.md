@@ -1237,7 +1237,15 @@ conjunct that can raise an error (`id % 2 = 0`) runs above a join rather than
 at its relation's scan, so `EXPLAIN ANALYZE` counts its rows in the join and
 hashes them; and a hash join whose build is empty still reads its outer
 relation, where PostgreSQL reads at most its first row; a derived table that
-PostgreSQL pulls up into an outer join still prints under its own name. A btree index may use
+PostgreSQL pulls up into an outer join still prints under its own name.
+ANALYZE gathers PostgreSQL's column statistics (`compute_scalar_stats`: most
+common values, histogram bounds, correlation and `n_distinct`) from the same
+sample PostgreSQL reads (`differential_exact/690`). Remaining: the element
+statistics of arrays and `tsvector` columns, range and multirange histograms,
+`compute_distinct_stats` for types without an ordering, and the widths of
+values PostgreSQL compresses; a table larger than 300 rows per unit of the
+statistics target is sampled at random, as PostgreSQL samples it, so its
+figures differ from run to run. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve
 `=` and no collation-aware comparison, and a default key no `~<~`-family

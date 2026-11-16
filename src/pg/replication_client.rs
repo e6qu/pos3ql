@@ -658,6 +658,9 @@ enum ClientState {
     AwaitingSlotAlter,
     AwaitingSlotAlterReady,
     AwaitingSlotResult,
+    /// Dropping a stale synchronization slot before creating it again.
+    AwaitingStaleSlotDrop,
+    AwaitingStaleSlotDropReady,
     SnapshotReady,
     AwaitingDropResult,
     CommandComplete,
@@ -673,6 +676,9 @@ enum ClientPurpose {
     Unbound,
     Stream,
     CreateSlot,
+    /// A synchronization slot, which first drops one an interrupted copy
+    /// left behind, as PostgreSQL's table synchronization does.
+    CreateSyncSlot,
     DropSlot,
     Sql,
 }
@@ -933,6 +939,19 @@ impl ReplicationClient {
         behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<(), ClientError> {
         self.bind_command(endpoint, slot, ClientPurpose::CreateSlot)?;
+        self.behavior = behavior;
+        Ok(())
+    }
+
+    /// Creates a synchronization slot, replacing one an interrupted copy
+    /// left on the publisher.
+    pub(crate) fn bind_create_sync_slot(
+        &mut self,
+        endpoint: ConnectionInfo,
+        slot: SqlName,
+        behavior: crate::storage::SubscriptionBehavior,
+    ) -> Result<(), ClientError> {
+        self.bind_command(endpoint, slot, ClientPurpose::CreateSyncSlot)?;
         self.behavior = behavior;
         Ok(())
     }
@@ -1461,6 +1480,10 @@ fn consume_frame<'a>(
                 create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingSlotResult;
             }
+            ClientPurpose::CreateSyncSlot => {
+                drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
+                *state = ClientState::AwaitingStaleSlotDrop;
+            }
             ClientPurpose::DropSlot => {
                 drop_replication_slot(send, slot).map_err(|_| ClientError::WireFull)?;
                 *state = ClientState::AwaitingDropResult;
@@ -1489,6 +1512,25 @@ fn consume_frame<'a>(
             tag: "DROP_REPLICATION_SLOT",
         } if *state == ClientState::AwaitingDropResult => {
             *state = ClientState::CommandComplete;
+        }
+        BackendFrame::CommandComplete {
+            tag: "DROP_REPLICATION_SLOT",
+        } if *state == ClientState::AwaitingStaleSlotDrop => {
+            *state = ClientState::AwaitingStaleSlotDropReady;
+        }
+        // No stale slot: the drop's error ends its command.
+        BackendFrame::Error { fields } if *state == ClientState::AwaitingStaleSlotDrop => {
+            let diagnostic = publisher_diagnostic(fields)?;
+            if diagnostic.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_OBJECT {
+                return Err(ClientError::Publisher(diagnostic));
+            }
+            *state = ClientState::AwaitingStaleSlotDropReady;
+        }
+        BackendFrame::ReadyForQuery {
+            transaction_status: b'I',
+        } if *state == ClientState::AwaitingStaleSlotDropReady => {
+            create_replication_slot(send, slot, behavior).map_err(|_| ClientError::WireFull)?;
+            *state = ClientState::AwaitingSlotResult;
         }
         BackendFrame::CommandComplete {
             tag: "ALTER_REPLICATION_SLOT",

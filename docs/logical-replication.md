@@ -81,7 +81,8 @@ replaced subscription.
 `DROP SUBSCRIPTION` drops the publisher's replication slot before it returns,
 as PostgreSQL does: it stops the apply worker, sends `DROP_REPLICATION_SLOT
 name WAIT`, reports `NOTICE: dropped replication slot "name" on publisher`, and
-then removes the subscription. Because the slot cannot come back, a
+then removes the subscription; the apply worker stays stopped until the
+dropping transaction ends. Because the slot cannot come back, a
 subscription with a slot cannot be dropped inside a transaction block (`25001`).
 If the publisher is unreachable or refuses the drop, the command fails with
 `08006` and the subscription stays.

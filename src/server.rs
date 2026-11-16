@@ -2287,7 +2287,7 @@ impl Server {
                             worker.bootstrap.table = 0;
                             worker.bootstrap.copy_setup = None;
                             worker.bootstrap.line.clear();
-                            let result = worker.client.bind_create_slot(
+                            let result = worker.client.bind_create_sync_slot(
                                 runtime.endpoint.connection(),
                                 bootstrap_slot,
                                 crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,

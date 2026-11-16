@@ -349,6 +349,38 @@ fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
     inline_attempted(routine) && !routine.attributes.strict
 }
 
+/// Whether a call of `routine` may be replaced by its body as PostgreSQL's
+/// `inline_function` does: a SQL function passing the declaration checks
+/// whose body is one `SELECT` of one plain expression. The checks of the
+/// call's arguments and the body's volatility and strictness come later.
+pub(crate) fn sql_function_body_inlinable(
+    routine: &crate::storage::RoutineDef,
+    arena: &Arena,
+) -> bool {
+    if routine.language != crate::storage::RoutineLanguage::Sql || !inline_attempted(routine) {
+        return false;
+    }
+    let Ok(name) = arena.alloc_str(routine.name.as_str()) else {
+        return false;
+    };
+    let Ok(body) = arena.alloc_str(routine.body.as_str()) else {
+        return false;
+    };
+    let Ok(mut parser) = crate::sql::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(name, routine.arguments()))
+    else {
+        return false;
+    };
+    let mut statements = crate::mem::arena::ArenaList::new(arena);
+    while let Ok(Some(statement)) = parser.next_stmt() {
+        if statements.push(statement).is_err() {
+            return false;
+        }
+    }
+    crate::sql::planner_inputs::inline::simple_expression(statements.as_slice())
+        .is_some_and(|expression| !expression.contains_subquery())
+}
+
 /// Whether `inline_function` passes its declaration showstoppers and goes on
 /// to parse the body and check its result; strictness is weighed later.
 fn inline_attempted(routine: &crate::storage::RoutineDef) -> bool {

@@ -1817,6 +1817,7 @@ mod numeric_loops;
 mod set_rows;
 mod transition_rows;
 pub(super) use call_environment::CallEnvironment;
+pub(crate) use call_environment::MaintenancePath;
 mod function_execution;
 mod procedure_execution;
 mod sql_function_execution;
@@ -1825,7 +1826,8 @@ pub(super) use function_execution::{FunctionOutput, SuspendedFunction};
 pub(super) use procedure_execution::SuspendedProcedure;
 pub(super) use sql_function_execution::execute_sql_function;
 pub(crate) use sql_function_execution::{
-    check_inlined_polymorphic_result, check_polymorphic_sql_result, sql_function_inlining,
+    check_inlined_polymorphic_result, check_polymorphic_sql_result, sql_function_body_inlinable,
+    sql_function_inlining,
 };
 mod engine_triggers;
 mod plpgsql_conditions;
@@ -2373,6 +2375,11 @@ fn create_table_kind(
             };
             let partition = def.partition.attachment.is_some();
             if let Err(error) = ddl::merge_with_existing_check(
+                ddl::CheckRelation {
+                    storage,
+                    txid: txn.txid,
+                    table: &def,
+                },
                 &def.checks[inherited],
                 true,
                 def.name.as_str(),
@@ -5233,12 +5240,31 @@ fn notify_inherited_column_merges(
             }
         }
     }
+    // The position of `name` among the inherited columns, each counted once
+    // in parent order (`findAttrByName` over the merged inherited list).
+    let inherited_position = |name: &str| -> Result<Option<usize>, SqlError> {
+        let mut position = 0usize;
+        for parent in 0..parents.len() {
+            for column in storage.table_def(parent_slot(parent)?, txid).columns() {
+                if defined_by_earlier_parent(parent, column.name.as_str())? {
+                    continue;
+                }
+                position += 1;
+                if column.name.as_str() == name {
+                    return Ok(Some(position));
+                }
+            }
+        }
+        Ok(None)
+    };
     for (index, column) in statement.columns.iter().enumerate() {
         if !reached(parents.len(), index) {
             break;
         }
-        match defined_by_earlier_parent(parents.len(), column.name) {
-            Ok(true) => responder.notice(
+        match inherited_position(column.name) {
+            // A declared column at its inherited column's position merges in
+            // place; elsewhere it moves there.
+            Ok(Some(position)) if position == index + 1 => responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(
                     160,
@@ -5247,7 +5273,24 @@ fn notify_inherited_column_merges(
                 )
                 .as_str(),
             )?,
-            Ok(false) => {}
+            Ok(Some(_)) => {
+                crate::sql::eval::stash_diagnostic(
+                    Some(crate::sql::eval::DiagnosticText::copy(
+                        "User-specified column moved to the position of the inherited column.",
+                    )),
+                    None,
+                );
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "moving and merging column \"{}\" with inherited definition",
+                        column.name
+                    )
+                    .as_str(),
+                )?;
+            }
+            Ok(None) => {}
             Err(error) => return Ok(Err(error)),
         }
     }
@@ -5367,7 +5410,14 @@ fn build_inherited_table_def(
                 }
             }
         }
-        inherit_table_checks(&parent_definition, &mut definition, false, arena)?;
+        inherit_table_checks(
+            storage,
+            txid,
+            &parent_definition,
+            &mut definition,
+            false,
+            arena,
+        )?;
         definition.inheritance.append(parent)?;
     }
     for (own_index, column) in own.columns().iter().enumerate() {
@@ -5500,21 +5550,36 @@ fn build_declared_table_def(
 /// requirements but deliberately leaves keys, foreign keys, and exclusion
 /// constraints local to each physical relation.
 fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     parent: &crate::storage::TableDefinition<Definition0>,
     child: &mut TableDefBuilder,
     require_existing: bool,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for inherited in parent.checks().iter().filter(|check| !check.no_inherit) {
-        if let Some(existing) = child.checks[..child.n_checks]
-            .iter_mut()
-            .find(|existing| existing.name == inherited.name)
+        if let Some(position) = child.checks[..child.n_checks]
+            .iter()
+            .position(|existing| existing.name == inherited.name)
         {
+            let columns = ddl::CheckRelation {
+                storage,
+                txid,
+                table: &*child,
+            };
+            let current = child.checks[position];
             if require_existing {
                 // `ALTER TABLE ... INHERIT` (`MergeConstraintsIntoExisting`).
-                ddl::merge_check_into_existing(inherited, existing, child.name.as_str(), arena)?;
+                ddl::merge_check_into_existing(
+                    columns,
+                    inherited,
+                    &current,
+                    child.name.as_str(),
+                    arena,
+                )?;
             } else if !ddl::same_check_expression(
-                existing.expression.as_str(),
+                columns,
+                current.expression.as_str(),
                 inherited.expression.as_str(),
                 arena,
             )? {
@@ -5525,6 +5590,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
                     inherited.name.as_str()
                 ));
             }
+            let existing = &mut child.checks[position];
             if inherited.validation.enforced() && !existing.validation.enforced() {
                 existing.validation = crate::storage::ConstraintValidation::EnforcedValidated;
             }
@@ -20469,11 +20535,12 @@ pub struct CreateSubscriptionCommand<'a> {
     pub options: crate::sql::ast::SubscriptionOptions<'a>,
 }
 
-pub fn create_subscription(
+pub(crate) fn create_subscription(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
     command: CreateSubscriptionCommand<'_>,
+    context: SubscriptionDropContext,
     responder: &mut Responder,
 ) -> Outcome {
     let CreateSubscriptionCommand {
@@ -20577,14 +20644,12 @@ pub fn create_subscription(
         (crate::sql::ast::SubscriptionConnect::Deferred, _, _) => {
             crate::storage::SubscriptionBootstrap::Deferred
         }
+        // The statement creates a managed slot; the initial copy uses a
+        // synchronization slot of its own, as for an existing slot.
         (
             crate::sql::ast::SubscriptionConnect::Now,
-            crate::storage::SubscriptionSlot::Managed(_),
-            copy_data,
-        ) => crate::storage::SubscriptionBootstrap::CreateManagedSlot { copy_data },
-        (
-            crate::sql::ast::SubscriptionConnect::Now,
-            crate::storage::SubscriptionSlot::External(_),
+            crate::storage::SubscriptionSlot::Managed(_)
+            | crate::storage::SubscriptionSlot::External(_),
             true,
         ) => crate::storage::SubscriptionBootstrap::CopyExternalSlot,
         (
@@ -20622,6 +20687,26 @@ pub fn create_subscription(
         }
         publication_names[index] = publication;
     }
+    // PostgreSQL connects to the publisher while CREATE SUBSCRIPTION runs:
+    // it checks the publications, lists their tables and creates the slot.
+    let connected = if options.connect == crate::sql::ast::SubscriptionConnect::Now {
+        match connect_subscription_publisher(
+            storage,
+            txn,
+            name,
+            connection,
+            &publication_names[..publications.len()],
+            publisher_slot,
+            options.behavior.into(),
+            context,
+            responder,
+        )? {
+            Ok(connected) => Some(connected),
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        None
+    };
     let slot = match storage.create_subscription(
         crate::storage::SubscriptionSpec {
             name,
@@ -20669,6 +20754,25 @@ pub fn create_subscription(
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
     }
+    if let Some(connected) = connected {
+        // Each published table starts in `i` to be copied, or `r` without
+        // a copy, as PostgreSQL records it in pg_subscription_rel.
+        let state = if options.copy_data {
+            crate::storage::SubscriptionRelationState::Initializing
+        } else {
+            crate::storage::SubscriptionRelationState::Ready
+        };
+        if let Err(error) = record_created_subscription_relations(
+            storage,
+            wal,
+            txn,
+            slot,
+            &connected.tables[..connected.count],
+            state,
+        ) {
+            return sql_fail(error);
+        }
+    }
     if options.connect == crate::sql::ast::SubscriptionConnect::Deferred {
         crate::sql::eval::stash_diagnostic(
             None,
@@ -20683,6 +20787,268 @@ pub fn create_subscription(
         )?;
     }
     Ok(Ok(responder.command_complete("CREATE SUBSCRIPTION")?))
+}
+
+/// What CREATE SUBSCRIPTION learned from its publisher: the local tables of
+/// its publications.
+struct ConnectedPublisher {
+    tables: [usize; crate::storage::MAX_PUBLICATION_TABLES],
+    count: usize,
+}
+
+/// CREATE SUBSCRIPTION's publisher connection (`walrcv_connect`,
+/// `check_publications`, `fetch_table_list` and `walrcv_create_slot`): the
+/// statement parks while the server runs each step and resumes from the
+/// start, so its messages are sent only when it finishes or fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the connection carries the statement's validated definition"
+)]
+fn connect_subscription_publisher(
+    storage: &Storage,
+    txn: &super::txn::TxnState,
+    name: SqlName,
+    connection: crate::storage::SubscriptionConnInfo,
+    publications: &[SqlName],
+    publisher_slot: crate::storage::SubscriptionSlot,
+    behavior: crate::storage::SubscriptionBehavior,
+    context: SubscriptionDropContext,
+    responder: &mut Responder,
+) -> Result<Result<ConnectedPublisher, SqlError>, WireFull> {
+    let create_slot = match publisher_slot {
+        crate::storage::SubscriptionSlot::Managed(slot) => Some(slot.sql_name()),
+        _ => None,
+    };
+    if create_slot.is_some() {
+        if context == SubscriptionDropContext::Function {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot be executed from a function"
+            )));
+        }
+        if context == SubscriptionDropContext::TransactionBlock || txn.is_explicit() {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot run inside a transaction block"
+            )));
+        }
+    }
+    if let Err(error) = connection.require_endpoint_for(name) {
+        return Ok(Err(error));
+    }
+    let owner = crate::storage::SlotDropOwner {
+        pid: storage.current_connection_id(),
+        txid: txn.txid,
+    };
+    let mut names = [SqlName::EMPTY; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
+    names[..publications.len()].copy_from_slice(publications);
+    let request = crate::storage::SubscriptionConnectRequest {
+        name,
+        connection,
+        publications: names,
+        publication_count: publications.len(),
+        slot: create_slot.unwrap_or(SqlName::EMPTY),
+        behavior,
+    };
+    let pending = || {
+        sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "publisher connection of CREATE SUBSCRIPTION in progress"
+        )
+    };
+    let failed = |failure: crate::storage::SlotDropFailure, slot_step: bool| {
+        if failure.connect {
+            sql_err!(
+                sqlstate::CONNECTION_FAILURE,
+                "subscription \"{}\" could not connect to the publisher: {}",
+                name.as_str(),
+                failure.message.as_str()
+            )
+        } else if slot_step {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "could not create replication slot \"{}\": {}",
+                request.slot.as_str(),
+                failure.message.as_str()
+            )
+        } else {
+            sql_err!(
+                sqlstate::CONNECTION_FAILURE,
+                "could not receive list of replicated tables from the publisher: {}",
+                failure.message.as_str()
+            )
+        }
+    };
+    let discovered = match storage.poll_subscription_connect(
+        owner,
+        crate::storage::SubscriptionConnectStep::Discover,
+        request,
+    ) {
+        Err(error) => return Ok(Err(error)),
+        Ok(crate::storage::SubscriptionConnectPoll::Pending) => return Ok(Err(pending())),
+        Ok(crate::storage::SubscriptionConnectPoll::Failed(failure)) => {
+            storage.release_subscription_connect(owner);
+            return Ok(Err(failed(failure, false)));
+        }
+        Ok(crate::storage::SubscriptionConnectPoll::Done(slot)) => slot,
+    };
+    // The publisher's tables must exist locally as ordinary or partitioned
+    // tables before the slot is created.
+    let mut missing = 0u64;
+    let resolved = storage.subscription_connect_result(discovered, |tables, absent| {
+        missing = absent;
+        let mut found = [0usize; crate::storage::MAX_PUBLICATION_TABLES];
+        let mut count = 0usize;
+        for table in tables {
+            let slot = match storage.resolve_subscription_target(
+                table.schema.as_str(),
+                table.name.as_str(),
+                txn.txid,
+            ) {
+                Ok(slot) => slot,
+                Err(error) if error.sqlstate == sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "relation \"{}.{}\" does not exist",
+                        table.schema.as_str(),
+                        table.name.as_str()
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            if count == found.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subscription relation catalog exhausted its startup capacity"
+                ));
+            }
+            found[count] = slot;
+            count += 1;
+        }
+        Ok((found, count))
+    });
+    let warn_missing = |responder: &mut Responder| -> Result<(), WireFull> {
+        if missing == 0 {
+            return Ok(());
+        }
+        let mut list = crate::util::StackStr::<4096>::new();
+        let mut count = 0;
+        for (position, publication) in publications.iter().enumerate() {
+            if missing & (1 << position) != 0 {
+                use core::fmt::Write as _;
+                let _ = write!(
+                    list,
+                    "{}\"{}\"",
+                    if count == 0 { "" } else { ", " },
+                    publication.as_str()
+                );
+                count += 1;
+            }
+        }
+        responder.warning(
+            sqlstate::UNDEFINED_OBJECT,
+            stack_format!(
+                4200,
+                "{} {} {} on the publisher",
+                if count == 1 {
+                    "publication"
+                } else {
+                    "publications"
+                },
+                list.as_str(),
+                if count == 1 {
+                    "does not exist"
+                } else {
+                    "do not exist"
+                }
+            )
+            .as_str(),
+        )
+    };
+    let (found, count) = match resolved.and_then(|resolved| resolved) {
+        Ok(found) => found,
+        Err(error) => {
+            storage.release_subscription_connect(owner);
+            warn_missing(responder)?;
+            return Ok(Err(error));
+        }
+    };
+    if create_slot.is_some() {
+        match storage.poll_subscription_connect(
+            owner,
+            crate::storage::SubscriptionConnectStep::CreateSlot,
+            request,
+        ) {
+            Err(error) => return Ok(Err(error)),
+            Ok(crate::storage::SubscriptionConnectPoll::Pending) => return Ok(Err(pending())),
+            Ok(crate::storage::SubscriptionConnectPoll::Failed(failure)) => {
+                storage.release_subscription_connect(owner);
+                warn_missing(responder)?;
+                return Ok(Err(failed(failure, true)));
+            }
+            Ok(crate::storage::SubscriptionConnectPoll::Done(_)) => {}
+        }
+    }
+    storage.release_subscription_connect(owner);
+    warn_missing(responder)?;
+    if create_slot.is_some() {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(
+                192,
+                "created replication slot \"{}\" on publisher",
+                request.slot.as_str()
+            )
+            .as_str(),
+        )?;
+    }
+    Ok(Ok(ConnectedPublisher {
+        tables: found,
+        count,
+    }))
+}
+
+/// Records CREATE SUBSCRIPTION's tables in pg_subscription_rel, journaled
+/// with the subscription and undone with its transaction.
+fn record_created_subscription_relations(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    slot: usize,
+    tables: &[usize],
+    state: crate::storage::SubscriptionRelationState,
+) -> Result<(), SqlError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    storage.add_created_subscription_relations(slot, tables, state, txn.txid)?;
+    txn.record_ddl(storage, super::txn::DdlUndo::SubscriptionRelationsChanged)?;
+    let stream = storage.subscription_stream(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "new subscription has no stream definition"
+        )
+    })?;
+    for &table in tables {
+        let (schema, name) = {
+            let definition = storage.table_def(table, txn.txid);
+            (definition.schema, definition.name)
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::AddSubscriptionRelation {
+                name: stream.name().as_str(),
+                created_at: stream.created_at(),
+                definition_generation: stream.definition_generation(),
+                schema: schema.as_str(),
+                table: name.as_str(),
+                state,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub fn alter_subscription(
@@ -35976,6 +36342,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         publications,
                         options: *options,
                     },
+                    super::exec::SubscriptionDropContext::Function,
                     responder,
                 ),
                 Stmt::AlterSubscription { name, action } => super::exec::alter_subscription(
@@ -61955,41 +62322,44 @@ fn require_static_catalog_comment_superuser(storage: &Storage, txid: u32) -> Res
 }
 
 /// Runs a `CREATE TABLE AS` query into encoded rows in two passes: a dry
-/// count, then the materialization with live sequences.
+/// count, then the materialization with live sequences. A materialized view
+/// binds its query as `REFRESH` does, by the dependencies its definition
+/// keeps, and is populated as a maintenance operation.
 fn create_table_as_rows<'a>(
     storage: &Storage,
     txid: u32,
     sql: &str,
+    materialized: Option<(
+        crate::storage::PathContext,
+        crate::storage::StoredQueryDependencyView<'_>,
+    )>,
     seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum],
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let sel = crate::sql::parser::parse_query(sql, arena)?;
     let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
-    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
-    let mut rows = 0usize;
-    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
-    super::query::select_into_rows(
-        storage,
-        txid,
-        sel,
-        arena,
-        params,
-        None,
-        Some(&dry_sequence),
-        &mut |_| {
-            rows += 1;
-            Ok(())
-        },
-    )?;
-    let empty: &[u8] = &[];
-    let rows_bytes: &mut [&[u8]] = arena.alloc_slice_with(rows, |_| empty).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "CREATE TABLE AS result exceeds the statement arena"
-        )
-    })?;
-    let mut at = 0usize;
+    let (sel, _maintenance) = match materialized {
+        Some((path, dependencies)) => (
+            super::query::expand_stored_query_exec(
+                sel,
+                storage,
+                txid,
+                path,
+                dependencies,
+                arena,
+                params,
+            )?,
+            Some(MaintenancePath::enter(storage, txid)?),
+        ),
+        None => (
+            super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?,
+            None,
+        ),
+    };
+    // One pass, as PostgreSQL runs the query once: each routine it calls
+    // and each sequence value it takes happens once.
+    let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
     super::query::select_into_rows(
         storage,
         txid,
@@ -61999,12 +62369,16 @@ fn create_table_as_rows<'a>(
         None,
         Some(&live_sequence),
         &mut |vals| {
-            rows_bytes[at] = encode_projected_pub(vals, arena)?;
-            at += 1;
-            Ok(())
+            let encoded = encode_projected_pub(vals, arena)?;
+            rows.push(encoded).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "CREATE TABLE AS result exceeds the statement arena"
+                )
+            })
         },
     )?;
-    Ok(rows_bytes)
+    Ok(rows.as_slice())
 }
 
 /// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's
@@ -62239,10 +62613,11 @@ pub fn create_table_as(
         ));
     }
     if with_data && !materialized {
-        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
-            Ok(rows) => rows,
-            Err(error) => return sql_fail(error),
-        };
+        computed =
+            match create_table_as_rows(storage, txn.txid, sql, None, seq_session, arena, params) {
+                Ok(rows) => rows,
+                Err(error) => return sql_fail(error),
+            };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
     let table_index = match storage.create_table_in(def.clone(), txn.txid) {
@@ -62295,7 +62670,17 @@ pub fn create_table_as(
     let write_target = storage.select_table_definition(table_index, txn.txid).0;
     let mut count = 0u64;
     if with_data && materialized {
-        computed = match create_table_as_rows(storage, txn.txid, sql, seq_session, arena, params) {
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+        computed = match create_table_as_rows(
+            storage,
+            txn.txid,
+            sql,
+            Some((path, dependencies.view())),
+            seq_session,
+            arena,
+            params,
+        ) {
             Ok(rows) => rows,
             Err(error) => return sql_fail(error),
         };
@@ -62517,34 +62902,12 @@ pub fn refresh_materialized_view(
     // Capture the replacement before mutating the backing table. Besides
     // separating immutable reads from writes, this preserves the statement
     // snapshot when a materialized view references its prior contents.
-    let mut rows = 0usize;
-    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
-    if let Err(e) = super::query::select_into_rows(
-        storage,
-        txn.txid,
-        select,
-        arena,
-        params,
-        None,
-        Some(&dry_sequence),
-        &mut |_| {
-            rows += 1;
-            Ok(())
-        },
-    ) {
-        return sql_fail(e);
-    }
-    let empty: &[u8] = &[];
-    let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
-        Ok(r) => r,
-        Err(_) => {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "REFRESH result exceeds the statement arena"
-            ));
-        }
+    let _maintenance = match MaintenancePath::enter(storage, txn.txid) {
+        Ok(scope) => scope,
+        Err(error) => return sql_fail(error),
     };
-    let mut at = 0usize;
+    // One pass, as PostgreSQL runs the query once.
+    let mut captured = crate::mem::arena::ArenaList::new_persistent(arena);
     if let Err(e) = super::query::select_into_rows(
         storage,
         txn.txid,
@@ -62554,13 +62917,18 @@ pub fn refresh_materialized_view(
         None,
         Some(&live_sequence),
         &mut |values| {
-            rows_bytes[at] = encode_projected_pub(values, arena)?;
-            at += 1;
-            Ok(())
+            let encoded = encode_projected_pub(values, arena)?;
+            captured.push(encoded).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "REFRESH result exceeds the statement arena"
+                )
+            })
         },
     ) {
         return sql_fail(e);
     }
+    let rows_bytes = captured.as_slice();
     // Remove every visible row transactionally (a materialized view has no
     // constraints), then install the already-captured replacement.
     let mut rowids: [u64; 4096] = [0; 4096];
@@ -73478,11 +73846,18 @@ pub fn create_index(
                     None
                 }
                 None => {
-                    return sql_fail(sql_err!(
+                    let error = sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
                         "column \"{}\" does not exist",
                         column_name
-                    ));
+                    );
+                    // A parenthesized key is an analyzed expression, whose
+                    // error points at the name; a bare column has no position.
+                    return sql_fail(if index_column.expression_text.starts_with('(') {
+                        crate::sql::error_position::at_subject(error, column_name)
+                    } else {
+                        error
+                    });
                 }
             },
             None => match ddl::plain_column_reference(index_column.expression, &tdef) {
@@ -73559,10 +73934,13 @@ pub fn create_index(
                         if let Expr::WholeRow(name) = expression
                             && *name != table
                         {
-                            return Err(sql_err!(
-                                sqlstate::UNDEFINED_TABLE,
-                                "missing FROM-clause entry for table \"{}\"",
-                                name
+                            return Err(crate::sql::error_position::at_subject(
+                                sql_err!(
+                                    sqlstate::UNDEFINED_TABLE,
+                                    "missing FROM-clause entry for table \"{}\"",
+                                    name
+                                ),
+                                name,
                             ));
                         }
                         super::query::walk_children(expression, &mut |child| {
@@ -74298,6 +74676,7 @@ fn prepare_index_creation(
     arena: &Arena,
     operation: crate::storage::IndexBindingOperation,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txn.txid)?;
     let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
         sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -74466,6 +74845,7 @@ fn validate_index_rows(
     validation: IndexRowValidation,
     arena: &Arena,
 ) -> Result<crate::storage::TableStatistics, SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
     let statistics = scan_index_rows(storage, table_index, txid, arena, &mut |_, _, _| Ok(()))?;
     let keys = match validation {
         IndexRowValidation::Create { unique: false, .. } => return Ok(statistics),
@@ -77474,6 +77854,26 @@ fn materialize_index_definition(
     register_reindex_definition(storage, wal, txn, candidate.table, original)
 }
 
+/// Evaluates every index key of `table` over its rows, as the index rebuild
+/// of `CLUSTER` and `VACUUM FULL` does: a key whose expression fails, or a
+/// routine it calls, behaves as in PostgreSQL's rebuild.
+pub(crate) fn rebuild_table_index_keys(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
+    validate_index_rows(
+        storage,
+        table,
+        txid,
+        IndexRowValidation::Reindex { selected: None },
+        arena,
+    )
+    .map(|_| ())
+}
+
 fn rebuild_reindex_table_cache(
     storage: &mut Storage,
     txn: &TxnState,
@@ -77481,6 +77881,7 @@ fn rebuild_reindex_table_cache(
     selected: Option<i32>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txn.txid)?;
     validate_index_rows(
         storage,
         table,
@@ -78496,6 +78897,9 @@ pub fn cluster(
             return sql_fail(error);
         }
         if let Err(error) = set_clustered_index(storage, wal, txn, table, Some(selected)) {
+            return sql_fail(error);
+        }
+        if let Err(error) = rebuild_table_index_keys(storage, txn.txid, table, arena) {
             return sql_fail(error);
         }
     }
@@ -97316,6 +97720,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let _maintenance = MaintenancePath::enter(storage, txid)?;
     let physical = (*storage.table_def(table, txid)).clone();
     let mut sources = [0usize; MAX_COLUMNS];
     for (index, column) in def.columns().iter().enumerate() {
@@ -99381,7 +99786,16 @@ fn propagated_check_name<'a>(
         for check in parent.checks() {
             if !check.no_inherit
                 && !definition.checks().iter().any(|own| own.name == check.name)
-                && ddl::same_check_expression(check.expression.as_str(), stored, arena)?
+                && ddl::same_check_expression(
+                    ddl::CheckRelation {
+                        storage,
+                        txid,
+                        table: definition,
+                    },
+                    check.expression.as_str(),
+                    stored,
+                    arena,
+                )?
             {
                 found = Some(check);
                 break;
@@ -99607,16 +100021,29 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.n_uniques += 1;
     }
     for constraint in parent.checks() {
-        if let Some(existing) = child.checks[..child.n_checks]
-            .iter_mut()
-            .find(|existing| existing.name == constraint.name)
+        if let Some(position) = child.checks[..child.n_checks]
+            .iter()
+            .position(|existing| existing.name == constraint.name)
         {
+            let columns = ddl::CheckRelation {
+                storage,
+                txid: transaction,
+                table: &*child,
+            };
+            let current = child.checks[position];
             // The partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
             if matches!(mode, PartitionInheritance::Attach) {
-                ddl::merge_check_into_existing(constraint, existing, child.name.as_str(), arena)?;
+                ddl::merge_check_into_existing(
+                    columns,
+                    constraint,
+                    &current,
+                    child.name.as_str(),
+                    arena,
+                )?;
             } else if !ddl::same_check_expression(
-                existing.expression.as_str(),
+                columns,
+                current.expression.as_str(),
                 constraint.expression.as_str(),
                 arena,
             )? {
@@ -99626,7 +100053,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                     constraint.name.as_str()
                 ));
             }
-            existing.local = false;
+            child.checks[position].local = false;
             continue;
         }
         if matches!(mode, PartitionInheritance::Attach) {
@@ -100160,7 +100587,14 @@ fn alter_table_inheritance(
                 ));
             }
         }
-        if let Err(error) = inherit_table_checks(&parent_definition, &mut updated, true, arena) {
+        if let Err(error) = inherit_table_checks(
+            storage,
+            txn.txid,
+            &parent_definition,
+            &mut updated,
+            true,
+            arena,
+        ) {
             return sql_fail(error);
         }
         if let Err(error) = updated.inheritance.append(parent) {
@@ -100176,7 +100610,7 @@ fn alter_table_inheritance(
         }
     } else if !updated.inheritance.remove(parent) {
         return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
+            sqlstate::UNDEFINED_TABLE,
             "relation \"{}\" is not a parent of relation \"{}\"",
             parent_definition.name.as_str(),
             updated.name.as_str()
@@ -100223,6 +100657,11 @@ fn alter_table_inheritance(
                 for parent in storage.table_def(usize::from(*slot), txn.txid).checks() {
                     if !parent.no_inherit && parent.name == check.name {
                         inherited |= match ddl::same_check_expression(
+                            ddl::CheckRelation {
+                                storage,
+                                txid: txn.txid,
+                                table: &updated,
+                            },
                             parent.expression.as_str(),
                             check.expression.as_str(),
                             arena,
@@ -103746,6 +104185,11 @@ fn alter_table_relation(
                     let existing = new_def.checks[position];
                     let partition = new_def.partition.attachment.is_some();
                     if let Err(error) = ddl::merge_with_existing_check(
+                        ddl::CheckRelation {
+                            storage,
+                            txid: txn.txid,
+                            table: &new_def,
+                        },
                         &existing,
                         crate::sql::catalog::check_inheritance_count(
                             storage,
@@ -104793,6 +105237,16 @@ fn alter_table_relation(
             if matches!(source, ColSource::Cast { .. }) {
                 retyped.insert(column);
             }
+        }
+        let _maintenance = match MaintenancePath::enter(storage, txn.txid) {
+            Ok(scope) => scope,
+            Err(error) => return sql_fail(error),
+        };
+        // The rebuilt indexes evaluate their keys over the rewritten rows.
+        if let Err(error) = rows(true, &mut |_, values, _| {
+            constraints::check_index_tuple_sizes(storage, &new_def, values, txn.txid, arena)
+        }) {
+            return sql_fail(error);
         }
         for phase in [
             constraints::RebuildPhase::Kept,

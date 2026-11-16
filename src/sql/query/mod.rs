@@ -119,8 +119,8 @@ mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
     anonymous_record_variable, bind_expression as bind_procedural_expression,
-    bind_statement as bind_procedural_statement, record_type_not_registered,
-    unregistered_record_variable,
+    bind_expression_wildcards, bind_statement as bind_procedural_statement,
+    bind_variable_wildcards, record_type_not_registered, unregistered_record_variable,
 };
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
@@ -1859,6 +1859,12 @@ pub(crate) struct RoutineInvocationState {
     /// The foreign scans the statement ran and their rows, kept in the
     /// statement arena from the first foreign scan on.
     foreign: Cell<Option<crate::mem::arena::ArenaHandle<ForeignScanLog>>>,
+    /// The pending call was made under a maintenance operation's restricted
+    /// search path, which its body runs under too.
+    pending_restricted: Cell<bool>,
+    /// Only calls that need the engine (PL/pgSQL bodies) go through this
+    /// log; a utility statement runs other routines where it evaluates.
+    engine_calls_only: bool,
 }
 
 /// What a statement keeps of its foreign scans across attempts.
@@ -2457,7 +2463,22 @@ impl RoutineInvocationState {
             initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
             attempt: Cell::new(0),
             foreign: Cell::new(None),
+            pending_restricted: Cell::new(false),
+            engine_calls_only: false,
         }
+    }
+
+    /// A log for a utility statement or key preparation, which runs only the
+    /// calls that need the engine through it and replays them by position.
+    pub(crate) fn for_engine_calls(arena: &Arena) -> Self {
+        Self {
+            engine_calls_only: true,
+            ..Self::new(arena, RoutineExecution::StatementReplay)
+        }
+    }
+
+    fn resolves(&self, routine: &crate::storage::RoutineDef) -> bool {
+        !self.engine_calls_only || routine.language == crate::storage::RoutineLanguage::PlPgSql
     }
 
     /// Holds the statement's output until it completes: a data-modifying
@@ -3050,6 +3071,22 @@ impl RoutineInvocationState {
 
     pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation> {
         self.pending.replace(None)
+    }
+
+    /// Records that the call now pending was made under a maintenance
+    /// operation's restricted search path.
+    pub(crate) fn mark_pending_restricted(&self) {
+        let pending = self.pending.take();
+        if pending.is_some() {
+            self.pending_restricted.set(true);
+        }
+        self.pending.set(pending);
+    }
+
+    /// Whether the pending call runs under the restricted search path; the
+    /// mark is consumed.
+    pub(crate) fn take_pending_restricted(&self) -> bool {
+        self.pending_restricted.replace(false)
     }
 
     pub(crate) fn complete(
@@ -5059,7 +5096,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )?;
-        if let Some(invocations) = self.invocations {
+        if let Some(invocations) = self
+            .invocations
+            .filter(|invocations| invocations.resolves(routine))
+        {
             return invocations.resolve(
                 routine,
                 arguments,
@@ -5072,17 +5112,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
             );
         }
         if let Some(result) = with_active_routine_invocations(|context| {
-            context.map(|(invocations, statement_arena)| {
-                invocations.resolve(
-                    routine,
-                    arguments,
-                    statement_arena,
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                )
-            })
+            context
+                .filter(|(invocations, _)| invocations.resolves(routine))
+                .map(|(invocations, statement_arena)| {
+                    invocations.resolve(
+                        routine,
+                        arguments,
+                        statement_arena,
+                        arena,
+                        source_position,
+                        input_collation,
+                        access,
+                    )
+                })
         }) {
             return result;
         }
@@ -5391,6 +5433,43 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn names_inlinable_sql_function(&self, name: &str) -> bool {
+        let (schema, bare) = match name.rsplit_once('.') {
+            Some((schema, bare)) => (Some(schema), bare),
+            None => (None, name),
+        };
+        let inlinable = |schema: &str| {
+            self.storage
+                .routine_slots_named(schema, bare, self.txid)
+                .any(|slot| {
+                    let routine = self.storage.routine_for(slot, self.txid);
+                    let mark = self.routine_workspace.mark();
+                    let inlinable =
+                        super::exec::sql_function_body_inlinable(&routine, self.routine_workspace);
+                    // SAFETY: the parsed body is consumed by the check.
+                    unsafe { self.routine_workspace.rewind_to(mark) };
+                    inlinable
+                })
+        };
+        match schema {
+            Some(schema) => inlinable(schema),
+            None => self
+                .storage
+                .path()
+                .entries()
+                .iter()
+                .any(|entry| match entry {
+                    crate::storage::PathEntry::Schema(slot) => inlinable(
+                        self.storage
+                            .schema_def_for(usize::from(*slot), self.txid)
+                            .name
+                            .as_str(),
+                    ),
+                    _ => false,
+                }),
+        }
+    }
+
     fn relation_row_type(&self, schema: &str, name: &str) -> Option<crate::storage::TypeCreation> {
         let slot = self.storage.find_visible(schema, name, self.txid)?;
         Some(
@@ -9157,7 +9236,7 @@ fn patch_param_column_types<'a>(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += record_star_width(base, scope, storage, txid, arena)?;
+                slot += record_star_width(base, scope, None, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
@@ -10162,6 +10241,7 @@ fn check_key_types<'a>(
             arena,
             storage,
             txid,
+            None,
         )?;
         if let Some(ctype) = noncomparable(target) {
             return Err(crate::sql::error_position::at_expression(
@@ -10267,10 +10347,11 @@ fn resolve_group_ordinals<'a>(
     arena: &'a Arena,
     storage: &Storage,
     txid: u32,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<&'a Select<'a>, SqlError> {
     let scoped_columns = scope.map(|scope| CatalogScopeCols {
         scope,
-        outer: None,
+        outer,
         storage,
         txid,
         arena,
@@ -10335,6 +10416,7 @@ fn resolve_group_ordinals<'a>(
                     storage,
                     txid,
                     "GROUP BY",
+                    outer,
                 )?,
                 _ if output_name(grouping) => {
                     super::exec::resolve_output_name(grouping, statement.items, "GROUP BY")
@@ -10363,7 +10445,7 @@ fn resolve_group_ordinals<'a>(
                 None => 0,
             },
             SelectItem::RecordStar(expression) => {
-                record_star_width(expression, scope, storage, txid, arena)?
+                record_star_width(expression, scope, outer, storage, txid, arena)?
             }
             SelectItem::Expr { .. } => 1,
         };
@@ -10410,6 +10492,7 @@ pub(super) fn resolve_order_target<'a>(
     arena: &'a Arena,
     storage: &Storage,
     txid: u32,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<&'a Expr<'a>, SqlError> {
     resolve_position_target(
         expression,
@@ -10419,6 +10502,7 @@ pub(super) fn resolve_order_target<'a>(
         storage,
         txid,
         "ORDER BY",
+        outer,
     )
 }
 
@@ -10452,6 +10536,10 @@ impl<'a> ResolvedSortKey<'a> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "key resolution reads the enclosing levels' columns explicitly"
+)]
 pub(super) fn resolve_sort_key<'a>(
     original: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
@@ -10460,13 +10548,18 @@ pub(super) fn resolve_sort_key<'a>(
     storage: &Storage,
     txid: u32,
     earlier: &[Option<ResolvedSortKey<'a>>],
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<ResolvedSortKey<'a>, SqlError> {
     resolve_clause_key(
-        original, items, scope, arena, storage, txid, earlier, "ORDER BY",
+        original, items, scope, arena, storage, txid, earlier, "ORDER BY", outer,
     )
 }
 
 /// A `DISTINCT ON` expression, resolved as an `ORDER BY` key.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "key resolution reads the enclosing levels' columns explicitly"
+)]
 pub(super) fn resolve_distinct_on_key<'a>(
     original: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
@@ -10475,6 +10568,7 @@ pub(super) fn resolve_distinct_on_key<'a>(
     storage: &Storage,
     txid: u32,
     earlier: &[Option<ResolvedSortKey<'a>>],
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<ResolvedSortKey<'a>, SqlError> {
     resolve_clause_key(
         original,
@@ -10485,6 +10579,7 @@ pub(super) fn resolve_distinct_on_key<'a>(
         txid,
         earlier,
         "DISTINCT ON",
+        outer,
     )
 }
 
@@ -10498,9 +10593,18 @@ fn resolve_clause_key<'a>(
     txid: u32,
     earlier: &[Option<ResolvedSortKey<'a>>],
     clause: &str,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<ResolvedSortKey<'a>, SqlError> {
-    let expression =
-        resolve_position_target(original, items, Some(scope), arena, storage, txid, clause)?;
+    let expression = resolve_position_target(
+        original,
+        items,
+        Some(scope),
+        arena,
+        storage,
+        txid,
+        clause,
+        outer,
+    )?;
     let source = if let Expr::Int(position) = original {
         // Resolution above checked this against the expanded output width.
         SortKeySource::Projection(*position as usize - 1)
@@ -10530,7 +10634,7 @@ fn resolve_clause_key<'a>(
                     index += scope.qualified_star_columns(qualifier)?;
                 }
                 SelectItem::RecordStar(base) => {
-                    index += record_star_width(base, Some(scope), storage, txid, arena)?;
+                    index += record_star_width(base, Some(scope), outer, storage, txid, arena)?;
                 }
             }
         }
@@ -10551,6 +10655,10 @@ fn resolve_clause_key<'a>(
 /// An `ORDER BY` / `GROUP BY` target: a bare integer is a 1-based position in
 /// the select list (a star item expanding to its columns), anything else is the
 /// expression itself, matched against the select list's aliases.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "key resolution reads the enclosing levels' columns explicitly"
+)]
 pub(super) fn resolve_position_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
@@ -10559,6 +10667,7 @@ pub(super) fn resolve_position_target<'a>(
     storage: &Storage,
     txid: u32,
     clause: &str,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<&'a Expr<'a>, SqlError> {
     // `findTargetlistEntrySQL92`: any other constant is neither a position
     // nor a useful key.
@@ -10642,14 +10751,14 @@ pub(super) fn resolve_position_target<'a>(
                 remaining -= width;
             }
             SelectItem::RecordStar(base) => {
-                let width = record_star_width(base, scope, storage, txid, arena)?;
+                let width = record_star_width(base, scope, outer, storage, txid, arena)?;
                 if remaining < width {
                     let target = remaining;
                     let mut result = None;
                     let mut index = 0usize;
                     let scoped_columns = scope.map(|scope| CatalogScopeCols {
                         scope,
-                        outer: None,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -11013,7 +11122,7 @@ pub(crate) fn validate_static_grouping<'a>(
     {
         return Ok(());
     }
-    let statement = resolve_group_ordinals(statement, Some(scope), arena, storage, txid)?;
+    let statement = resolve_group_ordinals(statement, Some(scope), arena, storage, txid, None)?;
     group::validate_grouped_columns(statement, scope, agg_nodes.as_slice(), storage, txid, arena)
 }
 
@@ -11983,10 +12092,11 @@ fn check_select_types<'a>(
             arena,
             storage,
             txid,
+            outer,
         )?)?;
     }
     // `GROUP BY 1` and `GROUP BY name` name output columns.
-    let grouped = resolve_group_ordinals(statement, Some(scope), arena, storage, txid)?;
+    let grouped = resolve_group_ordinals(statement, Some(scope), arena, storage, txid, outer)?;
     for g in grouped.group_by {
         check(g)?;
     }
@@ -11999,6 +12109,7 @@ fn check_select_types<'a>(
             storage,
             txid,
             "DISTINCT ON",
+            outer,
         )?)?;
     }
     // PostgreSQL analyses window definitions last: the WINDOW clause's, then
@@ -13359,10 +13470,11 @@ pub(crate) fn select_query_resumable<'a>(
     }
     // A GROUP BY position names a select-list column; resolve it before
     // anything reads the grouping keys.
-    let statement = match resolve_group_ordinals(statement, Some(&scope), arena, storage, txid) {
-        Ok(s) => s,
-        Err(e) => return sql_fail(e),
-    };
+    let statement =
+        match resolve_group_ordinals(statement, Some(&scope), arena, storage, txid, None) {
+            Ok(s) => s,
+            Err(e) => return sql_fail(e),
+        };
     if let Err(e) = check_key_types(statement, &scope, arena, storage, txid) {
         return sql_fail(e);
     }
@@ -13987,6 +14099,7 @@ fn check_fromless_keys<'a>(
             storage,
             txid,
             "ORDER BY",
+            None,
         )?;
         super::exec::infer_type_res(slot, columns)?;
     }
@@ -13999,6 +14112,7 @@ fn check_fromless_keys<'a>(
             storage,
             txid,
             "DISTINCT ON",
+            None,
         )?;
         super::exec::infer_type_res(slot, columns)?;
     }
@@ -14192,7 +14306,7 @@ pub(crate) fn constant_select_resumable<'a>(
     }
     // A GROUP BY position names a select-list column here too — a FROM-less
     // select has no scope, but its positions resolve against the items alone.
-    let statement = match resolve_group_ordinals(statement, None, arena, storage, txid) {
+    let statement = match resolve_group_ordinals(statement, None, arena, storage, txid, None) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -15142,7 +15256,8 @@ fn select_into_rows_mode<'a>(
             seq,
             outer,
         )?;
-        let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
+        let statement =
+            resolve_group_ordinals(statement, Some(&scope), arena, storage, txid, outer)?;
         check_key_types(statement, &scope, arena, storage, txid)?;
         let n_items = statement.items.len();
         let n_group = statement.group_by.len();
@@ -15903,7 +16018,8 @@ fn project_row_skipping<'a>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                for field in super::eval::record_star_expand(base, arena, params, row, hooks)? {
+                for field in super::eval::record_star_expand(base, arena, params, &chained, hooks)?
+                {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
                             sqlstate::TOO_MANY_COLUMNS,
@@ -16027,7 +16143,7 @@ pub fn describe_scope_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                n = describe_scope_record_star(base, scope, storage, txid, arena, out, n)?;
+                n = describe_scope_record_star(base, scope, outer, storage, txid, arena, out, n)?;
             }
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
@@ -16286,7 +16402,7 @@ pub fn describe_select_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += record_star_width(base, scope, storage, txid, arena)?;
+                column += record_star_width(base, scope, None, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(description) = subquery_result_type(
@@ -16335,7 +16451,7 @@ fn patch_array_subquery_field_types<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += record_star_width(base, outer_scope, storage, txid, arena)?;
+                column += record_star_width(base, outer_scope, None, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(metadata) =
@@ -17037,9 +17153,14 @@ fn matching_user_type_description<'q>(
 /// Emits one `ColDesc` per field of a `(record).*` expansion against a join
 /// scope, resolving whole-row bases to their table's columns. Returns the new
 /// column count.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description reads the enclosing levels' columns explicitly"
+)]
 fn describe_scope_record_star<'q>(
     base: &Expr<'_>,
     scope: &QueryScope<'_>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     storage: &Storage,
     txid: u32,
     arena: &'q Arena,
@@ -17066,11 +17187,29 @@ fn describe_scope_record_star<'q>(
     };
     let resolver = CatalogScopeCols {
         scope,
-        outer: None,
+        outer,
         storage,
         txid,
         arena,
     };
+    // A PL/pgSQL `record` variable without a named composite value reaches
+    // the query as a parameter of type `record`, whose fields parse analysis
+    // cannot expand.
+    if let (
+        Some(outer),
+        Expr::Column {
+            qualifier: None,
+            name,
+        },
+    ) = (outer, base)
+        && scope.source(name).is_err()
+        && scope
+            .find_column(None, name)
+            .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
+        && unregistered_record_variable(outer, name)
+    {
+        return Err(record_type_not_registered());
+    }
     super::exec::reject_scalar_expansion(base, &resolver, storage, txid)?;
     match base {
         Expr::Call {
@@ -17152,6 +17291,7 @@ fn describe_scope_record_star<'q>(
                     )
                 })?,
                 scope,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -17201,6 +17341,28 @@ fn describe_scope_record_star<'q>(
             }
             if index == 0 {
                 return Err(super::exec::row_expansion_error(base, &resolver));
+            }
+        }
+        // An enclosing level's row named bare (a trigger's `NEW`).
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if scope.find_column(None, name).is_err()
+            && outer.is_some_and(|outer| {
+                outer.col_type(None, name).is_none() && outer.whole_row_type(name).is_some()
+            }) =>
+        {
+            let mut index = 0usize;
+            while let Some((field, meta)) =
+                super::exec::ColTypeResolver::whole_row_field(&resolver, name, index)
+            {
+                push(
+                    ColDesc::new(field.as_str(), meta.type_oid, meta.ctype.typlen())
+                        .with_type_mod(meta.type_mod)
+                        .with_collation(meta.collation),
+                    &mut n,
+                )?;
+                index += 1;
             }
         }
         _ => {
@@ -17523,6 +17685,14 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     super::exec::ColTypeResolver::resolve(outer, qualifier, name)
                 })
                 .unwrap_or(Err(error))
+                .or_else(|error| {
+                    // A bare name of an enclosing row (a trigger's `NEW`) is
+                    // its whole row.
+                    match (qualifier, self.outer) {
+                        (None, Some(outer)) => outer.whole_row_type(name).ok_or(error),
+                        _ => Err(error),
+                    }
+                })
                 .map_err(|error| {
                     let mut suggestion =
                         crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
@@ -17976,10 +18146,12 @@ fn scope_column_type_mod(
 }
 
 /// Projection offsets include catalog-declared fields, including without FROM.
-/// An unknown shape cannot silently reserve zero output columns.
+/// An unknown shape cannot silently reserve zero output columns. `outer` is
+/// the enclosing levels' columns (a PL/pgSQL routine's variables among them).
 pub(super) fn record_star_width(
     base: &Expr<'_>,
     scope: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
@@ -18005,19 +18177,33 @@ pub(super) fn record_star_width(
         }
     }
     let scoped;
+    let singleton;
+    let enclosed;
     let fromless;
-    let columns: &dyn super::exec::ColTypeResolver = match scope {
-        Some(scope) => {
+    let columns: &dyn super::exec::ColTypeResolver = match (scope, outer) {
+        (Some(scope), _) => {
             scoped = CatalogScopeCols {
                 scope,
-                outer: None,
+                outer,
                 storage,
                 txid,
                 arena,
             };
             &scoped
         }
-        None => {
+        // A FROM-less level still reads the enclosing levels.
+        (None, Some(_)) => {
+            singleton = QueryScope::singleton(storage, txid, arena)?;
+            enclosed = CatalogScopeCols {
+                scope: &singleton,
+                outer,
+                storage,
+                txid,
+                arena,
+            };
+            &enclosed
+        }
+        (None, None) => {
             fromless = super::exec::CatalogCols {
                 remote_ctid: false,
                 definition: None,

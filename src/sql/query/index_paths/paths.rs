@@ -636,6 +636,40 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     }
 
     /// `btcostestimate`: startup and total cost, selectivity, correlation.
+    /// The cost of evaluating the operands an index's conditions compare
+    /// its keys with: a constant or an InitPlan's output costs nothing, a
+    /// stable expression its functions.
+    fn operand_cost(&self, clauses: &[IndexClause<'a>]) -> f64 {
+        let planner = self.planner;
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(planner.definition),
+            alias: None,
+            output_aliases: &[],
+            remote_ctid: false,
+        };
+        clauses
+            .iter()
+            .filter_map(|clause| match clause.restriction.clause {
+                Clause::Compare { operand, .. }
+                    if !operand.is_constant(false)
+                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_)) =>
+                {
+                    Some(
+                        super::super::plan::qual_cost(
+                            operand,
+                            &columns,
+                            planner.storage,
+                            planner.txid,
+                            self.arena,
+                        ) / 2.0
+                            * self.costs().cpu_operator,
+                    )
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     fn btcostestimate(
         &self,
         index: usize,
@@ -806,8 +840,12 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             index_pages * costs.random_page
         };
         let qual_op = costs.cpu_operator * clauses.len() as f64;
+        // `index_other_operands_eval_cost`: the index conditions' other
+        // operands are evaluated once, when the scan starts.
+        let operands = self.operand_cost(clauses);
+        total += operands;
         total += index_tuples * sa_scans * (costs.cpu_index_tuple + qual_op);
-        let mut startup = 0.0;
+        let mut startup = operands;
         if index_entries > 1.0 {
             let descent = (index_entries.ln() / 2.0f64.ln()).ceil() * costs.cpu_operator;
             startup += descent;
@@ -1855,12 +1893,9 @@ pub(crate) fn scan_path<'a>(
             storage, scope, txid, condition, needed, params, arena, shape, slot, definition,
         );
     }
-    // Extended statistics change PostgreSQL's selectivities in ways the
-    // model leaves out, which matters only among index paths.
-    let extended_statistics = storage
-        .extended_statistics_for_table(slot, txid)
-        .next()
-        .is_some();
+    // The statistics objects of the table, which change PostgreSQL's
+    // selectivity of conditions on two or more of their keys.
+    let extended_statistics = storage.extended_statistics_for_table(slot, txid);
     let statistics = storage.table_statistics(slot, txid);
     let size = super::relation_size(storage, slot, txid);
     // The table's indexes, newest first as `get_relation_info` lists them.
@@ -2151,10 +2186,17 @@ pub(crate) fn scan_path<'a>(
         // An expression key serves a condition on an expression, which a
         // condition the model has no form for may be, or an ORDER BY
         // expression; one it reads also serves its variable's conditions.
+        // A key the model does not read (one calling a user-defined routine,
+        // which PostgreSQL may inline) may hold any compared expression.
         let expression_served = catalog_index.expression_keys[..catalog_index.n_cols]
             .iter()
             .any(|&expression| expression)
-            && (unmodeled.is_some() || order.contains(&OrderKey::Expression));
+            && (unmodeled.is_some()
+                || order.contains(&OrderKey::Expression)
+                || (unread_expressions & (1 << position.min(63)) != 0
+                    && restrictions
+                        .iter()
+                        .any(|restriction| restriction.clause.compares_expression())));
         // A GiST or SP-GiST index may order by a distance (`<->`).
         let orders_by_distance = matches!(
             catalog_index.method,
@@ -2252,8 +2294,40 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    let extended = extended_statistics.then_some("a table with extended statistics");
-    if let Some(shape) = unmodeled.or(shape.unmodeled).or(extended) {
+    // Conditions on two or more keys of one statistics object (or on an
+    // expression, which an expression key may be) are estimated from it by
+    // `statext_clauselist_selectivity`, which the model leaves out.
+    let restricted = restrictions.iter().fold(0u64, |mask, restriction| {
+        mask | restriction.clause.columns()
+    });
+    let compares_expression = restrictions
+        .iter()
+        .any(|restriction| restriction.clause.compares_expression());
+    let extended = extended_statistics
+        .into_iter()
+        .any(|(_, statistics)| {
+            let mut covered = 0;
+            let mut expressions = false;
+            for key in statistics.keys_for(txid) {
+                match key {
+                    crate::storage::ExtendedStatisticsKey::Column(name) => {
+                        if definition
+                            .column_index(name.as_str())
+                            .is_some_and(|column| restricted & column_bit(column) != 0)
+                        {
+                            covered += 1;
+                        }
+                    }
+                    crate::storage::ExtendedStatisticsKey::Expression(_) => expressions = true,
+                }
+            }
+            covered >= 2 || (expressions && compares_expression)
+        })
+        .then_some("conditions a statistics object estimates");
+    if let Some(shape) = extended {
+        return Ok(Planned::Outside(shape));
+    }
+    if let Some(shape) = unmodeled.or(shape.unmodeled) {
         return Ok(match paths.index_paths_possible(all_restrictions)? {
             Ok(false) => Planned::SeqOnly,
             Ok(true) => Planned::Outside(shape),

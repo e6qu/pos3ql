@@ -636,7 +636,7 @@ impl SubscriptionConnInfo {
         self.endpoint_for(subscription).ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
-                "enabled subscription connection string requires a numeric host, port, user, dbname, and sslmode"
+                "subscription connection string requires a numeric host, port, user, dbname, and sslmode"
             )
         })
     }
@@ -8664,7 +8664,6 @@ impl SubscriptionSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubscriptionBootstrap {
     Deferred,
-    CreateManagedSlot { copy_data: bool },
     CopyExternalSlot,
     CopyWithoutSlot,
     Refresh { copy_data: bool },
@@ -8706,6 +8705,113 @@ impl SubscriptionSlotDrop {
     }
 }
 
+/// A publisher table CREATE SUBSCRIPTION found in its publications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublisherTable {
+    pub schema: SqlName,
+    pub name: SqlName,
+}
+
+impl PublisherTable {
+    const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+    };
+}
+
+/// What CREATE SUBSCRIPTION asks of the publisher while it runs: first its
+/// publications and their tables, then, with `create_slot`, the slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionConnectStep {
+    Discover,
+    CreateSlot,
+}
+
+/// The publisher connection of one CREATE SUBSCRIPTION statement.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionConnectRequest {
+    pub name: SqlName,
+    pub connection: SubscriptionConnInfo,
+    pub publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+    pub publication_count: usize,
+    pub slot: SqlName,
+    pub behavior: SubscriptionBehavior,
+}
+
+/// CREATE SUBSCRIPTION connects to the publisher before it commits, as
+/// PostgreSQL does. The statement parks while the server's worker of a free
+/// subscription slot runs each step; the backend that asked takes the outcome
+/// when it resumes, and abandons it if it is cancelled or disconnects.
+// Held in place in a startup-sized slot per subscription catalog entry.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+enum SubscriptionConnectState {
+    Idle,
+    Requested {
+        owner: SlotDropOwner,
+        step: SubscriptionConnectStep,
+    },
+    Running {
+        owner: Option<SlotDropOwner>,
+        step: SubscriptionConnectStep,
+    },
+    Finished {
+        owner: SlotDropOwner,
+        step: SubscriptionConnectStep,
+        failure: Option<SlotDropFailure>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct SubscriptionConnect {
+    state: SubscriptionConnectState,
+    request: Option<SubscriptionConnectRequest>,
+    /// Publisher tables found so far, at the start of this slot's segment.
+    tables: usize,
+    /// The requested publications, by position, the publisher lacks.
+    missing: u64,
+    /// The publications name more tables than a subscription can hold.
+    overflow: bool,
+}
+
+impl SubscriptionConnect {
+    const EMPTY: Self = Self {
+        state: SubscriptionConnectState::Idle,
+        request: None,
+        tables: 0,
+        missing: 0,
+        overflow: false,
+    };
+
+    const fn owner(&self) -> Option<SlotDropOwner> {
+        match self.state {
+            SubscriptionConnectState::Requested { owner, .. }
+            | SubscriptionConnectState::Running {
+                owner: Some(owner), ..
+            }
+            | SubscriptionConnectState::Finished { owner, .. } => Some(owner),
+            SubscriptionConnectState::Idle
+            | SubscriptionConnectState::Running { owner: None, .. } => None,
+        }
+    }
+
+    const fn idle(&self) -> bool {
+        matches!(self.state, SubscriptionConnectState::Idle)
+    }
+}
+
+/// A CREATE SUBSCRIPTION statement's view of its publisher connection.
+// Returned by value once per poll; boxing would allocate.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+pub(crate) enum SubscriptionConnectPoll {
+    Pending,
+    Failed(SlotDropFailure),
+    /// The step finished: the request's slot in the subscription catalog,
+    /// whose tables and missing publications [`Storage`] lends out.
+    Done(usize),
+}
+
 /// The backend statement waiting for a slot drop, and its transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlotDropOwner {
@@ -8731,8 +8837,6 @@ impl SubscriptionBootstrap {
     pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Deferred => 0,
-            Self::CreateManagedSlot { copy_data: false } => 1,
-            Self::CreateManagedSlot { copy_data: true } => 2,
             Self::CopyExternalSlot => 3,
             Self::CopyWithoutSlot => 4,
             Self::Ready => 5,
@@ -8744,8 +8848,6 @@ impl SubscriptionBootstrap {
     pub(crate) const fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Deferred),
-            1 => Some(Self::CreateManagedSlot { copy_data: false }),
-            2 => Some(Self::CreateManagedSlot { copy_data: true }),
             3 => Some(Self::CopyExternalSlot),
             4 => Some(Self::CopyWithoutSlot),
             5 => Some(Self::Ready),
@@ -10545,6 +10647,10 @@ struct ReplicationSlotIter<'a> {
 struct SubscriptionCatalog {
     definitions: FixedVec<SubscriptionDef>,
     relations: FixedVec<SubscriptionRelation>,
+    /// One CREATE SUBSCRIPTION publisher connection per free definition slot.
+    connects: FixedVec<SubscriptionConnect>,
+    /// `subscription_relation_capacity` publisher tables per connect slot.
+    connect_tables: FixedVec<PublisherTable>,
 }
 
 struct SubscriptionIter<'a> {
@@ -21315,7 +21421,8 @@ impl Storage {
             None
         };
         let wait = match reason {
-            // DROP SUBSCRIPTION waits for the publisher, not object storage.
+            // CREATE and DROP SUBSCRIPTION wait for the publisher, not object
+            // storage.
             crate::sql::StatementWait::ObjectIo if self.awaits_subscription_slot_drop(pid) => {
                 (Some("Client"), Some("LibPQWalReceiverReceive"))
             }
@@ -23679,6 +23786,13 @@ impl Storage {
                 .max_subscriptions
                 .saturating_mul(config.subscription_relation_capacity)
                 .saturating_mul(size_of::<SubscriptionRelation>()),
+            config
+                .max_subscriptions
+                .saturating_mul(size_of::<SubscriptionConnect>()),
+            config
+                .max_subscriptions
+                .saturating_mul(config.subscription_relation_capacity)
+                .saturating_mul(size_of::<PublisherTable>()),
             foreign::ForeignCatalog::budget_bytes(config),
             config
                 .max_foreign_sessions
@@ -24217,6 +24331,23 @@ impl Storage {
                 .push(SubscriptionRelation::EMPTY)
                 .expect("sized to subscription relation capacity");
         }
+        let mut subscription_connects =
+            FixedVec::new(budget, "subscription_connects", config.max_subscriptions)?;
+        for _ in 0..config.max_subscriptions {
+            subscription_connects
+                .push(SubscriptionConnect::EMPTY)
+                .expect("sized to max_subscriptions");
+        }
+        let mut subscription_connect_tables = FixedVec::new(
+            budget,
+            "subscription_connect_tables",
+            config.max_subscriptions * config.subscription_relation_capacity,
+        )?;
+        for _ in 0..config.max_subscriptions * config.subscription_relation_capacity {
+            subscription_connect_tables
+                .push(PublisherTable::EMPTY)
+                .expect("sized to subscription relation capacity");
+        }
         let mut matviews = FixedVec::new(budget, "matviews", config.max_materialized_views)?;
         for _ in 0..config.max_materialized_views {
             matviews
@@ -24741,6 +24872,8 @@ impl Storage {
             subscription_catalog: Mutex::new(SubscriptionCatalog {
                 definitions: subscriptions,
                 relations: subscription_relations,
+                connects: subscription_connects,
+                connect_tables: subscription_connect_tables,
             }),
             foreign: Mutex::new(foreign),
             foreign_sessions: ForeignSessionPool {
@@ -45405,7 +45538,7 @@ impl Storage {
                     | SubscriptionBootstrap::Ready
             ) | (
                 SubscriptionSlot::Managed(_),
-                SubscriptionBootstrap::CreateManagedSlot { .. }
+                SubscriptionBootstrap::CopyExternalSlot
                     | SubscriptionBootstrap::Refresh { .. }
                     | SubscriptionBootstrap::Ready
             )
@@ -45445,11 +45578,11 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let Some(slot) = catalog
-            .definitions
-            .iter()
-            .position(|subscription| subscription.ddl_state == CatalogDdlState::Absent)
-        else {
+        // A slot another CREATE SUBSCRIPTION connects from stays free.
+        let Some(slot) = (0..catalog.definitions.len()).find(|&slot| {
+            catalog.definitions[slot].ddl_state == CatalogDdlState::Absent
+                && catalog.connects[slot].idle()
+        }) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many subscriptions (limit {})",
@@ -45879,17 +46012,25 @@ impl Storage {
     }
 
     fn awaits_subscription_slot_drop(&self, pid: i32) -> bool {
-        self.subscription_catalog
+        let catalog = self
+            .subscription_catalog
             .lock()
-            .expect("subscription catalog lock poisoned")
-            .definitions
+            .expect("subscription catalog lock poisoned");
+        catalog
+            .connects
             .iter()
-            .any(|subscription| match subscription.slot_drop {
-                SubscriptionSlotDrop::Requested { owner }
-                | SubscriptionSlotDrop::Running { owner: Some(owner) }
-                | SubscriptionSlotDrop::Finished { owner, .. } => owner.pid == pid,
-                SubscriptionSlotDrop::Idle | SubscriptionSlotDrop::Running { owner: None } => false,
-            })
+            .any(|connect| connect.owner().is_some_and(|owner| owner.pid == pid))
+            || catalog
+                .definitions
+                .iter()
+                .any(|subscription| match subscription.slot_drop {
+                    SubscriptionSlotDrop::Requested { owner }
+                    | SubscriptionSlotDrop::Running { owner: Some(owner) }
+                    | SubscriptionSlotDrop::Finished { owner, .. } => owner.pid == pid,
+                    SubscriptionSlotDrop::Idle | SubscriptionSlotDrop::Running { owner: None } => {
+                        false
+                    }
+                })
     }
 
     /// Abandons every slot drop requested by backend `pid`, whose statement
@@ -45899,6 +46040,23 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
+        for connect in catalog.connects.iter_mut() {
+            match connect.state {
+                SubscriptionConnectState::Running {
+                    owner: Some(owner),
+                    step,
+                } if owner.pid == pid => {
+                    connect.state = SubscriptionConnectState::Running { owner: None, step };
+                }
+                SubscriptionConnectState::Requested { owner, .. }
+                | SubscriptionConnectState::Finished { owner, .. }
+                    if owner.pid == pid =>
+                {
+                    *connect = SubscriptionConnect::EMPTY;
+                }
+                _ => {}
+            }
+        }
         for subscription in catalog.definitions.iter_mut() {
             subscription.slot_drop = match subscription.slot_drop {
                 SubscriptionSlotDrop::Requested { owner }
@@ -45913,6 +46071,259 @@ impl Storage {
                 state => state,
             };
         }
+    }
+
+    /// Advances `owner`'s CREATE SUBSCRIPTION publisher connection to
+    /// `step`: asks the server for it on a free subscription slot, or returns
+    /// its outcome once it finished. Asking for [`SubscriptionConnectStep::CreateSlot`]
+    /// after discovery keeps the discovered tables.
+    pub(crate) fn poll_subscription_connect(
+        &self,
+        owner: SlotDropOwner,
+        step: SubscriptionConnectStep,
+        request: SubscriptionConnectRequest,
+    ) -> Result<SubscriptionConnectPoll, SqlError> {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        if let Some(slot) = catalog
+            .connects
+            .iter()
+            .position(|connect| connect.owner() == Some(owner))
+        {
+            let connect = &mut catalog.connects[slot];
+            return Ok(match connect.state {
+                SubscriptionConnectState::Finished {
+                    failure: Some(failure),
+                    ..
+                } => SubscriptionConnectPoll::Failed(failure),
+                // A later step finished includes the earlier ones.
+                SubscriptionConnectState::Finished {
+                    step: finished,
+                    failure: None,
+                    ..
+                } if finished == step || finished == SubscriptionConnectStep::CreateSlot => {
+                    SubscriptionConnectPoll::Done(slot)
+                }
+                SubscriptionConnectState::Finished { failure: None, .. } => {
+                    connect.state = SubscriptionConnectState::Requested { owner, step };
+                    SubscriptionConnectPoll::Pending
+                }
+                _ => SubscriptionConnectPoll::Pending,
+            });
+        }
+        let Some(slot) = (0..catalog.definitions.len()).find(|&slot| {
+            catalog.definitions[slot].ddl_state == CatalogDdlState::Absent
+                && catalog.connects[slot].idle()
+        }) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many subscriptions (limit {})",
+                catalog.definitions.len()
+            ));
+        };
+        catalog.connects[slot] = SubscriptionConnect {
+            state: SubscriptionConnectState::Requested {
+                owner,
+                step: SubscriptionConnectStep::Discover,
+            },
+            request: Some(request),
+            tables: 0,
+            missing: 0,
+            overflow: false,
+        };
+        Ok(SubscriptionConnectPoll::Pending)
+    }
+
+    /// The publisher tables and missing publications (by position) the
+    /// finished discovery of connect slot `slot` found; an error when they
+    /// name more tables than a subscription holds.
+    pub(crate) fn subscription_connect_result<T>(
+        &self,
+        slot: usize,
+        visit: impl FnOnce(&[PublisherTable], u64) -> T,
+    ) -> Result<T, SqlError> {
+        let catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let capacity = catalog.connect_tables.len() / catalog.connects.len().max(1);
+        let connect = catalog.connects[slot];
+        if connect.overflow {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription relation catalog exhausted its startup capacity"
+            ));
+        }
+        Ok(visit(
+            &catalog.connect_tables[slot * capacity..slot * capacity + connect.tables],
+            connect.missing,
+        ))
+    }
+
+    /// The number of subscription catalog slots, fixed at startup.
+    #[cfg(test)]
+    pub(crate) fn subscription_catalog_capacity(&self) -> usize {
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .definitions
+            .len()
+    }
+
+    /// Ends `owner`'s publisher connection once its statement took the
+    /// outcome.
+    pub(crate) fn release_subscription_connect(&self, owner: SlotDropOwner) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        for connect in catalog.connects.iter_mut() {
+            if connect.owner() == Some(owner) {
+                *connect = SubscriptionConnect::EMPTY;
+            }
+        }
+    }
+
+    /// The connect step the server must start on `slot`'s worker now.
+    pub(crate) fn start_subscription_connect(
+        &self,
+        slot: usize,
+    ) -> Option<(SubscriptionConnectStep, SubscriptionConnectRequest)> {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let connect = &mut catalog.connects[slot];
+        let SubscriptionConnectState::Requested { owner, step } = connect.state else {
+            return None;
+        };
+        connect.state = SubscriptionConnectState::Running {
+            owner: Some(owner),
+            step,
+        };
+        Some((
+            step,
+            connect
+                .request
+                .expect("a requested connect has its request"),
+        ))
+    }
+
+    /// Whether `slot`'s worker runs, or must keep idle for, a connect step.
+    pub(crate) fn subscription_connect_pending(&self, slot: usize) -> bool {
+        !self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .connects[slot]
+            .idle()
+    }
+
+    /// Records a publisher table the running discovery of `slot` found; one
+    /// beyond the subscription's capacity marks the discovery overflowed.
+    pub(crate) fn record_subscription_connect_table(&self, slot: usize, table: PublisherTable) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let capacity = catalog.connect_tables.len() / catalog.connects.len().max(1);
+        let count = catalog.connects[slot].tables;
+        if count == capacity {
+            catalog.connects[slot].overflow = true;
+            return;
+        }
+        catalog.connect_tables[slot * capacity + count] = table;
+        catalog.connects[slot].tables = count + 1;
+    }
+
+    /// Records the publisher tables CREATE SUBSCRIPTION found as the new
+    /// subscription's relations in `state`, pending until `txid` commits.
+    pub(crate) fn add_created_subscription_relations(
+        &mut self,
+        slot: usize,
+        tables: &[usize],
+        state: SubscriptionRelationState,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let subscription = catalog.definitions[slot];
+        for &table_slot in tables {
+            if table_slot > usize::from(u16::MAX) {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subscription relation table identity exceeds its fixed range"
+                ));
+            }
+            if catalog.relations.iter().any(|relation| {
+                relation.ddl_state.visible_to(txid)
+                    && relation.subscription_created_at == subscription.created_at
+                    && relation.table_slot() == table_slot
+            }) {
+                continue;
+            }
+            let relation = catalog
+                .relations
+                .iter_mut()
+                .find(|relation| relation.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "subscription relation catalog exhausted its startup capacity"
+                    )
+                })?;
+            *relation = SubscriptionRelation {
+                subscription_created_at: subscription.created_at,
+                definition_generation: subscription.definition_generation,
+                table_slot: table_slot as u16,
+                state,
+                synchronization_lsn: 0,
+                ddl_state: CatalogDdlState::PendingCreate { txid },
+            };
+        }
+        catalog.definitions[slot].pending_relation_refresh = Some(txid);
+        Ok(())
+    }
+
+    /// Records the requested publications the publisher lacks, by position.
+    pub(crate) fn record_subscription_connect_missing(&self, slot: usize, missing: u64) {
+        self.subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned")
+            .connects[slot]
+            .missing = missing;
+    }
+
+    /// Records a running connect step's outcome for its owner, or forgets the
+    /// connection when the owner abandoned it.
+    pub(crate) fn finish_subscription_connect(
+        &self,
+        slot: usize,
+        failure: Option<SlotDropFailure>,
+    ) {
+        let mut catalog = self
+            .subscription_catalog
+            .lock()
+            .expect("subscription catalog lock poisoned");
+        let connect = &mut catalog.connects[slot];
+        *connect = match connect.state {
+            SubscriptionConnectState::Running {
+                owner: Some(owner),
+                step,
+            } => SubscriptionConnect {
+                state: SubscriptionConnectState::Finished {
+                    owner,
+                    step,
+                    failure,
+                },
+                ..*connect
+            },
+            _ => SubscriptionConnect::EMPTY,
+        };
     }
 
     pub(crate) fn rollback_subscription_create(&mut self, slot: usize) {
@@ -46389,6 +46800,7 @@ impl Storage {
         stream: SubscriptionStream,
         schema: &str,
         table: &str,
+        state: SubscriptionRelationState,
         txid: u32,
     ) -> Result<usize, SqlError> {
         let table_slot = self.find_visible(schema, table, txid).ok_or_else(|| {
@@ -46409,13 +46821,14 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, txid)
+        Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, state, txid)
     }
 
     fn stage_subscription_relation_in(
         catalog: &mut SubscriptionCatalog,
         stream: SubscriptionStream,
         table_slot: usize,
+        state: SubscriptionRelationState,
         txid: u32,
     ) -> Result<usize, SqlError> {
         catalog
@@ -46458,7 +46871,7 @@ impl Storage {
             subscription_created_at: stream.created_at,
             definition_generation: stream.definition_generation,
             table_slot: table_slot as u16,
-            state: SubscriptionRelationState::DataCopy,
+            state,
             synchronization_lsn: 0,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -46493,7 +46906,7 @@ impl Storage {
             .expect("subscription catalog lock poisoned");
         catalog.definitions[stream.slot].pending_relation_refresh = Some(0);
         if let Err(error) =
-            Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, 0)
+            Self::stage_subscription_relation_in(&mut catalog, stream, table_slot, state, 0)
         {
             catalog.definitions[stream.slot].pending_relation_refresh = None;
             return Err(error);

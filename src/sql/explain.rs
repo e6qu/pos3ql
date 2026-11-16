@@ -1887,7 +1887,9 @@ fn scan_filters<'a>(
                 let context = crate::sql::catalog::deparse::Context {
                     storage,
                     txid,
-                    table: relation.table,
+                    table: relation
+                        .table
+                        .map(|table| table as &dyn crate::sql::catalog::deparse::DeparseTable),
                     parameters: &[],
                     joined: &joined,
                     pretty: false,
@@ -5717,6 +5719,7 @@ fn plan_pulled_select<'a>(
             statement.items,
             statement.order_by,
             arena,
+            outer,
         )?
     } else {
         None
@@ -11427,7 +11430,7 @@ fn plan_merge<'a, 'e>(
     target_scan.set_output(lists.as_ref().map(|lists| lists.scans[0]));
     let source_scan = match source_slot {
         Some(slot) => {
-            let definition = joined[1].table().expect("a table source");
+            let definition = &storage.table_def(slot, txid);
             let mut scan = physical_scan_node(
                 storage,
                 slot,
@@ -12624,7 +12627,20 @@ fn plan_statement_nodes<'a>(
 ) -> Result<Plan<'a>, SqlError> {
     // The planner plans the statement its constant folding produced, and
     // raises the folding's notices and errors (`eval_const_expressions`).
-    let statement = fold_statement(storage, txid, statement, arena)?;
+    // PostgreSQL's folding also replaces a call of a SQL function whose body
+    // is one plain expression by that expression (`inline_function`), which
+    // then prints, costs, estimates and matches index keys in its place;
+    // pos3ql plans the call itself, so it refuses such a statement.
+    let (statement, inlinable) = crate::sql::eval::folding_inlinable_calls(|| {
+        fold_statement(storage, txid, statement, arena)
+    });
+    let statement = statement?;
+    if inlinable {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a call of a SQL function PostgreSQL inlines is not supported"
+        ));
+    }
     if block != BlockId::ROOT {
         return plan_folded_statement(storage, txid, statement, block, arena);
     }

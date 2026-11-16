@@ -1,6 +1,6 @@
 //! SQL inlining analyzes type inputs before deciding whether to inline a body.
 
-pub(super) mod inline;
+pub(crate) mod inline;
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql_err;
@@ -881,6 +881,13 @@ impl Engine {
                 )?,
                 None => expression,
             };
+            let expression = query::bind_expression_wildcards(
+                expression,
+                &self.storage,
+                transaction,
+                arena,
+                row,
+            )?;
             let mark = arena.mark();
             let captured = query::visit_planner_expression(
                 expression,
@@ -919,6 +926,13 @@ impl Engine {
                     )?,
                     None => statement,
                 };
+                let statement = query::bind_variable_wildcards(
+                    statement,
+                    &self.storage,
+                    transaction,
+                    arena,
+                    row,
+                )?;
                 let captured = capture_planner_inputs(
                     statement,
                     Some(row),

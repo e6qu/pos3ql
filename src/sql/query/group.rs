@@ -833,7 +833,7 @@ pub(super) fn grouped_rows<'a>(
     // A star in a grouped select stands for its columns: expand it so each
     // expanded column is validated (and projected) like a written one —
     // PostgreSQL accepts `SELECT * FROM t GROUP BY a, b, c`.
-    let statement = expand_grouped_stars(statement, scope, storage, txid, arena)?;
+    let statement = expand_grouped_stars(statement, scope, outer, storage, txid, arena)?;
     check_grouped_columns(statement, scope, agg_nodes)?;
 
     let expressions: &mut [&Expr] = arena
@@ -937,6 +937,7 @@ pub(super) fn grouped_rows<'a>(
             storage,
             txid,
             &order_arr[..k],
+            outer,
         )?;
         // The sort key evaluates against the group, so it faces the same
         // grouping rule as a select item (42803, not a missing-column error).
@@ -1177,6 +1178,7 @@ pub(super) fn grouped_select<'a>(
                 arena,
                 storage,
                 txid,
+                None,
             ) {
                 Ok(expression) => expression,
                 Err(error) => return sql_fail(error),
@@ -1255,6 +1257,7 @@ pub(super) fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool 
 fn expand_grouped_stars<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1313,7 +1316,7 @@ fn expand_grouped_stars<'a>(
                 let mut error = None;
                 let resolver = super::CatalogScopeCols {
                     scope,
-                    outer: None,
+                    outer,
                     storage,
                     txid,
                     arena,
@@ -1395,7 +1398,7 @@ pub(super) fn validate_grouped_columns<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    let statement = expand_grouped_stars(statement, scope, storage, txid, arena)?;
+    let statement = expand_grouped_stars(statement, scope, None, storage, txid, arena)?;
     check_grouped_columns(statement, scope, agg_nodes)
 }
 

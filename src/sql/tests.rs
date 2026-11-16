@@ -17574,10 +17574,12 @@ fn extended_statistics_drive_plans_and_follow_schema_evolution() {
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
     );
+    // PostgreSQL estimates conditions on two keys of a statistics object
+    // from it, which the access model leaves out: EXPLAIN refuses them.
     assert!(
-        data_rows(&explained)
-            .iter()
-            .any(|line| line.contains("rows=10")),
+        String::from_utf8_lossy(&explained).contains(
+            "EXPLAIN of a scan of one table with conditions a statistics object estimates is not supported"
+        ),
         "{}",
         String::from_utf8_lossy(&explained)
     );
@@ -18813,7 +18815,12 @@ impl ConfiguredTransactionSession {
         let _ = query::take_arena_full_location();
         let _ = sequence::take_replay_error_diagnostic();
         let _ = crate::mem::arena::take_last_allocation_failure();
-        let status = self.execute_status(engine, sql, fixed_memory);
+        let mut status = self.execute_status(engine, sql, fixed_memory);
+        while matches!(status, ExecutionStatus::Blocked { .. })
+            && answer_subscription_connects(engine)
+        {
+            status = self.execute_status(engine, sql, fixed_memory);
+        }
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
     }
@@ -20043,21 +20050,45 @@ fn run_with_guc(
     let arena = Arena::new(budget, "sql", arena_bytes).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
-    let mut responder = Responder::new(&mut buffer);
-    let status = engine
-        .execute_simple(
-            sql_text,
-            &arena,
-            &mut txn,
-            &mut pool,
-            &mut test_cursors(budget),
-            guc,
-            &mut responder,
-            1,
-        )
-        .unwrap();
+    let mut cursors = test_cursors(budget);
+    let mut status;
+    loop {
+        buffer.clear();
+        let mut responder = Responder::new(&mut buffer);
+        status = engine
+            .execute_simple(
+                sql_text,
+                &arena,
+                &mut txn,
+                &mut pool,
+                &mut cursors,
+                guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+        if !(matches!(status, ExecutionStatus::Blocked { .. })
+            && answer_subscription_connects(engine))
+        {
+            break;
+        }
+    }
     finish_test_request(engine, &mut txn, guc, status);
     buffer.readable().to_vec()
+}
+
+/// Answers the publisher steps CREATE SUBSCRIPTION waits for as a publisher
+/// whose publications exist and publish no tables would: `true` when one
+/// was waiting, so the statement can run again.
+fn answer_subscription_connects(engine: &mut Engine) -> bool {
+    let mut answered = false;
+    for slot in 0..engine.storage.subscription_catalog_capacity() {
+        if engine.start_subscription_connect(slot).is_some() {
+            engine.finish_subscription_connect(slot, None);
+            answered = true;
+        }
+    }
+    answered
 }
 
 fn run_with_session(
@@ -55337,7 +55368,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 }
 
 #[test]
-fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
+fn explain_refuses_conditions_estimated_by_joint_statistics() {
     let mut config = test_config("correlated-composite-explain");
     config.wal_buffer_bytes = 1 << 20;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
@@ -55357,15 +55388,24 @@ fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let rows = data_rows(&run_with(
+    // Equalities on both keys are estimated from the object's MCV list and
+    // dependencies, which the access model leaves out; one key alone is not.
+    let both = run_with(
         &mut engine,
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
-    ));
-    assert!(
-        rows.iter().any(|row| row.contains("rows=100 ")),
-        "joint NDV=10 must estimate the 100 correlated matches instead of multiplying two 0.1 estimates: {rows:?}"
     );
+    assert!(
+        String::from_utf8_lossy(&both).contains("conditions a statistics object estimates"),
+        "{}",
+        String::from_utf8_lossy(&both)
+    );
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1",
+    ));
+    assert!(rows.iter().any(|row| row.contains("rows=100 ")), "{rows:?}");
 }
 
 #[test]
@@ -79304,6 +79344,83 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
         "checkpoint recovery must retain table synchronization state"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
+    let config = test_config("subscription-create-connect");
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let create = "CREATE SUBSCRIPTION connected CONNECTION \
+                  'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+                  PUBLICATION changes, absent";
+    session.success(&mut engine, "BEGIN", false);
+    let refused = session.execute_status(&mut engine, create, false);
+    assert_eq!(refused, ExecutionStatus::Complete);
+    assert!(
+        String::from_utf8_lossy(session.send.readable()).contains(
+            "C25001\0MCREATE SUBSCRIPTION ... WITH (create_slot = true) cannot run inside a transaction block"
+        )
+    );
+    session.success(&mut engine, "ROLLBACK", false);
+    let discover =
+        |session: &mut ConfiguredTransactionSession, engine: &mut Engine, table: &str| {
+            let status = session.execute_status(engine, create, false);
+            assert!(
+                matches!(status, ExecutionStatus::Blocked { .. }),
+                "{status:?}"
+            );
+            let slot = (0..config.max_subscriptions)
+                .find(|slot| engine.subscription_connect_pending(*slot))
+                .expect("the waiting CREATE asked for its publisher");
+            let (step, request) = engine.start_subscription_connect(slot).unwrap();
+            assert_eq!(step, crate::storage::SubscriptionConnectStep::Discover);
+            assert_eq!(request.publication_count, 2);
+            engine.record_subscription_connect_missing(slot, 0b10);
+            engine.record_subscription_connect_table(
+                slot,
+                crate::storage::PublisherTable {
+                    schema: crate::storage::SqlName::parse("public").unwrap(),
+                    name: crate::storage::SqlName::parse(table).unwrap(),
+                },
+            );
+            engine.finish_subscription_connect(slot, None);
+            slot
+        };
+    // A published table missing locally fails before any slot is created.
+    discover(&mut session, &mut engine, "items");
+    let missing = String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
+    assert!(
+        missing.contains("Mpublication \"absent\" does not exist on the publisher")
+            && missing.contains("C42P01\0Mrelation \"public.items\" does not exist"),
+        "{missing}"
+    );
+    session.success(&mut engine, "CREATE TABLE items (id int)", false);
+    let slot = discover(&mut session, &mut engine, "items");
+    let status = session.execute_status(&mut engine, create, false);
+    assert!(
+        matches!(status, ExecutionStatus::Blocked { .. }),
+        "{status:?}"
+    );
+    let (step, request) = engine.start_subscription_connect(slot).unwrap();
+    assert_eq!(step, crate::storage::SubscriptionConnectStep::CreateSlot);
+    assert_eq!(request.slot.as_str(), "connected");
+    engine.finish_subscription_connect(slot, None);
+    let created = String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
+    assert!(
+        created.contains("Mcreated replication slot \"connected\" on publisher")
+            && created.contains("CREATE SUBSCRIPTION"),
+        "{created}"
+    );
+    let states = String::from_utf8_lossy(&session.success(
+        &mut engine,
+        "SELECT srrelid::regclass::text, srsubstate FROM pg_subscription_rel",
+        false,
+    ))
+    .to_string();
+    assert!(states.contains("items") && states.contains('i'), "{states}");
+    assert!(!engine.subscription_connect_pending(slot));
 }
 
 #[test]

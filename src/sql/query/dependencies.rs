@@ -4156,7 +4156,17 @@ fn collect_routine_dependencies<'a>(
                 *from
             };
             let bound = context.bound_from(&from, storage, txid, ctes, arena)?;
-            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
+            // A routine's variables are the levels around a stored body's query.
+            let outer = context.transition.map(super::scope::ResolverColumns);
+            let scope = super::QueryScope::resolve_schema(
+                storage,
+                &bound,
+                txid,
+                arena,
+                outer
+                    .as_ref()
+                    .map(|outer| outer as &dyn crate::sql::eval::ColumnLookup<'_>),
+            )?;
             let resolver = DependencyTypes {
                 hidden: None,
                 merge_condition: false,

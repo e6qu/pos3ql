@@ -1370,10 +1370,16 @@ else
   stop_pos3ql "$SERVER_PID"
   start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
   SERVER_PID=$START_PID
-  sleep 0.3
-  mismatch_count_restarted=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
-  if [[ "$mismatch_count" == "1" && "$mismatch_count_after" == "1" && "$mismatch_count_restarted" == "1" ]]; then
-    ok "subscription schema failure is actionable, durable, and not retried"
+  # Like PostgreSQL's table synchronization, the restarted worker tries the
+  # copy again and reports the same failure.
+  mismatch_count_restarted=0
+  for _ in {1..100}; do
+    mismatch_count_restarted=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
+    [[ "$mismatch_count_restarted" == "2" ]] && break
+    sleep 0.1
+  done
+  if [[ "$mismatch_count" == "1" && "$mismatch_count_after" == "1" && "$mismatch_count_restarted" == "2" ]]; then
+    ok "subscription schema failure is actionable and reported again after restart"
   else
     bad "subscription schema failure persistence (counts $mismatch_count/$mismatch_count_after/$mismatch_count_restarted)"
     tail -60 "$WORK/server.log"

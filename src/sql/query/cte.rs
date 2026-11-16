@@ -3731,6 +3731,7 @@ pub(crate) fn filter_view_rows<'a>(
                 storage,
                 txid,
                 "view output",
+                None,
             )?)
             .map_err(|_| arena_full())?;
         names
@@ -3799,6 +3800,7 @@ pub(crate) fn filter_view_rows<'a>(
                     storage,
                     txid,
                     "DISTINCT ON",
+                    None,
                 )? == **expression;
             }
             safe_columns[index] &= in_distinct;
@@ -9603,7 +9605,7 @@ fn rewrite_stored_type_name<'a>(
         return Ok(type_name);
     };
     let Some((class, reference, array)) = stored_type_reference(type_name, dependencies) else {
-        return Ok(type_name);
+        return rewrite_stored_row_type_name(type_name, dependencies, context, arena);
     };
     let (schema, name) = match class {
         crate::storage::DependencyClass::Domain => {
@@ -9657,6 +9659,39 @@ fn rewrite_stored_type_name<'a>(
         crate::stack_format!(192, "{}.{}[]", schema.as_str(), name.as_str())
     } else {
         crate::stack_format!(192, "{}.{}", schema.as_str(), name.as_str())
+    };
+    arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
+}
+
+/// A relation's row type, which shares the relation's name and schema, is
+/// bound through the relation the text was written against: renamed with
+/// it, and found whatever the search path.
+fn rewrite_stored_row_type_name<'a>(
+    type_name: &'a str,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let (bare, array) = type_name
+        .strip_suffix("[]")
+        .map_or((type_name, false), |bare| (bare, true));
+    let (referenced_schema, referenced_name) = bare.split_once('.').unwrap_or(("", bare));
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        matches!(
+            dependency.class,
+            crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+        ) && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    }) else {
+        return Ok(type_name);
+    };
+    let bound = context
+        .storage
+        .rebound_stored_query_dependency(*dependency, context.txid)?;
+    let rendered = if array {
+        crate::stack_format!(192, "{}.{}[]", bound.schema.as_str(), bound.name.as_str())
+    } else {
+        crate::stack_format!(192, "{}.{}", bound.schema.as_str(), bound.name.as_str())
     };
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }

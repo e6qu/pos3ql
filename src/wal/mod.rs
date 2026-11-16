@@ -2033,6 +2033,7 @@ pub(crate) enum WalOp<'a> {
         definition_generation: u64,
         schema: &'a str,
         table: &'a str,
+        state: crate::storage::SubscriptionRelationState,
     },
     FailSubscription {
         name: &'a str,
@@ -4087,7 +4088,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             table,
             ..
-        } => 1 + name.len() + 8 + 8 + 1 + schema.len() + 1 + table.len(),
+        } => 1 + name.len() + 8 + 8 + 1 + schema.len() + 1 + table.len() + 1,
         WalOp::FailSubscription { name, message, .. } => {
             1 + name.len() + 8 + 8 + 5 + 1 + message.len()
         }
@@ -5934,12 +5935,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             definition_generation,
             schema,
             table,
+            state,
         } => {
             name_bytes(buffer, name)
                 && buffer.append(&created_at.to_le_bytes())
                 && buffer.append(&definition_generation.to_le_bytes())
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
+                && buffer.append(&[state.code()])
         }
         WalOp::FailSubscription {
             name,
@@ -9837,12 +9840,15 @@ fn decode_op_inner<'a>(
             at += 8;
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
+            let state = crate::storage::SubscriptionRelationState::from_code(*payload.get(at)?)?;
+            at += 1;
             (at == payload.len()).then_some(WalOp::AddSubscriptionRelation {
                 name,
                 created_at,
                 definition_generation,
                 schema,
                 table,
+                state,
             })
         }),
         KIND_FAIL_SUBSCRIPTION => decode_large_op(|| {

@@ -515,7 +515,9 @@ pub(super) fn rule_definition<'a>(
                     txid: transaction,
                     arena,
                     dependencies: None,
-                    table: relation_table.as_deref(),
+                    table: relation_table
+                        .as_deref()
+                        .map(|table| table as &dyn crate::sql::catalog::deparse::DeparseTable),
                     parameters: &[],
                     joined: &joined,
                     pretty,

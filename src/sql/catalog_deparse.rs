@@ -14,7 +14,34 @@ use super::{Arena, SqlError, Storage, arena_full, write_identifier};
 use crate::mem::arena::ArenaString;
 use crate::sql::ast::{BinaryOp, CallKind, Expr, UnaryOp};
 use crate::sql::types::{ColType, oid};
-use crate::storage::TableDef;
+use crate::storage::{ColumnMeta, DefinitionBacking, TableDefinition};
+
+/// The relation whose columns an expression names, stored or still being
+/// defined by its statement (a CHECK compared before the table exists).
+pub(crate) trait DeparseTable {
+    fn schema_name(&self) -> &str;
+    fn table_name(&self) -> &str;
+    fn columns(&self) -> &[ColumnMeta];
+    fn column_index(&self, name: &str) -> Option<usize>;
+}
+
+impl<B: DefinitionBacking> DeparseTable for TableDefinition<B> {
+    fn schema_name(&self) -> &str {
+        self.schema.as_str()
+    }
+
+    fn table_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn columns(&self) -> &[ColumnMeta] {
+        TableDefinition::columns(self)
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        TableDefinition::column_index(self, name)
+    }
+}
 use core::fmt::Write;
 
 #[path = "catalog_deparse_operators.rs"]
@@ -45,7 +72,7 @@ pub(crate) struct Context<'s> {
     /// The catalog identities a stored query captured at CREATE, which its
     /// nested queries' names are bound to.
     pub dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
-    pub table: Option<&'s TableDef>,
+    pub table: Option<&'s dyn DeparseTable>,
     /// Named parameters of the routine whose body or default is printed.
     pub parameters: &'s [crate::storage::RoutineParameterDef],
     /// The FROM items of a view, by exposed name. Column references are
@@ -116,7 +143,7 @@ pub(crate) struct Joined<'s> {
 /// The columns of a FROM item.
 #[derive(Clone, Copy)]
 pub(crate) enum Columns<'s> {
-    Table(&'s TableDef),
+    Table(&'s dyn DeparseTable),
     Derived(&'s [Column<'s>]),
 }
 
@@ -168,7 +195,7 @@ pub(crate) fn printed_name(name: &str) -> &str {
 }
 
 impl<'s> Joined<'s> {
-    pub(crate) fn new(name: &'s str, table: &'s TableDef) -> Self {
+    pub(crate) fn new(name: &'s str, table: &'s dyn DeparseTable) -> Self {
         Self {
             name,
             printed: printed_name(name),
@@ -183,7 +210,7 @@ impl<'s> Joined<'s> {
     }
 
     /// A rule's `OLD` or `NEW` row in a rule action.
-    pub(crate) fn rule_row(name: &'s str, table: &'s TableDef) -> Self {
+    pub(crate) fn rule_row(name: &'s str, table: &'s dyn DeparseTable) -> Self {
         Self {
             unqualified: false,
             ..Self::new(name, table)
@@ -206,7 +233,7 @@ impl<'s> Joined<'s> {
     }
 
     /// The table definition of a physical item.
-    pub(crate) fn table(&self) -> Option<&'s TableDef> {
+    pub(crate) fn table(&self) -> Option<&'s dyn DeparseTable> {
         match self.columns {
             Columns::Table(table) => Some(table),
             Columns::Derived(_) => None,
@@ -578,7 +605,7 @@ impl Context<'_> {
         let Some(table) = self.table else {
             return Ok(None);
         };
-        if qualifier.is_some_and(|qualifier| qualifier != table.name.as_str()) {
+        if qualifier.is_some_and(|qualifier| qualifier != table.table_name()) {
             return Ok(None);
         }
         let Some(column) = table
@@ -630,7 +657,7 @@ impl Context<'_> {
             || self.joined_source(qualifier, name).is_some()
             || self.system_column(qualifier, name).is_some()
             || self.table.is_some_and(|table| {
-                qualifier.is_none_or(|qualifier| qualifier == table.name.as_str())
+                qualifier.is_none_or(|qualifier| qualifier == table.table_name())
                     && table.column_index(name).is_some()
             })
     }
@@ -726,9 +753,9 @@ impl Context<'_> {
         };
         if self.joined.is_empty() {
             let table = self.table?;
-            return (name == table.name.as_str() && !(bare && table.column_index(name).is_some()))
+            return (name == table.table_name() && !(bare && table.column_index(name).is_some()))
                 .then(|| RowSource {
-                    printed: table.name.as_str(),
+                    printed: table.table_name(),
                     columns: Columns::Table(table),
                     row_type: self.row_type(table),
                 });
@@ -756,9 +783,9 @@ impl Context<'_> {
         })
     }
 
-    fn row_type(&self, table: &TableDef) -> Option<i32> {
+    fn row_type(&self, table: &dyn DeparseTable) -> Option<i32> {
         self.storage
-            .find_visible(table.schema.as_str(), table.name.as_str(), self.txid)
+            .find_visible(table.schema_name(), table.table_name(), self.txid)
             .map(|slot| super::table_row_type_oid(self.storage, slot, false))
     }
 
@@ -3005,7 +3032,7 @@ pub(crate) fn rule_action_definition<'a>(
         txid,
         arena,
         dependencies: None,
-        table: target_table,
+        table: target_table.map(|table| table as &dyn DeparseTable),
         parameters: &[],
         joined,
         pretty,
@@ -3032,16 +3059,17 @@ pub(crate) fn rule_action_definition<'a>(
         }
         relation
     };
-    let column_type = |table: &TableDef, name: &str| -> Result<Option<i32>, SqlError> {
-        match table
-            .columns()
-            .iter()
-            .find(|column| column.name.as_str() == name)
-        {
-            Some(column) => super::catalog_column_type_oid(storage, column, txid).map(Some),
-            None => Ok(None),
-        }
-    };
+    let column_type =
+        |table: &crate::storage::TableDef, name: &str| -> Result<Option<i32>, SqlError> {
+            match table
+                .columns()
+                .iter()
+                .find(|column| column.name.as_str() == name)
+            {
+                Some(column) => super::catalog_column_type_oid(storage, column, txid).map(Some),
+                None => Ok(None),
+            }
+        };
     let condition = |output: &mut Output<'_>, condition: Option<&Expr<'_>>| {
         if let Some(condition) = condition {
             output.keyword(" WHERE ", -8, 8, 1)?;
@@ -3317,7 +3345,7 @@ fn write_targets(
                 };
                 for column in table.columns() {
                     let column = Expr::Column {
-                        qualifier: Some(table.name.as_str()),
+                        qualifier: Some(table.table_name()),
                         name: column.name.as_str(),
                     };
                     target(output, &column, None)?;
@@ -3327,4 +3355,22 @@ fn write_targets(
         }
     }
     Ok(true)
+}
+
+impl DeparseTable for crate::storage::TableDefinitionRead<'_> {
+    fn schema_name(&self) -> &str {
+        self.schema.as_str()
+    }
+
+    fn table_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn columns(&self) -> &[ColumnMeta] {
+        crate::storage::TableDef::columns(self)
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        crate::storage::TableDef::column_index(self, name)
+    }
 }

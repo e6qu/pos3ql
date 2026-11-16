@@ -198,6 +198,8 @@ pub(super) fn parse<'a>(
                 )?,
                 None => expression,
             };
+            let expression =
+                super::query::bind_expression_wildcards(expression, storage, txid, arena, row)?;
             super::query::capture_contextual_expression_type_inputs(
                 &parser, expression, storage, txid, arena, &columns, row,
             )?;
@@ -233,6 +235,8 @@ pub(super) fn parse<'a>(
                     )?,
                     None => statement,
                 };
+                let statement =
+                    super::query::bind_variable_wildcards(statement, storage, txid, arena, row)?;
                 super::query::capture_procedural_statement_type_inputs(
                     &parser, statement, storage, txid, arena, row,
                 )?;

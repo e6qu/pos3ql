@@ -482,11 +482,20 @@ publisher slot before it returns, as PostgreSQL does, and keeps the apply
 worker stopped until its transaction ends; a synchronization slot an
 interrupted initial copy left on the publisher is dropped before the copy
 starts again, as PostgreSQL's table synchronization does. `CREATE
-SUBSCRIPTION` with `connect = true` still creates its slot and copies its
-tables in the background: PostgreSQL connects during the statement, reports
-`NOTICE: created replication slot "s" on publisher` (or fails the statement),
-and records each table's `pg_subscription_rel` row at commit before per-table
-synchronization workers copy them.
+SUBSCRIPTION` with `connect = true` connects while it runs: it fails with
+PostgreSQL's `08006` when the publisher is unreachable, warns about
+publications the publisher lacks (`42704`), requires each published table
+locally (`42P01`), creates the slot with `SNAPSHOT 'nothing'` and reports
+`NOTICE: created replication slot "s" on publisher`; with `create_slot` it is
+refused in a transaction block or function (`25001`). Its tables are recorded
+in `pg_subscription_rel` at commit as `i` (`r` without `copy_data`)
+(`differential_exact/782`). Remaining: the initial copy still runs as one
+bootstrap under one synchronization slot, so a table moves from `i` to `r`
+when the whole copy commits, without PostgreSQL's per-table `d`, `f` and `s`
+states, and a publication's differing column lists for one table are
+rejected by that copy rather than by the statement. The publisher connection
+needs a numeric host, port, user, dbname and sslmode (`22023` otherwise),
+where libpq resolves names and defaults.
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
@@ -732,15 +741,27 @@ dummy relation's `Result` is as wide as the select list's expressions. An
 in heap order and reads no index; a resumed attempt reads the same order
 under the statement's snapshot. A btree's distinct keys are counted as
 `estimate_num_groups` clamps a product of columns' distinct values.
-Remaining, which `EXPLAIN` rejects with `0A000` naming the
+An index key or predicate may call a PL/pgSQL function
+(`differential_exact/755`): a utility statement that evaluates outside a
+query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
+`ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a
+call in the engine and runs again replaying the results in their order, and
+a write prepares the keys of the rows it stored as it ends, one row at a
+time. Each replay runs the statement again, so a build calling one per row
+costs time quadratic in its rows; the build also evaluates each key once to
+validate it and once more to fill the value caches, so a function's notices
+repeat. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
-methods, expression indexes over user-defined routines or types (PostgreSQL
-inlines a simple SQL function's body, `inline_function`, into the index
-expression, the query and what `EXPLAIN` prints, which pos3ql does not do
-anywhere yet; and `CREATE INDEX` cannot evaluate a PL/pgSQL function, which
-needs the resumable executor), a regular
+methods, expression indexes over user-defined routines or types, a call
+of a SQL function PostgreSQL inlines (`inline_function` puts a body of one
+plain expression in the call's place, so it prints, costs, estimates and
+matches index keys as that expression; pos3ql refuses `EXPLAIN` of any
+statement calling one), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-extended statistics, a sub-partitioned table
+conditions on two or more keys of a statistics object (ANALYZE stores
+approximations, not `statext_ndistinct_build`, `statext_dependencies_build`
+and `statext_mcv_build` over PostgreSQL's sample, and the planner does not
+apply them), a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
@@ -749,12 +770,11 @@ skip-array scan over several leaf pages. Remaining inexact without
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update
 moves (a pruned page's freed space, HOT chains), which also orders an
-index's equal keys by their current heap position. PostgreSQL 17's
-maintenance operations (`CREATE INDEX`, `ANALYZE`, `REINDEX`, `VACUUM`,
-`REFRESH MATERIALIZED VIEW`) evaluate expressions under the search path
-`pg_catalog, pg_temp`, so an error there names a domain outside it
-qualified (`value for domain public.posint violates ...`); pos3ql keeps
-the session's search path. Grouping, `DISTINCT` and joins above the scan keep the
+index's equal keys by their current heap position. Maintenance
+operations (`CREATE INDEX` and the index builds of `ALTER TABLE`,
+`REINDEX`, `ANALYZE`, materialized view population) evaluate under the
+search path `pg_catalog, pg_temp`, as PostgreSQL 17's `RestrictSearchPath`
+does, after their own names resolve (`differential_exact/754`). Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM
@@ -914,9 +934,19 @@ builds then for an outer key with most-common-value statistics
 (`ExecHashBuildSkewHash`), and values it stores compressed or out of line
 (rows over about 2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
 `jsonb`, ranges, records) reports pos3ql's own table bytes. A scan's
-cost and row model covers comparisons of a column with a constant; a
-comparison with an InitPlan's output or a stable call leaves the crude
-estimate, where PostgreSQL may also choose an index scan. JSON nests as
+cost and row model covers comparisons of a column with a constant, with an
+InitPlan's output (a constant of unknown value: `var_eq_non_const` and
+`DEFAULT_INEQ_SEL`, the InitPlan's parameter usable as an index condition)
+and with a stable expression estimated from its value at planning
+(`estimate_expression_value`), whose evaluation an index scan charges once at
+startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
+Remaining there: a stable expression the model cannot evaluate (a
+user-defined function) leaves the crude estimate, and PostgreSQL's
+`min`/`max` InitPlan of a local table (`preprocess_minmax_aggregates`) and the
+cost of an implicit coercion function inside a condition (`length(name)`
+casting to `text`) are not modelled. A plain `Aggregate`'s cost is not
+PostgreSQL's `cost_agg` (its input cost plus each aggregate's transition
+function per input row): EXPLAIN shows pos3ql's own estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's
@@ -1274,15 +1304,19 @@ rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
 (`differential_exact/746`); other operators still compare every pair, and
 for a GiST constraint PostgreSQL names the partner its index scan finds
-first, where pos3ql names the first in heap order. Remaining: PostgreSQL
-compares merged CHECK predicates as analysed trees, so `a > 0::integer`
-and `a > 0` merge there but not here. A PL/pgSQL `record` variable (one not
-declared with a row type) expands under `(r).*` from its current value, where
-PostgreSQL reports `42809 record type has not been registered`; and inside a
-derived table (`SELECT s.a FROM (SELECT (r).*) s`) any row or record variable
-is not found (`42703`), where PostgreSQL expands a row-typed one. The
-variable's value reaches the outer statement's expansion but not the derived
-table's scope, which needs PL/pgSQL row variables in subquery analysis.
+first, where pos3ql names the first in heap order. Merged CHECK predicates
+compare in their analysed form, as PostgreSQL's `equal()` compares cooked
+trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
+operator) conflict; a predicate outside the deparser's typed coverage compares
+as parsed. A declared column merged with an inherited one at another position
+is reported as moved (`differential_exact/781`). PL/pgSQL row and record variables (a
+trigger's `NEW` and `OLD` among them) are visible to analysis at every query
+level of a statement: `(r).*`, `r.*` and `ROW(r.*)` expand a row-typed
+variable, or a record variable holding a named composite value, inside derived
+tables, `WITH` queries, set operations, grouped, `DISTINCT` and ordered levels;
+a record variable holding an anonymous record or none fails with `42809`, and
+`r.*` naming both a FROM item and a variable follows
+`plpgsql.variable_conflict` (`differential_exact/780`).
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in

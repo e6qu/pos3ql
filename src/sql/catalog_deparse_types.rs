@@ -39,7 +39,7 @@ impl ScopeTypes<'_, '_> {
             };
         }
         let table = self.context.table?;
-        if qualifier.is_some_and(|qualifier| qualifier != table.name.as_str()) {
+        if qualifier.is_some_and(|qualifier| qualifier != table.table_name()) {
             return None;
         }
         let column = table.columns().get(table.column_index(name)?)?;

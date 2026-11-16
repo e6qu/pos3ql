@@ -2660,6 +2660,12 @@ pub trait CatalogAccess {
         validate_catalog_reference_cast(source, target)
     }
 
+    /// Whether `name`, as a call names it, finds a SQL function whose call
+    /// PostgreSQL's planner may replace by its body (`inline_function`).
+    fn names_inlinable_sql_function(&self, _name: &str) -> bool {
+        false
+    }
+
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4988,6 +4994,20 @@ pub(crate) fn custom_plan_parameter<'v>(index: u32) -> Option<Datum<'v>> {
     (index < len).then(|| unsafe { *values.add(index).cast::<Datum<'v>>() })
 }
 
+std::thread_local! {
+    /// [`fold`] met a call PostgreSQL's planner may inline.
+    static INLINABLE_CALL_FOLDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `fold`, a planner folding of a statement, and reports whether it
+/// met a call of a SQL function PostgreSQL's planner may inline.
+pub(crate) fn folding_inlinable_calls<T>(fold: impl FnOnce() -> T) -> (T, bool) {
+    let prior = INLINABLE_CALL_FOLDED.with(|seen| seen.replace(false));
+    let result = fold();
+    let seen = INLINABLE_CALL_FOLDED.with(|seen| seen.replace(prior));
+    (result, seen)
+}
+
 /// How [`fold`] treats the constant subexpressions it evaluates.
 #[derive(Clone, Copy)]
 struct Folding<'c> {
@@ -5136,6 +5156,15 @@ fn fold<'a>(
             .map(|node| &*node)
             .map_err(|_| super::query::arena_full_pub())
     };
+    if let Expr::Call {
+        kind: super::ast::CallKind::Routine,
+        name,
+        ..
+    } = expression
+        && catalog.is_some_and(|catalog| catalog.names_inlinable_sql_function(name))
+    {
+        INLINABLE_CALL_FOLDED.with(|seen| seen.set(true));
+    }
     match expression {
         Expr::Null
         | Expr::Bool(_)

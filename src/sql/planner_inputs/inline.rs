@@ -912,7 +912,7 @@ fn known_null(
     })
 }
 
-pub(super) fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
+pub(crate) fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
     let [Stmt::Select(select)] = statements else {
         return None;
     };

@@ -157,6 +157,19 @@ impl Clause<'_> {
         }
     }
 
+    /// Whether the clause, or an arm of it, compares an expression, which an
+    /// expression key may hold.
+    pub(super) fn compares_expression(&self) -> bool {
+        match *self {
+            Self::Expression { .. } => true,
+            Self::Or(arms) => arms
+                .iter()
+                .flat_map(|arm| arm.iter())
+                .any(|restriction| restriction.clause.compares_expression()),
+            _ => false,
+        }
+    }
+
     /// The first shape inside the clause the model has no form for.
     pub(super) fn unmodeled(&self) -> Option<&'static str> {
         match *self {
@@ -393,6 +406,52 @@ impl<'a> Analyzer<'_, '_, 'a> {
             self.params,
             self.arena,
         )
+    }
+
+    /// Whether `expression` is an uncorrelated scalar subquery, which
+    /// PostgreSQL runs as an InitPlan whose output parameter the condition
+    /// compares: a constant whose value planning does not know.
+    fn init_plan_output(&self, expression: &'a Expr<'a>) -> Result<bool, SqlError> {
+        Ok(matches!(expression, Expr::Subquery(_))
+            && !crate::sql::query::subquery_node_correlated(
+                expression,
+                self.planner.storage,
+                self.planner.txid,
+                self.arena,
+            )?)
+    }
+
+    /// The value now of a stable expression compared with `column`: one
+    /// that reads no table column, no subquery and nothing volatile, which
+    /// `estimate_expression_value` folds for selectivity. `None` when the
+    /// model cannot evaluate it.
+    fn stable_value(&self, expression: &'a Expr<'a>, column: usize) -> Option<Datum<'a>> {
+        // A plain constant the model does not read stays unread: only a
+        // call has a value that planning folds for estimation.
+        if (expression.is_constant(false) && !expression.calls_routine())
+            || self.columns_of(expression) != 0
+            || expression.contains_subquery()
+            || expression.contains_volatile_function().is_some()
+        {
+            return None;
+        }
+        let mut reads_column = false;
+        expression.for_each_column_reference(&mut |_, _| reads_column = true);
+        if reads_column {
+            return None;
+        }
+        let value = crate::sql::eval::eval(
+            expression,
+            self.arena,
+            self.params,
+            &crate::sql::eval::NoColumns,
+        )
+        .ok()?;
+        let ctype = self.planner.column_type(column);
+        match value {
+            Datum::Null => Some(value),
+            value => crate::sql::eval::cast_to(value, ctype, self.arena).ok(),
+        }
     }
 
     /// The columns of the table `expression` reads.
@@ -649,18 +708,25 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 let Some(comparison) = Comparison::of(plain, on_left) else {
                     return Ok(Ok(other(self, "an operator other than a comparison")));
                 };
-                // A generic plan's parameter is a constant of unknown value.
-                let constant = if matches!(operand, Expr::Param(_)) && self.params.is_empty() {
+                // A generic plan's parameter, and an InitPlan's output, is a
+                // constant of unknown value; a stable expression is
+                // estimated from its value now (`estimate_expression_value`).
+                let constant = if (matches!(operand, Expr::Param(_)) && self.params.is_empty())
+                    || self.init_plan_output(operand)?
+                {
                     None
                 } else {
                     match self.constant(operand, column) {
                         Some(value) => Some(value),
-                        None => {
-                            return Ok(Ok(other(
-                                self,
-                                "a comparison with an expression that is not a constant",
-                            )));
-                        }
+                        None => match self.stable_value(operand, column) {
+                            Some(value) => Some(value),
+                            None => {
+                                return Ok(Ok(other(
+                                    self,
+                                    "a comparison with an expression that is not a constant",
+                                )));
+                            }
+                        },
                     }
                 };
                 Clause::Compare {

@@ -1522,7 +1522,7 @@ pub(crate) fn finalize_projected_row<'a>(
                 slot += scope.qualified_star_columns(q)?;
             }
             SelectItem::RecordStar(base) => {
-                slot += record_star_width(base, Some(scope), storage, txid, arena)?;
+                slot += record_star_width(base, Some(scope), outer, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
@@ -1566,6 +1566,7 @@ fn projected_collations<'a>(
     arena: &Arena,
     statement: &Select<'a>,
     scope: &QueryScope<'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<[Collation; MAX_PROJ], SqlError> {
     let mut collations = [Collation::None; MAX_PROJ];
     let mut width = 0;
@@ -1575,7 +1576,7 @@ fn projected_collations<'a>(
             SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
-                record_star_width(base, Some(scope), storage, txid, arena)?
+                record_star_width(base, Some(scope), outer, storage, txid, arena)?
             }
         };
         if width + remaining > MAX_PROJ {
@@ -1607,7 +1608,7 @@ fn projected_collations<'a>(
                     base,
                     &super::CatalogScopeCols {
                         scope,
-                        outer: None,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -1700,6 +1701,7 @@ pub(super) fn prepare_materialization<'a>(
             storage,
             txid,
             &order_exprs[..key],
+            outer,
         )?;
         key_collations[key] = scope.expression_collation(storage, arena, resolved.expression)?;
         order_exprs[key] = Some(resolved);
@@ -1713,6 +1715,7 @@ pub(super) fn prepare_materialization<'a>(
             storage,
             txid,
             &order_exprs[..n_order + index],
+            outer,
         )?;
         key_collations[n_order + index] =
             scope.expression_collation(storage, arena, resolved.expression)?;
@@ -1749,7 +1752,7 @@ pub(super) fn prepare_materialization<'a>(
             SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
-                record_star_width(base, Some(scope), storage, txid, arena)?
+                record_star_width(base, Some(scope), outer, storage, txid, arena)?
             }
             SelectItem::Expr { .. } => 1,
         };
@@ -1961,7 +1964,7 @@ pub(crate) fn materialized_rows<'a>(
     stages: &instrument::Stages,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
-    let visible_collations = projected_collations(storage, txid, arena, statement, scope)?;
+    let visible_collations = projected_collations(storage, txid, arena, statement, scope, outer)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,
@@ -1999,6 +2002,7 @@ pub(crate) fn materialized_rows<'a>(
             statement.items,
             statement.order_by,
             arena,
+            outer,
         )? {
             Some(ordered) => super::scan::ordered_indexed_candidates(
                 storage,
@@ -2595,6 +2599,7 @@ pub(crate) fn external_materialized_into<'a>(
             statement.items,
             statement.order_by,
             arena,
+            outer,
         )? {
             Some(ordered) => super::scan::ordered_indexed_candidates(
                 storage,
@@ -3292,6 +3297,7 @@ pub(crate) fn materialized_rows_into<'a>(
             arena,
             storage,
             txid,
+            outer,
         )?;
         order_collations[index] = scope.expression_collation(storage, arena, expression)?;
     }

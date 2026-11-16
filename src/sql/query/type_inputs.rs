@@ -93,6 +93,13 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
     fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
         self.row.row_variable(name)
     }
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.row.procedural_variable(qualifier, name)
+    }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)
     }

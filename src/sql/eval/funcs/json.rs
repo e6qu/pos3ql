@@ -1772,7 +1772,7 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                json::validate(text, arena)?;
+                json::validate(text)?;
                 if name.ends_with("_bytea") {
                     Ok(Datum::Bytea(text.as_bytes()))
                 } else {
@@ -1798,7 +1798,7 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                json::validate(text, arena)?;
+                json::validate(text)?;
                 Ok(Datum::Json { text, jsonb: false })
             }
             constructor if constructor.starts_with("__json_array_") => {
@@ -1938,9 +1938,9 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let parsed = match json::parse_source_order(text, arena) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(Datum::Bool(false)),
+                let unique_keys = predicate.ends_with("_unique");
+                let Some(parsed) = json::parse_predicate(text, unique_keys, arena)? else {
+                    return Ok(Datum::Bool(false));
                 };
                 let kind_matches = if predicate.contains("_scalar") {
                     !matches!(parsed, json::Json::Array(_) | json::Json::Object(_))
@@ -1951,7 +1951,7 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     true
                 };
-                let unique = !predicate.ends_with("_unique") || json::has_unique_keys(&parsed);
+                let unique = !unique_keys || json::has_unique_keys(&parsed);
                 Ok(Datum::Bool(kind_matches && unique))
             }
             "jsonb_path_exists"
@@ -2067,12 +2067,28 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
+                let not_array = |what| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "cannot get array length of a {}",
+                        what
+                    )
+                };
+                if name == "json_array_length" {
+                    // PostgreSQL counts a json array's elements without
+                    // decoding their escapes.
+                    return match json::kind_of(s) {
+                        json::Kind::Array => Ok(Datum::Int4(
+                            json::array_elements_source(s, false, arena)?.len() as i32,
+                        )),
+                        json::Kind::Object => Err(not_array("non-array")),
+                        json::Kind::Scalar => Err(not_array("scalar")),
+                    };
+                }
                 match json::parse(s, arena)? {
                     json::Json::Array(items) => Ok(Datum::Int4(items.len() as i32)),
-                    _ => Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "cannot get array length of a scalar"
-                    )),
+                    json::Json::Object(_) => Err(not_array("non-array")),
+                    _ => Err(not_array("scalar")),
                 }
             }
             // The JSON type name of the value, as PostgreSQL's json_typeof.

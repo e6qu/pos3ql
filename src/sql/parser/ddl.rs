@@ -4712,7 +4712,7 @@ impl<'a> Parser<'a> {
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
-                hint: None,
+                hint: Some("Remove UNENCRYPTED to store the password in encrypted form instead."),
                 near: None,
                 detail: None,
             });
@@ -6078,7 +6078,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
-                    detail: None,
+                    detail: Some("Valid values are between \"8\" and \"256\"."),
                 })?);
             } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
                 if options.n_distinct_per_range.is_some() {
@@ -6109,7 +6109,9 @@ impl<'a> Parser<'a> {
                             cursor: None,
                             hint: None,
                             near: None,
-                            detail: None,
+                            detail: Some(
+                                "Valid values are between \"-1.000000\" and \"2147483647.000000\".",
+                            ),
                         })?,
                 );
             } else if option.eq_ignore_ascii_case("false_positive_rate") {
@@ -6143,7 +6145,7 @@ impl<'a> Parser<'a> {
                         cursor: None,
                         hint: None,
                         near: None,
-                        detail: None,
+                        detail: Some("Valid values are between \"0.000100\" and \"0.250000\"."),
                     });
                 }
                 options.false_positive_rate = Some(raw);
@@ -6171,7 +6173,7 @@ impl<'a> Parser<'a> {
                     cursor: None,
                     hint: None,
                     near: None,
-                    detail: None,
+                    detail: Some("Valid values are between \"1\" and \"2024\"."),
                 })?);
             } else {
                 return Err(ParseError {

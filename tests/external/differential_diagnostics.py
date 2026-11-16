@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare psql data verbatim and diagnostics of every severity with their SQL source positions."""
+"""Compare psql data verbatim and diagnostics of every severity with their SQL source positions.
+
+`sqlstate` compares each diagnostic's severity and SQLSTATE, `verbose` adds
+its primary message and COPY context, and `full` adds every DETAIL, HINT,
+QUERY and CONTEXT line as well."""
 
 import argparse
 import json
@@ -15,9 +19,11 @@ START = re.compile(
     r"^(?:psql:(.+?):([0-9]+): )?(ERROR|WARNING|NOTICE|INFO|LOG|FATAL|PANIC|DEBUG[0-9]*):[ \t]*(.*)$"
 )
 AUXILIARY = re.compile(
-    r"^(?:DETAIL|HINT|QUERY|CONTEXT|LOCATION|SCHEMA NAME|TABLE NAME|COLUMN NAME|"
+    r"^(DETAIL|HINT|QUERY|CONTEXT|LOCATION|SCHEMA NAME|TABLE NAME|COLUMN NAME|"
     r"CONSTRAINT NAME|DATATYPE NAME):|^LINE [0-9]+:"
 )
+# The auxiliary fields `full` compares, each with its continuation lines.
+FULL_FIELDS = ("detail", "hint", "query", "context")
 
 
 def copy_line_positions(source, filename):
@@ -30,30 +36,40 @@ def copy_line_positions(source, filename):
     }
 
 
-def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnostics):
-    if diagnostics not in ("sqlstate", "verbose"):
+def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnostics, omit=()):
+    if diagnostics not in ("sqlstate", "verbose", "full"):
         raise ValueError(f"unknown corpus diagnostics {diagnostics}")
     if input_diagnostics not in ("sqlstate", "verbose"):
         raise ValueError(f"unknown input diagnostics {input_diagnostics}")
-    if diagnostics == "verbose" and input_diagnostics != "verbose":
-        raise ValueError("verbose comparison requires verbose input diagnostics")
+    if diagnostics != "sqlstate" and input_diagnostics != "verbose":
+        raise ValueError(f"{diagnostics} comparison requires verbose input diagnostics")
+    if omit and diagnostics != "full":
+        raise ValueError("only full comparison omits fields")
+    if any(name not in FULL_FIELDS for name in omit):
+        raise ValueError(f"unknown omitted fields {', '.join(omit)}")
     result = []
     current = None
-    auxiliary = False
-    in_context = False
+    # The auxiliary field the current line continues, or None for the
+    # primary message.
+    field = None
 
     def finish():
         if current is None:
             return
         record = {key: value for key, value in current.items()
-                  if key not in ("message", "context")}
+                  if key not in ("message", "fields")}
         if diagnostics == "verbose":
             record["message"] = "\n".join(current["message"])
-            # Other CONTEXT lines (routine frames) are not compared yet; a
-            # COPY line names the input line, column and value an error is about.
-            copy_context = [line for line in current["context"] if line.startswith("COPY ")]
+            # A COPY line names the input line, column and value an error is about.
+            copy_context = [line for line in current["fields"].get("context", [])
+                            if line.startswith("COPY ")]
             if copy_context:
                 record["copy_context"] = copy_context
+        elif diagnostics == "full":
+            record["message"] = "\n".join(current["message"])
+            for name in FULL_FIELDS:
+                if name in current["fields"] and name not in omit:
+                    record[name] = "\n".join(current["fields"][name])
         result.append(record)
 
     lines = stderr.split("\n")
@@ -81,33 +97,35 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
                 "severity": severity,
                 "sqlstate": state[1],
                 "message": message,
-                "context": [],
+                "fields": {},
             }
-            auxiliary = False
-            in_context = False
+            field = None
         elif line.startswith("psql:") or current is None:
             finish()
             current = None
             result.append({"client": line})
-        elif AUXILIARY.match(line):
-            auxiliary = True
-            in_context = line.startswith("CONTEXT:")
-            if in_context:
-                current["context"].append(line[len("CONTEXT:"):].lstrip(" "))
-            if line.startswith("LOCATION:"):
+        elif auxiliary := AUXILIARY.match(line):
+            # A cursor line and its caret line are compared through the
+            # statement's source position, not as text.
+            field = auxiliary[1].lower() if auxiliary[1] else "cursor"
+            if field in FULL_FIELDS:
+                current["fields"].setdefault(field, []).append(
+                    line[len(auxiliary[0]):].lstrip(" "))
+            if field == "location":
                 finish()
                 current = None
-        elif in_context:
-            current["context"].append(line)
-        elif not auxiliary:
+        elif field is None:
             current["message"].append(line)
+        elif field in FULL_FIELDS:
+            current["fields"][field].append(line)
     finish()
     return result
 
 
-def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output, *, input_diagnostics):
+def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output, *,
+                     input_diagnostics, omit=()):
     records = normalize_diagnostics(stderr, diagnostics, copy_positions,
-                                    input_diagnostics=input_diagnostics)
+                                    input_diagnostics=input_diagnostics, omit=omit)
     # Length framing keeps data that resembles these markers unambiguous.
     output.write(f"STDOUT {byte_count} bytes\n".encode())
     copied = 0
@@ -126,8 +144,10 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--stdout", type=Path, required=True)
     parser.add_argument("--stderr", type=Path, required=True)
-    parser.add_argument("--diagnostics", choices=("sqlstate", "verbose"), required=True)
+    parser.add_argument("--diagnostics", choices=("sqlstate", "verbose", "full"), required=True)
     parser.add_argument("--input-diagnostics", choices=("sqlstate", "verbose"), required=True)
+    parser.add_argument("--omit", action="append", default=[], choices=FULL_FIELDS,
+                        help="a full-comparison field left out, for a known difference")
     arguments = parser.parse_args()
     try:
         with arguments.stdout.open("rb") as stdout:
@@ -142,6 +162,7 @@ def main():
                 ),
                 sys.stdout.buffer,
                 input_diagnostics=arguments.input_diagnostics,
+                omit=tuple(arguments.omit),
             )
     except (OSError, ValueError) as error:
         parser.exit(1, f"FAIL: corpus transcript: {error}\n")

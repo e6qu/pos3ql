@@ -22,7 +22,6 @@ use super::datetime::{
 use super::eval::{SqlError, sqlstate};
 use super::timezone::Timezone;
 use crate::sql_err;
-use crate::util::StackStr;
 
 std::thread_local! {
     /// The session's DateStyle field order, published with its TimeZone before
@@ -115,7 +114,7 @@ impl DecodeError {
             DecodeError::MonthDayOverflow => {
                 crate::sql::eval::stash_diagnostic(
                     None,
-                    Some(StackStr::from_str(
+                    Some(crate::sql::eval::DiagnosticText::copy(
                         "Perhaps you need a different \"DateStyle\" setting.",
                     )),
                 );

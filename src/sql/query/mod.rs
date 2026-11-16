@@ -51,7 +51,8 @@ mod joined_from;
 #[cfg(test)]
 pub(crate) use joined_from::target_hash_builds;
 pub(crate) use joined_from::{
-    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, merge_join_plan,
+    JoinedFromRow, JoinedWriteJoin, JoinedWriteMethod, JoinedWritePairs, TargetHash,
+    TargetHashPlan, joined_from_match, joined_write_join, joined_write_pairs, merge_join_plan,
     recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
 mod materialize;
@@ -3274,7 +3275,7 @@ pub(crate) fn check_routine_scalar_result<'a>(
 
 /// PostgreSQL's `check_sql_stmt_retval` failure for a declared result.
 pub(crate) fn routine_result_mismatch(declared: &str, detail: &str) -> SqlError {
-    crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+    crate::sql::eval::stash_diagnostic(Some(crate::sql::eval::DiagnosticText::copy(detail)), None);
     sql_err!(
         sqlstate::INVALID_FUNCTION_DEFINITION,
         "return type mismatch in function declared to return {}",
@@ -3358,10 +3359,12 @@ pub(crate) fn parse_routine_function_program<'a>(
                 RoutinePrelude::Forbidden(name) => Some(*name),
             })
     {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{} is not yet supported in unquoted SQL function body",
-            tag
+        return Err(crate::sql::error_context::raised_before_validation(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not yet supported in unquoted SQL function body",
+                tag
+            ),
         ));
     }
     let declared = match result {
@@ -3396,6 +3399,8 @@ pub(crate) fn parse_routine_function_program<'a>(
                 RoutineFunctionResult::DataModification(statement)
             }
             RoutinePrelude::Statement(_) | RoutinePrelude::Forbidden(_) => {
+                // PostgreSQL finds this preparing the final statement.
+                crate::sql::error_context::blame_statement(count);
                 return Err(routine_result_mismatch(
                     declared,
                     ROUTINE_RESULT_STATEMENT_DETAIL,
@@ -6325,10 +6330,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "{} is not a function",
-                    name
+                return Err(super::exec::function_lookup_error(
+                    name,
+                    argument_type_oids,
+                    argument_names,
+                    super::exec::FunctionLookupFailure::IsProcedure,
+                    &super::eval::RuntimeColumnTypes {
+                        row: &super::eval::NoColumns,
+                        catalog: Some(self),
+                    },
                 ));
             }
             crate::storage::RoutineCallSelection::Absent => {
@@ -10131,16 +10141,10 @@ fn check_key_types<'a>(
             storage,
             txid,
         )?;
-        const ORDERING_HINT: &str = "Use an explicit ordering operator or modify the query.";
         if let Some(ctype) = noncomparable(target) {
-            return Err(crate::sql::error_position::at_expression_with_hint(
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "could not identify an ordering operator for type {}",
-                    ctype.name()
-                ),
+            return Err(crate::sql::error_position::at_expression(
+                crate::sql::error_position::missing_ordering_operator(&ctype.name()),
                 order.expression,
-                ORDERING_HINT,
             ));
         }
         if unordered_cid(target) {
@@ -10154,14 +10158,9 @@ fn check_key_types<'a>(
             } else {
                 "cid"
             };
-            return Err(crate::sql::error_position::at_expression_with_hint(
-                sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "could not identify an ordering operator for type {}",
-                    type_name
-                ),
+            return Err(crate::sql::error_position::at_expression(
+                crate::sql::error_position::missing_ordering_operator(&type_name),
                 order.expression,
-                ORDERING_HINT,
             ));
         }
     }
@@ -10208,10 +10207,8 @@ fn check_aggregate_key_types<'a>(
             if let Some(ctype) =
                 type_of(order.expression).filter(|ctype| !ctype.has_builtin_ordering())
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "could not identify an ordering operator for type {}",
-                    ctype.name()
+                return Err(crate::sql::error_position::missing_ordering_operator(
+                    &ctype.name(),
                 ));
             }
         }
@@ -10794,7 +10791,7 @@ pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
             );
             super::eval::stash_diagnostic(
                 None,
-                Some(crate::util::StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "Use the COLLATE clause to set the collation explicitly.",
                 )),
             );
@@ -14366,10 +14363,8 @@ pub(crate) fn constant_select_resumable<'a>(
         if let Some(ctype) = key_type.and_then(ColType::from_oid)
             && !ctype.has_builtin_ordering()
         {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "could not identify an ordering operator for type {}",
-                ctype.name()
+            return sql_fail(crate::sql::error_position::missing_ordering_operator(
+                &ctype.name(),
             ));
         }
     }

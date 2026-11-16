@@ -1,0 +1,6 @@
+# Exact-error fixtures whose DETAIL, HINT, QUERY or CONTEXT still differ from
+# PostgreSQL 18.6, and the fields the exact phase leaves out for them until
+# PLAN.md's diagnostics item is done. Columns: fixture, fields, difference.
+162_insert_source_calls	detail	a unique index built over duplicates names another duplicate key
+30_constraint_declaration_errors	detail	no catalog unique violation DETAIL, whose OIDs differ
+38_cursor_query_ownership	context,query	a static OPEN query's unresolved record field lacks its QUERY

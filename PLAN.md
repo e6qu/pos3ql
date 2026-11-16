@@ -733,10 +733,30 @@ right or full joins run, and print, as a `Nested Loop Right Join` or
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
 can differ from PostgreSQL's cost-based order. The executor has no merge
 join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
-pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
-USING` hash their first FROM table when it is joined to the target by
-equality, as a `SELECT` of the two tables would, and join later FROM items to
-it in nested loops; PostgreSQL may instead hash the joined FROM items. A statement
+pos3ql shows the hash join or nested loop it runs. An `UPDATE ... FROM` or
+`DELETE ... USING` of one plain FROM table, with both relations analyzed,
+local, without row security and without an index on a column its conditions
+read, runs and prints the join PostgreSQL's costs pick
+(`differential_exact/670`-`672`): it costs both orders of a hash join on the
+column equalities between the relations (`initial_cost_hashjoin`,
+`final_cost_hashjoin` with `estimate_hash_bucketsize`) and of a nested loop
+rescanning its inner relation or a `Materialize` of it, from each scan's
+pages, rows and filter, and keeps the cheapest as `add_path` does (fuzzily
+equal paths by startup cost, then the first generated). A relation's rows
+under its own conditions are those the conditions keep, which PostgreSQL's
+statistics estimate; a relation whose rolled-back or deleted rows grew its
+heap since `ANALYZE` is estimated by PostgreSQL from its current size, which
+pos3ql does not model. Each relation's scan filters by its own conjuncts,
+the hash join checks the equalities and the join filter the rest; the join
+returns its rows in the plan's order and each target row changes on its
+first join row, with that row's FROM row, so triggers and `RETURNING` see
+PostgreSQL's order. Other joined writes (several FROM items, a derived
+table, a FROM table with column aliases, an equality between expressions
+rather than columns, a condition reading a routine's variable or calling a
+function, relations without statistics, a nested loop on an equality)
+hash their first FROM table when it is joined to the target by equality,
+as a `SELECT` of the two tables would, and join later FROM items to it in
+nested loops; PostgreSQL may instead hash the joined FROM items. A statement
 rewrite rules change is explained as every query PostgreSQL's rewriter
 produces, each rule action rewritten again by its target's rules; a rule
 action of several `VALUES` rows over a statement's query, several rows or
@@ -907,9 +927,14 @@ computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
 scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
-ANALYZE` of a joined `UPDATE` or `DELETE` fails with `0A000`: the executor
-does not count their join's rows, as it probes the FROM rows for each
-target row and checks every condition per pair. A statement that runs again after an attempt stopped for a call counts each
+ANALYZE` of a joined `UPDATE` or `DELETE` counts the scans (each member's
+under an `Append`), the `Hash` with its table's size or the `Materialize`
+with its storage (`Storage: Memory  Maximum Storage`, as a `MERGE`'s
+nested loop also reports it), the join with the rows its join filter
+removed, and marks nodes that never ran (`differential_exact/670`,
+`671`); one outside the plan above fails with `0A000`, as its executor
+probes the FROM rows for each target row and checks every condition per
+pair. A statement that runs again after an attempt stopped for a call counts each
 node in the last attempt that ran it, so a data-modifying `WITH` query whose
 write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
 and scan figures. A `LIMIT` that stops `Unique`
@@ -1075,16 +1100,18 @@ table joined with other FROM items is read whole before the join (a right
 or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
-batch where PostgreSQL fetches only what the reads need. Date and time input
-and `SET TimeZone` follow PostgreSQL's decoder and its POSIX zone
-specifications. The named zones are PostgreSQL 18.6's, pinned at build, but
-their TZif contents come from `timezone_directory`, so a host's tzdata
-release, not PostgreSQL's 2026c, decides historical and future offsets. Error messages longer than 192 bytes are kept whole in the
-`error_text_bytes` pool; DETAIL and HINT text is still bounded at 12 KiB
-(`54000` past it) rather than drawing from that pool. Invalid `json` and
-`jsonb` input reports no `Token "..." is invalid.` DETAIL or `JSON data,
-line N:` CONTEXT, and a malformed array literal no DETAIL (`Unexpected end of
-input.`). COPY FROM into a foreign table queues its rows
+batch where PostgreSQL fetches only what the reads need. The exact-error
+fixtures compare every DETAIL, HINT, QUERY and CONTEXT line, except the
+fields `tests/external/exact-diagnostics-gaps.tsv` names for 3 fixtures that
+still differ: a unique index built over duplicates names the first duplicate
+pos3ql's row scan meets, where PostgreSQL names the first pair its tuplesort
+(quicksort in memory, merged runs beyond `maintenance_work_mem`) compares
+equal; a CREATE TABLE whose NOT NULL constraint repeats a CHECK constraint's
+name has no DETAIL, because the DETAIL's key names the new table's OID,
+which pos3ql assigns only after it names the constraints; and a PL/pgSQL
+`OPEN` of a static query selecting a field of an anonymous record value
+reports `could not identify column` without the query as its QUERY.
+COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup
@@ -1147,9 +1174,10 @@ partition or child ships the conditions it can to its server and shows no
 filter, or keeps every one (`differential_exact/614`). An `UPDATE ... FROM` or `DELETE ... USING`
 into such a table runs, and `EXPLAIN` prints, one join over the `Append`
 of the members pruning keeps under its own conditions (FROM items'
-columns prune nothing), its first FROM table hashed by an equality as for
-a plain target; the write lists each member and `VERBOSE` prints each
-node's list (`differential_exact/630`). A `MERGE` joins its target, a
+columns prune nothing), joined as for a plain target, the `Append` hashed
+or rescanned when PostgreSQL's costs pick it; the write lists each member,
+`VERBOSE` prints each node's list and `EXPLAIN ANALYZE` counts each
+member's scan (`differential_exact/630`, `671`). A `MERGE` joins its target, a
 partitioned table's `Append` included, and its source as PostgreSQL plans
 relations with statistics: a hash join building on the relation with fewer
 planned rows (on a tie, the source, or the target when only unmatched

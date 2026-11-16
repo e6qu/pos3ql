@@ -51,8 +51,6 @@ jobs:
       CARGO_JOBS: ${{ matrix.cargo_jobs }}
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -134,8 +132,6 @@ jobs:
       CARGO_JOBS: ${{ matrix.cargo_jobs }}
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -197,8 +193,6 @@ jobs:
       NATIVE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -279,8 +273,6 @@ jobs:
       CARGO_JOBS: ${{ matrix.cargo_jobs }}
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -310,8 +302,6 @@ jobs:
       TSAN_OPTIONS: halt_on_error=1
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -345,8 +335,6 @@ jobs:
         group: [memory-sql, sql-exec, storage, storage-definitions]
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -370,8 +358,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Build release executable
         run: cargo build --release --locked
@@ -393,8 +379,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Verify Linux amd64 compiler target
         run: |
@@ -522,8 +506,6 @@ jobs:
         partition: [0-of-12, 1-of-12, 2-of-12, 3-of-12, 4-of-12, 5-of-12, 6-of-12, 7-of-12, 8-of-12, 9-of-12, 10-of-12, 11-of-12]
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache Rust build
         uses: actions/cache@v5
@@ -558,8 +540,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: actions/download-artifact@v8
         with:
           name: library-tests-list-${{ github.sha }}
@@ -586,8 +566,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache Rust build
         uses: actions/cache@v5
@@ -632,8 +610,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache Rust build
         uses: actions/cache@v5
@@ -724,8 +700,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache release build
         uses: actions/cache@v5
@@ -759,8 +733,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
       - uses: dtolnay/rust-toolchain@stable
       - name: Measure shared startup capacity and active workloads
         run: >-
@@ -792,8 +764,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache Rust build
         uses: actions/cache@v5
@@ -837,8 +807,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - if: runner.os == 'Linux'
-        uses: ./.github/actions/zoneinfo
 
       - name: Cache Rust build
         uses: actions/cache@v5

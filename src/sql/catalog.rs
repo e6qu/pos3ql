@@ -4724,20 +4724,20 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
         }
     };
     if ambiguous {
-        Err(sql_err!(
+        Err(super::error_position::ambiguous_operator(sql_err!(
             sqlstate::AMBIGUOUS_FUNCTION,
             "operator is not unique: {} = {}",
             name(written_left),
             name(written_right)
-        ))
+        )))
     } else {
         best.ok_or_else(|| {
-            sql_err!(
+            super::error_position::missing_binary_operator(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "operator does not exist: {} = {}",
                 name(written_left),
                 name(written_right)
-            )
+            ))
         })
     }
 }

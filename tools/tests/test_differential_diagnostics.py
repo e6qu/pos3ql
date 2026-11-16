@@ -242,6 +242,61 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("copy_context", DIAGNOSTICS.normalize_diagnostics(
             stderr, "sqlstate", {}, input_diagnostics="verbose")[0])
 
+    def test_full_comparison_keeps_every_detail_hint_query_and_context_line(self):
+        stderr = (
+            "psql:c.sql:3: ERROR:  22P02: invalid input syntax for type json\n"
+            "LINE 1: SELECT '{x'::jsonb\n"
+            "               ^\n"
+            "DETAIL:  Token \"x\" is invalid.\n"
+            "QUERY:  SELECT '{x'::jsonb\n"
+            "CONTEXT:  JSON data, line 1: {x\n"
+            "PL/pgSQL function inline_code_block line 1 at PERFORM\n"
+            "LOCATION:  json_errsave_error, jsonfuncs.c:661\n"
+            "psql:c.sql:9: ERROR:  P0001: boom\n"
+            "DETAIL:  first detail line\nsecond detail line\n"
+            "HINT:  a hint\n"
+        )
+        records = DIAGNOSTICS.normalize_diagnostics(
+            stderr, "full", {}, input_diagnostics="verbose")
+        self.assertEqual(records[0], {
+            "source": "c.sql", "line": 3, "severity": "ERROR", "sqlstate": "22P02",
+            "message": "invalid input syntax for type json",
+            "detail": 'Token "x" is invalid.', "query": "SELECT '{x'::jsonb",
+            "context": "JSON data, line 1: {x\n"
+                       "PL/pgSQL function inline_code_block line 1 at PERFORM",
+        })
+        self.assertEqual(records[1]["detail"], "first detail line\nsecond detail line")
+        self.assertEqual(records[1]["hint"], "a hint")
+        # Verbose comparison keeps none of them; a known gap omits a field.
+        verbose = DIAGNOSTICS.normalize_diagnostics(
+            stderr, "verbose", {}, input_diagnostics="verbose")
+        self.assertNotIn("detail", verbose[0])
+        omitted = DIAGNOSTICS.normalize_diagnostics(
+            stderr, "full", {}, input_diagnostics="verbose", omit=("context", "query"))
+        self.assertNotIn("context", omitted[0])
+        self.assertNotIn("query", omitted[0])
+        self.assertEqual(omitted[0]["detail"], 'Token "x" is invalid.')
+        for mode, omit in (("verbose", ("context",)), ("full", ("location",))):
+            with self.subTest(mode=mode, omit=omit), self.assertRaises(ValueError):
+                DIAGNOSTICS.normalize_diagnostics(
+                    stderr, mode, {}, input_diagnostics="verbose", omit=omit)
+
+    def test_known_diagnostic_gaps_name_existing_fixtures_and_fields(self):
+        gaps = ROOT / "tests/external/exact-diagnostics-gaps.tsv"
+        fixtures = {path.stem for path in (ROOT / "tests/external/differential_exact").glob("*.sql")}
+        seen = set()
+        for line in gaps.read_text().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fixture, fields, difference = line.split("\t")
+            with self.subTest(fixture=fixture):
+                self.assertIn(fixture, fixtures)
+                self.assertNotIn(fixture, seen)
+                seen.add(fixture)
+                self.assertTrue(difference)
+                for field in fields.split(","):
+                    self.assertIn(field, DIAGNOSTICS.FULL_FIELDS)
+
     def test_verbose_capture_keeps_state_comparison_separate_from_primary_text(self):
         first = "psql:corpus.sql:8: ERROR:  54000: memtable exhausted\n"
         changed = first.replace("memtable exhausted", "another primary message")

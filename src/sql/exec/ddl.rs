@@ -1752,7 +1752,7 @@ fn exclusion_operator(
     );
     if !commutative {
         crate::sql::eval::stash_diagnostic(
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "Only commutative operators can be used in exclusion constraints.",
             )),
             None,
@@ -1767,7 +1767,7 @@ fn exclusion_operator(
         exclusion_family_membership(storage, class, method, operator.oid(), txid)?;
     if !member {
         crate::sql::eval::stash_diagnostic(
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "The exclusion operator must be related to the index operator class for the constraint.",
             )),
             None,
@@ -3006,14 +3006,13 @@ fn check_foreign_key_column_types(
                 constraint
             ));
         }
-        let detail = crate::stack_format!(
-            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+        let detail = crate::sql::eval::DiagnosticText::format(format_args!(
             "Key columns \"{}\" of the referencing table and \"{}\" of the referenced table are of incompatible types: {} and {}.",
             referencing_name,
             referenced_name,
             crate::sql::catalog::format_type_name(storage, txid, referencing_oid)?.as_str(),
             crate::sql::catalog::format_type_name(storage, txid, referenced_oid)?.as_str()
-        );
+        ));
         crate::sql::eval::stash_diagnostic(Some(detail), None);
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,

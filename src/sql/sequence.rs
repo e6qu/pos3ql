@@ -1157,22 +1157,31 @@ fn retain_effect_error(
     error: &SqlError,
 ) -> Result<ArenaHandle<StatementEffectError>, SqlError> {
     let diagnostic = super::eval::take_diagnostic();
+    if let Some(exhausted) = diagnostic
+        .as_ref()
+        .and_then(super::eval::Diagnostic::exhaustion)
+    {
+        return Err(exhausted);
+    }
     let copy = |value: &str| {
         arena
             .retain_slice_with(value.len(), |at| value.as_bytes()[at])
             .map_err(|_| effect_full())
     };
     let objects = diagnostic
+        .as_ref()
         .map(|diagnostic| diagnostic.objects)
         .unwrap_or_default();
-    let (detail, hint) = match diagnostic {
+    let (detail, hint) = match &diagnostic {
         Some(diagnostic) => (
             diagnostic
                 .detail
+                .as_ref()
                 .map(|detail| copy(detail.as_str()))
                 .transpose()?,
             diagnostic
                 .hint
+                .as_ref()
                 .map(|hint| copy(hint.as_str()))
                 .transpose()?,
         ),
@@ -1212,7 +1221,7 @@ fn restore_effect_error(
         let detail = arena
             .retained_slice_mut(detail)
             .map_err(|_| replay_changed())?;
-        Some(crate::util::StackStr::from_str(
+        Some(super::eval::DiagnosticText::copy(
             core::str::from_utf8(&detail).map_err(|_| replay_changed())?,
         ))
     } else {
@@ -1222,7 +1231,7 @@ fn restore_effect_error(
         let hint = arena
             .retained_slice_mut(hint)
             .map_err(|_| replay_changed())?;
-        let text = crate::util::StackStr::from_str(
+        let text = super::eval::DiagnosticText::copy(
             core::str::from_utf8(&hint).map_err(|_| replay_changed())?,
         );
         Some(text)
@@ -1230,11 +1239,11 @@ fn restore_effect_error(
         None
     };
     if detail.is_some() || hint.is_some() || !saved.objects.is_empty() {
-        super::eval::stash_full_diagnostic(super::eval::Diagnostic {
+        super::eval::stash_full_diagnostic(super::eval::Diagnostic::new(
             detail,
             hint,
-            objects: saved.objects,
-        });
+            saved.objects,
+        ));
     }
     Ok(message)
 }
@@ -2224,7 +2233,9 @@ mod tests {
                         .unwrap();
                         session.record_nextval(0, 1, value);
                         super::super::eval::stash_diagnostic(
-                            Some(crate::util::StackStr::from_str("caught literal detail")),
+                            Some(crate::sql::eval::DiagnosticText::copy(
+                                "caught literal detail",
+                            )),
                             None,
                         );
                         StatementEffectAttempt {
@@ -2670,7 +2681,7 @@ mod tests {
                     &arena,
                     || {
                         super::super::eval::stash_diagnostic(
-                            Some(crate::util::StackStr::from_str("one row required")),
+                            Some(crate::sql::eval::DiagnosticText::copy("one row required")),
                             None,
                         );
                         StatementEffectAttempt {
@@ -2726,8 +2737,10 @@ mod tests {
                         &arena,
                         || {
                             super::super::eval::stash_diagnostic(
-                                detail.map(crate::util::StackStr::from_str),
-                                Some(crate::util::StackStr::from_str("hint without detail")),
+                                detail.map(crate::sql::eval::DiagnosticText::copy),
+                                Some(crate::sql::eval::DiagnosticText::copy(
+                                    "hint without detail",
+                                )),
                             );
                             StatementEffectAttempt {
                                 result: Err(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "denied")),

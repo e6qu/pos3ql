@@ -50,17 +50,21 @@ pub use operators::{
 use operators::{compare_text_collated, logic, range_mismatch, unary};
 pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key_identified};
 
+pub use crate::sql::error_text::{DiagnosticText, DiagnosticWriter};
+
 /// DETAIL/HINT for the next error or notice stay separate from `SqlError`.
 /// Exception handlers and the wire responder consume this worker-local slot
-/// when taking ownership of the diagnostic. A longer DETAIL or HINT is
-/// reported as a `54000` error naming this bound.
-pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
-
-#[derive(Clone, Copy)]
+/// when taking ownership of the diagnostic. The text is kept whole in the
+/// error text pool (`error_text_bytes`, `error_text_leases`); text that does
+/// not fit makes the diagnostic report that exhaustion's `54000` instead.
+#[derive(Clone)]
 pub struct Diagnostic {
-    pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-    pub hint: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
+    pub detail: Option<crate::sql::error_text::ErrorText>,
+    pub hint: Option<crate::sql::error_text::ErrorText>,
     pub objects: ErrorObjects,
+    /// Why a DETAIL or HINT could not be kept; the error or notice is
+    /// reported as this `54000` in its place.
+    pub(crate) exhausted: Option<crate::sql::error_text::TextExhausted>,
 }
 
 /// The longest schema, table, column, data type or constraint name an error
@@ -140,15 +144,8 @@ std::thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-pub fn stash_diagnostic(
-    detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-    hint: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-) {
-    stash_full_diagnostic(Diagnostic {
-        detail,
-        hint,
-        objects: ErrorObjects::default(),
-    });
+pub fn stash_diagnostic(detail: Option<DiagnosticText>, hint: Option<DiagnosticText>) {
+    stash_full_diagnostic(Diagnostic::new(detail, hint, ErrorObjects::default()));
 }
 
 /// Replaces the pending diagnostic, including the objects it names.
@@ -158,40 +155,49 @@ pub fn stash_full_diagnostic(diagnostic: Diagnostic) {
 
 /// Stashes `detail` and `objects` for the next error.
 pub fn stash_object_diagnostic(detail: Option<&str>, objects: ErrorObjects) {
-    stash_full_diagnostic(Diagnostic {
-        detail: detail.map(StackStr::from_str),
-        hint: None,
+    stash_full_diagnostic(Diagnostic::new(
+        detail.map(DiagnosticText::copy),
+        None,
         objects,
-    });
+    ));
 }
 
 /// Returns `error` after stashing its `DETAIL` line.
 pub fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
-    let mut text = StackStr::<MAX_DIAGNOSTIC_DETAIL_BYTES>::new();
-    let _ = core::fmt::Write::write_fmt(&mut text, detail);
-    if text.is_truncated() {
-        return diagnostic_too_long();
-    }
-    stash_diagnostic(Some(text), None);
+    stash_diagnostic(Some(DiagnosticText::format(detail)), None);
     error
 }
 
-/// The `54000` error reported in place of an error whose DETAIL or HINT
-/// exceeds [`MAX_DIAGNOSTIC_DETAIL_BYTES`].
-pub fn diagnostic_too_long() -> SqlError {
-    crate::sql_err!(
-        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "error DETAIL or HINT exceeds {} bytes",
-        MAX_DIAGNOSTIC_DETAIL_BYTES
-    )
-}
-
 impl Diagnostic {
-    /// Whether a DETAIL or HINT did not fit; such a diagnostic is reported
-    /// as [`diagnostic_too_long`], never cut.
-    pub fn is_truncated(&self) -> bool {
-        self.detail.is_some_and(|detail| detail.is_truncated())
-            || self.hint.is_some_and(|hint| hint.is_truncated())
+    pub fn new(
+        detail: Option<DiagnosticText>,
+        hint: Option<DiagnosticText>,
+        objects: ErrorObjects,
+    ) -> Self {
+        let mut exhausted = None;
+        let mut keep = |text: Option<DiagnosticText>| match text.map(DiagnosticText::into_result) {
+            Some(Ok(text)) => Some(text),
+            Some(Err(error)) => {
+                exhausted.get_or_insert(error);
+                None
+            }
+            None => None,
+        };
+        let detail = keep(detail);
+        let hint = keep(hint);
+        Self {
+            detail,
+            hint,
+            objects,
+            exhausted,
+        }
+    }
+
+    /// The `54000` reported in place of an error or notice whose DETAIL or
+    /// HINT did not fit the error text pool.
+    pub(crate) fn exhaustion(&self) -> Option<SqlError> {
+        self.exhausted
+            .map(crate::sql::error_text::TextExhausted::error)
     }
 }
 
@@ -1470,7 +1476,7 @@ pub(crate) fn row_variable_field(
         RowVariable::Assigned => None,
         RowVariable::Unassigned => {
             stash_diagnostic(
-                Some(StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "The tuple structure of a not-yet-assigned record is indeterminate.",
                 )),
                 None,
@@ -2314,7 +2320,7 @@ pub(crate) fn column_precedes_variable_quietly(
 /// column, positioned at the reference.
 pub(crate) fn ambiguous_procedural_reference(qualifier: Option<&str>, name: &str) -> SqlError {
     stash_diagnostic(
-        Some(StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "It could refer to either a PL/pgSQL variable or a table column.",
         )),
         None,
@@ -5583,11 +5589,19 @@ pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),
         (Some(c), None) => Ok(Some(c)),
-        _ => Err(sql_err!(
-            sqlstate::INVALID_ESCAPE_SEQUENCE,
-            "invalid escape string"
-        )),
+        _ => Err(invalid_escape_string()),
     }
+}
+
+/// PostgreSQL's error for a LIKE or SIMILAR TO escape of several characters.
+fn invalid_escape_string() -> SqlError {
+    stash_diagnostic(
+        None,
+        Some(DiagnosticText::copy(
+            "Escape string must be empty or one character.",
+        )),
+    );
+    sql_err!(sqlstate::INVALID_ESCAPE_SEQUENCE, "invalid escape string")
 }
 
 pub struct OperatorEvaluation<'a> {
@@ -8702,12 +8716,7 @@ fn eval_full_inner<'a>(
                         match bytes {
                             [] => Some(None),
                             [byte] => Some(Some(char::from(*byte))),
-                            _ => {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_ESCAPE_SEQUENCE,
-                                    "invalid escape string"
-                                ));
-                            }
+                            _ => return Err(invalid_escape_string()),
                         }
                     } else {
                         Some(escape_char(value)?)
@@ -9658,7 +9667,7 @@ pub(crate) fn indeterminate_string_comparison() -> SqlError {
     );
     stash_diagnostic(
         None,
-        Some(StackStr::from_str(
+        Some(crate::sql::eval::DiagnosticText::copy(
             "Use the COLLATE clause to set the collation explicitly.",
         )),
     );
@@ -10611,9 +10620,12 @@ pub(crate) fn array_constructor_type<'a>(
                 multidimensional: false,
             })
             .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INDETERMINATE_DATATYPE,
-                    "cannot determine type of empty array"
+                crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::INDETERMINATE_DATATYPE,
+                        "cannot determine type of empty array"
+                    ),
+                    "Explicitly cast to the desired type, for example ARRAY[]::integer[].",
                 )
             });
     }
@@ -11973,7 +11985,7 @@ fn call<'a>(
                     "set-returning function called where not allowed"
                 )
             })?;
-            let kind = super::json::kind_of(text);
+            let kind = super::json::container_kind(text)?;
             if kind != super::json::Kind::Object {
                 return Err(super::json::object_keys_error(name, kind));
             }
@@ -12015,7 +12027,7 @@ fn call<'a>(
                     "set-returning function called where not allowed"
                 )
             })?;
-            let kind = super::json::kind_of(text);
+            let kind = super::json::container_kind(text)?;
             if kind != super::json::Kind::Array {
                 return Err(super::json::array_elements_error(name, jsonb, kind));
             }
@@ -12040,7 +12052,7 @@ fn call<'a>(
                 });
             }
             // json elements: verbatim source text (interior whitespace kept).
-            let items = super::json::array_elements_source(text, arena)?;
+            let items = super::json::array_elements_source(text, as_text, arena)?;
             let Some(element) = items.get(k - 1) else {
                 return Ok(Datum::Null);
             };
@@ -13006,6 +13018,26 @@ fn json_get<'a>(
     if r.is_null() {
         return Ok(Datum::Null);
     }
+    if !jsonb {
+        // A json value's member is its source text.
+        let step = match r {
+            Datum::Text(key) => super::json::SourceStep::Key(key),
+            Datum::Int2(i) => super::json::SourceStep::Index(i64::from(i)),
+            Datum::Int4(i) => super::json::SourceStep::Index(i64::from(i)),
+            Datum::Int8(i) => super::json::SourceStep::Index(i),
+            other => return Err(operand_type_mismatch(&other)),
+        };
+        let Some(member) = super::json::source_member(text, step, arena)? else {
+            return Ok(Datum::Null);
+        };
+        if as_text {
+            return Ok(super::json::source_text(member, arena)?.map_or(Datum::Null, Datum::Text));
+        }
+        return Ok(Datum::Json {
+            text: member,
+            jsonb,
+        });
+    }
     let tree = super::json::parse(text, arena)?;
     let child = match r {
         Datum::Text(k) => tree.get_field(k),
@@ -13023,22 +13055,16 @@ fn json_get<'a>(
         if let super::json::Json::Str(s) = child {
             return Ok(Datum::Text(s));
         }
-        let mut buffer = crate::util::StackStr::<8192>::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut buffer,
-            format_args!("{}", super::json::JsonWrite(&child)),
-        );
         return Ok(Datum::Text(
-            arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+            arena
+                .alloc_str_display(super::json::JsonWrite(&child))
+                .map_err(|_| arena_full())?,
         ));
     }
-    let mut buffer = crate::util::StackStr::<8192>::new();
-    let _ = core::fmt::Write::write_fmt(
-        &mut buffer,
-        format_args!("{}", super::json::JsonWrite(&child)),
-    );
     Ok(Datum::Json {
-        text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+        text: arena
+            .alloc_str_display(super::json::JsonWrite(&child))
+            .map_err(|_| arena_full())?,
         jsonb,
     })
 }
@@ -13322,7 +13348,7 @@ pub fn json_each_pairs<'a>(
     let as_text = name
         .get(name.len().saturating_sub(5)..)
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case("_text"));
-    let kind = super::json::kind_of(text);
+    let kind = super::json::container_kind(text)?;
     if kind != super::json::Kind::Object {
         return Err(super::json::each_error(name, jsonb, kind));
     }
@@ -13590,6 +13616,30 @@ fn json_path<'a>(
         Datum::Null => return Ok(Datum::Null),
         other => return Err(operand_type_mismatch(&other)),
     };
+    if !jsonb {
+        // A json value's member is its source text.
+        let mut node = text;
+        for step in super::array::elements(raw, element) {
+            let Datum::Text(key) = step else {
+                return Ok(Datum::Null);
+            };
+            let step = match super::json::kind_of(node) {
+                super::json::Kind::Array => match key.trim().parse::<i64>() {
+                    Ok(index) => super::json::SourceStep::Index(index),
+                    Err(_) => return Ok(Datum::Null),
+                },
+                _ => super::json::SourceStep::Key(key),
+            };
+            let Some(member) = super::json::source_member(node, step, arena)? else {
+                return Ok(Datum::Null);
+            };
+            node = member;
+        }
+        if as_text {
+            return Ok(super::json::source_text(node, arena)?.map_or(Datum::Null, Datum::Text));
+        }
+        return Ok(Datum::Json { text: node, jsonb });
+    }
     let mut node = super::json::parse(text, arena)?;
     for step in super::array::elements(raw, element) {
         let Datum::Text(key) = step else {
@@ -14103,6 +14153,33 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, SqlError> {
 pub(crate) struct InputError<'a> {
     pub(crate) sqlstate: SqlState,
     pub(crate) message: &'a str,
+    pub(crate) detail: Option<&'a str>,
+    pub(crate) hint: Option<&'a str>,
+}
+
+impl<'a> InputError<'a> {
+    /// Takes `error` from the error path into a result, with the DETAIL and
+    /// HINT stashed for it; its context is forgotten, as a soft error has
+    /// none.
+    fn caught(error: SqlError, arena: &'a Arena) -> Result<Self, SqlError> {
+        crate::sql::error_context::discard(&error);
+        let diagnostic = take_diagnostic();
+        let copy = |text: &str| arena.alloc_str(text).map_err(|_| arena_full());
+        Ok(Self {
+            sqlstate: error.sqlstate,
+            message: copy(error.message.as_str())?,
+            detail: diagnostic
+                .as_ref()
+                .and_then(|diagnostic| diagnostic.detail.as_ref())
+                .map(|detail| copy(detail.as_str()))
+                .transpose()?,
+            hint: diagnostic
+                .as_ref()
+                .and_then(|diagnostic| diagnostic.hint.as_ref())
+                .map(|hint| copy(hint.as_str()))
+                .transpose()?,
+        })
+    }
 }
 
 pub(crate) fn input_error<'a>(
@@ -14122,15 +14199,7 @@ pub(crate) fn input_error<'a>(
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
             Err(error) if !error.sqlstate.can_report_input_failure() => return Err(error),
-            Err(error) => {
-                let message = arena
-                    .alloc_str(error.message.as_str())
-                    .map_err(|_| arena_full())?;
-                return Ok(Some(InputError {
-                    sqlstate: error.sqlstate,
-                    message,
-                }));
-            }
+            Err(error) => return InputError::caught(error, arena).map(Some),
         }
     } else {
         None
@@ -14157,12 +14226,7 @@ pub(crate) fn input_error<'a>(
             if !error.sqlstate.can_report_input_failure() {
                 return Err(error);
             }
-            Ok(InputError {
-                sqlstate: error.sqlstate,
-                message: arena
-                    .alloc_str(error.message.as_str())
-                    .map_err(|_| arena_full())?,
-            })
+            InputError::caught(error, arena)
         })
         .transpose()
 }
@@ -14920,6 +14984,22 @@ struct WrittenTypeDisplay {
 /// the same spelling (`pg_catalog.foo`, `public.foo[]`), which names a
 /// missing type.
 fn written_type_name(
+    spelled: &str,
+) -> Result<(crate::util::StackStr<192>, WrittenTypeDisplay), SqlError> {
+    // `parseTypeString` names the string in a grammar error's context.
+    scan_written_type_name(spelled).map_err(|error| {
+        if error.sqlstate == sqlstate::SYNTAX_ERROR {
+            crate::sql::error_context::with_line(
+                error,
+                format_args!("invalid type name \"{}\"", spelled),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn scan_written_type_name(
     spelled: &str,
 ) -> Result<(crate::util::StackStr<192>, WrittenTypeDisplay), SqlError> {
     use core::fmt::Write as _;

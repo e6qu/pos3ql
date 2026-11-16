@@ -3,6 +3,7 @@ use crate::mem::budget::Budget;
 
 #[test]
 fn terminal_errors_keep_original_details_without_an_unneeded_control_image() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(32 << 10);
     let pool = LeasePool::new(
         &mut budget,
@@ -27,7 +28,10 @@ fn terminal_errors_keep_original_details_without_an_unneeded_control_image() {
         frames.start(program.body);
         let free = pool.lease::<u8>(8192).err().unwrap().free_bytes;
         let _ = crate::sql::eval::take_diagnostic();
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(&detail)), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy(&detail)),
+            None,
+        );
         let error = frames
             .begin_error(sql_err!(sqlstate::RAISE_EXCEPTION, "original error"), &pool)
             .unwrap_err();
@@ -103,8 +107,8 @@ fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
             .start(program.body);
         let _ = crate::sql::eval::take_diagnostic();
         crate::sql::eval::stash_diagnostic(
-            Some(StackStr::from_str("original detail")),
-            Some(StackStr::from_str("original hint")),
+            Some(crate::sql::eval::DiagnosticText::copy("original detail")),
+            Some(crate::sql::eval::DiagnosticText::copy("original hint")),
         );
         frames.progress = ExecutionProgress::Error(PendingError::capture(
             sql_err!(
@@ -117,7 +121,10 @@ fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
     });
     drop((parsing, workspace));
     crate::mem::guard::forbid_alloc(|| {
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("another connection")), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy("another connection")),
+            None,
+        );
         let (_, code) = saved.source().parse(&restored_syntax, None).unwrap();
         let mut execution = saved.restore(&output, &code).ok().unwrap();
         let frames = execution.status.control_frames.as_mut().unwrap();

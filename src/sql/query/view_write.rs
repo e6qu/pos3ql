@@ -151,19 +151,19 @@ impl NotAutoUpdatable {
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "WITH CHECK OPTION is supported only on automatically updatable views"
                 );
-                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                    detail: None,
-                    hint: Some(crate::util::StackStr::from_str(detail)),
-                    objects: crate::sql::eval::ErrorObjects::default(),
-                });
+                crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                    None,
+                    Some(crate::sql::eval::DiagnosticText::copy(detail)),
+                    crate::sql::eval::ErrorObjects::default(),
+                ));
                 return error;
             }
         };
-        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-            detail: Some(crate::util::StackStr::from_str(detail)),
-            hint: Some(crate::util::StackStr::from_str(hint)),
-            objects: crate::sql::eval::ErrorObjects::default(),
-        });
+        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+            Some(crate::sql::eval::DiagnosticText::copy(detail)),
+            Some(crate::sql::eval::DiagnosticText::copy(hint)),
+            crate::sql::eval::ErrorObjects::default(),
+        ));
         state
     }
 }
@@ -430,13 +430,13 @@ impl<'a> UpdatableView<'a> {
                         name,
                         view_name
                     );
-                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                        detail: Some(crate::util::StackStr::from_str(
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                        Some(crate::sql::eval::DiagnosticText::copy(
                             "View columns that are not columns of their base relation are not updatable.",
                         )),
-                        hint: None,
-                        objects: crate::sql::eval::ErrorObjects::default(),
-                    });
+                        None,
+                        crate::sql::eval::ErrorObjects::default(),
+                    ));
                     return Err(error);
                 }
                 *target = base;
@@ -555,11 +555,11 @@ impl<'a> UpdatableView<'a> {
                         level.columns[column],
                         level.name
                     );
-                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-                        detail: Some(crate::util::StackStr::from_str(detail)),
-                        hint: None,
-                        objects: crate::sql::eval::ErrorObjects::default(),
-                    });
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic::new(
+                        Some(crate::sql::eval::DiagnosticText::copy(detail)),
+                        None,
+                        crate::sql::eval::ErrorObjects::default(),
+                    ));
                     return Err(error);
                 }
             }

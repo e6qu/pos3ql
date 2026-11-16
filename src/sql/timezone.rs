@@ -641,7 +641,7 @@ mod tests {
     }
 
     fn zone(name: &str) -> Timezone {
-        super::super::tzif::init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
+        super::super::tzif::init_catalog().expect("zone data");
         lookup(name).expect("installed TZif zone")
     }
 

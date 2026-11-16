@@ -14,8 +14,8 @@ fn pending_errors_own_metadata_before_cleanup_and_release_it_after_handler_captu
     crate::mem::guard::forbid_alloc(|| {
         let _ = crate::sql::eval::take_diagnostic();
         crate::sql::eval::stash_diagnostic(
-            Some(StackStr::from_str("original é detail")),
-            Some(StackStr::from_str("")),
+            Some(crate::sql::eval::DiagnosticText::copy("original é detail")),
+            Some(crate::sql::eval::DiagnosticText::copy("")),
         );
         let original = sql_err!(
             crate::sql::eval::InternalControl::RoutineInvocation.diagnostic_code(),
@@ -25,8 +25,8 @@ fn pending_errors_own_metadata_before_cleanup_and_release_it_after_handler_captu
         let error = PendingError::capture(original, &pool);
         assert!(crate::sql::eval::take_diagnostic().is_none());
         crate::sql::eval::stash_diagnostic(
-            Some(StackStr::from_str("cleanup detail")),
-            Some(StackStr::from_str("cleanup hint")),
+            Some(crate::sql::eval::DiagnosticText::copy("cleanup detail")),
+            Some(crate::sql::eval::DiagnosticText::copy("cleanup hint")),
         );
         let mut handlers = DiagnosticBuffers::new(&pool, 1).unwrap();
         error.catch(&mut handlers).unwrap();
@@ -58,14 +58,17 @@ fn publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata
     crate::mem::guard::forbid_alloc(|| {
         let _ = crate::sql::eval::take_diagnostic();
         crate::sql::eval::stash_diagnostic(
-            Some(StackStr::from_str("saved detail")),
-            Some(StackStr::from_str("saved hint")),
+            Some(crate::sql::eval::DiagnosticText::copy("saved detail")),
+            Some(crate::sql::eval::DiagnosticText::copy("saved hint")),
         );
         let error = PendingError::capture(
             sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"),
             &pool,
         );
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("other work")), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy("other work")),
+            None,
+        );
         let error = error.publish();
         assert_eq!(error.sqlstate, "22012");
         let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
@@ -77,7 +80,10 @@ fn publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata
             sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "without metadata"),
             &pool,
         );
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("stale detail")), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy("stale detail")),
+            None,
+        );
         assert_eq!(error.publish().sqlstate, "22003");
         assert!(crate::sql::eval::take_diagnostic().is_none());
         assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
@@ -97,7 +103,10 @@ fn pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse() {
     crate::mem::guard::forbid_alloc(|| {
         let _ = crate::sql::eval::take_diagnostic();
         let held = pool.lease::<u8>(1024).unwrap();
-        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("original detail")), None);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy("original detail")),
+            None,
+        );
         let pending = PendingError::capture(
             sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"),
             &pool,
@@ -108,7 +117,7 @@ fn pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse() {
         assert!(error.message.as_str().contains("execution_control_bytes"));
         assert!(crate::sql::eval::take_diagnostic().is_none());
         drop(held);
-        crate::sql::eval::stash_diagnostic(None, Some(StackStr::from_str("")));
+        crate::sql::eval::stash_diagnostic(None, Some(crate::sql::eval::DiagnosticText::copy("")));
         let error = PendingError::capture(sql_err!(sqlstate::DIVISION_BY_ZERO, "retry"), &pool);
         let error = error.publish();
         assert_eq!(error.sqlstate, "22012");
@@ -130,7 +139,8 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
         4,
     )
     .unwrap();
-    let mut detail = StackStr::from_str(&"x".repeat(8192));
+    crate::sql::error_text::reserve_for_test();
+    let mut detail = crate::sql::eval::DiagnosticText::copy(&"x".repeat(8192));
     let error = sql_err!(sqlstate::RAISE_EXCEPTION, "first error");
     crate::mem::guard::forbid_alloc(|| {
         let mut buffers = DiagnosticBuffers::new(&pool, 1).unwrap();
@@ -138,15 +148,15 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
         buffers
             .capture(
                 &error,
-                Some(&crate::sql::eval::Diagnostic {
-                    detail: Some(detail),
-                    hint: None,
-                    objects: Default::default(),
-                }),
+                Some(&crate::sql::eval::Diagnostic::new(
+                    Some(detail.clone()),
+                    None,
+                    Default::default(),
+                )),
                 "outer",
             )
             .unwrap();
-        detail = StackStr::from_str("changed source");
+        detail = crate::sql::eval::DiagnosticText::copy("changed source");
         let first = buffers.current().unwrap();
         assert_eq!(
             first
@@ -170,11 +180,11 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
             buffers
                 .capture(
                     &sql_err!(sqlstate::DIVISION_BY_ZERO, "later"),
-                    Some(&crate::sql::eval::Diagnostic {
-                        detail: Some(detail),
-                        hint: Some(StackStr::from_str("")),
-                        objects: Default::default(),
-                    }),
+                    Some(&crate::sql::eval::Diagnostic::new(
+                        Some(detail.clone()),
+                        Some(crate::sql::eval::DiagnosticText::copy("")),
+                        Default::default(),
+                    )),
                     "inner",
                 )
                 .unwrap();
@@ -197,6 +207,7 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
 
 #[test]
 fn nested_diagnostic_failure_preserves_the_outer_handler_and_reuses_the_inner_slot() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(1 << 16);
     let output = Arena::new(&mut budget, "copied nested diagnostic", 1024).unwrap();
     let tiny = Arena::new(&mut budget, "exhausted diagnostic output", 1).unwrap();
@@ -207,11 +218,11 @@ fn nested_diagnostic_failure_preserves_the_outer_handler_and_reuses_the_inner_sl
         8,
     )
     .unwrap();
-    let too_large = crate::sql::eval::Diagnostic {
-        detail: Some(StackStr::from_str(&"x".repeat(4096))),
-        hint: None,
-        objects: Default::default(),
-    };
+    let too_large = crate::sql::eval::Diagnostic::new(
+        Some(crate::sql::eval::DiagnosticText::copy(&"x".repeat(4096))),
+        None,
+        Default::default(),
+    );
     crate::mem::guard::forbid_alloc(|| {
         let mut buffers = DiagnosticBuffers::new(&pool, 2).unwrap();
         buffers
@@ -413,6 +424,7 @@ fn diagnostic_admission_and_descriptor_failure_return_all_ranges_after_owner_dro
 
 #[test]
 fn diagnostic_growth_moves_bytes_and_recovers_after_fragmented_exhaustion() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(1 << 16);
     let output = Arena::new(&mut budget, "diagnostic growth copies", 1024).unwrap();
     let pool = LeasePool::new(
@@ -422,16 +434,16 @@ fn diagnostic_growth_moves_bytes_and_recovers_after_fragmented_exhaustion() {
         8,
     )
     .unwrap();
-    let medium = crate::sql::eval::Diagnostic {
-        detail: Some(StackStr::from_str(&"m".repeat(300))),
-        hint: None,
-        objects: Default::default(),
-    };
-    let large = crate::sql::eval::Diagnostic {
-        detail: Some(StackStr::from_str(&"l".repeat(700))),
-        hint: None,
-        objects: Default::default(),
-    };
+    let medium = crate::sql::eval::Diagnostic::new(
+        Some(crate::sql::eval::DiagnosticText::copy(&"m".repeat(300))),
+        None,
+        Default::default(),
+    );
+    let large = crate::sql::eval::Diagnostic::new(
+        Some(crate::sql::eval::DiagnosticText::copy(&"l".repeat(700))),
+        None,
+        Default::default(),
+    );
     crate::mem::guard::forbid_alloc(|| {
         let mut buffers = DiagnosticBuffers::new(&pool, 1).unwrap();
         buffers

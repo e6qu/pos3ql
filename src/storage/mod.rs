@@ -35721,11 +35721,10 @@ impl Storage {
         );
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(crate::stack_format!(
-                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            Some(crate::sql::eval::DiagnosticText::format(format_args!(
                 "You can drop extension {} instead.",
                 extension_name.as_str()
-            )),
+            ))),
         );
         Err(error)
     }

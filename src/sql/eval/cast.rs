@@ -724,11 +724,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Json => match v {
             Datum::Json { text, .. } => {
-                crate::sql::json::validate(text, arena)?;
+                crate::sql::json::validate(text)?;
                 Datum::Json { text, jsonb: false }
             }
             Datum::Text(s) => {
-                crate::sql::json::validate(s, arena)?;
+                crate::sql::json::validate(s)?;
                 Datum::Json {
                     text: s,
                     jsonb: false,
@@ -740,19 +740,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Json { jsonb: true, .. } => v,
             Datum::Json { text, jsonb: false } | Datum::Text(text) => {
                 let tree = crate::sql::json::parse(text, arena)?;
-                let mut buffer = crate::util::StackStr::<8192>::new();
-                let _ = core::fmt::Write::write_fmt(
-                    &mut buffer,
-                    format_args!("{}", crate::sql::json::JsonWrite(&tree)),
-                );
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "jsonb value exceeds the supported size"
-                    ));
-                }
                 Datum::Json {
-                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    text: arena
+                        .alloc_str_display(crate::sql::json::JsonWrite(&tree))
+                        .map_err(|_| arena_full())?,
                     jsonb: true,
                 }
             }
@@ -876,7 +867,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Range(kind) => match v {
             Datum::Range { kind: k, .. } if k == kind => v,
             Datum::Text(s) => {
-                let p = crate::sql::range::parse(s)?;
+                let p = crate::sql::range::parse_input(s, arena)?;
                 Datum::Range {
                     text: crate::sql::range::canonical(&p, kind, arena)?,
                     kind,

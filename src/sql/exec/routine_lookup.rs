@@ -245,11 +245,10 @@ pub(crate) fn lookup_routine<'a>(
                 if found.replace(candidate).is_some() {
                     crate::sql::eval::stash_diagnostic(
                         None,
-                        Some(crate::stack_format!(
-                            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                        Some(crate::sql::eval::DiagnosticText::format(format_args!(
                             "Specify the argument list to select the {} unambiguously.",
                             kind.noun()
-                        )),
+                        ))),
                     );
                     return Err(sql_err!(
                         sqlstate::AMBIGUOUS_FUNCTION,

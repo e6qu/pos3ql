@@ -261,7 +261,7 @@ fn assign_slice<'a>(
             (given_lower.or(current_lower), given_upper.or(current_upper))
         else {
             crate::sql::eval::stash_diagnostic(
-                Some(crate::util::StackStr::from_str(
+                Some(crate::sql::eval::DiagnosticText::copy(
                     "When assigning to a slice of an empty array value, slice boundaries must be fully specified.",
                 )),
                 None,

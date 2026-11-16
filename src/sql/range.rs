@@ -98,7 +98,172 @@ fn bad_element(kind: RangeKind, value: &str) -> SqlError {
     )
 }
 
-/// Parses a range literal (`[1,5)` / `(,5]` / `empty`) into its components.
+/// C's `isspace`, which PostgreSQL's range input skips.
+fn is_c_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// Reads a range literal as PostgreSQL's `range_parse` does, with its
+/// errors and DETAILs. A bound keeps its text between the separators, its
+/// quotes removed and backslash escapes resolved; `""` inside quotes is a
+/// quote, and an empty quoted bound is the empty string, not infinity.
+pub fn parse_input<'a>(input: &'a str, arena: &'a Arena) -> Result<Parsed<'a>, SqlError> {
+    let malformed =
+        |detail: &str| super::eval::with_detail(bad_literal(input), format_args!("{detail}"));
+    let bytes = input.as_bytes();
+    let mut at = 0;
+    while bytes.get(at).copied().is_some_and(is_c_space) {
+        at += 1;
+    }
+    if bytes.len() >= at + 5 && bytes[at..at + 5].eq_ignore_ascii_case(b"empty") {
+        at += 5;
+        while bytes.get(at).copied().is_some_and(is_c_space) {
+            at += 1;
+        }
+        if at != bytes.len() {
+            return Err(malformed("Junk after \"empty\" key word."));
+        }
+        return Ok(Parsed {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+        });
+    }
+    let lower_inc = match bytes.get(at) {
+        Some(b'[') => true,
+        Some(b'(') => false,
+        _ => return Err(malformed("Missing left parenthesis or bracket.")),
+    };
+    at += 1;
+    let lower = input_bound(input, &mut at, arena)?;
+    if bytes.get(at) != Some(&b',') {
+        return Err(malformed("Missing comma after lower bound."));
+    }
+    at += 1;
+    let upper = input_bound(input, &mut at, arena)?;
+    let upper_inc = match bytes.get(at) {
+        Some(b']') => true,
+        Some(b')') => false,
+        _ => return Err(malformed("Too many commas.")),
+    };
+    at += 1;
+    while bytes.get(at).copied().is_some_and(is_c_space) {
+        at += 1;
+    }
+    if at != bytes.len() {
+        return Err(malformed("Junk after right parenthesis or bracket."));
+    }
+    Ok(Parsed {
+        empty: false,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+    })
+}
+
+/// `range_parse_bound`: the bound starting at `at`, `None` when it is empty
+/// (infinite). Leaves `at` on the `,`, `)` or `]` after it.
+fn input_bound<'a>(
+    input: &'a str,
+    at: &mut usize,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let bytes = input.as_bytes();
+    let ends = |at: usize| matches!(bytes.get(at), Some(b',' | b')' | b']'));
+    if ends(*at) {
+        return Ok(None);
+    }
+    let start = *at;
+    let mut quoted = false;
+    let mut plain = true;
+    let mut length = 0usize;
+    // The first pass finds the bound's end and length; text without quotes
+    // or escapes is used in place.
+    let mut cursor = start;
+    while quoted || !ends(cursor) {
+        let Some(&byte) = bytes.get(cursor) else {
+            return Err(super::eval::with_detail(
+                bad_literal(input),
+                format_args!("Unexpected end of input."),
+            ));
+        };
+        cursor += 1;
+        match byte {
+            b'\\' => {
+                plain = false;
+                if cursor >= bytes.len() {
+                    return Err(super::eval::with_detail(
+                        bad_literal(input),
+                        format_args!("Unexpected end of input."),
+                    ));
+                }
+                cursor += 1;
+                length += 1;
+            }
+            b'"' => {
+                plain = false;
+                if !quoted {
+                    quoted = true;
+                } else if bytes.get(cursor) == Some(&b'"') {
+                    cursor += 1;
+                    length += 1;
+                } else {
+                    quoted = false;
+                }
+            }
+            _ => length += 1,
+        }
+    }
+    *at = cursor;
+    if plain {
+        return Ok(Some(&input[start..cursor]));
+    }
+    let output = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| range_arena_full())?;
+    let mut written = 0;
+    let mut cursor = start;
+    let mut quoted = false;
+    while cursor < *at {
+        let byte = bytes[cursor];
+        cursor += 1;
+        match byte {
+            b'\\' => {
+                output[written] = bytes[cursor];
+                cursor += 1;
+                written += 1;
+            }
+            b'"' if !quoted => quoted = true,
+            b'"' if bytes.get(cursor) == Some(&b'"') => {
+                output[written] = b'"';
+                cursor += 1;
+                written += 1;
+            }
+            b'"' => quoted = false,
+            _ => {
+                output[written] = byte;
+                written += 1;
+            }
+        }
+    }
+    // Escapes copy whole UTF-8 sequences byte by byte.
+    core::str::from_utf8(output)
+        .map(Some)
+        .map_err(|_| bad_literal(input))
+}
+
+fn range_arena_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "range value exceeds the statement arena"
+    )
+}
+
+/// Parses a stored range's canonical text (`[1,5)` / `(,5]` / `empty`) into
+/// its components. Client input goes through [`parse_input`].
 pub fn parse<'a>(input: &'a str) -> Result<Parsed<'a>, SqlError> {
     let t = input.trim();
     if t.eq_ignore_ascii_case("empty") {
@@ -293,8 +458,9 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
             Some(v) => bound_out(v, kind, arena)?,
             None => "",
         };
-        let text = stack_format!(160, "{}{},{}{}", lb, lower_out, upper_out, ub);
-        return alloc(arena, text.as_str());
+        return arena
+            .alloc_str_display(format_args!("{lb}{lower_out},{upper_out}{ub}"))
+            .map_err(|_| range_arena_full());
     }
     // Continuous: empty when bounds are equal and not both inclusive.
     if let (Some(lower_text), Some(upper_text)) = (p.lower, p.upper)
@@ -325,8 +491,9 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
         Some(v) => bound_out(v, kind, arena)?,
         None => "",
     };
-    let text = stack_format!(200, "{}{},{}{}", lb, lower_out, upper_out, rb);
-    alloc(arena, text.as_str())
+    arena
+        .alloc_str_display(format_args!("{lb}{lower_out},{upper_out}{rb}"))
+        .map_err(|_| range_arena_full())
 }
 
 /// Builds a range from a constructor `int4range(lower_text, upper_text [, flags])`.
@@ -1100,23 +1267,176 @@ pub fn parse_multirange<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let raw = component_slice(input, arena)?;
-    let canon = arena.alloc_slice_with(raw.len(), |_| "").map_err(|_| {
+    // A first pass counts the ranges and finds any syntax fault; the ranges
+    // before a fault are still read first, as PostgreSQL reads each range
+    // as it reaches it.
+    let mut ranges = 0usize;
+    let mut items = MultirangeItems::new(input);
+    let fault = loop {
+        match items.next_item() {
+            Ok(Some(MultirangeItem::Range(_))) => ranges += 1,
+            Ok(Some(MultirangeItem::Empty)) => {}
+            Ok(None) => break None,
+            Err(detail) => break Some(detail),
+        }
+    };
+    let canon = arena.alloc_slice_with(ranges, |_| "").map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "multirange components exceed the statement arena"
         )
     })?;
+    let mut items = MultirangeItems::new(input);
     let mut m = 0usize;
-    for &c in raw.iter() {
-        let p = parse(c)?;
-        let cx = canonical(&p, kind, arena)?;
+    for _ in 0..ranges {
+        let range = loop {
+            if let Ok(Some(MultirangeItem::Range(range))) = items.next_item() {
+                break range;
+            }
+        };
+        let cx = canonical(&parse_input(range, arena)?, kind, arena)?;
         if cx != "empty" {
             canon[m] = cx;
             m += 1;
         }
     }
+    if let Some(detail) = fault {
+        return Err(super::eval::with_detail(
+            sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "malformed multirange literal: \"{}\"",
+                input
+            ),
+            format_args!("{detail}"),
+        ));
+    }
     canonicalize_multirange(&mut canon[..m], kind, arena)
+}
+
+enum MultirangeItem<'a> {
+    /// A range's text, from its opening to its closing bracket.
+    Range(&'a str),
+    /// The `empty` key word, which adds no range.
+    Empty,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultirangeState {
+    BeforeRange,
+    InRange,
+    InRangeEscaped,
+    InRangeQuoted,
+    InRangeQuotedEscaped,
+    AfterRange,
+    Finished,
+}
+
+/// PostgreSQL's `multirange_in` state machine over a multirange literal,
+/// yielding its ranges in order; a fault is its DETAIL.
+struct MultirangeItems<'a> {
+    input: &'a str,
+    at: usize,
+    state: MultirangeState,
+    seen: usize,
+}
+
+impl<'a> MultirangeItems<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            at: 0,
+            state: MultirangeState::BeforeRange,
+            seen: 0,
+        }
+    }
+
+    fn next_item(&mut self) -> Result<Option<MultirangeItem<'a>>, &'static str> {
+        let bytes = self.input.as_bytes();
+        if self.at == 0 {
+            while bytes.get(self.at).copied().is_some_and(is_c_space) {
+                self.at += 1;
+            }
+            if bytes.get(self.at) != Some(&b'{') {
+                return Err("Missing left brace.");
+            }
+            self.at += 1;
+        }
+        let mut range_start = 0;
+        while self.state != MultirangeState::Finished {
+            let Some(&byte) = bytes.get(self.at) else {
+                return Err("Unexpected end of input.");
+            };
+            let here = self.at;
+            self.at += 1;
+            if is_c_space(byte) {
+                continue;
+            }
+            match self.state {
+                MultirangeState::BeforeRange => {
+                    if byte == b'[' || byte == b'(' {
+                        range_start = here;
+                        self.state = MultirangeState::InRange;
+                    } else if byte == b'}' && self.seen == 0 {
+                        self.state = MultirangeState::Finished;
+                    } else if bytes.len() >= here + 5
+                        && bytes[here..here + 5].eq_ignore_ascii_case(b"empty")
+                    {
+                        self.seen += 1;
+                        self.at = here + 5;
+                        self.state = MultirangeState::AfterRange;
+                        return Ok(Some(MultirangeItem::Empty));
+                    } else {
+                        return Err("Expected range start.");
+                    }
+                }
+                MultirangeState::InRange => {
+                    if byte == b']' || byte == b')' {
+                        self.seen += 1;
+                        self.state = MultirangeState::AfterRange;
+                        return Ok(Some(MultirangeItem::Range(
+                            &self.input[range_start..self.at],
+                        )));
+                    } else if byte == b'"' {
+                        self.state = MultirangeState::InRangeQuoted;
+                    } else if byte == b'\\' {
+                        self.state = MultirangeState::InRangeEscaped;
+                    }
+                }
+                MultirangeState::InRangeEscaped => self.state = MultirangeState::InRange,
+                MultirangeState::InRangeQuoted => {
+                    if byte == b'"' {
+                        if bytes.get(self.at) == Some(&b'"') {
+                            self.at += 1;
+                        } else {
+                            self.state = MultirangeState::InRange;
+                        }
+                    } else if byte == b'\\' {
+                        self.state = MultirangeState::InRangeQuotedEscaped;
+                    }
+                }
+                MultirangeState::InRangeQuotedEscaped => {
+                    self.state = MultirangeState::InRangeQuoted;
+                }
+                MultirangeState::AfterRange => {
+                    if byte == b',' {
+                        self.state = MultirangeState::BeforeRange;
+                    } else if byte == b'}' {
+                        self.state = MultirangeState::Finished;
+                    } else {
+                        return Err("Expected comma or end of multirange.");
+                    }
+                }
+                MultirangeState::Finished => unreachable!("the loop ends when finished"),
+            }
+        }
+        while bytes.get(self.at).copied().is_some_and(is_c_space) {
+            self.at += 1;
+        }
+        if self.at != bytes.len() {
+            return Err("Junk after closing right brace.");
+        }
+        Ok(None)
+    }
 }
 
 /// Wraps a single (canonical) range as a one-element multirange; an empty range

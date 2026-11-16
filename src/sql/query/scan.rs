@@ -173,7 +173,7 @@ pub(crate) fn row_security_off_error(
     if storage.object_owner(storage.table_access_object(table, txid), txid) == role {
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(crate::util::StackStr::from_str(
+            Some(crate::sql::eval::DiagnosticText::copy(
                 "To disable the policy for the table's owner, use ALTER TABLE NO FORCE ROW LEVEL SECURITY.",
             )),
         );

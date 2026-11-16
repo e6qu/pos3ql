@@ -1336,3 +1336,69 @@ fn failing_rows_show_readable_or_written_columns() {
         );
     });
 }
+
+#[test]
+fn routine_kinds_hints_and_sql_function_context_follow_postgresql() {
+    with_engine("routine-kind-hints", |engine, budget| {
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE PROCEDURE hint_proc(integer) LANGUAGE sql AS 'SELECT 1'",
+        );
+        assert!(reports(&output).is_empty(), "{:?}", reports(&output));
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "SELECT hint_proc(1)",
+                    &[
+                        "E|C=42809|M=hint_proc(integer) is a procedure|H=To call a procedure, use CALL.|P=8",
+                    ],
+                ),
+                (
+                    "SELECT * FROM hint_proc(1)",
+                    &[
+                        "E|C=42809|M=hint_proc(integer) is a procedure|H=To call a procedure, use CALL.|P=15",
+                    ],
+                ),
+                (
+                    "CALL lower('a')",
+                    &[
+                        "E|C=42809|M=lower(unknown) is not a procedure|H=To call a function, use SELECT.|P=6",
+                    ],
+                ),
+                (
+                    "CALL missing_proc(1)",
+                    &[
+                        "E|C=42883|M=procedure missing_proc(integer) does not exist|H=No procedure matches the given name and argument types. You might need to add explicit type casts.|P=6",
+                    ],
+                ),
+                (
+                    "DO $$BEGIN CALL missing_proc(1); END$$",
+                    &[
+                        "E|C=42883|M=procedure missing_proc(integer) does not exist|H=No procedure matches the given name and argument types. You might need to add explicit type casts.|W=PL/pgSQL function inline_code_block line 1 at CALL|p=6|q=CALL missing_proc(1)",
+                    ],
+                ),
+                (
+                    "SELECT nullif('a'::cstring, 'a'::cstring)",
+                    &[
+                        "E|C=42883|M=operator does not exist: cstring = cstring|H=No operator matches the given name and argument types. You might need to add explicit type casts.|P=8",
+                    ],
+                ),
+                (
+                    "CREATE FUNCTION empty_result() RETURNS integer LANGUAGE sql AS ''",
+                    &[
+                        "E|C=42P13|M=return type mismatch in function declared to return integer|D=Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.|W=SQL function \"empty_result\"",
+                    ],
+                ),
+                (
+                    "DO $$DECLARE n integer; BEGIN n := $3; END$$",
+                    &[
+                        "E|C=42P02|M=there is no parameter $3|W=PL/pgSQL function inline_code_block line 1 at assignment|p=6|q=n := $3",
+                    ],
+                ),
+            ],
+        );
+    });
+}

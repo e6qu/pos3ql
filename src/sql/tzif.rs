@@ -1,16 +1,16 @@
 //! The IANA time-zone database, read from TZif files (RFC 8536).
 //!
 //! PostgreSQL resolves named zones through the full tz database, historical
-//! transitions included. The zone names are PostgreSQL 18.6's, pinned at
-//! build (`timezone_name_data`); their TZif files come from the explicitly
-//! configured `timezone_directory`. Startup parses every one into a fixed
-//! table, and a missing or malformed file is a named startup error, so a
-//! session can resolve every zone PostgreSQL knows and no other. An instant
-//! resolves by binary search over the transition history, with the file's
-//! POSIX footer rule covering instants past the last transition.
+//! transitions included, from the zone data it compiles and installs itself
+//! (tzdata 2026c in 18.6), not the host's. The zones and their TZif files are
+//! PostgreSQL 18.6's, compiled and checksum-pinned at build (`timezone_data`),
+//! so offsets do not depend on the host's tzdata release. Startup parses every
+//! one into a fixed table, and a file that does not fit it is a named startup
+//! error, so a session can resolve every zone PostgreSQL knows and no other.
+//! An instant resolves by binary search over the transition history, with the
+//! file's POSIX footer rule covering instants past the last transition.
 
 use core::cell::RefCell;
-use std::io::Read as _;
 
 use super::timezone::Abbreviation;
 use crate::util::StackStr;
@@ -18,16 +18,13 @@ use crate::util::StackStr;
 /// Seconds between the Unix epoch and PostgreSQL's 2000-01-01 epoch.
 const PG_EPOCH_UNIX_SECONDS: i64 = 946_684_800;
 
-/// Transition capacity per zone. The largest installed zone has 242; the
-/// margin covers newer tzdata releases, and overflow refuses the zone loudly.
+/// Transition capacity per zone. The largest pinned zone has 242, and
+/// overflow refuses the zone loudly.
 const MAX_TRANSITIONS: usize = 512;
 
 /// Local-time type capacity per zone (offset/abbreviation combinations).
 const MAX_TYPES: usize = 32;
 pub(crate) const MAX_ABBREVIATIONS: usize = MAX_TYPES + 2;
-
-/// The longest `timezone_directory` path.
-pub(crate) const DIRECTORY_BYTES: usize = 1024;
 
 /// `TZ_MAX_CHARS`: PostgreSQL refuses a TZif file whose abbreviations take
 /// more bytes than this.
@@ -80,7 +77,6 @@ const EMPTY_ZONE: ZoneData = ZoneData {
 
 /// Every pinned zone, parsed at startup; a slot indexes `NAMES`.
 struct Zones {
-    directory: String,
     zones: Box<[ZoneData]>,
 }
 
@@ -91,99 +87,71 @@ std::thread_local! {
     static ZONES: RefCell<Option<Zones>> = const { RefCell::new(None) };
 }
 
-/// Why the configured zone database cannot serve PostgreSQL's zones.
+/// Why the built-in zone data cannot be served.
 #[derive(Debug)]
 pub enum ZoneDatabaseError {
-    /// `timezone_directory` lacks the TZif file of one or more pinned zones.
-    Missing {
-        directory: String,
-        missing: usize,
-        first: &'static str,
-    },
-    /// A pinned zone's file is not a TZif file pos3ql can hold.
-    Malformed {
-        directory: String,
-        zone: &'static str,
-    },
+    /// The data's checksum is not the pinned one.
+    Checksum,
+    /// A pinned zone's TZif file does not fit the fixed zone table.
+    Unfit { zone: &'static str },
 }
 
 impl core::fmt::Display for ZoneDatabaseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Missing {
-                directory,
-                missing,
-                first,
-            } => write!(
-                f,
-                "timezone_directory {directory:?} lacks {missing} of PostgreSQL 18.6's {} zones, among them {first:?}",
-                super::timezone_name_data::NAMES.len()
+            Self::Checksum => f.write_str(
+                "the built-in zone data does not match PostgreSQL 18.6's pinned checksum",
             ),
-            Self::Malformed { directory, zone } => write!(
+            Self::Unfit { zone } => write!(
                 f,
-                "timezone_directory {directory:?} holds no readable TZif file for zone {zone:?}"
+                "PostgreSQL 18.6's TZif file for zone {zone:?} does not fit the zone table"
             ),
         }
     }
+}
+
+/// SHA-256 over every zone's name, a NUL byte, its TZif bytes and a NUL
+/// byte, as `tools/generate-pg18-timezone-data.py` pins it.
+fn data_checksum() -> crate::crypto::sha256::HexDigest {
+    use super::timezone_data::{FILES, NAMES, ZONE_FILES};
+    let mut hasher = crate::crypto::sha256::Sha256::new();
+    for (name, &file) in NAMES.iter().zip(ZONE_FILES) {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(FILES[usize::from(file)]);
+        hasher.update(&[0]);
+    }
+    crate::crypto::sha256::HexDigest::of(&hasher.finish())
 }
 
 impl std::error::Error for ZoneDatabaseError {}
 
-/// Parses every zone PostgreSQL 18.6 names from `directory`. Startup only,
-/// on the thread that runs SQL, before the allocator freezes.
-pub fn init_catalog(directory: &str) -> Result<(), ZoneDatabaseError> {
-    if ZONES.with(|zones| {
-        zones
-            .borrow()
-            .as_ref()
-            .is_some_and(|zones| zones.directory == directory)
-    }) {
+/// Parses every zone PostgreSQL 18.6 installs. Startup only, on the thread
+/// that runs SQL, before the allocator freezes.
+pub fn init_catalog() -> Result<(), ZoneDatabaseError> {
+    if ZONES.with(|zones| zones.borrow().is_some()) {
         return Ok(());
     }
-    let names = super::timezone_name_data::NAMES;
-    let root = std::path::Path::new(directory);
-    let mut missing = 0usize;
-    let mut first = None;
-    for &name in names {
-        if !is_tzif_file(&root.join(name)) {
-            missing += 1;
-            first.get_or_insert(name);
-        }
+    if data_checksum().as_str() != super::timezone_data::SHA256 {
+        return Err(ZoneDatabaseError::Checksum);
     }
-    if let Some(first) = first {
-        return Err(ZoneDatabaseError::Missing {
-            directory: directory.to_string(),
-            missing,
-            first,
-        });
-    }
+    let names = super::timezone_data::NAMES;
     let mut zones = (0..names.len()).map(|_| EMPTY_ZONE).collect::<Vec<_>>();
-    for (zone, &name) in zones.iter_mut().zip(names) {
-        let parsed = std::fs::read(root.join(name)).is_ok_and(|data| parse_tzif(&data, zone));
-        if !parsed {
-            return Err(ZoneDatabaseError::Malformed {
-                directory: directory.to_string(),
-                zone: name,
-            });
+    for ((zone, &name), &file) in zones
+        .iter_mut()
+        .zip(names)
+        .zip(super::timezone_data::ZONE_FILES)
+    {
+        if !parse_tzif(super::timezone_data::FILES[usize::from(file)], zone) {
+            return Err(ZoneDatabaseError::Unfit { zone: name });
         }
     }
     ZONES.with(|slot| {
         *slot.borrow_mut() = Some(Zones {
-            directory: directory.to_string(),
             zones: zones.into_boxed_slice(),
         })
     });
     Ok(())
-}
-
-/// Zoneinfo installations contain several extensionless metadata files beside
-/// real zones. Identify a zone by the format's required magic.
-fn is_tzif_file(path: &std::path::Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).is_ok() && magic == *b"TZif"
 }
 
 /// The zone named `name`, matched case-insensitively against PostgreSQL's
@@ -193,7 +161,7 @@ pub fn load(name: &str) -> Option<TzifSlot> {
     if ZONES.with(|zones| zones.borrow().is_none()) {
         return None;
     }
-    super::timezone_name_data::NAMES
+    super::timezone_data::NAMES
         .iter()
         .position(|candidate| candidate.eq_ignore_ascii_case(name))
         .map(|slot| TzifSlot(slot as u16))
@@ -208,7 +176,7 @@ pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, Abbreviation) {
 
 /// The zone's name, spelled as PostgreSQL spells it.
 pub fn name(slot: TzifSlot) -> &'static str {
-    super::timezone_name_data::NAMES[usize::from(slot.0)]
+    super::timezone_data::NAMES[usize::from(slot.0)]
 }
 
 /// The callback cannot retain a reference beyond ownership of the cache.
@@ -345,7 +313,7 @@ pub(crate) fn visit_current(
         let Some(zones) = zones.as_ref() else {
             return false;
         };
-        for (zone, &name) in zones.zones.iter().zip(super::timezone_name_data::NAMES) {
+        for (zone, &name) in zones.zones.iter().zip(super::timezone_data::NAMES) {
             let (offset, abbreviation, is_dst) = resolve_zone(zone, utc_micros);
             visitor(name, offset, abbreviation, is_dst);
         }
@@ -536,17 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_without_postgresql_zones_is_a_named_error() {
-        let error = init_catalog("/nonexistent-zoneinfo").unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "timezone_directory \"/nonexistent-zoneinfo\" lacks 598 of PostgreSQL 18.6's 598 zones, among them \"Africa/Abidjan\""
-        );
+    fn the_built_in_zone_data_is_postgresql_18_6_s() {
+        use crate::sql::timezone_data::{NAMES, SHA256, ZONE_FILES};
+        assert_eq!(data_checksum().as_str(), SHA256);
+        assert_eq!(NAMES.len(), ZONE_FILES.len());
+        init_catalog().expect("every pinned zone fits the zone table");
+        // PostgreSQL 18.6's data, not the host's: Paris keeps CET/CEST.
+        let paris = load("europe/paris").expect("a pinned zone");
+        assert_eq!(resolve(paris, ts(2030, 7, 1, 12)).0, 7200);
+        assert_eq!(resolve(paris, ts(2030, 1, 1, 12)).0, 3600);
     }
 
-    fn load_or_skip(name: &str) -> Option<TzifSlot> {
-        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
-        load(name)
+    fn pinned(name: &str) -> TzifSlot {
+        init_catalog().expect("zone data");
+        load(name).expect("a zone PostgreSQL 18.6 installs")
     }
 
     #[test]
@@ -585,10 +556,7 @@ mod tests {
 
     #[test]
     fn new_york_matches_history_and_present() {
-        // Hermetic skip when the host has no zoneinfo.
-        let Some(slot) = load_or_skip("America/New_York") else {
-            return;
-        };
+        let slot = pinned("America/New_York");
         // Present rule.
         assert_eq!(resolve(slot, ts(2021, 1, 15, 12)).0, -5 * 3600);
         assert_eq!(resolve(slot, ts(2021, 7, 15, 12)).0, -4 * 3600);
@@ -605,26 +573,8 @@ mod tests {
     }
 
     #[test]
-    fn the_host_database_actually_loads_here() {
-        // The other tests skip hermetically on hosts without zoneinfo; this
-        // one asserts the harness machines (macOS/Linux dev and CI) do have
-        // it, so the skips cannot rot into never-running tests unnoticed.
-        if !std::path::Path::new("/usr/share/zoneinfo").is_dir() {
-            return;
-        }
-        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
-        assert!(
-            load("America/New_York").is_some(),
-            "zoneinfo present but load failed"
-        );
-    }
-
-    #[test]
     fn case_insensitive_and_unknown_names() {
-        init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
-        if load("America/New_York").is_none() {
-            return; // no zoneinfo on this host
-        }
+        pinned("America/New_York");
         assert!(load("aMeRiCa/nEw_YoRk").is_some());
         assert!(load("Not/A_Zone").is_none());
         assert!(load("../etc/passwd").is_none());
@@ -634,9 +584,7 @@ mod tests {
     fn moscow_history_needs_the_database() {
         // Moscow observed +04 year-round 2011..2014, then returned to +03 —
         // rule changes no single POSIX rule can express.
-        let Some(slot) = load_or_skip("Europe/Moscow") else {
-            return;
-        };
+        let slot = pinned("Europe/Moscow");
         assert_eq!(resolve(slot, ts(2012, 7, 1, 12)).0, 4 * 3600);
         assert_eq!(resolve(slot, ts(2021, 7, 1, 12)).0, 3 * 3600);
     }
@@ -645,9 +593,7 @@ mod tests {
     fn lord_howe_half_hour_dst() {
         // Lord Howe Island: +10:30 standard, +11:00 daylight — a half-hour
         // DST step the embedded rules never modeled.
-        let Some(slot) = load_or_skip("Australia/Lord_Howe") else {
-            return;
-        };
+        let slot = pinned("Australia/Lord_Howe");
         assert_eq!(resolve(slot, ts(2021, 7, 1, 12)).0, 10 * 3600 + 1800);
         assert_eq!(resolve(slot, ts(2021, 1, 15, 12)).0, 11 * 3600);
     }

@@ -3027,7 +3027,7 @@ pub(crate) fn dispatch<'a>(
                         Datum::Text(_) => {
                             crate::sql::eval::stash_diagnostic(
                                 None,
-                                Some(crate::util::StackStr::from_str(
+                                Some(crate::sql::eval::DiagnosticText::copy(
                                     "Valid fork names are \"main\", \"fsm\", \"vm\", and \"init\".",
                                 )),
                             );

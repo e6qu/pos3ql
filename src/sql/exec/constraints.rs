@@ -24,24 +24,19 @@ use super::{RowCtx, check_not_null};
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
 const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
 
-pub(crate) type DetailText =
-    crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>;
+/// A finished DETAIL, kept whole in the error text pool.
+pub(crate) type DetailText = crate::sql::error_text::ErrorText;
 
-fn detail_full() -> SqlError {
-    sql_err!(
-        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "error detail exceeds {} bytes",
-        crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES
-    )
-}
+/// Writes a DETAIL.
+type DetailWriter = crate::sql::eval::DiagnosticWriter;
 
 /// Writes `value`'s output text, cut to [`MAX_DESCRIBED_FIELD_BYTES`] at a
 /// character boundary and followed by `...` when longer, as PostgreSQL
 /// describes a failing row.
-fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
+fn write_described_value(out: &mut DetailWriter, value: Datum<'_>) {
     use core::fmt::Write;
     struct Clip<'o> {
-        out: &'o mut DetailText,
+        out: &'o mut DetailWriter,
         written: usize,
         clipped: bool,
     }
@@ -174,7 +169,7 @@ pub(crate) fn failing_row_detail(
             }
         }
     }
-    let mut detail = DetailText::new();
+    let mut detail = DetailWriter::new();
     let _ = detail.write_str("Failing row contains ");
     if named {
         let _ = detail.write_char('(');
@@ -210,16 +205,13 @@ pub(crate) fn failing_row_detail(
         }
     }
     let _ = detail.write_str(").");
-    if detail.is_truncated() {
-        return Err(detail_full());
-    }
-    Ok(Some(detail))
+    detail.finish().into_text().map(Some)
 }
 
 /// `Key (a, b)=(1, 2)`, PostgreSQL's description of an index key
 /// (`BuildIndexValueDescription`), written to `detail`.
 fn write_key_description(
-    detail: &mut DetailText,
+    detail: &mut DetailWriter,
     label: &str,
     columns: &mut dyn Iterator<Item = &str>,
     values: &mut dyn Iterator<Item = Datum<'_>>,
@@ -255,7 +247,7 @@ pub(crate) fn partition_key_detail<'v>(
     values: &mut dyn Iterator<Item = Datum<'v>>,
 ) -> Result<DetailText, SqlError> {
     use core::fmt::Write;
-    let mut detail = DetailText::new();
+    let mut detail = DetailWriter::new();
     let _ = detail.write_str("Partition key of the failing row contains (");
     for (index, column) in columns.enumerate() {
         if index > 0 {
@@ -271,10 +263,7 @@ pub(crate) fn partition_key_detail<'v>(
         write_described_value(&mut detail, value);
     }
     let _ = detail.write_str(").");
-    if detail.is_truncated() {
-        return Err(detail_full());
-    }
-    Ok(detail)
+    detail.finish().into_text()
 }
 
 /// Whether the current user may read a row's key values in an error
@@ -319,13 +308,10 @@ pub(crate) fn key_detail<'v>(
     suffix: core::fmt::Arguments<'_>,
 ) -> Result<DetailText, SqlError> {
     use core::fmt::Write;
-    let mut detail = DetailText::new();
+    let mut detail = DetailWriter::new();
     write_key_description(&mut detail, "Key", columns, values);
     let _ = detail.write_fmt(suffix);
-    if detail.is_truncated() {
-        return Err(detail_full());
-    }
-    Ok(detail)
+    detail.finish().into_text()
 }
 
 type ValidationRowVisitor<'callback> =
@@ -1013,13 +999,14 @@ impl<'e, 'a> ExclusionScan<'e, 'a> {
                     .as_str(),
             };
         }
-        let mut existing_text = DetailText::new();
+        let mut existing_text = DetailWriter::new();
         write_key_description(
             &mut existing_text,
             "key",
             &mut names[..n].iter().copied(),
             &mut other[..n].iter().copied(),
         );
+        let existing_text = existing_text.finish().into_text()?;
         let existing = match duplicate {
             DuplicateKey::Write => "existing ",
             DuplicateKey::IndexBuild => "",
@@ -3559,35 +3546,41 @@ fn check_fk_child_one_at(
         return Err(missing_parent_key(storage, txid, def, fk, values));
     };
     let parent_definition = storage.table_def(parent_index, txid).clone();
-    let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
-    for (position, (&child_column, &parent_column)) in
-        fk.columns().iter().zip(fk.parent_cols()).enumerate()
-    {
-        let referencing = def.columns()[usize::from(child_column)].ctype;
-        let referenced = parent_definition.columns()[usize::from(parent_column)].ctype;
-        let equality = super::foreign_key_equality::stored_key_equality(referencing, referenced)?;
-        key[position] = super::foreign_key_equality::comparison_value(
-            equality,
-            values[usize::from(child_column)],
+    // The check query converts the referencing values to the parent's key
+    // types, then looks the key up.
+    let lookup = || {
+        let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+        let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+        for (position, (&child_column, &parent_column)) in
+            fk.columns().iter().zip(fk.parent_cols()).enumerate()
+        {
+            let referencing = def.columns()[usize::from(child_column)].ctype;
+            let referenced = parent_definition.columns()[usize::from(parent_column)].ctype;
+            let equality =
+                super::foreign_key_equality::stored_key_equality(referencing, referenced)?;
+            key[position] = super::foreign_key_equality::comparison_value(
+                equality,
+                values[usize::from(child_column)],
+                arena,
+            )?;
+            key_types[position] = match equality {
+                super::foreign_key_equality::KeyEquality::Direct => referencing,
+                super::foreign_key_equality::KeyEquality::Cast(target) => target,
+            };
+        }
+        let n_key = fk.parent_cols().len();
+        parent_has_key(
+            storage,
+            parent_index,
+            fk.parent_cols(),
+            &key[..n_key],
+            &key_types[..n_key],
+            txid,
+            read,
             arena,
-        )?;
-        key_types[position] = match equality {
-            super::foreign_key_equality::KeyEquality::Direct => referencing,
-            super::foreign_key_equality::KeyEquality::Cast(target) => target,
-        };
-    }
-    let n_key = fk.parent_cols().len();
-    match parent_has_key(
-        storage,
-        parent_index,
-        fk.parent_cols(),
-        &key[..n_key],
-        &key_types[..n_key],
-        txid,
-        read,
-        arena,
-    ) {
+        )
+    };
+    match lookup() {
         Ok(true) => Ok(()),
         Ok(false) => Err(missing_parent_key(storage, txid, def, fk, values)),
         Err(error) if error.sqlstate.internal_control().is_some() => Err(error),
@@ -3704,16 +3697,11 @@ fn missing_parent_key(
             format_args!(" is not present in table \"{}\".", fk.parent.as_str()),
         )
     } else {
-        let mut detail = DetailText::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut detail,
-            format_args!("Key is not present in table \"{}\".", fk.parent.as_str()),
-        );
-        if detail.is_truncated() {
-            Err(detail_full())
-        } else {
-            Ok(detail)
-        }
+        crate::sql::error_text::ErrorText::format(format_args!(
+            "Key is not present in table \"{}\".",
+            fk.parent.as_str()
+        ))
+        .map_err(crate::sql::error_text::TextExhausted::error)
     };
     let detail = match detail {
         Ok(detail) => detail,
@@ -5679,18 +5667,11 @@ fn check_referenced_key(
             ),
         )?
     } else {
-        let mut detail = DetailText::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut detail,
-            format_args!(
-                "Key is {still}referenced from table \"{}\".",
-                child.name.as_str()
-            ),
-        );
-        if detail.is_truncated() {
-            return Err(detail_full());
-        }
-        detail
+        crate::sql::error_text::ErrorText::format(format_args!(
+            "Key is {still}referenced from table \"{}\".",
+            child.name.as_str()
+        ))
+        .map_err(crate::sql::error_text::TextExhausted::error)?
     };
     crate::sql::eval::stash_object_diagnostic(
         Some(detail.as_str()),

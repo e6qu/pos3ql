@@ -1391,7 +1391,7 @@ impl Engine {
                 {
                     crate::sql::error_context::SqlFunctionInlining::Executed
                 } else {
-                    crate::sql::error_context::SqlFunctionInlining::Folded
+                    crate::sql::error_context::SqlFunctionInlining::Inlining
                 },
             };
             let known = &*known;

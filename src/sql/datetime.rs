@@ -236,10 +236,13 @@ fn claim_format_integer(slot: &mut Option<i32>, value: i32, field: &str) -> Resu
     // PostgreSQL permits replacing an earlier zero but rejects conflicting
     // nonzero values, even when a later TZ field changed interpretation.
     if slot.is_some_and(|previous| previous != 0 && previous != value) {
-        return Err(sql_err!(
-            sqlstate::INVALID_DATETIME_FORMAT,
-            "conflicting values for \"{}\" field in formatting string",
-            field
+        return Err(super::eval::with_detail(
+            sql_err!(
+                sqlstate::INVALID_DATETIME_FORMAT,
+                "conflicting values for \"{}\" field in formatting string",
+                field
+            ),
+            format_args!("This value contradicts a previous setting for the same field type."),
         ));
     }
     *slot = Some(value);
@@ -561,10 +564,13 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
                 super::timezone::Timezone::utc()
             } else {
                 super::timezone::lookup_abbreviation(name).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_DATETIME_FORMAT,
-                        "invalid value \"{}\" for \"TZ\"",
-                        &input[start..]
+                    super::eval::with_detail(
+                        sql_err!(
+                            sqlstate::INVALID_DATETIME_FORMAT,
+                            "invalid value \"{}\" for \"TZ\"",
+                            &input[start..]
+                        ),
+                        format_args!("Time zone abbreviation is not recognized."),
                     )
                 })?
             };
@@ -2368,7 +2374,7 @@ mod tests {
 
     #[test]
     fn timestamptz_interval_keeps_local_civil_time_across_dst() {
-        crate::sql::tzif::init_catalog("/usr/share/zoneinfo").expect("zoneinfo");
+        crate::sql::tzif::init_catalog().expect("zone data");
         let zone = crate::sql::timezone::lookup("America/New_York").unwrap();
         crate::sql::timezone::set_session(zone);
         let before = parse_timestamp("2024-03-09 12:00:00-05", true).unwrap();

@@ -10152,6 +10152,79 @@ pub(crate) fn index_statistics_source(
 /// Resolves the catalog identity of the plain-column value index selected by
 /// the storage probe path. Duplicate indexes must not all receive credit for
 /// one physical scan.
+/// One index of a table as the planner's `get_relation_info` describes it.
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerIndex {
+    pub(crate) oid: i32,
+    pub(crate) name: StackStr<64>,
+    pub(crate) method: crate::sql::ast::IndexAccessMethod,
+    pub(crate) columns: [u16; crate::storage::MAX_INDEX_COLS],
+    pub(crate) n_cols: usize,
+    pub(crate) include_columns: [u16; crate::storage::MAX_INDEX_COLS],
+    pub(crate) n_include_cols: usize,
+    pub(crate) unique: bool,
+    pub(crate) descending: [bool; crate::storage::MAX_INDEX_COLS],
+    pub(crate) nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+    /// Every key is a plain column with its column's collation and its
+    /// type's default operator class, and the index has no predicate.
+    pub(crate) plain: bool,
+}
+
+/// Visits each index of the table in `table_slot`.
+pub(crate) fn planner_indexes(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    visit: &mut dyn FnMut(PlannerIndex),
+) {
+    let definition = storage.table_def(table_slot, txid);
+    visit_indexes(
+        storage,
+        txid,
+        None,
+        TableSelection::Table(table_slot),
+        ExplicitIndexes::Scanned,
+        |index| {
+            if index.table_slot != table_slot {
+                return;
+            }
+            let plain = index.predicate.is_none()
+                && !index.is_exclusion
+                && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
+                && index.columns[..index.n_cols]
+                    .iter()
+                    .enumerate()
+                    .all(|(position, column)| {
+                        !index.explicit_collations[position]
+                            || index.collations[position]
+                                == definition.columns[*column as usize].collation
+                    })
+                && !index.resolved_operator_classes[..index.n_cols].iter().any(
+                    |class| match class {
+                        Some(crate::storage::IndexOperatorClass::Catalog(_)) => true,
+                        Some(crate::storage::IndexOperatorClass::Btree(class)) => {
+                            class.is_pattern()
+                        }
+                        _ => false,
+                    },
+                );
+            visit(PlannerIndex {
+                oid: index.oid,
+                name: index.name,
+                method: index.method,
+                columns: index.columns,
+                n_cols: index.n_cols,
+                include_columns: index.include_columns,
+                n_include_cols: index.n_include_cols,
+                unique: index.is_unique || index.is_primary,
+                descending: index.descending,
+                nulls_first: index.nulls_first,
+                plain,
+            });
+        },
+    );
+}
+
 pub(crate) fn value_index_identity(
     storage: &Storage,
     txid: u32,

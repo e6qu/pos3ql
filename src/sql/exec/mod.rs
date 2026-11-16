@@ -73529,11 +73529,19 @@ fn validate_index_rows(
         let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
+        let mut packing = crate::storage::heap_layout::HeapPacking::new();
+        let mut pack = |values: &[Datum]| {
+            packing.add(crate::storage::heap_layout::tuple_length(
+                values,
+                &schema[..definition.n_columns],
+            ));
+        };
         let overlay = scan.for_each_overlay(&mut |rowid, home| {
             storage.with_row_bytes(table_index, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
                 validate_values(rowid, &values[..definition.n_columns])?;
+                pack(&values[..definition.n_columns]);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -73557,6 +73565,7 @@ fn validate_index_rows(
                     crate::storage::SpilledRowRepresentation::Values(values) => values,
                 };
                 validate_values(spilled.rowid, values)?;
+                pack(values);
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(match spilled.representation {
                     crate::storage::SpilledRowRepresentation::Encoded(bytes) => bytes.len() as u64,
@@ -73568,8 +73577,11 @@ fn validate_index_rows(
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
         let mut statistics = storage.table_statistics(table_index, 0);
-        statistics.valid = true;
+        // PostgreSQL's `index_update_stats` leaves a never-counted empty
+        // table's `reltuples` at -1.
+        statistics.valid |= rows != 0;
         statistics.rows = rows;
+        statistics.pages = packing.pages();
         statistics.average_row_width = row_bytes
             .checked_div(rows)
             .unwrap_or(0)

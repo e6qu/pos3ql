@@ -54954,9 +54954,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
          EXPLAIN (GENERIC_PLAN) EXECUTE ep_by_id(2)",
     ));
     assert!(
-        generic
-            .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
+        // PostgreSQL reads three rows on one page sequentially.
+        generic.iter().any(|row| row.contains("Seq Scan on ep")),
         "{generic:?}"
     );
     let analyzed_prepared = data_rows(&run_with(
@@ -55013,7 +55012,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on public.ep")),
+            .any(|row| row.contains("Seq Scan on public.ep")),
         "{detailed:?}"
     );
 
@@ -72106,10 +72105,11 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         "EXPLAIN SELECT key, payload, note FROM covered_rows \
          WHERE key >= 1 ORDER BY key",
     ));
+    // One row on one page: PostgreSQL sorts a sequential scan.
     assert!(
         covering_plan
             .iter()
-            .any(|row| row.contains("Index Only Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{covering_plan:?}"
     );
     assert_eq!(
@@ -72128,10 +72128,11 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         &mut replay_budget,
         "EXPLAIN SELECT payload, note FROM covered_rows WHERE key = 1 ORDER BY key",
     ));
+    // One row on one page: PostgreSQL reads it sequentially.
     assert!(
         exact_plan
             .iter()
-            .any(|row| row.contains("Index Only Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{exact_plan:?}"
     );
     let heap_plan = data_rows(&run_with(
@@ -72142,7 +72143,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     assert!(
         heap_plan
             .iter()
-            .any(|row| row.contains("Index Scan using covered_key")),
+            .any(|row| row.contains("Seq Scan on covered_rows")),
         "{heap_plan:?}"
     );
     assert!(heap_plan.iter().all(|row| !row.contains("Index Only Scan")));
@@ -73453,13 +73454,16 @@ fn index_file_owners_unrelated_commits_preserve_index_access_for_an_older_snapsh
         "UPDATE index_invoices SET note = 'new' WHERE id = 1",
         true,
     );
+    // PostgreSQL's plan is the same index-only scan; the visibility map
+    // decides its heap fetches.
     let plan = data_rows(&reader.success(
         &mut engine,
         "EXPLAIN SELECT id, note FROM index_invoices WHERE id = 1 ORDER BY id",
         true,
     ));
     assert!(
-        plan.iter().all(|row| !row.contains("Index Only Scan")),
+        plan.iter()
+            .any(|row| row.contains("Index Only Scan using covered_invoice")),
         "{plan:?}"
     );
     // Stream the single historical match; sorting would upload simulator runs.
@@ -82344,7 +82348,10 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let restarted_statistics = restarted.storage.table_statistics(restarted_slot, 0);
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
-    assert_eq!(restarted_statistics.column(1).unwrap().distinct_values, 2);
+    assert_eq!(
+        restarted_statistics.column(1).unwrap().distinct_fraction,
+        1.0
+    );
     let composite_slot = restarted
         .storage
         .extended_statistics_slot("public", "snapshot_rows_id_value_stats", 0)
@@ -86284,7 +86291,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     ));
     assert!(
         plan.iter()
-            .any(|line| line.contains("Seq Scan on pruning_rows")),
+            .any(|line| line.contains("Index Scan using pruning_rows_pkey")),
         "{plan:?}"
     );
     assert_eq!(
@@ -87521,7 +87528,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
     ));
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using format_value_index")),
+            .any(|row| row.contains("Bitmap Index Scan on format_value_index")),
         "cold recovery must retain the renamed enum's published index: {plan:?}"
     );
     assert_eq!(

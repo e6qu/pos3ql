@@ -4709,6 +4709,9 @@ impl Checkpointer {
                         parse_field(words.next(), "stats average row width")?;
                     let analyzed_generation: u64 =
                         parse_field(words.next(), "stats analyzed generation")?;
+                    let pages: u64 = parse_field(words.next(), "stats pages")?;
+                    let all_visible_pages: u64 =
+                        parse_field(words.next(), "stats all-visible pages")?;
                     let column_count: usize =
                         parse_field(words.next(), "stats analyzed column count")?;
                     let value_bytes: usize = parse_field(words.next(), "stats distribution bytes")?;
@@ -4729,6 +4732,8 @@ impl Checkpointer {
                             rows,
                             average_row_width,
                             analyzed_generation,
+                            pages,
+                            all_visible_pages,
                             columns: crate::storage::ColumnImages::EMPTY,
                         },
                         records: storage
@@ -11246,10 +11251,12 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "stats {slot} {} {} {} {} {}",
+                        "stats {slot} {} {} {} {} {} {} {}",
                         table_statistics.rows,
                         table_statistics.average_row_width,
                         table_statistics.analyzed_generation,
+                        table_statistics.pages,
+                        table_statistics.all_visible_pages,
                         table_statistics.columns.len(),
                         table_statistics
                             .columns

@@ -637,13 +637,33 @@ described by the view's privileges and the columns the statement wrote, and a
 subscription's applied row by the applying role's privileges with no written
 columns, as PostgreSQL's apply worker writes. Revoking a table privilege revokes it on
 each column too.
-Row order
-without `ORDER BY` follows a model of PostgreSQL's access path rather than
-its cost-based plan: a query or data change on one table whose condition
-constrains an index's leading column takes rows in their first-insertion
-order, as an index or bitmap scan reaches an updated row at its first
-position, and any other takes them in physical order. A table with saved row
-files read without index candidates keeps physical order.
+A
+query reading one plain table chooses its sequential, index, index-only or
+bitmap heap scan by PostgreSQL's costs (`cost_index` with `btcostestimate`
+and the column's correlation, `cost_bitmap_heap_scan`, `cost_seqscan`,
+`add_path` with its pathkeys, a sort's cost under `ORDER BY` and
+`create_limit_path` under `LIMIT`) from the statistics ANALYZE gathers, and
+returns its rows in that scan's order: an index scan by key (backward for the
+reverse order), a bitmap heap scan and a sequential scan by heap position
+(`differential_exact/691`, `692`). `EXPLAIN ANALYZE` counts what the chosen
+scan reads: rows its index conditions reach, `Rows Removed by Filter`, a
+bitmap heap scan's `Heap Blocks` and an index-only scan's `Heap Fetches`, and
+each index scan's `Index Searches`. Remaining: multi-column, expression,
+partial and non-btree indexes, a `BitmapAnd` of several indexes, conditions
+other than a column compared with a constant or tested for NULL (`IN`, `OR`,
+`LIKE`, functions), more than one ordering column, grouping or `DISTINCT`
+above the scan, joins, data changes and partitioned tables, which keep the
+access model below. The heap and btree layouts PostgreSQL's costs read are
+emulated: rows packed in physical order, an index laid out as CREATE INDEX
+builds it, and a visibility map whose pages stay all-visible after VACUUM
+until an update or delete (`relallvisible` then counts none) or an insert
+(pages from the first inserted row's on). Rows without such a chosen scan
+follow a model of PostgreSQL's access path rather than its cost-based plan:
+a query or data change on one table whose condition constrains an index's
+leading column takes rows in their first-insertion order, as an index or
+bitmap scan reaches an updated row at its first position, and any other
+takes them in physical order. A table with saved row files read without
+index candidates keeps physical order.
 An exclusion constraint element may be a column, a function call or a
 parenthesized expression (`EXCLUDE USING gist (int4range(a, b) WITH &&)`).
 Its elements' expressions together hold at most 256 bytes of stored text;
@@ -1254,12 +1274,11 @@ operator, as PostgreSQL's operator families do. It does not yet turn a
 `C`, `>=`/`<`) index range with the pattern kept as a filter, nor scan a
 pattern-class key for an explicit `~<~`-family range: those keys get their
 own physical binding, whose range plans need PostgreSQL's prefix and
-histogram selectivity to choose its bitmap scan. Any B-tree range (`id >= 5
-AND id < 9`, also under `enable_seqscan = off`) is planned as a sequential
-scan until its value binding is durably complete, so a range derived from a
-prefix would show only on spilled tables. `=` on a B-tree key whose columns
-cover the query shows `Index Scan` where PostgreSQL shows `Index Only Scan`;
-EXPLAIN names an index-only scan only for an ordered plan. A routine parameter or result written with `%TYPE` may name a
+histogram selectivity to choose its bitmap scan. Outside the chosen scans
+above, a B-tree range (`id >= 5 AND id < 9`, also under `enable_seqscan =
+off`) is planned as a sequential scan until its value binding is durably
+complete, and `=` on a B-tree key whose columns cover the query shows `Index
+Scan` where PostgreSQL shows `Index Only Scan`. A routine parameter or result written with `%TYPE` may name a
 table column but not a view column (`0A000`). When a block label and a row variable share the
 first word, the variable wins only when it is declared at least as deep as
 the labelled block's variable, where PostgreSQL compares block by block. A literal passed to a function's `regclass`

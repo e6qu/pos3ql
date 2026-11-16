@@ -205,6 +205,7 @@ mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
 pub(crate) use statistics::distribution::ColumnDistribution;
+pub(crate) use statistics::heap_layout;
 pub(crate) use statistics::{AnalyzedColumn, ColumnImages, StatisticsOrigin};
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
@@ -4033,6 +4034,12 @@ pub(crate) struct TableStatistics {
     pub(crate) rows: u64,
     pub(crate) average_row_width: u32,
     pub(crate) analyzed_generation: u64,
+    /// `pg_class.relpages`: the heap pages PostgreSQL would store the rows
+    /// in when VACUUM, ANALYZE or CREATE INDEX last counted them.
+    pub(crate) pages: u64,
+    /// `pg_class.relallvisible`: the pages its visibility map marked
+    /// all-visible then.
+    pub(crate) all_visible_pages: u64,
     pub(crate) columns: ColumnImages,
 }
 
@@ -4042,6 +4049,8 @@ impl PartialEq for TableStatistics {
             && self.rows == other.rows
             && self.average_row_width == other.average_row_width
             && self.analyzed_generation == other.analyzed_generation
+            && self.pages == other.pages
+            && self.all_visible_pages == other.all_visible_pages
             && self.columns == other.columns
     }
 }
@@ -4063,6 +4072,8 @@ impl TableStatistics {
         rows: 0,
         average_row_width: 0,
         analyzed_generation: 0,
+        pages: 0,
+        all_visible_pages: 0,
         columns: ColumnImages::EMPTY,
     };
 
@@ -38516,12 +38527,21 @@ impl Storage {
         arena: &Arena,
     ) -> Result<(), SqlError> {
         let _snapshot = self.analyze_snapshot();
+        let definition = self.table_def(table_slot, txid);
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = definition.schema(&mut schema);
+        drop(definition);
+        let schema = &schema[..n_columns];
         let scan = self.captured_row_scan_in(table_slot, txid, arena)?;
         let mut rows = 0u64;
         let mut row_bytes = 0u64;
+        let mut packing = heap_layout::HeapPacking::new();
         let _ = scan.for_each_overlay(&mut |rowid, home| {
             crate::sql::query::check_timeout()?;
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, schema, &mut values)?;
+                packing.add(heap_layout::tuple_length(&values[..n_columns], schema));
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(bytes.len() as u64);
                 Ok(())
@@ -38531,10 +38551,17 @@ impl Storage {
         scan.for_each_spilled_row_batch(arena, true, None, &mut |batch| {
             for row in batch {
                 crate::sql::query::check_timeout()?;
-                let length = match row.representation {
-                    SpilledRowRepresentation::Encoded(bytes) => bytes.len(),
-                    SpilledRowRepresentation::Values(values) => rowenc::encoded_len(values),
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                let (length, values) = match row.representation {
+                    SpilledRowRepresentation::Encoded(bytes) => {
+                        rowenc::decode(bytes, schema, &mut decoded)?;
+                        (bytes.len(), &decoded[..n_columns])
+                    }
+                    SpilledRowRepresentation::Values(values) => {
+                        (rowenc::encoded_len(values), values)
+                    }
                 };
+                packing.add(heap_layout::tuple_length(values, schema));
                 rows = rows.saturating_add(1);
                 row_bytes = row_bytes.saturating_add(length as u64);
             }
@@ -38545,6 +38572,9 @@ impl Storage {
         let mut statistics = self.table_statistics(table_slot, 0);
         statistics.valid = true;
         statistics.rows = rows;
+        // VACUUM leaves every page all-visible.
+        statistics.pages = packing.pages();
+        statistics.all_visible_pages = packing.pages();
         statistics.average_row_width = row_bytes
             .checked_div(rows)
             .unwrap_or(0)
@@ -38800,6 +38830,42 @@ impl Storage {
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32;
         statistics.analyzed_generation = analyzed_generation;
+        // The heap pages of the sampled rows, scaled to the table when the
+        // sample is a part of it; the visibility map keeps the pages VACUUM
+        // marked all-visible that no later change touched.
+        let mut packing = heap_layout::HeapPacking::new();
+        let mut first_new_page = None;
+        let (inserted, dead) = {
+            let cumulative = self.cumulative_statistics();
+            let relation = &cumulative.relations[table_slot];
+            (relation.n_ins_since_vacuum, relation.n_dead_tup)
+        };
+        let first_new_row = rows.saturating_sub(inserted);
+        for (position, &row) in sample_rows.iter().enumerate() {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(row, &schema[..n_columns], &mut values)?;
+            let page = packing.add(heap_layout::tuple_length(
+                &values[..n_columns],
+                &schema[..n_columns],
+            ));
+            if position as u64 == first_new_row && first_new_page.is_none() {
+                first_new_page = Some(page);
+            }
+        }
+        statistics.pages = if (sample_rows.len() as u64) < rows {
+            (packing.pages() as f64 * rows as f64 / sample_rows.len() as f64).ceil() as u64
+        } else {
+            packing.pages()
+        };
+        statistics.all_visible_pages = if dead != 0 {
+            0
+        } else if inserted == 0 {
+            statistics.all_visible_pages.min(statistics.pages)
+        } else {
+            first_new_page
+                .filter(|_| sample_rows.len() as u64 == rows)
+                .map_or(0, |page| statistics.all_visible_pages.min(page))
+        };
         for column in 0..n_columns {
             if !selected[column] || rows == 0 {
                 continue;

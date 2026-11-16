@@ -2,6 +2,7 @@
 
 mod columns;
 pub(crate) mod distribution;
+pub(crate) mod heap_layout;
 pub(crate) mod scalar;
 pub(crate) use columns::{AnalyzedColumn, ColumnImages};
 
@@ -29,10 +30,15 @@ impl TableStatistics {
 
     pub(crate) fn relation_pages(&self) -> i32 {
         if self.valid {
-            self.rows
-                .saturating_mul(u64::from(self.average_row_width))
-                .div_ceil(8_192)
-                .min(i32::MAX as u64) as i32
+            self.pages.min(i32::MAX as u64) as i32
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn relation_all_visible_pages(&self) -> i32 {
+        if self.valid {
+            self.all_visible_pages.min(self.pages).min(i32::MAX as u64) as i32
         } else {
             0
         }
@@ -713,6 +719,8 @@ impl Storage {
         state.committed.rows = statistics.rows;
         state.committed.average_row_width = statistics.average_row_width;
         state.committed.analyzed_generation = statistics.analyzed_generation;
+        state.committed.pages = statistics.pages;
+        state.committed.all_visible_pages = statistics.all_visible_pages;
         state.relation_revision = revision;
         state.dirty = true;
         state.wal_dirty = true;
@@ -740,6 +748,8 @@ impl Storage {
             statistics.rows = current.rows;
             statistics.average_row_width = current.average_row_width;
             statistics.analyzed_generation = current.analyzed_generation;
+            statistics.pages = current.pages;
+            statistics.all_visible_pages = current.all_visible_pages;
         }
         let revision = if origin == StatisticsOrigin::Definition {
             let definition = self.tables[table_slot].definition.read();
@@ -778,6 +788,8 @@ impl Storage {
                 state.committed.rows = statistics.rows;
                 state.committed.average_row_width = statistics.average_row_width;
                 state.committed.analyzed_generation = statistics.analyzed_generation;
+                state.committed.pages = statistics.pages;
+                state.committed.all_visible_pages = statistics.all_visible_pages;
                 state.relation_revision = next;
                 state.dirty = true;
                 state.wal_dirty = true;
@@ -820,6 +832,8 @@ impl Storage {
         state.committed.rows = statistics.rows;
         state.committed.average_row_width = statistics.average_row_width;
         state.committed.analyzed_generation = statistics.analyzed_generation;
+        state.committed.pages = statistics.pages;
+        state.committed.all_visible_pages = statistics.all_visible_pages;
         state.relation_revision = revision;
         state.dirty = true;
         state.wal_dirty |= dirty_wal;
@@ -1279,6 +1293,8 @@ mod tests {
             rows,
             average_row_width: (rows * 2) as u32,
             analyzed_generation: rows * 3,
+            pages: rows,
+            all_visible_pages: 0,
             columns: ColumnImages::new(
                 columns.freeze(),
                 crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -1917,6 +1933,7 @@ mod tests {
             let mut first = empty.clone();
             first.valid = true;
             first.rows = 1;
+            first.pages = 1;
             first.average_row_width = 8;
             assert!(first.relation_estimates_changed(&empty));
             assert_eq!((first.relation_tuples(), first.relation_pages()), (1.0, 1));
@@ -1925,7 +1942,7 @@ mod tests {
             samples_only.average_row_width = 16;
             assert!(!samples_only.relation_estimates_changed(&first));
             let mut pages_changed = first.clone();
-            pages_changed.average_row_width = 8_193;
+            pages_changed.pages = 2;
             assert!(pages_changed.relation_estimates_changed(&first));
             assert_eq!(pages_changed.relation_pages(), 2);
             let mut rows_changed = first.clone();

@@ -116,6 +116,9 @@ struct PlanNode {
     /// A join whose inner relation matches at most one row per outer row
     /// by a unique index on its join keys (`innerrel_is_unique`).
     inner_unique: bool,
+    /// A bitmap heap scan's index scan cost and rows, when the planner
+    /// costed it.
+    bitmap_index_estimate: Option<(f64, u64)>,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -379,11 +382,16 @@ impl PlanNode {
         scan_pruned: false,
         uncounted: false,
         inner_unique: false,
+        bitmap_index_estimate: None,
     };
 }
 
 /// What `EXPLAIN ANALYZE` reports for one node.
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a node's counters are copied by value, never stored in bulk"
+)]
 enum NodeActual {
     /// Not analyzed, or a node whose work the executor does not count.
     Unmeasured,
@@ -3019,6 +3027,7 @@ fn push_members(
         scan_pruned: expansion.planned.scan_pruned,
         uncounted: false,
         inner_unique: false,
+        bitmap_index_estimate: None,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3036,11 +3045,32 @@ fn push_members(
 fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     let bitmap_index = scan.bitmap_index;
     let bitmap_depth = scan.depth.saturating_add(1);
-    let bitmap_rows = scan.rows;
-    let bitmap_cost = scan.total_cost * 0.4;
+    let (bitmap_cost, bitmap_rows) = scan
+        .bitmap_index_estimate
+        .unwrap_or((scan.total_cost * 0.4, scan.rows));
     let mut index_cond = None;
     let mut verbose_index_cond = None;
+    // A heap scan that rechecks its conditions as written passes its
+    // bitmap index scan the `Index Cond` it holds.
     if !bitmap_index.as_str().is_empty()
+        && scan
+            .quals
+            .iter()
+            .any(|(label, _)| *label == QualLabel::RecheckCond)
+    {
+        for (quals, held) in [
+            (&mut scan.quals, &mut index_cond),
+            (&mut scan.verbose_quals, &mut verbose_index_cond),
+        ] {
+            if let Some(entry) = quals
+                .iter_mut()
+                .find(|(label, _)| *label == QualLabel::IndexCond)
+            {
+                *held = Some(entry.1);
+                *entry = (QualLabel::None, StackStr::new());
+            }
+        }
+    } else if !bitmap_index.as_str().is_empty()
         && let Some(entry) = scan
             .quals
             .iter_mut()
@@ -3057,6 +3087,11 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
             verbose_index_cond = Some(entry.1);
         }
     }
+    // The bitmap index scan counts under its heap scan's position.
+    let bitmap_key = scan.key.and_then(|key| match key.role {
+        Role::Scan(position) => Some(NodeKey::new(key.block, Role::BitmapIndex(position))),
+        _ => None,
+    });
     plan.push(scan)?;
     if !bitmap_index.as_str().is_empty() {
         let mut name = StackStr::new();
@@ -3064,6 +3099,7 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
         plan.push(
             PlanNode {
                 name,
+                key: bitmap_key,
                 depth: bitmap_depth,
                 total_cost: bitmap_cost,
                 rows: bitmap_rows,
@@ -3091,6 +3127,13 @@ fn index_condition<'a>(
     for (source, key, operator, operand) in index.index_conditions() {
         if count == MAX_CONJUNCTS {
             return Ok(None);
+        }
+        // A null test, and a bitmap heap scan's recheck, print the
+        // condition as written.
+        if index.as_written() || matches!(source, Expr::IsNull { .. }) {
+            conditions[count] = source;
+            count += 1;
+            continue;
         }
         let source_position = match source {
             Expr::Binary {
@@ -4075,6 +4118,69 @@ fn predicate_selectivity<'a>(
     }
 }
 
+/// The scan node of the path PostgreSQL's planner chose for the one
+/// relation of `scope`, with the index conditions it consumes.
+fn chosen_scan_node<'a>(
+    scope: &QueryScope<'a>,
+    depth: u8,
+    path: &query::index_paths::ScanPath<'a>,
+) -> (PlanNode, Option<query::IndexAccessPlan<'a>>) {
+    use query::index_paths::ScanKind;
+    let definition = scope.defs.stored(0).expect("a chosen path scans a table");
+    let mut name = StackStr::new();
+    let mut bitmap_index = StackStr::new();
+    match path.kind {
+        ScanKind::Seq => {
+            let _ = write!(name, "Seq Scan");
+        }
+        ScanKind::Index | ScanKind::IndexOnly => {
+            let _ = write!(
+                name,
+                "Index {}Scan {}using {}",
+                if path.kind == ScanKind::IndexOnly {
+                    "Only "
+                } else {
+                    ""
+                },
+                if path.backward { "Backward " } else { "" },
+                path.index_name.as_str()
+            );
+        }
+        ScanKind::Bitmap => {
+            let _ = write!(name, "Bitmap Heap Scan");
+            bitmap_index = path.index_name;
+        }
+    }
+    let mut relation = StackStr::new();
+    let mut schema = StackStr::new();
+    let mut alias = StackStr::new();
+    let exposed = crate::sql::catalog::deparse::printed_name(scope.names[0]);
+    let _ = write!(relation, "{}", definition.name.as_str());
+    let _ = write!(schema, "{}", definition.schema.as_str());
+    if exposed != definition.name.as_str() {
+        let _ = write!(alias, "{exposed}");
+    }
+    let node = PlanNode {
+        name,
+        bitmap_index,
+        relation,
+        alias,
+        depth,
+        startup_cost: path.startup_cost,
+        total_cost: path.total_cost,
+        rows: path.rows as u64,
+        width: path.width,
+        schema,
+        bitmap_index_estimate: (path.kind == ScanKind::Bitmap)
+            .then_some((path.index_cost, path.index_rows as u64)),
+        ..PlanNode::EMPTY
+    };
+    let used = (path.kind != ScanKind::Seq)
+        .then(|| query::IndexAccessPlan::chosen(path, definition))
+        .flatten();
+    (node, used)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "physical plan inputs are explicit"
@@ -4090,8 +4196,12 @@ fn scan_node<'a>(
     ordered: Option<query::OrderedIndexAccessPlan<'a>>,
     parameterized: Option<query::IndexAccessPlan<'a>>,
     index_only: bool,
+    chosen: Option<query::index_paths::ScanPath<'a>>,
 ) -> Result<(PlanNode, Option<query::IndexAccessPlan<'a>>), SqlError> {
     let slot = scope.slots[table];
+    if let Some(path) = chosen.filter(|_| table == 0) {
+        return Ok(chosen_scan_node(scope, depth, &path));
+    }
     let derived = scope.derived[table].is_some() || slot == usize::MAX;
     let rows = if derived {
         scope.derived[table].map_or(1_000, |rows| rows.len() as u64)
@@ -4253,6 +4363,7 @@ fn scan_node<'a>(
         scan_pruned: false,
         uncounted: false,
         inner_unique: false,
+        bitmap_index_estimate: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -5113,6 +5224,57 @@ fn plan_pulled_select<'a>(
         }
     }
 
+    // The path PostgreSQL's planner chooses for a query reading one table
+    // without grouping, for its ordering and row limit.
+    let chosen_path = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from))
+            if scope.n == 1
+                && from.joins.is_empty()
+                && from.base.sample.is_none()
+                && statement.group_by.is_empty()
+                && !statement.distinct
+                && statement.distinct_on.is_empty()
+                && !has_window(statement)
+                && !query::has_set_returning_items(statement.items, storage, txid) =>
+        {
+            let shape = if aggregate {
+                Some(query::index_paths::QueryShape::default())
+            } else {
+                query::index_paths::query_shape(
+                    storage,
+                    txid,
+                    scope,
+                    statement.items,
+                    statement.order_by,
+                    statement.limit,
+                    statement.offset,
+                    &[],
+                    arena,
+                )?
+            };
+            match shape {
+                Some(shape) => query::index_paths::scan_path(
+                    storage,
+                    scope,
+                    txid,
+                    statement.where_clause,
+                    query::streaming_pax_columns_ordered(
+                        scope,
+                        from,
+                        statement.items,
+                        statement.where_clause,
+                        statement.order_by,
+                    )
+                    .selected_mask(0),
+                    &[],
+                    arena,
+                    shape,
+                )?,
+                None => None,
+            }
+        }
+        _ => None,
+    };
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
     let mut object_requests = 0u64;
@@ -5176,6 +5338,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
+                chosen_path,
             )?;
             scan_indexes[table] = index;
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
@@ -5469,8 +5632,14 @@ fn plan_pulled_select<'a>(
     // Rows a window leaves sorted by the query's keys need no sort, and
     // ones sorted by a prefix of them only an incremental one.
     let presorted = presorted_order_keys(statement, sorted_keys, window_sorted);
+    // The chosen path may return the rows ordered; otherwise the legacy
+    // ordered index does.
+    let scan_ordered = match chosen_path {
+        Some(path) => !path.sort,
+        None => ordered_index.is_some(),
+    };
     if !sorted_keys.is_empty()
-        && ordered_index.is_none()
+        && !scan_ordered
         && presorted.is_none_or(|presorted| presorted < sorted_keys.len())
     {
         total_cost += estimated_rows as f64 * (estimated_rows.max(2) as f64).log2() * 0.0025;
@@ -5652,6 +5821,7 @@ fn plan_pulled_select<'a>(
     // A single relation's index condition and filter as `VERBOSE` prints
     // them.
     let mut verbose_quals: (Option<StackStr<512>>, Option<StackStr<512>>) = (None, None);
+    let mut bitmap_recheck = None;
     let index_conds = arena
         .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
         .map_err(|_| arena_full())?;
@@ -5828,6 +5998,38 @@ fn plan_pulled_select<'a>(
                 true,
                 arena,
             )?;
+            // A chosen bitmap heap scan rechecks its conditions as written;
+            // its bitmap index scan prints them with the indexed side first.
+            if chosen_path.is_some_and(|path| path.kind == query::index_paths::ScanKind::Bitmap)
+                && let Some(index) = scan_indexes[0]
+            {
+                let written = index.written();
+                let plain = single_relation_quals(
+                    storage,
+                    txid,
+                    exposed,
+                    def,
+                    scanned,
+                    security,
+                    Some(&written),
+                    false,
+                    arena,
+                )?
+                .0;
+                let verbose = single_relation_quals(
+                    storage,
+                    txid,
+                    exposed,
+                    def,
+                    scanned,
+                    security,
+                    Some(&written),
+                    true,
+                    arena,
+                )?
+                .0;
+                bitmap_recheck = Some((plain, verbose));
+            }
         } else if scope.n == 1
             && let Some(definition) = scope.defs.get(0)
             && let Some(from) = statement.from.as_ref()
@@ -6147,6 +6349,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
+                chosen_path,
             )?;
             // A join's outer relation, and an inner one it rescans directly,
             // may return their physical columns; one under a `Hash` or
@@ -6304,6 +6507,13 @@ fn plan_pulled_select<'a>(
             scan = scan
                 .with_qual(QualLabel::IndexCond, index_conds[table].take())
                 .with_qual(QualLabel::Filter, filters[table].take());
+            if n == 1
+                && let Some((plain, verbose)) = bitmap_recheck.take()
+            {
+                scan = scan
+                    .with_qual(QualLabel::RecheckCond, plain)
+                    .with_verbose_qual(QualLabel::RecheckCond, verbose);
+            }
             if n == 1 {
                 scan = scan
                     .with_verbose_qual(QualLabel::IndexCond, verbose_quals.0.take())
@@ -8076,6 +8286,7 @@ fn physical_scan_node(
         scan_pruned: false,
         uncounted: false,
         inner_unique: false,
+        bitmap_index_estimate: None,
     }
 }
 
@@ -8248,6 +8459,7 @@ fn push_set_tree(
                 scan_pruned: false,
                 uncounted: false,
                 inner_unique: false,
+                bitmap_index_estimate: None,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -8864,6 +9076,7 @@ fn plan_write<'a>(
         scan_pruned: false,
         uncounted: false,
         inner_unique: false,
+        bitmap_index_estimate: None,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -9028,6 +9241,7 @@ fn plan_write<'a>(
                 None,
                 parameterized[table],
                 false,
+                None,
             )?;
             scan_indexes[table + 1] = index;
             total_cost += node.total_cost;
@@ -11076,6 +11290,38 @@ fn removed_count(
     Some((label.removed_label()?, actual.removed(label)?))
 }
 
+/// The lines an analyzed index or bitmap scan prints after its
+/// conditions: an index-only scan's `Heap Fetches`, a bitmap heap scan's
+/// `Heap Blocks` and each index scan's `Index Searches`, one per loop.
+fn index_scan_details(node: &PlanNode, actual: NodeActual) -> impl Iterator<Item = StackStr<64>> {
+    let counters = match actual {
+        NodeActual::Unmeasured => None,
+        NodeActual::NeverExecuted => Some(NodeCounters::default()),
+        NodeActual::Ran(counters) => Some(counters),
+    };
+    let name = node.name.as_str();
+    let index_only = name.starts_with("Index Only Scan ");
+    let searched =
+        index_only || name.starts_with("Index Scan ") || name.starts_with("Bitmap Index Scan on ");
+    let mut lines = [StackStr::<64>::new(), StackStr::new()];
+    let mut count = 0;
+    if let Some(counters) = counters {
+        if index_only {
+            let _ = write!(lines[count], "Heap Fetches: {}", counters.heap_fetches);
+            count += 1;
+        }
+        if name == "Bitmap Heap Scan" && counters.heap_blocks > 0 {
+            let _ = write!(lines[count], "Heap Blocks: exact={}", counters.heap_blocks);
+            count += 1;
+        }
+        if searched {
+            let _ = write!(lines[count], "Index Searches: {}", counters.loops);
+            count += 1;
+        }
+    }
+    lines.into_iter().take(count)
+}
+
 fn emit_text(
     plan: &Plan<'_>,
     options: ExplainOptions,
@@ -11220,6 +11466,14 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
+        }
+        for line in index_scan_details(node, node_actual) {
+            let mut text = StackStr::<128>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(text, " ");
+            }
+            let _ = write!(text, "{line}");
+            emit(text.as_str())?;
         }
         // `show_incremental_sort_info`.
         if let NodeActual::Ran(NodeCounters {
@@ -12218,6 +12472,27 @@ fn structured_node(
         document.text(label.text(), text);
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
+        }
+    }
+    let counters = match node_actual {
+        NodeActual::Unmeasured => None,
+        NodeActual::NeverExecuted => Some(NodeCounters::default()),
+        NodeActual::Ran(counters) => Some(counters),
+    };
+    if let Some(counters) = counters {
+        let name = node.name.as_str();
+        if name.starts_with("Index Only Scan ") {
+            document.number("Heap Fetches", counters.heap_fetches);
+        }
+        if name == "Bitmap Heap Scan" {
+            document.number("Exact Heap Blocks", counters.heap_blocks);
+            document.number("Lossy Heap Blocks", 0);
+        }
+        if name.starts_with("Index Scan ")
+            || name.starts_with("Index Only Scan ")
+            || name.starts_with("Bitmap Index Scan on ")
+        {
+            document.number("Index Searches", counters.loops);
         }
     }
     if let NodeActual::Ran(NodeCounters {

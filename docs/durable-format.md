@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v47` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v48` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `33` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -182,8 +182,9 @@ Other payload rules:
   encodings (empty when ANALYZE computed none). The checkpoint manifest's
   `stats` line adds the image's distribution bytes; each `cstat` and `cdist`
   line names the index stamp before the attribute, and a `cdist` line after
-  each `cstat` holds the distribution in hexadecimal. V3–V6 images and
-  `pos3ql-manifest-v46` are rejected.
+  each `cstat` holds the distribution in hexadecimal. V3–V6 images are
+  rejected, as are `pos3ql-manifest-v46` and `pos3ql-manifest-v47`, whose
+  `cstat` and `cdist` lines lack the index stamp.
 - **Commit boundaries** append PostgreSQL-epoch commit microseconds to the
   transaction identity fields. The empty, identity-only and
   identity-plus-assignment forms are still read; LSN recovery can use them, but

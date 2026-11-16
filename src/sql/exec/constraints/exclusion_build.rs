@@ -4,8 +4,9 @@
 //! that conflicts with any other, and a row it conflicts with. Comparing
 //! every pair of rows finds that row in O(n²); here equality elements group
 //! the rows by sorting and a range-overlap element is swept in lower-bound
-//! order, so the build makes O(n log n) comparisons. Other operators keep
-//! the pairwise check. The partner reported is the first conflicting row in
+//! order, so the build makes O(n log n) comparisons. Elements of other
+//! operators are compared pairwise only among the rows whose equality
+//! elements are equal. The partner reported is the first conflicting row in
 //! heap order, which is PostgreSQL's B-tree index order among equal keys.
 
 use core::cell::Cell;
@@ -28,13 +29,15 @@ struct Entry {
     length: u32,
 }
 
-/// How the build finds conflicting rows.
+/// How the build finds conflicting rows: it sorts them by their equality
+/// elements, then within each run of equal rows sweeps one range-overlap
+/// element, or compares every pair when another operator remains.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Strategy {
-    /// Equality elements, and at most one range-overlap element.
-    Sorted { overlap: Option<usize> },
-    /// Another operator: every pair of rows.
-    Pairwise,
+struct Strategy {
+    /// The elements whose operator is equality.
+    equal: [bool; MAX_INDEX_COLS],
+    overlap: Option<usize>,
+    pairwise: bool,
 }
 
 /// Checks the exclusion constraint at `position` of `def` over `rows`, as
@@ -199,23 +202,17 @@ pub(crate) fn check_exclusion_build<B: crate::storage::DefinitionBacking>(
         Ok(conflict)
     };
     // The first row in heap order that conflicts with another.
-    let first = match strategy(&scan, n) {
-        Strategy::Pairwise => {
-            let mut first = None;
-            'rows: for a in 0..count {
-                for b in 0..count {
-                    if a != b && conflicts(a, b)? {
-                        first = Some(a);
-                        break 'rows;
-                    }
-                }
-            }
-            first
-        }
-        Strategy::Sorted { overlap } => sorted_first(
-            storage, txid, &scan, n, overlap, count, &with_keys, &conflicts, arena,
-        )?,
-    };
+    let first = sorted_first(
+        storage,
+        txid,
+        &scan,
+        n,
+        strategy(&scan, n),
+        count,
+        &with_keys,
+        &conflicts,
+        arena,
+    )?;
     let Some(first) = first else {
         return Ok(());
     };
@@ -281,36 +278,47 @@ type WithKeys<'w> = dyn Fn(usize, &mut dyn FnMut(&ExclusionKeys<'_>) -> Result<(
 
 /// How the elements' operators let the build find conflicts.
 fn strategy(scan: &ExclusionScan<'_, '_>, n: usize) -> Strategy {
-    let mut overlap = None;
+    let mut strategy = Strategy {
+        equal: [false; MAX_INDEX_COLS],
+        overlap: None,
+        pairwise: false,
+    };
     for (position, operator) in scan.exclusion.operators()[..n].iter().enumerate() {
         match operator.binary() {
             // A catalog collation's equality is the collation's.
-            Some(BinaryOp::Eq) => {}
-            Some(BinaryOp::Overlaps) if overlap.is_none() => overlap = Some(position),
-            _ => return Strategy::Pairwise,
+            Some(BinaryOp::Eq) => strategy.equal[position] = true,
+            Some(BinaryOp::Overlaps) if strategy.overlap.is_none() => {
+                strategy.overlap = Some(position);
+            }
+            _ => strategy.pairwise = true,
         }
     }
-    Strategy::Sorted { overlap }
+    // Pairs are compared on every element anyway.
+    if strategy.pairwise {
+        strategy.overlap = None;
+    }
+    strategy
 }
 
 /// The first row in heap order with a conflict, found by sorting the rows
 /// by their equality elements, then by the overlap element's lower bound:
-/// equal rows conflict, and within a run of equal rows a range overlaps
-/// another exactly when it overlaps the next one or the earlier one that
-/// reaches furthest.
+/// equal rows conflict, within a run of equal rows a range overlaps another
+/// exactly when it overlaps the next one or the earlier one that reaches
+/// furthest, and other operators are tried on each pair of the run.
 #[allow(clippy::too_many_arguments)]
 fn sorted_first(
     storage: &Storage,
     txid: u32,
     scan: &ExclusionScan<'_, '_>,
     n: usize,
-    overlap: Option<usize>,
+    strategy: Strategy,
     count: usize,
     with_keys: &WithKeys<'_>,
     conflicts: &dyn Fn(usize, usize) -> Result<bool, SqlError>,
     arena: &Arena,
 ) -> Result<Option<usize>, SqlError> {
     let full = || crate::sql::eval::arena_full();
+    let overlap = strategy.overlap;
     // Rows that can conflict at all: no NULL element, no empty range.
     let mut candidates = 0usize;
     let eligible = arena
@@ -347,7 +355,7 @@ fn sorted_first(
         with_keys(a, &mut |left| {
             with_keys(b, &mut |right| {
                 for position in 0..n {
-                    if Some(position) == overlap {
+                    if !strategy.equal[position] {
                         continue;
                     }
                     ordering = compare_datums_collated(
@@ -400,6 +408,18 @@ fn sorted_first(
         }
         let run = &order[start..end];
         match overlap {
+            None if strategy.pairwise => {
+                for (index, &row) in run.iter().enumerate() {
+                    for &other in &run[index + 1..] {
+                        if (!flagged[row as usize] || !flagged[other as usize])
+                            && conflicts(row as usize, other as usize)?
+                        {
+                            flagged[row as usize] = true;
+                            flagged[other as usize] = true;
+                        }
+                    }
+                }
+            }
             None if run.len() > 1 => {
                 for &row in run {
                     flagged[row as usize] = true;

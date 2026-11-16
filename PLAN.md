@@ -952,9 +952,14 @@ subquery's ordered `LIMIT` reads and sorts every row rather than stopping an
 ordered index scan, so `EXPLAIN ANALYZE` of such a plan fails with `0A000`;
 a written scalar subquery's `ORDER BY ... LIMIT` over an index reports every
 row its scan reads where PostgreSQL's stops at the limit. Remaining there: a stable expression the model cannot evaluate
-(a user-defined function) leaves the crude estimate, and the cost of an
-implicit coercion function inside a condition (`length(name)` casting to
-`text`) is not modelled. Aggregation over the chosen scan of one
+(a user-defined function) leaves the crude estimate. A built-in function's
+argument of another type than it declares is charged its cast function
+(`length(name)` reads `text(name)`), unless the types are binary coercible,
+and an operator between two integer types or between `real` and `double
+precision` casts nothing, as PostgreSQL's cross-type operators do
+(`differential_exact/793`). EXPLAIN prints the constant of `real * 2` as
+`'2'::real` where PostgreSQL's `real * double precision` operator prints
+`'2'::double precision`. Aggregation over the chosen scan of one
 plain table is costed as PostgreSQL's `cost_agg` costs it
 (`differential_exact/790`): each transition state's function and input
 expressions per input row and each final function once per group
@@ -1328,9 +1333,11 @@ target list, and a cursor may be declared in a nested block
 (`differential_exact/743`, `744`). An exclusion constraint's build sorts the
 rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
-(`differential_exact/746`); other operators still compare every pair, and
-for a GiST constraint PostgreSQL names the partner its index scan finds
-first, where pos3ql names the first in heap order. Merged CHECK predicates
+(`differential_exact/746`); elements of other operators are compared
+pairwise only among the rows its equality elements make equal
+(`differential_exact/792`), so a constraint without equality elements still
+compares every pair, and for a GiST constraint PostgreSQL names the partner
+its index scan finds first, where pos3ql names the first in heap order. Merged CHECK predicates
 compare in their analysed form, as PostgreSQL's `equal()` compares cooked
 trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
 operator) conflict; a predicate outside the deparser's typed coverage compares

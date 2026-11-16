@@ -1871,6 +1871,8 @@ pub(super) struct JoinedWriteLists {
     pub(super) join: Output,
     pub(super) target: Output,
     pub(super) source: Output,
+    /// The values a hashed row of the target and of the FROM table holds.
+    pub(super) hashed: [Option<HashColumns>; 2],
 }
 
 impl<'a> RelationTargets<'a> {
@@ -1953,7 +1955,7 @@ impl<'a> RelationTargets<'a> {
         source: &TableDef,
         source_exposed: &str,
         expression: &'a Expr<'a>,
-        reads: &mut [ArenaList<'a, Entry<'a>>; 2],
+        reads: &mut [ArenaList<'a, (Entry<'a>, HashColumn)>; 2],
     ) -> Result<bool, SqlError> {
         let mut found = ArenaList::new(self.arena);
         let mut full = false;
@@ -1970,12 +1972,21 @@ impl<'a> RelationTargets<'a> {
             let Some(entry) = self.entry(column, Destination::Value)? else {
                 return Ok(false);
             };
+            let Expr::Column { name, .. } = column else {
+                return Ok(false);
+            };
+            let relation = if owner == 0 { self.table } else { source };
+            let held = match relation.column_index(name) {
+                Some(index) => HashColumn::Column(u16::try_from(index).unwrap_or(u16::MAX)),
+                None if *name == "tableoid" => HashColumn::TableOid,
+                None => return Ok(false),
+            };
             if !reads[owner]
                 .as_slice()
                 .iter()
-                .any(|held| held.text == entry.text)
+                .any(|(read, _)| read.text == entry.text)
             {
-                reads[owner].push(entry).map_err(|_| arena_full())?;
+                reads[owner].push((entry, held)).map_err(|_| arena_full())?;
             }
         }
         Ok(true)
@@ -2031,9 +2042,21 @@ impl<'a> RelationTargets<'a> {
             }
             entries.push(entry).map_err(|_| arena_full())
         };
+        let push_read = |entries: &mut ArenaList<'a, (Entry<'a>, HashColumn)>,
+                         entry: Entry<'a>,
+                         held: HashColumn| {
+            if entries
+                .as_slice()
+                .iter()
+                .any(|(read, _)| read.text == entry.text)
+            {
+                return Ok(());
+            }
+            entries.push((entry, held)).map_err(|_| arena_full())
+        };
         // Per relation, the columns the join's list reads, in order; the
         // row identities are entries of their own.
-        let mut reads: [ArenaList<'a, Entry<'a>>; 2] =
+        let mut reads: [ArenaList<'a, (Entry<'a>, HashColumn)>; 2] =
             [ArenaList::new(arena), ArenaList::new(arena)];
         let mut join = ArenaList::new(arena);
         for column in self.table.columns() {
@@ -2054,11 +2077,11 @@ impl<'a> RelationTargets<'a> {
         if !tree {
             let identity = qualified(self.exposed, "ctid")?;
             join.push(identity).map_err(|_| arena_full())?;
-            push_new(&mut reads[0], identity)?;
+            push_read(&mut reads[0], identity, HashColumn::RowIdentity)?;
         }
         let mark = qualified(source_exposed, "ctid")?;
         join.push(mark).map_err(|_| arena_full())?;
-        push_new(&mut reads[1], mark)?;
+        push_read(&mut reads[1], mark, HashColumn::RowIdentity)?;
         // The FROM table's columns `RETURNING` reads; the target's come
         // from the row the write changes.
         let mut returned = ArenaList::new(arena);
@@ -2074,7 +2097,11 @@ impl<'a> RelationTargets<'a> {
                         let entry = source_column(index)?;
                         returned.push(entry).map_err(|_| arena_full())?;
                         push_new(&mut join, entry)?;
-                        push_new(&mut reads[1], entry)?;
+                        push_read(
+                            &mut reads[1],
+                            entry,
+                            HashColumn::Column(u16::try_from(index).unwrap_or(u16::MAX)),
+                        )?;
                     }
                 }
                 SelectItem::TableWildcard(qualifier) if *qualifier == self.exposed => {
@@ -2089,7 +2116,11 @@ impl<'a> RelationTargets<'a> {
                         let entry = source_column(index)?;
                         returned.push(entry).map_err(|_| arena_full())?;
                         push_new(&mut join, entry)?;
-                        push_new(&mut reads[1], entry)?;
+                        push_read(
+                            &mut reads[1],
+                            entry,
+                            HashColumn::Column(u16::try_from(index).unwrap_or(u16::MAX)),
+                        )?;
                     }
                 }
                 SelectItem::Expr { expression, .. } => {
@@ -2097,14 +2128,14 @@ impl<'a> RelationTargets<'a> {
                         return Ok(None);
                     };
                     returned.push(entry).map_err(|_| arena_full())?;
-                    let mut read: [ArenaList<'a, Entry<'a>>; 2] =
+                    let mut read: [ArenaList<'a, (Entry<'a>, HashColumn)>; 2] =
                         [ArenaList::new(arena), ArenaList::new(arena)];
                     if !self.joined_reads(source, source_exposed, expression, &mut read)? {
                         return Ok(None);
                     }
-                    for &entry in read[1].as_slice() {
+                    for &(entry, held) in read[1].as_slice() {
                         push_new(&mut join, entry)?;
-                        push_new(&mut reads[1], entry)?;
+                        push_read(&mut reads[1], entry, held)?;
                     }
                 }
                 SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => return Ok(None),
@@ -2116,26 +2147,41 @@ impl<'a> RelationTargets<'a> {
             conjuncts(condition, &mut conditions)?;
         }
         for &conjunct in conditions.as_slice() {
-            let mut read: [ArenaList<'a, Entry<'a>>; 2] =
+            let mut read: [ArenaList<'a, (Entry<'a>, HashColumn)>; 2] =
                 [ArenaList::new(arena), ArenaList::new(arena)];
             if !self.joined_reads(source, source_exposed, conjunct, &mut read)? {
                 return Ok(None);
             }
             if read.iter().all(|read| !read.as_slice().is_empty()) {
                 for (reads, read) in reads.iter_mut().zip(&read) {
-                    for &entry in read.as_slice() {
-                        push_new(reads, entry)?;
+                    for &(entry, held) in read.as_slice() {
+                        push_read(reads, entry, held)?;
                     }
                 }
             }
         }
         if tree {
-            for column in ["tableoid", "ctid"] {
+            for (column, held) in [
+                ("tableoid", HashColumn::TableOid),
+                ("ctid", HashColumn::RowIdentity),
+            ] {
                 let entry = qualified(self.exposed, column)?;
                 join.push(entry).map_err(|_| arena_full())?;
-                reads[0].push(entry).map_err(|_| arena_full())?;
+                reads[0].push((entry, held)).map_err(|_| arena_full())?;
             }
         }
+        let render_reads = |reads: &ArenaList<'a, (Entry<'a>, HashColumn)>| {
+            let mut entries = ArenaList::new(arena);
+            let mut held = HashColumns::EMPTY;
+            let mut sized = true;
+            for &(entry, column) in reads.as_slice() {
+                entries.push(entry).map_err(|_| arena_full())?;
+                sized &= held.push(column).is_some();
+            }
+            Ok::<_, SqlError>((render(entries.as_slice())?, sized.then_some(held)))
+        };
+        let (target, target_held) = render_reads(&reads[0])?;
+        let (source, source_held) = render_reads(&reads[1])?;
         Ok(Some(JoinedWriteLists {
             returned: if returning.items.is_empty() {
                 None
@@ -2143,8 +2189,9 @@ impl<'a> RelationTargets<'a> {
                 Some(render(returned.as_slice())?)
             },
             join: render(join.as_slice())?,
-            target: render(reads[0].as_slice())?,
-            source: render(reads[1].as_slice())?,
+            target,
+            source,
+            hashed: [target_held, source_held],
         }))
     }
 }

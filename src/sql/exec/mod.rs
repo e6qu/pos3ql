@@ -84735,6 +84735,7 @@ fn merge_target<'a>(
     if crate::sql::query::instrument::active() {
         record_merge_scans(MergeScans {
             source_outer,
+            materialized: true,
             preserves_outer,
             preserves_inner,
             inner_costs: inner_planned_rows.is_none_or(|rows| rows > 0),
@@ -86116,6 +86117,9 @@ impl MergeScanCounts {
 /// What a `MERGE`'s join read: its plan's shape and each relation's rows.
 struct MergeScans<'r, 'a, Definition0: crate::storage::DefinitionBacking> {
     source_outer: bool,
+    /// Whether a nested loop rescans its inner relation from a
+    /// `Materialize`, rather than scanning it again.
+    materialized: bool,
     preserves_outer: bool,
     preserves_inner: bool,
     /// Whether the plan's inner relation costs anything to read.
@@ -86140,6 +86144,10 @@ struct MergeScans<'r, 'a, Definition0: crate::storage::DefinitionBacking> {
 /// builds its table when the outer scan starts for less than the inner one
 /// costs (`ExecHashJoin`), and stops when either side is empty; a nested
 /// loop reads its inner relation once per outer row, from a copy.
+/// How many bytes a node stores for a row holding some values of a row.
+type RowSize =
+    fn(&[crate::sql::query::instrument::HashColumn], &[Datum<'_>], &[ColType]) -> Option<usize>;
+
 fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
     scans: MergeScans<'_, '_, Definition0>,
 ) {
@@ -86202,13 +86210,70 @@ fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
     if !inner_runs {
         return;
     }
+    if scans.hash.is_none() && !scans.materialized {
+        for _ in 0..outer.passed {
+            record(inner_position, inner, false);
+        }
+        return;
+    }
     record(inner_position, inner, false);
+    // The values of the inner relation's row `row`, with their types.
+    let mut target_schema = [ColType::Bool; MAX_COLUMNS];
+    scans.target_def.schema(&mut target_schema);
+    let mut source_schema = [ColType::Bool; MAX_COLUMNS];
+    let visible = scans.source_def.n_columns.min(scans.source_members.visible);
+    for (ctype, column) in source_schema
+        .iter_mut()
+        .zip(&scans.source_def.columns()[..visible])
+    {
+        *ctype = column.ctype;
+    }
+    let inner_row_bytes = |row: usize, columns: &[instrument::HashColumn], size: RowSize| {
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        let (values, schema): (&[Datum<'_>], &[ColType]) = if scans.source_outer {
+            (
+                scans.target_rows[row],
+                &target_schema[..scans.target_def.n_columns],
+            )
+        } else {
+            let bytes = scans.source_rows[row];
+            let width = projected_row_width(bytes).min(MAX_COLUMNS);
+            for (column, value) in values.iter_mut().enumerate().take(width) {
+                *value = decode_projected_pub(bytes, column);
+            }
+            (&values[..width], &source_schema[..visible])
+        };
+        size(columns, values, schema)
+    };
     let Some(hash) = scans.hash else {
-        // The copy returns every inner row once per outer row.
+        // The copy returns every inner row once per outer row; its
+        // tuplestore holds them all from the first pass.
         let node = instrument::node(Role::Materialize(inner_position));
         for _ in 0..outer.passed {
             let _copy = node.start();
             node.rows(inner.passed);
+        }
+        if outer.passed > 0
+            && let Some(columns) = node.hash_columns()
+        {
+            let rows = if scans.source_outer {
+                scans.target_rows.len()
+            } else {
+                scans.source_rows.len()
+            };
+            let held = (0..rows).try_fold(0usize, |bytes, row| {
+                Some(
+                    bytes
+                        + inner_row_bytes(
+                            row,
+                            columns.as_slice(),
+                            instrument::materialized_row_bytes,
+                        )?,
+                )
+            });
+            if let Some(held) = held {
+                node.stored(instrument::tuplestore_bytes(rows as u64, held));
+            }
         }
         return;
     };
@@ -86218,36 +86283,14 @@ fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
     // The table's rows as PostgreSQL stores them.
     let mut tuple_bytes = node.hash_columns().map(|_| 0usize);
     if let Some(columns) = node.hash_columns() {
-        let mut target_schema = [ColType::Bool; MAX_COLUMNS];
-        scans.target_def.schema(&mut target_schema);
-        let mut source_schema = [ColType::Bool; MAX_COLUMNS];
-        let visible = scans.source_def.n_columns.min(scans.source_members.visible);
-        for (ctype, column) in source_schema
-            .iter_mut()
-            .zip(&scans.source_def.columns()[..visible])
-        {
-            *ctype = column.ctype;
-        }
         for (row, key) in hash.inner.iter().enumerate() {
             if key.is_none() && !scans.preserves_inner {
                 continue;
             }
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            let (values, schema): (&[Datum<'_>], &[ColType]) = if scans.source_outer {
-                (
-                    scans.target_rows[row],
-                    &target_schema[..scans.target_def.n_columns],
-                )
-            } else {
-                let bytes = scans.source_rows[row];
-                let width = projected_row_width(bytes).min(MAX_COLUMNS);
-                for (column, value) in values.iter_mut().enumerate().take(width) {
-                    *value = decode_projected_pub(bytes, column);
-                }
-                (&values[..width], &source_schema[..visible])
-            };
             tuple_bytes = tuple_bytes.and_then(|bytes| {
-                Some(bytes + instrument::hashed_row_bytes(columns.as_slice(), values, schema)?)
+                Some(
+                    bytes + inner_row_bytes(row, columns.as_slice(), instrument::hashed_row_bytes)?,
+                )
             });
         }
     }
@@ -93074,6 +93117,48 @@ pub(crate) fn update<'a>(
             params,
             &hooks,
         )
+    } else if let Some(from) = statement.from
+        && let Some((plan, leaves)) = match planned_joined_write(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            statement.table,
+            statement.alias,
+            from,
+            selection_where,
+            row_security,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
+            params,
+            &hooks,
+            txn.txid,
+            arena,
+        ) {
+            Ok(planned) => planned,
+            Err(error) => return sql_fail(error),
+        }
+    {
+        collect_planned_join(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            statement.alias,
+            from,
+            plan,
+            leaves,
+            arena,
+            params,
+            txn.txid,
+            &hooks,
+            scratch,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
+            outer,
+        )
     } else if let Some(from) = statement.from {
         let target_hash = match super::query::target_hash_plan(
             storage,
@@ -94826,6 +94911,44 @@ pub(crate) fn delete<'a>(
             statement.where_clause,
             params,
             &hooks,
+        )
+    } else if let Some(using) = statement.using
+        && let Some((plan, leaves)) = match planned_joined_write(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            statement.table,
+            statement.alias,
+            using,
+            selection_where,
+            row_security,
+            delete_capture,
+            params,
+            &hooks,
+            txn.txid,
+            arena,
+        ) {
+            Ok(planned) => planned,
+            Err(error) => return sql_fail(error),
+        }
+    {
+        collect_planned_join(
+            storage,
+            table_index,
+            statement.inheritance,
+            def,
+            statement.alias,
+            using,
+            plan,
+            leaves,
+            arena,
+            params,
+            txn.txid,
+            &hooks,
+            scratch,
+            delete_capture,
+            outer,
         )
     } else if let Some(using) = statement.using {
         let target_hash = match super::query::target_hash_plan(
@@ -105532,6 +105655,520 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(ControlFlow::Continue(()))
             },
         )?;
+    }
+    images.finish()
+}
+
+/// The rows of the table in `slot`, read as `alias`, that `condition`
+/// keeps, as of `txid`: the count PostgreSQL's statistics estimate for a
+/// condition on an analyzed table. `None` when evaluating it fails.
+pub(crate) fn relation_rows_kept<'a>(
+    storage: &Storage,
+    slot: usize,
+    alias: &str,
+    condition: &Expr<'a>,
+    params: &[Datum<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<u64>, SqlError> {
+    let definition = (*storage.table_def(slot, txid)).clone();
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..NO_HOOKS
+    };
+    let mut kept = 0u64;
+    let mut failed = false;
+    storage.for_each_row_state(slot, &mut |rowid, state| {
+        let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
+            return Ok(core::ops::ControlFlow::Continue(()));
+        };
+        let mark = arena.mark();
+        let passes = (|| -> Result<bool, SqlError> {
+            let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            row_matches_values(
+                storage,
+                txid,
+                Some(slot),
+                &definition,
+                Some(alias),
+                &values[..definition.n_columns],
+                Some(condition),
+                arena,
+                params,
+                &hooks,
+                None,
+                None,
+            )
+        })();
+        // SAFETY: the count retains nothing of the row.
+        unsafe { arena.rewind_to(mark) };
+        match passes {
+            Ok(true) => kept += 1,
+            Ok(false) => {}
+            Err(_) => {
+                failed = true;
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    Ok((!failed).then_some(kept))
+}
+
+/// The plan of an `UPDATE ... FROM` or `DELETE ... USING` whose join
+/// PostgreSQL plans from its relations' statistics
+/// ([`super::query::joined_write_join`]), with the target's members pruning
+/// keeps; `None` for a write joined row by row.
+#[allow(clippy::too_many_arguments)]
+fn planned_joined_write<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    target: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a super::ast::FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
+    capture: DmlCapture,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<(super::query::JoinedWriteJoin<'a>, &'a [usize])>, SqlError> {
+    if row_security.is_some() {
+        return Ok(None);
+    }
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
+    let leaves = dml_pruned_leaves(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        alias,
+        where_clause,
+        params,
+        hooks,
+        true,
+        txid,
+        arena,
+    )?;
+    Ok(super::query::joined_write_join(
+        storage,
+        target,
+        alias,
+        from,
+        where_clause,
+        leaves,
+        params,
+        txid,
+        arena,
+    )?
+    .map(|plan| (plan, leaves)))
+}
+
+/// Selects the target rows of a joined write planned by `plan`, as
+/// PostgreSQL's plan runs: each relation's scan in its physical order,
+/// filtered by its own conditions, then the hash join or nested loop
+/// returning its rows in its order. Each target row is changed on its first
+/// join row, with that row's FROM row, and later join rows of a changed
+/// row are skipped, as PostgreSQL's `ModifyTable` skips a row the command
+/// already changed. The rows go in that order. `EXPLAIN ANALYZE` counts each
+/// node.
+#[allow(clippy::too_many_arguments)]
+fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&'a str>,
+    from: &'a super::ast::FromClause<'a>,
+    plan: super::query::JoinedWriteJoin<'a>,
+    leaves: &'a [usize],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    txid: u32,
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    scratch: &mut DmlScratch,
+    capture: DmlCapture,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<DmlRowImages<'a>, SqlError> {
+    use crate::sql::query::instrument::{self, Role};
+    let _snapshot = storage.dml_expression_snapshot(capture.command());
+    scratch.clear();
+    let mut images = DmlRowImages::new(arena);
+    capture_pruned_layouts(
+        storage,
+        table_index,
+        inheritance,
+        def,
+        leaves,
+        &mut images,
+        capture,
+        txid,
+        arena,
+    )?;
+    // The target's rows its scan returns, in the order it reads them.
+    let mut capacity = 0usize;
+    for &leaf in leaves {
+        capacity = capacity
+            .checked_add(storage.visible_row_count(leaf, txid)?)
+            .ok_or_else(arena_full)?;
+    }
+    let target_rows = arena
+        .alloc_slice_with(capacity, |_| None::<PhysicalRow>)
+        .map_err(|_| arena_full())?;
+    let target_values = arena
+        .alloc_slice_with(capacity, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let target_bytes = arena
+        .alloc_slice_with(capacity, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let target_scan = arena
+        .alloc_slice_with(leaves.len(), |_| MergeScanCounts::default())
+        .map_err(|_| arena_full())?;
+    let mut targets = 0usize;
+    for (member, &leaf) in leaves.iter().enumerate() {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        storage.record_serializable_read(txid, leaf);
+        storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
+        let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+        let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
+        let counts = &mut target_scan[member];
+        for_each_physical_row(storage, leaf, txid, arena, &mut |rowid, home| {
+            storage.record_relation_tuple_read(txid, leaf, None)?;
+            let snapshot = home.snapshot();
+            let row_mark = arena.mark();
+            let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
+            let mut physical_values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, layout.schema, &mut physical_values)?;
+            let mut logical = [Datum::Null; MAX_COLUMNS];
+            layout.project(&physical_values, &mut logical);
+            let logical = arena
+                .alloc_slice_copy(&logical[..def.n_columns])
+                .map_err(|_| arena_full())?;
+            let mark = arena.mark();
+            let passes = row_matches_values(
+                storage,
+                txid,
+                Some(leaf),
+                def,
+                alias,
+                logical,
+                plan.conditions.target,
+                arena,
+                params,
+                hooks,
+                None,
+                outer,
+            );
+            if !passes? {
+                // SAFETY: nothing of a removed row outlives its condition.
+                unsafe { arena.rewind_to(row_mark) };
+                counts.removed += 1;
+                return Ok(());
+            }
+            // SAFETY: the condition's result retains nothing of the arena.
+            unsafe { arena.rewind_to(mark) };
+            counts.pass();
+            let slot = targets;
+            if slot >= capacity {
+                return Err(arena_full());
+            }
+            target_rows[slot] = Some(PhysicalRow::local(leaf, rowid, snapshot));
+            target_values[slot] = logical;
+            target_bytes[slot] = if capture_bytes { bytes } else { &[] };
+            targets += 1;
+            Ok(())
+        })?;
+    }
+    let target_values = &target_values[..targets];
+    // The FROM table's rows its scan returns, in the order it reads them.
+    let source_slot = plan.source_slot;
+    let source_def = (*storage.table_def(source_slot, txid)).clone();
+    let mut source_schema = [ColType::Bool; MAX_COLUMNS];
+    source_def.schema(&mut source_schema);
+    let source_schema = &source_schema[..source_def.n_columns];
+    let source_capacity = storage.visible_row_count(source_slot, txid)?;
+    let source_ids = arena
+        .alloc_slice_with(source_capacity, |_| 0u64)
+        .map_err(|_| arena_full())?;
+    let source_rows = arena
+        .alloc_slice_with(source_capacity, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let mut source_scan = MergeScanCounts::default();
+    let mut sources = 0usize;
+    storage.record_serializable_read(txid, source_slot);
+    storage.record_relation_scan(
+        txid,
+        source_slot,
+        None,
+        0,
+        crate::sql::datetime::now_micros(),
+    )?;
+    for_each_physical_row(storage, source_slot, txid, arena, &mut |rowid, home| {
+        storage.record_relation_tuple_read(txid, source_slot, None)?;
+        let mark = arena.mark();
+        let bytes = storage.row_bytes(source_slot, rowid, home, arena)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, source_schema, &mut values)?;
+        let passes = row_matches_values(
+            storage,
+            txid,
+            Some(source_slot),
+            &source_def,
+            Some(plan.source_name),
+            &values[..source_def.n_columns],
+            plan.conditions.source,
+            arena,
+            params,
+            hooks,
+            None,
+            outer,
+        );
+        let kept = match passes {
+            Ok(true) => Some(encode_projected_pub(&values[..source_def.n_columns], arena)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        };
+        let Some(encoded) = kept else {
+            // SAFETY: nothing of a removed row outlives its condition.
+            unsafe { arena.rewind_to(mark) };
+            source_scan.removed += 1;
+            return Ok(());
+        };
+        let encoded = encoded?;
+        source_scan.pass();
+        if sources >= source_capacity {
+            return Err(arena_full());
+        }
+        source_ids[sources] = rowid;
+        source_rows[sources] = encoded;
+        sources += 1;
+        Ok(())
+    })?;
+    let source_ids = &source_ids[..sources];
+    let source_rows = &source_rows[..sources];
+    // Each relation's key values, as the hash join reads them.
+    let keys = plan.keys();
+    let read = |is_target: bool, row: usize, key: usize| -> Datum<'a> {
+        if is_target {
+            target_values[row]
+                .get(keys[key].0)
+                .copied()
+                .unwrap_or(Datum::Null)
+        } else {
+            decode_projected_pub(source_rows[row], keys[key].1)
+        }
+    };
+    // Candidate FROM rows per target row: a hash table on the FROM rows'
+    // keys, whatever relation the plan hashes.
+    let candidates_hash = if plan.hashed() {
+        Some(MergeHash::build(
+            storage,
+            txid,
+            targets,
+            sources,
+            keys.len(),
+            plan.collations(),
+            &|outer, row, key| read(outer, row, key),
+            arena,
+        )?)
+    } else {
+        None
+    };
+    // The hash table the plan builds, sized as PostgreSQL's.
+    let plan_hash = match (&candidates_hash, plan.source_outer) {
+        (Some(_), true) => Some(MergeHash::build(
+            storage,
+            txid,
+            sources,
+            targets,
+            keys.len(),
+            plan.collations(),
+            &|outer, row, key| read(!outer, row, key),
+            arena,
+        )?),
+        _ => None,
+    };
+    // The FROM row each target row's first join row holds, by target row.
+    let winners = arena
+        .alloc_slice_with(targets, |_| {
+            None::<(u32, Option<super::query::JoinedFromRow<'a>>)>
+        })
+        .map_err(|_| arena_full())?;
+    // The FROM rows by identity, for the join rows that name them so.
+    let by_identity = arena
+        .alloc_slice_with(sources, |index| (source_ids[index], index as u32))
+        .map_err(|_| arena_full())?;
+    by_identity.sort_unstable_by_key(|&(rowid, _)| rowid);
+    let by_identity = &*by_identity;
+    let source_index = |rowid: u64| -> Result<u32, SqlError> {
+        by_identity
+            .binary_search_by_key(&rowid, |&(id, _)| id)
+            .map(|at| by_identity[at].1)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a joined FROM row is not among its scan's rows"
+                )
+            })
+    };
+    // A target row joins its candidates in the order its first join row is
+    // found: the hash chain's (later rows first) when it probes the hash
+    // table, and scan order otherwise.
+    let descending = plan.hashed() && !plan.source_outer;
+    let mut pairs = super::query::JoinedWritePairs::default();
+    let retain = capture.retains_joined().then_some(arena);
+    // The pairs' FROM scans are this join's, counted below.
+    let hidden = instrument::suspend();
+    for target in 0..targets {
+        let (leaf, _, _) = target_rows[target]
+            .expect("selected target row")
+            .local_parts();
+        let mark = arena.mark();
+        let candidates: &'a [u64] = match candidates_hash.as_ref() {
+            Some(hash) => {
+                let mut count = 0usize;
+                let mut entry = hash.first(target);
+                while let Some(inner) = entry {
+                    count += 1;
+                    entry = hash.following(inner, target);
+                }
+                let list = arena
+                    .alloc_slice_with(count, |_| 0u64)
+                    .map_err(|_| arena_full())?;
+                let mut entry = hash.first(target);
+                let mut at = 0usize;
+                while let Some(inner) = entry {
+                    let slot = if descending { at } else { count - 1 - at };
+                    list[slot] = source_ids[inner];
+                    at += 1;
+                    entry = hash.following(inner, target);
+                }
+                list
+            }
+            None => source_ids,
+        };
+        let context = RowCtx {
+            table_oid: Some(crate::sql::catalog::user_table_oid(storage, leaf) as u32),
+            def: crate::storage::RelationDefinition::from_definition(def),
+            values: target_values[target],
+            alias,
+        };
+        let first = match outer {
+            Some(outer) => super::query::joined_write_pairs(
+                storage,
+                from,
+                txid,
+                plan.conditions.hash,
+                plan.conditions.join,
+                arena,
+                params,
+                &JoinedTriggerDmlScope {
+                    row: &context,
+                    outer,
+                },
+                hooks.sequences,
+                candidates,
+                retain,
+                &mut pairs,
+            ),
+            None => super::query::joined_write_pairs(
+                storage,
+                from,
+                txid,
+                plan.conditions.hash,
+                plan.conditions.join,
+                arena,
+                params,
+                &context,
+                hooks.sequences,
+                candidates,
+                retain,
+                &mut pairs,
+            ),
+        };
+        let first = match first {
+            Ok(Some((rowid, joined))) => Ok(Some((source_index(rowid)?, joined))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        // SAFETY: a retained FROM row lives in the arena's persistent tail.
+        unsafe { arena.rewind_to(mark) };
+        winners[target] = first?;
+    }
+    drop(hidden);
+    // The order the join returns each changed row's first join row in:
+    // by target row when the target is the outer relation, otherwise by
+    // its first FROM row, then as the inner relation returns target rows.
+    let order = arena
+        .alloc_slice_with(targets, |index| index as u32)
+        .map_err(|_| arena_full())?;
+    if plan.source_outer {
+        let hashed = plan.hashed();
+        order.sort_unstable_by_key(|&target| {
+            let winner = winners[target as usize]
+                .as_ref()
+                .map_or(u32::MAX, |(source, _)| *source);
+            let rank = if hashed { u32::MAX - target } else { target };
+            (winner, rank)
+        });
+    }
+    for &target in order.iter() {
+        let Some((_, joined)) = winners[target as usize] else {
+            continue;
+        };
+        let row = target_rows[target as usize].expect("selected target row");
+        let (leaf, rowid, _) = row.local_parts();
+        if !target_bytes[target as usize].is_empty() {
+            images.push(leaf, rowid, target_bytes[target as usize])?;
+        }
+        if let Some(joined) = joined {
+            images.push_joined(row, joined)?;
+        }
+        push_selected(scratch, row)?;
+    }
+    if instrument::active() {
+        let planned_rows = |slot: usize| storage.planning_row_estimate(slot);
+        let inner_planned = if plan.source_outer {
+            leaves.iter().map(|&leaf| planned_rows(leaf)).sum::<u64>()
+        } else {
+            planned_rows(source_slot)
+        };
+        let source_definition = crate::storage::RelationDefinition::from_definition(&source_def);
+        record_merge_scans(MergeScans {
+            source_outer: plan.source_outer,
+            materialized: plan.method == super::query::JoinedWriteMethod::Materialized,
+            preserves_outer: false,
+            preserves_inner: false,
+            inner_costs: inner_planned > 0,
+            hash: if plan.source_outer {
+                plan_hash.as_ref()
+            } else {
+                candidates_hash.as_ref()
+            },
+            leaves,
+            target: target_scan,
+            target_rows: target_values,
+            target_def: def,
+            source: source_scan,
+            source_rows,
+            source_def: &source_definition,
+            source_members: MergeSourceMembers::NONE,
+        });
+        let join = instrument::node(Role::Join(1));
+        if join.measured() {
+            let _join = join.start();
+            join.rows(pairs.joined);
+            join.add_join_filtered(pairs.filtered);
+        }
     }
     images.finish()
 }

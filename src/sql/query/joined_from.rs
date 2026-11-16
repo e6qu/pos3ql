@@ -1111,3 +1111,476 @@ impl<'a> TargetHash<'a> {
             .map(|rowids| &*rowids)
     }
 }
+
+/// The join of an `UPDATE ... FROM` or `DELETE ... USING` target with its
+/// one FROM table, planned as PostgreSQL plans two relations with
+/// statistics: a hash join on the conditions' equalities between them,
+/// building on the relation [`crate::sql::explain::joined_write_source_outer`]
+/// picks, or without an equality a nested loop rescanning the other
+/// relation from a `Materialize`. Each `WHERE` conjunct reading only one
+/// relation filters that relation's scan, the key equalities are the hash
+/// join's condition and the rest its join filter. Execution walks the
+/// join's rows in its plan's order and changes each target row on its first
+/// join row; EXPLAIN shows the same plan and counts it.
+#[derive(Clone, Copy)]
+pub(crate) struct JoinedWriteJoin<'a> {
+    /// The FROM table's storage slot and exposed name.
+    pub(crate) source_slot: usize,
+    pub(crate) source_name: &'a str,
+    /// Equi-key column pairs (target column, FROM table column).
+    keys: [(usize, usize); 8],
+    key_count: usize,
+    collations: [crate::sql::ast::Collation; 8],
+    /// Whether the FROM table is the outer relation, the target being
+    /// hashed or rescanned.
+    pub(crate) source_outer: bool,
+    /// How the join reads its inner relation.
+    pub(crate) method: JoinedWriteMethod,
+    /// A unique index on the inner relation's hash keys (`Inner Unique`).
+    pub(crate) inner_unique: bool,
+    /// Where the plan checks the `WHERE` conjuncts: `target` and `source`
+    /// filter each relation's scan, `hash` holds the key equalities and
+    /// `join` the join's filter.
+    pub(crate) conditions: MergeConditions<'a>,
+}
+
+impl<'a> JoinedWriteJoin<'a> {
+    /// The equi-key pairs (target column, FROM table column); empty for a
+    /// nested loop.
+    pub(crate) fn keys(&self) -> &[(usize, usize)] {
+        &self.keys[..self.key_count]
+    }
+
+    pub(crate) fn collations(&self) -> &[crate::sql::ast::Collation] {
+        &self.collations[..self.key_count]
+    }
+
+    pub(crate) fn hashed(&self) -> bool {
+        self.method == JoinedWriteMethod::Hash
+    }
+}
+
+/// How a joined write's join reads its inner relation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JoinedWriteMethod {
+    /// A hash join building on it.
+    Hash,
+    /// A nested loop rescanning a `Materialize` copy of it.
+    Materialized,
+    /// A nested loop scanning it again for each outer row.
+    Rescanned,
+}
+
+/// What a relation's indexes offer a two-relation join over `key` columns:
+/// an index on a column only the hash keys read (`keys`), one on another
+/// column the conditions read or a partial or expression index (`other`),
+/// and a unique one on key columns only (`unique`).
+#[derive(Clone, Copy, Default)]
+struct JoinIndexReach {
+    keys: bool,
+    other: bool,
+    unique: bool,
+}
+
+impl JoinIndexReach {
+    fn of(
+        storage: &Storage,
+        slot: usize,
+        txid: u32,
+        reads: &dyn Fn(usize) -> bool,
+        key: &dyn Fn(usize) -> bool,
+    ) -> Self {
+        let definition = storage.table_def(slot, txid);
+        let columns = definition.columns();
+        let mut reach = Self {
+            unique: columns
+                .iter()
+                .enumerate()
+                .any(|(column, meta)| (meta.unique || meta.primary) && key(column)),
+            ..Self::default()
+        };
+        for index in storage.indexes_for_slot(slot, txid) {
+            let plain = index.predicate.is_none()
+                && index.expressions[..index.n_cols]
+                    .iter()
+                    .all(Option::is_none);
+            if !plain {
+                reach.other = true;
+                continue;
+            }
+            reach.unique |= index.unique
+                && index.columns[..index.n_cols]
+                    .iter()
+                    .all(|&column| key(usize::from(column)));
+        }
+        for binding in 0..storage.value_binding_count(slot) {
+            let (keys, count) = storage.value_binding_columns(slot, binding);
+            for &column in &keys[..count] {
+                let column = usize::from(column);
+                if !reads(column) {
+                    continue;
+                }
+                if key(column) {
+                    reach.keys = true;
+                } else {
+                    reach.other = true;
+                }
+            }
+        }
+        reach
+    }
+
+    /// A tree's members together, which PostgreSQL does not prove unique.
+    fn with(self, member: Self) -> Self {
+        Self {
+            keys: self.keys || member.keys,
+            other: self.other || member.other,
+            unique: false,
+        }
+    }
+}
+
+/// Plans the join of the target `target` (its members `leaves`, those
+/// pruning keeps) with `from` under `where_clause`, when it is a join of
+/// two relations PostgreSQL plans from their statistics: one plain FROM
+/// table, every relation analyzed, local, without row security, and no
+/// index PostgreSQL could scan, join or merge by. `None` otherwise.
+#[expect(clippy::too_many_arguments, reason = "the joined write's parts")]
+pub(crate) fn joined_write_join<'a>(
+    storage: &Storage,
+    target: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    leaves: &[usize],
+    params: &[Datum<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<JoinedWriteJoin<'a>>, SqlError> {
+    let base = &from.base;
+    if !from.joins.is_empty()
+        || base.subquery.is_some()
+        || base.cte.is_some()
+        || base.func_args.is_some()
+        || base.rows_from.is_some()
+        || base.join_members.is_some()
+        || base.sample.is_some()
+        || base.col_alias.is_some()
+        || base.lateral
+        || leaves.is_empty()
+    {
+        return Ok(None);
+    }
+    let (mut scope, _) =
+        super::dependencies::dml_join_scope(storage, target, alias, Some(from), txid, arena, None)?;
+    if scope.n != 2 || scope.derived[1].is_some() || scope.slots[1] == usize::MAX {
+        return Ok(None);
+    }
+    let target_slot = scope.slots[0];
+    let source_slot = scope.slots[1];
+    let Some(role) = storage.current_role_slot(txid) else {
+        return Ok(None);
+    };
+    let source_role = scope.authorization_roles[1].map_or(role, usize::from);
+    let local = |slot: usize| {
+        storage.table_def(slot, txid).kind == crate::storage::TableKind::Local
+            && storage.table_statistics(slot, txid).valid
+    };
+    if !local(source_slot)
+        || storage.relation_has_descendants(source_slot, txid)
+        || storage.row_security_applies(source_slot, source_role, txid)
+        || storage.row_security_applies(target_slot, role, txid)
+        || !leaves.iter().all(|&leaf| local(leaf))
+    {
+        return Ok(None);
+    }
+    // Every conjunct reads a relation and no subquery: PostgreSQL gates the
+    // join on the others, or runs them as subplans.
+    let mut conjuncts = [&Expr::Null; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if let Some(condition) = where_clause {
+        if !super::plan::flatten_and(condition, &mut conjuncts, &mut count) {
+            return Ok(None);
+        }
+        for &conjunct in &conjuncts[..count] {
+            if conjunct.contains_subquery()
+                || conjunct.contains_call()
+                || !matches!(super::plan::expr_tables(conjunct, &scope), Some(1..=3))
+            {
+                return Ok(None);
+            }
+        }
+    }
+    let conjuncts = &conjuncts[..count];
+    let methods = crate::sql::guc::planner_methods();
+    let mut plan = JoinedWriteJoin {
+        source_slot,
+        source_name: arena.alloc_str(scope.names[1]).map_err(|_| arena_full())?,
+        keys: [(0, 0); 8],
+        key_count: 0,
+        collations: [crate::sql::ast::Collation::None; 8],
+        source_outer: false,
+        method: JoinedWriteMethod::Rescanned,
+        inner_unique: false,
+        conditions: MergeConditions::default(),
+    };
+    if let Some((pairs, pair_count)) =
+        super::scan::hash_join_keys(&scope, where_clause, None, 0, 1)?
+    {
+        // PostgreSQL merges by the equalities when it may not hash them.
+        if !methods.hashjoin {
+            return Ok(None);
+        }
+        // A key column the conditions equate with a constant or another
+        // column makes the join's equality implied, as PostgreSQL's
+        // equivalence classes do.
+        for (index, &(target_column, source_column)) in pairs[..pair_count].iter().enumerate() {
+            if pairs[..pair_count].iter().enumerate().any(|(other, pair)| {
+                other != index && (pair.0 == target_column || pair.1 == source_column)
+            }) || conjuncts.iter().any(|conjunct| {
+                super::scan::fixes_column(&scope, conjunct, (0, target_column))
+                    || super::scan::fixes_column(&scope, conjunct, (1, source_column))
+            }) {
+                return Ok(None);
+            }
+            plan.keys[index] = (target_column, source_column);
+            plan.collations[index] =
+                super::scan::join_key_collation(&scope, (0, target_column), (1, source_column))
+                    .expect("hash keys have a collation");
+        }
+        plan.key_count = pair_count;
+    } else if !methods.nestloop {
+        return Ok(None);
+    }
+    // Each conjunct's place in the plan.
+    let column = |side: &Expr<'_>| match side {
+        Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+            Ok(super::ResolvedColumn::Table(table, column)) => Some((table, column)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let is_key = |conjunct: &Expr<'_>| {
+        let Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = conjunct
+        else {
+            return false;
+        };
+        let pair = match (column(left), column(right)) {
+            (Some((0, target)), Some((1, source))) | (Some((1, source)), Some((0, target))) => {
+                (target, source)
+            }
+            _ => return false,
+        };
+        plan.keys().contains(&pair)
+    };
+    let mut conditions = MergeConditions::default();
+    for &conjunct in conjuncts {
+        // PostgreSQL hashes on any equality between the two relations,
+        // which this plan's keys hold only for columns.
+        if let Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = conjunct
+            && matches!(
+                (
+                    super::plan::expr_tables(left, &scope),
+                    super::plan::expr_tables(right, &scope)
+                ),
+                (Some(1), Some(2)) | (Some(2), Some(1))
+            )
+            && !is_key(conjunct)
+        {
+            return Ok(None);
+        }
+        let slot = if plan.key_count != 0 && is_key(conjunct) {
+            &mut conditions.hash
+        } else {
+            match super::plan::expr_tables(conjunct, &scope) {
+                Some(1) => &mut conditions.target,
+                Some(2) => &mut conditions.source,
+                _ => &mut conditions.join,
+            }
+        };
+        *slot = super::and_where(*slot, Some(conjunct), arena)?;
+    }
+    plan.conditions = conditions;
+    // The columns each relation's conditions read, and whether only as a
+    // hash key.
+    let reads = |table: usize, column_index: usize| {
+        conjuncts.iter().any(|conjunct| {
+            let mut found = false;
+            conjunct.for_each_column_reference(&mut |qualifier, name| {
+                found |= matches!(
+                    scope.find_column(qualifier, name),
+                    Ok(super::ResolvedColumn::Table(owner, at)) if owner == table && at == column_index
+                );
+            });
+            found
+        })
+    };
+    let key_only = |table: usize, column_index: usize| {
+        [conditions.target, conditions.source, conditions.join]
+            .into_iter()
+            .flatten()
+            .all(|condition| {
+                let mut found = false;
+                condition.for_each_column_reference(&mut |qualifier, name| {
+                    found |= matches!(
+                        scope.find_column(qualifier, name),
+                        Ok(super::ResolvedColumn::Table(owner, at)) if owner == table && at == column_index
+                    );
+                });
+                !found
+            })
+            && plan.keys().iter().any(|&(target_column, source_column)| {
+                if table == 0 {
+                    target_column == column_index
+                } else {
+                    source_column == column_index
+                }
+            })
+    };
+    let target_member = |leaf: usize| {
+        JoinIndexReach::of(storage, leaf, txid, &|column| reads(0, column), &|column| {
+            key_only(0, column)
+        })
+    };
+    let target_reach = if leaves == [target_slot] {
+        target_member(target_slot)
+    } else {
+        leaves
+            .iter()
+            .fold(JoinIndexReach::default(), |reach, &leaf| {
+                reach.with(target_member(leaf))
+            })
+    };
+    let source_reach = JoinIndexReach::of(
+        storage,
+        source_slot,
+        txid,
+        &|column| reads(1, column),
+        &|column| key_only(1, column),
+    );
+    let Some((source_outer, method)) = crate::sql::explain::joined_write_shape(
+        storage, &mut scope, leaves, &plan, params, txid, arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    // A nested loop over key equalities checks them as its join filter,
+    // which this plan does not model.
+    if plan.key_count != 0 && method != JoinedWriteMethod::Hash {
+        return Ok(None);
+    }
+    plan.source_outer = source_outer;
+    plan.method = method;
+    let (outer_reach, inner_reach) = if plan.source_outer {
+        (source_reach, target_reach)
+    } else {
+        (target_reach, source_reach)
+    };
+    // PostgreSQL may scan the outer relation by such an index, or rescan
+    // the inner one by it in a nested loop.
+    if outer_reach.keys
+        || outer_reach.other
+        || inner_reach.other
+        || (inner_reach.keys && !plan.hashed())
+    {
+        return Ok(None);
+    }
+    plan.inner_unique = inner_reach.unique;
+    Ok(Some(plan))
+}
+
+/// The join rows one target row made with its candidate FROM rows: those
+/// the join returned, and those its join filter removed.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JoinedWritePairs {
+    pub(crate) joined: u64,
+    pub(crate) filtered: u64,
+}
+
+/// Joins the target row `target` with the FROM rows `candidates`, in that
+/// order: each whose `hash` equalities hold is a candidate pair, which the
+/// join returns when `filter` holds. Counts the pairs in `counts` and
+/// returns the first pair the join returned, its FROM row retained in
+/// `retain` when given.
+#[expect(clippy::too_many_arguments, reason = "joined DML scan inputs")]
+pub(crate) fn joined_write_pairs<'a, 'r>(
+    storage: &'a Storage,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    hash: Option<&'a Expr<'a>>,
+    filter: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    target: &dyn ColumnLookup<'a>,
+    sequences: Option<&dyn SequenceAccess>,
+    candidates: &'a [u64],
+    retain: Option<&'r Arena>,
+    counts: &mut JoinedWritePairs,
+) -> Result<Option<(u64, Option<JoinedFromRow<'r>>)>, SqlError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut first = None;
+    let observed: &[&'a Expr<'a>] = match filter {
+        Some(filter) => core::slice::from_ref(arena.alloc(filter).map_err(|_| arena_full())?),
+        None => &[],
+    };
+    scan_from_matches(
+        storage,
+        from,
+        txid,
+        hash,
+        observed,
+        retain.is_some(),
+        arena,
+        params,
+        target,
+        sequences,
+        Some(candidates),
+        &mut |row, joined, hooks| {
+            let passes = match filter {
+                Some(filter) => super::plan::where_passes(
+                    filter,
+                    arena,
+                    params,
+                    &Chained {
+                        inner: joined,
+                        outer: None,
+                    },
+                    hooks,
+                )?,
+                None => true,
+            };
+            if !passes {
+                counts.filtered += 1;
+                return Ok(true);
+            }
+            counts.joined += 1;
+            if first.is_none() {
+                let rowid = row.rowids.first().copied().flatten().ok_or_else(|| {
+                    crate::sql_err!(
+                        crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                        "a joined FROM row has no row identity"
+                    )
+                })?;
+                let retained = match retain {
+                    Some(retain) => Some(JoinedFromRow::encode(row, retain)?),
+                    None => None,
+                };
+                first = Some((rowid, retained));
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(first)
+}

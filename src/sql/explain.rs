@@ -3606,6 +3606,359 @@ fn extended_statistics_selectivity<'a>(
     None
 }
 
+/// PostgreSQL's `cpu_tuple_cost` and `cpu_operator_cost`.
+const CPU_TUPLE_COST: f64 = 0.01;
+const CPU_OPERATOR_COST: f64 = 0.0025;
+
+/// `clamp_row_est`.
+fn clamp_row_estimate(rows: f64) -> f64 {
+    if rows <= 1.0 { 1.0 } else { rows.round() }
+}
+
+/// The operators and function calls PostgreSQL's `cost_qual_eval` charges
+/// `cpu_operator_cost` each for when it evaluates `expression`.
+fn qual_operators(expression: Option<&Expr<'_>>) -> f64 {
+    fn count(expression: &Expr<'_>) -> f64 {
+        let own = match expression {
+            Expr::Binary {
+                operator: BinaryOp::And | BinaryOp::Or,
+                ..
+            } => 0.0,
+            Expr::Binary { .. } | Expr::Call { .. } | Expr::Like { .. } | Expr::Match { .. } => 1.0,
+            Expr::InList { list, .. } => list.len() as f64,
+            _ => 0.0,
+        };
+        let mut children = 0.0;
+        let _ = query::walk_children(expression, &mut |child| {
+            children += count(child);
+            Ok(())
+        });
+        own + children
+    }
+    expression.map_or(0.0, count)
+}
+
+/// The heap pages ANALYZE records for the table in `slot` (`relpages`):
+/// its rows as PostgreSQL lays them out, each a 24-byte header, its
+/// values at their alignment and a line pointer, packed into 8 kB pages.
+fn heap_pages(storage: &Storage, slot: usize, txid: u32) -> f64 {
+    let statistics = storage.table_statistics(slot, txid);
+    let definition = storage.table_def(slot, txid);
+    let align = |offset: usize, alignment: u8| {
+        let to = match alignment {
+            b'd' => 8,
+            b'i' => 4,
+            b's' => 2,
+            _ => 1,
+        };
+        offset.next_multiple_of(to)
+    };
+    let mut data = 0usize;
+    for (column, meta) in definition.columns().iter().enumerate() {
+        let layout = meta.ctype.physical_layout();
+        if layout.length > 0 {
+            data = align(data, layout.alignment) + layout.length as usize;
+            continue;
+        }
+        let width = definition
+            .attributes
+            .number(column)
+            .and_then(|attribute| statistics.column(attribute))
+            .map_or(32, |column| column.average_width as usize);
+        data += if width < 127 {
+            width + 1
+        } else {
+            align(data, layout.alignment) - data + width + 4
+        };
+    }
+    // A row without NULLs: no null bitmap after the 23-byte header.
+    let tuple = 24 + data.next_multiple_of(8) + 4;
+    let per_page = (8168 / tuple).clamp(1, 291) as f64;
+    (statistics.rows as f64 / per_page).ceil()
+}
+
+/// One relation of a joined write as PostgreSQL's planner costs it: the
+/// rows its scan returns, the scan's total cost and the distinct values
+/// of each hash key among those rows (`None` without statistics).
+#[derive(Clone, Copy)]
+struct CostedRelation {
+    rows: f64,
+    total: f64,
+    distinct: [Option<f64>; 8],
+}
+
+/// Costs the sequential scans of `slots` (one relation, or a tree's
+/// members under an `Append`) at `table` of `scope` under `condition`.
+#[allow(clippy::too_many_arguments)]
+fn costed_relation<'a>(
+    storage: &Storage,
+    scope: &mut QueryScope<'a>,
+    table: usize,
+    slots: &[usize],
+    condition: Option<&'a Expr<'a>>,
+    keys: &[usize],
+    params: &[Datum<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<CostedRelation>, SqlError> {
+    let original = scope.slots[table];
+    let operators = qual_operators(condition);
+    let mut costed = CostedRelation {
+        rows: 0.0,
+        total: 0.0,
+        distinct: [Some(0.0); 8],
+    };
+    for &slot in slots {
+        scope.slots[table] = slot;
+        let tuples = storage.planning_row_estimate(slot) as f64;
+        // The rows a condition keeps, which PostgreSQL's statistics
+        // estimate closely for an analyzed table.
+        let rows = clamp_row_estimate(match condition {
+            None => tuples,
+            Some(condition) => {
+                match crate::sql::exec::relation_rows_kept(
+                    storage,
+                    slot,
+                    scope.names[table],
+                    condition,
+                    params,
+                    txid,
+                    arena,
+                )? {
+                    Some(rows) => rows as f64,
+                    None => {
+                        scope.slots[table] = original;
+                        return Ok(None);
+                    }
+                }
+            }
+        });
+        costed.rows += rows;
+        costed.total += heap_pages(storage, slot, txid)
+            + tuples * (CPU_TUPLE_COST + CPU_OPERATOR_COST * operators);
+        let statistics = storage.table_statistics(slot, txid);
+        let definition = storage.table_def(slot, txid);
+        for (distinct, &column) in costed.distinct.iter_mut().zip(keys) {
+            let Some(column_statistics) = definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute))
+                .filter(|_| statistics.valid)
+            else {
+                *distinct = None;
+                continue;
+            };
+            let values = crate::storage::column_distinct_estimate(
+                &definition.columns()[column],
+                column_statistics,
+                statistics.rows,
+                false,
+            );
+            // `estimate_hash_bucketsize` scales the distinct values by the
+            // fraction of rows the scan keeps.
+            let scaled = if tuples > 0.0 && rows < tuples {
+                clamp_row_estimate(values * rows / tuples)
+            } else {
+                values
+            };
+            *distinct = distinct.map(|sum| sum + scaled);
+        }
+    }
+    scope.slots[table] = original;
+    if slots.len() > 1 {
+        // `cost_append`'s per-row charge.
+        costed.total += CPU_TUPLE_COST * 0.5 * costed.rows;
+    }
+    for distinct in &mut costed.distinct {
+        *distinct = distinct.map(|values| values.min(costed.rows).max(1.0));
+    }
+    Ok(Some(costed))
+}
+
+/// How PostgreSQL's planner joins a joined write's target, its members
+/// `leaves`, and its FROM table under `join`: it costs both orders of a
+/// hash join (`initial_cost_hashjoin` and `final_cost_hashjoin`) and of a
+/// nested loop rescanning its inner relation or a `Materialize` of it, and
+/// `add_path` keeps the path generated first unless another costs less by
+/// more than its fuzz factor, in total cost, then startup
+/// cost, then by any amount. Returns whether the FROM table is the outer
+/// relation and the join method; `None` when a relation's condition cannot
+/// be estimated.
+pub(crate) fn joined_write_shape<'a>(
+    storage: &Storage,
+    scope: &mut QueryScope<'a>,
+    leaves: &[usize],
+    join: &query::JoinedWriteJoin<'a>,
+    params: &[Datum<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<(bool, query::JoinedWriteMethod)>, SqlError> {
+    let mut target_keys = [0usize; 8];
+    let mut source_keys = [0usize; 8];
+    for (index, &(target_column, source_column)) in join.keys().iter().enumerate() {
+        target_keys[index] = target_column;
+        source_keys[index] = source_column;
+    }
+    let count = join.keys().len();
+    let Some(target) = costed_relation(
+        storage,
+        scope,
+        0,
+        leaves,
+        join.conditions.target,
+        &target_keys[..count],
+        params,
+        txid,
+        arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(source) = costed_relation(
+        storage,
+        scope,
+        1,
+        &[join.source_slot],
+        join.conditions.source,
+        &source_keys[..count],
+        params,
+        txid,
+        arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    let filter = CPU_OPERATOR_COST * qual_operators(join.conditions.join);
+    let keys = count as f64;
+    // (startup, total) of a nested loop with `outer` rescanning `inner`,
+    // from a `Materialize` or by scanning it again.
+    let nested = |outer: &CostedRelation, inner: &CostedRelation, materialized: bool| {
+        let rescans = (outer.rows - 1.0).max(0.0);
+        let inner_cost = if materialized {
+            inner.total
+                + 2.0 * CPU_OPERATOR_COST * inner.rows
+                + rescans * CPU_OPERATOR_COST * inner.rows
+        } else {
+            inner.total * (1.0 + rescans)
+        };
+        let qual = CPU_TUPLE_COST + CPU_OPERATOR_COST * keys + filter;
+        (
+            0.0,
+            outer.total + inner_cost + outer.rows * inner.rows * qual,
+        )
+    };
+    // (startup, total) of a hash join with `outer` probing `inner`.
+    let hashed = |outer: &CostedRelation, inner: &CostedRelation| {
+        let startup = inner.total + (CPU_OPERATOR_COST * keys + CPU_TUPLE_COST) * inner.rows;
+        let buckets = (inner.rows.max(1.0) as u64).next_power_of_two().max(1024) as f64;
+        // `estimate_hash_bucketsize`: the smallest bucket fraction of the
+        // keys, 0.1 for a key without statistics.
+        let fraction = inner.distinct[..count]
+            .iter()
+            .map(|distinct| {
+                distinct.map_or(0.1_f64.max(1.0 / buckets), |values| {
+                    (if values > buckets {
+                        1.0 / buckets
+                    } else {
+                        1.0 / values
+                    })
+                    .clamp(1.0e-6, 1.0)
+                })
+            })
+            .fold(1.0_f64, f64::min);
+        let matches = (0..count).fold(outer.rows * inner.rows, |rows, key| {
+            let distinct = |relation: &CostedRelation| relation.distinct[key].unwrap_or(200.0);
+            rows / distinct(outer).max(distinct(inner))
+        });
+        let total = startup
+            + outer.total
+            + CPU_OPERATOR_COST * keys * outer.rows
+            + CPU_OPERATOR_COST
+                * keys
+                * outer.rows
+                * clamp_row_estimate(inner.rows * fraction)
+                * 0.5
+            + (CPU_TUPLE_COST + filter) * clamp_row_estimate(matches);
+        (startup, total)
+    };
+    // The paths in the order `add_paths_to_joinrel` generates them: the
+    // target outer, then the FROM table outer; per order the nested loops
+    // (`match_unsorted_outer`), then the hash join.
+    let mut paths = [(0.0, 0.0, false, query::JoinedWriteMethod::Rescanned); 6];
+    let mut generated = 0;
+    for (source_outer, outer, inner) in [(false, &target, &source), (true, &source, &target)] {
+        for method in [
+            query::JoinedWriteMethod::Rescanned,
+            query::JoinedWriteMethod::Materialized,
+        ] {
+            if method == query::JoinedWriteMethod::Materialized
+                && !crate::sql::guc::planner_methods().material
+            {
+                continue;
+            }
+            let (startup, total) = nested(
+                outer,
+                inner,
+                method == query::JoinedWriteMethod::Materialized,
+            );
+            paths[generated] = (startup, total, source_outer, method);
+            generated += 1;
+        }
+        if count != 0 {
+            let (startup, total) = hashed(outer, inner);
+            paths[generated] = (startup, total, source_outer, query::JoinedWriteMethod::Hash);
+            generated += 1;
+        }
+    }
+    // `compare_path_costs_fuzzily` of `new` against `old`: `Some(true)`
+    // when `new` is better, `Some(false)` when `old` is.
+    let compare = |new: (f64, f64), old: (f64, f64), fuzz: f64| -> Option<bool> {
+        if new.1 > old.1 * fuzz {
+            Some(false)
+        } else if old.1 > new.1 * fuzz {
+            Some(true)
+        } else if new.0 > old.0 * fuzz {
+            Some(false)
+        } else if old.0 > new.0 * fuzz {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    // `add_path`: a new path displaces the kept ones it is fuzzily better
+    // than, or is rejected by one fuzzily better; among fuzzily equal
+    // paths of the same rows the strictly cheaper stays.
+    let mut kept = [None::<usize>; 6];
+    for new in 0..generated {
+        let cost = (paths[new].0, paths[new].1);
+        let mut accept = true;
+        for slot in kept.iter_mut() {
+            let Some(old) = *slot else { continue };
+            let old_cost = (paths[old].0, paths[old].1);
+            match compare(cost, old_cost, 1.01).or_else(|| compare(cost, old_cost, 1.000_000_000_1))
+            {
+                Some(true) => *slot = None,
+                Some(false) | None => {
+                    accept = false;
+                    break;
+                }
+            }
+        }
+        if accept {
+            kept[new] = Some(new);
+        }
+    }
+    // `set_cheapest`: the cheapest total cost, the earliest on a tie.
+    let chosen = kept.iter().flatten().copied().reduce(|best, path| {
+        if paths[path].1 < paths[best].1 {
+            path
+        } else {
+            best
+        }
+    });
+    Ok(chosen.map(|path| (paths[path].2, paths[path].3)))
+}
+
 fn predicate_selectivity<'a>(
     storage: &Storage,
     scope: &QueryScope<'_>,
@@ -8584,6 +8937,34 @@ fn plan_write<'a>(
             None
         };
         drop(target_definition);
+        let leaves = target_expansion.map_or(core::slice::from_ref(&target_slot), |expansion| {
+            expansion.planned.leaves
+        });
+        if let Some(join) = query::joined_write_join(
+            storage,
+            target,
+            alias,
+            from,
+            predicate,
+            leaves,
+            &[],
+            txid,
+            arena,
+        )? {
+            let mut plan = plan_joined_write(
+                plan,
+                storage,
+                txid,
+                statement,
+                target_slot,
+                target_expansion,
+                join,
+                block,
+                arena,
+            )?;
+            plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            return Ok(plan);
+        }
         let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
         let order = arena
             .alloc_slice_with(scope.n, |index| index)
@@ -9171,6 +9552,352 @@ fn plan_write<'a>(
     plan.nodes[0].object_requests = child.object_requests;
     plan.nodes[0].cache_blocks = child.cache_blocks;
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    Ok(plan)
+}
+
+/// Plans an `UPDATE ... FROM` or `DELETE ... USING` joined as execution
+/// joins it (`query::joined_write_join`): the target's scan (each member's
+/// under an `Append`) and the FROM table's, each filtered by its own
+/// conditions, under a hash join building on the relation PostgreSQL's
+/// costs pick, or a nested loop rescanning it from a `Materialize`. `plan`
+/// holds the write's node.
+#[allow(clippy::too_many_arguments)]
+fn plan_joined_write<'a, 'e>(
+    mut plan: Plan<'a>,
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'e>,
+    target_slot: usize,
+    expansion: Option<Expansion<'_>>,
+    join: query::JoinedWriteJoin<'e>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let (verb, target, alias, assignments, returning, predicate): (
+        &str,
+        _,
+        _,
+        &[(&str, &Expr<'_>)],
+        _,
+        _,
+    ) = match statement {
+        Stmt::Update(update) => (
+            "Update",
+            update.table,
+            update.alias,
+            update.assignments,
+            update.returning,
+            update.where_clause,
+        ),
+        Stmt::Delete(delete) => (
+            "Delete",
+            delete.table,
+            delete.alias,
+            &[],
+            delete.returning,
+            delete.where_clause,
+        ),
+        _ => unreachable!("a joined write is an UPDATE or DELETE"),
+    };
+    let exposed = alias.unwrap_or(target.name);
+    let target_table = (*storage.table_def(target_slot, txid)).clone();
+    let source_table = (*storage.table_def(join.source_slot, txid)).clone();
+    let source_name = join.source_name;
+    let lists = targets::RelationTargets::joined_write(
+        storage,
+        txid,
+        &target_table,
+        exposed,
+        &source_table,
+        source_name,
+        expansion.is_some(),
+        assignments,
+        returning,
+        predicate,
+        arena,
+    )?;
+    let joined = arena
+        .alloc_slice_with(2, |at| {
+            if at == 0 {
+                crate::sql::catalog::deparse::Joined::new(exposed, &target_table)
+            } else {
+                crate::sql::catalog::deparse::Joined::new(source_name, &source_table)
+            }
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+        bare: None,
+        domain_value: None,
+        sublinks: Some(&registered_sublink),
+        references: None,
+        folded: true,
+        arena,
+        dependencies: None,
+    };
+    let conditions = join.conditions;
+    // The hash condition reads the outer relation's key first.
+    let mut hash_conds = crate::mem::arena::ArenaList::new(arena);
+    if let Some(hash) = conditions.hash {
+        let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+        let mut count = 0;
+        if split_conjuncts(hash, &mut conjuncts, &mut count, arena).is_none() {
+            return Err(arena_full());
+        }
+        for &conjunct in &conjuncts[..count] {
+            let Expr::Binary {
+                operator,
+                left,
+                right,
+                source_position,
+            } = conjunct
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a hash join key is not an equality"
+                ));
+            };
+            let reads_target = |side: &Expr<'_>| {
+                let mut target_side = false;
+                side.for_each_column_reference(&mut |qualifier, name| {
+                    target_side |= match qualifier {
+                        Some(qualifier) => qualifier == exposed,
+                        None => target_table.column_index(name).is_some(),
+                    };
+                });
+                target_side
+            };
+            let (outer_side, inner_side) = if reads_target(left) != join.source_outer {
+                (*left, *right)
+            } else {
+                (*right, *left)
+            };
+            hash_conds
+                .push(
+                    &*arena
+                        .alloc(Expr::Binary {
+                            operator: *operator,
+                            left: outer_side,
+                            right: inner_side,
+                            source_position: *source_position,
+                        })
+                        .map_err(|_| arena_full())?,
+                )
+                .map_err(|_| arena_full())?;
+        }
+    }
+    let hash_cond = deparse_qual(&context, hash_conds.as_slice(), arena)?;
+    let mut join_filters = crate::mem::arena::ArenaList::new(arena);
+    if let Some(filter) = conditions.join {
+        let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+        let mut count = 0;
+        if split_conjuncts(filter, &mut conjuncts, &mut count, arena).is_none() {
+            return Err(arena_full());
+        }
+        for &conjunct in &conjuncts[..count] {
+            join_filters.push(conjunct).map_err(|_| arena_full())?;
+        }
+    }
+    let join_filter = deparse_qual(&context, join_filters.as_slice(), arena)?;
+    let rescanned = join.method == query::JoinedWriteMethod::Rescanned;
+    let inner_depth = if rescanned { 2 } else { 3 };
+    let (target_depth, source_depth) = if join.source_outer {
+        (inner_depth, 2)
+    } else {
+        (2, inner_depth)
+    };
+    let mut target_scan = physical_scan_node(
+        storage,
+        target_slot,
+        target.name,
+        conditions.target.is_some(),
+        txid,
+        target_depth,
+        None,
+    );
+    target_scan.alias = plan.nodes[0].alias;
+    let target_filter = |verbose: bool| {
+        single_relation_quals(
+            storage,
+            txid,
+            exposed,
+            &target_table,
+            conditions.target,
+            &[],
+            None,
+            verbose,
+            arena,
+        )
+        .map(|(_, filter)| filter)
+    };
+    let mut target_scan = target_scan
+        .with_qual(QualLabel::Filter, target_filter(false)?)
+        .with_verbose_qual(QualLabel::Filter, target_filter(true)?);
+    target_scan.key = Some(NodeKey::new(block, Role::Scan(0)));
+    target_scan.set_output(lists.as_ref().map(|lists| lists.target));
+    let mut source_scan = physical_scan_node(
+        storage,
+        join.source_slot,
+        source_table.name.as_str(),
+        conditions.source.is_some(),
+        txid,
+        source_depth,
+        None,
+    );
+    if source_name != source_table.name.as_str() {
+        source_scan.alias = StackStr::from_str(source_name);
+    }
+    let source_filter = |verbose: bool| {
+        single_relation_quals(
+            storage,
+            txid,
+            source_name,
+            &source_table,
+            conditions.source,
+            &[],
+            None,
+            verbose,
+            arena,
+        )
+        .map(|(_, filter)| filter)
+    };
+    let mut source_scan = source_scan
+        .with_qual(QualLabel::Filter, source_filter(false)?)
+        .with_verbose_qual(QualLabel::Filter, source_filter(true)?);
+    source_scan.key = Some(NodeKey::new(block, Role::Scan(1)));
+    source_scan.set_output(lists.as_ref().map(|lists| lists.source));
+    let fresh_names = || -> Result<RangeTableNames<'_>, SqlError> {
+        let count = expansion.map_or(0, |expansion| expansion.planned.leaves.len());
+        let names = arena
+            .alloc_slice_with(count + 1, |_| StackStr::<96>::new())
+            .map_err(|_| arena_full())?;
+        names[0] = StackStr::from_str(exposed);
+        Ok(RangeTableNames { names, count: 1 })
+    };
+    if let Some(expansion) = expansion {
+        let mut targets = fresh_names()?;
+        for &leaf in expansion.started {
+            let name = targets.take(exposed)?;
+            let member = storage.table_def(leaf, txid);
+            plan.push(PlanNode {
+                name: StackStr::from_str(verb),
+                relation: StackStr::from_str(member.name.as_str()),
+                schema: StackStr::from_str(member.schema.as_str()),
+                alias: if name.as_str() == member.name.as_str() {
+                    StackStr::new()
+                } else {
+                    name
+                },
+                depth: 1,
+                target_member: true,
+                ..PlanNode::EMPTY
+            })?;
+        }
+    }
+    let join_index = plan.count;
+    plan.push(
+        PlanNode {
+            name: StackStr::from_str(if join.hashed() {
+                "Hash Join"
+            } else {
+                "Nested Loop"
+            }),
+            depth: 1,
+            total_cost: target_scan.total_cost + source_scan.total_cost,
+            rows: target_scan.rows.max(source_scan.rows),
+            width: target_scan.width,
+            key: Some(NodeKey::new(block, Role::Join(1))),
+            inner_unique: join.inner_unique,
+            output: lists.as_ref().map(|lists| lists.join).unwrap_or_default(),
+            output_unprintable: lists.is_none(),
+            ..PlanNode::EMPTY
+        }
+        .with_qual(QualLabel::HashCond, hash_cond)
+        .with_qual(QualLabel::JoinFilter, join_filter),
+    )?;
+    let push_target = |plan: &mut Plan<'a>, scan: PlanNode| -> Result<(), SqlError> {
+        match expansion {
+            Some(expansion) => {
+                push_members(
+                    plan,
+                    storage,
+                    txid,
+                    scan,
+                    expansion,
+                    true,
+                    &mut fresh_names()?,
+                    &|leaf| {
+                        Some(NodeKey::new(
+                            block,
+                            Role::Member(0, u32::try_from(leaf).unwrap_or(u32::MAX)),
+                        ))
+                    },
+                    None,
+                )?;
+                // One member scanned in place of the `Append` names the
+                // target's columns in the join's conditions.
+                if expansion.planned.leaves.len() == 1 {
+                    let member = plan.nodes[plan.count - 1];
+                    plan.nodes[join_index].requalify(exposed, member.exposed_name());
+                }
+                Ok(())
+            }
+            None => push_scan(plan, scan),
+        }
+    };
+    let hashed_columns = lists.as_ref().map(|lists| lists.hashed);
+    let inner = |scan: &PlanNode, relation: usize| PlanNode {
+        name: StackStr::from_str(if join.hashed() { "Hash" } else { "Materialize" }),
+        key: Some(NodeKey::new(
+            block,
+            if join.hashed() {
+                Role::Hash(relation as u16)
+            } else {
+                Role::Materialize(relation as u16)
+            },
+        )),
+        depth: 2,
+        total_cost: scan.total_cost,
+        rows: scan.rows,
+        width: scan.width,
+        output: scan.output,
+        output_unprintable: scan.output_unprintable,
+        hash_columns: hashed_columns.and_then(|hashed| hashed[relation]),
+        // A hashed or stored row's size needs the values it holds.
+        uncounted: hashed_columns.and_then(|hashed| hashed[relation]).is_none(),
+        ..PlanNode::EMPTY
+    };
+    if join.source_outer {
+        push_scan(&mut plan, source_scan)?;
+        if !rescanned {
+            plan.push(inner(&target_scan, 0))?;
+        }
+        push_target(&mut plan, target_scan)?;
+    } else {
+        push_target(&mut plan, target_scan)?;
+        if !rescanned {
+            plan.push(inner(&source_scan, 1))?;
+        }
+        push_scan(&mut plan, source_scan)?;
+    }
+    plan.nodes[0].total_cost = plan.nodes[join_index].total_cost;
+    match lists {
+        Some(lists) => {
+            plan.nodes[0].set_output(Some(lists.returned.unwrap_or_default()));
+            // The `RETURNING` list is set against the first result relation.
+            if expansion.is_some() {
+                let first = unique_rtable_name(exposed, &[StackStr::<96>::from_str(exposed)]);
+                plan.nodes[0].requalify(exposed, first.as_str());
+            }
+        }
+        None => plan.nodes[0].set_output(None),
+    }
     Ok(plan)
 }
 
@@ -9793,10 +10520,7 @@ fn plan_merge<'a, 'e>(
         width: scan.width,
         output: scan.output,
         output_unprintable: scan.output_unprintable,
-        hash_columns: lists
-            .as_ref()
-            .filter(|_| join.hashed())
-            .map(|lists| lists.hashed[relation]),
+        hash_columns: lists.as_ref().map(|lists| lists.hashed[relation]),
         ..PlanNode::EMPTY
     };
     if source_outer {
@@ -11446,13 +12170,13 @@ fn structured_node(
     if members_end > at + 1 {
         document.open_group("Target Tables", Some("Target Tables"), false);
         for member in &plan.nodes[at + 1..members_end] {
-            document.open_group("Result Relation", None, true);
+            document.open_group("Target Table", None, true);
             document.text("Relation Name", member.relation.as_str());
             if options.verbose {
                 document.text("Schema", member.schema.as_str());
             }
             document.text("Alias", member.exposed_name());
-            document.close_group("Result Relation", true);
+            document.close_group("Target Table", true);
         }
     }
     // A `MERGE`'s outcome, inside its result relations' group.

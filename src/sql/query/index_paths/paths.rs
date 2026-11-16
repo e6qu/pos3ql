@@ -2165,15 +2165,6 @@ pub(crate) fn scan_path<'a>(
         .find_map(|restriction| restriction.clause.unmodeled());
     // An index the model does not cover is outside it when the query could
     // use it.
-    let mut columns_read = needed.unwrap_or(u64::MAX);
-    for restriction in restrictions {
-        columns_read |= restriction.clause.columns();
-    }
-    for key in order {
-        if let OrderKey::Column { column, .. } = key {
-            columns_read |= column_bit(*column);
-        }
-    }
     for (position, index) in planner.indexes.iter().enumerate() {
         if usable[position] {
             continue;
@@ -2250,7 +2241,6 @@ pub(crate) fn scan_path<'a>(
                 _ => "an index with a non-default operator class or collation",
             }));
         }
-        let _ = columns_read;
     }
     let all_cost = restrictions
         .iter()
@@ -2524,12 +2514,10 @@ fn build<'a>(
         }
     }
     outside!(paths.or_paths(all, &[], &mut bitmap_candidates, &mut bitmap_count)?);
-    let mut bitmap = None;
     if bitmap_count > 0 {
         let node = outside!(paths.choose_bitmap_and(&bitmap_candidates[..bitmap_count])?);
         let tree = paths.nodes.items[node];
         let (startup, total) = paths.bitmap_heap(tree.tree_cost, tree.selectivity);
-        bitmap = Some(node);
         if candidate_count == MAX_CANDIDATES {
             return Ok(Err("more than 66 paths"));
         }
@@ -2544,7 +2532,6 @@ fn build<'a>(
         });
         candidate_count += 1;
     }
-    let _ = bitmap;
     let candidates = arena
         .alloc_slice_with(candidate_count, |at| {
             candidates[at].expect("dense candidates")

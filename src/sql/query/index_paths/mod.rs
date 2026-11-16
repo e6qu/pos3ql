@@ -1706,11 +1706,6 @@ fn string_scalars(value: &[u8], low: &[u8], high: &[u8]) -> (f64, f64, f64) {
     {
         prefix += 1;
     }
-    // `convert_string_to_scalar` stops at the low bound's end.
-    if prefix == low.len() || prefix < low.len() {
-        // fallthrough: the loop above already stopped at the first
-        // difference or the shortest string.
-    }
     let one = |text: &[u8]| -> f64 {
         let text = &text[prefix.min(text.len())..];
         if text.is_empty() {

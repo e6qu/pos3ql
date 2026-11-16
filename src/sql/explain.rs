@@ -12622,12 +12622,22 @@ fn plan_statement_nodes<'a>(
     block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
-    if block == BlockId::ROOT {
-        reject_inlined_calls(storage, txid, statement, arena)?;
-    }
     // The planner plans the statement its constant folding produced, and
     // raises the folding's notices and errors (`eval_const_expressions`).
-    let statement = fold_statement(storage, txid, statement, arena)?;
+    // PostgreSQL's folding also replaces a call of a SQL function whose body
+    // is one plain expression by that expression (`inline_function`), which
+    // then prints, costs, estimates and matches index keys in its place;
+    // pos3ql plans the call itself, so it refuses such a statement.
+    let (statement, inlinable) = crate::sql::eval::folding_inlinable_calls(|| {
+        fold_statement(storage, txid, statement, arena)
+    });
+    let statement = statement?;
+    if inlinable {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a call of a SQL function PostgreSQL inlines is not supported"
+        ));
+    }
     if block != BlockId::ROOT {
         return plan_folded_statement(storage, txid, statement, block, arena);
     }
@@ -12754,45 +12764,6 @@ fn plan_folded_statement<'a>(
             "EXPLAIN does not support this statement type"
         )),
     }
-}
-
-/// PostgreSQL's planner replaces a call of a SQL function whose body is one
-/// plain expression by that expression (`inline_function`), which then
-/// prints, costs, estimates and matches indexes as written in its place.
-/// pos3ql plans the call itself, so EXPLAIN of a statement calling such a
-/// function is refused rather than shown differently.
-fn reject_inlined_calls(
-    storage: &Storage,
-    txid: u32,
-    statement: &Stmt<'_>,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let mark = arena.mark();
-    let result = (|| {
-        let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
-        query::collect_runtime_statement(statement, storage, txid, &mut dependencies, arena, None)?;
-        for dependency in dependencies.entries() {
-            let crate::storage::StoredDependencyIdentity::RoutineOid(oid) = dependency.identity
-            else {
-                continue;
-            };
-            let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
-                continue;
-            };
-            let routine = storage.routine_for(slot, txid);
-            if crate::sql::exec::sql_function_body_inlinable(&routine, arena) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "EXPLAIN of a call of SQL function \"{}\", which PostgreSQL inlines, is not supported",
-                    routine.name.as_str()
-                ));
-            }
-        }
-        Ok(())
-    })();
-    // SAFETY: the dependencies and parsed bodies are consumed here.
-    unsafe { arena.rewind_to(mark) };
-    result
 }
 
 /// `statement` with its constants folded, as execution folds them before it

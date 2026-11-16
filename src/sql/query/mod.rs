@@ -5433,6 +5433,43 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn names_inlinable_sql_function(&self, name: &str) -> bool {
+        let (schema, bare) = match name.rsplit_once('.') {
+            Some((schema, bare)) => (Some(schema), bare),
+            None => (None, name),
+        };
+        let inlinable = |schema: &str| {
+            self.storage
+                .routine_slots_named(schema, bare, self.txid)
+                .any(|slot| {
+                    let routine = self.storage.routine_for(slot, self.txid);
+                    let mark = self.routine_workspace.mark();
+                    let inlinable =
+                        super::exec::sql_function_body_inlinable(&routine, self.routine_workspace);
+                    // SAFETY: the parsed body is consumed by the check.
+                    unsafe { self.routine_workspace.rewind_to(mark) };
+                    inlinable
+                })
+        };
+        match schema {
+            Some(schema) => inlinable(schema),
+            None => self
+                .storage
+                .path()
+                .entries()
+                .iter()
+                .any(|entry| match entry {
+                    crate::storage::PathEntry::Schema(slot) => inlinable(
+                        self.storage
+                            .schema_def_for(usize::from(*slot), self.txid)
+                            .name
+                            .as_str(),
+                    ),
+                    _ => false,
+                }),
+        }
+    }
+
     fn relation_row_type(&self, schema: &str, name: &str) -> Option<crate::storage::TypeCreation> {
         let slot = self.storage.find_visible(schema, name, self.txid)?;
         Some(

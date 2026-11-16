@@ -309,6 +309,18 @@ impl Context<'_> {
         )?;
         output.push(" ")?;
         output.push(symbol)?;
+        // A planned text pattern and escape fold to the pattern
+        // `like_escape` makes.
+        if self.folded
+            && kind == oid::TEXT
+            && let (Expr::Str(pattern), Expr::Str(escape)) = (pattern, escape)
+        {
+            output.push(" ")?;
+            let folded =
+                crate::sql::query::index_paths::like_escape(pattern, escape, output.arena)?;
+            self.constant(folded, oid::TEXT, output)?;
+            return self.close(output);
+        }
         output.push(" like_escape(")?;
         self.write(pattern, Some(kind), output)?;
         output.push(", ")?;

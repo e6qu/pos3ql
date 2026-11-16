@@ -22,6 +22,8 @@ use super::{RowCtx, check_not_null};
 
 mod build_sort;
 pub(crate) use build_sort::{BuildKeys, BuildRowVisit, RebuildPhase, check_sorted_builds};
+mod exclusion_build;
+pub(crate) use exclusion_build::check_exclusion_build;
 
 /// The longest prefix of one value PostgreSQL shows in a row description
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
@@ -2178,6 +2180,13 @@ fn check_row_keys(
                 checked
             }
         }
+        // A stored row meets a non-deferrable exclusion constraint when its
+        // index is built (`check_exclusion_build`).
+        RowKey::Exclusion(position)
+            if existing && !def.exclusions()[position].timing.is_deferrable() =>
+        {
+            Ok(())
+        }
         RowKey::Exclusion(position) => {
             let exclusion = &def.exclusions()[position];
             let checked = enforce_exclusion_constraint(
@@ -2432,46 +2441,6 @@ fn check_index_tuple_sizes_inner(
         )?;
     }
     Ok(())
-}
-
-/// Checks the exclusion constraint at `position` of `def` for one existing
-/// row against the others, as rebuilding its index does.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn check_rebuilt_exclusion(
-    storage: &Storage,
-    table_index: usize,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    schema: &[ColType],
-    values: &[Datum],
-    rowid: u64,
-    txid: u32,
-    arena: &Arena,
-    position: usize,
-) -> Result<(), SqlError> {
-    let exclusion = &def.exclusions()[position];
-    let predicate = exclusion
-        .predicate
-        .map(|source| {
-            let source = arena
-                .alloc_str(source.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            crate::sql::parser::parse_expr(source, arena)
-        })
-        .transpose()?;
-    enforce_exclusion_constraint(
-        storage,
-        table_index,
-        def,
-        schema,
-        values,
-        Some(rowid),
-        txid,
-        exclusion,
-        predicate,
-        arena,
-        Some(storage.validation_read()),
-        DuplicateKey::IndexBuild,
-    )
 }
 
 /// One unique index's check of a written row.

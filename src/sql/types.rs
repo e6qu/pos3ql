@@ -4211,6 +4211,12 @@ impl ArrElem {
                 {
                     ColType::Enum(_) => ColType::Enum(base_identity),
                     ColType::Composite(_) => ColType::Composite(base_identity),
+                    ColType::Array(ArrElem::Enum(_)) => {
+                        ColType::Array(ArrElem::Enum(base_identity))
+                    }
+                    ColType::Array(ArrElem::Composite(_)) => {
+                        ColType::Array(ArrElem::Composite(base_identity))
+                    }
                     base => base,
                 }
             }
@@ -4466,15 +4472,16 @@ impl ArrElem {
 
     /// Rebuilds a domain-array element identity from the domain catalog.
     pub fn domain(identity: crate::storage::TypeCreation, base: ColType) -> Option<Self> {
-        // Built-in array bases retain their complete element in the base code.
-        // Nested named creations are not represented by that code.
-        if matches!(base, ColType::Record)
-            || matches!(base, ColType::Array(element) if element.is_named())
-        {
-            return None;
-        }
+        // Built-in array bases retain their complete element in the base
+        // code; an array of an enum or composite type keeps that type's
+        // identity as the base identity. An array of a domain would need a
+        // third identity.
         let base_identity = match base {
+            ColType::Record | ColType::Array(ArrElem::Domain { .. } | ArrElem::Nested { .. }) => {
+                return None;
+            }
             ColType::Enum(slot) | ColType::Composite(slot) => slot,
+            ColType::Array(ArrElem::Enum(slot) | ArrElem::Composite(slot)) => Some(slot?),
             _ => None,
         };
         Some(Self::Domain {
@@ -6503,12 +6510,12 @@ mod named_type_layout_tests {
         assert_eq!(size_of::<TypeCreation>(), 3);
         assert_eq!(size_of::<Option<TypeCreation>>(), 3);
         assert_eq!(align_of::<TypeCreation>(), 1);
-        assert_eq!(size_of::<CachedArrayElement>(), 6);
+        assert_eq!(size_of::<CachedArrayElement>(), 8);
         assert!(size_of::<ColType>() <= 8);
         assert!(size_of::<ArrElem>() <= 8);
         assert!(size_of::<Datum<'_>>() <= 32);
-        assert!(size_of::<OwnedDatum>() <= 128);
-        assert!(size_of::<ColumnDefault>() <= 256);
+        assert!(size_of::<OwnedDatum>() <= 136);
+        assert!(size_of::<ColumnDefault>() <= 272);
         assert_eq!(size_of::<crate::sql::ast::CatalogCollation>(), 4);
         assert_eq!(size_of::<crate::sql::ast::Collation>(), 4);
         assert_eq!(align_of::<crate::sql::ast::Collation>(), 1);

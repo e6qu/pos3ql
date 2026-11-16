@@ -9,7 +9,7 @@ CREATE TABLE m720 (id int PRIMARY KEY, a int, b int, c int, d int, t text);
 INSERT INTO m720
   SELECT g, g % 20, (g * 7) % 50, g % 7, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 13 END,
          'v' || (g % 100)
-  FROM generate_series(1, 3000) g;
+  FROM generate_series(1, 1500) g;
 CREATE INDEX m720_ab ON m720 (a, b);
 CREATE INDEX m720_cd ON m720 (c DESC, d NULLS FIRST);
 ANALYZE m720;

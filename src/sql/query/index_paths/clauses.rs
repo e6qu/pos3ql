@@ -89,10 +89,12 @@ pub(super) enum Clause<'a> {
     },
     /// An `OR` of its arms, each a list of conditions.
     Or(&'a [&'a [Restriction<'a>]]),
-    /// `column LIKE 'pattern'` (or `NOT LIKE`), a text column matched with
-    /// a constant pattern and the default escape.
+    /// `column LIKE 'pattern'` (or `NOT LIKE`, `ILIKE`, `~`, `~*`), a text
+    /// column matched with a constant pattern; a `LIKE` pattern escaped by
+    /// `\\` (`like_escape` of its `ESCAPE`).
     Like {
         column: usize,
+        kind: super::like::PatternKind,
         pattern: &'a str,
         negated: bool,
         /// The index conditions its fixed prefix gives a key of the column's
@@ -100,6 +102,20 @@ pub(super) enum Clause<'a> {
         /// of a pattern class (`~>=~` and `~<~`).
         plain: &'a [Restriction<'a>],
         pattern_class: &'a [Restriction<'a>],
+    },
+    /// An expression no index holds compared with a constant, tested for
+    /// NULL or used as a boolean: without statistics of its own PostgreSQL
+    /// estimates it by its defaults (`DEFAULT_EQ_SEL` from
+    /// `DEFAULT_NUM_DISTINCT`, `DEFAULT_INEQ_SEL`, `DEFAULT_UNK_SEL`, a
+    /// function's 1/3).
+    Expression {
+        /// The columns it reads, as a mask.
+        columns: u64,
+        /// Equal expressions share a key past every column's number, by
+        /// which `addRangeClause` pairs their bounds; `Some(lower)` for a
+        /// bound.
+        bound: Option<(usize, bool)>,
+        selectivity: f64,
     },
     /// A condition the model has no form for, reading the columns of the
     /// mask (columns past 63 set bit 63); `indexable` when an index on one
@@ -121,7 +137,7 @@ impl Clause<'_> {
             | Self::NullTest { column, .. }
             | Self::Array { column, .. }
             | Self::Like { column, .. } => Some(column),
-            Self::Or(_) | Self::Other { .. } => None,
+            Self::Or(_) | Self::Other { .. } | Self::Expression { .. } => None,
         }
     }
 
@@ -137,7 +153,7 @@ impl Clause<'_> {
                 .iter()
                 .flat_map(|arm| arm.iter())
                 .fold(0, |mask, restriction| mask | restriction.clause.columns()),
-            Self::Other { columns, .. } => columns,
+            Self::Other { columns, .. } | Self::Expression { columns, .. } => columns,
         }
     }
 
@@ -225,6 +241,10 @@ pub(super) struct Analyzer<'p, 's, 'a> {
     /// The distinct clauses seen so far, by identity.
     pub(super) seen: &'p mut [&'a Expr<'a>],
     pub(super) seen_count: usize,
+    /// The expressions compared with constants, each keyed by its
+    /// position past the table's columns.
+    pub(super) expressions: [&'a Expr<'a>; MAX_CONJUNCTS],
+    pub(super) expression_count: usize,
 }
 
 impl<'a> Analyzer<'_, '_, 'a> {
@@ -246,10 +266,10 @@ impl<'a> Analyzer<'_, '_, 'a> {
         })
     }
 
-    /// A cast of a column PostgreSQL keeps as the column: from `varchar` to
-    /// `text`, a `RelabelType` printed as written. (A cast to the column's
-    /// own type, which PostgreSQL's parser drops, is printed and costed as
-    /// written here, so stays outside the model.)
+    /// A cast of a column PostgreSQL reads as the column: one to the
+    /// column's own type, which its parser drops, or a binary-coercible
+    /// relabeling between `varchar` and `text`, whose operators an index on
+    /// the column applies.
     fn relabeled(&self, expression: &'a Expr<'a>) -> Option<usize> {
         let Expr::Cast {
             operand,
@@ -266,13 +286,103 @@ impl<'a> Analyzer<'_, '_, 'a> {
         let Ok(ResolvedColumn::Table(0, column)) = self.scope.find_column(*qualifier, name) else {
             return None;
         };
-        let text = type_name
-            .trim_start_matches("pg_catalog.")
-            .eq_ignore_ascii_case("text");
-        match self.planner.column_type(column) {
-            ColType::Varchar if text => Some(column),
+        let target = ColType::from_sql_name(type_name.trim_start_matches("pg_catalog."))?;
+        let own = self.planner.column_type(column);
+        let meta = &self.planner.definition.columns()[column];
+        if meta.user_type.is_some() {
+            return None;
+        }
+        match (own, target) {
+            (own, target) if own == target => Some(column),
+            (ColType::Varchar, ColType::Text) | (ColType::Text, ColType::Varchar) => Some(column),
             _ => None,
         }
+    }
+
+    /// Whether `expression` is one PostgreSQL estimates by its defaults: it
+    /// reads the table, calls nothing volatile and reads no subquery.
+    fn estimated_expression(&self, expression: &'a Expr<'a>) -> bool {
+        self.columns_of(expression) != 0
+            && expression.contains_volatile_function().is_none()
+            && !expression.contains_subquery()
+    }
+
+    /// `expression op constant` (or reversed) for an expression no index
+    /// holds, estimated by PostgreSQL's defaults; `None` for another shape.
+    fn expression_comparison(
+        &mut self,
+        left: &'a Expr<'a>,
+        operator: BinaryOp,
+        right: &'a Expr<'a>,
+    ) -> Result<Option<Clause<'a>>, SqlError> {
+        let constant = |expression: &'a Expr<'a>| {
+            (expression.is_constant(false) && !expression.calls_routine())
+                || matches!(expression, Expr::Param(_))
+        };
+        let (expression, value, on_left) = if constant(right) && self.estimated_expression(left) {
+            (left, right, true)
+        } else if constant(left) && self.estimated_expression(right) {
+            (right, left, false)
+        } else {
+            return Ok(None);
+        };
+        let Some(comparison) = Comparison::of(operator, on_left) else {
+            return Ok(None);
+        };
+        // A strict operator's NULL operand matches no row.
+        let null = !matches!(value, Expr::Param(_))
+            && matches!(
+                crate::sql::eval::eval(
+                    value,
+                    self.arena,
+                    self.params,
+                    &crate::sql::eval::NoColumns
+                ),
+                Ok(Datum::Null)
+            );
+        let key = match self.expressions[..self.expression_count]
+            .iter()
+            .position(|held| **held == *expression)
+        {
+            Some(at) => at,
+            None if self.expression_count < MAX_CONJUNCTS => {
+                self.expressions[self.expression_count] = expression;
+                self.expression_count += 1;
+                self.expression_count - 1
+            }
+            None => return Ok(None),
+        };
+        let key = usize::MAX / 2 + key;
+        // `get_variable_numdistinct` without statistics: two for a boolean,
+        // else `DEFAULT_NUM_DISTINCT`.
+        let boolean = matches!(
+            crate::sql::exec::infer_type_catalog(
+                expression,
+                Some(self.planner.definition),
+                self.planner.storage,
+                self.planner.txid,
+                self.arena,
+            ),
+            Ok((16, _))
+        );
+        let equal = 1.0
+            / if boolean {
+                2.0
+            } else {
+                super::DEFAULT_NUM_DISTINCT
+            };
+        let (bound, selectivity) = match comparison {
+            _ if null => (None, 0.0),
+            Comparison::Eq => (None, equal),
+            Comparison::Ne => (None, 1.0 - equal),
+            Comparison::Lt | Comparison::Le => (Some((key, false)), super::DEFAULT_INEQ_SEL),
+            Comparison::Gt | Comparison::Ge => (Some((key, true)), super::DEFAULT_INEQ_SEL),
+        };
+        Ok(Some(Clause::Expression {
+            columns: self.columns_of(expression),
+            bound,
+            selectivity,
+        }))
     }
 
     /// The constant `expression` compared with `column`.
@@ -480,6 +590,29 @@ impl<'a> Analyzer<'_, '_, 'a> {
                         .map_err(|_| crate::sql::eval::arena_full())?,
                 )
             }
+            // `simplify_boolean_equality`: `x = true` and `x <> false` are
+            // `x`.
+            Expr::Binary {
+                operator: operator @ (BinaryOp::Eq | BinaryOp::NotEq),
+                left,
+                right,
+                ..
+            } if matches!((left, right), (_, Expr::Bool(_)) | (Expr::Bool(_), _))
+                && !matches!(
+                    (left, right),
+                    (Expr::Column { .. }, _) | (_, Expr::Column { .. })
+                ) =>
+            {
+                let (value, other_side) = match (left, right) {
+                    (_, Expr::Bool(value)) => (*value, *left),
+                    (Expr::Bool(value), _) => (*value, *right),
+                    _ => unreachable!("one side is a boolean constant"),
+                };
+                if value == (*operator == BinaryOp::Eq) {
+                    return self.clause(other_side, depth + 1);
+                }
+                other(self, "a boolean expression compared with its negation")
+            }
             Expr::Binary {
                 operator,
                 left,
@@ -490,7 +623,14 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     match (self.column_of(left)?, self.column_of(right)?) {
                         (Some(column), None) => (column, *left, *right, true),
                         (None, Some(column)) => (column, *right, *left, false),
-                        _ => return Ok(Ok(other(self, "a comparison of two expressions"))),
+                        _ => {
+                            return Ok(Ok(
+                                match self.expression_comparison(left, *operator, right)? {
+                                    Some(clause) => clause,
+                                    None => other(self, "a comparison of two expressions"),
+                                },
+                            ));
+                        }
                     };
                 let pattern = matches!(
                     operator,
@@ -537,17 +677,51 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 operand,
                 pattern,
                 negated,
-                case_insensitive: false,
-                escape: None,
-            } => match self.like(conjunct, operand, pattern, *negated)? {
-                Ok(Some(clause)) => clause,
-                Ok(None) => other(self, "a LIKE the model does not read"),
-                Err(shape) => return Ok(Err(shape)),
-            },
+                case_insensitive,
+                escape,
+            } => {
+                let kind = if *case_insensitive {
+                    super::like::PatternKind::ILike
+                } else {
+                    super::like::PatternKind::Like
+                };
+                match self.like(conjunct, operand, pattern, *escape, kind, *negated)? {
+                    Ok(Some(clause)) => clause,
+                    Ok(None) => other(self, "a LIKE the model does not read"),
+                    Err(shape) => return Ok(Err(shape)),
+                }
+            }
+            Expr::Match {
+                operand,
+                pattern,
+                negated,
+                case_insensitive,
+            } => {
+                let kind = if *case_insensitive {
+                    super::like::PatternKind::IRegex
+                } else {
+                    super::like::PatternKind::Regex
+                };
+                match self.like(conjunct, operand, pattern, None, kind, *negated)? {
+                    Ok(Some(clause)) => clause,
+                    Ok(None) => other(self, "a regular expression the model does not read"),
+                    Err(shape) => return Ok(Err(shape)),
+                }
+            }
             Expr::IsNull { operand, negated } => match self.column_of(operand)? {
                 Some(column) => Clause::NullTest {
                     column,
                     is_null: !negated,
+                },
+                // `nulltestsel` without statistics.
+                None if self.estimated_expression(operand) => Clause::Expression {
+                    columns: self.columns_of(operand),
+                    bound: None,
+                    selectivity: if *negated {
+                        super::DEFAULT_NOT_UNK_SEL
+                    } else {
+                        super::DEFAULT_UNK_SEL
+                    },
                 },
                 None => other(self, "a NULL test of an expression"),
             },
@@ -697,17 +871,78 @@ impl<'a> Analyzer<'_, '_, 'a> {
                             boolean: Some(value),
                         }
                     }
-                    _ => other(
-                        self,
-                        "a condition other than a column compared with constants",
-                    ),
+                    _ => match self.function_clause(column_expression, value) {
+                        Some(clause) => clause,
+                        None => other(
+                            self,
+                            "a condition other than a column compared with constants",
+                        ),
+                    },
                 }
             }
-            _ => other(
-                self,
-                "a condition other than a column compared with constants",
-            ),
+            // `starts_with`, whose support function reads it as a prefix
+            // pattern.
+            Expr::Call {
+                name,
+                args: [operand, prefix],
+                star: false,
+                ..
+            } if name
+                .trim_start_matches("pg_catalog.")
+                .eq_ignore_ascii_case("starts_with")
+                && self.column_of(operand)?.is_some() =>
+            {
+                match self.like(
+                    conjunct,
+                    operand,
+                    prefix,
+                    None,
+                    super::like::PatternKind::Prefix,
+                    false,
+                )? {
+                    Ok(Some(clause)) => clause,
+                    Ok(None) => match self.function_clause(conjunct, true) {
+                        Some(clause) => clause,
+                        None => other(self, "a starts_with the model does not read"),
+                    },
+                    Err(shape) => return Ok(Err(shape)),
+                }
+            }
+            _ => match self.function_clause(conjunct, true) {
+                Some(clause) => clause,
+                None => other(
+                    self,
+                    "a condition other than a column compared with constants",
+                ),
+            },
         }))
+    }
+
+    /// A boolean function of the table's columns (or its `NOT`, when not
+    /// `value`), which `function_selectivity` estimates as a third of the
+    /// rows without a support function.
+    fn function_clause(&self, expression: &'a Expr<'a>, value: bool) -> Option<Clause<'a>> {
+        if !matches!(expression, Expr::Call { .. })
+            || expression.is_aggregate_use()
+            || !self.estimated_expression(expression)
+        {
+            return None;
+        }
+        let boolean = matches!(
+            crate::sql::exec::infer_type_catalog(
+                expression,
+                Some(self.planner.definition),
+                self.planner.storage,
+                self.planner.txid,
+                self.arena,
+            ),
+            Ok((16, _))
+        );
+        boolean.then(|| Clause::Expression {
+            columns: self.columns_of(expression),
+            bound: None,
+            selectivity: if value { 0.3333333 } else { 1.0 - 0.3333333 },
+        })
     }
 
     /// `column LIKE 'pattern'` on a text column, with the index conditions
@@ -718,6 +953,8 @@ impl<'a> Analyzer<'_, '_, 'a> {
         conjunct: &'a Expr<'a>,
         operand: &'a Expr<'a>,
         pattern: &'a Expr<'a>,
+        escape: Option<&'a Expr<'a>>,
+        kind: super::like::PatternKind,
         negated: bool,
     ) -> Result<Result<Option<Clause<'a>>, &'static str>, SqlError> {
         let Some(column) = self.column_of(operand)? else {
@@ -732,34 +969,35 @@ impl<'a> Analyzer<'_, '_, 'a> {
         let Some(Datum::Text(text)) = self.constant(pattern, column) else {
             return Ok(Ok(None));
         };
-        if super::like::escapes(text) {
-            return Ok(Ok(None));
-        }
-        let text = self
-            .arena
-            .alloc_str(text)
-            .map_err(|_| crate::sql::eval::arena_full())?;
+        // `ESCAPE` folds to the pattern `like_escape` makes.
+        let text = match escape {
+            Some(escape) => {
+                let Some(Datum::Text(escape)) = self.constant(escape, column) else {
+                    return Ok(Ok(None));
+                };
+                super::like::like_escape(text, escape, self.arena)?
+            }
+            None => self
+                .arena
+                .alloc_str(text)
+                .map_err(|_| crate::sql::eval::arena_full())?,
+        };
         if negated {
             return Ok(Ok(Some(Clause::Like {
                 column,
+                kind,
                 pattern: text,
                 negated,
                 plain: &[],
                 pattern_class: &[],
             })));
         }
-        let fixed = super::like::fixed_prefix(text);
+        let fixed = match super::like::fixed_prefix(kind, text, self.arena)? {
+            Ok(fixed) => fixed,
+            Err(shape) => return Ok(Err(shape)),
+        };
         let (plain, pattern_class) = match fixed.prefix {
             Some(prefix) => {
-                let prefix = self
-                    .arena
-                    .alloc_str(prefix)
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                // A prefix past ASCII has a greater string the model does not
-                // build.
-                if !prefix.is_ascii() {
-                    return Ok(Err("a LIKE prefix of non-ASCII characters"));
-                }
                 let mut plain = [None::<Restriction<'a>>; 2];
                 let mut pattern_ops = [None::<Restriction<'a>>; 2];
                 let mut count = 0;
@@ -809,6 +1047,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         };
         Ok(Ok(Some(Clause::Like {
             column,
+            kind,
             pattern: text,
             negated,
             plain,
@@ -940,13 +1179,15 @@ impl<'a> Analyzer<'_, '_, 'a> {
             }
             Clause::Like {
                 column,
+                kind,
                 pattern,
                 negated,
                 ..
-            } => match planner.like_selectivity(column, pattern, negated)? {
+            } => match planner.like_selectivity(column, kind, pattern, negated)? {
                 Ok(selectivity) => selectivity,
                 Err(shape) => return Ok(Err(shape)),
             },
+            Clause::Expression { selectivity, .. } => selectivity,
             // Unknown; a plan that depends on it is outside the model.
             Clause::Other { .. } => f64::NAN,
         }))

@@ -2236,13 +2236,23 @@ fn create_table_kind(
             "ON COMMIT can only be used on temporary tables"
         ));
     }
-    let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
+    // PostgreSQL reports each column merge as it merges it, before an
+    // error a later column or constraint raises.
+    let mut merged = InheritedMerge::default();
+    let built = build_partitioned_table_def(storage, statement, txn.txid, arena, &mut merged);
+    if let Err(error) = notify_inherited_column_merges(
+        storage,
+        statement,
+        txn.txid,
+        built.is_err().then_some(merged),
+        responder,
+    )? {
+        return sql_fail(error);
+    }
+    let mut def = match built {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    if let Err(error) = notify_inherited_column_merges(storage, statement, txn.txid, responder)? {
-        return sql_fail(error);
-    }
     if let Err(error) = capture_created_table_inputs(storage, &mut def, statement, txn.txid, arena)
     {
         return sql_fail(error);
@@ -2327,8 +2337,8 @@ fn create_table_kind(
     if let Err(e) = reject_multiple_primary(&def) {
         return sql_fail(e);
     }
-    // A named CHECK the table also inherits, with the same predicate, merges
-    // into the inherited one (`MergeWithExistingConstraint`).
+    // A named CHECK the table also inherits merges into the inherited one
+    // when it has the same predicate (`MergeWithExistingConstraint`).
     let declared_constraints = match arena
         .alloc_slice_with(statement.constraints.len(), |position| {
             statement.constraints[position]
@@ -2341,31 +2351,58 @@ fn create_table_kind(
         let constraint = declared_constraints[position];
         if let crate::sql::ast::TableConstraint::Check {
             name: Some(name),
+            expression,
             text,
-            no_inherit: false,
+            validation,
+            no_inherit,
             ..
         } = constraint
             && let Some(inherited) = def.checks[..def.n_checks]
                 .iter()
                 .position(|check| !check.local && check.name.as_str() == name)
         {
+            // PostgreSQL analyses the predicate before it merges it.
+            if let Err(error) =
+                ddl::analyse_check_expression(storage, txn.txid, &def, expression, true, arena)
+            {
+                return sql_fail(error);
+            }
             let stored = match ddl::stored_relation_expression(text, &def, arena) {
                 Ok(stored) => stored,
                 Err(error) => return sql_fail(error),
             };
-            if def.checks[inherited].expression.as_str() == stored {
-                responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(
-                        160,
-                        "merging constraint \"{}\" with inherited definition",
-                        name
-                    )
-                    .as_str(),
-                )?;
-                def.checks[inherited].local = true;
-                continue;
+            let partition = def.partition.attachment.is_some();
+            if let Err(error) = ddl::merge_with_existing_check(
+                &def.checks[inherited],
+                true,
+                def.name.as_str(),
+                partition,
+                ddl::CheckAddition {
+                    stored,
+                    validation,
+                    local: true,
+                    no_inherit,
+                    allow_merge: true,
+                },
+                arena,
+            ) {
+                return sql_fail(error);
             }
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "merging constraint \"{}\" with inherited definition",
+                    name
+                )
+                .as_str(),
+            )?;
+            let merged = &mut def.checks[inherited];
+            merged.local = !partition;
+            if validation.enforced() && !merged.validation.enforced() {
+                merged.validation = crate::storage::ConstraintValidation::EnforcedValidated;
+            }
+            continue;
         }
         declared_constraints[kept] = constraint;
         kept += 1;
@@ -4890,11 +4927,12 @@ fn build_partitioned_table_def(
     statement: &CreateTable,
     txid: u32,
     arena: &Arena,
+    merged: &mut InheritedMerge,
 ) -> Result<TableDefBuilder, SqlError> {
     match statement.partition {
-        PartitionClause::None => build_inherited_table_def(storage, statement, txid, arena),
+        PartitionClause::None => build_inherited_table_def(storage, statement, txid, arena, merged),
         PartitionClause::By { strategy, columns } => {
-            let mut def = build_inherited_table_def(storage, statement, txid, arena)?;
+            let mut def = build_inherited_table_def(storage, statement, txid, arena, merged)?;
             def.partition.scheme = Some(resolve_partition_scheme(&def, strategy, columns)?);
             Ok(def)
         }
@@ -4988,6 +5026,8 @@ fn build_partitioned_table_def(
                     column.not_null = crate::storage::NotNullOrigin::Nullable;
                     *name = None;
                 }
+                // A new partition has no rows to leave unchecked.
+                column.not_null_validated = true;
             }
             partition_column_options(storage, &mut def, statement.columns, txid, arena)?;
             for index in 0..def.n_uniques {
@@ -5130,12 +5170,29 @@ fn partition_column_options(
 
 /// PostgreSQL's notices for a column that several parents, or a parent and
 /// the new table itself, define.
+/// How far building an inheriting table merged its parents' columns, and
+/// then its own: the parent (or, past the last parent, the own column list)
+/// and the columns of it merged, the last one included.
+#[derive(Clone, Copy, Default)]
+struct InheritedMerge {
+    list: usize,
+    columns: usize,
+}
+
+/// Reports the column merges of `statement`, all of them, or with
+/// `failed` those made before a merge failed.
 fn notify_inherited_column_merges(
     storage: &Storage,
     statement: &CreateTable,
     txid: u32,
+    failed: Option<InheritedMerge>,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
+    let reached = |list: usize, column: usize| {
+        failed.is_none_or(|merged| {
+            list < merged.list || (list == merged.list && column < merged.columns)
+        })
+    };
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
         return Ok(Ok(()));
     };
@@ -5157,7 +5214,10 @@ fn notify_inherited_column_merges(
             Ok(parent) => storage.table_def(parent, txid),
             Err(error) => return Ok(Err(error)),
         };
-        for column in parent.columns() {
+        for (index, column) in parent.columns().iter().enumerate() {
+            if !reached(position, index) {
+                break;
+            }
             match defined_by_earlier_parent(position, column.name.as_str()) {
                 Ok(true) => responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -5173,7 +5233,10 @@ fn notify_inherited_column_merges(
             }
         }
     }
-    for column in statement.columns {
+    for (index, column) in statement.columns.iter().enumerate() {
+        if !reached(parents.len(), index) {
+            break;
+        }
         match defined_by_earlier_parent(parents.len(), column.name) {
             Ok(true) => responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
@@ -5199,6 +5262,7 @@ fn build_inherited_table_def(
     statement: &CreateTable,
     txid: u32,
     arena: &Arena,
+    merged: &mut InheritedMerge,
 ) -> Result<TableDefBuilder, SqlError> {
     let own = build_declared_table_def(storage, statement, txid, arena)?;
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
@@ -5210,7 +5274,22 @@ fn build_inherited_table_def(
     definition.not_null_names = [None; MAX_COLUMNS];
     definition.not_null_name_edits = crate::storage::ColumnSet::EMPTY;
     definition.inheritance = crate::storage::TableInheritance::NONE;
-    for parent_name in parents {
+    // `DefineRelation` resolves every parent and rejects a repeated one
+    // before it merges anything.
+    for (list, parent_name) in parents.iter().enumerate() {
+        let parent = resolve_dml_table(storage, parent_name, txid)?;
+        for earlier in &parents[..list] {
+            if resolve_dml_table(storage, earlier, txid)? == parent {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" would be inherited from more than once",
+                    storage.table_def(parent, txid).name.as_str()
+                ));
+            }
+        }
+    }
+    for (list, parent_name) in parents.iter().enumerate() {
+        *merged = InheritedMerge { list, columns: 0 };
         let parent = resolve_dml_table(storage, parent_name, txid)?;
         let parent_definition = storage.table_def(parent, txid);
         if parent_definition.persistence == crate::storage::RelationPersistence::Temporary
@@ -5237,6 +5316,7 @@ fn build_inherited_table_def(
             ));
         }
         for (parent_index, parent_column) in parent_definition.columns().iter().enumerate() {
+            merged.columns = parent_index + 1;
             let mut inherited = *parent_column;
             inherited.not_null =
                 if inherited.not_null.is_required() && inherited.not_null_inheritable {
@@ -5244,6 +5324,8 @@ fn build_inherited_table_def(
                 } else {
                     crate::storage::NotNullOrigin::Nullable
                 };
+            // A new table has no rows to leave unchecked.
+            inherited.not_null_validated = true;
             // A child has its own physical rows and its own identity-sequence
             // ownership. PostgreSQL does not make the parent's sequence an
             // implicit writable dependency of the child relation.
@@ -5289,6 +5371,10 @@ fn build_inherited_table_def(
         definition.inheritance.append(parent)?;
     }
     for (own_index, column) in own.columns().iter().enumerate() {
+        *merged = InheritedMerge {
+            list: parents.len(),
+            columns: own_index + 1,
+        };
         if let Some(existing) = definition.column_index(column.name.as_str()) {
             let inherited = definition.columns[existing];
             if inherited.ctype != column.ctype
@@ -5424,12 +5510,23 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
             .iter_mut()
             .find(|existing| existing.name == inherited.name)
         {
-            if existing.expression != inherited.expression {
+            if require_existing {
+                // `ALTER TABLE ... INHERIT` (`MergeConstraintsIntoExisting`).
+                ddl::merge_check_into_existing(inherited, existing, child.name.as_str(), arena)?;
+            } else if !ddl::same_check_expression(
+                existing.expression.as_str(),
+                inherited.expression.as_str(),
+                arena,
+            )? {
+                // Two parents of a new table (`MergeCheckConstraint`).
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "constraint \"{}\" conflicts with inherited constraint of the same name",
+                    "check constraint name \"{}\" appears multiple times but with different expressions",
                     inherited.name.as_str()
                 ));
+            }
+            if inherited.validation.enforced() && !existing.validation.enforced() {
+                existing.validation = crate::storage::ConstraintValidation::EnforcedValidated;
             }
             // A partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
@@ -22106,15 +22203,24 @@ struct BoundCursorArgument<'a> {
     value: &'a Expr<'a>,
 }
 
+/// A local declaration visible to the statements being parsed, with the
+/// label of the block declaring it.
+#[derive(Clone, Copy)]
+struct VisibleLocal<'a> {
+    label: Option<SqlName>,
+    local: ParsedTriggerLocalDecl<'a>,
+}
+
 thread_local! {
-    /// The bound cursors of the program being parsed, for its `OPEN`s.
+    /// The locals of the blocks around the statements being parsed,
+    /// innermost first, for their `OPEN`s and cursor loops.
     static BOUND_CURSORS: core::cell::Cell<(*const (), usize)> =
         const { core::cell::Cell::new((core::ptr::null(), 0)) };
 }
 
 /// Runs `parse` with `locals` visible to [`bound_plpgsql_cursor`].
 fn with_bound_plpgsql_cursors<'a, T>(
-    locals: &'a [ParsedTriggerLocalDecl<'a>],
+    locals: &'a [VisibleLocal<'a>],
     parse: impl FnOnce() -> T,
 ) -> T {
     struct Restore((*const (), usize));
@@ -22128,25 +22234,65 @@ fn with_bound_plpgsql_cursors<'a, T>(
     parse()
 }
 
-/// The bound cursor declared as `name` in the program being parsed.
-fn bound_plpgsql_cursor<'a>(name: SqlName, _arena: &'a Arena) -> Option<BoundPlpgsqlCursor<'a>> {
-    plpgsql_cursor_variable(name).flatten()
-}
-
-/// The `refcursor` local declared as `name` in the program being parsed:
-/// `Some(Some(_))` when it is bound to a query, `Some(None)` when unbound.
-fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+/// The locals of the blocks around the statements being parsed.
+fn visible_plpgsql_locals<'a>() -> &'a [VisibleLocal<'a>] {
     let (pointer, len) = BOUND_CURSORS.with(core::cell::Cell::get);
     if pointer.is_null() {
-        return None;
+        return &[];
     }
     // SAFETY: `with_bound_plpgsql_cursors` publishes these declarations only
     // while the program that owns them is parsed from the same arena, and
     // restores the previous value before that borrow ends. Statements parsed
     // in that window borrow the arena for the declarations' lifetime.
-    let locals =
-        unsafe { core::slice::from_raw_parts(pointer.cast::<ParsedTriggerLocalDecl<'a>>(), len) };
-    let local = locals.iter().find(|local| local.name == name)?;
+    unsafe { core::slice::from_raw_parts(pointer.cast::<VisibleLocal<'a>>(), len) }
+}
+
+/// Runs `parse` with the locals `declarations` of a block labelled `label`
+/// visible ahead of the enclosing blocks' locals.
+fn with_block_plpgsql_cursors<'a, T>(
+    label: Option<SqlName>,
+    declarations: &'a [ParsedTriggerLocalDecl<'a>],
+    arena: &'a Arena,
+    parse: impl FnOnce() -> T,
+) -> Result<T, SqlError> {
+    let enclosing = visible_plpgsql_locals();
+    let visible = arena
+        .alloc_slice_with(
+            declarations.len() + enclosing.len(),
+            |index| match declarations.get(index) {
+                Some(&local) => VisibleLocal { label, local },
+                None => enclosing[index - declarations.len()],
+            },
+        )
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(with_bound_plpgsql_cursors(visible, parse))
+}
+
+/// The bound cursor declared as `name`, in the block labelled `label` when
+/// one is given, in the program being parsed.
+fn bound_plpgsql_cursor<'a>(
+    label: Option<SqlName>,
+    name: SqlName,
+    _arena: &'a Arena,
+) -> Option<BoundPlpgsqlCursor<'a>> {
+    plpgsql_cursor_variable_in(label, name).flatten()
+}
+
+/// The `refcursor` local declared as `name` in the program being parsed:
+/// `Some(Some(_))` when it is bound to a query, `Some(None)` when unbound.
+fn plpgsql_cursor_variable<'a>(name: SqlName) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+    plpgsql_cursor_variable_in(None, name)
+}
+
+/// [`plpgsql_cursor_variable`] of the block labelled `label`, when given.
+fn plpgsql_cursor_variable_in<'a>(
+    label: Option<SqlName>,
+    name: SqlName,
+) -> Option<Option<BoundPlpgsqlCursor<'a>>> {
+    let visible = visible_plpgsql_locals().iter().find(|visible| {
+        visible.local.name == name && label.is_none_or(|label| visible.label == Some(label))
+    })?;
+    let local = visible.local;
     match (local.bound, local.ty) {
         (Some(bound), _) => Some(Some(bound)),
         (None, ParsedPlpgsqlLocalType::Named { name, .. })
@@ -25758,8 +25904,25 @@ fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
-    let assignment = trigger_assignment_operator(statement, arena)?;
-    let default = trigger_top_level_keyword(statement, "default", arena)?.map(|offset| (offset, 7));
+    // A cursor declaration's query is not an initializer, even when it
+    // holds `=` or `DEFAULT`.
+    let (_, name_end) = parse_plpgsql_identifier_prefix(statement.trim(), arena)?;
+    let after_name = statement.trim()[name_end..].trim_start();
+    let cursor_keywords = strip_trigger_keyword(after_name, "no")
+        .and_then(|rest| strip_trigger_keyword(rest.trim_start(), "scroll"))
+        .or_else(|| strip_trigger_keyword(after_name, "scroll"))
+        .map_or(after_name, str::trim_start);
+    let cursor = strip_trigger_keyword(cursor_keywords, "cursor").is_some();
+    let assignment = if cursor {
+        None
+    } else {
+        trigger_assignment_operator(statement, arena)?
+    };
+    let default = if cursor {
+        None
+    } else {
+        trigger_top_level_keyword(statement, "default", arena)?.map(|offset| (offset, 7))
+    };
     let initial = match (assignment, default) {
         (Some(assignment), Some(default)) => Some(if assignment.0 < default.0 {
             assignment
@@ -27702,13 +27865,36 @@ fn parse_plpgsql_cursor_open<'a>(
     let written = body[..split].trim_end();
     let variable = parse_plpgsql_variable_name(written, arena)?;
     let body = body[split..].trim();
-    // A label-qualified name never names a bound cursor declaration.
-    if variable.label.is_none()
-        && let Some(bound) = bound_plpgsql_cursor(variable.name, arena)
-    {
+    if let Some(bound) = bound_plpgsql_cursor(variable.label, variable.name, arena) {
         return parse_bound_cursor_open(variable, written, bound, body, arena).map(Some);
     }
     let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
+        // `OPEN` names a cursor variable (`cursor_variable`).
+        if plpgsql_cursor_variable_in(variable.label, variable.name).is_none()
+            && let Some(visible) = visible_plpgsql_locals().iter().find(|visible| {
+                visible.local.name == variable.name
+                    && variable
+                        .label
+                        .is_none_or(|label| visible.label == Some(label))
+            })
+        {
+            let error = if matches!(
+                visible.local.ty,
+                ParsedPlpgsqlLocalType::Record | ParsedPlpgsqlLocalType::Row { .. }
+            ) {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cursor variable must be a simple variable"
+                )
+            } else {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "variable \"{}\" must be of type cursor or refcursor",
+                    variable.name.as_str()
+                )
+            };
+            return Err(crate::sql::error_position::at_subject(error, written));
+        }
         return Err(unsupported_trigger_body());
     };
     let options = body[..for_at].trim();
@@ -28696,26 +28882,34 @@ fn parse_trigger_block<'a>(
             } else {
                 &[]
             };
-            let (protected, ending) = parse_trigger_block(
-                segments,
-                at,
-                arena,
-                targets,
-                inner,
-                handler_active,
-                program_kind,
-            )?;
-            let (statement, end_label) = match ending {
-                TriggerBlockEnd::Exception => {
-                    let (exception, end_label) = parse_trigger_exception_handlers(
+            // The block's cursors are visible to its statements and
+            // handlers, ahead of the enclosing blocks' of the same name.
+            let (protected, ending) =
+                with_block_plpgsql_cursors(loop_label, declarations, arena, || {
+                    parse_trigger_block(
                         segments,
                         at,
                         arena,
                         targets,
                         inner,
+                        handler_active,
                         program_kind,
-                        protected,
-                    )?;
+                    )
+                })??;
+            let (statement, end_label) = match ending {
+                TriggerBlockEnd::Exception => {
+                    let (exception, end_label) =
+                        with_block_plpgsql_cursors(loop_label, declarations, arena, || {
+                            parse_trigger_exception_handlers(
+                                segments,
+                                at,
+                                arena,
+                                targets,
+                                inner,
+                                program_kind,
+                                protected,
+                            )
+                        })??;
                     (TriggerStatement::Exception(exception), end_label)
                 }
                 TriggerBlockEnd::End(end_label) => (
@@ -29051,7 +29245,7 @@ fn parse_plpgsql_program_inner<'a>(
             is_loop: false,
         })
         .map_err(|_| super::query::arena_full_pub())?;
-    with_bound_plpgsql_cursors(locals, || {
+    with_block_plpgsql_cursors(label, locals, arena, || {
         parse_plpgsql_program_body(
             PlpgsqlProgramFrame {
                 label,
@@ -29065,7 +29259,7 @@ fn parse_plpgsql_program_inner<'a>(
             targets,
             program_kind,
         )
-    })
+    })?
 }
 
 /// The label, declarations and options that surround a PL/pgSQL program's
@@ -29755,6 +29949,8 @@ fn validate_plpgsql_variable_uses(
         label: Option<SqlName>,
         name: SqlName,
         constant: bool,
+        /// A nested block's `refcursor` or bound cursor variable.
+        cursor: bool,
         parent: Option<&'a ScopedLocal<'a>>,
     }
     fn binding_constant(
@@ -29966,11 +30162,21 @@ fn validate_plpgsql_variable_uses(
                             ),
                         },
                         Some(_) => {
+                            // The innermost nested local of the name: a
+                            // block's cursor, or another variable such as a
+                            // loop's.
                             let mut scoped = shadowed;
                             let mut loop_variable = false;
                             while let Some(local) = scoped {
-                                loop_variable |= local.name == name
-                                    && target.label.is_none_or(|label| local.label == Some(label));
+                                if local.name == name
+                                    && target.label.is_none_or(|label| local.label == Some(label))
+                                {
+                                    if local.cursor {
+                                        return Ok(());
+                                    }
+                                    loop_variable = true;
+                                    break;
+                                }
                                 scoped = local.parent;
                             }
                             match locals.iter().rfind(|local| target.names(local)) {
@@ -30109,6 +30315,7 @@ fn validate_plpgsql_variable_uses(
                             label: statement.label,
                             name: statement.target.name,
                             constant: false,
+                            cursor: false,
                             parent: shadowed,
                         };
                         validate_block(
@@ -30132,6 +30339,7 @@ fn validate_plpgsql_variable_uses(
                             label: statement.label,
                             name: statement.target.name,
                             constant: false,
+                            cursor: false,
                             parent: shadowed,
                         };
                         validate_block(
@@ -30275,12 +30483,14 @@ fn validate_plpgsql_variable_uses(
                         label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
                         constant: true,
+                        cursor: false,
                         parent: shadowed,
                     };
                     let message = ScopedLocal {
                         label: None,
                         name: SqlName::parse("sqlerrm").expect("static diagnostic name"),
                         constant: true,
+                        cursor: false,
                         parent: Some(&state),
                     };
                     for handler in statement.handlers {
@@ -30338,6 +30548,9 @@ fn validate_plpgsql_variable_uses(
                     label,
                     name: first.name,
                     constant,
+                    cursor: first.bound.is_some()
+                        || matches!(first.ty, ParsedPlpgsqlLocalType::Named { name, .. }
+                            if name.eq_ignore_ascii_case("refcursor")),
                     parent: shadowed,
                 };
                 validate_scope(
@@ -33092,6 +33305,8 @@ fn classify_planning(
     }
     // Names resolve while PostgreSQL analyzes the expression.
     if record_reference_error(&error)
+        || (error.sqlstate == sqlstate::WRONG_OBJECT_TYPE
+            && error.message.as_str() == "record type has not been registered")
         || matches!(
             error.sqlstate.as_str(),
             sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
@@ -33400,6 +33615,9 @@ fn eval_procedural_expression<'a>(
         if !kept {
             check_procedural_record_fields(context, expression, row)?;
         }
+        if let Expr::Field { base, field: "*" } = expression {
+            return expand_procedural_record(context, base, row, text);
+        }
         eval_procedural_expression_in(context, expression, row, continuation)
     });
     // An assignment keeps its plan once the whole statement is planned.
@@ -33440,7 +33658,46 @@ fn check_procedural_record_fields<'a>(
         row,
         catalog: Some(&catalog),
     };
+    // The expression is the target list of the query PostgreSQL makes of
+    // it, which expands a record's fields only as its whole: elsewhere a
+    // `.*` fails analysis at its position.
+    if let Expr::Field { base, field: "*" } = expression {
+        if let Expr::Column {
+            qualifier: None,
+            name,
+        } = base
+            && super::query::unregistered_record_variable(row, name)
+        {
+            return Err(super::query::record_type_not_registered());
+        }
+        return visit(base, &mut |selection, base, field| {
+            check_record_field(selection, base, field, row, &columns)
+        });
+    }
     visit(expression, &mut |selection, base, field| {
+        check_record_field(selection, base, field, row, &columns)
+    })
+}
+
+/// [`check_procedural_record_fields`] of the field selection `selection`,
+/// `field` of `base`; `*` expands no field here.
+fn check_record_field<'a>(
+    selection: &'a Expr<'a>,
+    base: &'a Expr<'a>,
+    field: &str,
+    row: &TriggerLocalScope<'_, 'a>,
+    columns: &super::eval::RuntimeColumnTypes<'_, 'a>,
+) -> Result<(), SqlError> {
+    if field == "*" {
+        return Err(crate::sql::error_position::expression_error(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "row expansion via \"*\" is not supported here"
+            ),
+            selection,
+        ));
+    }
+    {
         if let Expr::Column {
             qualifier: None,
             name,
@@ -33452,10 +33709,59 @@ fn check_procedural_record_fields<'a>(
                 selection,
             ));
         }
-        super::exec::record_field_metadata(base, field, &columns)
+        super::exec::record_field_metadata(base, field, columns)
             .map(|_| ())
             .map_err(|error| crate::sql::error_position::expression_error(error, selection))
-    })
+    }
+}
+
+/// A PL/pgSQL expression `(base).*`: the one field of the record `base`
+/// as the query's one column, or PostgreSQL's error when the record has
+/// another count of fields.
+fn expand_procedural_record<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    base: &'a Expr<'a>,
+    row: &TriggerLocalScope<'_, 'a>,
+    text: &str,
+) -> Result<Datum<'a>, SqlError> {
+    let arena = context.arena;
+    let catalog = super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&catalog),
+    };
+    let mut first: Option<&'a str> = None;
+    let mut full = false;
+    let count = super::exec::record_shape_metadata(base, &columns, |name, _| {
+        if first.is_none() {
+            match arena.alloc_str(name) {
+                Ok(name) => first = Some(name),
+                Err(_) => full = true,
+            }
+        }
+    })?
+    .ok_or_else(super::query::record_type_not_registered)?;
+    if full {
+        return Err(arena_full());
+    }
+    if count != 1 {
+        return Err(crate::sql::error_context::with_line(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "query returned {} column{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            format_args!("query: {text}"),
+        ));
+    }
+    let field = arena
+        .alloc(Expr::Field {
+            base,
+            field: first.expect("a record of one field names it"),
+        })
+        .map_err(|_| arena_full())?;
+    eval_procedural_expression_in(context, field, row, None)
 }
 
 /// The backend PL/pgSQL instance running `row`'s routine and the body
@@ -61897,6 +62203,7 @@ pub fn create_table_as(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -74184,26 +74491,26 @@ fn validate_index_rows(
         )
     };
     let mut exclusion = |position: usize| {
-        scan_index_rows(
+        let mut rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+            for_each_index_build_row(
+                storage,
+                table_index,
+                txid,
+                &definition,
+                ordered,
+                arena,
+                visit,
+            )
+        };
+        constraints::check_exclusion_build(
             storage,
             table_index,
             txid,
+            &definition,
+            position,
+            &mut rows,
             arena,
-            &mut |rowid, schema, values| {
-                constraints::check_rebuilt_exclusion(
-                    storage,
-                    table_index,
-                    &definition,
-                    schema,
-                    values,
-                    rowid,
-                    txid,
-                    arena,
-                    position,
-                )
-            },
         )
-        .map(|_| ())
     };
     let selected = constraints::check_sorted_builds(
         storage,
@@ -89108,6 +89415,7 @@ pub(crate) fn view_trigger_definition<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -93995,6 +94303,7 @@ pub(crate) fn update<'a>(
             },
             params,
             &hooks,
+            outer,
             txn.txid,
             arena,
         ) {
@@ -95789,6 +96098,7 @@ pub(crate) fn delete<'a>(
             delete_capture,
             params,
             &hooks,
+            outer,
             txn.txid,
             arena,
         ) {
@@ -96996,8 +97306,8 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
 }
 
 /// Builds `def`'s selected unique keys over the rows of `table`, a relation
-/// with `def`'s columns, as PostgreSQL builds their indexes. Exclusion
-/// constraints are left to the row checks.
+/// with `def`'s columns, as PostgreSQL builds their indexes, the exclusion
+/// constraints among them too.
 fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table: usize,
@@ -97017,7 +97327,7 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             )
         })?;
     }
-    let mut rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+    let rows = |ordered: bool, visit: &mut constraints::BuildRowVisit<'_>| {
         for_each_index_build_row(
             storage,
             table,
@@ -97034,6 +97344,22 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
             },
         )
     };
+    // A deferrable exclusion constraint's conflicts are queued by the row
+    // checks; another is checked as building its index checks it.
+    let mut exclusion = |position: usize| {
+        if def.exclusions()[position].timing.is_deferrable() {
+            return Ok(());
+        }
+        constraints::check_exclusion_build(
+            storage,
+            table,
+            txid,
+            def,
+            position,
+            &mut { rows },
+            arena,
+        )
+    };
     constraints::check_sorted_builds(
         storage,
         table,
@@ -97041,8 +97367,8 @@ fn check_unique_builds<Definition0: crate::storage::DefinitionBacking>(
         def,
         keys,
         ColumnSet::EMPTY,
-        &mut rows,
-        &mut |_| Ok(()),
+        &mut { rows },
+        &mut exclusion,
         arena,
     )?;
     Ok(())
@@ -98239,72 +98565,6 @@ fn drop_column_constraints(
     Ok(removed_count)
 }
 
-/// Whether two rewritten rows conflict under the exclusion constraint at
-/// `position`, whose parsed predicate `expressions` holds.
-#[allow(clippy::too_many_arguments)]
-fn rewritten_exclusion_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
-    storage: &Storage,
-    transaction: u32,
-    table_index: usize,
-    new_def: &crate::storage::TableDefinition<Definition0>,
-    expressions: &ParsedChecks,
-    scan: &constraints::ExclusionScan<'_, 'a>,
-    position: usize,
-    a: &[Datum<'a>],
-    b: &[Datum<'a>],
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    let catalog = super::query::storage_catalog(storage, arena, transaction);
-    let hooks = EvalHooks {
-        catalog: Some(&catalog),
-        ..super::eval::NO_HOOKS
-    };
-    if let Some(predicate) = expressions[crate::storage::MAX_CHECKS + position] {
-        let left = RowCtx {
-            table_oid: None,
-            def: crate::storage::RelationDefinition::from_definition(new_def),
-            values: a,
-            alias: None,
-        };
-        let right = RowCtx {
-            table_oid: None,
-            def: crate::storage::RelationDefinition::from_definition(new_def),
-            values: b,
-            alias: None,
-        };
-        if !matches!(
-            eval_full(predicate, arena, &[], &left, &hooks)?,
-            Datum::Bool(true)
-        ) || !matches!(
-            eval_full(predicate, arena, &[], &right, &hooks)?,
-            Datum::Bool(true)
-        ) {
-            return Ok(());
-        }
-    }
-    let mark = arena.mark();
-    let result = (|| {
-        let left = scan.keys(storage, transaction, new_def, a, arena)?;
-        let right = scan.keys(storage, transaction, new_def, b, arena)?;
-        if scan.conflicts(storage, transaction, &left, &right, arena)? {
-            return Err(constraints::index_build_exclusion_violation(
-                scan,
-                storage,
-                transaction,
-                table_index,
-                new_def,
-                &right,
-                &left,
-                arena,
-            ));
-        }
-        Ok(())
-    })();
-    // SAFETY: both rows' keys are consumed; only an owned error escapes.
-    unsafe { arena.rewind_to(mark) };
-    result
-}
-
 /// Forgets the stamp of a column default that this ALTER replaces, so table
 /// admission gives the new `pg_attrdef` row a new OID, as PostgreSQL does.
 fn renew_default_identity<B: crate::storage::DefinitionBacking>(
@@ -98467,6 +98727,12 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
             crate::sql::ast::TableConstraint::Check { no_inherit, .. }
             | crate::sql::ast::TableConstraint::NotNull { no_inherit, .. },
         ) => !no_inherit,
+        AlterAction::ValidateConstraint(name) | AlterAction::DropConstraint { name, .. }
+            if not_null_column(definition, name).is_some() =>
+        {
+            not_null_column(definition, name)
+                .is_some_and(|column| definition.columns()[column].not_null_inheritable)
+        }
         AlterAction::DropConstraint { name, .. }
         | AlterAction::RenameConstraint { from: name, .. }
         | AlterAction::ValidateConstraint(name) => definition
@@ -98475,6 +98741,22 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
             .any(|check| !check.no_inherit && check.name.as_str() == *name),
         _ => false,
     }
+}
+
+/// The column whose NOT NULL constraint `definition` names `name`.
+fn not_null_column<Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+) -> Option<usize> {
+    definition
+        .columns()
+        .iter()
+        .enumerate()
+        .position(|(column, meta)| {
+            meta.not_null.is_required()
+                && definition.not_null_names.as_ref()[column]
+                    .is_some_and(|named| named.as_str() == name)
+        })
 }
 
 /// PostgreSQL's refusals of a column change to only a partitioned table that
@@ -99016,6 +99298,19 @@ fn add_not_null_constraint(
                 "You might need to make the existing constraint inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.",
             ));
         }
+        // A valid constraint cannot merge into a NOT VALID one
+        // (`AdjustNotNullInheritance`).
+        if !not_valid && !current.not_null_validated {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "incompatible NOT VALID constraint \"{}\" on relation \"{}\"",
+                    existing.as_str(),
+                    definition.name.as_str()
+                ),
+                "You might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.",
+            ));
+        }
         if !propagated
             && let Some(name) = name
             && name != existing.as_str()
@@ -99035,12 +99330,8 @@ fn add_not_null_constraint(
             ));
         }
     } else {
-        if not_valid {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "NOT VALID not-null constraints are not supported"
-            ));
-        }
+        // A NOT VALID constraint checks new rows only.
+        definition.columns[index].not_null_validated = !not_valid;
         let name = match name {
             Some(name) if !propagated => Some(SqlName::parse(name)?),
             _ if propagated => inherited_not_null_name(storage, definition, column, txid),
@@ -99086,11 +99377,17 @@ fn propagated_check_name<'a>(
         .chain(definition.inheritance.parents_ref())
     {
         let parent = storage.table_def(usize::from(*parent), txid);
-        if let Some(check) = parent.checks().iter().find(|check| {
-            !check.no_inherit
-                && check.expression.as_str() == stored
+        let mut found = None;
+        for check in parent.checks() {
+            if !check.no_inherit
                 && !definition.checks().iter().any(|own| own.name == check.name)
-        }) {
+                && ddl::same_check_expression(check.expression.as_str(), stored, arena)?
+            {
+                found = Some(check);
+                break;
+            }
+        }
+        if let Some(check) = found {
             return arena
                 .alloc_str(check.name.as_str())
                 .map_err(|_| arena_full());
@@ -99316,18 +99613,20 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         {
             // The partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
-            existing.local = false;
-            if existing.expression != constraint.expression {
+            if matches!(mode, PartitionInheritance::Attach) {
+                ddl::merge_check_into_existing(constraint, existing, child.name.as_str(), arena)?;
+            } else if !ddl::same_check_expression(
+                existing.expression.as_str(),
+                constraint.expression.as_str(),
+                arena,
+            )? {
                 return Err(sql_err!(
-                    if matches!(mode, PartitionInheritance::Attach) {
-                        sqlstate::DATATYPE_MISMATCH
-                    } else {
-                        sqlstate::DUPLICATE_OBJECT
-                    },
+                    sqlstate::DUPLICATE_OBJECT,
                     "constraint \"{}\" conflicts with inherited constraint of the same name",
                     constraint.name.as_str()
                 ));
             }
+            existing.local = false;
             continue;
         }
         if matches!(mode, PartitionInheritance::Attach) {
@@ -99790,9 +100089,25 @@ fn alter_table_inheritance(
     let mut updated = TableDefBuilder::from_definition(&child_definition);
     if inherit {
         if child == parent || storage.relation_descends_from(parent, child, txn.txid) {
+            return sql_fail(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "circular inheritance not allowed"
+                ),
+                format_args!(
+                    "\"{}\" is already a child of \"{}\".",
+                    parent_name.name,
+                    updated.name.as_str()
+                ),
+            ));
+        }
+        // `CreateInheritance` rejects a parent the table already has before
+        // it merges any column or constraint.
+        if updated.inheritance.contains(parent) {
             return sql_fail(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "circular inheritance is not allowed"
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" would be inherited from more than once",
+                parent_definition.name.as_str()
             ));
         }
         for expected in parent_definition.columns() {
@@ -99903,17 +100218,22 @@ fn alter_table_inheritance(
         // A CHECK no remaining parent defines becomes the child's own.
         for position in 0..updated.n_checks {
             let check = updated.checks[position];
-            if !updated.inheritance.parents_ref().iter().any(|slot| {
-                storage
-                    .table_def(usize::from(*slot), txn.txid)
-                    .checks()
-                    .iter()
-                    .any(|parent| {
-                        !parent.no_inherit
-                            && parent.name == check.name
-                            && parent.expression == check.expression
-                    })
-            }) {
+            let mut inherited = false;
+            for slot in updated.inheritance.parents_ref() {
+                for parent in storage.table_def(usize::from(*slot), txn.txid).checks() {
+                    if !parent.no_inherit && parent.name == check.name {
+                        inherited |= match ddl::same_check_expression(
+                            parent.expression.as_str(),
+                            check.expression.as_str(),
+                            arena,
+                        ) {
+                            Ok(same) => same,
+                            Err(error) => return sql_fail(error),
+                        };
+                    }
+                }
+            }
+            if !inherited {
                 updated.checks[position].local = true;
             }
         }
@@ -103125,6 +103445,8 @@ fn alter_table_relation(
                 } else {
                     new_def.columns[i].not_null = new_def.columns[i].not_null.add_local();
                 }
+                // `SET NOT NULL` validates a NOT VALID constraint.
+                new_def.columns[i].not_null_validated = true;
                 validate_definition = true;
             }
             AlterAction::DropNotNull { column } => {
@@ -103159,6 +103481,7 @@ fn alter_table_relation(
                     }
                     new_def.not_null_names[i] = None;
                     new_def.not_null_name_edits.insert(i);
+                    new_def.columns[i].not_null_validated = true;
                 }
             }
             AlterAction::SetStatistics { column, target } => {
@@ -103398,33 +103721,71 @@ fn alter_table_relation(
                         Err(error) => return sql_fail(error),
                     },
                 };
-                // An identical CHECK the table has merges with it
+                // A CHECK of the same name the table has merges with it
                 // (`MergeWithExistingConstraint`): a child's own or inherited
                 // one, or, added to the table itself, one it only inherits.
                 if let Some(position) = new_def.checks[..new_def.n_checks]
                     .iter()
                     .position(|check| check.name.as_str() == name)
                 {
-                    let existing = new_def.checks[position];
-                    if existing.expression.as_str() == stored
-                        && !existing.no_inherit
-                        && (propagated
-                            || (!existing.local && new_def.partition.attachment.is_none()))
-                    {
-                        responder.notice(
-                            sqlstate::SUCCESSFUL_COMPLETION,
-                            stack_format!(
-                                160,
-                                "merging constraint \"{}\" with inherited definition",
-                                name
-                            )
-                            .as_str(),
-                        )?;
-                        if !propagated {
-                            new_def.checks[position].local = true;
-                        }
-                        continue;
+                    let crate::sql::ast::TableConstraint::Check {
+                        expression,
+                        validation,
+                        no_inherit,
+                        ..
+                    } = *constraint
+                    else {
+                        unreachable!("matched a CHECK constraint");
+                    };
+                    // PostgreSQL analyses the predicate before it merges it.
+                    if let Err(error) = ddl::analyse_check_expression(
+                        storage, txn.txid, &new_def, expression, false, arena,
+                    ) {
+                        return sql_fail(error);
                     }
+                    let existing = new_def.checks[position];
+                    let partition = new_def.partition.attachment.is_some();
+                    if let Err(error) = ddl::merge_with_existing_check(
+                        &existing,
+                        crate::sql::catalog::check_inheritance_count(
+                            storage,
+                            txn.txid,
+                            table_index,
+                            &existing,
+                        ) > 0,
+                        new_def.name.as_str(),
+                        partition,
+                        ddl::CheckAddition {
+                            stored,
+                            validation,
+                            local: !propagated,
+                            no_inherit,
+                            allow_merge: propagated,
+                        },
+                        arena,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            160,
+                            "merging constraint \"{}\" with inherited definition",
+                            name
+                        )
+                        .as_str(),
+                    )?;
+                    let merged = &mut new_def.checks[position];
+                    if partition {
+                        merged.local = false;
+                    } else if !propagated {
+                        merged.local = true;
+                    }
+                    merged.no_inherit |= no_inherit;
+                    if validation.enforced() && !merged.validation.enforced() {
+                        merged.validation = crate::storage::ConstraintValidation::EnforcedValidated;
+                    }
+                    continue;
                 }
                 let crate::sql::ast::TableConstraint::Check {
                     source_position,
@@ -103738,6 +104099,13 @@ fn alter_table_relation(
                         new_def.fkeys[index].validation =
                             crate::storage::ConstraintValidation::EnforcedValidated;
                     }
+                } else if let Some(column) = not_null_column(&new_def, name) {
+                    // Validating checks the stored rows below, against the
+                    // now validated constraint.
+                    if !new_def.columns[column].not_null_validated {
+                        new_def.columns[column].not_null_validated = true;
+                        validate_definition = true;
+                    }
                 } else if !new_def.has_constraint_named(name) {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -103759,6 +104127,44 @@ fn alter_table_relation(
                 if_exists,
                 cascade,
             } => {
+                // A NOT NULL constraint drops as `DROP NOT NULL` of its
+                // column does, except that an inherited one is refused.
+                if let Some(i) = not_null_column(&new_def, name) {
+                    let in_primary_key = new_def.columns[i].primary
+                        || new_def.uniques[..new_def.n_uniques]
+                            .iter()
+                            .any(|k| k.kind.is_primary() && k.columns().contains(&(i as u16)));
+                    if inheritance_scope == AlterInheritanceScope::Propagated {
+                        new_def.columns[i].not_null = new_def.columns[i].not_null.drop_inherited();
+                    } else if new_def.columns[i].not_null.is_inherited() {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot drop inherited constraint \"{}\" of relation \"{}\"",
+                            name,
+                            def.name.as_str()
+                        ));
+                    } else if in_primary_key {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "column \"{}\" is in a primary key",
+                            new_def.columns[i].name.as_str()
+                        ));
+                    } else {
+                        new_def.columns[i].not_null = new_def.columns[i].not_null.drop_local();
+                    }
+                    if !new_def.columns[i].not_null.is_required() {
+                        if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
+                            source[i]
+                        {
+                            let attribute = usize::from(def.attribute_number(original) - 1);
+                            new_def.attribute_identities[attribute].not_null = None;
+                        }
+                        new_def.not_null_names[i] = None;
+                        new_def.not_null_name_edits.insert(i);
+                        new_def.columns[i].not_null_validated = true;
+                    }
+                    continue;
+                }
                 // A child's CHECK survives its parent's when the child defines
                 // it too or another parent still does; dropped directly, an
                 // inherited one is refused.
@@ -104349,21 +104755,6 @@ fn alter_table_relation(
     // old rows still installed in storage: PostgreSQL rebuilds every index of
     // the rewritten table, in OID order.
     if has_rewrite {
-        let exclusion_scans = match arena
-            .alloc_slice_with(new_def.n_exclusions, |_| constraints::ExclusionScan::EMPTY)
-        {
-            Ok(scans) => scans,
-            Err(_) => return sql_fail(crate::sql::eval::arena_full()),
-        };
-        for (scan, exclusion) in exclusion_scans.iter_mut().zip(new_def.exclusions()) {
-            *scan = match constraints::ExclusionScan::new(
-                exclusion, storage, txn.txid, &new_def, arena,
-            ) {
-                Ok(scan) => scan,
-                Err(error) => return sql_fail(error),
-            };
-        }
-        let exclusion_scans = &*exclusion_scans;
         let images = &rewritten_images;
         // The rewritten images are in the copied heap's order.
         let mut rows = |_: bool, visit: &mut constraints::BuildRowVisit<'_>| {
@@ -104375,31 +104766,27 @@ fn alter_table_relation(
             }
             Ok(())
         };
-        // Each exclusion constraint compares every pair of rewritten rows.
+        // Each exclusion constraint checks the rewritten rows as its
+        // rebuilt index does.
         let mut exclusion = |position: usize| {
-            for (a, image) in images.iter().enumerate() {
-                let abytes = image.as_ref().expect("rewritten input retained");
-                let mut avals = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(abytes, new_schema, &mut avals)?;
-                for image in images.iter().skip(a + 1) {
-                    let bbytes = image.as_ref().expect("rewritten input retained");
-                    let mut bvals = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bbytes, new_schema, &mut bvals)?;
-                    rewritten_exclusion_conflict(
-                        storage,
-                        txn.txid,
-                        table_index,
-                        &new_def,
-                        &checks,
-                        &exclusion_scans[position],
-                        position,
-                        &avals[..new_def.n_columns],
-                        &bvals[..new_def.n_columns],
-                        arena,
-                    )?;
+            let mut rows = |_: bool, visit: &mut constraints::BuildRowVisit<'_>| {
+                for image in images.iter() {
+                    let bytes = image.as_ref().expect("rewritten input retained");
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    rowenc::decode(bytes, new_schema, &mut values)?;
+                    visit(0, &values[..new_def.n_columns], bytes.len())?;
                 }
-            }
-            Ok(())
+                Ok(())
+            };
+            constraints::check_exclusion_build(
+                storage,
+                table_index,
+                txn.txid,
+                &new_def,
+                position,
+                &mut rows,
+                arena,
+            )
         };
         let mut retyped = ColumnSet::EMPTY;
         for (column, source) in source[..new_def.n_columns].iter().enumerate() {
@@ -106035,11 +106422,12 @@ fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlEr
     })
 }
 
-/// Visits a table's visible rows in the order a sequential `SELECT` reads
-/// them, as PostgreSQL's data changes read their target: routines they call
-/// observe earlier rows' changes in that order: saved rows by row identity,
-/// then heap rows by heap position. Only a table without saved row files
-/// keeps an order record for every row.
+/// Visits the rows of `table` a sequential scan reads, in heap order: each
+/// row's version the statement sees, saved rows by identity and then
+/// resident ones by heap position. The order is the versions' own, so an
+/// attempt resumed after its own changes reads the rows in the order the
+/// statement's first attempt did. Without such changes the saved rows
+/// stream in that order.
 fn for_each_physical_row(
     storage: &Storage,
     table: usize,
@@ -106047,7 +106435,7 @@ fn for_each_physical_row(
     arena: &Arena,
     visit: &mut dyn FnMut(u64, crate::storage::VisibleRowHome) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    if storage.spill_generation_count(table) != 0 {
+    if storage.spill_generation_count(table) != 0 && !storage.table_has_own_pending(table, txid) {
         let scan = storage.captured_row_scan_in(table, txid, arena)?;
         // The visitor never stops the scan early.
         let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
@@ -106067,19 +106455,32 @@ fn for_each_physical_row(
             )
         })?;
     let mut fill = 0usize;
-    storage.for_each_row_state(table, &mut |rowid, state| {
-        if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
-            let slot = ordered.get_mut(fill).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "visible row count changed during a data change's scan"
-                )
-            })?;
-            *slot = Some(snapshot.retain(rowid, &home)?);
-            fill += 1;
-        }
-        Ok(core::ops::ControlFlow::Continue(()))
-    })?;
+    let mut retain = |rowid: u64, home: &crate::storage::VisibleRowHome| -> Result<(), SqlError> {
+        let slot = ordered.get_mut(fill).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "visible row count changed during a data change's scan"
+            )
+        })?;
+        *slot = Some(snapshot.retain(rowid, home)?);
+        fill += 1;
+        Ok(())
+    };
+    if storage.spill_generation_count(table) != 0 {
+        let scan = storage.captured_row_scan_in(table, txid, arena)?;
+        // The visitor never stops the scan early.
+        let _ = scan.for_each_home_physically(arena, &mut |rowid, home| {
+            retain(rowid, &home)?;
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    } else {
+        storage.for_each_row_state(table, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(table, rowid, state, txid)? {
+                retain(rowid, &home)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+    }
     ordered[..fill].sort_unstable_by_key(|row| row.map(|row| row.sort_key()));
     for row in ordered[..fill].iter().copied().flatten() {
         visit(row.rowid(), row.read()?)?;
@@ -106533,7 +106934,11 @@ pub(super) fn collect_matches<'a>(
                 | crate::sql::query::index_paths::ScanKind::IndexOnly
         )
     });
+    // A sequential scan PostgreSQL's costs chose reads no index.
+    let sequential =
+        chosen.is_some_and(|order| order.kind == crate::sql::query::index_paths::ScanKind::Seq);
     let indexed = if transition.is_none()
+        && !sequential
         && def.kind != crate::storage::TableKind::Foreign
         && !storage.relation_has_descendants(table_index, txid)
     {
@@ -106560,21 +106965,20 @@ pub(super) fn collect_matches<'a>(
     // else physical order. (PostgreSQL's sequential scan reads heap order
     // even then; a resumed attempt would need the heap positions the rows
     // had when the statement began, which own changes move.)
-    let index_order =
-        match chosen.filter(|order| order.kind != crate::sql::query::index_paths::ScanKind::Seq) {
-            Some(_) => true,
-            None => {
-                indexed.is_some()
-                    || (def.kind != crate::storage::TableKind::Foreign
-                        && super::query::dml_condition_reaches_index(
-                            storage,
-                            &def,
-                            alias,
-                            txid,
-                            where_clause,
-                        ))
-            }
-        };
+    let index_order = match chosen {
+        Some(order) => order.kind != crate::sql::query::index_paths::ScanKind::Seq,
+        None => {
+            indexed.is_some()
+                || (def.kind != crate::storage::TableKind::Foreign
+                    && super::query::dml_condition_reaches_index(
+                        storage,
+                        &def,
+                        alias,
+                        txid,
+                        where_clause,
+                    ))
+        }
+    };
     // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
     // visible row it matched or its filter removed, and each member's share
     // when the target is a partitioned table or inheritance tree.
@@ -107271,15 +107675,27 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     images.finish()
 }
 
+/// The variables of the routine running a statement, and its evaluation
+/// hooks: a column the statement's relations lack that `lookup` answers
+/// for is a constant of the statement.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineScope<'s, 'a> {
+    pub(crate) lookup: &'s dyn ColumnLookup<'a>,
+    pub(crate) hooks: &'s super::eval::EvalHooks<'s, 'a>,
+}
+
 /// The rows of the table in `slot`, read as `alias`, that `condition`
-/// keeps, as of `txid`: the count PostgreSQL's statistics estimate for a
-/// condition on an analyzed table. `None` when evaluating it fails.
+/// keeps, as of `txid`, with the routine variables `routine` answers for: the count PostgreSQL's
+/// statistics estimate for a condition on an analyzed table. `None` when
+/// evaluating it fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn relation_rows_kept<'a>(
     storage: &Storage,
     slot: usize,
     alias: &str,
     condition: &Expr<'a>,
     params: &[Datum<'a>],
+    routine: Option<RoutineScope<'_, 'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<u64>, SqlError> {
@@ -107303,20 +107719,36 @@ pub(crate) fn relation_rows_kept<'a>(
             let bytes = storage.row_bytes(slot, rowid, home, arena)?;
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, schema, &mut values)?;
-            row_matches_values(
-                storage,
-                txid,
-                Some(slot),
-                &definition,
-                Some(alias),
-                &values[..definition.n_columns],
-                Some(condition),
-                arena,
-                params,
-                &hooks,
-                None,
-                None,
-            )
+            match routine {
+                Some(routine) => row_matches_values(
+                    storage,
+                    txid,
+                    Some(slot),
+                    &definition,
+                    Some(alias),
+                    &values[..definition.n_columns],
+                    Some(condition),
+                    arena,
+                    params,
+                    routine.hooks,
+                    None,
+                    Some(routine.lookup),
+                ),
+                None => row_matches_values(
+                    storage,
+                    txid,
+                    Some(slot),
+                    &definition,
+                    Some(alias),
+                    &values[..definition.n_columns],
+                    Some(condition),
+                    arena,
+                    params,
+                    &hooks,
+                    None,
+                    None,
+                ),
+            }
         })();
         // SAFETY: the count retains nothing of the row.
         unsafe { arena.rewind_to(mark) };
@@ -107331,6 +107763,42 @@ pub(crate) fn relation_rows_kept<'a>(
         Ok(core::ops::ControlFlow::Continue(()))
     })?;
     Ok((!failed).then_some(kept))
+}
+
+/// `expression` evaluated over one row of the table in `slot`, read as
+/// `alias`, with the routine variables `outer` answers for.
+#[allow(clippy::too_many_arguments)]
+fn eval_row_expression<'a, Definition0: crate::storage::DefinitionBacking>(
+    expression: &Expr<'a>,
+    storage: &Storage,
+    slot: usize,
+    def: &crate::storage::TableDefinition<Definition0>,
+    alias: Option<&str>,
+    values: &[Datum<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &super::eval::EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<Datum<'a>, SqlError> {
+    let context = RowCtx {
+        table_oid: Some(crate::sql::catalog::user_table_oid(storage, slot) as u32),
+        def: crate::storage::RelationDefinition::from_definition(def),
+        values: &values[..def.n_columns],
+        alias,
+    };
+    match outer {
+        Some(outer) => super::eval::eval_full(
+            expression,
+            arena,
+            params,
+            &TriggerDmlScope {
+                row: &context,
+                outer,
+            },
+            hooks,
+        ),
+        None => super::eval::eval_full(expression, arena, params, &context, hooks),
+    }
 }
 
 /// The plan of an `UPDATE ... FROM` or `DELETE ... USING` whose join
@@ -107351,6 +107819,7 @@ fn planned_joined_write<'a, Definition0: crate::storage::DefinitionBacking>(
     capture: DmlCapture,
     params: &[Datum<'a>],
     hooks: &super::eval::EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<(super::query::JoinedWriteJoin<'a>, &'a [usize])>, SqlError> {
@@ -107379,6 +107848,7 @@ fn planned_joined_write<'a, Definition0: crate::storage::DefinitionBacking>(
         where_clause,
         leaves,
         params,
+        outer.map(|lookup| RoutineScope { lookup, hooks }),
         txid,
         arena,
     )?
@@ -107445,6 +107915,12 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
     let target_scan = arena
         .alloc_slice_with(leaves.len(), |_| MergeScanCounts::default())
         .map_err(|_| arena_full())?;
+    // Each kept row's hash key values, `key_count` per row.
+    let keys = plan.keys();
+    let key_count = keys.len();
+    let target_keys = arena
+        .alloc_slice_with(capacity * key_count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let mut targets = 0usize;
     for (member, &leaf) in leaves.iter().enumerate() {
         let physical = (*storage.table_def(leaf, txid)).clone();
@@ -107493,6 +107969,14 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             if slot >= capacity {
                 return Err(arena_full());
             }
+            for (at, key) in keys.iter().enumerate() {
+                target_keys[slot * key_count + at] = match key.target_column {
+                    Some(column) => logical.get(column).copied().unwrap_or(Datum::Null),
+                    None => eval_row_expression(
+                        key.target, storage, leaf, def, alias, logical, arena, params, hooks, outer,
+                    )?,
+                };
+            }
             target_rows[slot] = Some(PhysicalRow::local(leaf, rowid, snapshot));
             target_values[slot] = logical;
             target_bytes[slot] = if capture_bytes { bytes } else { &[] };
@@ -107513,6 +107997,9 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
         .map_err(|_| arena_full())?;
     let source_rows = arena
         .alloc_slice_with(source_capacity, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    let source_keys = arena
+        .alloc_slice_with(source_capacity * key_count, |_| Datum::Null)
         .map_err(|_| arena_full())?;
     let mut source_scan = MergeScanCounts::default();
     let mut sources = 0usize;
@@ -107560,6 +108047,23 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
         if sources >= source_capacity {
             return Err(arena_full());
         }
+        for (at, key) in keys.iter().enumerate() {
+            source_keys[sources * key_count + at] = match key.source_column {
+                Some(column) => values[column],
+                None => eval_row_expression(
+                    key.source,
+                    storage,
+                    source_slot,
+                    &source_def,
+                    Some(plan.source_name),
+                    &values[..source_def.n_columns],
+                    arena,
+                    params,
+                    hooks,
+                    outer,
+                )?,
+            };
+        }
         source_ids[sources] = rowid;
         source_rows[sources] = encoded;
         sources += 1;
@@ -107568,15 +108072,13 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
     let source_ids = &source_ids[..sources];
     let source_rows = &source_rows[..sources];
     // Each relation's key values, as the hash join reads them.
-    let keys = plan.keys();
+    let target_keys = &*target_keys;
+    let source_keys = &*source_keys;
     let read = |is_target: bool, row: usize, key: usize| -> Datum<'a> {
         if is_target {
-            target_values[row]
-                .get(keys[key].0)
-                .copied()
-                .unwrap_or(Datum::Null)
+            target_keys[row * key_count + key]
         } else {
-            decode_projected_pub(source_rows[row], keys[key].1)
+            source_keys[row * key_count + key]
         }
     };
     // Candidate FROM rows per target row: a hash table on the FROM rows'
@@ -107587,7 +108089,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             txid,
             targets,
             sources,
-            keys.len(),
+            key_count,
             plan.collations(),
             &|outer, row, key| read(outer, row, key),
             arena,
@@ -107602,7 +108104,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             txid,
             sources,
             targets,
-            keys.len(),
+            key_count,
             plan.collations(),
             &|outer, row, key| read(!outer, row, key),
             arena,
@@ -109518,6 +110020,7 @@ fn coerce_composite_value_inner<'a>(
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
             not_null_inheritable: true,
+            not_null_validated: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -110564,7 +111067,11 @@ fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
     description: constraints::RowDescription,
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
-        if c.not_null.is_required() && values[i].is_null() {
+        // A row being written satisfies every NOT NULL constraint; rows
+        // already stored only the validated ones.
+        let checked = c.not_null.is_required()
+            && (c.not_null_validated || description != constraints::RowDescription::Existing);
+        if checked && values[i].is_null() {
             if description == constraints::RowDescription::Existing {
                 crate::sql::eval::stash_object_diagnostic(
                     None,

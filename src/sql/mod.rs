@@ -82,6 +82,7 @@ pub mod sha512;
 pub mod snapshot;
 pub(crate) mod snowball;
 mod spgist_catalog;
+pub(crate) mod stack_depth;
 pub(crate) mod statistics;
 pub(crate) mod text_parser;
 pub mod timezone;

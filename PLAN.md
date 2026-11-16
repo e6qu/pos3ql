@@ -708,27 +708,50 @@ index's predicate) reach, `Rows Removed by Filter`, each bitmap index scan
 of a `BitmapAnd` or `BitmapOr`, a bitmap heap scan's `Heap Blocks` and an
 index-only scan's `Heap Fetches`, and each index scan's `Index Searches`. A
 table without index paths for the query keeps its sequential scan whatever
-its conditions. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+its conditions. Pattern conditions follow `like_support.c` under `C`
+(`differential_exact/752`): `LIKE` (its `ESCAPE` folded through
+`like_escape`, as `EXPLAIN` prints it), `ILIKE` (its prefix stopping at a
+letter), regular expressions (`~`, `~*`, their prefix read from the
+anchored characters `pg_regprefix` finds, exact before a final `$`) and
+`starts_with` (a prefix through its support function) bound an index by
+their prefix, a non-ASCII one too (`make_greater_string`'s UTF-8
+increment), with `patternsel`'s selectivity. A condition on an expression
+no index holds takes PostgreSQL's defaults (`differential_exact/753`): an
+equality `1/DEFAULT_NUM_DISTINCT` (a boolean's 1/2), an inequality
+`DEFAULT_INEQ_SEL`, two bounds of one expression `DEFAULT_RANGE_INEQ_SEL`,
+a NULL test `DEFAULT_UNK_SEL`, a boolean function a third, and a
+comparison with a boolean constant is its other side
+(`simplify_boolean_equality`). A cast of a column to its own type is no
+node, printed and costed as the column, and a binary-coercible cast costs
+nothing; a `varchar` or `text` relabeling is the column for its index. A
+dummy relation's `Result` is as wide as the select list's expressions. An
+`UPDATE` or `DELETE` whose costs choose a sequential scan changes its rows
+in heap order and reads no index; a resumed attempt reads the same order
+under the statement's snapshot. A btree's distinct keys are counted as
+`estimate_num_groups` clamps a product of columns' distinct values.
+Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
-methods, expression indexes over user-defined routines or types, `ILIKE`,
-regular expressions, `LIKE` with an escape or a non-ASCII prefix and other
-casts of indexed columns, extended statistics, a sub-partitioned table
+methods, expression indexes over user-defined routines or types (PostgreSQL
+inlines a simple SQL function's body, `inline_function`, into the index
+expression, the query and what `EXPLAIN` prints, which pos3ql does not do
+anywhere yet; and `CREATE INDEX` cannot evaluate a PL/pgSQL function, which
+needs the resumable executor), a regular
+expression with embedded options or a director (`(?i)`, `***=`),
+extended statistics, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. Remaining inexact without
-`0A000`: a sequential scan's estimates when a condition reads an expression
-no index holds (PostgreSQL's defaults for an unanalyzed expression), btree
-sizes after out-of-order inserts (PostgreSQL's page splits, `nbtsplitloc`,
-grow an index past the `CREATE INDEX` layout the model computes, which also
-estimates a multi-column index's distinct keys as the product of its
-columns'), the heap placement of rows a large update moves (a pruned
-page's freed space), and the row order of an `UPDATE` or `DELETE` whose
-costs choose a sequential scan while its condition reaches an index: it
-takes row identity order, where PostgreSQL reads heap order, because a
-resumed attempt must select the rows in the order of the first, and its own
-changes have moved the rows' heap positions since (heap order needs each
-row's position as the statement began). Grouping, `DISTINCT` and joins above the scan keep the
+`0A000`: btree sizes, which the model computes from the column statistics
+where PostgreSQL counts the pages its build (`nbtsort`) and later page
+splits (`nbtsplitloc`) made, and the heap placement of rows a large update
+moves (a pruned page's freed space, HOT chains), which also orders an
+index's equal keys by their current heap position. PostgreSQL 17's
+maintenance operations (`CREATE INDEX`, `ANALYZE`, `REINDEX`, `VACUUM`,
+`REFRESH MATERIALIZED VIEW`) evaluate expressions under the search path
+`pg_catalog, pg_temp`, so an error there names a domain outside it
+qualified (`value for domain public.posint violates ...`); pos3ql keeps
+the session's search path. Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM
@@ -846,10 +869,14 @@ pos3ql does not model. Each relation's scan filters by its own conjuncts,
 the hash join checks the equalities and the join filter the rest; the join
 returns its rows in the plan's order and each target row changes on its
 first join row, with that row's FROM row, so triggers and `RETURNING` see
-PostgreSQL's order. Other joined writes (several FROM items, a derived
-table, a FROM table with column aliases, an equality between expressions
-rather than columns, a condition reading a routine's variable or calling a
-function, relations without statistics, a nested loop on an equality)
+PostgreSQL's order. The hash keys are any equalities between an
+expression of the target and one of the FROM table (`t.id = s.k + 1`), and
+a SQL-language routine's parameters, a PL/pgSQL routine's variables and
+built-in function calls in the conditions are planned as PostgreSQL plans
+them (`differential_exact/740`). Other joined writes (several FROM items, a
+derived table, a FROM table with column aliases, relations without
+statistics, which PostgreSQL may merge-join, a nested loop on an equality)
+keep the row-by-row executor: they
 hash their first FROM table when it is joined to the target by equality,
 as a `SELECT` of the two tables would, and join later FROM items to it in
 nested loops; PostgreSQL may instead hash the joined FROM items. A statement
@@ -877,11 +904,22 @@ over scans), in all four formats. A hash join's `Hash` node reports the table Po
 would build: buckets sized from the node's row estimate (at least 1024) and
 doubled while its rows outnumber them, one batch, and `Memory Usage` from each
 row's minimal tuple (as PostgreSQL stores the values the node returns) and the
-bucket pointers. Remaining: PostgreSQL's skew buckets for an outer key with
-most-common-value statistics, its batches for a build larger than `work_mem`
-times 2, and values it stores compressed or out of line (rows over about
-2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
-`jsonb`, ranges, records) reports pos3ql's own table bytes. A query without FROM drops sort, grouping
+bucket pointers. Remaining: PostgreSQL's batches for a build larger than
+`work_mem` times 2 (`ExecChooseHashTableSize`, `ExecHashIncreaseNumBatches`,
+which need each row's PostgreSQL hash value and size), the skew buckets it
+builds then for an outer key with most-common-value statistics
+(`ExecHashBuildSkewHash`), and values it stores compressed or out of line
+(rows over about 2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
+`jsonb`, ranges, records) reports pos3ql's own table bytes. A scan's
+cost and row model covers comparisons of a column with a constant; a
+comparison with an InitPlan's output or a stable call leaves the crude
+estimate, where PostgreSQL may also choose an index scan. JSON nests as
+deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
+`max_stack_depth` (21,790 and 18,675 levels on the reference build), and
+deeper documents, or a recursion that would exhaust the query thread's
+fixed stack, fail with `54001` "stack depth limit exceeded"
+(`differential_exact/747`); PostgreSQL's limit varies with each operation's
+frames, which pos3ql does not model. A query without FROM drops sort, grouping
 and distinct keys that are planner constants, as PostgreSQL does (a constant
 `DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
 the constants the planner folds them into (`'2'::double precision`). Times are measured
@@ -909,7 +947,9 @@ aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated
 scalar, `EXISTS` or `ARRAY` subquery as `InitPlan n` under the query's top
 node (referenced as `(InitPlan n).col1`, and gating the scan from a `Result`
-when a condition reads only such subplans), a correlated one in the select
+when a condition reads only such subplans; the top node, and a gating
+`Result`'s scan, include its cost as `SS_charge_for_initplans` charges it,
+`differential_exact/741`), a correlated one in the select
 list or `WHERE` of a one-relation query as `SubPlan n` after the inputs of the
 node evaluating it, numbered as PostgreSQL plans them, with the subplan's
 relations named uniquely (`u_1`). Under `ANALYZE` each subplan's nodes
@@ -1219,14 +1259,21 @@ constraints record `conislocal` apart from their inheritance count. A
 composite routine parameter accepts a `ROW(...)` argument, a PL/pgSQL
 `record` variable holding an anonymous record rejects `(r).f1`, and a bound
 cursor's query sees only the variables declared before the cursor.
-Remaining: `ALTER TABLE ... ADD NOT NULL col NOT VALID` on a column without
-a NOT NULL constraint fails with `0A000` (pos3ql has no NOT VALID NOT NULL
-state); an exclusion constraint's rebuild still compares every pair of rows;
-CREATE TABLE merges a named CHECK into an inherited one only when their
-stored predicate texts match, where PostgreSQL compares the analysed
-expressions; a cursor declared in a nested block's DECLARE section fails
-with `0A000`; and `(r).*` of a PL/pgSQL record variable fails with `0A000`
-where PostgreSQL raises `42809`.
+A NOT VALID not-null constraint checks new rows only, until VALIDATE
+CONSTRAINT or SET NOT NULL checks the stored ones, and DROP CONSTRAINT drops
+a not-null constraint (`differential_exact/745`). A CHECK merges with a
+same-named inherited one when their parsed predicates are equal, with
+PostgreSQL's conflicts for a different predicate, `NO INHERIT`, NOT VALID or
+NOT ENFORCED (`differential_exact/742`); a PL/pgSQL expression `(r).*` is a
+target list, and a cursor may be declared in a nested block
+(`differential_exact/743`, `744`). An exclusion constraint's build sorts the
+rows by its equality elements and sweeps one range-overlap element in O(n
+log n) comparisons and names the first conflicting row in heap order
+(`differential_exact/746`); other operators still compare every pair, and
+for a GiST constraint PostgreSQL names the partner its index scan finds
+first, where pos3ql names the first in heap order. Remaining: PostgreSQL
+compares merged CHECK predicates as analysed trees, so `a > 0::integer`
+and `a > 0` merge there but not here.
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
@@ -1363,9 +1410,9 @@ and a type without equality leaves `n_distinct` unknown, as PostgreSQL's
 `compute_range_stats`, `compute_tsvector_stats` and `compute_trivial_stats`
 do. Remaining: the element statistics of arrays and `tsvector` columns, range
 and multirange histograms, `compute_distinct_stats` for types without an
-ordering, the widths of values PostgreSQL compresses, and the binary element
-type of a domain over an array of an enum or composite, which names the
-array type where PostgreSQL names the domain; a table larger than 300 rows per unit of the
+ordering, the widths of values PostgreSQL compresses, and the binary form
+of a composite value inside a statistics array, which pos3ql sends as
+text; a table larger than 300 rows per unit of the
 statistics target is sampled at random, as PostgreSQL samples it, so its
 figures differ from run to run. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which

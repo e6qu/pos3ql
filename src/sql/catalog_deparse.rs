@@ -1818,6 +1818,11 @@ impl Context<'_> {
                         };
                         self.constant(named, target, output)
                     }
+                    // A cast to the operand's own type is no node: the parser
+                    // drops it.
+                    _ if *type_mod < 0 && self.type_of(operand)? == Some(target) => {
+                        self.write(operand, None, output)
+                    }
                     _ => {
                         self.wrapped(operand, Some(None), Parent::Cast, true, output)?;
                         output.push("::")?;

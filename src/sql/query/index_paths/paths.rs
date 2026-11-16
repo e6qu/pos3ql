@@ -105,6 +105,7 @@ pub(super) fn range_bound(clause: &Clause<'_>) -> Option<(usize, bool)> {
             Comparison::Gt | Comparison::Ge => Some((column, true)),
             _ => None,
         },
+        Clause::Expression { bound, .. } => bound,
         _ => None,
     }
 }
@@ -718,7 +719,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                             sa_scans = previous_scans;
                             break;
                         }
-                        distinct = (distinct * fraction).round().max(1.0);
+                        distinct = (distinct * fraction).round_ties_even().max(1.0);
                     } else {
                         distinct += 1.0;
                     }
@@ -773,12 +774,12 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 .map_err(|_| crate::sql::eval::arena_full())?;
             let selectivity = self.with_predicate(index, bound)?;
             sa_scans = sa_scans.min((info.pages * 0.333_333_3).ceil()).max(1.0);
-            (selectivity * tuples / sa_scans).round()
+            (selectivity * tuples / sa_scans).round_ties_even()
         };
         // `genericcostestimate`.
         let selectivity = self.with_predicate(index, clauses)?;
         let mut index_tuples = if index_tuples <= 0.0 {
-            (selectivity * tuples / sa_scans).round()
+            (selectivity * tuples / sa_scans).round_ties_even()
         } else {
             index_tuples
         };
@@ -1985,6 +1986,8 @@ pub(crate) fn scan_path<'a>(
         arena,
         seen: &mut seen,
         seen_count: 0,
+        expressions: [&Expr::Null; clauses::MAX_CONJUNCTS],
+        expression_count: 0,
     };
     let restrictions = match analyzer.conjuncts(&kept_conjuncts[..kept_count], 0)? {
         Ok(restrictions) => restrictions,

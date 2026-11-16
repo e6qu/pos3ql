@@ -155,7 +155,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::{CACHED_ARRAY_ELEMENT_BYTES, CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -1528,6 +1528,11 @@ pub struct ColumnMeta {
     /// Whether this column's local NOT NULL constraint participates in
     /// ordinary table inheritance. It is irrelevant for a nullable column.
     pub not_null_inheritable: bool,
+    /// PostgreSQL's `convalidated` of the column's NOT NULL constraint:
+    /// false for one added `NOT VALID`, which new rows satisfy but existing
+    /// ones were not checked against, so nothing may assume them non-null.
+    /// True for a nullable column.
+    pub not_null_validated: bool,
     pub unique: bool,
     pub primary: bool,
     /// Implicit identity generation in stored shapes. The SQL builder also
@@ -1735,6 +1740,12 @@ pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
 pub(crate) const MAX_VIEW_DEFAULTS: usize = 64;
 
 impl ColumnMeta {
+    /// Whether every row of the column is known to be non-null: a validated
+    /// NOT NULL constraint, which a proof may rely on.
+    pub const fn proven_not_null(&self) -> bool {
+        self.not_null.is_required() && self.not_null_validated
+    }
+
     pub const EMPTY: Self = ColumnMeta {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
@@ -1744,6 +1755,7 @@ impl ColumnMeta {
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         not_null_inheritable: true,
+        not_null_validated: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -38429,6 +38441,21 @@ impl Storage {
         self.pin_row_selection(table_slot, rowid, state, visible, Some(commit_snapshot))
     }
 
+    /// Whether a row of the table has a pending version of `txid`: its own
+    /// changes moved the row since the transaction began.
+    pub(crate) fn table_has_own_pending(&self, table_slot: usize, txid: u32) -> bool {
+        let (versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_read_for_batch()?,
+                self.tables[table_slot].rows.try_read_for_batch()?,
+            ))
+        });
+        rows.iter().any(|(_, &state)| {
+            pending_last(&versions.pending_row_versions, state.pending)
+                .is_some_and(|pending| pending.txid == txid)
+        })
+    }
+
     /// Cache probes need only this verdict while their saved block is borrowed;
     /// copy no row bytes or root owners and release metadata guards immediately.
     pub(crate) fn row_has_own_pending(&self, table_slot: usize, rowid: u64, txid: u32) -> bool {
@@ -61941,6 +61968,7 @@ pub(crate) mod tests {
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 not_null_inheritable: true,
+                not_null_validated: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

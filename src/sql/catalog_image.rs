@@ -93,9 +93,12 @@ impl<'a> Reader<'a> {
                 return Some(());
             }
             (ColType::Array(expected), 200) => {
-                let element =
-                    crate::storage::CachedArrayElement::from_bytes(self.take(6)?.try_into().ok()?)?
-                        .element();
+                let element = crate::storage::CachedArrayElement::from_bytes(
+                    self.take(crate::storage::CACHED_ARRAY_ELEMENT_BYTES)?
+                        .try_into()
+                        .ok()?,
+                )?
+                .element();
                 if element != expected
                     || !ArrElem::BUILTIN.contains(&element)
                     || element == ArrElem::Record

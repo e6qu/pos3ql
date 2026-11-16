@@ -15,7 +15,9 @@ use crate::sql::ast::{
 };
 use crate::sql::eval::{ColumnLookup, SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
-use crate::sql::query::instrument::{BlockId, NodeCounters, NodeKey, Role, Segment, Slot};
+use crate::sql::query::instrument::{
+    BlockId, HashColumns, NodeCounters, NodeKey, Role, Segment, Slot,
+};
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
@@ -73,6 +75,8 @@ struct PlanNode {
     /// The node's identity in execution, for the nodes whose work
     /// `EXPLAIN ANALYZE` measures.
     key: Option<NodeKey>,
+    /// A `Hash` node's row values, which size its table as PostgreSQL's.
+    hash_columns: Option<HashColumns>,
     /// Qualifications as `VERBOSE` prints them, where that differs: with
     /// every column qualified by its relation.
     verbose_quals: [(QualLabel, StackStr<512>); 3],
@@ -106,6 +110,12 @@ struct PlanNode {
     /// An `Append` whose members PostgreSQL prunes again during each scan
     /// by a subplan's or an enclosing query's value.
     scan_pruned: bool,
+    /// A joined `UPDATE` or `DELETE`'s join, whose rows the executor does
+    /// not count.
+    uncounted: bool,
+    /// A join whose inner relation matches at most one row per outer row
+    /// by a unique index on its join keys (`innerrel_is_unique`).
+    inner_unique: bool,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -353,6 +363,7 @@ impl PlanNode {
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::new(),
         subplan: None,
@@ -366,6 +377,8 @@ impl PlanNode {
         subplans_removed: None,
         target_member: false,
         scan_pruned: false,
+        uncounted: false,
+        inner_unique: false,
     };
 }
 
@@ -511,9 +524,17 @@ impl<'a> Plan<'a> {
                 "EXPLAIN ANALYZE of partition pruning by a subquery or outer query value is not supported"
             ));
         }
+        if self.nodes[..self.count].iter().any(|node| node.uncounted) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE of a joined UPDATE or DELETE is not supported"
+            ));
+        }
         let nodes = &self.nodes[..self.count];
         let slots = arena
-            .alloc_slice_with(self.count, |index| Slot::new(nodes[index].key))
+            .alloc_slice_with(self.count, |index| {
+                Slot::new(nodes[index].key).with_hash_columns(nodes[index].hash_columns)
+            })
             .map_err(|_| query::arena_full_pub())?;
         let result = query::instrument::analyze(slots, timing, execute);
         let counters = arena
@@ -597,6 +618,27 @@ impl<'a> Plan<'a> {
         }
     }
 
+    /// What an analyzed `MERGE` did with the rows of its join, the node at
+    /// `join`: the rows each kind of action changed, and the rest.
+    fn merge_tuples(&self, join: usize) -> Option<MergeOutcome> {
+        let measured = self.measured?;
+        if self.nodes[0].name.as_str() != "Merge" {
+            return None;
+        }
+        let changed = measured[0].merged;
+        let total = measured.get(join)?.rows;
+        Some(MergeOutcome {
+            total,
+            inserted: changed.inserted,
+            updated: changed.updated,
+            deleted: changed.deleted,
+            skipped: total
+                .saturating_sub(changed.inserted)
+                .saturating_sub(changed.updated)
+                .saturating_sub(changed.deleted),
+        })
+    }
+
     fn memory_kib(&self) -> (usize, usize) {
         let header = core::mem::size_of::<Self>();
         let node = core::mem::size_of::<PlanNode>();
@@ -608,6 +650,25 @@ impl<'a> Plan<'a> {
                 .saturating_add(self.nodes.len().saturating_mul(node))
                 .div_ceil(1024),
         )
+    }
+}
+
+/// The rows of an analyzed `MERGE`'s join (`total`) and what its actions
+/// did with them (`show_modifytable_info`).
+struct MergeOutcome {
+    total: u64,
+    inserted: u64,
+    updated: u64,
+    deleted: u64,
+    skipped: u64,
+}
+
+impl MergeOutcome {
+    fn properties(&self, document: &mut impl FnMut(&'static str, u64)) {
+        document("Tuples Inserted", self.inserted);
+        document("Tuples Updated", self.updated);
+        document("Tuples Deleted", self.deleted);
+        document("Tuples Skipped", self.skipped);
     }
 }
 
@@ -2956,6 +3017,8 @@ fn push_members(
             u32::try_from(planned.len() - expansion.started.len()).map_err(|_| arena_full())?,
         ),
         scan_pruned: expansion.planned.scan_pruned,
+        uncounted: false,
+        inner_unique: false,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3821,6 +3884,7 @@ fn scan_node<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema,
         subplan: None,
@@ -3834,6 +3898,8 @@ fn scan_node<'a>(
         subplans_removed: None,
         target_member: false,
         scan_pruned: false,
+        uncounted: false,
+        inner_unique: false,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -4771,6 +4837,7 @@ fn plan_pulled_select<'a>(
                 from,
                 statement.where_clause,
                 &table_order[..scope.n],
+                None,
                 txid,
                 arena,
             )?
@@ -5907,6 +5974,10 @@ fn plan_pulled_select<'a>(
                         } else {
                             Role::Materialize(position_role)
                         }),
+                        hash_columns: block_targets
+                            .as_ref()
+                            .filter(|_| hash_join)
+                            .and_then(|found| found.hashed_columns(table)),
                         depth: scan.depth,
                         total_cost: scan.total_cost,
                         rows: scan.rows,
@@ -7636,6 +7707,7 @@ fn physical_scan_node(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
         subplan: None,
@@ -7649,6 +7721,8 @@ fn physical_scan_node(
         subplans_removed: None,
         target_member: false,
         scan_pruned: false,
+        uncounted: false,
+        inner_unique: false,
     }
 }
 
@@ -7805,6 +7879,7 @@ fn push_set_tree(
                     PlanKeys::NONE
                 },
                 key: Some(NodeKey::new(block, role)),
+                hash_columns: None,
                 verbose_quals: NO_QUALS,
                 schema: StackStr::new(),
                 subplan: None,
@@ -7818,6 +7893,8 @@ fn push_set_tree(
                 subplans_removed: None,
                 target_member: false,
                 scan_pruned: false,
+                uncounted: false,
+                inner_unique: false,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -8372,18 +8449,29 @@ fn plan_write<'a>(
         ));
     }
     let capacity = if let Some(from) = joined_from {
+        // A partitioned or inheritance target lists each member and scans
+        // it under an `Append`.
         3 + (from.joins.len() + 2) * 3
+            + match relation_slot(storage, txid, target.schema, target.name) {
+                Some(slot) if query::partition_prune::expands(storage, slot, txid) => {
+                    2 * crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?
+                        .len()
+                }
+                _ => 0,
+            }
     } else if let Some(select) = source {
         1 + select_plan_capacity(select)
     } else {
         // A partitioned or inheritance target lists each member and scans
-        // it under an `Append`.
-        3 + match relation_slot(storage, txid, target.schema, target.name) {
-            Some(slot) if query::partition_prune::expands(storage, slot, txid) => {
-                2 * crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?.len()
+        // it under an `Append`; a `MERGE` joins it with its source's scan.
+        3 + 4 * usize::from(matches!(statement, Stmt::Merge(_)))
+            + match relation_slot(storage, txid, target.schema, target.name) {
+                Some(slot) if query::partition_prune::expands(storage, slot, txid) => {
+                    2 * crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?
+                        .len()
+                }
+                _ => 0,
             }
-            _ => 0,
-        }
     };
     let mut plan = Plan::new(arena, capacity)?;
     let mut name = StackStr::new();
@@ -8405,6 +8493,7 @@ fn plan_write<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: Some(NodeKey::new(block, Role::Modify)),
+        hash_columns: None,
         verbose_quals: NO_QUALS,
         schema: relation_slot(storage, txid, target.schema, target.name)
             .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
@@ -8420,6 +8509,8 @@ fn plan_write<'a>(
         subplans_removed: None,
         target_member: false,
         scan_pruned: false,
+        uncounted: false,
+        inner_unique: false,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -8444,27 +8535,55 @@ fn plan_write<'a>(
             return Ok(plan);
         }
     }
-    // A joined write or a MERGE reads each member of a partitioned or
-    // inheritance target in its own join, which this plan does not model.
-    if (joined_from.is_some() || matches!(statement, Stmt::Merge(_)))
-        && let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
-        && query::partition_prune::expands(storage, slot, txid)
-    {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a joined write to a partitioned table or inheritance tree is not supported"
-        ));
-    }
-    // MERGE joins its target to its source, which this plan does not build.
-    if matches!(statement, Stmt::Merge(_)) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of MERGE is not supported"
-        ));
+    if let Stmt::Merge(merge) = statement {
+        let mut plan = plan_merge(plan, storage, txid, merge, block, arena)?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
     }
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");
+        // A partitioned or inheritance target joins the `Append` of the
+        // members its condition keeps; with none, the join is PostgreSQL's
+        // dummy relation and reads a `Result` returning no rows.
+        let inheritance = write_inheritance(statement);
+        let target_definition = storage.table_def(target_slot, txid);
+        let target_expansion = if query::partition_prune::expands(storage, target_slot, txid)
+            && (inheritance == crate::sql::ast::RelationInheritance::Descendants
+                || target_definition.partition.is_partitioned())
+        {
+            let expansion = if inheritance == crate::sql::ast::RelationInheritance::Only {
+                None
+            } else {
+                target_members(
+                    storage,
+                    txid,
+                    target_slot,
+                    alias.unwrap_or(target.name),
+                    predicate,
+                    true,
+                    arena,
+                )?
+            };
+            if expansion.is_none() {
+                plan.push(PlanNode {
+                    name: StackStr::from_str("Result"),
+                    depth: 1,
+                    rows: 0,
+                    total_cost: 0.0,
+                    constant_false: true,
+                    ..PlanNode::EMPTY
+                })?;
+                plan.nodes[0].set_output(None);
+                plan.planning_micros =
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                return Ok(plan);
+            }
+            expansion
+        } else {
+            None
+        };
+        drop(target_definition);
         let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
         let order = arena
             .alloc_slice_with(scope.n, |index| index)
@@ -8543,7 +8662,44 @@ fn plan_write<'a>(
                 .is_some();
         let target_definition = storage.table_def(target_slot, txid);
         let target_exposed = alias.unwrap_or(target.name);
+        // `VERBOSE` lists cover a join of one FROM table, read sequentially.
+        let lists = match scope.defs.stored(0) {
+            Some(source)
+                if scope.n == 1
+                    && from.joins.is_empty()
+                    && from.base.subquery.is_none()
+                    && from.base.cte.is_none()
+                    && !scope.lateral[0]
+                    && scope.slots[0] != usize::MAX
+                    && !storage.relation_has_descendants(scope.slots[0], txid)
+                    && source_nodes[0].name.as_str() == "Seq Scan" =>
+            {
+                let (assignments, returning): (&[(&str, &Expr<'_>)], _) = match statement {
+                    Stmt::Update(update) => (update.assignments, update.returning),
+                    Stmt::Delete(delete) => (&[], delete.returning),
+                    _ => unreachable!("a joined write is an UPDATE or DELETE"),
+                };
+                let definition = (*target_definition).clone();
+                targets::RelationTargets::joined_write(
+                    storage,
+                    txid,
+                    &definition,
+                    target_exposed,
+                    source,
+                    scope.names[0],
+                    target_expansion.is_some(),
+                    assignments,
+                    returning,
+                    predicate,
+                    arena,
+                )?
+            }
+            _ => None,
+        };
         let filters = arena
+            .alloc_slice_with(relations_count, |_| None::<StackStr<512>>)
+            .map_err(|_| arena_full())?;
+        let verbose_filters = arena
             .alloc_slice_with(relations_count, |_| None::<StackStr<512>>)
             .map_err(|_| arena_full())?;
         let join_filters = arena
@@ -8601,6 +8757,7 @@ fn plan_write<'a>(
                 arena,
             )? {
                 filters.copy_from_slice(quals.filters);
+                verbose_filters.copy_from_slice(quals.verbose_filters);
                 join_filters.copy_from_slice(quals.join_filters);
                 hash_cond = quals.hash_cond;
             }
@@ -8665,6 +8822,41 @@ fn plan_write<'a>(
             QualLabel::JoinFilter,
             join_filters[relations_count - 1].take(),
         );
+        let mut join = join;
+        join.uncounted = true;
+        if let Some(lists) = lists.as_ref() {
+            join.set_output(Some(lists.join));
+        }
+        // The result relations, named as the members' scans are.
+        let fresh_names = || -> Result<RangeTableNames<'_>, SqlError> {
+            let count = target_expansion.map_or(0, |expansion| expansion.planned.leaves.len());
+            let names = arena
+                .alloc_slice_with(count + 1, |_| StackStr::<96>::new())
+                .map_err(|_| arena_full())?;
+            names[0] = StackStr::from_str(target_exposed);
+            Ok(RangeTableNames { names, count: 1 })
+        };
+        if let Some(expansion) = target_expansion {
+            let mut targets = fresh_names()?;
+            for &leaf in expansion.started {
+                let name = targets.take(target_exposed)?;
+                let member = storage.table_def(leaf, txid);
+                plan.push(PlanNode {
+                    name: StackStr::from_str(verb),
+                    relation: StackStr::from_str(member.name.as_str()),
+                    schema: StackStr::from_str(member.schema.as_str()),
+                    alias: if name.as_str() == member.name.as_str() {
+                        StackStr::new()
+                    } else {
+                        name
+                    },
+                    depth: 1,
+                    target_member: true,
+                    ..PlanNode::EMPTY
+                })?;
+            }
+        }
+        let join_index = plan.count;
         plan.push(join)?;
         for position in (1..relations_count - 1).rev() {
             plan.push(
@@ -8680,11 +8872,42 @@ fn plan_write<'a>(
                 .with_qual(QualLabel::JoinFilter, join_filters[position].take()),
             )?;
         }
-        let target_scan = target_scan.with_qual(QualLabel::Filter, filters[0].take());
-        push_scan(&mut plan, target_scan)?;
+        let mut target_scan = target_scan
+            .with_qual(QualLabel::Filter, filters[0].take())
+            .with_verbose_qual(QualLabel::Filter, verbose_filters[0].take());
+        if let Some(lists) = lists.as_ref() {
+            target_scan.set_output(Some(lists.target));
+        }
+        if let Some(expansion) = target_expansion {
+            push_members(
+                &mut plan,
+                storage,
+                txid,
+                target_scan,
+                expansion,
+                true,
+                &mut fresh_names()?,
+                &|_| None,
+                None,
+            )?;
+            // One member scanned in place of the `Append` names the
+            // target's columns in the join's conditions.
+            if expansion.planned.leaves.len() == 1 {
+                let member = plan.nodes[plan.count - 1];
+                for node in &mut plan.nodes[join_index..plan.count - 1] {
+                    node.requalify(target_exposed, member.exposed_name());
+                }
+            }
+        } else {
+            push_scan(&mut plan, target_scan)?;
+        }
         for (position, &table) in order[..scope.n].iter().enumerate() {
-            let mut node =
-                source_nodes[table].with_qual(QualLabel::Filter, filters[table + 1].take());
+            let mut node = source_nodes[table]
+                .with_qual(QualLabel::Filter, filters[table + 1].take())
+                .with_verbose_qual(QualLabel::Filter, verbose_filters[table + 1].take());
+            if let Some(lists) = lists.as_ref() {
+                node.set_output(Some(lists.source));
+            }
             let sequential =
                 node.name.as_str() == "Seq Scan" && crate::sql::guc::planner_methods().material;
             let hash = hash_at(position + 1);
@@ -8699,6 +8922,7 @@ fn plan_write<'a>(
                     width: node.width,
                     object_requests: node.object_requests,
                     cache_blocks: node.cache_blocks,
+                    output: node.output,
                     ..PlanNode::EMPTY
                 })?;
                 node.depth += 1;
@@ -8731,9 +8955,22 @@ fn plan_write<'a>(
                 arena,
             )?;
         }
-        // A joined write's lists qualify each relation's columns, which
-        // this plan does not model.
-        plan.nodes[0].set_output(None);
+        match lists {
+            Some(lists) => {
+                plan.nodes[0].set_output(Some(lists.returned.unwrap_or_default()));
+                // The `RETURNING` list is set against the first result
+                // relation, as a one-table write's is.
+                if target_expansion.is_some() {
+                    let first = unique_rtable_name(
+                        target_exposed,
+                        &[StackStr::<96>::from_str(target_exposed)],
+                    );
+                    plan.nodes[0].requalify(target_exposed, first.as_str());
+                }
+            }
+            // Other joined writes' lists are outside this plan.
+            None => plan.nodes[0].set_output(None),
+        }
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
@@ -8937,6 +9174,690 @@ fn plan_write<'a>(
     Ok(plan)
 }
 
+/// Plans a `MERGE` as execution joins its target and source
+/// (`query::merge_join_plan`): a hash join building on the smaller
+/// relation, or a nested loop rescanning it, whose `ON` conditions reading
+/// one side filter that side's scan unless the join keeps that side's
+/// unmatched rows. `plan` holds the write's node.
+fn plan_merge<'a, 'e>(
+    mut plan: Plan<'a>,
+    storage: &Storage,
+    txid: u32,
+    merge: &'e crate::sql::ast::Merge<'e>,
+    block: BlockId,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let unsupported = |what: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of MERGE {} is not supported",
+            what
+        )
+    };
+    let target = merge.target;
+    let Some(target_slot) = relation_slot(storage, txid, target.schema, target.name) else {
+        return Err(unsupported("into a view"));
+    };
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let source = merge.source;
+    // Whether the `ON` condition reads column `name` of the target
+    // (`relation` 0) or the source (1), or reads either's whole row.
+    let target_name = merge.target_alias.unwrap_or(target.name);
+    let source_name = source.alias.unwrap_or(source.table);
+    let reads_in = |condition: &Expr<'_>,
+                    relation: usize,
+                    name: &str,
+                    columns: &[crate::storage::ColumnMeta]| {
+        let named = |column: &str| columns.iter().any(|meta| meta.name.as_str() == column);
+        let mut reads = false;
+        condition.for_each_column_reference(&mut |qualifier, column| {
+            reads |= column == name
+                && match qualifier {
+                    Some(qualifier) => {
+                        qualifier
+                            == if relation == 0 {
+                                target_name
+                            } else {
+                                source_name
+                            }
+                    }
+                    None => named(column),
+                };
+        });
+        let mut whole = false;
+        visit_whole_rows(condition, &mut |table| {
+            whole |= table
+                == if relation == 0 {
+                    target_name
+                } else {
+                    source_name
+                };
+        });
+        reads || whole
+    };
+    let on_reads = |relation: usize, name: &str, columns: &[crate::storage::ColumnMeta]| {
+        reads_in(merge.on, relation, name, columns)
+    };
+    // What the indexes of the relation in `slot` (`relation` 0 the target,
+    // 1 the source) offer the join over the `key` columns PostgreSQL may
+    // hash: an index on another column `ON` reads, or a partial or
+    // expression index, may be scanned, joined or merged by as its costs
+    // choose; an index on hash keys only serves a nested loop rescanning
+    // that relation. A unique one on those keys makes it unique for the
+    // join.
+    let index_reach = |slot: usize, relation: usize, key: &dyn Fn(&str) -> bool| {
+        let definition = storage.table_def(slot, txid);
+        let columns = definition.columns();
+        let name = |column: u16| {
+            columns
+                .get(usize::from(column))
+                .map(|meta| meta.name.as_str())
+        };
+        let mut reach = IndexReach {
+            // A column's own `PRIMARY KEY` or `UNIQUE` constraint.
+            unique: columns
+                .iter()
+                .any(|meta| (meta.unique || meta.primary) && key(meta.name.as_str())),
+            ..IndexReach::default()
+        };
+        for index in storage.indexes_for_slot(slot, txid) {
+            let plain = index.predicate.is_none()
+                && index.expressions[..index.n_cols]
+                    .iter()
+                    .all(Option::is_none);
+            if !plain {
+                reach.other = true;
+                continue;
+            }
+            let keys = &index.columns[..index.n_cols];
+            reach.unique |=
+                index.unique && keys.iter().all(|&column| name(column).is_some_and(key));
+        }
+        for binding in 0..storage.value_binding_count(slot) {
+            let (keys, count) = storage.value_binding_columns(slot, binding);
+            for &column in &keys[..count] {
+                match name(column) {
+                    Some(name) if !on_reads(relation, name, columns) => {}
+                    Some(name) if key(name) => reach.keys = true,
+                    _ => reach.other = true,
+                }
+            }
+        }
+        reach
+    };
+    let values = source.subquery.and_then(values_list);
+    let source_slot = match storage.resolve_relation(source.schema, source.table, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot))
+            if source.subquery.is_none()
+                && source.cte.is_none()
+                && source.func_args.is_none()
+                && source.rows_from.is_none()
+                && source.join_members.is_none() =>
+        {
+            Some(slot)
+        }
+        _ => None,
+    };
+    if source_slot.is_none() && values.is_none() {
+        return Err(unsupported(
+            "from a source other than a table or VALUES list",
+        ));
+    }
+    if let Some(slot) = source_slot
+        && (storage.relation_has_descendants(slot, txid)
+            || storage.table_def(slot, txid).kind != crate::storage::TableKind::Local
+            || storage.row_security_applies(slot, role, txid))
+    {
+        return Err(unsupported("from a table with row security or descendants"));
+    }
+    if storage.row_security_applies(target_slot, role, txid) {
+        return Err(unsupported("into a table with row security"));
+    }
+    let join = query::merge_join_plan(storage, merge, txid, arena)?;
+    let inheritance = merge.target_inheritance;
+    let target_definition = (*storage.table_def(target_slot, txid)).clone();
+    let exposed = merge.target_alias.unwrap_or(target.name);
+    let tree = query::partition_prune::expands(storage, target_slot, txid)
+        && (inheritance == crate::sql::ast::RelationInheritance::Descendants
+            || target_definition.partition.is_partitioned());
+    let expansion = if tree {
+        if inheritance == crate::sql::ast::RelationInheritance::Only {
+            return Err(unsupported("into ONLY a partitioned table"));
+        }
+        match target_members(
+            storage,
+            txid,
+            target_slot,
+            exposed,
+            (!join.preserves_target).then_some(merge.on),
+            true,
+            arena,
+        )? {
+            Some(expansion) => Some(expansion),
+            None => return Err(unsupported("whose target pruning leaves no member")),
+        }
+    } else {
+        None
+    };
+    let leaves = match expansion {
+        Some(expansion) => expansion.planned.leaves,
+        None => core::slice::from_ref(&target_slot),
+    };
+    if leaves
+        .iter()
+        .any(|&leaf| storage.table_def(leaf, txid).kind != crate::storage::TableKind::Local)
+    {
+        return Err(unsupported("into a table with a foreign member"));
+    }
+    // A column `ON` reads only in the hash join's key equalities.
+    let key_only = |relation: usize, name: &str, columns: &[crate::storage::ColumnMeta]| {
+        let conditions = join.conditions;
+        [conditions.target, conditions.source, conditions.join]
+            .into_iter()
+            .flatten()
+            .all(|condition| !reads_in(condition, relation, name, columns))
+    };
+    let target_key = |name: &str| {
+        join.keys()
+            .iter()
+            .any(|&(column, _)| target_definition.columns()[column].name.as_str() == name)
+            && key_only(0, name, target_definition.columns())
+    };
+    let source_columns = source_slot.map(|slot| (*storage.table_def(slot, txid)).clone());
+    let source_key = |name: &str| {
+        join.keys().iter().any(|&(_, column)| column == name)
+            && source_columns
+                .as_ref()
+                .is_some_and(|definition| key_only(1, name, definition.columns()))
+    };
+    let target_reach = match expansion {
+        Some(_) => leaves.iter().fold(IndexReach::default(), |reach, &leaf| {
+            reach.with(index_reach(leaf, 0, &target_key))
+        }),
+        None => index_reach(target_slot, 0, &target_key),
+    };
+    let source_reach = source_slot.map_or(IndexReach::default(), |slot| {
+        index_reach(slot, 1, &source_key)
+    });
+    // PostgreSQL merges relations it knows no statistics for.
+    let target_rows = leaves.iter().try_fold(0u64, |rows, &leaf| {
+        storage
+            .table_statistics(leaf, txid)
+            .valid
+            .then(|| rows.saturating_add(storage.planning_row_estimate(leaf)))
+    });
+    let values_count = values
+        .and_then(values_rows)
+        .map_or(0, |(rows, _)| rows as usize);
+    let source_rows =
+        crate::sql::exec::merge_source_planned_rows(storage, merge, values_count, txid);
+    let (Some(target_rows), Some(source_rows)) = (target_rows, source_rows) else {
+        return Err(unsupported("of relations without statistics"));
+    };
+    let source_outer = join.source_outer(target_rows, source_rows);
+    // An index on the hashed relation's keys alone leaves the hash join,
+    // whose outer relation PostgreSQL would rescan by it otherwise.
+    let (outer_reach, inner_reach) = if source_outer {
+        (source_reach, target_reach)
+    } else {
+        (target_reach, source_reach)
+    };
+    if outer_reach.keys
+        || outer_reach.other
+        || inner_reach.other
+        || (inner_reach.keys && !join.hashed())
+    {
+        return Err(unsupported(
+            "with an index on a column its join condition reads",
+        ));
+    }
+    // The relations' names and columns, as the conditions print them.
+    let source_from = &*arena
+        .alloc(crate::sql::ast::FromClause {
+            base: source,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let (scope, _) = query::dml_join_scope(
+        storage,
+        target,
+        merge.target_alias,
+        Some(source_from),
+        txid,
+        arena,
+        None,
+    )?;
+    let source_name = scope.names[1];
+    let source_definition = source_slot.map(|slot| (*storage.table_def(slot, txid)).clone());
+    let source_joined = match source_definition.as_ref() {
+        Some(definition) => crate::sql::catalog::deparse::Joined::new(source_name, definition),
+        None => {
+            let definition = scope.defs.get(1).expect("resolved source");
+            let columns = arena
+                .alloc_slice_with(definition.n_columns, |index| {
+                    crate::sql::catalog::deparse::Column {
+                        name: definition.columns[index].name.as_str(),
+                        type_oid: None,
+                        merged: None,
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            for (index, column) in columns.iter_mut().enumerate() {
+                let printed = arena
+                    .alloc_str_display(format_args!("column{}", index + 1))
+                    .map_err(|_| arena_full())?;
+                column.merged = Some((Some("*VALUES*"), printed));
+            }
+            crate::sql::catalog::deparse::Joined {
+                unqualified: true,
+                printed: crate::sql::catalog::deparse::printed_name(source_name),
+                ..crate::sql::catalog::deparse::Joined::rule_columns(
+                    source_name,
+                    crate::sql::catalog::deparse::Columns::Derived(columns),
+                )
+            }
+        }
+    };
+    let target_table = &target_definition;
+    let joined = arena
+        .alloc_slice_with(2, |at| {
+            if at == 0 {
+                crate::sql::catalog::deparse::Joined::new(exposed, target_table)
+            } else {
+                source_joined
+            }
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+        bare: None,
+        domain_value: None,
+        sublinks: Some(&registered_sublink),
+        references: None,
+        folded: true,
+        arena,
+        dependencies: None,
+    };
+    // Each `ON` conjunct by the relations it reads: a hash key, a filter of
+    // one side's scan, or the join's filter.
+    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        let reads = |relation: &crate::sql::catalog::deparse::Joined<'_>| {
+            qualifier.is_none_or(|qualifier| qualifier == relation.name)
+                && relation.columns.position(name).is_some()
+        };
+        if reads(&joined[0]) {
+            Some(0)
+        } else if reads(&joined[1]) {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(merge.on, &mut conjuncts, &mut count, arena).is_none() {
+        return Err(unsupported("with this join condition"));
+    }
+    let column_of = |side: &Expr<'e>| -> Option<(usize, &'e str)> {
+        match side {
+            Expr::Column { qualifier, name } => {
+                resolve(*qualifier, name).map(|relation| (relation, *name))
+            }
+            _ => None,
+        }
+    };
+    let mut hash_conds = crate::mem::arena::ArenaList::new(arena);
+    let mut join_filters = crate::mem::arena::ArenaList::new(arena);
+    // The conjuncts the join evaluates, in `ON` order.
+    let mut join_conjuncts = crate::mem::arena::ArenaList::new(arena);
+    let mut target_filters = crate::mem::arena::ArenaList::new(arena);
+    let mut source_filters = crate::mem::arena::ArenaList::new(arena);
+    for &conjunct in &conjuncts[..count] {
+        if conjunct.contains_subquery() {
+            return Err(unsupported("with a subquery in its join condition"));
+        }
+        let key = match conjunct {
+            Expr::Binary {
+                operator: crate::sql::ast::BinaryOp::Eq,
+                left,
+                right,
+                source_position,
+            } => match (column_of(left), column_of(right)) {
+                (Some((0, target_column)), Some((1, source_column)))
+                | (Some((1, source_column)), Some((0, target_column)))
+                    if join.keys().iter().any(|&(column, name)| {
+                        target_table.columns()[column].name.as_str() == target_column
+                            && name == source_column
+                    }) =>
+                {
+                    let (target_side, source_side) =
+                        if column_of(left).is_some_and(|(relation, _)| relation == 0) {
+                            (*left, *right)
+                        } else {
+                            (*right, *left)
+                        };
+                    let (outer_side, inner_side) = if source_outer {
+                        (source_side, target_side)
+                    } else {
+                        (target_side, source_side)
+                    };
+                    Some(
+                        &*arena
+                            .alloc(Expr::Binary {
+                                operator: crate::sql::ast::BinaryOp::Eq,
+                                left: outer_side,
+                                right: inner_side,
+                                source_position: *source_position,
+                            })
+                            .map_err(|_| arena_full())?,
+                    )
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(key) = key {
+            hash_conds.push(key).map_err(|_| arena_full())?;
+            join_conjuncts.push(conjunct).map_err(|_| arena_full())?;
+            continue;
+        }
+        let list = match relation_mask(conjunct, &resolve) {
+            Some(1) if !join.preserves_target => &mut target_filters,
+            Some(2) if !join.preserves_source => &mut source_filters,
+            Some(1..=3) => {
+                join_conjuncts.push(conjunct).map_err(|_| arena_full())?;
+                &mut join_filters
+            }
+            _ => return Err(unsupported("with this join condition")),
+        };
+        list.push(conjunct).map_err(|_| arena_full())?;
+    }
+    if values.is_some() && !source_filters.as_slice().is_empty() {
+        return Err(unsupported("filtering its VALUES list"));
+    }
+    let hash_cond = deparse_qual(&context, hash_conds.as_slice(), arena)?;
+    let join_filter = deparse_qual(&context, join_filters.as_slice(), arena)?;
+    let and_all = |list: &[&'e Expr<'e>]| -> Result<Option<&Expr<'_>>, SqlError> {
+        let mut condition = None;
+        for &conjunct in list {
+            condition = query::and_where(condition, Some(conjunct), arena)?;
+        }
+        Ok(condition)
+    };
+    let target_condition = and_all(target_filters.as_slice())?;
+    let source_condition = and_all(source_filters.as_slice())?;
+    // The scans, the outer one at depth 2 and the inner one below a `Hash`
+    // or `Materialize`.
+    let (outer_preserved, inner_preserved) = if source_outer {
+        (join.preserves_source, join.preserves_target)
+    } else {
+        (join.preserves_target, join.preserves_source)
+    };
+    let join_name = match (join.hashed(), outer_preserved, inner_preserved) {
+        (true, false, false) => "Hash Join",
+        (true, true, false) => "Hash Left Join",
+        (true, false, true) => "Hash Right Join",
+        (true, true, true) => "Hash Full Join",
+        (false, false, false) => "Nested Loop",
+        (false, true, false) => "Nested Loop Left Join",
+        (false, _, true) => return Err(unsupported("joining without an equality")),
+    };
+    if !join.hashed() && (values.is_some() || !crate::sql::guc::planner_methods().material) {
+        return Err(unsupported("joining without an equality"));
+    }
+    let lists = targets::RelationTargets::merge_write(
+        storage,
+        txid,
+        target_table,
+        exposed,
+        joined,
+        values.is_some(),
+        expansion.is_some(),
+        merge,
+        join.preserves_target,
+        join_conjuncts.as_slice(),
+        arena,
+    )?;
+    let (target_depth, source_depth) = if source_outer { (3, 2) } else { (2, 3) };
+    let mut target_scan = physical_scan_node(
+        storage,
+        target_slot,
+        target.name,
+        target_condition.is_some(),
+        txid,
+        target_depth,
+        None,
+    );
+    target_scan.alias = plan.nodes[0].alias;
+    let filter = |verbose: bool| {
+        single_relation_quals(
+            storage,
+            txid,
+            exposed,
+            target_table,
+            target_condition,
+            &[],
+            None,
+            verbose,
+            arena,
+        )
+        .map(|(_, filter)| filter)
+    };
+    let mut target_scan = target_scan
+        .with_qual(QualLabel::Filter, filter(false)?)
+        .with_verbose_qual(QualLabel::Filter, filter(true)?);
+    target_scan.key = Some(NodeKey::new(block, Role::Scan(0)));
+    target_scan.set_output(lists.as_ref().map(|lists| lists.scans[0]));
+    let source_scan = match source_slot {
+        Some(slot) => {
+            let definition = joined[1].table().expect("a table source");
+            let mut scan = physical_scan_node(
+                storage,
+                slot,
+                source.table,
+                source_condition.is_some(),
+                txid,
+                source_depth,
+                None,
+            );
+            if source_name != source.table {
+                scan.alias = StackStr::from_str(source_name);
+            }
+            let filter = |verbose: bool| {
+                single_relation_quals(
+                    storage,
+                    txid,
+                    source_name,
+                    definition,
+                    source_condition,
+                    &[],
+                    None,
+                    verbose,
+                    arena,
+                )
+                .map(|(_, filter)| filter)
+            };
+            scan.with_qual(QualLabel::Filter, filter(false)?)
+                .with_verbose_qual(QualLabel::Filter, filter(true)?)
+        }
+        None => PlanNode {
+            name: StackStr::from_str("Values Scan"),
+            alias: StackStr::from_str("*VALUES*"),
+            depth: source_depth,
+            rows: source_rows,
+            total_cost: 0.01,
+            ..PlanNode::EMPTY
+        },
+    };
+    let mut source_scan = source_scan;
+    source_scan.set_output(lists.as_ref().map(|lists| lists.scans[1]));
+    source_scan.key = Some(NodeKey::new(block, Role::Scan(1)));
+    let fresh_names = || -> Result<RangeTableNames<'_>, SqlError> {
+        let names = arena
+            .alloc_slice_with(leaves.len() + 1, |_| StackStr::<96>::new())
+            .map_err(|_| arena_full())?;
+        names[0] = StackStr::from_str(exposed);
+        Ok(RangeTableNames { names, count: 1 })
+    };
+    if let Some(expansion) = expansion {
+        let mut targets = fresh_names()?;
+        for &leaf in expansion.started {
+            let name = targets.take(exposed)?;
+            let member = storage.table_def(leaf, txid);
+            plan.push(PlanNode {
+                name: StackStr::from_str("Merge"),
+                relation: StackStr::from_str(member.name.as_str()),
+                schema: StackStr::from_str(member.schema.as_str()),
+                alias: if name.as_str() == member.name.as_str() {
+                    StackStr::new()
+                } else {
+                    name
+                },
+                depth: 1,
+                target_member: true,
+                ..PlanNode::EMPTY
+            })?;
+        }
+    }
+    let join_index = plan.count;
+    plan.push(
+        PlanNode {
+            name: StackStr::from_str(join_name),
+            depth: 1,
+            total_cost: target_scan.total_cost + source_scan.total_cost,
+            rows: target_scan.rows.max(source_scan.rows),
+            width: target_scan.width,
+            key: Some(NodeKey::new(block, Role::Join(1))),
+            inner_unique: inner_reach.unique,
+            output: lists.as_ref().map(|lists| lists.join).unwrap_or_default(),
+            output_unprintable: lists.is_none(),
+            ..PlanNode::EMPTY
+        }
+        .with_qual(QualLabel::HashCond, hash_cond)
+        .with_qual(QualLabel::JoinFilter, join_filter),
+    )?;
+    let push_target = |plan: &mut Plan<'a>, scan: PlanNode| -> Result<(), SqlError> {
+        match expansion {
+            Some(expansion) => {
+                push_members(
+                    plan,
+                    storage,
+                    txid,
+                    scan,
+                    expansion,
+                    true,
+                    &mut fresh_names()?,
+                    &|leaf| {
+                        Some(NodeKey::new(
+                            block,
+                            Role::Member(0, u32::try_from(leaf).unwrap_or(u32::MAX)),
+                        ))
+                    },
+                    None,
+                )?;
+                // One member scanned in place of the `Append` names the
+                // target's columns in the join's conditions.
+                if expansion.planned.leaves.len() == 1 {
+                    let member = plan.nodes[plan.count - 1];
+                    plan.nodes[join_index].requalify(exposed, member.exposed_name());
+                }
+                Ok(())
+            }
+            None => push_scan(plan, scan),
+        }
+    };
+    let inner = |scan: &PlanNode, relation: usize| PlanNode {
+        name: StackStr::from_str(if join.hashed() { "Hash" } else { "Materialize" }),
+        key: Some(NodeKey::new(
+            block,
+            if join.hashed() {
+                Role::Hash(relation as u16)
+            } else {
+                Role::Materialize(relation as u16)
+            },
+        )),
+        depth: 2,
+        total_cost: scan.total_cost,
+        rows: scan.rows,
+        width: scan.width,
+        output: scan.output,
+        output_unprintable: scan.output_unprintable,
+        hash_columns: lists
+            .as_ref()
+            .filter(|_| join.hashed())
+            .map(|lists| lists.hashed[relation]),
+        ..PlanNode::EMPTY
+    };
+    if source_outer {
+        push_scan(&mut plan, source_scan)?;
+        plan.push(inner(&target_scan, 0))?;
+        push_target(&mut plan, target_scan)?;
+    } else {
+        push_target(&mut plan, target_scan)?;
+        plan.push(inner(&source_scan, 1))?;
+        push_scan(&mut plan, source_scan)?;
+    }
+    plan.nodes[0].total_cost = plan.nodes[join_index].total_cost;
+    match lists {
+        Some(lists) => {
+            plan.nodes[0].set_output(Some(lists.returned.unwrap_or_default()));
+            // The `RETURNING` list is set against the first result relation.
+            if expansion.is_some() {
+                let first = unique_rtable_name(exposed, &[StackStr::<96>::from_str(exposed)]);
+                plan.nodes[0].requalify(exposed, first.as_str());
+            }
+        }
+        None => plan.nodes[0].set_output(None),
+    }
+    Ok(plan)
+}
+
+/// What a relation's indexes offer a `MERGE`'s join: one on a column
+/// `ON` reads only as a hash key (`keys`), one on another column it reads
+/// or a partial or expression index (`other`), and a unique one on hash
+/// keys (`unique`).
+#[derive(Clone, Copy, Default)]
+struct IndexReach {
+    keys: bool,
+    other: bool,
+    unique: bool,
+}
+
+impl IndexReach {
+    /// The reach of a tree's members together, which PostgreSQL does not
+    /// prove unique.
+    fn with(self, member: Self) -> Self {
+        Self {
+            keys: self.keys || member.keys,
+            other: self.other || member.other,
+            unique: false,
+        }
+    }
+}
+
+/// Calls `visit` with the relation of each whole-row reference of
+/// `expression`, its subqueries included.
+fn visit_whole_rows(expression: &Expr<'_>, visit: &mut dyn FnMut(&str)) {
+    if let Expr::WholeRow(table) = expression {
+        visit(table);
+    }
+    let _ = query::walk_children(expression, &mut |child| {
+        visit_whole_rows(child, visit);
+        Ok(())
+    });
+}
+
 /// Whether a write returns nothing.
 fn returning_empty(statement: &Stmt<'_>) -> bool {
     match statement {
@@ -8974,7 +9895,6 @@ fn expanded_write<'e>(
     block: BlockId,
     arena: &'e Arena,
 ) -> Result<PlanNode, SqlError> {
-    use query::partition_prune::{PruneStage, ScanRelation, ScanValues, conjuncts, members};
     let inheritance = write_inheritance(statement);
     let definition = (*storage.table_def(slot, txid)).clone();
     let exposed = alias.unwrap_or(definition.name.as_str());
@@ -9000,62 +9920,12 @@ fn expanded_write<'e>(
         plan.push(empty)?;
         return Ok(empty);
     }
-    let columns = arena
-        .alloc_slice_copy(definition.columns())
-        .map_err(|_| arena_full())?;
-    let values = ScanValues {
-        storage,
-        txid,
-        relation: ScanRelation::Target {
-            columns,
-            name: exposed,
-        },
-        arena,
-        params: crate::sql::eval::generic_plan_parameters(),
-        hooks: &crate::sql::eval::NO_HOOKS,
-        outer: None,
-    };
-    let conditions = conjuncts(predicate, arena)?;
-    let planned = members(
-        storage,
-        txid,
-        slot,
-        conditions,
-        &values,
-        PruneStage::Plan,
-        arena,
-    )?;
-    let own = |qualifier: Option<&str>, _: &str| qualifier.is_none_or(|q| q == exposed);
-    reject_member_indexes(storage, txid, planned.leaves, &|name| {
-        reads_column(conditions.iter().copied(), &own, name)
-    })?;
-    if planned.leaves.is_empty() {
+    let Some(Expansion {
+        planned, started, ..
+    }) = target_members(storage, txid, slot, exposed, predicate, false, arena)?
+    else {
         plan.push(empty)?;
         return Ok(empty);
-    }
-    let started = if planned.leaves.len() >= 2 {
-        let kept = members(
-            storage,
-            txid,
-            slot,
-            conditions,
-            &values,
-            PruneStage::Startup,
-            arena,
-        )?;
-        let started = arena
-            .alloc_slice_with(planned.leaves.len(), |_| 0usize)
-            .map_err(|_| arena_full())?;
-        let mut count = 0;
-        for &leaf in planned.leaves {
-            if kept.leaves.contains(&leaf) {
-                started[count] = leaf;
-                count += 1;
-            }
-        }
-        &started[..count]
-    } else {
-        planned.leaves
     };
     let mut scan = physical_scan_node(
         storage,
@@ -9199,6 +10069,87 @@ fn expanded_write<'e>(
     Ok(scan)
 }
 
+/// The members an `UPDATE` or `DELETE` of the partitioned table or
+/// inheritance tree `slot`, exposed as `exposed`, reaches under its
+/// condition: those planning keeps, and of them those executor startup
+/// keeps. `None` when pruning leaves none. A `joined` write's FROM items'
+/// columns prune nothing.
+fn target_members<'e>(
+    storage: &Storage,
+    txid: u32,
+    slot: usize,
+    exposed: &str,
+    predicate: Option<&'e Expr<'e>>,
+    joined: bool,
+    arena: &'e Arena,
+) -> Result<Option<Expansion<'e>>, SqlError> {
+    use query::partition_prune::{PruneStage, ScanRelation, ScanValues, conjuncts, members};
+    let definition = storage.table_def(slot, txid);
+    let columns = arena
+        .alloc_slice_copy(definition.columns())
+        .map_err(|_| arena_full())?;
+    let values = ScanValues {
+        storage,
+        txid,
+        relation: ScanRelation::Target {
+            columns,
+            name: exposed,
+            joined,
+        },
+        arena,
+        params: crate::sql::eval::generic_plan_parameters(),
+        hooks: &crate::sql::eval::NO_HOOKS,
+        outer: None,
+    };
+    let conditions = conjuncts(predicate, arena)?;
+    let planned = members(
+        storage,
+        txid,
+        slot,
+        conditions,
+        &values,
+        PruneStage::Plan,
+        arena,
+    )?;
+    let own = |qualifier: Option<&str>, _: &str| qualifier.is_none_or(|q| q == exposed);
+    reject_member_indexes(storage, txid, planned.leaves, &|name| {
+        reads_column(conditions.iter().copied(), &own, name)
+    })?;
+    if planned.leaves.is_empty() {
+        return Ok(None);
+    }
+    let started = if planned.leaves.len() >= 2 {
+        let kept = members(
+            storage,
+            txid,
+            slot,
+            conditions,
+            &values,
+            PruneStage::Startup,
+            arena,
+        )?;
+        let started = arena
+            .alloc_slice_with(planned.leaves.len(), |_| 0usize)
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for &leaf in planned.leaves {
+            if kept.leaves.contains(&leaf) {
+                started[count] = leaf;
+                count += 1;
+            }
+        }
+        &started[..count]
+    } else {
+        planned.leaves
+    };
+    Ok(Some(Expansion {
+        planned,
+        started,
+        foreign_shipped: false,
+        foreign_local: &[],
+    }))
+}
+
 /// The target lists `VERBOSE` prints for a one-table write: the
 /// `RETURNING` list on the write's node, and on an `UPDATE` or `DELETE`
 /// scan the new values of the assigned columns in column order
@@ -9326,6 +10277,48 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
 
 /// The hash table a `Hash` node built while `EXPLAIN ANALYZE` ran: pos3ql
 /// builds it in one batch, in the arrays whose bytes it reports.
+/// A `Hash` node's table as PostgreSQL reports it: `ExecChooseHashTableSize`
+/// sizes its buckets from the node's row estimate, `ExecHashTableInsert`
+/// doubles them while the rows outnumber them, and its memory is its rows'
+/// bytes and its bucket pointers. The rows' bytes are pos3ql's own when a
+/// hashed value has no PostgreSQL size here.
+struct PostgresHashTable {
+    buckets: u64,
+    original_buckets: u64,
+    bytes: usize,
+}
+
+impl PostgresHashTable {
+    fn of(node: &PlanNode, table: query::instrument::HashTable) -> Self {
+        /// `MaxAllocSize / sizeof(HashJoinTuple)`.
+        const MAX_ALLOC_POINTERS: u64 = 0x3fff_ffff / 8;
+        // `get_hash_memory_limit`: work_mem times the default
+        // hash_mem_multiplier of 2, which pos3ql does not let a session change.
+        let memory_limit = u64::try_from(crate::sql::guc::work_mem_kilobytes())
+            .unwrap_or(0)
+            .saturating_mul(1024 * 2);
+        let pointers = (memory_limit / 8).clamp(1, MAX_ALLOC_POINTERS);
+        let max_pointers = (1u64 << pointers.ilog2()).min(i32::MAX as u64 / 2 + 1);
+        let estimated = if node.rows == 0 { 1000 } else { node.rows };
+        let original = estimated.min(max_pointers).max(1024).next_power_of_two();
+        let mut buckets = original;
+        // A row inserted while the rows before it outnumber the buckets
+        // doubles them.
+        while table.tuples.saturating_sub(1) > buckets
+            && buckets <= i32::MAX as u64 / 2
+            && buckets * 2 <= MAX_ALLOC_POINTERS
+        {
+            buckets *= 2;
+        }
+        let rows = table.tuple_bytes.unwrap_or(table.own_bytes);
+        Self {
+            buckets,
+            original_buckets: original,
+            bytes: rows.saturating_add(buckets as usize * 8),
+        }
+    }
+}
+
 fn hash_table(actual: NodeActual) -> Option<query::instrument::HashTable> {
     match actual {
         NodeActual::Ran(counters) => counters.hash,
@@ -9381,6 +10374,30 @@ pub(super) fn visit_text_rows<E>(
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
+        // A `MERGE`'s outcome follows its result relations.
+        if index > 0
+            && !node.target_member
+            && plan.nodes[1..index].iter().all(|node| node.target_member)
+            && let Some(tuples) = plan.merge_tuples(index)
+            && tuples.total > 0
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(&plan.nodes[0]) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Tuples:");
+            for (label, count) in [
+                ("inserted", tuples.inserted),
+                ("updated", tuples.updated),
+                ("deleted", tuples.deleted),
+                ("skipped", tuples.skipped),
+            ] {
+                if count > 0 {
+                    let _ = write!(line, " {label}={count}");
+                }
+            }
+            emit(line.as_str())?;
+        }
         if node.target_member {
             let mut line = StackStr::<512>::new();
             let parent =
@@ -9426,6 +10443,15 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
             emit(output.as_str())?;
+        }
+        // Text shows a join's proven unique inner relation under VERBOSE.
+        if options.verbose && node.inner_unique {
+            let mut line = StackStr::<64>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Inner Unique: true");
+            emit(line.as_str())?;
         }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
@@ -9539,6 +10565,7 @@ pub(super) fn visit_text_rows<E>(
             emit(line.as_str())?;
         }
         if let Some(table) = hash_table(node_actual) {
+            let table = PostgresHashTable::of(node, table);
             let mut line = StackStr::<256>::new();
             for _ in 0..node_indent(node) {
                 let _ = write!(line, " ");
@@ -10427,10 +11454,18 @@ fn structured_node(
             document.text("Alias", member.exposed_name());
             document.close_group("Result Relation", true);
         }
+    }
+    // A `MERGE`'s outcome, inside its result relations' group.
+    if at == 0
+        && let Some(tuples) = plan.merge_tuples(members_end)
+    {
+        tuples.properties(&mut |label, count| document.number(label, count));
+    }
+    if members_end > at + 1 {
         document.close_group("Target Tables", false);
     }
     if kind.join_type.is_some() {
-        document.boolean("Inner Unique", false);
+        document.boolean("Inner Unique", node.inner_unique);
     }
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);
@@ -10444,6 +11479,7 @@ fn structured_node(
         document.text("One-Time Filter", "false");
     }
     if let Some(table) = hash_table(node_actual) {
+        let table = PostgresHashTable::of(node, table);
         document.number("Hash Buckets", table.buckets);
         document.number("Original Hash Buckets", table.original_buckets);
         document.number("Hash Batches", 1);
@@ -10759,22 +11795,20 @@ pub(super) fn analyze_rewritten<'a, R>(
         RewrittenQuery::Notify => 0,
     };
     let total: usize = queries.iter().map(planned).sum();
-    let key_at = |mut index: usize| {
+    let slot_at = |mut index: usize| {
         for query in queries.iter() {
             if let RewrittenQuery::Planned(plan) = query {
                 if index < plan.count {
-                    return plan.nodes[index].key;
+                    let node = &plan.nodes[index];
+                    return Slot::new(node.key).with_hash_columns(node.hash_columns);
                 }
                 index -= plan.count;
             }
         }
-        None
+        Slot::new(None)
     };
     let slots = arena
-        .alloc_slice_with(total, key_at)
-        .map_err(|_| query::arena_full_pub())?;
-    let slots = arena
-        .alloc_slice_with(total, |index| Slot::new(slots[index]))
+        .alloc_slice_with(total, slot_at)
         .map_err(|_| query::arena_full_pub())?;
     let result = query::instrument::analyze_queries(slots, timing, execute);
     let mut start = 0;
@@ -10935,7 +11969,7 @@ pub(super) fn emit_plan(
     not(feature = "sql-fixture-suite")
 ))]
 mod tests {
-    use super::{PlanNode, object_request_cost, structured_node_name};
+    use super::{PlanNode, PostgresHashTable, object_request_cost, query, structured_node_name};
     use crate::store::BlockIoStats;
     use crate::util::StackStr;
 
@@ -10974,5 +12008,36 @@ mod tests {
             structured_node_name(&node),
             ("Index Scan", Some("accounts_pkey"))
         );
+    }
+
+    #[test]
+    fn hash_tables_size_buckets_as_postgresql() {
+        let table = |rows, tuples| {
+            PostgresHashTable::of(
+                &PlanNode {
+                    rows,
+                    ..PlanNode::EMPTY
+                },
+                query::instrument::HashTable {
+                    tuples,
+                    tuple_bytes: Some(1000),
+                    own_bytes: 7,
+                },
+            )
+        };
+        // At least 1024 buckets, doubled once the rows before an insert
+        // outnumber them.
+        let small = table(15, 1025);
+        assert_eq!((small.buckets, small.original_buckets), (1024, 1024));
+        assert_eq!(small.bytes, 1000 + 1024 * 8);
+        let grown = table(15, 3000);
+        assert_eq!((grown.buckets, grown.original_buckets), (4096, 1024));
+        let estimated = table(1500, 1500);
+        assert_eq!(
+            (estimated.buckets, estimated.original_buckets),
+            (2048, 2048)
+        );
+        // A relation with no estimate is taken as 1000 rows.
+        assert_eq!(table(0, 1).original_buckets, 1024);
     }
 }

@@ -115,7 +115,7 @@ pub(crate) fn rename(
 
     for slot in 0..storage.table_count() {
         if storage.table(slot).database() != storage.current_database_oid()
-            || !storage.table(slot).visible_to(txn.txid)
+            || !storage.table_slot_visible_to(slot, txn.txid)
         {
             continue;
         }

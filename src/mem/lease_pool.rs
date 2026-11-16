@@ -51,6 +51,12 @@ impl Purpose {
         leases: "result_spool_leases",
         ranges: "result spool free ranges",
     };
+    pub(crate) const ERROR_TEXT: Self = Self {
+        pool: "error text pool",
+        bytes: "error_text_bytes",
+        leases: "error_text_leases",
+        ranges: "error text free ranges",
+    };
     pub(crate) const PLAN_BUILD: Self = Self {
         pool: "plan build pool",
         bytes: "plan_build_bytes",

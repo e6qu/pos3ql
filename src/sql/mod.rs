@@ -22,10 +22,12 @@ pub(crate) mod column_suggestion;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
+pub mod datetime_input;
 pub mod encoding;
 pub(crate) mod enum_values;
 pub(crate) mod error_context;
 pub(crate) mod error_position;
+pub mod error_text;
 pub mod eval;
 pub(crate) mod event_trigger;
 pub mod exec;
@@ -84,6 +86,7 @@ pub(crate) mod statistics;
 pub(crate) mod text_parser;
 pub mod timezone;
 mod timezone_abbreviation_data;
+mod timezone_name_data;
 pub mod to_char;
 pub mod trigger_events;
 pub(crate) mod two_phase;
@@ -308,6 +311,8 @@ pub enum EngineSetupError {
     Storage(SqlError),
     ForeignTransport(String),
     TriggerEventSpill(trigger_events::TriggerEventSpillError),
+    /// `timezone_directory` cannot serve PostgreSQL's named zones.
+    ZoneDatabase(crate::sql::tzif::ZoneDatabaseError),
 }
 
 impl From<SqlError> for EngineSetupError {
@@ -327,6 +332,7 @@ impl std::fmt::Display for EngineSetupError {
             Self::Storage(e) => write!(f, "{}", e.message.as_str()),
             Self::ForeignTransport(e) => write!(f, "{e}"),
             Self::TriggerEventSpill(e) => write!(f, "{e}"),
+            Self::ZoneDatabase(e) => write!(f, "{e}"),
         }
     }
 }
@@ -3840,7 +3846,7 @@ impl Engine {
                 );
                 self.fatal_commit_failure = Some(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
                 return Err(sql_err!(
                     sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
@@ -4179,7 +4185,7 @@ impl Engine {
         );
         let role = guc.current_identity().refresh(&self.storage, txn.txid);
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         self.publish_session_context(guc, txn, role.as_str())
     }
 
@@ -4997,7 +5003,8 @@ impl Engine {
             ));
         }
 
-        crate::sql::tzif::init_catalog();
+        crate::sql::tzif::init_catalog(&config.timezone_directory)
+            .map_err(EngineSetupError::ZoneDatabase)?;
         budget.draw(
             exec::record_shape_pool_bytes(config.max_composites),
             "record_shapes",
@@ -8121,7 +8128,7 @@ impl Engine {
             .storage
             .compute_path(guc.search_path().as_str(), role.as_str(), txn.txid);
         let prior = self.storage.swap_path(path);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         if let Some(database) = self
             .storage
             .database_slot_by_oid(self.storage.current_database_oid(), txn.txid)
@@ -8203,7 +8210,7 @@ impl Engine {
         {
             self.fatal_commit_failure = Some(SqlError {
                 sqlstate: error.sqlstate,
-                message: error.message,
+                message: error.message.clone(),
             });
             return Err(error);
         }
@@ -8322,7 +8329,7 @@ impl Engine {
                 );
                 self.fatal_commit_failure = Some(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
             }
         }
@@ -10492,7 +10499,7 @@ impl Engine {
                     txn.checkpoint_request = None;
                     return Ok(Err(SqlError {
                         sqlstate: error.sqlstate,
-                        message: error.message,
+                        message: error.message.clone(),
                     }));
                 }
                 return Ok(Err(sql_err!(
@@ -11393,14 +11400,13 @@ impl Engine {
         guc: &GucState,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if param_types.len() > prep::MAX_PREP_PARAMS {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                format_args!(
                     "PREPARE parameter types exceed the prepared-statement boundary of {}",
                     prep::MAX_PREP_PARAMS
                 ),
-            }));
+            )));
         }
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             return Ok(Err(error));
@@ -11635,10 +11641,10 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Some(name) = name {
             if !sqlprep.remove(name) {
-                return Ok(Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-                    message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
-                }));
+                return Ok(Err(SqlError::formatted(
+                    SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+                    format_args!("prepared statement \"{}\" does not exist", name),
+                )));
             }
         } else {
             sqlprep.clear();
@@ -12029,7 +12035,7 @@ impl Engine {
             {
                 return Err(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
             }
         }
@@ -12214,7 +12220,7 @@ impl Engine {
         eval::funcs::system::set_session_user(guc.session_identity());
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         responder.set_render(guc.render());
         Ok(scope)
     }
@@ -12592,7 +12598,7 @@ impl Engine {
             self.cache_capacity_generation,
             SqlError {
                 sqlstate: error.sqlstate,
-                message: error.message,
+                message: error.message.clone(),
             },
         ));
         if let Some(checkpointer) = self.ckpt.as_ref() {
@@ -12600,7 +12606,7 @@ impl Engine {
                 checkpointer.requested_checkpoint_epoch(),
                 SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 },
             ));
         }
@@ -14714,7 +14720,7 @@ impl Engine {
                 if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                     return Ok(Err(error));
                 }
-                timezone::set_session(guc.timezone());
+                guc.publish_datetime_input();
                 parser.capture_type_inputs();
                 loop {
                     match parser.next_stmt() {
@@ -14968,7 +14974,7 @@ impl Engine {
         eval::funcs::system::set_session_user(guc.session_identity());
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         Ok(())
     }
 
@@ -19804,7 +19810,7 @@ impl Engine {
             role
         };
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         // Cleanup must not replace the body's SQL or wire error.
         match outcome {
@@ -20221,7 +20227,7 @@ impl Engine {
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
             }
-            timezone::set_session(guc.timezone());
+            guc.publish_datetime_input();
             let bindings = if check_body
                 && routine.language == ast::RoutineLanguage::Sql
                 && let ast::RoutineBody::String(body) = routine.body
@@ -20334,7 +20340,7 @@ impl Engine {
             ))
         })();
         let role = eval::funcs::system::current_user_owned();
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         let validated = match result {
             Err(error) => return Err(error),
@@ -21144,7 +21150,7 @@ impl Engine {
         if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
             return Ok(Err(error));
         }
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let encoded_arguments = match pending.arguments(input_arena) {
             Ok(arguments) => arguments,
             Err(error) => return Ok(Err(error)),
@@ -21970,7 +21976,7 @@ impl Engine {
             if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
                 return Ok(Err(error));
             }
-            timezone::set_session(guc.timezone());
+            guc.publish_datetime_input();
             // pg_stat_user_functions counts each completed procedure call.
             let track = match guc.track_functions() {
                 guc::TrackFunctions::None => false,
@@ -22437,7 +22443,7 @@ impl Engine {
             role
         };
         eval::funcs::system::set_current_user(role);
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         let restored = self.publish_session_context(guc, txn, role.as_str());
         match outcome {
             Err(error) => Err(error),
@@ -22612,9 +22618,11 @@ impl Engine {
             .parameter_types(name)
             .map_or(0, prep::PreparedTypeOids::len);
         check_prepared_argument_count(name, declared, argument_count)?;
-        let text = arena.alloc_str(text).map_err(|_| SqlError {
-            sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-            message: stack_format!(192, "statement too large for SQL arena"),
+        let text = arena.alloc_str(text).map_err(|_| {
+            SqlError::formatted(
+                SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                format_args!("statement too large for SQL arena"),
+            )
         })?;
         let inputs = arena
             .alloc_slice_copy(sqlprep.type_inputs(name).ok_or_else(|| {
@@ -22977,13 +22985,12 @@ impl Engine {
             return Ok(Err(error));
         }
         if txn.failed {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
+                format_args!(
                     "current transaction is aborted, commands ignored until end of transaction block"
                 ),
-            }));
+            )));
         }
         if transaction_context == exec::PlpgsqlTransactionContext::Atomic
             && let Some(command) = top_level_only_command(statement)
@@ -23253,7 +23260,7 @@ impl Engine {
         let statement_clock = datetime::statement_clock();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
-        timezone::set_session(guc.timezone());
+        guc.publish_datetime_input();
         // Render output with the current session settings (a SET earlier in the
         // same batch takes effect here).
         responder.set_render(guc.render());
@@ -23268,13 +23275,12 @@ impl Engine {
                     | Stmt::PrepareTransaction(_)
             )
         {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
+                format_args!(
                     "current transaction is aborted, commands ignored until end of transaction block"
                 ),
-            }));
+            )));
         }
         if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic
             && let Some(command) = top_level_only_command(statement)
@@ -26023,14 +26029,10 @@ impl Engine {
             ),
             Stmt::ExecutePrepared { name, args } => {
                 let Some(text) = sqlprep.get(name) else {
-                    return Ok(Err(SqlError {
-                        sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-                        message: stack_format!(
-                            192,
-                            "prepared statement \"{}\" does not exist",
-                            name
-                        ),
-                    }));
+                    return Ok(Err(SqlError::formatted(
+                        SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+                        format_args!("prepared statement \"{}\" does not exist", name),
+                    )));
                 };
                 let bound_inputs = match sqlprep
                     .type_inputs(name)
@@ -26053,10 +26055,10 @@ impl Engine {
                 let text = match arena.alloc_str(text) {
                     Ok(t) => t,
                     Err(_) => {
-                        return Ok(Err(SqlError {
-                            sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-                            message: stack_format!(192, "statement too large for SQL arena"),
-                        }));
+                        return Ok(Err(SqlError::formatted(
+                            SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                            format_args!("statement too large for SQL arena"),
+                        )));
                     }
                 };
                 let (inner_params, parameter_oids) = match self.prepared_arguments(
@@ -26074,10 +26076,10 @@ impl Engine {
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
-                        return Ok(Err(SqlError {
-                            sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
-                            message: stack_format!(192, "{}", e.message.as_str()),
-                        }));
+                        return Ok(Err(SqlError::formatted(
+                            SqlState::known(sqlstate::SYNTAX_ERROR),
+                            format_args!("{}", e.message.as_str()),
+                        )));
                     }
                 };
                 let source_bindings = match type_inputs::decode_session(bound_inputs, arena) {
@@ -26117,10 +26119,10 @@ impl Engine {
                                 })
                             }
                             Ok(None) => Ok(Ok(())),
-                            Err(e) => Ok(Err(SqlError {
-                                sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
-                                message: stack_format!(192, "{}", e.message.as_str()),
-                            })),
+                            Err(e) => Ok(Err(SqlError::formatted(
+                                SqlState::known(sqlstate::SYNTAX_ERROR),
+                                format_args!("{}", e.message.as_str()),
+                            ))),
                         },
                     )
                 })
@@ -29074,9 +29076,11 @@ impl Engine {
     ) -> Result<crate::util::StackStr<256>, SqlError> {
         self.fixed_setting_for(name, txn)
             .or_else(|| guc.get_owned(name))
-            .ok_or_else(|| SqlError {
-                sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                message: stack_format!(192, "unrecognized configuration parameter \"{}\"", name),
+            .ok_or_else(|| {
+                SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_OBJECT),
+                    format_args!("unrecognized configuration parameter \"{}\"", name),
+                )
             })
     }
 }
@@ -32127,10 +32131,10 @@ fn apply_wal_op(
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal writes to unknown table \"{}\"", table),
+                ));
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
@@ -32144,10 +32148,10 @@ fn apply_wal_op(
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal deletes from unknown table \"{}\"", table),
+                ));
             };
             storage.replay_committed_row(index, rowid, None, moved_out, lsn)?;
         }
@@ -33586,10 +33590,10 @@ fn apply_wal_op(
             new_schema,
         } => {
             let Some(index) = storage.find_table(schema, name) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal moves unknown table \"{}\"", name),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal moves unknown table \"{}\"", name),
+                ));
             };
             let revision = storage.reserve_table_definition_revision()?;
             storage.move_table_schema(
@@ -33690,14 +33694,10 @@ fn apply_wal_op(
             fk_name,
         } => {
             let Some(index) = storage.find_table(schema, table) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(
-                        192,
-                        "journal severs a key of unknown table \"{}\"",
-                        table
-                    ),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal severs a key of unknown table \"{}\"", table),
+                ));
             };
             let revision = storage.reserve_table_definition_revision()?;
             let _ = storage.drop_fk(index, fk_name, revision)?;

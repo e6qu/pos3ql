@@ -1901,18 +1901,20 @@ impl<'a> Evaluator<'a> {
                 0,
             ),
             Method::Time => {
-                let (value, zone) = crate::sql::datetime::parse_timetz(text)
+                let time = crate::sql::datetime::parse_timetz(text)
                     .map_err(|_| datetime_method_error())?;
-                if zone.is_some() {
+                if time.zone_written {
                     return Err(datetime_method_error());
                 }
-                (JsonTemporalKind::Time, value, 0)
+                (JsonTemporalKind::Time, time.micros, 0)
             }
             Method::TimeTz => {
-                let (value, zone) = crate::sql::datetime::parse_timetz(text)
+                let time = crate::sql::datetime::parse_timetz(text)
                     .map_err(|_| datetime_method_error())?;
-                let zone = zone.ok_or_else(datetime_method_error)?;
-                (JsonTemporalKind::TimeTz, value, zone)
+                if !time.zone_written {
+                    return Err(datetime_method_error());
+                }
+                (JsonTemporalKind::TimeTz, time.micros, time.east)
             }
             Method::Timestamp => {
                 if jsonpath_has_timezone(text) {
@@ -2493,7 +2495,8 @@ fn template_datetime_kind(
 
 fn timestamp_timezone_offset(text: &str) -> Option<i32> {
     let (_, time) = text.split_once('T').or_else(|| text.split_once(' '))?;
-    crate::sql::datetime::parse_timetz(time).ok()?.1
+    let time = crate::sql::datetime::parse_timetz(time).ok()?;
+    time.zone_written.then_some(time.east)
 }
 
 fn jsonpath_has_timezone(text: &str) -> bool {

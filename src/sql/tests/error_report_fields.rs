@@ -984,7 +984,7 @@ fn long_raise_messages_are_reported_whole() {
             ),
             (
                 "DO $$ BEGIN RAISE EXCEPTION '%', repeat('x', 30000); END $$".to_string(),
-                vec!["ERROR 54000 error message exceeds 27824 bytes".to_string()],
+                vec![format!("ERROR P0001 {}", "x".repeat(30000))],
             ),
         ];
         for (sql, expected) in &cases {

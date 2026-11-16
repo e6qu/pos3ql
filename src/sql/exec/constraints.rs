@@ -3078,7 +3078,7 @@ pub(crate) fn enforce_row_keys(
         .unwrap_or(table_index);
     if def.partition.is_partitioned() {
         for candidate in 0..storage.table_count() {
-            if !storage.table(candidate).visible_to(txid)
+            if !storage.table_slot_visible_to(candidate, txid)
                 || storage
                     .table_def(candidate, txid)
                     .partition
@@ -3970,7 +3970,7 @@ pub(crate) fn validate_constraint_obligation(
         return Ok(None);
     };
     let table_index = table as usize;
-    if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
+    if table_index >= storage.table_count() || !storage.table_slot_visible_to(table_index, txid) {
         return Ok(None);
     }
     let definition = storage.table_def(table_index, txid).clone();
@@ -4083,7 +4083,7 @@ fn constraint_row_tables(
         return visit(table_index);
     }
     for candidate in 0..storage.table_count() {
-        if storage.table(candidate).visible_to(txid)
+        if storage.table_slot_visible_to(candidate, txid)
             && !storage
                 .table_def(candidate, txid)
                 .partition
@@ -4213,7 +4213,7 @@ pub(crate) fn constraint_timing(
         return trigger.visible_to(txid).then(|| trigger.kind.timing());
     };
     let table_index = table as usize;
-    if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
+    if table_index >= storage.table_count() || !storage.table_slot_visible_to(table_index, txid) {
         return None;
     }
     let definition = storage.table_def(table_index, txid);
@@ -4295,7 +4295,7 @@ pub(crate) fn resolve_constraint_name(
         let mut found = false;
         let mut count = 0;
         for table in 0..storage.table_count() {
-            if !storage.table(table).visible_to(txid) {
+            if !storage.table_slot_visible_to(table, txid) {
                 continue;
             }
             let definition = storage.table_def(table, txid);
@@ -4702,7 +4702,7 @@ pub(crate) fn apply_fk_parent_actions(
         })?;
     let physical_parent = storage.table_def(parent_index, txn.txid).clone();
     for child_index in 0..storage.table_count() {
-        if !storage.table(child_index).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(child_index, txn.txid) {
             continue;
         }
         let (_, cdef) = storage.select_table_definition(child_index, txn.txid);
@@ -4872,9 +4872,9 @@ fn fire_foreign_key_action(
     let parent_index = usize::from(effective_table);
     let storage = context.storage();
     if child_index >= storage.table_count()
-        || !storage.table(child_index).visible_to(txid)
+        || !storage.table_slot_visible_to(child_index, txid)
         || parent_index >= storage.table_count()
-        || !storage.table(parent_index).visible_to(txid)
+        || !storage.table_slot_visible_to(parent_index, txid)
     {
         return context.txn.fire_trigger_event(index);
     }
@@ -5525,9 +5525,9 @@ fn check_referenced_key(
     let txid = txn.txid;
     let child_index = table as usize;
     if child_index >= storage.table_count()
-        || !storage.table(child_index).visible_to(txid)
+        || !storage.table_slot_visible_to(child_index, txid)
         || parent_index >= storage.table_count()
-        || !storage.table(parent_index).visible_to(txid)
+        || !storage.table_slot_visible_to(parent_index, txid)
     {
         return Ok(());
     }
@@ -5745,7 +5745,7 @@ fn references_parent(
 /// Whether any visible table has a foreign key referencing `name`.
 pub(crate) fn table_is_referenced(storage: &Storage, schema: &str, name: &str, txid: u32) -> bool {
     for column_index in 0..storage.table_count() {
-        if !storage.table(column_index).visible_to(txid) {
+        if !storage.table_slot_visible_to(column_index, txid) {
             continue;
         }
         if storage
@@ -5780,7 +5780,7 @@ pub(crate) fn referenced_key_changed(
         })?;
     let physical_parent = storage.table_def(parent_index, txid).clone();
     for column_index in 0..storage.table_count() {
-        if !storage.table(column_index).visible_to(txid) {
+        if !storage.table_slot_visible_to(column_index, txid) {
             continue;
         }
         let cdef = storage.table_def(column_index, txid).clone();

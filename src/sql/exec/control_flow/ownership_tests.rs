@@ -304,6 +304,7 @@ fn parse_owned_program<'a>(
 
 #[test]
 fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(64 << 10);
     let parsing = Arena::new(&mut budget, "output admission syntax", 16 << 10).unwrap();
     let workspace = Arena::new(&mut budget, "output admission workspace", 16 << 10).unwrap();
@@ -735,6 +736,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
 
 #[test]
 fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(64 << 10);
     let parsing = Arena::new(&mut budget, "reservation syntax", 16 << 10).unwrap();
     let arena = Arena::new(&mut budget, "reservation positions", 4 << 10).unwrap();

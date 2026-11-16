@@ -757,10 +757,15 @@ evaluation, set operations, derived tables, `VALUES` lists, a write's target
 scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
 (its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
 and the `ProjectSet` that expands set-returning calls, which also appears
-over scans), in all four formats. A hash join's `Hash` node reports the table pos3ql
-built: its bucket count (and the count it started with when it grew), one
-batch, and the bytes of its arrays as `Memory Usage`, which differ from
-PostgreSQL's allocator figures. A query without FROM drops sort, grouping
+over scans), in all four formats. A hash join's `Hash` node reports the table PostgreSQL
+would build: buckets sized from the node's row estimate (at least 1024) and
+doubled while its rows outnumber them, one batch, and `Memory Usage` from each
+row's minimal tuple (as PostgreSQL stores the values the node returns) and the
+bucket pointers. Remaining: PostgreSQL's skew buckets for an outer key with
+most-common-value statistics, its batches for a build larger than `work_mem`
+times 2, and values it stores compressed or out of line (rows over about
+2 kB) are not modelled; a value type without a PostgreSQL size here (arrays,
+`jsonb`, ranges, records) reports pos3ql's own table bytes. A query without FROM drops sort, grouping
 and distinct keys that are planner constants, as PostgreSQL does (a constant
 `DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
 the constants the planner folds them into (`'2'::double precision`). Times are measured
@@ -891,21 +896,23 @@ outer or hashed side. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
 group lines of a window's own incremental sort or of one under a `LIMIT`,
 `VERBOSE` output lists (rejected with `0A000`) of a joined `UPDATE` or
-`DELETE`, `MERGE`, a several-row `INSERT` whose rows omit columns or
+`DELETE` other than one of a single FROM table read sequentially, of a
+`MERGE` from a `VALUES` list with a `NOT MATCHED BY SOURCE` action (whose
+join reads the list's row as a placeholder expression) or whose lists hold
+a subquery, a several-row `INSERT` whose rows omit columns or
 use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
-scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. A statement that runs again after an attempt stopped for a call counts each
+scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
+ANALYZE` of a joined `UPDATE` or `DELETE` fails with `0A000`: the executor
+does not count their join's rows, as it probes the FROM rows for each
+target row and checks every condition per pair. A statement that runs again after an attempt stopped for a call counts each
 node in the last attempt that ran it, so a data-modifying `WITH` query whose
 write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
-and scan figures. A node of a path
-the executor does not count (a joined `UPDATE` or
-`DELETE`, `MERGE`) prints no actual figures, except the top node, which reports
-the statement's rows; `MERGE` plans its target scan alone where PostgreSQL
-joins the target and source (`Hash Right Join`); a `LIMIT` that stops `Unique`
+and scan figures. A `LIMIT` that stops `Unique`
 early leaves its `Sort` without figures, as pos3ql deduplicates before
 sorting. Where pos3ql's plan differs from
 PostgreSQL's cost-based one the figures are those of the plan it shows and
@@ -1068,9 +1075,16 @@ table joined with other FROM items is read whole before the join (a right
 or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
-batch where PostgreSQL fetches only what the reads need. Date input reads
-`YYYY-MM-DD` and the special values; PostgreSQL's other forms (`05/01/2024`
-read in the `DateStyle` field order, month names) fail with `22007`. COPY FROM into a foreign table queues its rows
+batch where PostgreSQL fetches only what the reads need. Date and time input
+and `SET TimeZone` follow PostgreSQL's decoder and its POSIX zone
+specifications. The named zones are PostgreSQL 18.6's, pinned at build, but
+their TZif contents come from `timezone_directory`, so a host's tzdata
+release, not PostgreSQL's 2026c, decides historical and future offsets. Error messages longer than 192 bytes are kept whole in the
+`error_text_bytes` pool; DETAIL and HINT text is still bounded at 12 KiB
+(`54000` past it) rather than drawing from that pool. Invalid `json` and
+`jsonb` input reports no `Token "..." is invalid.` DETAIL or `JSON data,
+line N:` CONTEXT, and a malformed array literal no DETAIL (`Unexpected end of
+input.`). COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup
@@ -1085,7 +1099,8 @@ read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per
 referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
-detached and dropped; a referenced partition's violations, `DETACH` and
+detached and dropped, and each referenced partition has `relhastriggers`
+set, so psql's `\d` lists the keys referencing it; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
 clones (`54000`). `pg_get_partition_constraintdef(oid)` and psql's `\d+`
 `Partition constraint:` line print the constraint PostgreSQL's
@@ -1129,23 +1144,70 @@ is a `Result` returning no rows: hashed on an outer join's nullable side,
 its columns unnamed when the plan scans another relation, and an inner or
 semi join with it returns nothing (`differential_exact/613`). A foreign
 partition or child ships the conditions it can to its server and shows no
-filter, or keeps every one (`differential_exact/614`). Remaining, each
+filter, or keeps every one (`differential_exact/614`). An `UPDATE ... FROM` or `DELETE ... USING`
+into such a table runs, and `EXPLAIN` prints, one join over the `Append`
+of the members pruning keeps under its own conditions (FROM items'
+columns prune nothing), its first FROM table hashed by an equality as for
+a plain target; the write lists each member and `VERBOSE` prints each
+node's list (`differential_exact/630`). A `MERGE` joins its target, a
+partitioned table's `Append` included, and its source as PostgreSQL plans
+relations with statistics: a hash join building on the relation with fewer
+planned rows (on a tie, the source, or the target when only unmatched
+source rows reach an action), whose probe reads its rows in scan order and
+each key's hashed rows later rows first, then the unmatched hashed rows,
+those with a NULL key first; without an equality, a nested loop
+rescanning the smaller relation from a `Materialize`. `ON` conditions
+reading one side filter that side's scan unless the join keeps its
+unmatched rows, `DO NOTHING` actions keep none, and a join keeping both
+sides' rows without an equality between them fails as PostgreSQL's full
+join does (`0A000`) (`differential_exact/631`). Each relation's scan checks
+the `ON` conjuncts reading only that relation unless the join keeps its
+unmatched rows, the hash join its key equalities and the join the rest,
+as PostgreSQL distributes them. `VERBOSE` prints PostgreSQL's lists: the
+join returns a plain target's `ctid`, the source columns each action reads
+(its condition, then its values in target column order), with a `NOT
+MATCHED BY SOURCE` action the source's whole row and the source columns
+`ON` reads, the source's row mark, the source columns `RETURNING` reads,
+then a partitioned target's `tableoid` and `ctid`; each scan returns its
+part of that list, then the columns the join's conditions read
+(`differential_exact/651`). `EXPLAIN ANALYZE` counts the scans (each
+member's under an `Append`), the `Hash` with its table's size, the
+`Materialize` and the join with the rows its filter removed, and reports
+the actions' `Tuples:`; a hash join keeping no unmatched inner row stops
+when either relation is empty, reading the outer one first when the inner
+one costs anything to scan (`differential_exact/652`). An index on a column
+`ON` does not read, or on the hashed relation's key columns alone, leaves
+the hash join PostgreSQL picks, and a unique one marks the hashed relation
+`Inner Unique` (`differential_exact/653`). PostgreSQL merges relations it
+has no statistics for, sorted by key; such a `MERGE` runs as a nested loop
+over its source rows in their order and its `EXPLAIN` fails with `0A000`,
+as do one from a source other than a table or `VALUES` list, one with an
+index on another column `ON` reads, on the outer relation's keys or a
+partial or expression index (PostgreSQL may scan, join or merge by it as
+its costs choose), and one with row security. A `MERGE` reads its target's
+and a stored source's `tableoid` in conditions, values and `RETURNING`; a
+`WHEN` condition reading another system column fails with `42P10`, and an
+action reading a relation its kind cannot reach fails with `42P01` (or
+`42703` for a bare column), during analysis as in PostgreSQL. `ctid`
+fails with `0A000` there as in every statement (`differential_exact/650`).
+Joined `UPDATE` and `DELETE` conditions read the target's `tableoid`.
+Remaining, each
 failing with `0A000`: a member with an index on a column the query's
 conditions, keys or aggregates read (execution scans members sequentially,
 while PostgreSQL scans each by its own index as costs choose, possibly
 under a `Merge Append`); `EXPLAIN ANALYZE` of pruning by a subquery that
-reads an enclosing query; a joined write (`UPDATE ... FROM`, `DELETE ...
-USING`) into such a table, which execution joins member by member where
-PostgreSQL joins one `Append`; `EXPLAIN` of any `MERGE`; a write whose
+reads an enclosing query; a write whose
 subquery is correlated, a set or row subquery, or in `RETURNING`; a full or
 anti join with an emptied partitioned table, or an outer join with an
 emptied inheritance tree; a foreign member that ships only some of its
 conditions, and `VERBOSE` over foreign members; a whole-row reference to an
 inheritance child with columns of its own. Joins and grouping over
 partitioned tables use pos3ql's join and aggregation methods, which differ
-from PostgreSQL's cost choices as they do for plain tables, and `EXPLAIN
-ANALYZE` of a hash join reports pos3ql's own hash table (16 buckets for a
-small build) where PostgreSQL's holds at least 1024; a derived table that
+from PostgreSQL's cost choices as they do for plain tables. A `WHERE`
+conjunct that can raise an error (`id % 2 = 0`) runs above a join rather than
+at its relation's scan, so `EXPLAIN ANALYZE` counts its rows in the join and
+hashes them; and a hash join whose build is empty still reads its outer
+relation, where PostgreSQL reads at most its first row; a derived table that
 PostgreSQL pulls up into an outer join still prints under its own name. A btree index may use
 `text_pattern_ops`, `varchar_pattern_ops` or `bpchar_pattern_ops`, which
 order and compare strings byte by byte; the planner lets such a key serve

@@ -867,13 +867,38 @@ Dates and times:
   [Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
   (checksum-pinned at build) and the session zone: `2021-06-01 12:00 EST` is
   17:00 UTC; with `TimeZone = 'Asia/Shanghai'`, `CST` means UTC+8.
-  `timezone_abbreviations` cannot be changed. Named zones need
-  `/usr/share/zoneinfo`.
+  `timezone_abbreviations` cannot be changed. The named zones are
+  PostgreSQL 18.6's 598 (checksum-pinned at build); their TZif files come from
+  the required `timezone_directory` setting, and startup fails naming any zone
+  the directory lacks. On Debian and Ubuntu, `/usr/share/zoneinfo` holds the
+  legacy names such as `PST8PDT` and `US/Eastern` only with the
+  `tzdata-legacy` package.
 - Numeric time zones are hours east of UTC (`SET timezone TO '2.5'` is
   UTC+02:30), within ±167:59:59; month/day interval fields return `22023`
   ([PostgreSQL rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251),
   [bounds](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/localtime.c#L667)).
   `NaN` returns `0A000`.
+- Date and time input decodes text as PostgreSQL 18.6 does
+  ([`datetime.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/datetime.c)).
+  Numbers read in the `DateStyle` field order: `'05/01/2024'::date` is May 1
+  under `MDY` (the default) and January 5 under `DMY`; `YMD` reads `24/05/01`
+  as 2024-05-01. A year of three or more digits, a month name (`Jan 5 2024`,
+  `5-Jan-2024`), a Julian day (`J2451187`), run-together digits (`20240105`,
+  `20240105T123456`), a day of the year (`2024.005`), `BC`/`AD`, `AM`/`PM`,
+  zone names, abbreviations and offsets, and the words `epoch`, `infinity`,
+  `now`, `today`, `tomorrow`, `yesterday` and `allballs` work in any order.
+  Errors carry PostgreSQL's SQLSTATE and message: `'13/01/2024'::date` fails
+  with `22008` and the hint `Perhaps you need a different "DateStyle"
+  setting.`; an unknown zone name such as `Mars/Olympus` fails with `22023`.
+  BC dates print with a ` BC` suffix (`0044-03-15 BC`). A name that is not an
+  installed zone is read as a POSIX zone specification, as PostgreSQL reads
+  it, in input, `AT TIME ZONE` and `SET TimeZone`: the offset counts hours
+  *west* of UTC, so `UTC+3` is three hours behind UTC and `xyz5` five; a
+  daylight-time name follows (`EST5EDT`, an hour ahead unless an offset is
+  given) with rules such as `,M3.2.0,M11.1.0` (`Mm.w.d`, `Jn` or `n`, with an
+  optional `/time`), the United States rules when none are given. `SHOW
+  TimeZone` reports the specification upper-cased (`XYZ5`), whose letters are
+  also the zone's abbreviations.
 
 ### Statements that cannot yet pause
 
@@ -1107,6 +1132,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
 | `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
+| `error_text_bytes`, `error_text_leases` | Error messages longer than 192 bytes, kept whole; one that does not fit fails with `54000` |
 | `definition_image_slots` | Schema pins held by executing statements |
 | `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
 | `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |
@@ -1144,6 +1170,14 @@ The value does not size memory in pos3ql. Each query runs in a workspace of
 files: a sort, grouping or hash table that outgrows the workspace fails with
 `54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
 file and restart to let larger sorts run.
+
+`EXPLAIN ANALYZE` reports a hash join's `Hash` node as PostgreSQL sizes its
+table: at least 1024 buckets, the next power of two above the node's row
+estimate, doubled while the rows outnumber them, and `Memory Usage` counting
+each row as PostgreSQL stores it plus 8 bytes per bucket. For example, a
+1,500-row build reports `Buckets: 2048  Batches: 1`. It always reports one
+batch: a build larger than `work_mem` times 2 (PostgreSQL's default
+`hash_mem_multiplier`), which PostgreSQL splits into batches, still runs whole.
 
 ### Planner settings
 
@@ -1239,8 +1273,13 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   provided: it is the oid of the table that holds the row, so
   `SELECT tableoid::regclass, count(*) FROM measurements GROUP BY 1` counts
   the rows of each partition, inheritance child or foreign child, also in
-  window queries and in the `FROM` items of `UPDATE ... FROM` and `DELETE
-  ... USING`.
+  window queries, in the `FROM` items of `UPDATE ... FROM` and `DELETE
+  ... USING`, and in `MERGE` for its target and a table source. For example,
+  `MERGE INTO measurements m USING readings r ON m.id = r.id WHEN MATCHED THEN
+  UPDATE SET v = r.v RETURNING m.tableoid::regclass` names the partition each
+  changed row is in. As in PostgreSQL, a `MERGE` `WHEN` condition may read
+  no other system column (`42P10`), and assigning a system column fails with
+  `0A000` (`cannot assign to system column "ctid"`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`

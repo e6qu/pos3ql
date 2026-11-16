@@ -3,6 +3,7 @@ use crate::mem::budget::Budget;
 
 #[test]
 fn local_slot_owners_preserve_values_on_failed_admission_and_return_capacity_on_drop() {
+    crate::sql::error_text::reserve_for_test();
     let mut budget = Budget::new(32 << 10);
     let source = Arena::new(&mut budget, "owned local payloads", 16 << 10).unwrap();
     let pool = LeasePool::new(

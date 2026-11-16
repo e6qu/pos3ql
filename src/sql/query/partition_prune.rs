@@ -2527,10 +2527,12 @@ pub(crate) enum ScanRelation<'s, 'a> {
         scope: &'s super::QueryScope<'a>,
         table: usize,
     },
-    /// A write's target, exposed as `name`.
+    /// A write's target, exposed as `name`. A `joined` write's other
+    /// columns are its FROM items', which prune nothing.
     Target {
         columns: &'s [ColumnMeta],
         name: &'s str,
+        joined: bool,
     },
 }
 
@@ -2565,6 +2567,7 @@ impl<'a> PruneValues<'a> for ScanValues<'_, '_, 'a> {
             ScanRelation::Target {
                 columns,
                 name: exposed,
+                ..
             } => {
                 if qualifier.is_some_and(|qualifier| qualifier != exposed) {
                     return None;
@@ -2701,10 +2704,12 @@ impl<'a> ScanValues<'_, '_, 'a> {
             ScanRelation::Target {
                 columns,
                 name: exposed,
+                joined,
             } => {
-                qualifier.is_none_or(|qualifier| qualifier == exposed)
-                    && (columns.iter().any(|column| column.name.as_str() == *name)
-                        || ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"].contains(name))
+                joined
+                    || qualifier.is_none_or(|qualifier| qualifier == exposed)
+                        && (columns.iter().any(|column| column.name.as_str() == *name)
+                            || ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"].contains(name))
             }
         }
     }

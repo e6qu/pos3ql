@@ -513,7 +513,11 @@ pub(crate) fn required_by(
         let owner = describe(storage, txid, owner, arena)?;
         crate::sql::eval::stash_diagnostic(
             None,
-            Some(stack_format!(128, "You can drop {} instead.", owner)),
+            Some(stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "You can drop {} instead.",
+                owner
+            )),
         );
         Ok::<_, SqlError>(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -584,7 +588,11 @@ pub(crate) fn report(
             let owner = describe(storage, txid, owner, arena)?;
             crate::sql::eval::stash_diagnostic(
                 None,
-                Some(stack_format!(128, "You can drop {} instead.", owner)),
+                Some(stack_format!(
+                    crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                    "You can drop {} instead.",
+                    owner
+                )),
             );
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,

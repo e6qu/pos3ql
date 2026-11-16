@@ -16,7 +16,7 @@ BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
     -- HashAggregate's batch line is not shown by pos3ql yet, and its hash
     -- tables size their buckets differently.
-    CONTINUE WHEN line ~ '^\s*(Batches|Buckets):';
+    CONTINUE WHEN line ~ '^\s*(Batches):';
     RETURN NEXT regexp_replace(line, '(Memory|Memory Usage): \d+kB', '\1: NkB');
   END LOOP;
 END

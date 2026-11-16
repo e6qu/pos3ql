@@ -427,6 +427,9 @@ jobs:
       - name: CI timeout guard
         run: bash tools/check-ci-timeouts.sh
 
+      - name: Library test suite source guard
+        run: bash tools/check-test-suites.sh
+
       - name: Tool guard tests
         run: >-
           python3 -m unittest tools/tests/test_coverage_merge.py

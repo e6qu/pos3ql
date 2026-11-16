@@ -824,7 +824,7 @@ fn swap_runs(data: &mut [u32], a: usize, b: usize, n: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "sql-fixture-suite")))]
 mod tests {
     use super::*;
 

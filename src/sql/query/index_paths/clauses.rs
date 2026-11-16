@@ -177,22 +177,22 @@ pub(super) fn constant_value<'a>(
         return match ctype {
             ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => Some(value),
             ctype @ (ColType::Bool
-                | ColType::Int2
-                | ColType::Int4
-                | ColType::Int8
-                | ColType::Float4
-                | ColType::Float8
-                | ColType::Numeric
-                | ColType::Oid
-                | ColType::Date
-                | ColType::Time
-                | ColType::Timetz
-                | ColType::Timestamp
-                | ColType::Timestamptz
-                | ColType::Interval
-                | ColType::Bytea
-                | ColType::Uuid
-                | ColType::Char) => crate::sql::eval::cast_to(value, ctype, arena).ok(),
+            | ColType::Int2
+            | ColType::Int4
+            | ColType::Int8
+            | ColType::Float4
+            | ColType::Float8
+            | ColType::Numeric
+            | ColType::Oid
+            | ColType::Date
+            | ColType::Time
+            | ColType::Timetz
+            | ColType::Timestamp
+            | ColType::Timestamptz
+            | ColType::Interval
+            | ColType::Bytea
+            | ColType::Uuid
+            | ColType::Char) => crate::sql::eval::cast_to(value, ctype, arena).ok(),
             _ => None,
         };
     }
@@ -620,8 +620,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                     _ => (conjunct, true),
                 };
                 match self.column_of(column_expression)? {
-                    Some(column) if self.planner.column_type(column) == ColType::Bool =>
-                    {
+                    Some(column) if self.planner.column_type(column) == ColType::Bool => {
                         let operand = self
                             .arena
                             .alloc(Expr::Bool(value))

@@ -589,13 +589,21 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let tuples = planner.size.tuples;
         let index_entries = info.tuples;
         let correlation_of = |planner: &Planner<'_, '_>| {
-            let column = usize::from(info.catalog.columns[0]);
-            let variable = planner.variable(column);
-            if !variable.analyzed {
-                return 0.0;
-            }
-            variable
-                .distribution
+            // An expression key's correlation is the index's own statistic,
+            // a partial index's too.
+            let distribution = if info.catalog.expression_keys[0] {
+                if planner.statistics.index_column(info.stamp, 1).is_none() {
+                    return 0.0;
+                }
+                planner.statistics.index_distribution(info.stamp, 1)
+            } else {
+                let variable = planner.variable(usize::from(info.catalog.columns[0]));
+                if !variable.analyzed {
+                    return 0.0;
+                }
+                variable.distribution
+            };
+            distribution
                 .and_then(|distribution| distribution.correlation())
                 .map_or(0.0, |correlation| {
                     let mut correlation = f64::from(correlation);
@@ -1878,6 +1886,10 @@ pub(crate) fn scan_path<'a>(
             let index = catalog[position];
             IndexInfo {
                 catalog: index,
+                stamp: storage
+                    .indexes_for_slot(slot, txid)
+                    .find(|definition| definition.name_for(txid).as_str() == index.name.as_str())
+                    .map_or(0, |definition| definition.created_at),
                 pages: 1.0,
                 height: 0,
                 deduplicated: false,
@@ -1901,7 +1913,7 @@ pub(crate) fn scan_path<'a>(
     let mut layouts = [(1.0, 0u32, false); MAX_INDEXES];
     for (position, index) in planner.indexes.iter().enumerate() {
         if index.catalog.method == IndexAccessMethod::Btree {
-            layouts[position] = super::btree_layout(&planner, &index.catalog, entries);
+            layouts[position] = super::btree_layout(&planner, index, entries);
         }
     }
     let indexes = arena
@@ -2037,7 +2049,8 @@ pub(crate) fn scan_path<'a>(
                 "a partial index whose predicate the model does not read",
             ));
         };
-        let (pages, height, deduplicated) = super::btree_layout(&planner, &index, entries);
+        let (pages, height, deduplicated) =
+            super::btree_layout(&planner, &planner.indexes[position], entries);
         partial_layouts[position] = Some((pages, height, deduplicated, entries.min(size.tuples)));
     }
     // The restrictions each usable predicate implies (`indrestrictinfo`); a
@@ -2480,11 +2493,17 @@ fn build<'a>(
         .is_some_and(|(count, _)| count.is_some_and(|count| count > 0.0));
     let mut kept = [None::<Candidate>; MAX_CANDIDATES];
     let kept_count = add_paths(candidates, consider_startup, &mut kept);
+    // The target list's expressions are evaluated by the scan below any
+    // sort.
+    if let Some(projection) = shape.projection {
+        for path in kept[..kept_count].iter_mut().flatten() {
+            path.total += projection.per_tuple * rows;
+        }
+    }
     let cheapest = cheapest_total(&kept[..kept_count]).expect("the sequential path is kept");
-    let width = f64::from(super::output_width(
-        definition,
-        planner.statistics,
-        shape.output.or(needed),
+    let width = f64::from(shape.projection.map_or_else(
+        || super::output_width(definition, planner.statistics, shape.output.or(needed)),
+        |projection| projection.width,
     ));
     let limit_tuples = shape
         .limit
@@ -2627,7 +2646,10 @@ fn describe<'a>(
         recheck: &[],
         absorbed: &[],
         rows,
-        width: super::output_width(definition, planner.statistics, shape.output.or(needed)),
+        width: shape.projection.map_or_else(
+            || super::output_width(definition, planner.statistics, shape.output.or(needed)),
+            |projection| projection.width,
+        ),
         startup_cost: scan.startup,
         total_cost: scan.total,
         backward: false,

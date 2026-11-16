@@ -152,7 +152,10 @@ pub(crate) fn table_expressions<'a>(
     let mut unread = 0u64;
     let first = definition.columns().len();
     for (at, planned) in catalog.iter_mut().enumerate() {
-        if !planned.expression_keys[..planned.n_cols].iter().any(|&key| key) {
+        if !planned.expression_keys[..planned.n_cols]
+            .iter()
+            .any(|&key| key)
+        {
             continue;
         }
         let Some(index) = storage
@@ -367,7 +370,10 @@ impl<'a> KeyReader<'a> {
 
     /// Key `at`'s value in the table row `values`, of a table defined by
     /// `definition`.
-    #[expect(clippy::too_many_arguments, reason = "the evaluation context is explicit")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the evaluation context is explicit"
+    )]
     pub(crate) fn value(
         &self,
         storage: &Storage,

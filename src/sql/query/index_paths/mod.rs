@@ -289,7 +289,8 @@ fn deduplicates(ctype: ColType, collation: Collation) -> bool {
 /// rows, as CREATE INDEX lays it out: its tuples hold every key and
 /// included column, each aligned, and equal keys share posting lists when
 /// every key column's class allows it and nothing is included.
-fn btree_layout(planner: &Planner<'_, '_>, index: &PlannerIndex, entries: f64) -> (f64, u32, bool) {
+fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f64, u32, bool) {
+    let index = &info.catalog;
     let definition = planner.definition;
     let mut width = 0.0f64;
     let mut deduplicate = !index.unique && index.n_include_cols == 0;
@@ -350,9 +351,25 @@ fn btree_layout(planner: &Planner<'_, '_>, index: &PlannerIndex, entries: f64) -
         entries
     } else {
         let mut product = 1.0;
-        for &column in &index.columns[..index.n_cols] {
-            let variable = planner.variable(usize::from(column));
-            product *= planner.distinct(&variable).0;
+        for (position, &column) in index.columns[..index.n_cols].iter().enumerate() {
+            // An expression key's own statistics count its distinct values,
+            // a partial index's too.
+            let own = (index.expression_keys[position])
+                .then(|| {
+                    planner
+                        .statistics
+                        .index_column(info.stamp, position as u16 + 1)
+                })
+                .flatten();
+            product *= match own {
+                Some(statistics) if statistics.distinct_fraction != 0.0 => {
+                    clamp_row_est(f64::from(statistics.distinct_fraction) * entries)
+                }
+                Some(statistics) if statistics.distinct_values > 0 => {
+                    statistics.distinct_values as f64
+                }
+                _ => planner.distinct(&planner.variable(usize::from(column))).0,
+            };
         }
         product
     };
@@ -607,6 +624,8 @@ pub(super) struct VariableStatistics<'s> {
 #[derive(Clone, Copy)]
 pub(super) struct IndexInfo {
     pub(super) catalog: PlannerIndex,
+    /// The index's creation stamp, which keys its expressions' statistics.
+    pub(super) stamp: u64,
     /// The index's pages and tree height as CREATE INDEX lays them out.
     pub(super) pages: f64,
     pub(super) height: u32,
@@ -1533,9 +1552,9 @@ impl<'s, 'a> Planner<'s, 'a> {
 fn prop_reads_expression(prop: &predicate::Prop<'_>, variables: &ExpressionVariables<'_>) -> bool {
     use predicate::Prop;
     match *prop {
-        Prop::Compare { column, .. } | Prop::NullTest { column, .. } | Prop::Array { column, .. } => {
-            variables.get(column).is_some()
-        }
+        Prop::Compare { column, .. }
+        | Prop::NullTest { column, .. }
+        | Prop::Array { column, .. } => variables.get(column).is_some(),
         Prop::And(parts) | Prop::Or(parts) => parts
             .iter()
             .any(|part| prop_reads_expression(part, variables)),
@@ -1752,6 +1771,19 @@ pub(crate) struct QueryShape {
     /// Only whether PostgreSQL builds any index path matters: the answer is
     /// [`Planned::SeqOnly`] when it builds none.
     pub(crate) probe: bool,
+    /// The target list the scan computes, when the model reads it: its
+    /// width and the per-row cost of its expressions.
+    pub(crate) projection: Option<Projection>,
+}
+
+/// The scan's target list (`apply_scanjoin_target_to_paths`): the select
+/// list and the sort keys it lacks, each column's analyzed width and each
+/// expression's type width (`set_pathtarget_cost_width`), and the per-row
+/// cost of evaluating its expressions, which the scan's cost includes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Projection {
+    pub(crate) width: u32,
+    pub(crate) per_tuple: f64,
 }
 
 impl Default for QueryShape {
@@ -1766,6 +1798,7 @@ impl Default for QueryShape {
             only: false,
             output: None,
             probe: false,
+            projection: None,
         }
     }
 }
@@ -1908,12 +1941,105 @@ pub(crate) fn query_shape<'a>(
             },
         ))
     };
+    shape.projection = projection(storage, txid, scope, items, order_by, arena)?;
     let (Some(count), Some(skip)) = (constant(limit)?, constant(offset)?) else {
         shape.unmodeled = Some("a LIMIT or OFFSET that is not a constant");
         return Ok(shape);
     };
     shape.limit = (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0)));
     Ok(shape)
+}
+
+/// The target list a scan of the one plain table `scope` reads computes
+/// for `items` ordered by `order_by`; `None` for a list the model does not
+/// read (a record expansion, or an expression of a catalog-defined type).
+fn projection<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    items: &'a [crate::sql::ast::SelectItem<'a>],
+    order_by: &'a [crate::sql::ast::OrderBy<'a>],
+    arena: &'a Arena,
+) -> Result<Option<Projection>, SqlError> {
+    use crate::sql::ast::SelectItem;
+    if scope.n != 1 || scope.slots[0] == usize::MAX {
+        return Ok(None);
+    }
+    let Some(definition) = scope.defs.stored(0) else {
+        return Ok(None);
+    };
+    let statistics = storage.table_statistics(scope.slots[0], txid);
+    let costs = Costs::current();
+    let mut width = 0u32;
+    let mut per_tuple = 0.0;
+    // An entry's width and per-row cost.
+    let entry = |expression: &'a Expr<'a>| -> Option<(u32, f64)> {
+        if let Expr::Column { qualifier, name } = expression
+            && let Ok(ResolvedColumn::Table(0, column)) = scope.find_column(*qualifier, name)
+        {
+            return Some((
+                output_width(definition, &statistics, Some(1 << column.min(63))),
+                0.0,
+            ));
+        }
+        if expression.contains_subquery() {
+            return None;
+        }
+        let (type_oid, type_mod) =
+            crate::sql::exec::infer_type_catalog(expression, Some(definition), storage, txid, arena)
+                .ok()?;
+        let Some((ctype, None)) = crate::sql::exec::catalog_column_type(storage, txid, type_oid)
+        else {
+            return None;
+        };
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition: crate::storage::RelationDefinition::from_definition(definition),
+            alias: None,
+            output_aliases: &[],
+            remote_ctid: false,
+        };
+        Some((
+            type_average_width(ctype, i32::from(type_mod)) as u32,
+            super::plan::qual_cost(expression, &columns, storage, txid, arena) / 2.0
+                * costs.cpu_operator,
+        ))
+    };
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                width += output_width(definition, &statistics, None);
+            }
+            SelectItem::Expr { expression, .. } => {
+                let Some((entry_width, cost)) = entry(expression) else {
+                    return Ok(None);
+                };
+                width += entry_width;
+                per_tuple += cost;
+            }
+            SelectItem::RecordStar(_) => return Ok(None),
+        }
+    }
+    // A sort key the select list lacks joins the target list unnamed.
+    for order in order_by {
+        let target =
+            super::resolve_order_target(order.expression, items, scope, arena, storage, txid)?;
+        let listed = items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } => **expression == *target,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                matches!(target, Expr::Column { .. })
+            }
+            SelectItem::RecordStar(_) => false,
+        });
+        if listed || (target.is_constant(false) && !target.calls_routine()) {
+            continue;
+        }
+        let Some((entry_width, cost)) = entry(target) else {
+            return Ok(None);
+        };
+        width += entry_width;
+        per_tuple += cost;
+    }
+    Ok(Some(Projection { width, per_tuple }))
 }
 
 /// The key expressions of the indexes of the one plain table `scope` reads.

@@ -76,7 +76,11 @@ impl<'w> AnalyzedIndexes<'w> {
         } else {
             storage
                 .indexes_for_slot(slot, txid)
-                .filter(|index| index.expressions[..index.n_cols].iter().any(Option::is_some))
+                .filter(|index| {
+                    index.expressions[..index.n_cols]
+                        .iter()
+                        .any(Option::is_some)
+                })
                 .count()
         };
         let indexes = arena
@@ -115,8 +119,7 @@ impl<'w> AnalyzedIndexes<'w> {
                 let Some(text) = text else {
                     continue;
                 };
-                let Some((expression, ctype)) =
-                    expression_key(
+                let Some((expression, ctype)) = expression_key(
                     storage,
                     txid,
                     &definition,
@@ -166,7 +169,12 @@ impl<'w> AnalyzedIndexes<'w> {
         })
     }
 
-    fn value(&self, storage: &Storage, expression: &Expr<'w>, row: &[Datum<'w>]) -> Result<Datum<'w>, SqlError> {
+    fn value(
+        &self,
+        storage: &Storage,
+        expression: &Expr<'w>,
+        row: &[Datum<'w>],
+    ) -> Result<Datum<'w>, SqlError> {
         let catalog = crate::sql::query::storage_catalog(storage, self.arena, self.txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
@@ -204,16 +212,14 @@ impl<'w> IndexExpressionSampler<'w> for AnalyzedIndexes<'w> {
         self.indexes[index].predicate.is_some()
     }
 
-    fn passes(
-        &self,
-        storage: &Storage,
-        index: usize,
-        row: &[Datum<'w>],
-    ) -> Result<bool, SqlError> {
+    fn passes(&self, storage: &Storage, index: usize, row: &[Datum<'w>]) -> Result<bool, SqlError> {
         let Some(predicate) = self.indexes[index].predicate else {
             return Ok(true);
         };
-        Ok(matches!(self.value(storage, predicate, row)?, Datum::Bool(true)))
+        Ok(matches!(
+            self.value(storage, predicate, row)?,
+            Datum::Bool(true)
+        ))
     }
 
     fn evaluate(

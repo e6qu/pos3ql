@@ -4149,8 +4149,7 @@ pub(crate) trait IndexExpressionSampler<'w> {
     /// The index has a predicate.
     fn partial(&self, index: usize) -> bool;
     /// Whether `row` meets the predicate of partial index `index`.
-    fn passes(&self, storage: &Storage, index: usize, row: &[Datum<'w>])
-    -> Result<bool, SqlError>;
+    fn passes(&self, storage: &Storage, index: usize, row: &[Datum<'w>]) -> Result<bool, SqlError>;
     /// Evaluates the expression keys of `index` over `row` into `out`, in
     /// [`Self::keys`] order.
     fn evaluate(

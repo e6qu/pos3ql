@@ -413,7 +413,10 @@ impl<'a> Analyzer<'_, '_, 'a> {
     /// `estimate_expression_value` folds for selectivity. `None` when the
     /// model cannot evaluate it.
     fn stable_value(&self, expression: &'a Expr<'a>, column: usize) -> Option<Datum<'a>> {
-        if self.columns_of(expression) != 0
+        // A plain constant the model does not read stays unread: only a
+        // call has a value that planning folds for estimation.
+        if (expression.is_constant(false) && !expression.calls_routine())
+            || self.columns_of(expression) != 0
             || expression.contains_subquery()
             || expression.contains_volatile_function().is_some()
         {

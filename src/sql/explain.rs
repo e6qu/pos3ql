@@ -12627,7 +12627,20 @@ fn plan_statement_nodes<'a>(
 ) -> Result<Plan<'a>, SqlError> {
     // The planner plans the statement its constant folding produced, and
     // raises the folding's notices and errors (`eval_const_expressions`).
-    let statement = fold_statement(storage, txid, statement, arena)?;
+    // PostgreSQL's folding also replaces a call of a SQL function whose body
+    // is one plain expression by that expression (`inline_function`), which
+    // then prints, costs, estimates and matches index keys in its place;
+    // pos3ql plans the call itself, so it refuses such a statement.
+    let (statement, inlinable) = crate::sql::eval::folding_inlinable_calls(|| {
+        fold_statement(storage, txid, statement, arena)
+    });
+    let statement = statement?;
+    if inlinable {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a call of a SQL function PostgreSQL inlines is not supported"
+        ));
+    }
     if block != BlockId::ROOT {
         return plan_folded_statement(storage, txid, statement, block, arena);
     }

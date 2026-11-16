@@ -1094,6 +1094,29 @@ impl ProtocolStatement {
     }
 }
 
+/// Utility statements that evaluate expressions outside any query, so a
+/// routine they call that needs the engine runs through
+/// [`Engine::execute_with_routine_replay`]. A concurrent index build runs
+/// across transactions of its own and is not replayed.
+fn calls_routines_outside_queries(statement: &Stmt<'_>, txn: &TxnState) -> bool {
+    match statement {
+        Stmt::CreateIndex { .. } => txn.concurrent_index.is_none(),
+        Stmt::Reindex { .. }
+        | Stmt::Cluster { .. }
+        | Stmt::Analyze(_)
+        | Stmt::Vacuum { .. }
+        | Stmt::RefreshMaterializedView { .. }
+        | Stmt::CreateTableAs { .. } => true,
+        // A partition detach evaluates nothing and runs its concurrent form
+        // across transactions of its own.
+        Stmt::AlterTable(alter) => !alter
+            .actions
+            .iter()
+            .any(|action| matches!(action, ast::AlterAction::DetachPartition { .. })),
+        _ => false,
+    }
+}
+
 fn statement_writes(statement: &Stmt<'_>) -> bool {
     match statement {
         Stmt::Explain { options, statement } => {
@@ -4090,49 +4113,11 @@ impl Engine {
             .compute_path(raw_path.as_str(), current_role, txn.txid);
         let prior_path = self.storage.swap_path(path);
         // Publish the path's schema names for current_schema/current_schemas.
-        {
-            use core::fmt::Write as _;
-            let mut published = eval::funcs::system::SessionSchemas {
-                names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
-                n: 0,
-                catalog_pos: usize::MAX,
-            };
-            for entry in path.entries() {
-                match entry {
-                    crate::storage::PathEntry::Catalog => {
-                        // An *explicit* pg_catalog is a real path element
-                        // (current_schema can be pg_catalog); the implicit
-                        // one only surfaces in current_schemas(true).
-                        if path.explicit_catalog() {
-                            let _ = write!(published.names[published.n], "pg_catalog");
-                            published.n += 1;
-                        } else if published.catalog_pos == usize::MAX {
-                            published.catalog_pos = published.n;
-                        }
-                    }
-                    crate::storage::PathEntry::InformationSchema => {
-                        let _ = write!(published.names[published.n], "information_schema");
-                        published.n += 1;
-                    }
-                    crate::storage::PathEntry::Toast => {
-                        let _ = write!(published.names[published.n], "pg_toast");
-                        published.n += 1;
-                    }
-                    crate::storage::PathEntry::Schema(slot) => {
-                        let _ = write!(
-                            published.names[published.n],
-                            "{}",
-                            self.storage
-                                .schema_def_for(*slot as usize, txn.txid)
-                                .name
-                                .as_str()
-                        );
-                        published.n += 1;
-                    }
-                }
-            }
-            eval::funcs::system::set_session_schemas(published);
-        }
+        eval::funcs::system::set_session_schemas(eval::funcs::system::path_session_schemas(
+            &self.storage,
+            &path,
+            txn.txid,
+        ));
         // Publish this statement's readable settings for `current_setting()`,
         // the exact values `SHOW` reports (fixed server params + session GUCs).
         {
@@ -10340,6 +10325,7 @@ impl Engine {
         let _snapshot = self.storage.analyze_snapshot();
         let mut total_rows = 0u64;
         if targets.is_empty() {
+            let _maintenance = exec::MaintenancePath::enter(&self.storage, txn.txid)?;
             for slot in 0..self.storage.table_count() {
                 if self.storage.table_slot_visible_to(slot, txn.txid)
                     && self
@@ -10391,6 +10377,7 @@ impl Engine {
         }
         for target in targets {
             let root = exec::resolve_dml_table(&self.storage, &target.table, txn.txid)?;
+            let _maintenance = exec::MaintenancePath::enter(&self.storage, txn.txid)?;
             for slot in 0..self.storage.table_count() {
                 if !self.storage.table_slot_visible_to(slot, txn.txid)
                     || !self
@@ -10463,6 +10450,7 @@ impl Engine {
         &mut self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
+        full: bool,
         elapsed_micros: u64,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
@@ -10472,6 +10460,11 @@ impl Engine {
                     && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
+                    if full {
+                        // VACUUM FULL rebuilds the table's indexes.
+                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
+                        self.work.reset();
+                    }
                     self.storage
                         .refresh_relation_counts(slot, txid, &self.work)?;
                     self.storage.vacuum_relation_index_hint(slot)?;
@@ -10491,6 +10484,11 @@ impl Engine {
                     && self.maintenance_permitted(slot, txid)
                 {
                     self.work.reset();
+                    if full {
+                        // VACUUM FULL rebuilds the table's indexes.
+                        exec::rebuild_table_index_keys(&self.storage, txid, slot, &self.work)?;
+                        self.work.reset();
+                    }
                     self.storage
                         .refresh_relation_counts(slot, txid, &self.work)?;
                     self.storage.vacuum_relation_index_hint(slot)?;
@@ -10604,6 +10602,7 @@ impl Engine {
         if let Err(error) = self.record_vacuum_targets(
             targets,
             txn.txid,
+            options.full,
             datetime::now_micros().saturating_sub(started).max(0) as u64,
         ) {
             return Ok(Err(error));
@@ -23394,8 +23393,26 @@ impl Engine {
             txn.txid,
             &self.work,
         );
+        let touched_before = txn.touched().len();
         let result = if let Err(error) = prebuilt {
             Ok(Err(error))
+        } else if capture.is_none()
+            && calls_routines_outside_queries(statement, txn)
+            && query::with_active_routine_invocations(|context| context.is_none())
+        {
+            self.execute_with_routine_replay(
+                statement,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+                reset_workspace,
+                &mut snapshot.lease,
+            )
         } else {
             self.execute_stmt_with_snapshot(
                 statement,
@@ -23411,6 +23428,18 @@ impl Engine {
                 capture,
                 &mut snapshot.lease,
             )
+        };
+        let result = match result {
+            Ok(Ok(())) if txn.touched().len() > touched_before => self.prepare_statement_row_keys(
+                touched_before,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            ),
+            other => other,
         };
         if reset_workspace
             && matches!(&result, Ok(Err(error)) if
@@ -23488,6 +23517,179 @@ impl Engine {
             return Ok(Err(error));
         }
         Ok(Ok(()))
+    }
+
+    /// Prepares, as the statement that wrote them ends, the index keys of the
+    /// rows it touched in tables with expression or partial indexes, which
+    /// PostgreSQL computes as each row is stored. A routine such a key calls
+    /// that needs the engine (a PL/pgSQL function) runs here, one row at a
+    /// time, and the row's keys are prepared again replaying its results;
+    /// commit then publishes the prepared keys.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "key preparation forwards the statement's execution services"
+    )]
+    fn prepare_statement_row_keys(
+        &mut self,
+        from: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        for at in from..txn.touched().len() {
+            let (table, rowid, _) = txn.touched()[at];
+            let table = table as usize;
+            if !self.storage.indexes_for_slot(table, txn.txid).any(|index| {
+                index.predicate.is_some()
+                    || index.expressions[..index.n_cols]
+                        .iter()
+                        .any(Option::is_some)
+            }) {
+                continue;
+            }
+            let invocations = query::RoutineInvocationState::for_engine_calls(arena);
+            loop {
+                invocations.begin_attempt();
+                let prepared = query::with_routine_invocation_scope(
+                    Some(query::RoutineInvocationContext::new(&invocations, arena)),
+                    || {
+                        self.storage
+                            .prepare_commit_row_keys(txn.txid, core::iter::once((table, rowid)))
+                    },
+                );
+                match prepared {
+                    Ok(()) => break,
+                    Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
+                        let Some(pending) = invocations.take_pending() else {
+                            return Ok(Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "index key preparation yielded without a pending call"
+                            )));
+                        };
+                        if let Err(error) = self.complete_pending_routine(
+                            pending,
+                            &invocations,
+                            arena,
+                            arena,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                        )? {
+                            return Ok(Err(error));
+                        }
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Runs a utility statement whose expressions are evaluated outside a
+    /// query (index builds, table rewrites, materialized view population,
+    /// `ANALYZE`) so that a routine needing the engine, such as a PL/pgSQL
+    /// function in an index expression, can run: a call that leaves the
+    /// statement rolls the attempt back, runs in the engine (under the
+    /// restricted search path when a maintenance operation made it), and the
+    /// statement runs again, replaying the results of the calls it already
+    /// made in their order.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the replay loop forwards the statement's execution services"
+    )]
+    fn execute_with_routine_replay(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
+        responder: &mut Responder,
+        reset_workspace: bool,
+        snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let invocations = query::RoutineInvocationState::for_engine_calls(arena);
+        let replay = match sequence::begin_replay_cursor() {
+            Ok(replay) => replay,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+        loop {
+            if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                return Ok(Err(error));
+            }
+            invocations.begin_attempt();
+            let output_mark = responder.attempt_mark();
+            let outcome = query::with_routine_invocation_scope(
+                Some(query::RoutineInvocationContext::new(&invocations, arena)),
+                || {
+                    self.execute_stmt_with_snapshot(
+                        statement,
+                        arena,
+                        params,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        routine_transaction_context,
+                        responder,
+                        reset_workspace,
+                        None,
+                        snapshot_lease,
+                    )
+                },
+            )?;
+            let Err(error) = outcome else {
+                return Ok(outcome);
+            };
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Ok(Err(error));
+            }
+            if let Err(error) = responder.restart_attempt(output_mark) {
+                return Ok(Err(error));
+            }
+            let Some(pending) = invocations.take_pending() else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "utility statement yielded without a pending call"
+                )));
+            };
+            let restricted = invocations.take_pending_restricted();
+            if txn.owns_statement_mark(mark) {
+                self.rollback_waiting_statement(txn, mark);
+            }
+            let maintenance = if restricted {
+                match exec::MaintenancePath::enter(&self.storage, txn.txid) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                None
+            };
+            let completed = self.complete_pending_routine(
+                pending,
+                &invocations,
+                arena,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )?;
+            drop(maintenance);
+            if let Err(error) = completed {
+                return Ok(Err(error));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

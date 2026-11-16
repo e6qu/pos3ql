@@ -1859,6 +1859,12 @@ pub(crate) struct RoutineInvocationState {
     /// The foreign scans the statement ran and their rows, kept in the
     /// statement arena from the first foreign scan on.
     foreign: Cell<Option<crate::mem::arena::ArenaHandle<ForeignScanLog>>>,
+    /// The pending call was made under a maintenance operation's restricted
+    /// search path, which its body runs under too.
+    pending_restricted: Cell<bool>,
+    /// Only calls that need the engine (PL/pgSQL bodies) go through this
+    /// log; a utility statement runs other routines where it evaluates.
+    engine_calls_only: bool,
 }
 
 /// What a statement keeps of its foreign scans across attempts.
@@ -2457,7 +2463,22 @@ impl RoutineInvocationState {
             initplan_counts: RefCell::new(crate::mem::arena::RetainedList::new()),
             attempt: Cell::new(0),
             foreign: Cell::new(None),
+            pending_restricted: Cell::new(false),
+            engine_calls_only: false,
         }
+    }
+
+    /// A log for a utility statement or key preparation, which runs only the
+    /// calls that need the engine through it and replays them by position.
+    pub(crate) fn for_engine_calls(arena: &Arena) -> Self {
+        Self {
+            engine_calls_only: true,
+            ..Self::new(arena, RoutineExecution::StatementReplay)
+        }
+    }
+
+    fn resolves(&self, routine: &crate::storage::RoutineDef) -> bool {
+        !self.engine_calls_only || routine.language == crate::storage::RoutineLanguage::PlPgSql
     }
 
     /// Holds the statement's output until it completes: a data-modifying
@@ -3050,6 +3071,22 @@ impl RoutineInvocationState {
 
     pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation> {
         self.pending.replace(None)
+    }
+
+    /// Records that the call now pending was made under a maintenance
+    /// operation's restricted search path.
+    pub(crate) fn mark_pending_restricted(&self) {
+        let pending = self.pending.take();
+        if pending.is_some() {
+            self.pending_restricted.set(true);
+        }
+        self.pending.set(pending);
+    }
+
+    /// Whether the pending call runs under the restricted search path; the
+    /// mark is consumed.
+    pub(crate) fn take_pending_restricted(&self) -> bool {
+        self.pending_restricted.replace(false)
     }
 
     pub(crate) fn complete(
@@ -5059,7 +5096,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )?;
-        if let Some(invocations) = self.invocations {
+        if let Some(invocations) = self
+            .invocations
+            .filter(|invocations| invocations.resolves(routine))
+        {
             return invocations.resolve(
                 routine,
                 arguments,
@@ -5072,17 +5112,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
             );
         }
         if let Some(result) = with_active_routine_invocations(|context| {
-            context.map(|(invocations, statement_arena)| {
-                invocations.resolve(
-                    routine,
-                    arguments,
-                    statement_arena,
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                )
-            })
+            context
+                .filter(|(invocations, _)| invocations.resolves(routine))
+                .map(|(invocations, statement_arena)| {
+                    invocations.resolve(
+                        routine,
+                        arguments,
+                        statement_arena,
+                        arena,
+                        source_position,
+                        input_collation,
+                        access,
+                    )
+                })
         }) {
             return result;
         }
@@ -5391,6 +5433,43 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn names_inlinable_sql_function(&self, name: &str) -> bool {
+        let (schema, bare) = match name.rsplit_once('.') {
+            Some((schema, bare)) => (Some(schema), bare),
+            None => (None, name),
+        };
+        let inlinable = |schema: &str| {
+            self.storage
+                .routine_slots_named(schema, bare, self.txid)
+                .any(|slot| {
+                    let routine = self.storage.routine_for(slot, self.txid);
+                    let mark = self.routine_workspace.mark();
+                    let inlinable =
+                        super::exec::sql_function_body_inlinable(&routine, self.routine_workspace);
+                    // SAFETY: the parsed body is consumed by the check.
+                    unsafe { self.routine_workspace.rewind_to(mark) };
+                    inlinable
+                })
+        };
+        match schema {
+            Some(schema) => inlinable(schema),
+            None => self
+                .storage
+                .path()
+                .entries()
+                .iter()
+                .any(|entry| match entry {
+                    crate::storage::PathEntry::Schema(slot) => inlinable(
+                        self.storage
+                            .schema_def_for(usize::from(*slot), self.txid)
+                            .name
+                            .as_str(),
+                    ),
+                    _ => false,
+                }),
+        }
+    }
+
     fn relation_row_type(&self, schema: &str, name: &str) -> Option<crate::storage::TypeCreation> {
         let slot = self.storage.find_visible(schema, name, self.txid)?;
         Some(

@@ -171,6 +171,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/zoneinfo
       - name: Expose PostgreSQL 18 publisher and client adapters
         run: |
           docker run --rm --detach --name pos3ql-subscription-publisher \

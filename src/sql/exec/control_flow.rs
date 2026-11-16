@@ -103,13 +103,15 @@ pub(super) fn procedural_signature<'a>(
     if matches!(invocation.program_kind, PlpgsqlProgramKind::Anonymous) {
         return Ok("inline_code_block");
     }
-    if let Some(signature) = crate::sql::catalog::routine_name_by_oid(
-        context.storage(),
-        context.txn.txid,
-        invocation.routine_oid,
-        true,
-        context.arena,
-    )? {
+    if let Some(signature) = super::call_environment::with_session_path(|| {
+        crate::sql::catalog::routine_name_by_oid(
+            context.storage(),
+            context.txn.txid,
+            invocation.routine_oid,
+            true,
+            context.arena,
+        )
+    })? {
         return Ok(signature);
     }
     // A trigger function whose catalog row this transaction cannot see is

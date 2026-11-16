@@ -17574,10 +17574,12 @@ fn extended_statistics_drive_plans_and_follow_schema_evolution() {
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
     );
+    // PostgreSQL estimates conditions on two keys of a statistics object
+    // from it, which the access model leaves out: EXPLAIN refuses them.
     assert!(
-        data_rows(&explained)
-            .iter()
-            .any(|line| line.contains("rows=10")),
+        String::from_utf8_lossy(&explained).contains(
+            "EXPLAIN of a scan of one table with conditions a statistics object estimates is not supported"
+        ),
         "{}",
         String::from_utf8_lossy(&explained)
     );
@@ -55366,7 +55368,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 }
 
 #[test]
-fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
+fn explain_refuses_conditions_estimated_by_joint_statistics() {
     let mut config = test_config("correlated-composite-explain");
     config.wal_buffer_bytes = 1 << 20;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
@@ -55386,15 +55388,24 @@ fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let rows = data_rows(&run_with(
+    // Equalities on both keys are estimated from the object's MCV list and
+    // dependencies, which the access model leaves out; one key alone is not.
+    let both = run_with(
         &mut engine,
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
-    ));
-    assert!(
-        rows.iter().any(|row| row.contains("rows=100 ")),
-        "joint NDV=10 must estimate the 100 correlated matches instead of multiplying two 0.1 estimates: {rows:?}"
     );
+    assert!(
+        String::from_utf8_lossy(&both).contains("conditions a statistics object estimates"),
+        "{}",
+        String::from_utf8_lossy(&both)
+    );
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1",
+    ));
+    assert!(rows.iter().any(|row| row.contains("rows=100 ")), "{rows:?}");
 }
 
 #[test]

@@ -157,6 +157,19 @@ impl Clause<'_> {
         }
     }
 
+    /// Whether the clause, or an arm of it, compares an expression, which an
+    /// expression key may hold.
+    pub(super) fn compares_expression(&self) -> bool {
+        match *self {
+            Self::Expression { .. } => true,
+            Self::Or(arms) => arms
+                .iter()
+                .flat_map(|arm| arm.iter())
+                .any(|restriction| restriction.clause.compares_expression()),
+            _ => false,
+        }
+    }
+
     /// The first shape inside the clause the model has no form for.
     pub(super) fn unmodeled(&self) -> Option<&'static str> {
         match *self {

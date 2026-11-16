@@ -1,6 +1,6 @@
 //! SQL inlining analyzes type inputs before deciding whether to inline a body.
 
-pub(super) mod inline;
+pub(crate) mod inline;
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql_err;

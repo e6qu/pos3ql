@@ -2954,7 +2954,8 @@ pub(crate) fn enforce_row_keys(
 }
 
 /// Validates a candidate row's *content* — NOT NULL, CHECK, and outbound
-/// foreign keys — without the uniqueness scan. ALTER's row rewrite uses this to
+/// foreign keys — without the uniqueness scan or index keys, which the
+/// rebuilt indexes evaluate after the rewrite. ALTER's row rewrite uses this to
 /// validate freshly transformed images before any of them is journaled: the
 /// uniqueness of a rewritten column against the other rewritten rows can't be
 /// judged against storage (which still holds the old images), so it is checked
@@ -2973,7 +2974,6 @@ pub(crate) fn check_row_content(
     description: RowDescription,
 ) -> Result<(), SqlError> {
     check_not_null(storage, txid, def, values, description)?;
-    check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
     check_row_checks(
         storage,

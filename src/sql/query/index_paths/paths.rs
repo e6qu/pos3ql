@@ -273,7 +273,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     fn with_predicate(&self, index: usize, clauses: &[IndexClause<'a>]) -> Result<f64, SqlError> {
         let planner = self.planner;
         let arena = self.arena;
-        let mut extra = [None::<(Option<(usize, bool)>, f64)>; clauses::MAX_CONJUNCTS];
+        let mut extra = [None::<&'a Restriction<'a>>; clauses::MAX_CONJUNCTS];
         let mut extra_count = 0;
         let predicate = self.predicate(index);
         if !predicate.is_empty() {
@@ -290,18 +290,43 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             for part in predicate {
                 let target = Prop::of(part, arena)?;
                 if !predicate::implied_by(&target, &quals, &compare, arena)? {
-                    extra[extra_count] = Some((range_bound(&part.clause), part.selectivity));
+                    extra[extra_count] = Some(part);
                     extra_count += 1;
                 }
             }
         }
-        Ok(planner.clauselist(
-            extra[..extra_count].iter().flatten().copied().chain(
-                clauses
-                    .iter()
-                    .map(|clause| (clause.range(), clause.selectivity)),
-            ),
-        ))
+        // An `OR` turned into an array condition is no clause the
+        // statistics objects read.
+        const ARRAY_OF_OR: Clause<'static> = Clause::Other {
+            columns: 0,
+            shape: "an OR as an array",
+            indexable: false,
+            pattern_only: false,
+        };
+        let conditions = arena
+            .alloc_slice_with(extra_count + clauses.len(), |at| {
+                if at < extra_count {
+                    let part = extra[at].expect("counted predicate part");
+                    super::extended::Condition {
+                        clause: &part.clause,
+                        range: range_bound(&part.clause),
+                        selectivity: part.selectivity,
+                    }
+                } else {
+                    let clause = &clauses[at - extra_count];
+                    super::extended::Condition {
+                        clause: if clause.or_array.is_some() {
+                            &ARRAY_OF_OR
+                        } else {
+                            &clause.restriction.clause
+                        },
+                        range: clause.range(),
+                        selectivity: clause.selectivity,
+                    }
+                }
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        planner.clauselist_ext(conditions)
     }
 
     /// The index conditions a `LIKE` restriction's fixed prefix gives key
@@ -1424,7 +1449,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let mut selectivity = 0.0;
         let mut cost = QualCost::default();
         for arm in selected {
-            let arm_selectivity = self.planner.selectivity(arm);
+            let arm_selectivity = self.planner.selectivity(arm)?;
             selectivity = selectivity + arm_selectivity - selectivity * arm_selectivity;
             cost = arm
                 .iter()
@@ -1770,6 +1795,8 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
     let mut product = 1.0;
     let mut largest = 1.0f64;
     let mut count = 0;
+    let mut grouped = [0usize; 64];
+    let mut grouped_count = 0;
     for (at, &column) in columns.iter().enumerate() {
         if columns[..at].contains(&column) {
             continue;
@@ -1778,6 +1805,26 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
             groups *= 2.0;
             continue;
         }
+        if grouped_count < grouped.len() {
+            grouped[grouped_count] = column;
+            grouped_count += 1;
+            continue;
+        }
+        let variable = planner.variable(column);
+        let distinct = planner.distinct(&variable).0;
+        product *= distinct;
+        largest = largest.max(distinct);
+        count += 1;
+    }
+    // `estimate_multivariate_ndistinct`: column sets a statistics object
+    // counts, then each remaining column.
+    let multivariate = planner.multivariate_distinct(&mut grouped, &mut grouped_count);
+    for &distinct in multivariate.values() {
+        product *= distinct;
+        largest = largest.max(distinct);
+        count += 1;
+    }
+    for &column in &grouped[..grouped_count] {
         let variable = planner.variable(column);
         let distinct = planner.distinct(&variable).0;
         product *= distinct;
@@ -1934,6 +1981,11 @@ pub(crate) fn scan_path<'a>(
             }
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
+    let (extended, unreadable) =
+        match super::extended::table_objects(storage, txid, slot, definition, arena)? {
+            Ok(objects) => (objects, None),
+            Err(shape) => (&[][..], Some(shape)),
+        };
     let mut planner = Planner {
         variables,
         storage,
@@ -1945,6 +1997,7 @@ pub(crate) fn scan_path<'a>(
         size,
         costs: Costs::current(),
         indexes,
+        extended,
         arena,
     };
     // The btree layouts, which read the planner's distinct estimates.
@@ -2294,9 +2347,9 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    // Conditions on two or more keys of one statistics object (or on an
-    // expression, which an expression key may be) are estimated from it by
-    // `statext_clauselist_selectivity`, which the model leaves out.
+    // Conditions on an expression a statistics object's expression key may
+    // be are estimated from it by `statext_clauselist_selectivity`, which
+    // the model leaves out, as it does statistics objects it cannot read.
     let restricted = restrictions.iter().fold(0u64, |mask, restriction| {
         mask | restriction.clause.columns()
     });
@@ -2321,9 +2374,13 @@ pub(crate) fn scan_path<'a>(
                     crate::storage::ExtendedStatisticsKey::Expression(_) => expressions = true,
                 }
             }
-            covered >= 2 || (expressions && compares_expression)
+            (covered >= 2 && unreadable.is_some()) || (expressions && compares_expression)
         })
-        .then_some("conditions a statistics object estimates");
+        .then_some(unreadable.unwrap_or("conditions on an expression a statistics object holds"));
+    let extended = extended.or_else(|| {
+        super::extended::or_through_statistics(planner.extended, restrictions)
+            .then_some("an OR a statistics object estimates")
+    });
     if let Some(shape) = extended {
         return Ok(Planned::Outside(shape));
     }
@@ -2334,7 +2391,7 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions));
+    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
     paths.rows = rows;
     match build(
         &mut paths,

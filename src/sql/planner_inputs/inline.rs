@@ -1240,6 +1240,7 @@ pub(crate) fn inline_call<'a>(
     let mut parser = crate::sql::parser::Parser::new(body, arena)
         .and_then(|parser| parser.with_routine_parameters(routine_name, routine.arguments()))
         .map_err(|error| crate::sql::parse_error_to_sql(&error))?;
+    parser.capture_type_inputs();
     let mut statements = crate::mem::arena::ArenaList::new(arena);
     while let Some(statement) = parser
         .next_stmt()
@@ -1248,6 +1249,23 @@ pub(crate) fn inline_call<'a>(
         statements
             .push(statement)
             .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    // A literal of a user-defined type, whose input may run a routine, was
+    // checked once as the call's planner inputs; the call keeps them.
+    let user_input = user_type_inputs(&parser, storage, txid)
+        || statements.as_slice().iter().any(|statement| {
+            let Stmt::Select(select) = statement else {
+                return false;
+            };
+            select.items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } => {
+                    calls_checked_input_function(expression, storage, txid, arena, 0)
+                }
+                _ => false,
+            })
+        });
+    if user_input {
+        return Ok(Inlining::Unmodeled);
     }
     let mut statements = statements.as_slice();
     // A SQL-standard body names the objects it was bound to when created.
@@ -1800,6 +1818,114 @@ fn substitute_select<'a>(
         Err(Failure::Uncovered) => Ok(None),
         Err(Failure::Full) => Err(crate::sql::eval::arena_full()),
     }
+}
+
+/// Whether `parser` captured a literal of a user-defined type, whose input
+/// may run a routine.
+fn user_type_inputs(parser: &crate::sql::parser::Parser<'_>, storage: &Storage, txid: u32) -> bool {
+    parser.type_input_candidates().iter().any(|candidate| {
+        let oid = match candidate.target {
+            crate::sql::type_inputs::CandidateTarget::TypeName(name) => {
+                match crate::sql::exec::resolve_routine_type(storage, txid, name) {
+                    Ok(resolved) => {
+                        storage.routine_type_oid(resolved.ctype, resolved.user_type, txid)
+                    }
+                    Err(_) => None,
+                }
+            }
+            crate::sql::type_inputs::CandidateTarget::ContextualOid(oid) => Some(oid),
+        };
+        oid.is_none_or(|oid| {
+            crate::storage::NamedTypeKind::from_oid(oid).is_some()
+                || crate::sql::catalog::is_polymorphic_pseudo_type(oid)
+        })
+    })
+}
+
+/// Whether `expression` calls a SQL function whose body, or a SQL function
+/// it calls, holds a literal of a user-defined type: such literals were
+/// checked once as the outer call's planner inputs, so the call stays.
+fn calls_checked_input_function(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    if let Expr::Call {
+        kind: CallKind::Routine,
+        name,
+        ..
+    } = expression
+    {
+        let (schema, bare) = match name.rsplit_once('.') {
+            Some((schema, bare)) => (Some(schema), bare),
+            None => (None, *name),
+        };
+        let found = (0..storage.routine_count()).any(|slot| {
+            let Some(identity) = storage.routine_identity_for(slot, txid) else {
+                return false;
+            };
+            if identity.name.as_str() != bare {
+                return false;
+            }
+            let routine = storage.routine_for(slot, txid);
+            if routine.language != RoutineLanguage::Sql
+                || schema.is_some_and(|schema| routine.schema.as_str() != schema)
+            {
+                return false;
+            }
+            let mark = arena.mark();
+            let result = (|| {
+                let text = if routine.body_kind == crate::storage::RoutineBodyKind::Return {
+                    arena
+                        .alloc_str_display(format_args!("SELECT {}", routine.body.as_str()))
+                        .ok()?
+                } else {
+                    arena.alloc_str(routine.body.as_str()).ok()?
+                };
+                let routine_name = arena.alloc_str(routine.name.as_str()).ok()?;
+                let mut parser = crate::sql::parser::Parser::new(text, arena)
+                    .and_then(|parser| {
+                        parser.with_routine_parameters(routine_name, routine.arguments())
+                    })
+                    .ok()?;
+                parser.capture_type_inputs();
+                let mut nested = false;
+                while let Ok(Some(statement)) = parser.next_stmt() {
+                    if let Stmt::Select(select) = statement {
+                        for item in select.items {
+                            if let SelectItem::Expr { expression, .. } = item {
+                                nested |= calls_checked_input_function(
+                                    expression,
+                                    storage,
+                                    txid,
+                                    arena,
+                                    depth + 1,
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(nested || user_type_inputs(&parser, storage, txid))
+            })();
+            // SAFETY: the parsed body was consumed above.
+            unsafe { arena.rewind_to(mark) };
+            result.unwrap_or(true)
+        });
+        if found {
+            return true;
+        }
+    }
+    let mut found = false;
+    let _ = crate::sql::query::walk_children(expression, &mut |child| {
+        found |= calls_checked_input_function(child, storage, txid, arena, depth);
+        Ok(())
+    });
+    found
 }
 
 /// Whether `name` names a SQL-language function of the catalog.

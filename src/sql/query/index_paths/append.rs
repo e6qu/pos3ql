@@ -815,6 +815,7 @@ pub(super) fn tree_path<'a>(
         },
         costs,
         indexes: &[],
+        extended: &[],
         arena,
     };
     let groups = |presorted: usize| {

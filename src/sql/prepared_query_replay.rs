@@ -581,24 +581,7 @@ pub(super) fn stage_query_record(
             let slot = storage
                 .extended_statistics_slot(schema, name, txid)
                 .ok_or_else(|| invalid("statistics source"))?;
-            let mut data = statistics.materialize()?;
-            if statistics.has_legacy_enum_hashes() && storage.live_enums().next().is_some() {
-                let definition = storage.extended_statistics(slot);
-                let table = storage.table_def(usize::from(definition.table), txid);
-                if definition.keys_for(txid).iter().any(|key| match key {
-                    ExtendedStatisticsKey::Column(name) => {
-                        table.column_index(name.as_str()).is_some_and(|column| {
-                            matches!(
-                                table.columns()[column].ctype,
-                                super::types::ColType::Enum(_)
-                            )
-                        })
-                    }
-                    ExtendedStatisticsKey::Expression(_) => true,
-                }) {
-                    data.n_mcv = 0;
-                }
-            }
+            let data = statistics.materialize()?;
             storage.write_extended_statistics_data(slot, txid, data)?;
             if let Err(error) = transaction.record_extended_statistics(slot as u32) {
                 storage.rollback_extended_statistics_data(slot, txid);

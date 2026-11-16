@@ -760,6 +760,31 @@ inlined, constants folded) before pulling it up. A `Function Scan` costs
 its call once and each row (`cost_functionscan`), its rows the function's
 `prorows` or, for `generate_series` over integers and `unnest`, what their
 support functions compute of constant arguments.
+ANALYZE builds each statistics object's kinds over its sample
+(`differential_exact/801`): every row of a table of up to `300 *` its
+target rows (the object's, else its columns' largest, else
+`default_statistics_target`), else a reservoir sample of that many, as
+`statext_ndistinct_build` (each combination of two or more keys, the
+Haas-Stokes estimate), `statext_dependencies_build` (each degree, those
+of zero left out) and `statext_mcv_build` (groups sorted by count with
+PostgreSQL's quicksort, kept while above `get_mincount_for_mcv_list`,
+with base frequencies) do, rows with a value wider than 1024 bytes left
+out of the MCV list and the dependencies; a table without rows keeps its
+earlier statistics. An MCV list holds at most 100 items and each item's
+values at most 128 bytes of text; more fail with `54000`. pg_stats_ext
+and pg_statistic_ext_data show them in PostgreSQL's key order (columns
+by attribute number, then expressions). The single-table planner applies
+them as `statext_clauselist_selectivity` does: conditions on two or more
+keys from the MCV list (`mcv_clauselist_selectivity` combined with the
+simple estimate), then equality conditions from the strongest
+dependencies (`dependencies_clauselist_selectivity`), and
+`estimate_num_groups` counts the groups of a statistics object's keys
+from its ndistinct (`estimate_multivariate_ndistinct`). Remaining: the
+estimates of joins, of plans outside the single-table planner (the
+general `GROUP BY` costing among them), and of an index condition PostgreSQL derives from an `OR` ignore the
+statistics objects without `0A000`, and pg_stats_ext_exprs shows an
+expression key's null fraction, distinct values and width, not its MCV
+list or histogram.
 An index key or predicate may call a PL/pgSQL function
 (`differential_exact/755`): a utility statement that evaluates outside a
 query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
@@ -781,10 +806,12 @@ lateral argument or a body with `WITH`, windows or a coerced column, a
 function scan of a built-in whose support function estimates its rows
 other than `generate_series` over integers and `unnest`, a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-conditions on two or more keys of a statistics object (ANALYZE stores
-approximations, not `statext_ndistinct_build`, `statext_dependencies_build`
-and `statext_mcv_build` over PostgreSQL's sample, and the planner does not
-apply them), a sub-partitioned table
+conditions on an expression key of a statistics object, an `OR` reading
+two or more keys of a statistics object with an MCV list (estimated
+through it with `is_or`), conditions a
+statistics object on a column past the 63rd or with an MCV list of a type
+other than the integer, floating, numeric, character, boolean, date,
+timestamp and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or

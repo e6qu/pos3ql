@@ -48,7 +48,7 @@ pub use operators::{
     hash_key_collated,
 };
 use operators::{compare_text_collated, logic, range_mismatch, unary};
-pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key_identified};
+pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog};
 
 pub use crate::sql::error_text::{DiagnosticText, DiagnosticWriter};
 

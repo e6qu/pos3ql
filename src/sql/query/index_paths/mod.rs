@@ -27,6 +27,7 @@ use super::scope::{QueryScope, ResolvedColumn};
 mod append;
 mod clauses;
 mod expressions;
+mod extended;
 mod like;
 mod paths;
 mod predicate;
@@ -822,6 +823,8 @@ pub(super) struct Planner<'s, 'a> {
     pub(super) costs: Costs,
     /// Every index of the table, newest first.
     pub(super) indexes: &'s [IndexInfo],
+    /// The table's statistics objects.
+    pub(super) extended: &'a [extended::ExtendedObject<'a>],
     pub(super) arena: &'a Arena,
 }
 
@@ -1656,14 +1659,18 @@ impl<'s, 'a> Planner<'s, 'a> {
         Ok(Ok(selectivity))
     }
 
-    /// `clauselist_selectivity` of `restrictions`.
-    pub(super) fn selectivity(&self, restrictions: &[clauses::Restriction<'_>]) -> f64 {
-        self.clauselist(restrictions.iter().map(|restriction| {
-            (
-                paths::range_bound(&restriction.clause),
-                restriction.selectivity,
-            )
-        }))
+    /// `clauselist_selectivity` of `restrictions`, with the table's
+    /// extended statistics.
+    pub(super) fn selectivity(
+        &self,
+        restrictions: &[clauses::Restriction<'a>],
+    ) -> Result<f64, SqlError> {
+        let mark = self.arena.mark();
+        let result = extended::conditions(restrictions, self.arena)
+            .and_then(|conditions| self.clauselist_ext(conditions));
+        // SAFETY: the conditions were consumed above.
+        unsafe { self.arena.rewind_to(mark) };
+        result
     }
 
     /// `clauselist_selectivity` of clauses given as each one's range bound

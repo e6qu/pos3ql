@@ -22,6 +22,9 @@
 #   FAST_CORPUS_SHARD(S)       selected curated-corpus file slice
 #   EXACT_ONLY                 exact-diagnostics fixtures to run: names or
 #                              number prefixes separated by spaces (default all)
+#   EXACT_SHARD(S)             selected exact-diagnostics fixture slice: the
+#                              fixtures whose sorted ordinal is EXACT_SHARD
+#                              modulo EXACT_SHARDS (default 0 of 1)
 #   FUZZ_START                 first ordinal in the seeded fuzz sequence
 #
 # Gating steps (a failure fails CI): wire probe, psycopg driver, the curated
@@ -77,7 +80,14 @@ FAST_CORPUS_SHARDS=${FAST_CORPUS_SHARDS:-1}
 FAST_CORPUS_ONLY=${FAST_CORPUS_ONLY:-}
 FAST_CORPUS_EXCLUDE=${FAST_CORPUS_EXCLUDE:-}
 EXACT_ONLY=${EXACT_ONLY:-}
+EXACT_SHARD=${EXACT_SHARD:-0}
+EXACT_SHARDS=${EXACT_SHARDS:-1}
 FUZZ_START=${FUZZ_START:-0}
+if ! [[ "$EXACT_SHARD" =~ ^[0-9]+$ && "$EXACT_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( EXACT_SHARD >= EXACT_SHARDS )); then
+  echo "EXACT_SHARD must be in [0, EXACT_SHARDS)" >&2
+  exit 1
+fi
 if ! [[ "$FAST_CORPUS_SHARD" =~ ^[0-9]+$ && "$FAST_CORPUS_SHARDS" =~ ^[1-9][0-9]*$ ]] \
     || (( FAST_CORPUS_SHARD >= FAST_CORPUS_SHARDS )); then
   echo "FAST_CORPUS_SHARD must be in [0, FAST_CORPUS_SHARDS)" >&2
@@ -1795,8 +1805,12 @@ else
   bad "initdb numbering of the pinned reference image"
   printf 'PostgreSQL (rebased): %s\npos3ql:               %s\n' "$reference_numbering" "$p3_numbering"
 fi
-# Every DETAIL, HINT, QUERY and CONTEXT line is compared.
+# Every DETAIL, HINT, QUERY and CONTEXT line is compared. Round-robin slices
+# of the sorted fixture list run each fixture in exactly one shard.
+exact_ordinal=0
 for f in "$EXT"/differential_exact/*.sql; do
+  exact_ordinal=$((exact_ordinal + 1))
+  (( (exact_ordinal - 1) % EXACT_SHARDS == EXACT_SHARD )) || continue
   n=$(basename "$f" .sql)
   if [[ -n "$EXACT_ONLY" ]]; then
     selected=0

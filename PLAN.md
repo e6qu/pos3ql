@@ -1101,16 +1101,26 @@ or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
 batch where PostgreSQL fetches only what the reads need. The exact-error
-fixtures compare every DETAIL, HINT, QUERY and CONTEXT line, except the
-fields `tests/external/exact-diagnostics-gaps.tsv` names for 3 fixtures that
-still differ: a unique index built over duplicates names the first duplicate
-pos3ql's row scan meets, where PostgreSQL names the first pair its tuplesort
-(quicksort in memory, merged runs beyond `maintenance_work_mem`) compares
-equal; a CREATE TABLE whose NOT NULL constraint repeats a CHECK constraint's
-name has no DETAIL, because the DETAIL's key names the new table's OID,
-which pos3ql assigns only after it names the constraints; and a PL/pgSQL
-`OPEN` of a static query selecting a field of an anonymous record value
-reports `could not identify column` without the query as its QUERY.
+fixtures compare every DETAIL, HINT, QUERY and CONTEXT line. The comparator
+masks one value: the new table's OID in the `Key (conrelid, contypid,
+conname)=(...)` DETAIL of a CREATE TABLE that repeats a constraint name,
+which each server draws from its own counter. A unique B-tree index build
+(CREATE UNIQUE INDEX, REINDEX) over duplicate keys names the first equal
+pair PostgreSQL's in-memory quicksort compares, reading rows in a sequential
+scan's physical order; REINDEX of a table reports the first index, by OID,
+whose rebuild fails. A build PostgreSQL would sort in parallel or beyond its
+default `maintenance_work_mem` (64 MB) fails with `0A000` when it finds
+duplicates; pos3ql estimates both conservatively from its own row sizes,
+and treats a parent's inherited NOT NULL name that repeats an inherited CHECK
+name as taken, where PostgreSQL keeps it and fails on the catalog index.
+Remaining: a table-level NOT NULL constraint (`CONSTRAINT n NOT NULL col` in
+CREATE TABLE or ALTER TABLE ADD) is a syntax error; ALTER TABLE ADD
+CONSTRAINT UNIQUE and table rewrites over duplicates name the first
+duplicate pos3ql's row scan meets; a routine argument of a composite type
+does not accept a `ROW(...)` value (`42883`); and a PL/pgSQL record variable
+assigned a `ROW(...)` value resolves `(r).f1`, which PostgreSQL rejects as
+a field of an anonymous record, and a bound cursor's query sees variables
+declared after the cursor.
 COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in

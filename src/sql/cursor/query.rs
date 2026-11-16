@@ -237,6 +237,13 @@ impl CursorQuery {
             .unwrap_or("")
     }
 
+    /// Where the bound query's private copy of its text lives.
+    pub(crate) fn bound_text(&self) -> Option<crate::sql::error_position::CopiedText> {
+        self.bound
+            .as_ref()
+            .map(|bound| crate::sql::error_position::CopiedText::of(bound.source))
+    }
+
     pub(crate) fn owner(&self) -> crate::sql::type_input_plans::Owner {
         self.owner
     }

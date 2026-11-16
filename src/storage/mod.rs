@@ -23753,7 +23753,12 @@ impl Storage {
                 .attributes
                 .initialize(definition.n_columns)
                 .expect("internal column attributes fit");
-            constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
+            // No other relation exists while storage is set up.
+            constraint_names::table(
+                &mut definition,
+                constraint_names::GeneratedNames::InSchema(&|_| false),
+            )
+            .expect("internal NOT NULL names are valid");
             let definition = definition
                 .freeze(&metadata_pool)
                 .map_err(StorageSetupError::Metadata)?;

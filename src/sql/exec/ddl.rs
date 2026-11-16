@@ -2222,8 +2222,9 @@ pub(super) fn attach_constraints(
             }
         }
     }
-    def.attributes.initialize(def.n_columns)?;
-    crate::storage::constraint_names::table(def)
+    // NOT NULL constraints are named when the table is created or altered,
+    // in PostgreSQL's order relative to these constraints.
+    def.attributes.initialize(def.n_columns)
 }
 
 /// One `EXCLUDE` element resolved as PostgreSQL's `ComputeIndexAttrs` does:

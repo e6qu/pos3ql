@@ -286,7 +286,13 @@ impl<'storage> TableDefinitionEdit<'storage> {
             definition.columns(),
             column_mapping,
         )?;
-        super::constraint_names::remap_table(current, &mut definition, column_mapping)?;
+        // Admission named the draft's constraints before staging it.
+        super::constraint_names::remap_table(
+            current,
+            &mut definition,
+            column_mapping,
+            super::constraint_names::GeneratedNames::Assigned,
+        )?;
         definition.not_null_name_edits = super::ColumnSet::EMPTY;
         self.storage
             .reserve_table_catalog_identities(&mut definition)?;

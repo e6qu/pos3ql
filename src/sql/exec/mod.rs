@@ -5157,6 +5157,7 @@ fn build_inherited_table_def(
     definition.n_columns = 0;
     definition.columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
     definition.not_null_names = [None; MAX_COLUMNS];
+    definition.not_null_name_edits = crate::storage::ColumnSet::EMPTY;
     definition.inheritance = crate::storage::TableInheritance::NONE;
     for parent_name in parents {
         let parent = resolve_dml_table(storage, parent_name, txid)?;
@@ -5273,12 +5274,18 @@ fn build_inherited_table_def(
                 definition.columns[existing].not_null_inheritable = column.not_null_inheritable;
                 // The child's own declaration names the merged constraint.
                 definition.not_null_names[existing] = own.not_null_names[own_index];
+                if own.not_null_name_edits.contains(own_index) {
+                    definition.not_null_name_edits.insert(existing);
+                }
             }
         } else {
             let mut count = definition.n_columns;
             push_column(&mut definition, &mut count, *column)?;
             definition.n_columns = count;
             definition.not_null_names[count - 1] = own.not_null_names[own_index];
+            if own.not_null_name_edits.contains(own_index) {
+                definition.not_null_name_edits.insert(count - 1);
+            }
         }
     }
     for index in 0..definition.n_uniques {
@@ -6864,7 +6871,7 @@ fn build_def_with_likes(
     for position in 0..=statement.columns.len() {
         for like in statement.likes.iter().filter(|l| l.at == position) {
             let source = like_source(storage, like, txid)?;
-            for column in source.columns() {
+            for (source_column, column) in source.columns().iter().enumerate() {
                 let mut copied = *column;
                 if !like.defaults && !copied.default.is_generated() {
                     copied.default = crate::storage::ColumnDefault::NONE;
@@ -6890,6 +6897,12 @@ fn build_def_with_likes(
                     copied.compression = crate::sql::ast::ColumnCompression::Default;
                 }
                 push_column(&mut def, &mut n, copied)?;
+                // LIKE copies a NOT NULL constraint under its own name.
+                if copied.not_null.is_required()
+                    && let Some(name) = source.not_null_names.as_ref()[source_column]
+                {
+                    def.set_not_null_constraint_name(n - 1, name);
+                }
             }
         }
         if let Some(column) = statement.columns.get(position) {
@@ -29558,9 +29571,11 @@ fn compile_plpgsql_execution<'a>(
     let source = ProgramSource::capture(source, kind, positionals, &storage.execution_control)?;
     crate::sql::error_context::within_plpgsql_compilation(name, || {
         let (parsed, code) = source.parse(arena, Some(written))?;
-        let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
-            resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
-        })?;
+        let program = crate::sql::error_position::with_copied_source(
+            written,
+            crate::sql::error_position::CopiedText::of(code.text()),
+            || resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter),
+        )?;
         Ok((program, code))
     })
 }
@@ -33258,6 +33273,9 @@ fn eval_procedural_expression<'a>(
         failed_planning: &failed_planning,
     };
     let result = in_simple_expression(text, mode, expression, arena, plan, || {
+        if !kept {
+            check_procedural_record_fields(context, expression, row)?;
+        }
         eval_procedural_expression_in(context, expression, row, continuation)
     });
     // An assignment keeps its plan once the whole statement is planned.
@@ -33271,6 +33289,38 @@ fn eval_procedural_expression<'a>(
         keep_expression_plan(context, &row.invocation, expression)?;
     }
     result
+}
+
+/// Resolves each field selection of `expression` as PostgreSQL's analysis
+/// does when it plans the expression: a field of a value whose type is the
+/// anonymous `record`, such as a record variable's `record` field, names no
+/// column even when the value at hand has one.
+fn check_procedural_record_fields<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    expression: &'a Expr<'a>,
+    row: &TriggerLocalScope<'_, 'a>,
+) -> Result<(), SqlError> {
+    fn visit<'a>(
+        expression: &'a Expr<'a>,
+        check: &mut dyn FnMut(&'a Expr<'a>, &'a Expr<'a>, &str) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        if let Expr::Field { base, field } = expression
+            && *field != "*"
+        {
+            check(expression, base, field)?;
+        }
+        super::query::walk_children(expression, &mut |child| visit(child, check))
+    }
+    let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&catalog),
+    };
+    visit(expression, &mut |selection, base, field| {
+        super::exec::record_field_metadata(base, field, &columns)
+            .map(|_| ())
+            .map_err(|error| crate::sql::error_position::expression_error(error, selection))
+    })
 }
 
 /// The backend PL/pgSQL instance running `row`'s routine and the body
@@ -39250,25 +39300,32 @@ fn prepare_static_plpgsql_statement<'a>(
         )?;
         return Ok((statement, None));
     };
-    let prepared = engine
-        .prepare_plpgsql_inputs(
-            row.invocation.input_plan_key(site)?,
-            site,
-            row,
-            row.invocation.materialized_relations,
-            context.arena,
-            context.txn,
-            sqlprep,
-            cursors,
-            guc,
-            context.responder,
-        )
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL type input exceeds the send buffer"
+    let key = row.invocation.input_plan_key(site)?;
+    // PostgreSQL analyses the query as SPI prepares it, so an analysis error
+    // is positioned in the query and names it. Other statements run whole in
+    // their query's frame; OPEN checks its cursor variable outside it.
+    let opens = matches!(statement, TriggerStatement::CursorOpen(_));
+    let prepared = in_statement_query(opens.then_some(site.text), || {
+        engine
+            .prepare_plpgsql_inputs(
+                key,
+                site,
+                row,
+                row.invocation.materialized_relations,
+                context.arena,
+                context.txn,
+                sqlprep,
+                cursors,
+                guc,
+                context.responder,
             )
-        })??;
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "PL/pgSQL type input exceeds the send buffer"
+                )
+            })?
+    })?;
     if prepared.bindings.is_empty() {
         return Ok((statement, Some((site, prepared))));
     }
@@ -73784,7 +73841,134 @@ enum IndexRowValidation {
     Reindex { selected: Option<i32> },
 }
 
+/// Validates the rows an index build reads. A row-by-row probe finds whether
+/// a unique key has duplicates; PostgreSQL then names the pair its sort of
+/// that key's index compares first.
 fn validate_index_rows(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    validation: IndexRowValidation,
+    arena: &Arena,
+) -> Result<crate::storage::TableStatistics, SqlError> {
+    match validate_index_rows_by_probe(storage, table_index, txid, validation, arena) {
+        Err(error) if error.sqlstate == sqlstate::UNIQUE_VIOLATION => Err(
+            match sorted_unique_build_error(storage, table_index, txid, validation, arena) {
+                Ok(error) | Err(error) => error,
+            },
+        ),
+        validated => validated,
+    }
+}
+
+/// PostgreSQL rebuilds a table's indexes one at a time in OID order, each
+/// with its own sort; the first that fails names the first equal pair its
+/// sort compares.
+fn sorted_unique_build_error(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    validation: IndexRowValidation,
+    arena: &Arena,
+) -> Result<SqlError, SqlError> {
+    let definition = (*storage.table_def(table_index, txid)).clone();
+    let oid = match validation {
+        IndexRowValidation::Create { selected, .. }
+        | IndexRowValidation::Reindex {
+            selected: Some(selected),
+        } => selected,
+        IndexRowValidation::Reindex { selected: None } => {
+            let mut failing = None;
+            constraints::for_each_build_key_oid(storage, &definition, txid, &mut |oid| {
+                if failing.is_none()
+                    && let Err(error) = validate_index_rows_by_probe(
+                        storage,
+                        table_index,
+                        txid,
+                        IndexRowValidation::Reindex {
+                            selected: Some(oid),
+                        },
+                        arena,
+                    )
+                {
+                    failing = Some((oid, error));
+                }
+                Ok(())
+            })?;
+            match failing {
+                Some((oid, error)) if error.sqlstate == sqlstate::UNIQUE_VIOLATION => oid,
+                Some((_, error)) => return Ok(error),
+                None => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "no index rebuild repeats the table's unique violation"
+                    ));
+                }
+            }
+        }
+    };
+    let mut rows = |visit: &mut constraints::BuildRowVisit<'_>| {
+        for_each_index_build_row(storage, table_index, txid, &definition, arena, visit)
+    };
+    constraints::sorted_build_violation(
+        storage,
+        table_index,
+        txid,
+        &definition,
+        oid,
+        &mut rows,
+        arena,
+    )?
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "unique index build has no key with OID {}",
+            oid
+        )
+    })
+}
+
+/// Visits each row an index build reads, in a sequential scan's physical
+/// order, after checking its index tuples' sizes as forming them does: its
+/// row identifier, values and stored size.
+fn for_each_index_build_row(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    definition: &TableDef,
+    arena: &Arena,
+    visit: &mut constraints::BuildRowVisit<'_>,
+) -> Result<(), SqlError> {
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let schema = &schema[..definition.n_columns];
+    let mut admit = |rowid: u64, values: &[Datum<'_>], stored: usize| {
+        let mark = arena.mark();
+        let checked = check_index_tuple_sizes(storage, definition, values, txid, arena);
+        // SAFETY: the size check returns only an owned verdict.
+        unsafe { arena.rewind_to(mark) };
+        checked?;
+        visit(rowid, values, stored)
+    };
+    let scan = storage.index_validation_scan_in(table_index, txid, arena)?;
+    let scanned = scan.for_each_home_physically(arena, &mut |rowid, home| {
+        storage.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, schema, &mut values)?;
+            admit(rowid, &values[..schema.len()], bytes.len())
+        })?;
+        Ok(core::ops::ControlFlow::Continue(()))
+    })?;
+    if scanned.is_break() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "index validation stopped before completing the scan"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_index_rows_by_probe(
     storage: &Storage,
     table_index: usize,
     txid: u32,
@@ -98754,7 +98938,13 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.copy_constraint_expression_dependencies(parent, constraint.name, inherited.name)?;
     }
     storage.prepare_inline_key_names(child, transaction, Some(child_slot))?;
-    crate::storage::constraint_names::table(child)
+    let schema = child.schema;
+    crate::storage::constraint_names::table(
+        child,
+        crate::storage::constraint_names::GeneratedNames::InSchema(&|name| {
+            storage.schema_constraint_name_taken(schema, name, transaction, Some(child_slot))
+        }),
+    )
 }
 
 fn has_unique_identity<Definition0: crate::storage::DefinitionBacking>(
@@ -99182,7 +99372,13 @@ fn alter_table_inheritance(
             };
         }
     }
-    if let Err(error) = crate::storage::constraint_names::table(&mut updated) {
+    let schema = updated.schema;
+    if let Err(error) = crate::storage::constraint_names::table(
+        &mut updated,
+        crate::storage::constraint_names::GeneratedNames::InSchema(&|name| {
+            storage.schema_constraint_name_taken(schema, name, txn.txid, Some(child))
+        }),
+    ) {
         return sql_fail(error);
     }
     let mut mapping = [None; MAX_COLUMNS];
@@ -103217,9 +103413,13 @@ fn alter_table_relation(
     {
         return sql_fail(error);
     }
-    if let Err(error) =
-        crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping)
-    {
+    // Admission named the draft's constraints just above.
+    if let Err(error) = crate::storage::constraint_names::remap_table(
+        &def,
+        &mut new_def,
+        &column_mapping,
+        crate::storage::constraint_names::GeneratedNames::Assigned,
+    ) {
         return sql_fail(error);
     }
     if let Err(error) = ddl::check_altered_foreign_key_types(storage, txn.txid, &new_def) {
@@ -104027,7 +104227,18 @@ fn alter_table_relation(
                 if !changed {
                     continue;
                 }
-                if let Err(error) = crate::storage::constraint_names::table(&mut dependent) {
+                let schema = dependent.schema;
+                if let Err(error) = crate::storage::constraint_names::table(
+                    &mut dependent,
+                    crate::storage::constraint_names::GeneratedNames::InSchema(&|name| {
+                        storage.schema_constraint_name_taken(
+                            schema,
+                            name,
+                            txn.txid,
+                            Some(descendant),
+                        )
+                    }),
+                ) {
                     return sql_fail(error);
                 }
                 // A partition's existing rows must satisfy the constraints it

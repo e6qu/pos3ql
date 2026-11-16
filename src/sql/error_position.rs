@@ -998,15 +998,32 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
     run()
 }
 
+/// Where a verbatim copy of a piece of statement text lives. Positioning
+/// compares addresses only, so the copy need not be borrowed meanwhile.
+#[derive(Clone, Copy)]
+pub(crate) struct CopiedText {
+    address: usize,
+    len: usize,
+}
+
+impl CopiedText {
+    pub(crate) fn of(copy: &str) -> Self {
+        Self {
+            address: copy.as_ptr() as usize,
+            len: copy.len(),
+        }
+    }
+}
+
 /// Runs `run` positioning subjects inside `copy`, a verbatim copy of
 /// `written`, where `written` appears in the installed statement text.
-pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce() -> R) -> R {
+pub(crate) fn with_copied_source<R>(written: &str, copy: CopiedText, run: impl FnOnce() -> R) -> R {
     let Some((at, current)) = locate(written) else {
         return run();
     };
     let copies = [SourceCopy {
-        address: copy.as_ptr() as usize,
-        len: copy.len(),
+        address: copy.address,
+        len: copy.len,
         at,
     }];
     let _scope = SourceScope(

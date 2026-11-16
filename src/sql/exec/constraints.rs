@@ -20,6 +20,9 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, 
 
 use super::{RowCtx, check_not_null};
 
+mod build_sort;
+pub(crate) use build_sort::{BuildRowVisit, sorted_build_violation};
+
 /// The longest prefix of one value PostgreSQL shows in a row description
 /// (`ExecBuildSlotValueDescription`'s `maxfieldlen`).
 const MAX_DESCRIBED_FIELD_BYTES: usize = 64;
@@ -1402,6 +1405,59 @@ pub(crate) fn index_key_values<'a>(
     Ok(keys)
 }
 
+/// The unique violation of index or key `name` for the key `keys`, its
+/// columns named as `pg_get_indexdef_columns` names them: each expression key
+/// deparsed from its binding.
+#[allow(clippy::too_many_arguments)]
+fn index_key_violation(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    name: SqlName,
+    columns: &[u16],
+    expressions: &[Option<&Expr<'_>>],
+    expression_texts: &[Option<&str>],
+    keys: &[Datum],
+    duplicate: DuplicateKey,
+    arena: &Arena,
+) -> SqlError {
+    let mut displays = [None; crate::storage::MAX_INDEX_COLS];
+    for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
+        if let (Some(expression), Some(source)) =
+            (expressions[position], expression_texts[position])
+        {
+            match crate::sql::catalog::index_key_display(
+                storage,
+                txid,
+                table_index,
+                expression,
+                source,
+                arena,
+            ) {
+                Ok(text) => *display = Some(text),
+                Err(error) => return error,
+            }
+        }
+    }
+    let names = columns.iter().enumerate().map(|(position, column)| {
+        displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
+    });
+    let values = keys.iter().copied();
+    let visible = key_values_visible(
+        storage,
+        table_index,
+        txid,
+        &mut columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| expressions[position].is_none().then_some(*column)),
+    );
+    duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut {
+        values
+    })
+}
+
 /// Enforces a unique expression index without manufacturing a column-only
 /// cache key. Expressions and an optional predicate are evaluated against the
 /// authoritative committed and pending images with one parser representation.
@@ -1437,42 +1493,19 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let violation = || {
-        // `pg_get_indexdef_columns`: each expression key deparsed from its
-        // binding.
-        let mut displays = [None; crate::storage::MAX_INDEX_COLS];
-        for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
-            if let (Some(expression), Some(source)) =
-                (expressions[position], expression_texts[position])
-            {
-                match crate::sql::catalog::index_key_display(
-                    storage,
-                    txid,
-                    table_index,
-                    expression,
-                    source,
-                    arena,
-                ) {
-                    Ok(text) => *display = Some(text),
-                    Err(error) => return error,
-                }
-            }
-        }
-        let names = columns.iter().enumerate().map(|(position, column)| {
-            displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
-        });
-        let values = keys[..columns.len()].iter().copied();
-        let visible = key_values_visible(
+        index_key_violation(
             storage,
             table_index,
             txid,
-            &mut columns
-                .iter()
-                .enumerate()
-                .map(|(position, column)| expressions[position].is_none().then_some(*column)),
-        );
-        duplicate_key_error(duplicate, name, def, visible, &mut { names }, &mut {
-            values
-        })
+            def,
+            name,
+            columns,
+            expressions,
+            expression_texts,
+            &keys[..columns.len()],
+            duplicate,
+            arena,
+        )
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -2008,6 +2041,28 @@ pub(crate) fn index_predicate_matches(
             "unknown"
         )),
     }
+}
+
+/// Visits the index OID of each unique and exclusion constraint of `def`, in
+/// OID order, the order PostgreSQL rebuilds a table's indexes.
+pub(crate) fn for_each_build_key_oid<B: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<B>,
+    txid: u32,
+    visit: &mut dyn FnMut(i32) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let oid = |identity: Option<crate::storage::RelationIdentity>| {
+        identity.map(crate::storage::RelationIdentity::oid)
+    };
+    for_each_row_key(storage, def, txid, &mut |key| {
+        let key_oid = match key {
+            RowKey::Column(column) => oid(def.column_index_identity(column)),
+            RowKey::Table(key) => oid(key.index_identity),
+            RowKey::Exclusion(position) => oid(def.exclusions()[position].index_identity),
+            RowKey::Index(index) => Some(crate::sql::catalog::explicit_index_oid(index)),
+        };
+        key_oid.map_or(Ok(()), &mut *visit)
+    })
 }
 
 /// A unique or exclusion constraint a row must satisfy, named by its

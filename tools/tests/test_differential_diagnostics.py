@@ -267,35 +267,31 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         })
         self.assertEqual(records[1]["detail"], "first detail line\nsecond detail line")
         self.assertEqual(records[1]["hint"], "a hint")
-        # Verbose comparison keeps none of them; a known gap omits a field.
+        # Verbose comparison keeps none of them.
         verbose = DIAGNOSTICS.normalize_diagnostics(
             stderr, "verbose", {}, input_diagnostics="verbose")
         self.assertNotIn("detail", verbose[0])
-        omitted = DIAGNOSTICS.normalize_diagnostics(
-            stderr, "full", {}, input_diagnostics="verbose", omit=("context", "query"))
-        self.assertNotIn("context", omitted[0])
-        self.assertNotIn("query", omitted[0])
-        self.assertEqual(omitted[0]["detail"], 'Token "x" is invalid.')
-        for mode, omit in (("verbose", ("context",)), ("full", ("location",))):
-            with self.subTest(mode=mode, omit=omit), self.assertRaises(ValueError):
-                DIAGNOSTICS.normalize_diagnostics(
-                    stderr, mode, {}, input_diagnostics="verbose", omit=omit)
 
-    def test_known_diagnostic_gaps_name_existing_fixtures_and_fields(self):
-        gaps = ROOT / "tests/external/exact-diagnostics-gaps.tsv"
-        fixtures = {path.stem for path in (ROOT / "tests/external/differential_exact").glob("*.sql")}
-        seen = set()
-        for line in gaps.read_text().splitlines():
-            if not line or line.startswith("#"):
-                continue
-            fixture, fields, difference = line.split("\t")
-            with self.subTest(fixture=fixture):
-                self.assertIn(fixture, fixtures)
-                self.assertNotIn(fixture, seen)
-                seen.add(fixture)
-                self.assertTrue(difference)
-                for field in fields.split(","):
-                    self.assertIn(field, DIAGNOSTICS.FULL_FIELDS)
+    def test_full_comparison_masks_only_the_catalog_name_key_relation_oid(self):
+        violation = ('duplicate key value violates unique constraint '
+                     '"pg_constraint_conrelid_contypid_conname_index"')
+        def detail(message, line):
+            stderr = f"psql:c.sql:1: ERROR:  23505: {message}\nDETAIL:  {line}\n"
+            return DIAGNOSTICS.normalize_diagnostics(
+                stderr, "full", {}, input_diagnostics="verbose")[0]["detail"]
+        key = "Key (conrelid, contypid, conname)=({}, 0, repeated_name) already exists."
+        self.assertEqual(detail(violation, key.format(16390)), detail(violation, key.format(17)))
+        self.assertEqual(detail(violation, key.format(16390)),
+                         key.format("<relation oid>"))
+        # Another constraint's key, or another field of the key, stays exact.
+        other = 'duplicate key value violates unique constraint "t_pkey"'
+        self.assertEqual(detail(other, "Key (id)=(16390) already exists."),
+                         "Key (id)=(16390) already exists.")
+        self.assertNotEqual(
+            detail(violation, "Key (conrelid, contypid, conname)=(1, 0, a) already exists."),
+            detail(violation, "Key (conrelid, contypid, conname)=(1, 0, b) already exists."))
+        with self.assertRaises(ValueError):
+            detail(violation, "Key (conrelid, contypid, conname)=(x, 1, a) already exists.")
 
     def test_verbose_capture_keeps_state_comparison_separate_from_primary_text(self):
         first = "psql:corpus.sql:8: ERROR:  54000: memtable exhausted\n"

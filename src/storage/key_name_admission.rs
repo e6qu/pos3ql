@@ -74,6 +74,27 @@ impl Storage {
         self.schema_generated_name_taken(definition.schema, name, transaction, exclude, class, None)
     }
 
+    /// Whether a constraint in `schema` already has `name`, as PostgreSQL's
+    /// `ChooseConstraintName` checks `pg_constraint` before a new table's
+    /// own constraints exist.
+    /// `exclude` is the table being altered, whose own names its draft holds.
+    pub(crate) fn schema_constraint_name_taken(
+        &self,
+        schema: SqlName,
+        name: SqlName,
+        transaction: u32,
+        exclude: Option<usize>,
+    ) -> bool {
+        self.schema_generated_name_taken(
+            schema,
+            name,
+            transaction,
+            exclude,
+            GeneratedNameClass::Constraint,
+            None,
+        )
+    }
+
     fn schema_generated_name_taken(
         &self,
         schema: SqlName,
@@ -319,7 +340,16 @@ impl Storage {
         let previous = self.table_def(target.table(), target.transaction());
         definition.attributes =
             column_attributes::ColumnAttributes::rewrite(&previous, definition.columns(), mapping)?;
-        constraint_names::remap_table(&previous, definition, mapping)?;
+        let schema = definition.schema;
+        let transaction = target.transaction();
+        constraint_names::remap_table(
+            &previous,
+            definition,
+            mapping,
+            constraint_names::GeneratedNames::InSchema(&|name| {
+                self.schema_constraint_name_taken(schema, name, transaction, Some(target.table()))
+            }),
+        )?;
         self.prepare_inline_key_names(definition, target.transaction(), Some(target.table()))?;
         for key in definition.inline_key_names() {
             if previous.inline_key_names().iter().any(|prior| prior == key) {

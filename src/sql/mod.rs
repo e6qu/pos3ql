@@ -27770,101 +27770,113 @@ impl Engine {
                 return Err(error);
             }
         }
-        let txid = txn.txid;
-        let command = cursor_snapshot_command(&self.storage, txn.command_id());
-        if let Err(error) =
-            cursors
-                .execution_parts(at)
-                .0
-                .retain_snapshot(&self.storage, txid, command)
-        {
-            cursors.abandon_attempt(attempt)?;
-            return Err(error);
-        }
-        // A retained join builds its hash tables now: one that does not fit
-        // `plan_build_bytes` leaves the cursor to run its query whole at its
-        // first read instead.
-        let mut materialize = false;
-        loop {
-            let out = self.run_cursor_query(
-                at,
-                command,
-                arena,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-                |storage, work, _sequence, cursors| {
-                    cursors.restart_opening_output(attempt)?;
-                    let prepared = if materialize {
-                        Ok(false)
-                    } else {
-                        let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(
-                            description,
-                            crate::pg::respond::CursorRowOutput::Save(rows),
-                        );
-                        query.prepare_source(
-                            storage,
-                            txid,
-                            &mut capture,
-                            query::RetainedUse::Cursor,
-                        )
-                    };
-                    match prepared {
-                        Ok(true) => retained_cursor_plan_scroll(cursors, at, storage, txid, work),
-                        // A query that does not stream, or a hash table that
-                        // does not fit, runs whole at the first read instead.
-                        Ok(false) => {
-                            describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
-                        }
-                        Err(error) if error.is_plan_build_exhausted() => {
-                            describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
-                        }
-                        Err(error) => Err(error),
-                    }
-                },
-            );
-            if let Err(error) = out {
-                if !cursor_input_wait(&error) {
-                    cursors.abandon_attempt(attempt)?;
-                }
+        // Analysis errors raised planning the cursor's private copy of an
+        // internal query are positioned in the query the routine wrote.
+        let copy = cursors.execution_parts(at).0.bound_text().ok_or_else(|| {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor query is not bound"
+            )
+        })?;
+        error_position::with_copied_source(sql, copy, || {
+            let txid = txn.txid;
+            let command = cursor_snapshot_command(&self.storage, txn.command_id());
+            if let Err(error) =
+                cursors
+                    .execution_parts(at)
+                    .0
+                    .retain_snapshot(&self.storage, txid, command)
+            {
+                cursors.abandon_attempt(attempt)?;
                 return Err(error);
             }
-            if materialize || cursors.execution_parts(at).0.source().is_none() {
-                break;
-            }
-            self.storage.set_read_snapshot(command);
-            let built = {
-                let (work, buffers) = self.work.cursor_parts();
-                cursors.execution_parts(at).0.build_tables(
-                    &self.storage,
-                    txid,
-                    datetime::now_micros(),
-                    work,
-                    buffers,
-                )
-            };
-            match built {
-                Ok(()) => break,
-                Err(error) if error.is_plan_build_exhausted() => {
-                    cursors.execution_parts(at).0.discard_source();
-                    materialize = true;
-                }
-                Err(error) => {
+            // A retained join builds its hash tables now: one that does not fit
+            // `plan_build_bytes` leaves the cursor to run its query whole at its
+            // first read instead.
+            let mut materialize = false;
+            loop {
+                let out = self.run_cursor_query(
+                    at,
+                    command,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                    |storage, work, _sequence, cursors| {
+                        cursors.restart_opening_output(attempt)?;
+                        let prepared = if materialize {
+                            Ok(false)
+                        } else {
+                            let (query, description, rows) = cursors.execution_parts(at);
+                            let mut capture = Responder::for_cursor(
+                                description,
+                                crate::pg::respond::CursorRowOutput::Save(rows),
+                            );
+                            query.prepare_source(
+                                storage,
+                                txid,
+                                &mut capture,
+                                query::RetainedUse::Cursor,
+                            )
+                        };
+                        match prepared {
+                            Ok(true) => {
+                                retained_cursor_plan_scroll(cursors, at, storage, txid, work)
+                            }
+                            // A query that does not stream, or a hash table that
+                            // does not fit, runs whole at the first read instead.
+                            Ok(false) => {
+                                describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
+                            }
+                            Err(error) if error.is_plan_build_exhausted() => {
+                                describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    },
+                );
+                if let Err(error) = out {
                     if !cursor_input_wait(&error) {
                         cursors.abandon_attempt(attempt)?;
                     }
                     return Err(error);
                 }
+                if materialize || cursors.execution_parts(at).0.source().is_none() {
+                    break;
+                }
+                self.storage.set_read_snapshot(command);
+                let built = {
+                    let (work, buffers) = self.work.cursor_parts();
+                    cursors.execution_parts(at).0.build_tables(
+                        &self.storage,
+                        txid,
+                        datetime::now_micros(),
+                        work,
+                        buffers,
+                    )
+                };
+                match built {
+                    Ok(()) => break,
+                    Err(error) if error.is_plan_build_exhausted() => {
+                        cursors.execution_parts(at).0.discard_source();
+                        materialize = true;
+                    }
+                    Err(error) => {
+                        if !cursor_input_wait(&error) {
+                            cursors.abandon_attempt(attempt)?;
+                        }
+                        return Err(error);
+                    }
+                }
             }
-        }
-        if let Err(error) = cursors.seal(at) {
-            cursors.abandon_attempt(attempt)?;
-            return Err(error);
-        }
-        Ok(())
+            if let Err(error) = cursors.seal(at) {
+                cursors.abandon_attempt(attempt)?;
+                return Err(error);
+            }
+            Ok(())
+        })
     }
 
     /// Runs `evaluate` over a bound cursor query after preparing its planner

@@ -15833,7 +15833,11 @@ mod tests {
         def.attributes.initialize(def.n_columns).unwrap();
         def.set_column_key_name(0, SqlName::parse("t_pkey").unwrap())
             .unwrap();
-        crate::storage::constraint_names::table(&mut def).unwrap();
+        crate::storage::constraint_names::table(
+            &mut def,
+            crate::storage::constraint_names::GeneratedNames::InSchema(&|_| false),
+        )
+        .unwrap();
         for (position, identity) in def.table_index_identities_mut().enumerate() {
             *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
         }

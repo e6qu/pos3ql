@@ -5514,7 +5514,7 @@ fn validate_partition_bound(
 ) -> Result<(), SqlError> {
     let mut siblings = crate::mem::arena::ArenaList::new(arena);
     for slot in 0..storage.table_count() {
-        if !storage.table(slot).visible_to(txid) {
+        if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
         if let Some(attachment) = storage.table_def(slot, txid).partition.attachment
@@ -5849,7 +5849,7 @@ fn validate_default_partition_rows(
         .scheme
         .expect("partition parent has a scheme");
     for default in 0..storage.table_count() {
-        if !storage.table(default).visible_to(txid) {
+        if !storage.table_slot_visible_to(default, txid) {
             continue;
         }
         let definition = (*storage.table_def(default, txid)).clone();
@@ -5861,7 +5861,7 @@ fn validate_default_partition_rows(
             continue;
         }
         for candidate in 0..storage.table_count() {
-            if storage.table(candidate).visible_to(txid)
+            if storage.table_slot_visible_to(candidate, txid)
                 && (candidate == default
                     || storage.partition_descends_from(candidate, default, txid))
             {
@@ -5875,7 +5875,7 @@ fn validate_default_partition_rows(
         }
         let read = storage.validation_read();
         for candidate in 0..storage.table_count() {
-            if !storage.table(candidate).visible_to(txid)
+            if !storage.table_slot_visible_to(candidate, txid)
                 || storage
                     .table_def(candidate, txid)
                     .partition
@@ -10322,7 +10322,7 @@ fn drop_table_kind_with_columns(
                     // receive exactly the same treatment as an explicit DROP.
                     loop {
                         let child = (0..storage.table_count()).find_map(|candidate| {
-                            if !storage.table(candidate).visible_to(txn.txid) {
+                            if !storage.table_slot_visible_to(candidate, txn.txid) {
                                 return None;
                             }
                             let definition = storage.table_def(candidate, txn.txid);
@@ -10525,7 +10525,7 @@ fn drop_table_kind_with_columns(
                     }
                     loop {
                         let inbound = (0..storage.table_count()).find_map(|child| {
-                            if !storage.table(child).visible_to(txn.txid)
+                            if !storage.table_slot_visible_to(child, txn.txid)
                                 || selected_tables[..selected_table_count].contains(&child)
                             {
                                 return None;
@@ -15740,7 +15740,7 @@ fn drop_owned_objects(
         .enumerate()
         .take(storage.table_count())
     {
-        if !selected || !storage.table(slot).visible_to(txn.txid) {
+        if !selected || !storage.table_slot_visible_to(slot, txn.txid) {
             continue;
         }
         let definition = (*storage.table_def(slot, txn.txid)).clone();
@@ -16441,7 +16441,7 @@ fn resolve_privilege_objects(
                             ));
                         }
                         for slot in 0..storage.table_count() {
-                            if !storage.table(slot).visible_to(txid) {
+                            if !storage.table_slot_visible_to(slot, txid) {
                                 continue;
                             }
                             let definition = storage.table_def(slot, txid);
@@ -19076,12 +19076,12 @@ pub(crate) fn drop_schema(
                     );
                 }
             }
-            let mut hint = crate::util::StackStr::<128>::new();
-            let _ = write!(
-                hint,
-                "Use DROP ... CASCADE to drop the dependent objects too."
+            crate::sql::eval::stash_diagnostic(
+                Some(detail),
+                Some(crate::util::StackStr::from_str(
+                    "Use DROP ... CASCADE to drop the dependent objects too.",
+                )),
             );
-            crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
             return sql_fail(sql_err!(
                 crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "cannot drop schema {} because other objects depend on it",
@@ -43576,10 +43576,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
     if detail.is_some() || hint.is_some() {
         super::eval::stash_diagnostic(detail, hint);
     }
-    Err(SqlError {
-        sqlstate: state,
-        message: StackStr::from_str(message),
-    })
+    Err(SqlError::new(state, message))
 }
 
 // Keep statement-specific scratch off every nested procedural dispatch frame.
@@ -45924,7 +45921,7 @@ pub fn create_trigger(
         && let crate::storage::TriggerTarget::Table(table) = target
     {
         for descendant in 0..storage.table_count() {
-            if storage.table(descendant).visible_to(txn.txid)
+            if storage.table_slot_visible_to(descendant, txn.txid)
                 && storage.partition_descends_from(descendant, usize::from(table), txn.txid)
                 && storage
                     .trigger_slot_on(
@@ -62376,7 +62373,7 @@ fn rewrite_sequence_default_references(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table_slot, txn.txid) {
             continue;
         }
         let (edit_target, current) = storage.select_table_definition(table_slot, txn.txid);
@@ -67332,28 +67329,27 @@ fn stored_dependency_drop_error(storage: &Storage, txid: u32, root: StoredQueryR
             );
         }
     };
-    let mut message = crate::util::StackStr::<192>::new();
-    let _ = write!(message, "cannot drop {} ", root.kind);
-    if !visible {
-        write_identifier(&mut message, root.schema.as_str());
-        let _ = message.write_char('.');
-    }
-    write_identifier(&mut message, root.name.as_str());
-    let _ = write!(
-        message,
-        "{} because other objects depend on it",
-        root.suffix.as_str()
-    );
-    if message.is_truncated() {
-        return sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "dependency diagnostic exceeds 192 bytes"
-        );
-    }
-    SqlError {
-        sqlstate: super::eval::SqlState::known(sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
-        message,
-    }
+    crate::sql::error_position::full_message_error(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        |message| {
+            let _ = write!(message, "cannot drop {} ", root.kind);
+            // Two quoted identifiers, every quote doubled.
+            let mut name =
+                crate::util::StackStr::<{ 4 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 8 }>::new();
+            if !visible {
+                write_identifier(&mut name, root.schema.as_str());
+                let _ = name.write_char('.');
+            }
+            write_identifier(&mut name, root.name.as_str());
+            let _ = write!(
+                message,
+                "{}{} because other objects depend on it",
+                name.as_str(),
+                root.suffix.as_str()
+            );
+            Ok(())
+        },
+    )
 }
 
 fn routine_dependency_suffix(
@@ -67964,12 +67960,12 @@ fn report_stored_query_dependents(
     if cascade {
         dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     } else {
-        let mut hint = crate::util::StackStr::<128>::new();
-        let _ = write!(
-            hint,
-            "Use DROP ... CASCADE to drop the dependent objects too."
+        crate::sql::eval::stash_diagnostic(
+            Some(detail),
+            Some(crate::util::StackStr::from_str(
+                "Use DROP ... CASCADE to drop the dependent objects too.",
+            )),
         );
-        crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
     }
     Ok(())
 }
@@ -70130,7 +70126,7 @@ fn rewrite_composite_dependent_tables(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table_slot, txn.txid) {
             continue;
         }
         let (edit_target, current) = storage.select_table_definition(table_slot, txn.txid);
@@ -74061,7 +74057,7 @@ fn refresh_partitioned_index_validity(
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index has no table"))?;
     let mut valid = true;
     for child in 0..storage.table_count() {
-        if !storage.table(child).visible_to(txn.txid)
+        if !storage.table_slot_visible_to(child, txn.txid)
             || !storage
                 .table_def(child, txn.txid)
                 .partition
@@ -74621,7 +74617,7 @@ pub fn alter_tables_tablespace(
     };
     let mut count = 0usize;
     for table in 0..storage.table_count() {
-        if !storage.table(table).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table, txn.txid) {
             continue;
         }
         let definition = storage.table_def(table, txn.txid);
@@ -76894,7 +76890,7 @@ pub fn reindex(
             }
             for table in 0..storage.table_count() {
                 let definition = storage.table_def(table, txn.txid);
-                if storage.table(table).visible_to(txn.txid)
+                if storage.table_slot_visible_to(table, txn.txid)
                     && definition.schema.as_str() == name.name
                 {
                     if table_count == tables.len() {
@@ -76920,7 +76916,7 @@ pub fn reindex(
                 ));
             }
             for table in 0..storage.table_count() {
-                if storage.table(table).visible_to(txn.txid) {
+                if storage.table_slot_visible_to(table, txn.txid) {
                     if table_count == tables.len() {
                         return sql_fail(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -80292,7 +80288,7 @@ pub fn apply_replication_truncate(
         })
         .map_err(|_| super::query::arena_full_pub())?;
     for other in 0..storage.table_count() {
-        if !storage.table(other).visible_to(txn.txid) || tables.contains(&other) {
+        if !storage.table_slot_visible_to(other, txn.txid) || tables.contains(&other) {
             continue;
         }
         let other_def = storage.table_def(other, txn.txid);
@@ -95023,7 +95019,7 @@ pub(crate) fn truncate(
         loop {
             let mut descendants_added = false;
             for other in 0..storage.table_count() {
-                if !storage.table(other).visible_to(txn.txid) || list[..n].contains(&other) {
+                if !storage.table_slot_visible_to(other, txn.txid) || list[..n].contains(&other) {
                     continue;
                 }
                 let definition = storage.table_def(other, txn.txid);
@@ -95047,7 +95043,7 @@ pub(crate) fn truncate(
         }
         let mut grew = false;
         for other in 0..storage.table_count() {
-            if !storage.table(other).visible_to(txn.txid) || list[..n].contains(&other) {
+            if !storage.table_slot_visible_to(other, txn.txid) || list[..n].contains(&other) {
                 continue;
             }
             let other_def = storage.table_def(other, txn.txid);
@@ -95395,7 +95391,7 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
     for candidate in 0..storage.table_count() {
         let selected = if include_descendants && storage.relation_has_descendants(table_index, txid)
         {
-            storage.table(candidate).visible_to(txid)
+            storage.table_slot_visible_to(candidate, txid)
                 && !storage
                     .table_def(candidate, txid)
                     .partition
@@ -95719,7 +95715,7 @@ fn constraint_requires_index(index: &str, table: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
         None,
         Some(stack_format!(
-            128,
+            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
             "You can drop constraint {} on table {} instead.",
             index,
             table
@@ -96224,7 +96220,7 @@ fn drop_dependent_foreign_keys(
     };
     let mut count = 0usize;
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table_slot, txn.txid) {
             continue;
         }
         let definition = storage.table_def(table_slot, txn.txid);
@@ -96254,7 +96250,7 @@ fn drop_dependent_foreign_keys(
         .map_err(|_| arena_full())?;
     let mut next = 0usize;
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table_slot, txn.txid) {
             continue;
         }
         let definition = storage.table_def(table_slot, txn.txid);
@@ -96314,7 +96310,7 @@ fn drop_dependent_foreign_keys(
     }
     dependency_report::send_cascade_lines(responder, detail.as_str(), reported)?;
     for table_slot in 0..storage.table_count() {
-        if !storage.table(table_slot).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(table_slot, txn.txid) {
             continue;
         }
         let (edit_target, live_definition) = storage.select_table_definition(table_slot, txn.txid);
@@ -97085,7 +97081,7 @@ fn validate_relation_persistence_change<Definition0: crate::storage::DefinitionB
 ) -> Result<(), SqlError> {
     if persistence == crate::storage::RelationPersistence::Unlogged {
         for referencing in 0..storage.table_count() {
-            if referencing == table || !storage.table(referencing).visible_to(txid) {
+            if referencing == table || !storage.table_slot_visible_to(referencing, txid) {
                 continue;
             }
             let referencing_definition = storage.table_def(referencing, txid);
@@ -97205,7 +97201,7 @@ fn alter_table_trigger_enabled(
         if inherited {
             let prior_mode = storage.partition_trigger_enabled_to(slot, table, txn.txid);
             for descendant in 0..storage.table_count() {
-                if storage.table(descendant).visible_to(txn.txid)
+                if storage.table_slot_visible_to(descendant, txn.txid)
                     && storage.partition_descends_from(descendant, table, txn.txid)
                 {
                     if recurse {
@@ -97228,7 +97224,7 @@ fn alter_table_trigger_enabled(
         }
         if matches!(trigger.level, TriggerLevel::Row) {
             for descendant in 0..storage.table_count() {
-                if !storage.table(descendant).visible_to(txn.txid)
+                if !storage.table_slot_visible_to(descendant, txn.txid)
                     || !storage.partition_descends_from(descendant, table, txn.txid)
                 {
                     continue;
@@ -97341,7 +97337,7 @@ fn alter_foreign_key_trigger_modes(
     // first system trigger a non-superuser selects.
     let mut first: Option<SqlName> = None;
     for child in 0..storage.table_count() {
-        if !storage.table(child).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(child, txn.txid) {
             continue;
         }
         let definition = storage.table_def(child, txn.txid);
@@ -97383,7 +97379,7 @@ fn alter_foreign_key_trigger_modes(
         ));
     }
     for child in 0..storage.table_count() {
-        if !storage.table(child).visible_to(txn.txid) {
+        if !storage.table_slot_visible_to(child, txn.txid) {
             continue;
         }
         let (edit_target, definition) = storage.select_table_definition(child, txn.txid);
@@ -98681,7 +98677,7 @@ fn alter_partition_attachment(
                     ));
                 }
                 if (0..storage.table_count()).any(|slot| {
-                    storage.table(slot).visible_to(txn.txid)
+                    storage.table_slot_visible_to(slot, txn.txid)
                         && storage
                             .table_def(slot, txn.txid)
                             .partition
@@ -98701,7 +98697,7 @@ fn alter_partition_attachment(
                     ));
                 }
                 if (0..storage.table_count()).any(|slot| {
-                    storage.table(slot).visible_to(txn.txid)
+                    storage.table_slot_visible_to(slot, txn.txid)
                         && storage
                             .table_def(slot, txn.txid)
                             .partition
@@ -98834,7 +98830,7 @@ fn alter_partition_attachment(
     if child_def.partition.is_partitioned() {
         for depth in 1..=storage.table_count() {
             for descendant in 0..storage.table_count() {
-                if !storage.table(descendant).visible_to(txn.txid)
+                if !storage.table_slot_visible_to(descendant, txn.txid)
                     || partition_depth_from(storage, descendant, child, txn.txid) != Some(depth)
                 {
                     continue;
@@ -98957,7 +98953,7 @@ fn alter_partition_attachment(
                 storage.partition_trigger_enabled_to(trigger_slot, parent, txn.txid)
             };
             for candidate in 0..storage.table_count() {
-                if storage.table(candidate).visible_to(txn.txid)
+                if storage.table_slot_visible_to(candidate, txn.txid)
                     && (candidate == child
                         || storage.partition_descends_from(candidate, child, txn.txid))
                     && let Err(error) =
@@ -102950,7 +102946,7 @@ fn alter_table_relation(
     {
         for depth in 1..=storage.table_count() {
             for descendant in 0..storage.table_count() {
-                if !storage.table(descendant).visible_to(txn.txid)
+                if !storage.table_slot_visible_to(descendant, txn.txid)
                     || partition_depth_from(storage, descendant, table_index, txn.txid)
                         != Some(depth)
                 {
@@ -103195,7 +103191,7 @@ pub(super) fn stage_inbound_foreign_key_moves<
     for dependent_table in 0..storage.table_count() {
         if dependent_table == table
             || storage.table(dependent_table).database() != storage.current_database_oid()
-            || !storage.table(dependent_table).visible_to(txn.txid)
+            || !storage.table_slot_visible_to(dependent_table, txn.txid)
         {
             continue;
         }

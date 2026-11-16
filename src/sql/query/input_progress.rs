@@ -2107,6 +2107,7 @@ mod tests {
 
     #[test]
     fn retained_inputs_reject_a_syntax_node_replacing_an_ordinary_routine() {
+        crate::sql::error_text::reserve_for_test();
         let mut budget = Budget::new(32768);
         let statement = Arena::new(&mut budget, "tagged input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "tagged input work", 8192).unwrap();

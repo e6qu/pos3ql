@@ -335,7 +335,7 @@ impl Queue {
             } => {
                 return Err(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
             }
             Phase::Ready { result: Ok(()), .. } => {}

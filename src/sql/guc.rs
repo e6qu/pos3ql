@@ -1046,8 +1046,7 @@ struct GucValues {
     datestyle: StackStr<48>,
     intervalstyle: IntervalStyle,
     lc_monetary: StackStr<16>,
-    timezone: StackStr<64>,
-    /// Parsed current time zone, so rendering does not re-parse it.
+    /// The current time zone, which also names itself for `SHOW`.
     parsed_timezone: super::timezone::Timezone,
 
     client_encoding: StackStr<32>,
@@ -1229,7 +1228,6 @@ impl GucValues {
             datestyle,
             intervalstyle,
             lc_monetary,
-            timezone,
             client_encoding,
             application_name,
             search_path,
@@ -1268,7 +1266,6 @@ impl GucValues {
             datestyle: StackStr::new(),
             intervalstyle: IntervalStyle::Postgres,
             lc_monetary: StackStr::from_str("C.UTF-8"),
-            timezone: StackStr::new(),
             parsed_timezone: super::timezone::Timezone::utc(),
             client_encoding: StackStr::new(),
             application_name: StackStr::new(),
@@ -1300,7 +1297,6 @@ impl GucValues {
             custom: [StackStr::new(); CUSTOM_PARAMETER_SLOTS],
         };
         let _ = write!(values.datestyle, "ISO, MDY");
-        let _ = write!(values.timezone, "UTC");
         let _ = write!(values.client_encoding, "UTF8");
         let _ = write!(values.search_path, "\"$user\", public");
         let _ = write!(values.default_text_search_config, "pg_catalog.english");
@@ -1837,7 +1833,6 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
     copy!(GUC_INTERVALSTYLE, intervalstyle);
     copy!(GUC_LC_MONETARY, lc_monetary);
     if mask & GUC_TIMEZONE != 0 {
-        target.timezone = source.timezone;
         target.parsed_timezone = source.parsed_timezone;
     }
     copy!(GUC_CLIENT_ENCODING, client_encoding);
@@ -2851,36 +2846,52 @@ impl GucState {
     }
 
     pub(crate) fn set_time_zone_sql(&self, raw: &str, local: bool) -> Result<(), SqlError> {
-        let value = raw.trim();
-        if value.eq_ignore_ascii_case("local") || value.eq_ignore_ascii_case("default") {
-            return self.assign("timezone", None, local);
+        if let Some(seconds) = time_zone_numeric_offset(raw)? {
+            return self.set_time_zone_offset(seconds, raw, local);
         }
-        if let Some(seconds) = time_zone_numeric_offset(value)? {
-            return self.set_time_zone_offset(seconds, local);
-        }
-        self.assign("timezone", Some(value), local)
+        self.assign("timezone", Some(raw), local)
     }
 
+    /// `SET TIME ZONE INTERVAL ...`, which PostgreSQL checks as the setting
+    /// `INTERVAL '<interval>'`.
     pub(crate) fn set_time_zone_interval(
         &self,
         interval: super::types::Interval,
         local: bool,
     ) -> Result<(), SqlError> {
-        if interval.months != 0 || interval.days != 0 {
-            return Err(invalid_setting_value(
-                "TimeZone",
-                "interval containing months or days",
+        let style = self.store.borrow().current.intervalstyle;
+        let value = crate::stack_format!(
+            128,
+            "INTERVAL '{}'",
+            super::datetime::format_interval_styled(interval, style).as_str()
+        );
+        let unsupported = if interval.months != 0 {
+            Some("Cannot specify months in time zone interval.")
+        } else if interval.days != 0 {
+            Some("Cannot specify days in time zone interval.")
+        } else {
+            None
+        };
+        if let Some(detail) = unsupported {
+            return Err(crate::sql::eval::with_detail(
+                invalid_setting_value("TimeZone", value.as_str()),
+                format_args!("{detail}"),
             ));
         }
         let seconds = i32::try_from(interval.micros / 1_000_000)
-            .map_err(|_| invalid_setting_value("TimeZone", "interval"))?;
-        self.set_time_zone_offset(seconds, local)
+            .map_err(|_| time_zone_offset_out_of_range(value.as_str()))?;
+        self.set_time_zone_offset(seconds, value.as_str(), local)
     }
 
-    fn set_time_zone_offset(&self, seconds_east: i32, local: bool) -> Result<(), SqlError> {
+    fn set_time_zone_offset(
+        &self,
+        seconds_east: i32,
+        value: &str,
+        local: bool,
+    ) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
-        apply_time_zone_offset(&mut values, seconds_east)?;
+        apply_time_zone_offset(&mut values, seconds_east, value)?;
         finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false)
     }
 
@@ -3503,7 +3514,6 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     if name.eq_ignore_ascii_case("datestyle") {
         values.datestyle = defaults.datestyle;
     } else if name.eq_ignore_ascii_case("timezone") {
-        values.timezone = defaults.timezone;
         values.parsed_timezone = defaults.parsed_timezone;
     } else if name.eq_ignore_ascii_case("lc_monetary") {
         values.lc_monetary = defaults.lc_monetary;
@@ -3604,19 +3614,23 @@ fn apply_setting(
     }
     if name.eq_ignore_ascii_case("timezone") {
         if let Some(seconds) = time_zone_numeric_offset(v)? {
-            return apply_time_zone_offset(values, seconds);
+            return apply_time_zone_offset(values, seconds, v);
         }
-        // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
-        // DST) are honored; an unknown zone is rejected loudly.
-        let timezone = parse_timezone(v).ok_or_else(|| {
-            sql_err!(
-                crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
-                "invalid value for parameter \"TimeZone\": \"{}\"",
-                v
-            )
-        })?;
-        store(&mut values.timezone, v)?;
-        values.parsed_timezone = timezone;
+        let zone =
+            super::timezone::pg_tzset(v).ok_or_else(|| invalid_setting_value("TimeZone", v))?;
+        // `pg_tz_acceptable`: local time at 2000-01-01 00:00 UTC must fall
+        // on a whole minute.
+        if zone.resolve(0).0 % 60 != 0 {
+            return Err(crate::sql::eval::with_detail(
+                sql_err!(
+                    crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                    "time zone \"{}\" appears to use leap seconds",
+                    v
+                ),
+                format_args!("PostgreSQL does not support leap seconds."),
+            ));
+        }
+        values.parsed_timezone = zone;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("client_encoding") {
@@ -3933,7 +3947,7 @@ fn owned_setting(values: &GucValues, custom: &CustomNames, name: &str) -> Option
     } else if name.eq_ignore_ascii_case("datestyle") {
         Some(StackStr::from_str(values.datestyle.as_str()))
     } else if name.eq_ignore_ascii_case("timezone") {
-        Some(StackStr::from_str(values.timezone.as_str()))
+        Some(StackStr::from_str(values.parsed_timezone.name().as_str()))
     } else if name.eq_ignore_ascii_case("client_encoding") {
         Some(StackStr::from_str(values.client_encoding.as_str()))
     } else if name.eq_ignore_ascii_case("application_name") {
@@ -4744,40 +4758,10 @@ pub(crate) fn canonical_setting_name(name: &str) -> Result<crate::storage::SqlNa
     crate::storage::SqlName::parse(normalized.as_str())
 }
 
-fn is_utc(v: &str) -> bool {
-    v.eq_ignore_ascii_case("utc")
-        || v.eq_ignore_ascii_case("gmt")
-        || v.eq_ignore_ascii_case("etc/utc")
-        || v.eq_ignore_ascii_case("universal")
-}
-
-// PostgreSQL localtime.c accepts offsets through 167:59:59.
-const TIME_ZONE_MAX_OFFSET_SECONDS: i32 = 167 * 3600 + 59 * 60 + 59;
-
-// Decimal GUC values denote hours east of UTC, including quoted strings.
-// Canonical POSIX names are parsed separately from numeric input.
-// Bare colon-separated offsets instead follow the timezone parser's POSIX sign.
+// Decimal GUC values denote hours east of UTC, as `strtod` reads them after
+// leading white space; anything else names a zone.
 fn time_zone_numeric_offset(value: &str) -> Result<Option<i32>, SqlError> {
-    let text = value.trim();
-    if let Some((east, west)) = text.strip_prefix('<').and_then(|text| text.split_once('>')) {
-        if let Some(seconds) = parse_hms(east, 167)
-            && super::datetime::iso_offset_string(seconds).as_str() == east
-            && (if seconds == 0 {
-                west == "-00"
-            } else {
-                super::datetime::iso_offset_string(-seconds).as_str() == west
-            })
-        {
-            // PostgreSQL rejects second-bearing named zones as leap-second
-            // zones, although its direct numeric-offset path accepts them.
-            if seconds % 60 != 0 {
-                return Err(invalid_setting_value("TimeZone", value));
-            }
-            return Ok(Some(seconds));
-        }
-        return Ok(None);
-    }
-    let Ok(hours) = text.parse::<f64>() else {
+    let Ok(hours) = value.trim_start().parse::<f64>() else {
         return Ok(None);
     };
     if hours.is_nan() {
@@ -4788,106 +4772,29 @@ fn time_zone_numeric_offset(value: &str) -> Result<Option<i32>, SqlError> {
     }
     // PostgreSQL converts hours to whole seconds by truncating toward zero.
     let seconds = (hours * 3600.0).trunc();
-    if !seconds.is_finite()
-        || !(-f64::from(TIME_ZONE_MAX_OFFSET_SECONDS)..=f64::from(TIME_ZONE_MAX_OFFSET_SECONDS))
-            .contains(&seconds)
-    {
-        return Err(invalid_setting_value("TimeZone", value));
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&seconds) {
+        return Err(time_zone_offset_out_of_range(value));
     }
     Ok(Some(seconds as i32))
 }
 
-fn apply_time_zone_offset(values: &mut GucValues, seconds_east: i32) -> Result<(), SqlError> {
-    if !(-TIME_ZONE_MAX_OFFSET_SECONDS..=TIME_ZONE_MAX_OFFSET_SECONDS).contains(&seconds_east) {
-        return Err(invalid_setting_value("TimeZone", "UTC offset"));
-    }
-    let east = super::datetime::iso_offset_string(seconds_east);
-    let west = super::datetime::iso_offset_string(-seconds_east);
-    let display = crate::stack_format!(
-        32,
-        "<{}>{}",
-        east.as_str(),
-        if seconds_east == 0 {
-            "-00"
-        } else {
-            west.as_str()
-        }
-    );
-    store(&mut values.timezone, display.as_str())?;
-    values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "", false);
+fn time_zone_offset_out_of_range(value: &str) -> SqlError {
+    crate::sql::eval::with_detail(
+        invalid_setting_value("TimeZone", value),
+        format_args!("UTC timezone offset is out of range."),
+    )
+}
+
+/// Selects the zone `pg_tzset_offset` names for `seconds_east`; `value` is
+/// the setting as written, which an out-of-range error quotes.
+fn apply_time_zone_offset(
+    values: &mut GucValues,
+    seconds_east: i32,
+    value: &str,
+) -> Result<(), SqlError> {
+    values.parsed_timezone = super::timezone::pg_tzset_offset(seconds_east)
+        .ok_or_else(|| time_zone_offset_out_of_range(value))?;
     Ok(())
-}
-
-/// Parses timezone names and POSIX offsets; datetime input also recognizes
-/// abbreviations separately. GUC decimal hours are handled before this parser.
-/// `Etc/GMT+5` is UTC-5 and `+05:30` is UTC-5:30.
-pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
-    use super::timezone::Timezone;
-    let t = v.trim();
-    if is_utc(t) || t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("zulu") {
-        return Some(Timezone::utc());
-    }
-    // Session settings select installed IANA zones, including their history.
-    if let Some(timezone) = super::timezone::lookup(t) {
-        return Some(timezone);
-    }
-    // Etc/GMT±N and GMT±N: the sign is inverted; the abbreviation PostgreSQL
-    // shows is the resulting ISO offset (e.g. Etc/GMT+5 -> "-05").
-    let etc = if t
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("etc/gmt"))
-    {
-        Some(&t[7..])
-    } else if t
-        .get(..3)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gmt"))
-    {
-        Some(&t[3..])
-    } else {
-        None
-    };
-    if let Some(rest) = etc {
-        if rest.is_empty() {
-            return Some(Timezone::utc());
-        }
-        let offset = -parse_hms(rest, 24)?;
-        return Some(Timezone::fixed(
-            offset,
-            super::datetime::iso_offset_string(offset).as_str(),
-            false,
-        ));
-    }
-    // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
-    if t.starts_with('+') || t.starts_with('-') {
-        return Some(Timezone::fixed(-parse_hms(t, 24)?, "", false));
-    }
-    None
-}
-
-/// Parses `±HH[:MM[:SS]]` to signed seconds (sign as written, not inverted).
-fn parse_hms(s: &str, max_hours: i32) -> Option<i32> {
-    let (sign, rest) = match s.strip_prefix('-') {
-        Some(r) => (-1, r),
-        None => (1, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let mut parts = rest.split(':');
-    let hh: i32 = parts.next()?.parse().ok()?;
-    let mm: i32 = match parts.next() {
-        Some(x) => x.parse().ok()?,
-        None => 0,
-    };
-    let ss: i32 = match parts.next() {
-        Some(x) => x.parse().ok()?,
-        None => 0,
-    };
-    if parts.next().is_some()
-        || !(0..=max_hours).contains(&hh)
-        || !(0..60).contains(&mm)
-        || !(0..60).contains(&ss)
-    {
-        return None;
-    }
-    Some(sign * (hh * 3600 + mm * 60 + ss))
 }
 
 fn is_utf8(v: &str) -> bool {
@@ -5020,7 +4927,7 @@ fn invalid_enum_value(param: &str, v: &str, available: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
         None,
         Some(crate::stack_format!(
-            128,
+            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
             "Available values: {}.",
             available
         )),

@@ -2947,7 +2947,7 @@ pub(super) fn check_altered_foreign_key_types(
         }
     }
     for table in 0..storage.table_count() {
-        if !storage.table(table).visible_to(txid) {
+        if !storage.table_slot_visible_to(table, txid) {
             continue;
         }
         let child = storage.table_def(table, txid);

@@ -52,7 +52,8 @@ pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key
 
 /// DETAIL/HINT for the next error or notice stay separate from `SqlError`.
 /// Exception handlers and the wire responder consume this worker-local slot
-/// when taking ownership of the diagnostic.
+/// when taking ownership of the diagnostic. A longer DETAIL or HINT is
+/// reported as a `54000` error naming this bound.
 pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 
 #[derive(Clone, Copy)]
@@ -141,11 +142,11 @@ std::thread_local! {
 
 pub fn stash_diagnostic(
     detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-    hint: Option<StackStr<128>>,
+    hint: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
 ) {
     stash_full_diagnostic(Diagnostic {
         detail,
-        hint: hint.map(|hint| StackStr::from_str(hint.as_str())),
+        hint,
         objects: ErrorObjects::default(),
     });
 }
@@ -168,8 +169,30 @@ pub fn stash_object_diagnostic(detail: Option<&str>, objects: ErrorObjects) {
 pub fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
     let mut text = StackStr::<MAX_DIAGNOSTIC_DETAIL_BYTES>::new();
     let _ = core::fmt::Write::write_fmt(&mut text, detail);
+    if text.is_truncated() {
+        return diagnostic_too_long();
+    }
     stash_diagnostic(Some(text), None);
     error
+}
+
+/// The `54000` error reported in place of an error whose DETAIL or HINT
+/// exceeds [`MAX_DIAGNOSTIC_DETAIL_BYTES`].
+pub fn diagnostic_too_long() -> SqlError {
+    crate::sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "error DETAIL or HINT exceeds {} bytes",
+        MAX_DIAGNOSTIC_DETAIL_BYTES
+    )
+}
+
+impl Diagnostic {
+    /// Whether a DETAIL or HINT did not fit; such a diagnostic is reported
+    /// as [`diagnostic_too_long`], never cut.
+    pub fn is_truncated(&self) -> bool {
+        self.detail.is_some_and(|detail| detail.is_truncated())
+            || self.hint.is_some_and(|hint| hint.is_truncated())
+    }
 }
 
 pub fn take_diagnostic() -> Option<Diagnostic> {
@@ -346,10 +369,31 @@ impl PartialEq<&str> for SqlState {
 pub struct SqlError {
     /// Five-character SQLSTATE per PostgreSQL's errcodes table.
     pub sqlstate: SqlState,
-    pub message: StackStr<192>,
+    /// The whole message; see [`crate::sql::error_text`].
+    pub message: crate::sql::error_text::ErrorText,
 }
 
 impl SqlError {
+    /// An error whose message is `args`, formatted whole. A message too long
+    /// for the error text pool raises the pool's `54000` error instead.
+    pub fn formatted(sqlstate: SqlState, args: core::fmt::Arguments<'_>) -> Self {
+        match crate::sql::error_text::ErrorText::format(args) {
+            Ok(message) => Self { sqlstate, message },
+            Err(exhausted) => exhausted.error(),
+        }
+    }
+
+    /// An error whose message is `message`, copied whole.
+    pub fn new(sqlstate: impl Into<SqlState>, message: &str) -> Self {
+        match crate::sql::error_text::ErrorText::copy(message) {
+            Ok(message) => Self {
+                sqlstate: sqlstate.into(),
+                message,
+            },
+            Err(exhausted) => exhausted.error(),
+        }
+    }
+
     /// An exception while evaluating a domain CHECK is a hard error, even if
     /// its code also describes bad input. A false CHECK remains reportable.
     pub(crate) fn input_expression_failure(mut self) -> Self {
@@ -388,10 +432,10 @@ impl SqlError {
 #[macro_export]
 macro_rules! sql_err {
     ($state:expr, $($arg:tt)*) => {
-        $crate::sql::eval::SqlError {
-            sqlstate: $crate::sql::eval::SqlState::known($state),
-            message: $crate::stack_format!(192, $($arg)*),
-        }
+        $crate::sql::eval::SqlError::formatted(
+            $crate::sql::eval::SqlState::known($state),
+            format_args!($($arg)*),
+        )
     };
 }
 
@@ -493,7 +537,8 @@ fn queue_eval_message(
     detail: Option<&'static str>,
 ) -> Result<(), SqlError> {
     let mut text = StackStr::<MAX_EVAL_MESSAGE_BYTES>::new();
-    if core::fmt::Write::write_fmt(&mut text, message).is_err() {
+    let _ = core::fmt::Write::write_fmt(&mut text, message);
+    if text.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "message exceeds {} bytes",
@@ -12268,7 +12313,6 @@ fn call<'a>(
 /// A listed built-in routine pos3ql cannot run: it exists in `pg_proc`, so
 /// it is not missing, but calling it is unsupported.
 fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError {
-    use core::fmt::Write;
     let Some(signature) = super::catalog::builtin_callable_by_oid(oid) else {
         return sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -12299,30 +12343,24 @@ fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError
         }
         _ => {}
     }
-    let mut message = crate::util::StackStr::<192>::new();
-    let _ = write!(message, "function {}(", signature.name);
-    for (index, &argument) in signature.arguments.iter().enumerate() {
-        if index != 0 {
-            let _ = message.write_str(", ");
-        }
-        let name = hooks
-            .catalog
-            .and_then(|catalog| catalog.type_name_fixed(argument).ok().flatten())
-            .or_else(|| super::exec::builtin_type_name_fixed(argument));
-        match name {
-            Some(name) => {
-                let _ = message.write_str(name.as_str());
+    crate::sql::error_position::full_message_error(sqlstate::FEATURE_NOT_SUPPORTED, |message| {
+        let _ = write!(message, "function {}(", signature.name);
+        for (index, &argument) in signature.arguments.iter().enumerate() {
+            if index != 0 {
+                let _ = message.write_str(", ");
             }
-            None => {
-                let _ = write!(message, "{argument}");
-            }
+            let name = hooks
+                .catalog
+                .and_then(|catalog| catalog.type_name_fixed(argument).ok().flatten())
+                .or_else(|| super::exec::builtin_type_name_fixed(argument));
+            let _ = match name {
+                Some(name) => message.write_str(name.as_str()),
+                None => write!(message, "{argument}"),
+            };
         }
-    }
-    let _ = message.write_str(") is not supported");
-    SqlError {
-        sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
-        message,
-    }
+        let _ = message.write_str(") is not supported");
+        Ok(())
+    })
 }
 
 /// A built-in called by name that implements an operator or cast runs as that
@@ -14085,17 +14123,9 @@ pub(crate) fn input_error<'a>(
             Ok(None) => None,
             Err(error) if !error.sqlstate.can_report_input_failure() => return Err(error),
             Err(error) => {
-                let message = if error.message.is_truncated()
-                    && catalog.enum_creation_of_name(base_name).is_some()
-                {
-                    arena.alloc_str_display(format_args!(
-                        "invalid input value for enum {}: \"{}\"",
-                        base_name, input
-                    ))
-                } else {
-                    arena.alloc_str(error.message.as_str())
-                }
-                .map_err(|_| arena_full())?;
+                let message = arena
+                    .alloc_str(error.message.as_str())
+                    .map_err(|_| arena_full())?;
                 return Ok(Some(InputError {
                     sqlstate: error.sqlstate,
                     message,

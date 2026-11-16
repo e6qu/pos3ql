@@ -15629,7 +15629,8 @@ fn visit_fkeys(
 
 /// Whether some visible foreign key references each table slot, over every
 /// table whatever a synthesis selects: a parent's `relhastriggers` counts its
-/// children's keys.
+/// children's keys, and a referenced partition counts the clone whose action
+/// triggers it holds.
 fn foreign_key_parents<'a>(
     storage: &Storage,
     txid: u32,
@@ -15642,6 +15643,10 @@ fn foreign_key_parents<'a>(
     let parents = storage.visible_table_names(txid, arena)?;
     visit_fkeys(storage, txid, TableSelection::All, &parents, |key| {
         referenced[key.parent_slot] = true;
+        let identity = storage.table_def(key.child_slot, txid).fkeys()[key.fk_index].identity;
+        for clone in live_fkey_clones(storage, txid, key.child_slot, identity, key.parent_slot) {
+            referenced[clone.partition.slot()] = true;
+        }
     });
     // SAFETY: only the name map, now unused, was allocated since the mark.
     unsafe { arena.rewind_to(mark) };

@@ -13,7 +13,7 @@
 use crate::sql::ast::Expr;
 use crate::sql::numeric::Numeric;
 use crate::sql::types::{ColType, Datum, Interval};
-use crate::sql::{datetime, guc, to_char};
+use crate::sql::{datetime, to_char};
 use crate::{sql_err, stack_format};
 
 use super::super::{
@@ -29,15 +29,24 @@ fn session_offset(utc_micros: i64) -> i32 {
 
 fn timezone_from_datum(value: Datum<'_>) -> Result<crate::sql::timezone::Timezone, SqlError> {
     match text_view(value) {
-        Datum::Text(name) => crate::sql::timezone::lookup_abbreviation(name)
-            .or_else(|| guc::parse_timezone(name))
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "time zone \"{}\" not recognized",
-                    name
-                )
-            }),
+        Datum::Text(name) => {
+            // PostgreSQL copies the name into a `TZ_STRLEN_MAX` buffer first,
+            // cutting it at a character boundary.
+            let mut length = name.len().min(crate::sql::timezone::TZ_STRLEN_MAX);
+            while !name.is_char_boundary(length) {
+                length -= 1;
+            }
+            let name = &name[..length];
+            crate::sql::timezone::lookup_abbreviation(name)
+                .or_else(|| crate::sql::timezone::pg_tzset(name))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "time zone \"{}\" not recognized",
+                        name
+                    )
+                })
+        }
         Datum::Interval(interval) if interval.months == 0 && interval.days == 0 => {
             let seconds = i32::try_from(interval.micros / 1_000_000).map_err(|_| {
                 sql_err!(

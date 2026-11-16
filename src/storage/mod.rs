@@ -21596,8 +21596,10 @@ impl Storage {
             .is_ok_and(|name| name.as_str() == schema)
     }
 
+    /// Whether the current session's transaction sees `table`: a relation of
+    /// its database, and a temporary one only in its own temporary schema.
     pub(crate) fn relation_visible_to_current_session(&self, table: usize, txid: u32) -> bool {
-        self.table(table).visible_to(txid)
+        self.table_slot_visible_to(table, txid)
             && (self.table_def(table, txid).persistence != RelationPersistence::Temporary
                 || self.is_current_temporary_schema(self.table_def(table, txid).schema.as_str()))
     }
@@ -23353,6 +23355,10 @@ impl Storage {
                 config.plan_build_bytes,
                 config.plan_build_leases,
             ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.error_text_bytes,
+                config.error_text_leases,
+            ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
@@ -23650,6 +23656,13 @@ impl Storage {
             config.plan_build_bytes,
             config.plan_build_leases,
         )?;
+        // Long error text raised on this thread, the one running SQL.
+        crate::sql::error_text::install(crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::ERROR_TEXT,
+            config.error_text_bytes,
+            config.error_text_leases,
+        )?);
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
         let row_walks = RowWalkPool::new(std::sync::Arc::clone(&row_work));
@@ -25797,7 +25810,7 @@ impl Storage {
 
     pub(crate) fn schema_drop_object_count(&self, txid: u32) -> usize {
         let visible_tables =
-            (0..self.table_count()).filter(|&slot| self.table(slot).visible_to(txid));
+            (0..self.table_count()).filter(|&slot| self.table_slot_visible_to(slot, txid));
         let table_count = visible_tables.clone().count();
         let foreign_key_count = visible_tables
             .map(|slot| self.table_def(slot, txid).n_fkeys)
@@ -35709,7 +35722,7 @@ impl Storage {
         crate::sql::eval::stash_diagnostic(
             None,
             Some(crate::stack_format!(
-                128,
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
                 "You can drop extension {} instead.",
                 extension_name.as_str()
             )),
@@ -37120,14 +37133,15 @@ impl Storage {
                             )
                         })?;
                             rowenc::decode(encoded, &schema[..layout.columns()], values).map_err(
-                                |error| SqlError {
-                                    sqlstate: error.sqlstate,
-                                    message: stack_format!(
-                                        192,
-                                        "spilled PAX row {} failed to decode: {}",
-                                        rowid,
-                                        error.message.as_str()
-                                    ),
+                                |error| {
+                                    SqlError::formatted(
+                                        error.sqlstate,
+                                        format_args!(
+                                            "spilled PAX row {} failed to decode: {}",
+                                            rowid,
+                                            error.message.as_str()
+                                        ),
+                                    )
                                 },
                             )?;
                             SpilledRowRepresentation::Values(&*values)
@@ -37936,14 +37950,15 @@ impl Storage {
                 };
                 let Some((key_len, payload_len, hash)) = self
                     .encode_value_binding_entry(table_slot, binding, rowid, home, output)
-                    .map_err(|error| SqlError {
-                        sqlstate: error.sqlstate,
-                        message: stack_format!(
-                            192,
-                            "resident checkpoint value source row {}: {}",
-                            rowid,
-                            error.message.as_str()
-                        ),
+                    .map_err(|error| {
+                        SqlError::formatted(
+                            error.sqlstate,
+                            format_args!(
+                                "resident checkpoint value source row {}: {}",
+                                rowid,
+                                error.message.as_str()
+                            ),
+                        )
                     })?
                 else {
                     cursor.resident_position += 1;
@@ -37999,14 +38014,15 @@ impl Storage {
                 let values = match representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         rowenc::decode(bytes, &schema[..n_columns], &mut decoded).map_err(
-                            |error| SqlError {
-                                sqlstate: error.sqlstate,
-                                message: stack_format!(
-                                    192,
-                                    "spilled checkpoint value source row {}: {}",
-                                    rowid,
-                                    error.message.as_str()
-                                ),
+                            |error| {
+                                SqlError::formatted(
+                                    error.sqlstate,
+                                    format_args!(
+                                        "spilled checkpoint value source row {}: {}",
+                                        rowid,
+                                        error.message.as_str()
+                                    ),
+                                )
                             },
                         )?;
                         &decoded[..n_columns]

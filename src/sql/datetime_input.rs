@@ -514,6 +514,10 @@ fn keyword(word: &[u8]) -> Option<Keyword> {
 
 /// What a word in the input means: a zone abbreviation (which takes
 /// precedence, as `DecodeTimezoneAbbrev` runs first), a keyword, or neither.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a dynamic zone is copied without heap allocation"
+)]
 enum Word {
     /// A fixed-offset abbreviation; `daylight` marks a DST one (`DTZ`).
     FixedZone {
@@ -540,7 +544,7 @@ fn word(text: &[u8]) -> Word {
 
 /// `pg_tzset`: a zone named in the input.
 fn named_zone(text: &[u8]) -> Option<Timezone> {
-    super::timezone::lookup(core::str::from_utf8(text).expect("datetime fields are ASCII"))
+    super::timezone::pg_tzset(core::str::from_utf8(text).expect("datetime fields are ASCII"))
 }
 
 /// The broken-down value (`struct pg_tm` and `fsec`).

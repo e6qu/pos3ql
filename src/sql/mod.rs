@@ -27,6 +27,7 @@ pub mod encoding;
 pub(crate) mod enum_values;
 pub(crate) mod error_context;
 pub(crate) mod error_position;
+pub mod error_text;
 pub mod eval;
 pub(crate) mod event_trigger;
 pub mod exec;
@@ -3841,7 +3842,7 @@ impl Engine {
                 );
                 self.fatal_commit_failure = Some(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
                 return Err(sql_err!(
                     sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
@@ -8204,7 +8205,7 @@ impl Engine {
         {
             self.fatal_commit_failure = Some(SqlError {
                 sqlstate: error.sqlstate,
-                message: error.message,
+                message: error.message.clone(),
             });
             return Err(error);
         }
@@ -8323,7 +8324,7 @@ impl Engine {
                 );
                 self.fatal_commit_failure = Some(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
             }
         }
@@ -10493,7 +10494,7 @@ impl Engine {
                     txn.checkpoint_request = None;
                     return Ok(Err(SqlError {
                         sqlstate: error.sqlstate,
-                        message: error.message,
+                        message: error.message.clone(),
                     }));
                 }
                 return Ok(Err(sql_err!(
@@ -11394,14 +11395,13 @@ impl Engine {
         guc: &GucState,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if param_types.len() > prep::MAX_PREP_PARAMS {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                format_args!(
                     "PREPARE parameter types exceed the prepared-statement boundary of {}",
                     prep::MAX_PREP_PARAMS
                 ),
-            }));
+            )));
         }
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
             return Ok(Err(error));
@@ -11636,10 +11636,10 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Some(name) = name {
             if !sqlprep.remove(name) {
-                return Ok(Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-                    message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
-                }));
+                return Ok(Err(SqlError::formatted(
+                    SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+                    format_args!("prepared statement \"{}\" does not exist", name),
+                )));
             }
         } else {
             sqlprep.clear();
@@ -12030,7 +12030,7 @@ impl Engine {
             {
                 return Err(SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 });
             }
         }
@@ -12593,7 +12593,7 @@ impl Engine {
             self.cache_capacity_generation,
             SqlError {
                 sqlstate: error.sqlstate,
-                message: error.message,
+                message: error.message.clone(),
             },
         ));
         if let Some(checkpointer) = self.ckpt.as_ref() {
@@ -12601,7 +12601,7 @@ impl Engine {
                 checkpointer.requested_checkpoint_epoch(),
                 SqlError {
                     sqlstate: error.sqlstate,
-                    message: error.message,
+                    message: error.message.clone(),
                 },
             ));
         }
@@ -22613,9 +22613,11 @@ impl Engine {
             .parameter_types(name)
             .map_or(0, prep::PreparedTypeOids::len);
         check_prepared_argument_count(name, declared, argument_count)?;
-        let text = arena.alloc_str(text).map_err(|_| SqlError {
-            sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-            message: stack_format!(192, "statement too large for SQL arena"),
+        let text = arena.alloc_str(text).map_err(|_| {
+            SqlError::formatted(
+                SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                format_args!("statement too large for SQL arena"),
+            )
         })?;
         let inputs = arena
             .alloc_slice_copy(sqlprep.type_inputs(name).ok_or_else(|| {
@@ -22978,13 +22980,12 @@ impl Engine {
             return Ok(Err(error));
         }
         if txn.failed {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
+                format_args!(
                     "current transaction is aborted, commands ignored until end of transaction block"
                 ),
-            }));
+            )));
         }
         if transaction_context == exec::PlpgsqlTransactionContext::Atomic
             && let Some(command) = top_level_only_command(statement)
@@ -23269,13 +23270,12 @@ impl Engine {
                     | Stmt::PrepareTransaction(_)
             )
         {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
-                message: stack_format!(
-                    192,
+            return Ok(Err(SqlError::formatted(
+                SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
+                format_args!(
                     "current transaction is aborted, commands ignored until end of transaction block"
                 ),
-            }));
+            )));
         }
         if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic
             && let Some(command) = top_level_only_command(statement)
@@ -26024,14 +26024,10 @@ impl Engine {
             ),
             Stmt::ExecutePrepared { name, args } => {
                 let Some(text) = sqlprep.get(name) else {
-                    return Ok(Err(SqlError {
-                        sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-                        message: stack_format!(
-                            192,
-                            "prepared statement \"{}\" does not exist",
-                            name
-                        ),
-                    }));
+                    return Ok(Err(SqlError::formatted(
+                        SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+                        format_args!("prepared statement \"{}\" does not exist", name),
+                    )));
                 };
                 let bound_inputs = match sqlprep
                     .type_inputs(name)
@@ -26054,10 +26050,10 @@ impl Engine {
                 let text = match arena.alloc_str(text) {
                     Ok(t) => t,
                     Err(_) => {
-                        return Ok(Err(SqlError {
-                            sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-                            message: stack_format!(192, "statement too large for SQL arena"),
-                        }));
+                        return Ok(Err(SqlError::formatted(
+                            SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                            format_args!("statement too large for SQL arena"),
+                        )));
                     }
                 };
                 let (inner_params, parameter_oids) = match self.prepared_arguments(
@@ -26075,10 +26071,10 @@ impl Engine {
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
-                        return Ok(Err(SqlError {
-                            sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
-                            message: stack_format!(192, "{}", e.message.as_str()),
-                        }));
+                        return Ok(Err(SqlError::formatted(
+                            SqlState::known(sqlstate::SYNTAX_ERROR),
+                            format_args!("{}", e.message.as_str()),
+                        )));
                     }
                 };
                 let source_bindings = match type_inputs::decode_session(bound_inputs, arena) {
@@ -26118,10 +26114,10 @@ impl Engine {
                                 })
                             }
                             Ok(None) => Ok(Ok(())),
-                            Err(e) => Ok(Err(SqlError {
-                                sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
-                                message: stack_format!(192, "{}", e.message.as_str()),
-                            })),
+                            Err(e) => Ok(Err(SqlError::formatted(
+                                SqlState::known(sqlstate::SYNTAX_ERROR),
+                                format_args!("{}", e.message.as_str()),
+                            ))),
                         },
                     )
                 })
@@ -29075,9 +29071,11 @@ impl Engine {
     ) -> Result<crate::util::StackStr<256>, SqlError> {
         self.fixed_setting_for(name, txn)
             .or_else(|| guc.get_owned(name))
-            .ok_or_else(|| SqlError {
-                sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                message: stack_format!(192, "unrecognized configuration parameter \"{}\"", name),
+            .ok_or_else(|| {
+                SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_OBJECT),
+                    format_args!("unrecognized configuration parameter \"{}\"", name),
+                )
             })
     }
 }
@@ -32128,10 +32126,10 @@ fn apply_wal_op(
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal writes to unknown table \"{}\"", table),
+                ));
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
@@ -32145,10 +32143,10 @@ fn apply_wal_op(
             ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal deletes from unknown table \"{}\"", table),
+                ));
             };
             storage.replay_committed_row(index, rowid, None, moved_out, lsn)?;
         }
@@ -33587,10 +33585,10 @@ fn apply_wal_op(
             new_schema,
         } => {
             let Some(index) = storage.find_table(schema, name) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(192, "journal moves unknown table \"{}\"", name),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal moves unknown table \"{}\"", name),
+                ));
             };
             let revision = storage.reserve_table_definition_revision()?;
             storage.move_table_schema(
@@ -33691,14 +33689,10 @@ fn apply_wal_op(
             fk_name,
         } => {
             let Some(index) = storage.find_table(schema, table) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(
-                        192,
-                        "journal severs a key of unknown table \"{}\"",
-                        table
-                    ),
-                });
+                return Err(SqlError::formatted(
+                    SqlState::known(sqlstate::UNDEFINED_TABLE),
+                    format_args!("journal severs a key of unknown table \"{}\"", table),
+                ));
             };
             let revision = storage.reserve_table_definition_revision()?;
             let _ = storage.drop_fk(index, fk_name, revision)?;

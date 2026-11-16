@@ -18,6 +18,7 @@ use core::cell::RefCell;
 use core::fmt::Write as _;
 use std::io::Read as _;
 
+use super::timezone::Abbreviation;
 use crate::util::StackStr;
 
 /// Seconds between the Unix epoch and PostgreSQL's 2000-01-01 epoch.
@@ -38,6 +39,10 @@ const MAX_CACHED: usize = 64;
 /// Installed zone names the startup catalog can hold.
 const MAX_CATALOG: usize = 1024;
 
+/// `TZ_MAX_CHARS`: PostgreSQL refuses a TZif file whose abbreviations take
+/// more bytes than this.
+const TZ_MAX_CHARS: usize = 50;
+
 /// A cache entry returned only after a TZif zone has been parsed and retained.
 /// Its index is private so a caller cannot manufacture a stale zone state.
 #[derive(Clone, Copy, Debug)]
@@ -47,7 +52,7 @@ pub struct TzifSlot(u16);
 #[derive(Clone, Copy)]
 struct TypeInfo {
     utoff: i32,
-    abbrev: StackStr<8>,
+    abbrev: StackStr<TZ_MAX_CHARS>,
     is_dst: bool,
 }
 
@@ -260,9 +265,20 @@ pub fn load(name: &str) -> Option<TzifSlot> {
 
 /// The offset (seconds east) and abbreviation zone `slot` has at `utc`
 /// (microseconds since 2000).
-pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
+pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, Abbreviation) {
     let (offset, abbreviation, _) = resolve_info(slot, utc_micros);
     (offset, abbreviation)
+}
+
+/// The installed name of the zone in `slot`, spelled as its file is.
+pub fn name(slot: TzifSlot) -> StackStr<48> {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let cache = cache
+            .as_ref()
+            .expect("a TZif slot requires the initialized cache");
+        cache.names[slot.0 as usize]
+    })
 }
 
 /// The callback cannot retain a reference beyond ownership of the cache.
@@ -280,7 +296,7 @@ fn with_zone<T>(slot: TzifSlot, read: impl FnOnce(&ZoneData) -> T) -> T {
     })
 }
 
-pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, Abbreviation, bool) {
     with_zone(slot, |zone| resolve_zone(zone, utc_micros))
 }
 
@@ -327,7 +343,7 @@ pub(crate) fn abbreviation_meaning(slot: TzifSlot, name: &str) -> Option<Abbrevi
 
 /// PostgreSQL's pg_interpret_timezone_abbrev selects the latest matching era
 /// before the instant, or the earliest matching era when it was used only later.
-fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, StackStr<8>, bool)> {
+fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, Abbreviation, bool)> {
     let unix = utc.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
     let count = zone.n_transitions;
     if (count == 0 || unix >= zone.times[count - 1])
@@ -343,7 +359,7 @@ fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, StackS
         let kind = zone.types[usize::from(kind)];
         kind.abbrev.as_str().eq_ignore_ascii_case(name).then_some((
             kind.utoff,
-            kind.abbrev,
+            Abbreviation::from_str(kind.abbrev.as_str()),
             kind.is_dst,
         ))
     })
@@ -353,14 +369,14 @@ pub(crate) fn resolve_abbreviation(
     slot: TzifSlot,
     name: &str,
     utc: i64,
-) -> Option<(i32, StackStr<8>, bool)> {
+) -> Option<(i32, Abbreviation, bool)> {
     with_zone(slot, |zone| abbreviation_at(zone, name, utc))
 }
 
 pub(crate) fn visit_abbreviations(
     slot: TzifSlot,
     utc: i64,
-    mut visit: impl FnMut(StackStr<8>, i32, bool),
+    mut visit: impl FnMut(Abbreviation, i32, bool),
 ) {
     with_zone(slot, |zone| {
         for (index, kind) in zone.types.iter().enumerate() {
@@ -379,7 +395,11 @@ pub(crate) fn visit_abbreviations(
         }
         if let Some(footer) = zone.footer {
             footer.visit_abbreviations(|abbreviation, offset, is_dst| {
-                if zone.types.iter().any(|kind| kind.abbrev == abbreviation) {
+                if zone
+                    .types
+                    .iter()
+                    .any(|kind| kind.abbrev.as_str() == abbreviation.as_str())
+                {
                     return;
                 }
                 visit(abbreviation, offset, is_dst);
@@ -393,7 +413,7 @@ pub(crate) fn visit_abbreviations(
 /// inside startup-bounded memory.
 pub(crate) fn visit_current(
     utc_micros: i64,
-    mut visitor: impl FnMut(&str, i32, StackStr<8>, bool),
+    mut visitor: impl FnMut(&str, i32, Abbreviation, bool),
 ) -> bool {
     CATALOG.with(|catalog| {
         let catalog = catalog.borrow();
@@ -439,12 +459,16 @@ pub(crate) fn visit_current(
     })
 }
 
-fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, Abbreviation, bool) {
     let unix = utc_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
     let n = zone.n_transitions;
     if n == 0 || unix < zone.times[0] {
         let value = zone.types[zone.first_type as usize];
-        return (value.utoff, value.abbrev, value.is_dst);
+        return (
+            value.utoff,
+            Abbreviation::from_str(value.abbrev.as_str()),
+            value.is_dst,
+        );
     }
     if unix >= zone.times[n - 1]
         && let Some(footer) = &zone.footer
@@ -453,7 +477,11 @@ fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, StackStr<8>, bool) {
     }
     let index = zone.times[..n].partition_point(|&time| time <= unix) - 1;
     let value = zone.types[zone.type_after[index] as usize];
-    (value.utoff, value.abbrev, value.is_dst)
+    (
+        value.utoff,
+        Abbreviation::from_str(value.abbrev.as_str()),
+        value.is_dst,
+    )
 }
 
 /// Parses a TZif file (RFC 8536): the version-1 block is skipped when a
@@ -529,6 +557,9 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
     if timecnt > MAX_TRANSITIONS || typecnt > MAX_TYPES || typecnt == 0 {
         return false;
     }
+    if h.charcnt as usize > TZ_MAX_CHARS {
+        return false;
+    }
     let need = h.data_len(time_size);
     if d.len() < need {
         return false;
@@ -559,15 +590,17 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         let is_dst = d[at + 4] != 0;
         let abbrind = d[at + 5] as usize;
         at += 6;
-        let mut abbrev = StackStr::new();
-        if let Some(tail) = abbrevs.get(abbrind..) {
-            for &b in tail {
-                if b == 0 {
-                    break;
-                }
-                let _ = abbrev.write_char(b as char);
-            }
-        }
+        let Some(tail) = abbrevs.get(abbrind..) else {
+            return false;
+        };
+        let length = tail
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(tail.len());
+        let Ok(text) = core::str::from_utf8(&tail[..length]) else {
+            return false;
+        };
+        let abbrev = StackStr::from_str(text);
         *slot = TypeInfo {
             utoff,
             abbrev,
@@ -583,10 +616,9 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
     true
 }
 
-/// Parses the TZif footer's POSIX TZ string (between its newlines) into the
-/// embedded rule machinery. `None` for an empty or unsupported footer — the
-/// zone then freezes at its last transition's offset, which is what an empty
-/// footer means.
+/// Parses the TZif footer's POSIX TZ string (between its newlines) with
+/// `tzparse`. `None` for an empty footer or one `tzparse` refuses: the zone
+/// then keeps its last transition's offset, as PostgreSQL's `tzload` does.
 fn parse_footer(d: &[u8]) -> Option<super::timezone::PosixZone> {
     let s = core::str::from_utf8(d).ok()?;
     let s = s.trim_matches(['\n', '\r', ' ']);

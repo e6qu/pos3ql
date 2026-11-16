@@ -1073,10 +1073,13 @@ or full join's unmatched-row pass and hash builds read the whole input), and
 a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
 batch where PostgreSQL fetches only what the reads need. Date and time input
-follows PostgreSQL's decoder, but a POSIX zone specification (`UTC+3`,
-`xyz5`) fails with `22023` in input and `SET TimeZone`, where PostgreSQL
-parses it; an error message quoting input longer than about 150 bytes is cut
-at pos3ql's 192-byte message limit. COPY FROM into a foreign table queues its rows
+and `SET TimeZone` follow PostgreSQL's decoder and its POSIX zone
+specifications. Error messages longer than 192 bytes are kept whole in the
+`error_text_bytes` pool; DETAIL and HINT text is still bounded at 12 KiB
+(`54000` past it) rather than drawing from that pool. Invalid `json` and
+`jsonb` input reports no `Token "..." is invalid.` DETAIL or `JSON data,
+line N:` CONTEXT, and a malformed array literal no DETAIL (`Unexpected end of
+input.`). COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup

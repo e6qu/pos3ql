@@ -231,7 +231,7 @@ mod tests {
         crate::sql_err!(sqlstate::UNIQUE_VIOLATION, "{}", text)
     }
 
-    fn failure(result: Result<(), FlushFailure>) -> (u64, StackStr<192>) {
+    fn failure(result: Result<(), FlushFailure>) -> (u64, crate::sql::error_text::ErrorText) {
         let failure = result.expect_err("flush fails");
         (failure.line, failure.error.message)
     }

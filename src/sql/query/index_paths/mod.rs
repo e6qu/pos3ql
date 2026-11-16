@@ -250,7 +250,7 @@ pub(crate) struct RelationSize {
 }
 
 /// `get_typavgwidth` for a column without a statistics width.
-fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
+pub(crate) fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
     let layout = ctype.physical_layout();
     if layout.length > 0 {
         return f64::from(layout.length);

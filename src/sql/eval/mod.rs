@@ -2666,6 +2666,19 @@ pub trait CatalogAccess {
         false
     }
 
+    /// PostgreSQL's `inline_function` for `call`, a routine call whose
+    /// arguments are folded, typed by `columns`; `active` names the
+    /// functions whose inlined bodies enclose it.
+    fn inline_sql_function<'a>(
+        &self,
+        _call: &'a Expr<'a>,
+        _columns: &dyn crate::sql::exec::ColTypeResolver,
+        _active: &dyn Fn(i32) -> bool,
+        _arena: &'a Arena,
+    ) -> Result<Inlining<'a>, SqlError> {
+        Ok(Inlining::Kept)
+    }
+
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4668,6 +4681,8 @@ fn fold_check<'a>(
     let folding = Folding {
         catalog,
         replace: false,
+        columns: None,
+        active: None,
     };
     Ok(fold(expression, arena, folding)?.1)
 }
@@ -4995,17 +5010,59 @@ pub(crate) fn custom_plan_parameter<'v>(index: u32) -> Option<Datum<'v>> {
 }
 
 std::thread_local! {
-    /// [`fold`] met a call PostgreSQL's planner may inline.
-    static INLINABLE_CALL_FOLDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// [`fold`] met a call PostgreSQL's planner may inline that it could not
+    /// inline: no column types were in view, or the call has a shape
+    /// [`CatalogAccess::inline_sql_function`] reports unmodeled.
+    static UNINLINED_CALL_FOLDED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Runs `fold`, a planner folding of a statement, and reports whether it
-/// met a call of a SQL function PostgreSQL's planner may inline.
-pub(crate) fn folding_inlinable_calls<T>(fold: impl FnOnce() -> T) -> (T, bool) {
-    let prior = INLINABLE_CALL_FOLDED.with(|seen| seen.replace(false));
+/// met a call of a SQL function PostgreSQL's planner may inline that the
+/// folding left in place without deciding it.
+pub(crate) fn folding_uninlined_calls<T>(fold: impl FnOnce() -> T) -> (T, bool) {
+    let prior = UNINLINED_CALL_FOLDED.with(|seen| seen.replace(false));
     let result = fold();
-    let seen = INLINABLE_CALL_FOLDED.with(|seen| seen.replace(prior));
+    let seen = UNINLINED_CALL_FOLDED.with(|seen| seen.replace(prior));
     (result, seen)
+}
+
+/// What [`CatalogAccess::inline_sql_function`] decided for a call.
+pub enum Inlining<'a> {
+    /// PostgreSQL keeps the call (`inline_function` returns NULL).
+    Kept,
+    /// The call's body with its arguments in place of its parameters.
+    Inlined(InlinedCall<'a>),
+    /// PostgreSQL may inline the call, in a shape pos3ql does not model.
+    Unmodeled,
+}
+
+/// A SQL function call replaced by its body, as `inline_function` does.
+pub struct InlinedCall<'a> {
+    pub(crate) expression: &'a Expr<'a>,
+    pub(crate) oid: i32,
+    pub(crate) name: &'a str,
+    pub(crate) body: &'a str,
+}
+
+/// A function whose inlined body [`fold`] is folding: `inline_function`
+/// never inlines a call of a function already being inlined.
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveFunction<'c> {
+    oid: i32,
+    outer: Option<&'c ActiveFunction<'c>>,
+}
+
+impl ActiveFunction<'_> {
+    pub(crate) fn contains(active: Option<&Self>, oid: i32) -> bool {
+        let mut at = active;
+        while let Some(function) = at {
+            if function.oid == oid {
+                return true;
+            }
+            at = function.outer;
+        }
+        false
+    }
 }
 
 /// How [`fold`] treats the constant subexpressions it evaluates.
@@ -5015,6 +5072,10 @@ struct Folding<'c> {
     /// Replace each folded subexpression with its value, so the statement
     /// does not evaluate it again for every row. A probe only reports errors.
     replace: bool,
+    /// The column types of the query level being folded, which select and
+    /// coerce a SQL function call's inlined body; `None` folds no call body.
+    columns: Option<&'c dyn crate::sql::exec::ColTypeResolver>,
+    active: Option<&'c ActiveFunction<'c>>,
 }
 
 /// PostgreSQL's planner folding (`eval_const_expressions`) of `expression`,
@@ -5032,6 +5093,26 @@ pub fn fold_constants<'a>(
     let folding = Folding {
         catalog,
         replace: true,
+        columns: None,
+        active: None,
+    };
+    Ok(fold(expression, arena, folding)?.0)
+}
+
+/// [`fold_constants`] of an expression of a query level whose column types
+/// `columns` gives: a call of a SQL function PostgreSQL's planner inlines
+/// (`inline_function`) is replaced by its body, which folds in its place.
+pub fn fold_constants_in_scope<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    catalog: &dyn CatalogAccess,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let folding = Folding {
+        catalog: Some(catalog),
+        replace: true,
+        columns: Some(columns),
+        active: None,
     };
     Ok(fold(expression, arena, folding)?.0)
 }
@@ -5156,14 +5237,15 @@ fn fold<'a>(
             .map(|node| &*node)
             .map_err(|_| super::query::arena_full_pub())
     };
-    if let Expr::Call {
-        kind: super::ast::CallKind::Routine,
-        name,
-        ..
-    } = expression
+    if folding.columns.is_none()
+        && let Expr::Call {
+            kind: super::ast::CallKind::Routine,
+            name,
+            ..
+        } = expression
         && catalog.is_some_and(|catalog| catalog.names_inlinable_sql_function(name))
     {
-        INLINABLE_CALL_FOLDED.with(|seen| seen.set(true));
+        UNINLINED_CALL_FOLDED.with(|seen| seen.set(true));
     }
     match expression {
         Expr::Null
@@ -5497,6 +5579,48 @@ fn fold<'a>(
                     Ok(Some(fold(node, arena, folding).map_err(Failure)?.0))
                 })
                 .map_err(|Failure(error)| error)?;
+            // `simplify_function`: a call no constant folding settled is
+            // replaced by its SQL function's body when `inline_function`
+            // accepts it, and the body folds in its place, under the
+            // function's `during inlining` context.
+            if folding.replace
+                && let (Some(catalog), Some(columns)) = (catalog, folding.columns)
+                && let Expr::Call {
+                    kind: super::ast::CallKind::Routine,
+                    over: None,
+                    ..
+                } = rebuilt
+            {
+                let active = folding.active;
+                match catalog.inline_sql_function(
+                    rebuilt,
+                    columns,
+                    &|oid| ActiveFunction::contains(active, oid),
+                    arena,
+                )? {
+                    Inlining::Kept => {}
+                    Inlining::Unmodeled => UNINLINED_CALL_FOLDED.with(|seen| seen.set(true)),
+                    Inlining::Inlined(call) => {
+                        let node = ActiveFunction {
+                            oid: call.oid,
+                            outer: folding.active,
+                        };
+                        let inner = Folding {
+                            active: Some(&node),
+                            ..folding
+                        };
+                        let frame = crate::sql::error_context::SqlFunctionFrame {
+                            name: call.name,
+                            body: call.body,
+                            statement: core::cell::Cell::new(0),
+                            inlining: crate::sql::error_context::SqlFunctionInlining::Inlining,
+                        };
+                        return crate::sql::error_context::within(&frame, || {
+                            fold(call.expression, arena, inner)
+                        });
+                    }
+                }
+            }
             // A comparison operator is strict: with a NULL constant operand
             // it folds to NULL, as `eval_const_expressions` simplifies it.
             if folding.replace

@@ -58,6 +58,7 @@ pub mod notify;
 pub mod numeric;
 mod param_types;
 pub mod parser;
+pub(crate) mod pg_qsort;
 pub(crate) mod plan_invalidations;
 mod planner_inputs;
 mod plpgsql_inputs;

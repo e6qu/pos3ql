@@ -934,8 +934,8 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 pub(crate) use srf::{
-    builtin_set_routine_name, describe_derived_definition, expression_has_project_set,
-    is_srf_name as is_builtin_set_routine, table_func_rows_outer,
+    builtin_set_routine_name, column_definition_list_present, describe_derived_definition,
+    expression_has_project_set, is_srf_name as is_builtin_set_routine, table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -5433,6 +5433,23 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn inline_sql_function<'a>(
+        &self,
+        call: &'a Expr<'a>,
+        columns: &dyn super::exec::ColTypeResolver,
+        active: &dyn Fn(i32) -> bool,
+        arena: &'a Arena,
+    ) -> Result<super::eval::Inlining<'a>, SqlError> {
+        super::planner_inputs::inline::inline_call(
+            call,
+            columns,
+            active,
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
     fn names_inlinable_sql_function(&self, name: &str) -> bool {
         let (schema, bare) = match name.rsplit_once('.') {
             Some((schema, bare)) => (Some(schema), bare),
@@ -12277,6 +12294,27 @@ fn check_select_constants_in<'a>(
     Ok(())
 }
 
+/// Runs `run` with the column types of a query level whose sources `scope`
+/// resolved (none for a level without sources, or a catalog without SQL
+/// functions to inline).
+fn with_level_columns<'a, R>(
+    scope: Option<&QueryScope<'a>>,
+    catalog: &dyn super::eval::CatalogAccess,
+    run: impl FnOnce(&dyn super::exec::ColTypeResolver) -> R,
+) -> R {
+    let empty = super::eval::NoColumns;
+    let schema = scope.map(materialize::ScopeSchema);
+    let row: &dyn ColumnLookup<'_> = match &schema {
+        Some(schema) => schema,
+        None => &empty,
+    };
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(catalog),
+    };
+    run(&columns)
+}
+
 /// PostgreSQL's planner folding of a SELECT about to run: the analysis checks
 /// [`check_select_constants`] makes, then each clause's constant
 /// subexpressions replaced with their values (see
@@ -12306,8 +12344,82 @@ fn fold_select_constants_in<'a>(
         })?;
     }
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let Some(from) = &statement.from else {
+        return with_level_columns(None, &catalog, |columns| {
+            fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
+        });
+    };
+    if !level_calls_sql_function(statement, storage, txid) {
+        return fold_select_level(statement, arena, storage, txid, &catalog, None);
+    }
+    // A level whose sources this folding cannot type (a view or a `WITH`
+    // query not yet expanded, a routine's variables) has no column types
+    // here: its calls of inlinable functions stay calls, which `EXPLAIN`
+    // refuses.
+    let mark = arena.mark();
+    match QueryScope::resolve_schema(storage, from, txid, arena, None) {
+        Ok(scope) => with_level_columns(Some(&scope), &catalog, |columns| {
+            fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
+        }),
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => Err(error),
+        Err(_) => {
+            // SAFETY: the failed resolution's scratch is not referenced.
+            unsafe { arena.rewind_to(mark) };
+            fold_select_level(statement, arena, storage, txid, &catalog, None)
+        }
+    }
+}
+
+/// Whether `expression`, outside its subqueries, calls a SQL function
+/// PostgreSQL's planner may inline.
+fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        ..
+    } = expression
+        && super::planner_inputs::inline::storage_names_sql_function(storage, txid, name)
+    {
+        return true;
+    }
+    let mut found = false;
+    let _ = walk_children(expression, &mut |child| {
+        found |= expression_calls_sql_function(child, storage, txid);
+        Ok(())
+    });
+    found
+}
+
+/// Whether a select-list, join or condition expression of this query level
+/// calls a SQL function PostgreSQL's planner may inline.
+fn level_calls_sql_function(statement: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    let items = returning_expressions(statement.items);
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    items
+        .chain(joins)
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .chain(statement.order_by.iter().map(|key| key.expression))
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.distinct_on.iter().copied())
+        .any(|expression| expression_calls_sql_function(expression, storage, txid))
+}
+
+fn fold_select_level<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: Option<&dyn super::exec::ColTypeResolver>,
+) -> Result<&'a Select<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| match columns {
+        Some(columns) => super::eval::fold_constants_in_scope(expression, arena, catalog, columns),
+        None => super::eval::fold_constants(expression, arena, Some(catalog)),
+    };
     let mut changed = false;
     let mut rebuilt = *statement;
     let items = arena
@@ -12315,9 +12427,8 @@ fn fold_select_constants_in<'a>(
         .map_err(|_| arena_full())?;
     for item in items.iter_mut() {
         match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                *expression = fold(expression)?;
-            }
+            SelectItem::Expr { expression, alias } => fold_named(expression, alias, &fold)?,
+            SelectItem::RecordStar(expression) => *expression = fold(expression)?,
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
@@ -12518,8 +12629,86 @@ fn fold_update_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Update<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let written = statement
+        .assignments
+        .iter()
+        .map(|(_, expression)| *expression)
+        .chain(statement.where_clause)
+        .chain(returning_expressions(statement.returning.items));
+    let scope = dml_level_scope(
+        written,
+        storage,
+        txid,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.from,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    match &scope {
+        Some(scope) => with_level_columns(Some(scope), &catalog, |columns| {
+            fold_update_level(statement, arena, &catalog, Some(columns))
+        }),
+        None => fold_update_level(statement, arena, &catalog, None),
+    }
+}
+
+/// The expressions of a `RETURNING` list.
+fn returning_expressions<'s, 'a>(
+    items: &'s [SelectItem<'a>],
+) -> impl Iterator<Item = &'a Expr<'a>> + 's {
+    items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+    })
+}
+
+/// The scope a data change's folding types its calls of inlinable SQL
+/// functions with: `None` when no expression of `written` calls one, or the
+/// sources cannot be typed here (a routine's variables), when its calls stay
+/// calls, which `EXPLAIN` refuses.
+fn dml_level_scope<'a, 'e>(
+    mut written: impl Iterator<Item = &'e Expr<'e>>,
+    storage: &Storage,
+    txid: u32,
+    resolve: impl FnOnce() -> Result<QueryScope<'a>, SqlError>,
+    arena: &Arena,
+) -> Result<Option<QueryScope<'a>>, SqlError> {
+    if !written.any(|expression| expression_calls_sql_function(expression, storage, txid)) {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    match resolve() {
+        Ok(scope) => Ok(Some(scope)),
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => Err(error),
+        Err(_) => {
+            // SAFETY: the failed resolution's scratch is not referenced.
+            unsafe { arena.rewind_to(mark) };
+            Ok(None)
+        }
+    }
+}
+
+fn fold_update_level<'a>(
+    statement: &crate::sql::ast::Update<'a>,
+    arena: &'a Arena,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: Option<&dyn super::exec::ColTypeResolver>,
+) -> Result<crate::sql::ast::Update<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| match columns {
+        Some(columns) => super::eval::fold_constants_in_scope(expression, arena, catalog, columns),
+        None => super::eval::fold_constants(expression, arena, Some(catalog)),
+    };
     let mut folded = *statement;
     if statement
         .assignments
@@ -12577,8 +12766,20 @@ fn fold_insert_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    with_level_columns(None, &catalog, |columns| {
+        fold_insert_level(statement, arena, &catalog, columns)
+    })
+}
+
+fn fold_insert_level<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| {
+        super::eval::fold_constants_in_scope(expression, arena, catalog, columns)
+    };
     let mut folded = *statement;
     let fold_rows = || -> Result<&'a [&'a [&'a Expr<'a>]], SqlError> {
         if statement.select.is_some() || statement.rows.is_empty() {
@@ -12774,12 +12975,60 @@ fn fold_delete_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
-    let mut folded = *statement;
-    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
-    folded.where_clause = statement.where_clause.map(fold).transpose()?;
-    Ok(folded)
+    let written = statement
+        .where_clause
+        .into_iter()
+        .chain(returning_expressions(statement.returning.items));
+    let scope = dml_level_scope(
+        written,
+        storage,
+        txid,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.using,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    with_level_columns(scope.as_ref(), &catalog, |columns| {
+        let in_scope = scope.is_some();
+        let fold = |expression: &'a Expr<'a>| {
+            if in_scope {
+                super::eval::fold_constants_in_scope(expression, arena, &catalog, columns)
+            } else {
+                super::eval::fold_constants(expression, arena, Some(&catalog))
+            }
+        };
+        let mut folded = *statement;
+        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        folded.where_clause = statement.where_clause.map(fold).transpose()?;
+        Ok(folded)
+    })
+}
+
+/// Folds a select or `RETURNING` item's expression; an inlined call keeps
+/// the name its analysis gave the column.
+fn fold_named<'a>(
+    expression: &mut &'a Expr<'a>,
+    alias: &mut Option<&'a str>,
+    fold: &dyn Fn(&'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError>,
+) -> Result<(), SqlError> {
+    let written = *expression;
+    *expression = fold(written)?;
+    if alias.is_none() && !core::ptr::eq(*expression, written) {
+        let name = super::exec::derived_name(written);
+        if name != super::exec::derived_name(expression) {
+            *alias = Some(name);
+        }
+    }
+    Ok(())
 }
 
 fn fold_returning_items<'a>(
@@ -12793,9 +13042,8 @@ fn fold_returning_items<'a>(
     let folded = arena.alloc_slice_copy(items).map_err(|_| arena_full())?;
     for item in folded.iter_mut() {
         match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                *expression = fold(expression)?;
-            }
+            SelectItem::Expr { expression, alias } => fold_named(expression, alias, fold)?,
+            SelectItem::RecordStar(expression) => *expression = fold(expression)?,
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }

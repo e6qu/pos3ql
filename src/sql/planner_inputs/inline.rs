@@ -3,7 +3,7 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::{
-    ast::{self, BinaryOp, CallKind, CastBinding, Expr, SelectItem, Stmt, UnaryOp},
+    ast::{self, BinaryOp, CallKind, CastBinding, Expr, Select, SelectItem, Stmt, UnaryOp},
     catalog,
     eval::{SqlError, sqlstate},
     exec::{ColTypeResolver, infer_routine_argument_oid},
@@ -1008,6 +1008,820 @@ pub(crate) fn accepted(
         uses,
         arguments,
     ))
+}
+
+/// PostgreSQL's `inline_function` for `call`, a call whose arguments are
+/// folded and typed by `columns` (the caller's query level): a SQL function
+/// whose body is one plain expression that passes the inlining checks is
+/// replaced by that expression with each parameter replaced by its argument,
+/// converted to the parameter's type. `active` names the functions whose
+/// inlined bodies enclose the call, which are never inlined again.
+pub(crate) fn inline_call<'a>(
+    call: &'a Expr<'a>,
+    columns: &dyn ColTypeResolver,
+    active: &dyn Fn(i32) -> bool,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<crate::sql::eval::Inlining<'a>, SqlError> {
+    use crate::sql::eval::Inlining;
+    let Expr::Call {
+        kind: CallKind::Routine,
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        star: false,
+        distinct: false,
+        order_by: [],
+        over: None,
+        filter: None,
+        ..
+    } = call
+    else {
+        return Ok(Inlining::Kept);
+    };
+    let named = (0..storage.routine_count()).any(|slot| {
+        storage
+            .routine_identity_for(slot, txid)
+            .is_some_and(|identity| match bound_oid {
+                Some(oid) => identity.oid == *oid,
+                None => {
+                    *name == identity.name.as_str()
+                        || name
+                            .strip_suffix(identity.name.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                }
+            })
+    });
+    if !named {
+        return Ok(Inlining::Kept);
+    }
+    let mut oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > oids.len() {
+        return Ok(Inlining::Kept);
+    }
+    for (oid, expression) in oids.iter_mut().zip(*args) {
+        *oid = match infer_routine_argument_oid(expression, columns) {
+            Ok(oid) => oid,
+            // A column of an enclosing query this level cannot type.
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                return Ok(if storage_names_sql_function(storage, txid, name) {
+                    Inlining::Unmodeled
+                } else {
+                    Inlining::Kept
+                });
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    let oids = &oids[..args.len()];
+    let selection = match bound_oid {
+        Some(oid) => storage
+            .routine_slot_by_oid(*oid, txid)
+            .map(crate::storage::RoutineCallSelection::Stored),
+        None => Some(storage.select_routine_call(
+            name,
+            argument_names,
+            oids,
+            *variadic,
+            txid,
+            crate::storage::RoutineCallKind::Function,
+        )),
+    };
+    let Some(crate::storage::RoutineCallSelection::Stored(slot)) = selection else {
+        return Ok(Inlining::Kept);
+    };
+    let declared = storage.routine_for(slot, txid);
+    if declared.language != RoutineLanguage::Sql
+        || !matches!(declared.kind, RoutineKind::Function { .. })
+    {
+        return Ok(Inlining::Kept);
+    }
+    let function_oid = crate::storage::routine_oid(&declared);
+    let Some(routine) =
+        storage.function_for_captured_call(function_oid, argument_names, oids, *variadic, txid)
+    else {
+        return Ok(Inlining::Kept);
+    };
+    if !declaration(
+        &routine,
+        routine.argument_count,
+        active(function_oid),
+        storage.require_routine_execute(slot, txid).is_ok(),
+    ) {
+        return Ok(Inlining::Kept);
+    }
+    if routine.body_kind == crate::storage::RoutineBodyKind::Atomic {
+        return Ok(Inlining::Unmodeled);
+    }
+    let Some((_, mapping)) =
+        storage.routine_call_mapping(slot, argument_names, args.len(), *variadic, txid)
+    else {
+        return Ok(Inlining::Kept);
+    };
+    // `expand_function_arguments`: each input's argument, its default, or
+    // the elements a variadic input packs into an array.
+    let inputs = arena
+        .alloc_slice_with(routine.argument_count, |_| &Expr::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (input, slot_value) in inputs.iter_mut().enumerate() {
+        let parameter = routine
+            .parameter_for_input(input)
+            .ok_or_else(missing_contract)?;
+        let mut supplied = None;
+        let mut count = 0usize;
+        for (at, mapped) in mapping[..args.len()].iter().enumerate() {
+            if usize::from(*mapped) == input {
+                supplied = Some(args[at]);
+                count += 1;
+            }
+        }
+        *slot_value = match supplied {
+            Some(argument)
+                if count == 1
+                    && !(matches!(
+                        parameter.mode,
+                        crate::storage::RoutineParameterMode::Variadic { .. }
+                    ) && !*variadic) =>
+            {
+                argument
+            }
+            // Packed variadic elements.
+            Some(_) => return Ok(Inlining::Unmodeled),
+            None => {
+                let source = parameter.mode.default().ok_or_else(missing_contract)?;
+                let parameter_index = routine
+                    .parameters()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, parameter)| parameter.mode.is_input())
+                    .nth(input)
+                    .ok_or_else(missing_contract)?
+                    .0;
+                let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
+                crate::sql::query::bind_routine_parameter_default(
+                    source.as_str(),
+                    parameter_index,
+                    storage,
+                    txid,
+                    dependencies.view(),
+                    arena,
+                )?
+            }
+        };
+    }
+    // Each argument converted to its parameter's type, as the call's
+    // analysis coerced it.
+    let mut facts = crate::mem::arena::ArenaList::new(arena);
+    for (input, argument) in inputs.iter_mut().enumerate() {
+        let target = storage
+            .routine_type_oid(
+                routine.arguments()[input].ctype,
+                routine.arguments()[input].user_type,
+                txid,
+            )
+            .ok_or_else(missing_contract)?;
+        if crate::sql::catalog::is_polymorphic_pseudo_type(target) {
+            return Ok(Inlining::Unmodeled);
+        }
+        let fact = argument_facts(&[*argument], columns, storage, txid, arena)?[0];
+        let source = fact.type_oid;
+        facts
+            .push(convert_argument(fact, target, storage, txid, arena)?)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        if source != target {
+            let type_name = crate::sql::catalog::format_type_name(storage, txid, target)?;
+            let type_name = arena
+                .alloc_str(type_name.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            *argument = arena
+                .alloc(Expr::Cast {
+                    source_position: ast::SourcePosition::UNKNOWN,
+                    operand: argument,
+                    type_name,
+                    type_mod: -1,
+                    binding: CastBinding::Resolve,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?;
+        }
+    }
+    let facts = facts.as_slice();
+    // A strict function with a NULL argument folds to NULL instead.
+    if routine.attributes.strict && facts.iter().any(|fact| fact.known_null) {
+        return Ok(Inlining::Kept);
+    }
+    let RoutineKind::Function { result } = routine.kind else {
+        return Ok(Inlining::Kept);
+    };
+    let result_oid = storage
+        .routine_type_oid(result.ctype, result.user_type, txid)
+        .ok_or_else(missing_contract)?;
+    if crate::sql::catalog::is_polymorphic_pseudo_type(result_oid) {
+        return Ok(Inlining::Unmodeled);
+    }
+    let body = if routine.body_kind == crate::storage::RoutineBodyKind::Return {
+        let mut text = crate::mem::arena::ArenaString::new(arena);
+        core::fmt::Write::write_fmt(&mut text, format_args!("SELECT {}", routine.body.as_str()))
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        text.as_str()
+    } else {
+        arena
+            .alloc_str(routine.body.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?
+    };
+    let routine_name = arena
+        .alloc_str(routine.name.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut parser = crate::sql::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(routine_name, routine.arguments()))
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?;
+    let mut statements = crate::mem::arena::ArenaList::new(arena);
+    while let Some(statement) = parser
+        .next_stmt()
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?
+    {
+        statements
+            .push(statement)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    let mut statements = statements.as_slice();
+    // A SQL-standard body names the objects it was bound to when created.
+    if routine.body_kind == crate::storage::RoutineBodyKind::Return
+        && let [statement] = statements
+    {
+        let bound = crate::sql::query::bind_stored_routine_statement(
+            statement,
+            storage,
+            slot,
+            &routine,
+            txid,
+            arena,
+            &[],
+        )?;
+        statements = core::slice::from_ref(bound);
+    }
+    let Some(expression) = simple_expression(statements) else {
+        return Ok(Inlining::Kept);
+    };
+    if expression.contains_subquery() {
+        return Ok(Inlining::Kept);
+    }
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let input_collation = call_collation(
+        args,
+        &mapping[..args.len()],
+        &routine,
+        columns,
+        storage,
+        txid,
+        arena,
+    )?;
+    let accepted = {
+        let _parameters = crate::sql::exec::enter_routine_parameter_types(
+            routine.arguments(),
+            Some(&catalog),
+            input_collation,
+        )?;
+        let body_columns = crate::sql::exec::CatalogCols {
+            remote_ctid: false,
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let context = Context {
+            storage,
+            txid,
+            arena,
+            body_columns: &body_columns,
+        };
+        let accepted = accepted(&routine, statements, facts, &context)?;
+        let source = if accepted {
+            infer_routine_argument_oid(expression, &body_columns)?
+        } else {
+            result_oid
+        };
+        accepted.then_some(source)
+    };
+    let Some(source) = accepted else {
+        return Ok(Inlining::Kept);
+    };
+    // `substitute_actual_parameters`.
+    struct Failure;
+    impl From<crate::mem::arena::ArenaFull> for Failure {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self
+        }
+    }
+    let substituted =
+        ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+            Option<&'a Expr<'a>>,
+            Failure,
+        > {
+            Ok(match node {
+                Expr::Param(index)
+                | Expr::RoutineParam {
+                    index,
+                    source: ast::ParameterSource::SqlRoutine,
+                    ..
+                } => Some(inputs[*index as usize - 1]),
+                Expr::RoutineParam {
+                    index,
+                    name,
+                    source: ast::ParameterSource::SqlRoutineField,
+                    ..
+                } => Some(arena.alloc(Expr::Field {
+                    base: inputs[*index as usize - 1],
+                    field: name,
+                })?),
+                _ => None,
+            })
+        })
+        .map_err(|Failure| crate::sql::eval::arena_full())?;
+    // `check_sql_fn_retval` coerced the body's result to the declared type.
+    let substituted = if source != result_oid && source != oid::UNKNOWN {
+        let type_name = crate::sql::catalog::format_type_name(storage, txid, result_oid)?;
+        let type_name = arena
+            .alloc_str(type_name.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        &*arena
+            .alloc(Expr::Cast {
+                source_position: ast::SourcePosition::UNKNOWN,
+                operand: substituted,
+                type_name,
+                type_mod: -1,
+                binding: CastBinding::Resolve,
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?
+    } else {
+        substituted
+    };
+    Ok(Inlining::Inlined(crate::sql::eval::InlinedCall {
+        expression: substituted,
+        oid: function_oid,
+        name: routine_name,
+        body: arena
+            .alloc_str(routine.body.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?,
+    }))
+}
+
+/// What [`inline_set_returning_call`] decided for a function in FROM.
+pub(crate) enum SetInlining<'a> {
+    Kept,
+    /// The FROM item as a subquery of the function's body.
+    Inlined(&'a ast::TableRef<'a>),
+    /// PostgreSQL may inline the call, in a shape pos3ql does not model.
+    Unmodeled,
+}
+
+/// PostgreSQL's `inline_set_returning_function` for `item`, a FROM item that
+/// calls one function: a non-strict, non-volatile SQL function returning a
+/// set whose body is one `SELECT` of the declared result becomes a subquery
+/// of that `SELECT`, each parameter replaced by its argument, under the
+/// item's name and column names. Arguments must not read other FROM items.
+pub(crate) fn inline_set_returning_call<'a>(
+    item: &ast::TableRef<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SetInlining<'a>, SqlError> {
+    let Some(args) = item.func_args else {
+        return Ok(SetInlining::Kept);
+    };
+    if item.rows_from.is_some()
+        || item.with_ordinality
+        || item.subquery.is_some()
+        || matches!(item.table, "json_table" | "xmltable")
+        || crate::sql::query::column_definition_list_present(item)
+    {
+        return Ok(SetInlining::Kept);
+    }
+    let name = match item.schema {
+        Some(schema) => arena
+            .alloc_str_display(format_args!("{schema}.{}", item.table))
+            .map_err(|_| crate::sql::eval::arena_full())?,
+        None => item.table,
+    };
+    if !storage_names_sql_function(storage, txid, name) {
+        return Ok(SetInlining::Kept);
+    }
+    let empty = crate::sql::exec::CatalogCols {
+        remote_ctid: false,
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let mut oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > oids.len() {
+        return Ok(SetInlining::Kept);
+    }
+    for (oid, expression) in oids.iter_mut().zip(args) {
+        *oid = match infer_routine_argument_oid(expression, &empty) {
+            Ok(oid) => oid,
+            // An argument reading another FROM item (`LATERAL`).
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                return Ok(SetInlining::Unmodeled);
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    let oids = &oids[..args.len()];
+    let crate::storage::RoutineCallSelection::Stored(slot) = storage.select_routine_call(
+        name,
+        item.func_argument_names,
+        oids,
+        item.func_variadic,
+        txid,
+        crate::storage::RoutineCallKind::Function,
+    ) else {
+        return Ok(SetInlining::Kept);
+    };
+    let declared = storage.routine_for(slot, txid);
+    if declared.language != RoutineLanguage::Sql || !declared.kind.is_set_returning() {
+        return Ok(SetInlining::Kept);
+    }
+    let function_oid = crate::storage::routine_oid(&declared);
+    let Some(routine) = storage.function_for_captured_call(
+        function_oid,
+        item.func_argument_names,
+        oids,
+        item.func_variadic,
+        txid,
+    ) else {
+        return Ok(SetInlining::Kept);
+    };
+    if routine.attributes.strict
+        || routine.attributes.volatility == RoutineVolatility::Volatile
+        || routine.attributes.security_definer
+        || !routine.configs().is_empty()
+        || storage.require_routine_execute(slot, txid).is_err()
+    {
+        return Ok(SetInlining::Kept);
+    }
+    if routine.body_kind != crate::storage::RoutineBodyKind::String {
+        return Ok(SetInlining::Unmodeled);
+    }
+    let Some((_, mapping)) = storage.routine_call_mapping(
+        slot,
+        item.func_argument_names,
+        args.len(),
+        item.func_variadic,
+        txid,
+    ) else {
+        return Ok(SetInlining::Kept);
+    };
+    let inputs = arena
+        .alloc_slice_with(routine.argument_count, |_| &Expr::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (input, value) in inputs.iter_mut().enumerate() {
+        let mut supplied = None;
+        let mut count = 0usize;
+        for (at, mapped) in mapping[..args.len()].iter().enumerate() {
+            if usize::from(*mapped) == input {
+                supplied = Some(args[at]);
+                count += 1;
+            }
+        }
+        let target = storage
+            .routine_type_oid(
+                routine.arguments()[input].ctype,
+                routine.arguments()[input].user_type,
+                txid,
+            )
+            .ok_or_else(missing_contract)?;
+        // A default, a packed variadic or a polymorphic input.
+        let (Some(argument), 1) = (supplied, count) else {
+            return Ok(SetInlining::Unmodeled);
+        };
+        if crate::sql::catalog::is_polymorphic_pseudo_type(target)
+            || routine.parameter_for_input(input).is_some_and(|parameter| {
+                matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                ) && !item.func_variadic
+            })
+        {
+            return Ok(SetInlining::Unmodeled);
+        }
+        // Volatile arguments or sub-selects keep the call.
+        let facts = argument_facts(&[argument], &empty, storage, txid, arena)?[0];
+        if !facts.properties.known || facts.properties.volatility >= 2 || facts.properties.subplan {
+            return Ok(SetInlining::Kept);
+        }
+        *value = if infer_routine_argument_oid(argument, &empty)? == target {
+            argument
+        } else {
+            let type_name = crate::sql::catalog::format_type_name(storage, txid, target)?;
+            let type_name = arena
+                .alloc_str(type_name.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            arena
+                .alloc(Expr::Cast {
+                    source_position: ast::SourcePosition::UNKNOWN,
+                    operand: argument,
+                    type_name,
+                    type_mod: -1,
+                    binding: CastBinding::Resolve,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?
+        };
+    }
+    let body = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let routine_name = arena
+        .alloc_str(routine.name.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut parser = crate::sql::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(routine_name, routine.arguments()))
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?;
+    let mut statements = crate::mem::arena::ArenaList::new(arena);
+    while let Some(statement) = parser
+        .next_stmt()
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?
+    {
+        statements
+            .push(statement)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    let [Stmt::Select(select)] = statements.as_slice() else {
+        return Ok(SetInlining::Kept);
+    };
+    if !select.locking.is_empty() {
+        return Ok(SetInlining::Kept);
+    }
+    let Some(select) = substitute_select(select, inputs, arena)? else {
+        return Ok(SetInlining::Unmodeled);
+    };
+    // The item's own columns, which the body must return unchanged
+    // (`check_sql_fn_retval` would otherwise coerce them).
+    let from = crate::sql::ast::FromClause {
+        base: *item,
+        joins: &[],
+    };
+    let scope = crate::sql::query::QueryScope::resolve_schema(storage, &from, txid, arena, None)?;
+    let Some(declared) = scope.defs.get(0) else {
+        return Ok(SetInlining::Unmodeled);
+    };
+    let output = crate::sql::query::describe_derived_definition(
+        storage, &select, "", None, txid, arena, None,
+    )?;
+    if output.n_columns != declared.n_columns
+        || output
+            .columns()
+            .iter()
+            .zip(declared.columns())
+            .any(|(body, column)| body.ctype != column.ctype)
+    {
+        return Ok(SetInlining::Unmodeled);
+    }
+    let names: &'a mut [&'a str] = arena
+        .alloc_slice_with(declared.n_columns, |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (name, column) in names.iter_mut().zip(declared.columns()) {
+        *name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    let select = arena
+        .alloc(select)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let inlined = arena
+        .alloc(ast::TableRef {
+            schema: None,
+            table: "",
+            alias: Some(item.alias.unwrap_or(item.table)),
+            subquery: Some(select),
+            func_args: None,
+            func_argument_names: &[],
+            func_variadic: false,
+            rows_from: None,
+            col_alias: Some(names),
+            ..*item
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    Ok(SetInlining::Inlined(inlined))
+}
+
+/// `select` with each parameter of the SQL function whose body it is
+/// replaced by its argument in `inputs`, through every nested query
+/// (`substitute_actual_srf_parameters`); `None` for a clause this
+/// substitution does not cover (`WITH`, windows, grouping sets).
+fn substitute_select<'a>(
+    select: &Select<'a>,
+    inputs: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<Option<Select<'a>>, SqlError> {
+    struct Uncovered;
+    enum Failure {
+        Full,
+        Uncovered,
+    }
+    impl From<crate::mem::arena::ArenaFull> for Failure {
+        fn from(_: crate::mem::arena::ArenaFull) -> Self {
+            Self::Full
+        }
+    }
+    impl From<Uncovered> for Failure {
+        fn from(_: Uncovered) -> Self {
+            Self::Uncovered
+        }
+    }
+    fn query<'a>(
+        select: &Select<'a>,
+        inputs: &[&'a Expr<'a>],
+        arena: &'a Arena,
+    ) -> Result<Select<'a>, Failure> {
+        if !select.with.is_empty() || !select.windows.is_empty() || !select.grouping_sets.is_empty()
+        {
+            return Err(Failure::Uncovered);
+        }
+        let mut copy = *select;
+        let expression = |value: &'a Expr<'a>| expression(value, inputs, arena);
+        let items = arena.alloc_slice_copy(select.items)?;
+        for item in items.iter_mut() {
+            match item {
+                SelectItem::Expr {
+                    expression: value, ..
+                }
+                | SelectItem::RecordStar(value) => {
+                    *value = expression(value)?;
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+            }
+        }
+        copy.items = items;
+        let list = |values: &'a [&'a Expr<'a>]| -> Result<&'a [&'a Expr<'a>], Failure> {
+            let copied = arena.alloc_slice_copy(values)?;
+            for value in copied.iter_mut() {
+                *value = expression(value)?;
+            }
+            Ok(copied)
+        };
+        copy.distinct_on = list(select.distinct_on)?;
+        copy.group_by = list(select.group_by)?;
+        let order = arena.alloc_slice_copy(select.order_by)?;
+        for key in order.iter_mut() {
+            key.expression = expression(key.expression)?;
+        }
+        copy.order_by = order;
+        copy.where_clause = select.where_clause.map(expression).transpose()?;
+        copy.having = select.having.map(expression).transpose()?;
+        copy.limit = select.limit.map(expression).transpose()?;
+        copy.offset = select.offset.map(expression).transpose()?;
+        if let Some(from) = &select.from {
+            let table = |item: &ast::TableRef<'a>| -> Result<ast::TableRef<'a>, Failure> {
+                if item.rows_from.is_some() || item.join_members.is_some() || item.cte.is_some() {
+                    return Err(Failure::Uncovered);
+                }
+                let mut copy = *item;
+                if let Some(arguments) = item.func_args {
+                    copy.func_args = Some(list(arguments)?);
+                }
+                if let Some(body) = item.subquery {
+                    copy.subquery = Some(arena.alloc(query(body, inputs, arena)?)?);
+                }
+                Ok(copy)
+            };
+            let joins = arena.alloc_slice_copy(from.joins)?;
+            for join in joins.iter_mut() {
+                join.table = table(&join.table)?;
+                join.on = join.on.map(expression).transpose()?;
+            }
+            copy.from = Some(ast::FromClause {
+                base: table(&from.base)?,
+                joins,
+            });
+        }
+        if let Some(tree) = select.set_body {
+            copy.set_body = Some(arena.alloc(set_tree(tree, inputs, arena)?)?);
+        }
+        Ok(copy)
+    }
+    fn set_tree<'a>(
+        tree: &ast::SetTree<'a>,
+        inputs: &[&'a Expr<'a>],
+        arena: &'a Arena,
+    ) -> Result<ast::SetTree<'a>, Failure> {
+        Ok(match tree {
+            ast::SetTree::Select(select) => {
+                ast::SetTree::Select(arena.alloc(query(select, inputs, arena)?)?)
+            }
+            ast::SetTree::Op {
+                syntax,
+                operator,
+                all,
+                left,
+                right,
+            } => ast::SetTree::Op {
+                syntax: *syntax,
+                operator: *operator,
+                all: *all,
+                left: arena.alloc(set_tree(left, inputs, arena)?)?,
+                right: arena.alloc(set_tree(right, inputs, arena)?)?,
+            },
+        })
+    }
+    fn expression<'a>(
+        value: &'a Expr<'a>,
+        inputs: &[&'a Expr<'a>],
+        arena: &'a Arena,
+    ) -> Result<&'a Expr<'a>, Failure> {
+        let nested = |select: &Select<'a>| -> Result<&'a Select<'a>, Failure> {
+            Ok(arena.alloc(query(select, inputs, arena)?)?)
+        };
+        ast::rewrite_expression(value, arena, &mut |node: &'a Expr<'a>| {
+            Ok(match node {
+                Expr::Param(index)
+                | Expr::RoutineParam {
+                    index,
+                    source: ast::ParameterSource::SqlRoutine,
+                    ..
+                } => Some(inputs[*index as usize - 1]),
+                Expr::RoutineParam {
+                    index,
+                    name,
+                    source: ast::ParameterSource::SqlRoutineField,
+                    ..
+                } => Some(&*arena.alloc(Expr::Field {
+                    base: inputs[*index as usize - 1],
+                    field: name,
+                })?),
+                Expr::Subquery(select) => Some(&*arena.alloc(Expr::Subquery(nested(select)?))?),
+                Expr::Exists(select) => Some(&*arena.alloc(Expr::Exists(nested(select)?))?),
+                Expr::ArraySubquery(select) => {
+                    Some(&*arena.alloc(Expr::ArraySubquery(nested(select)?))?)
+                }
+                Expr::RowSubquery { select, arity } => Some(&*arena.alloc(Expr::RowSubquery {
+                    select: nested(select)?,
+                    arity: *arity,
+                })?),
+                Expr::InSubquery {
+                    operand,
+                    select,
+                    negated,
+                } => Some(&*arena.alloc(Expr::InSubquery {
+                    operand: expression(operand, inputs, arena)?,
+                    select: nested(select)?,
+                    negated: *negated,
+                })?),
+                Expr::QuantifiedSubquery {
+                    operand,
+                    operator,
+                    select,
+                    all,
+                } => Some(&*arena.alloc(Expr::QuantifiedSubquery {
+                    operand: expression(operand, inputs, arena)?,
+                    operator: *operator,
+                    select: nested(select)?,
+                    all: *all,
+                })?),
+                Expr::Call { over: Some(_), .. } => return Err(Failure::Uncovered),
+                _ => None,
+            })
+        })
+    }
+    match query(select, inputs, arena) {
+        Ok(select) => Ok(Some(select)),
+        Err(Failure::Uncovered) => Ok(None),
+        Err(Failure::Full) => Err(crate::sql::eval::arena_full()),
+    }
+}
+
+/// Whether `name` names a SQL-language function of the catalog.
+pub(crate) fn storage_names_sql_function(storage: &Storage, txid: u32, name: &str) -> bool {
+    (0..storage.routine_count()).any(|slot| {
+        storage
+            .routine_identity_for(slot, txid)
+            .is_some_and(|identity| {
+                (name == identity.name.as_str()
+                    || name
+                        .strip_suffix(identity.name.as_str())
+                        .is_some_and(|prefix| prefix.ends_with('.')))
+                    && storage.routine_for(slot, txid).language == RoutineLanguage::Sql
+            })
+    })
+}
+
+fn missing_contract() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "selected inlining contract is unavailable"
+    )
 }
 
 fn post_analysis(

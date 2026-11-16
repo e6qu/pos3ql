@@ -1273,8 +1273,13 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   provided: it is the oid of the table that holds the row, so
   `SELECT tableoid::regclass, count(*) FROM measurements GROUP BY 1` counts
   the rows of each partition, inheritance child or foreign child, also in
-  window queries and in the `FROM` items of `UPDATE ... FROM` and `DELETE
-  ... USING`.
+  window queries, in the `FROM` items of `UPDATE ... FROM` and `DELETE
+  ... USING`, and in `MERGE` for its target and a table source. For example,
+  `MERGE INTO measurements m USING readings r ON m.id = r.id WHEN MATCHED THEN
+  UPDATE SET v = r.v RETURNING m.tableoid::regclass` names the partition each
+  changed row is in. As in PostgreSQL, a `MERGE` `WHEN` condition may read
+  no other system column (`42P10`), and assigning a system column fails with
+  `0A000` (`cannot assign to system column "ctid"`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`

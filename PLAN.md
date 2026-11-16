@@ -896,8 +896,10 @@ outer or hashed side. Not yet shown: row
 subqueries as subplans, a correlated subquery of a join, the `ANALYZE`
 group lines of a window's own incremental sort or of one under a `LIMIT`,
 `VERBOSE` output lists (rejected with `0A000`) of a joined `UPDATE` or
-`DELETE` other than one of a single FROM table read sequentially, of
-`MERGE`, a several-row `INSERT` whose rows omit columns or
+`DELETE` other than one of a single FROM table read sequentially, of a
+`MERGE` from a `VALUES` list with a `NOT MATCHED BY SOURCE` action (whose
+join reads the list's row as a placeholder expression) or whose lists hold
+a subquery, a several-row `INSERT` whose rows omit columns or
 use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
@@ -905,8 +907,9 @@ computes without the postponed expressions), and an `EXISTS` subplan's
 list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
 scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
-ANALYZE` of a joined `UPDATE` or `DELETE` and of `MERGE` fails with `0A000`:
-the executor does not count their join's rows. A statement that runs again after an attempt stopped for a call counts each
+ANALYZE` of a joined `UPDATE` or `DELETE` fails with `0A000`: the executor
+does not count their join's rows, as it probes the FROM rows for each
+target row and checks every condition per pair. A statement that runs again after an attempt stopped for a call counts each
 node in the last attempt that ran it, so a data-modifying `WITH` query whose
 write a later attempt keeps reports its `ModifyTable` (its `RETURNING` rows)
 and scan figures. A `LIMIT` that stops `Unique`
@@ -1096,7 +1099,8 @@ read-only virtual schema. A foreign key that references a partitioned table
 has one `pg_constraint` clone, with its two RI action triggers, per
 referenced partition at any depth (`pc_a_fkey_1`, named against the namespace
 when made and kept), added and removed as partitions are created, attached,
-detached and dropped; a referenced partition's violations, `DETACH` and
+detached and dropped, and each referenced partition has `relhastriggers`
+set, so psql's `\d` lists the keys referencing it; a referenced partition's violations, `DETACH` and
 `DROP` report it as PostgreSQL does. A table can hold at most 256 such
 clones (`54000`). `pg_get_partition_constraintdef(oid)` and psql's `\d+`
 `Partition constraint:` line print the constraint PostgreSQL's
@@ -1156,14 +1160,38 @@ rescanning the smaller relation from a `Materialize`. `ON` conditions
 reading one side filter that side's scan unless the join keeps its
 unmatched rows, `DO NOTHING` actions keep none, and a join keeping both
 sides' rows without an equality between them fails as PostgreSQL's full
-join does (`0A000`) (`differential_exact/631`). PostgreSQL merges relations
-it has no statistics for, sorted by key; such a `MERGE` runs as a nested
-loop over its source rows in their order and its `EXPLAIN` fails with
-`0A000`, as do one from a source other than a table or `VALUES` list,
-with an index on either relation (PostgreSQL may scan or merge by it),
-with row security, and its `VERBOSE` lists. A `MERGE` expression reading
-its target's system columns (`tableoid`, `ctid`) still fails as an
-undefined column (`42703`), where PostgreSQL returns them. Remaining, each
+join does (`0A000`) (`differential_exact/631`). Each relation's scan checks
+the `ON` conjuncts reading only that relation unless the join keeps its
+unmatched rows, the hash join its key equalities and the join the rest,
+as PostgreSQL distributes them. `VERBOSE` prints PostgreSQL's lists: the
+join returns a plain target's `ctid`, the source columns each action reads
+(its condition, then its values in target column order), with a `NOT
+MATCHED BY SOURCE` action the source's whole row and the source columns
+`ON` reads, the source's row mark, the source columns `RETURNING` reads,
+then a partitioned target's `tableoid` and `ctid`; each scan returns its
+part of that list, then the columns the join's conditions read
+(`differential_exact/651`). `EXPLAIN ANALYZE` counts the scans (each
+member's under an `Append`), the `Hash` with its table's size, the
+`Materialize` and the join with the rows its filter removed, and reports
+the actions' `Tuples:`; a hash join keeping no unmatched inner row stops
+when either relation is empty, reading the outer one first when the inner
+one costs anything to scan (`differential_exact/652`). An index on a column
+`ON` does not read, or on the hashed relation's key columns alone, leaves
+the hash join PostgreSQL picks, and a unique one marks the hashed relation
+`Inner Unique` (`differential_exact/653`). PostgreSQL merges relations it
+has no statistics for, sorted by key; such a `MERGE` runs as a nested loop
+over its source rows in their order and its `EXPLAIN` fails with `0A000`,
+as do one from a source other than a table or `VALUES` list, one with an
+index on another column `ON` reads, on the outer relation's keys or a
+partial or expression index (PostgreSQL may scan, join or merge by it as
+its costs choose), and one with row security. A `MERGE` reads its target's
+and a stored source's `tableoid` in conditions, values and `RETURNING`; a
+`WHEN` condition reading another system column fails with `42P10`, and an
+action reading a relation its kind cannot reach fails with `42P01` (or
+`42703` for a bare column), during analysis as in PostgreSQL. `ctid`
+fails with `0A000` there as in every statement (`differential_exact/650`).
+Joined `UPDATE` and `DELETE` conditions read the target's `tableoid`.
+Remaining, each
 failing with `0A000`: a member with an index on a column the query's
 conditions, keys or aggregates read (execution scans members sequentially,
 while PostgreSQL scans each by its own index as costs choose, possibly

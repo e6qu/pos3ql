@@ -734,6 +734,20 @@ pub(crate) struct MergeJoinPlan<'a> {
     keys: [(usize, &'a str); 8],
     key_count: usize,
     collations: [crate::sql::ast::Collation; 8],
+    /// The `ON` conjuncts each part of the plan checks: the scan of the
+    /// target and of the source (each relation's own conditions, unless the
+    /// join keeps its unmatched rows), the hash join's key equalities, and
+    /// the join's filter (the rest), each the `AND` of its conjuncts.
+    pub(crate) conditions: MergeConditions<'a>,
+}
+
+/// Where a `MERGE` checks the conjuncts of its `ON` condition.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MergeConditions<'a> {
+    pub(crate) target: Option<&'a Expr<'a>>,
+    pub(crate) source: Option<&'a Expr<'a>>,
+    pub(crate) hash: Option<&'a Expr<'a>>,
+    pub(crate) join: Option<&'a Expr<'a>>,
 }
 
 impl<'a> MergeJoinPlan<'a> {
@@ -801,6 +815,10 @@ pub(crate) fn merge_join_plan<'a>(
         keys: [(0, ""); 8],
         key_count: 0,
         collations: [crate::sql::ast::Collation::None; 8],
+        conditions: MergeConditions {
+            join: Some(statement.on),
+            ..MergeConditions::default()
+        },
     };
     let source_from = &*arena
         .alloc(FromClause {
@@ -871,7 +889,71 @@ pub(crate) fn merge_join_plan<'a>(
         }
         plan.key_count = count;
     }
+    plan.conditions = merge_conditions(&scope, statement.on, &plan, arena)?;
     Ok(plan)
+}
+
+/// Splits a `MERGE`'s `ON` condition among the parts of its plan, as
+/// PostgreSQL distributes its conjuncts: one reading only one relation
+/// filters that relation's scan unless the join keeps that relation's
+/// unmatched rows, an equality the hash join keys on is its hash
+/// condition, and the rest is the join's filter.
+fn merge_conditions<'a>(
+    scope: &QueryScope<'_>,
+    on: &'a Expr<'a>,
+    plan: &MergeJoinPlan<'_>,
+    arena: &'a Arena,
+) -> Result<MergeConditions<'a>, SqlError> {
+    let mut conjuncts = [on; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(on, &mut conjuncts, &mut count) {
+        return Ok(MergeConditions {
+            join: Some(on),
+            ..MergeConditions::default()
+        });
+    }
+    let column = |side: &Expr<'_>| match side {
+        Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+            Ok(super::ResolvedColumn::Table(table, column)) => Some((table, column)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let key = |conjunct: &Expr<'_>| {
+        let Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = conjunct
+        else {
+            return false;
+        };
+        let pair = match (column(left), column(right)) {
+            (Some((0, target)), Some((1, source))) | (Some((1, source)), Some((0, target))) => {
+                (target, source)
+            }
+            _ => return false,
+        };
+        let source = scope.defs.get(1).expect("resolved source");
+        plan.keys()
+            .iter()
+            .any(|&(target, name)| target == pair.0 && source.columns[pair.1].name.as_str() == name)
+    };
+    let mut conditions = MergeConditions::default();
+    for &conjunct in &conjuncts[..count] {
+        let slot = if plan.hashed() && key(conjunct) {
+            &mut conditions.hash
+        } else {
+            match super::plan::expr_tables(conjunct, scope) {
+                Some(1) if !plan.preserves_target => &mut conditions.target,
+                Some(2) if !plan.preserves_source => &mut conditions.source,
+                _ => &mut conditions.join,
+            }
+        };
+        *slot = super::and_where(*slot, Some(conjunct), arena)?;
+    }
+    Ok(conditions)
 }
 
 /// Target hash joins this thread built, for tests of the selected plan.

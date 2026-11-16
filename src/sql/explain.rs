@@ -110,8 +110,12 @@ struct PlanNode {
     /// An `Append` whose members PostgreSQL prunes again during each scan
     /// by a subplan's or an enclosing query's value.
     scan_pruned: bool,
-    /// A join a write runs whose rows the executor does not count.
+    /// A joined `UPDATE` or `DELETE`'s join, whose rows the executor does
+    /// not count.
     uncounted: bool,
+    /// A join whose inner relation matches at most one row per outer row
+    /// by a unique index on its join keys (`innerrel_is_unique`).
+    inner_unique: bool,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -374,6 +378,7 @@ impl PlanNode {
         target_member: false,
         scan_pruned: false,
         uncounted: false,
+        inner_unique: false,
     };
 }
 
@@ -522,7 +527,7 @@ impl<'a> Plan<'a> {
         if self.nodes[..self.count].iter().any(|node| node.uncounted) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
-                "EXPLAIN ANALYZE of a joined UPDATE, DELETE or MERGE is not supported"
+                "EXPLAIN ANALYZE of a joined UPDATE or DELETE is not supported"
             ));
         }
         let nodes = &self.nodes[..self.count];
@@ -613,6 +618,27 @@ impl<'a> Plan<'a> {
         }
     }
 
+    /// What an analyzed `MERGE` did with the rows of its join, the node at
+    /// `join`: the rows each kind of action changed, and the rest.
+    fn merge_tuples(&self, join: usize) -> Option<MergeOutcome> {
+        let measured = self.measured?;
+        if self.nodes[0].name.as_str() != "Merge" {
+            return None;
+        }
+        let changed = measured[0].merged;
+        let total = measured.get(join)?.rows;
+        Some(MergeOutcome {
+            total,
+            inserted: changed.inserted,
+            updated: changed.updated,
+            deleted: changed.deleted,
+            skipped: total
+                .saturating_sub(changed.inserted)
+                .saturating_sub(changed.updated)
+                .saturating_sub(changed.deleted),
+        })
+    }
+
     fn memory_kib(&self) -> (usize, usize) {
         let header = core::mem::size_of::<Self>();
         let node = core::mem::size_of::<PlanNode>();
@@ -624,6 +650,25 @@ impl<'a> Plan<'a> {
                 .saturating_add(self.nodes.len().saturating_mul(node))
                 .div_ceil(1024),
         )
+    }
+}
+
+/// The rows of an analyzed `MERGE`'s join (`total`) and what its actions
+/// did with them (`show_modifytable_info`).
+struct MergeOutcome {
+    total: u64,
+    inserted: u64,
+    updated: u64,
+    deleted: u64,
+    skipped: u64,
+}
+
+impl MergeOutcome {
+    fn properties(&self, document: &mut impl FnMut(&'static str, u64)) {
+        document("Tuples Inserted", self.inserted);
+        document("Tuples Updated", self.updated);
+        document("Tuples Deleted", self.deleted);
+        document("Tuples Skipped", self.skipped);
     }
 }
 
@@ -2973,6 +3018,7 @@ fn push_members(
         ),
         scan_pruned: expansion.planned.scan_pruned,
         uncounted: false,
+        inner_unique: false,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3853,6 +3899,7 @@ fn scan_node<'a>(
         target_member: false,
         scan_pruned: false,
         uncounted: false,
+        inner_unique: false,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -7675,6 +7722,7 @@ fn physical_scan_node(
         target_member: false,
         scan_pruned: false,
         uncounted: false,
+        inner_unique: false,
     }
 }
 
@@ -7846,6 +7894,7 @@ fn push_set_tree(
                 target_member: false,
                 scan_pruned: false,
                 uncounted: false,
+                inner_unique: false,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -8461,6 +8510,7 @@ fn plan_write<'a>(
         target_member: false,
         scan_pruned: false,
         uncounted: false,
+        inner_unique: false,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -8486,7 +8536,7 @@ fn plan_write<'a>(
         }
     }
     if let Stmt::Merge(merge) = statement {
-        let mut plan = plan_merge(plan, storage, txid, merge, arena)?;
+        let mut plan = plan_merge(plan, storage, txid, merge, block, arena)?;
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
@@ -9134,6 +9184,7 @@ fn plan_merge<'a, 'e>(
     storage: &Storage,
     txid: u32,
     merge: &'e crate::sql::ast::Merge<'e>,
+    block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     let unsupported = |what: &str| {
@@ -9153,8 +9204,92 @@ fn plan_merge<'a, 'e>(
             "current role is not present in the role catalog"
         )
     })?;
-    let indexed = |slot: usize| storage.value_binding_count(slot) != 0;
     let source = merge.source;
+    // Whether the `ON` condition reads column `name` of the target
+    // (`relation` 0) or the source (1), or reads either's whole row.
+    let target_name = merge.target_alias.unwrap_or(target.name);
+    let source_name = source.alias.unwrap_or(source.table);
+    let reads_in = |condition: &Expr<'_>,
+                    relation: usize,
+                    name: &str,
+                    columns: &[crate::storage::ColumnMeta]| {
+        let named = |column: &str| columns.iter().any(|meta| meta.name.as_str() == column);
+        let mut reads = false;
+        condition.for_each_column_reference(&mut |qualifier, column| {
+            reads |= column == name
+                && match qualifier {
+                    Some(qualifier) => {
+                        qualifier
+                            == if relation == 0 {
+                                target_name
+                            } else {
+                                source_name
+                            }
+                    }
+                    None => named(column),
+                };
+        });
+        let mut whole = false;
+        visit_whole_rows(condition, &mut |table| {
+            whole |= table
+                == if relation == 0 {
+                    target_name
+                } else {
+                    source_name
+                };
+        });
+        reads || whole
+    };
+    let on_reads = |relation: usize, name: &str, columns: &[crate::storage::ColumnMeta]| {
+        reads_in(merge.on, relation, name, columns)
+    };
+    // What the indexes of the relation in `slot` (`relation` 0 the target,
+    // 1 the source) offer the join over the `key` columns PostgreSQL may
+    // hash: an index on another column `ON` reads, or a partial or
+    // expression index, may be scanned, joined or merged by as its costs
+    // choose; an index on hash keys only serves a nested loop rescanning
+    // that relation. A unique one on those keys makes it unique for the
+    // join.
+    let index_reach = |slot: usize, relation: usize, key: &dyn Fn(&str) -> bool| {
+        let definition = storage.table_def(slot, txid);
+        let columns = definition.columns();
+        let name = |column: u16| {
+            columns
+                .get(usize::from(column))
+                .map(|meta| meta.name.as_str())
+        };
+        let mut reach = IndexReach {
+            // A column's own `PRIMARY KEY` or `UNIQUE` constraint.
+            unique: columns
+                .iter()
+                .any(|meta| (meta.unique || meta.primary) && key(meta.name.as_str())),
+            ..IndexReach::default()
+        };
+        for index in storage.indexes_for_slot(slot, txid) {
+            let plain = index.predicate.is_none()
+                && index.expressions[..index.n_cols]
+                    .iter()
+                    .all(Option::is_none);
+            if !plain {
+                reach.other = true;
+                continue;
+            }
+            let keys = &index.columns[..index.n_cols];
+            reach.unique |=
+                index.unique && keys.iter().all(|&column| name(column).is_some_and(key));
+        }
+        for binding in 0..storage.value_binding_count(slot) {
+            let (keys, count) = storage.value_binding_columns(slot, binding);
+            for &column in &keys[..count] {
+                match name(column) {
+                    Some(name) if !on_reads(relation, name, columns) => {}
+                    Some(name) if key(name) => reach.keys = true,
+                    _ => reach.other = true,
+                }
+            }
+        }
+        reach
+    };
     let values = source.subquery.and_then(values_list);
     let source_slot = match storage.resolve_relation(source.schema, source.table, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot))
@@ -9176,12 +9311,9 @@ fn plan_merge<'a, 'e>(
     if let Some(slot) = source_slot
         && (storage.relation_has_descendants(slot, txid)
             || storage.table_def(slot, txid).kind != crate::storage::TableKind::Local
-            || storage.row_security_applies(slot, role, txid)
-            || indexed(slot))
+            || storage.row_security_applies(slot, role, txid))
     {
-        return Err(unsupported(
-            "from a table with an index, row security or descendants",
-        ));
+        return Err(unsupported("from a table with row security or descendants"));
     }
     if storage.row_security_applies(target_slot, role, txid) {
         return Err(unsupported("into a table with row security"));
@@ -9216,11 +9348,42 @@ fn plan_merge<'a, 'e>(
         Some(expansion) => expansion.planned.leaves,
         None => core::slice::from_ref(&target_slot),
     };
-    if leaves.iter().any(|&leaf| {
-        indexed(leaf) || storage.table_def(leaf, txid).kind != crate::storage::TableKind::Local
-    }) {
-        return Err(unsupported("into a table with an index"));
+    if leaves
+        .iter()
+        .any(|&leaf| storage.table_def(leaf, txid).kind != crate::storage::TableKind::Local)
+    {
+        return Err(unsupported("into a table with a foreign member"));
     }
+    // A column `ON` reads only in the hash join's key equalities.
+    let key_only = |relation: usize, name: &str, columns: &[crate::storage::ColumnMeta]| {
+        let conditions = join.conditions;
+        [conditions.target, conditions.source, conditions.join]
+            .into_iter()
+            .flatten()
+            .all(|condition| !reads_in(condition, relation, name, columns))
+    };
+    let target_key = |name: &str| {
+        join.keys()
+            .iter()
+            .any(|&(column, _)| target_definition.columns()[column].name.as_str() == name)
+            && key_only(0, name, target_definition.columns())
+    };
+    let source_columns = source_slot.map(|slot| (*storage.table_def(slot, txid)).clone());
+    let source_key = |name: &str| {
+        join.keys().iter().any(|&(_, column)| column == name)
+            && source_columns
+                .as_ref()
+                .is_some_and(|definition| key_only(1, name, definition.columns()))
+    };
+    let target_reach = match expansion {
+        Some(_) => leaves.iter().fold(IndexReach::default(), |reach, &leaf| {
+            reach.with(index_reach(leaf, 0, &target_key))
+        }),
+        None => index_reach(target_slot, 0, &target_key),
+    };
+    let source_reach = source_slot.map_or(IndexReach::default(), |slot| {
+        index_reach(slot, 1, &source_key)
+    });
     // PostgreSQL merges relations it knows no statistics for.
     let target_rows = leaves.iter().try_fold(0u64, |rows, &leaf| {
         storage
@@ -9237,6 +9400,22 @@ fn plan_merge<'a, 'e>(
         return Err(unsupported("of relations without statistics"));
     };
     let source_outer = join.source_outer(target_rows, source_rows);
+    // An index on the hashed relation's keys alone leaves the hash join,
+    // whose outer relation PostgreSQL would rescan by it otherwise.
+    let (outer_reach, inner_reach) = if source_outer {
+        (source_reach, target_reach)
+    } else {
+        (target_reach, source_reach)
+    };
+    if outer_reach.keys
+        || outer_reach.other
+        || inner_reach.other
+        || (inner_reach.keys && !join.hashed())
+    {
+        return Err(unsupported(
+            "with an index on a column its join condition reads",
+        ));
+    }
     // The relations' names and columns, as the conditions print them.
     let source_from = &*arena
         .alloc(crate::sql::ast::FromClause {
@@ -9340,6 +9519,8 @@ fn plan_merge<'a, 'e>(
     };
     let mut hash_conds = crate::mem::arena::ArenaList::new(arena);
     let mut join_filters = crate::mem::arena::ArenaList::new(arena);
+    // The conjuncts the join evaluates, in `ON` order.
+    let mut join_conjuncts = crate::mem::arena::ArenaList::new(arena);
     let mut target_filters = crate::mem::arena::ArenaList::new(arena);
     let mut source_filters = crate::mem::arena::ArenaList::new(arena);
     for &conjunct in &conjuncts[..count] {
@@ -9388,12 +9569,16 @@ fn plan_merge<'a, 'e>(
         };
         if let Some(key) = key {
             hash_conds.push(key).map_err(|_| arena_full())?;
+            join_conjuncts.push(conjunct).map_err(|_| arena_full())?;
             continue;
         }
         let list = match relation_mask(conjunct, &resolve) {
             Some(1) if !join.preserves_target => &mut target_filters,
             Some(2) if !join.preserves_source => &mut source_filters,
-            Some(1..=3) => &mut join_filters,
+            Some(1..=3) => {
+                join_conjuncts.push(conjunct).map_err(|_| arena_full())?;
+                &mut join_filters
+            }
             _ => return Err(unsupported("with this join condition")),
         };
         list.push(conjunct).map_err(|_| arena_full())?;
@@ -9431,6 +9616,19 @@ fn plan_merge<'a, 'e>(
     if !join.hashed() && (values.is_some() || !crate::sql::guc::planner_methods().material) {
         return Err(unsupported("joining without an equality"));
     }
+    let lists = targets::RelationTargets::merge_write(
+        storage,
+        txid,
+        target_table,
+        exposed,
+        joined,
+        values.is_some(),
+        expansion.is_some(),
+        merge,
+        join.preserves_target,
+        join_conjuncts.as_slice(),
+        arena,
+    )?;
     let (target_depth, source_depth) = if source_outer { (3, 2) } else { (2, 3) };
     let mut target_scan = physical_scan_node(
         storage,
@@ -9442,18 +9640,25 @@ fn plan_merge<'a, 'e>(
         None,
     );
     target_scan.alias = plan.nodes[0].alias;
-    let (_, target_filter) = single_relation_quals(
-        storage,
-        txid,
-        exposed,
-        target_table,
-        target_condition,
-        &[],
-        None,
-        false,
-        arena,
-    )?;
-    let target_scan = target_scan.with_qual(QualLabel::Filter, target_filter);
+    let filter = |verbose: bool| {
+        single_relation_quals(
+            storage,
+            txid,
+            exposed,
+            target_table,
+            target_condition,
+            &[],
+            None,
+            verbose,
+            arena,
+        )
+        .map(|(_, filter)| filter)
+    };
+    let mut target_scan = target_scan
+        .with_qual(QualLabel::Filter, filter(false)?)
+        .with_verbose_qual(QualLabel::Filter, filter(true)?);
+    target_scan.key = Some(NodeKey::new(block, Role::Scan(0)));
+    target_scan.set_output(lists.as_ref().map(|lists| lists.scans[0]));
     let source_scan = match source_slot {
         Some(slot) => {
             let definition = joined[1].table().expect("a table source");
@@ -9469,18 +9674,22 @@ fn plan_merge<'a, 'e>(
             if source_name != source.table {
                 scan.alias = StackStr::from_str(source_name);
             }
-            let (_, filter) = single_relation_quals(
-                storage,
-                txid,
-                source_name,
-                definition,
-                source_condition,
-                &[],
-                None,
-                false,
-                arena,
-            )?;
-            scan.with_qual(QualLabel::Filter, filter)
+            let filter = |verbose: bool| {
+                single_relation_quals(
+                    storage,
+                    txid,
+                    source_name,
+                    definition,
+                    source_condition,
+                    &[],
+                    None,
+                    verbose,
+                    arena,
+                )
+                .map(|(_, filter)| filter)
+            };
+            scan.with_qual(QualLabel::Filter, filter(false)?)
+                .with_verbose_qual(QualLabel::Filter, filter(true)?)
         }
         None => PlanNode {
             name: StackStr::from_str("Values Scan"),
@@ -9491,6 +9700,9 @@ fn plan_merge<'a, 'e>(
             ..PlanNode::EMPTY
         },
     };
+    let mut source_scan = source_scan;
+    source_scan.set_output(lists.as_ref().map(|lists| lists.scans[1]));
+    source_scan.key = Some(NodeKey::new(block, Role::Scan(1)));
     let fresh_names = || -> Result<RangeTableNames<'_>, SqlError> {
         let names = arena
             .alloc_slice_with(leaves.len() + 1, |_| StackStr::<96>::new())
@@ -9526,7 +9738,10 @@ fn plan_merge<'a, 'e>(
             total_cost: target_scan.total_cost + source_scan.total_cost,
             rows: target_scan.rows.max(source_scan.rows),
             width: target_scan.width,
-            uncounted: true,
+            key: Some(NodeKey::new(block, Role::Join(1))),
+            inner_unique: inner_reach.unique,
+            output: lists.as_ref().map(|lists| lists.join).unwrap_or_default(),
+            output_unprintable: lists.is_none(),
             ..PlanNode::EMPTY
         }
         .with_qual(QualLabel::HashCond, hash_cond)
@@ -9543,7 +9758,12 @@ fn plan_merge<'a, 'e>(
                     expansion,
                     true,
                     &mut fresh_names()?,
-                    &|_| None,
+                    &|leaf| {
+                        Some(NodeKey::new(
+                            block,
+                            Role::Member(0, u32::try_from(leaf).unwrap_or(u32::MAX)),
+                        ))
+                    },
                     None,
                 )?;
                 // One member scanned in place of the `Append` names the
@@ -9557,27 +9777,85 @@ fn plan_merge<'a, 'e>(
             None => push_scan(plan, scan),
         }
     };
-    let inner = |scan: &PlanNode| PlanNode {
+    let inner = |scan: &PlanNode, relation: usize| PlanNode {
         name: StackStr::from_str(if join.hashed() { "Hash" } else { "Materialize" }),
+        key: Some(NodeKey::new(
+            block,
+            if join.hashed() {
+                Role::Hash(relation as u16)
+            } else {
+                Role::Materialize(relation as u16)
+            },
+        )),
         depth: 2,
         total_cost: scan.total_cost,
         rows: scan.rows,
         width: scan.width,
+        output: scan.output,
+        output_unprintable: scan.output_unprintable,
+        hash_columns: lists
+            .as_ref()
+            .filter(|_| join.hashed())
+            .map(|lists| lists.hashed[relation]),
         ..PlanNode::EMPTY
     };
     if source_outer {
         push_scan(&mut plan, source_scan)?;
-        plan.push(inner(&target_scan))?;
+        plan.push(inner(&target_scan, 0))?;
         push_target(&mut plan, target_scan)?;
     } else {
         push_target(&mut plan, target_scan)?;
-        plan.push(inner(&source_scan))?;
+        plan.push(inner(&source_scan, 1))?;
         push_scan(&mut plan, source_scan)?;
     }
     plan.nodes[0].total_cost = plan.nodes[join_index].total_cost;
-    // The lists a `MERGE`'s nodes print are outside this plan.
-    plan.nodes[0].set_output(None);
+    match lists {
+        Some(lists) => {
+            plan.nodes[0].set_output(Some(lists.returned.unwrap_or_default()));
+            // The `RETURNING` list is set against the first result relation.
+            if expansion.is_some() {
+                let first = unique_rtable_name(exposed, &[StackStr::<96>::from_str(exposed)]);
+                plan.nodes[0].requalify(exposed, first.as_str());
+            }
+        }
+        None => plan.nodes[0].set_output(None),
+    }
     Ok(plan)
+}
+
+/// What a relation's indexes offer a `MERGE`'s join: one on a column
+/// `ON` reads only as a hash key (`keys`), one on another column it reads
+/// or a partial or expression index (`other`), and a unique one on hash
+/// keys (`unique`).
+#[derive(Clone, Copy, Default)]
+struct IndexReach {
+    keys: bool,
+    other: bool,
+    unique: bool,
+}
+
+impl IndexReach {
+    /// The reach of a tree's members together, which PostgreSQL does not
+    /// prove unique.
+    fn with(self, member: Self) -> Self {
+        Self {
+            keys: self.keys || member.keys,
+            other: self.other || member.other,
+            unique: false,
+        }
+    }
+}
+
+/// Calls `visit` with the relation of each whole-row reference of
+/// `expression`, its subqueries included.
+fn visit_whole_rows(expression: &Expr<'_>, visit: &mut dyn FnMut(&str)) {
+    if let Expr::WholeRow(table) = expression {
+        visit(table);
+    }
+    let _ = query::walk_children(expression, &mut |child| {
+        visit_whole_rows(child, visit);
+        Ok(())
+    });
 }
 
 /// Whether a write returns nothing.
@@ -10096,6 +10374,30 @@ pub(super) fn visit_text_rows<E>(
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
+        // A `MERGE`'s outcome follows its result relations.
+        if index > 0
+            && !node.target_member
+            && plan.nodes[1..index].iter().all(|node| node.target_member)
+            && let Some(tuples) = plan.merge_tuples(index)
+            && tuples.total > 0
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(&plan.nodes[0]) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Tuples:");
+            for (label, count) in [
+                ("inserted", tuples.inserted),
+                ("updated", tuples.updated),
+                ("deleted", tuples.deleted),
+                ("skipped", tuples.skipped),
+            ] {
+                if count > 0 {
+                    let _ = write!(line, " {label}={count}");
+                }
+            }
+            emit(line.as_str())?;
+        }
         if node.target_member {
             let mut line = StackStr::<512>::new();
             let parent =
@@ -10141,6 +10443,15 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
             emit(output.as_str())?;
+        }
+        // Text shows a join's proven unique inner relation under VERBOSE.
+        if options.verbose && node.inner_unique {
+            let mut line = StackStr::<64>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Inner Unique: true");
+            emit(line.as_str())?;
         }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
@@ -11143,10 +11454,18 @@ fn structured_node(
             document.text("Alias", member.exposed_name());
             document.close_group("Result Relation", true);
         }
+    }
+    // A `MERGE`'s outcome, inside its result relations' group.
+    if at == 0
+        && let Some(tuples) = plan.merge_tuples(members_end)
+    {
+        tuples.properties(&mut |label, count| document.number(label, count));
+    }
+    if members_end > at + 1 {
         document.close_group("Target Tables", false);
     }
     if kind.join_type.is_some() {
-        document.boolean("Inner Unique", false);
+        document.boolean("Inner Unique", node.inner_unique);
     }
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);

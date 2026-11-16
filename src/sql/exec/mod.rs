@@ -21125,54 +21125,125 @@ fn alter_subscription_definition(
     Ok(())
 }
 
-pub fn drop_subscription(
+/// Where DROP SUBSCRIPTION runs, for PostgreSQL's PreventInTransactionBlock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionDropContext {
+    TopLevel,
+    TransactionBlock,
+    Function,
+}
+
+/// DROP SUBSCRIPTION. A subscription with a publisher slot drops that slot
+/// before it commits, as PostgreSQL does: the statement parks until the server
+/// has stopped the apply worker and run `DROP_REPLICATION_SLOT ... WAIT`, and
+/// the slot's removal cannot be rolled back, so it must run outside a
+/// transaction block.
+pub(crate) fn drop_subscription(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    names: &[&str],
+    name: &str,
     if_exists: bool,
+    context: SubscriptionDropContext,
     responder: &mut Responder,
 ) -> Outcome {
-    for name in names {
-        let Some((slot, _)) = storage.subscription(name, txn.txid) else {
-            if if_exists {
+    let Some((slot, definition)) = storage.subscription(name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "subscription \"{}\" does not exist, skipping", name).as_str(),
+            )?;
+            return Ok(Ok(responder.command_complete("DROP SUBSCRIPTION")?));
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "subscription \"{}\" does not exist",
+            name
+        ));
+    };
+    if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
+        return sql_fail(error);
+    }
+    let visible = definition.definition_to(txn.txid);
+    if let Some(remote_slot) = visible.slot.name() {
+        if context == SubscriptionDropContext::Function {
+            return sql_fail(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "DROP SUBSCRIPTION cannot be executed from a function"
+            ));
+        }
+        if context == SubscriptionDropContext::TransactionBlock || txn.is_explicit() {
+            return sql_fail(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "DROP SUBSCRIPTION cannot run inside a transaction block"
+            ));
+        }
+        if let Err(error) = visible.connection.require_endpoint_for(definition.name) {
+            return sql_fail(error);
+        }
+        let owner = crate::storage::SlotDropOwner {
+            pid: storage.current_connection_id(),
+            txid: txn.txid,
+        };
+        match storage.poll_subscription_slot_drop(slot, owner) {
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_IO_WAIT,
+                    "publisher replication slot drop in progress"
+                ));
+            }
+            Some(Some(failure)) if failure.connect => {
+                return sql_fail(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::CONNECTION_FAILURE,
+                        "could not connect to publisher when attempting to drop replication slot \"{}\": {}",
+                        remote_slot.as_str(),
+                        failure.message.as_str()
+                    ),
+                    "Use ALTER SUBSCRIPTION ... DISABLE to disable the subscription, and then use ALTER SUBSCRIPTION ... SET (slot_name = NONE) to disassociate it from the slot.",
+                ));
+            }
+            Some(Some(failure)) => {
+                return sql_fail(sql_err!(
+                    sqlstate::CONNECTION_FAILURE,
+                    "could not drop replication slot \"{}\" on publisher: {}",
+                    remote_slot.as_str(),
+                    failure.message.as_str()
+                ));
+            }
+            Some(None) => {
                 responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(128, "subscription \"{}\" does not exist, skipping", name)
-                        .as_str(),
+                    stack_format!(
+                        192,
+                        "dropped replication slot \"{}\" on publisher",
+                        remote_slot.as_str()
+                    )
+                    .as_str(),
                 )?;
-                continue;
             }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription \"{}\" does not exist",
-                name
-            ));
-        };
-        if let Err(error) = storage.require_subscription_owner(slot, txn.txid) {
-            return sql_fail(error);
         }
-        let Some(slot) = (match storage.drop_subscription(name, txn.txid) {
-            Ok(slot) => slot,
-            Err(error) => return sql_fail(error),
-        }) else {
-            return sql_fail(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "subscription disappeared before DROP SUBSCRIPTION completed"
-            ));
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSubscription { name }) {
-            storage.rollback_subscription_drop(slot, txn.txid);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(
-            storage,
-            super::txn::DdlUndo::SubscriptionDropped(slot as u32),
-        ) {
-            storage.rollback_subscription_drop(slot, txn.txid);
-            return sql_fail(error);
-        }
+    }
+    let Some(slot) = (match storage.drop_subscription(name, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    }) else {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "subscription disappeared before DROP SUBSCRIPTION completed"
+        ));
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::DropSubscription { name }) {
+        storage.rollback_subscription_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SubscriptionDropped(slot as u32),
+    ) {
+        storage.rollback_subscription_drop(slot, txn.txid);
+        return sql_fail(error);
     }
     Ok(Ok(responder.command_complete("DROP SUBSCRIPTION")?))
 }
@@ -35609,12 +35680,13 @@ fn execute_bound_plpgsql_utility<'a>(
                     *action,
                     responder,
                 ),
-                Stmt::DropSubscription { names, if_exists } => super::exec::drop_subscription(
+                Stmt::DropSubscription { name, if_exists } => super::exec::drop_subscription(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    names,
+                    name,
                     *if_exists,
+                    super::exec::SubscriptionDropContext::Function,
                     responder,
                 ),
                 Stmt::CreateTextSearchParser(command) => super::exec::create_text_search_parser(

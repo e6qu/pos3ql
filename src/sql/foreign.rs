@@ -514,7 +514,7 @@ fn connect(
 }
 
 /// What libpq reports for a connection that failed.
-enum ConnectFailure<'e> {
+pub(crate) enum ConnectFailure<'e> {
     /// The TCP connection failed (`connectFailureMessage`).
     Socket(&'e std::io::Error),
     Receive(&'e std::io::Error),
@@ -551,62 +551,79 @@ fn write_strerror(output: &mut impl core::fmt::Write, error: &std::io::Error) {
     }
 }
 
-/// `could not connect to server "name"` with libpq's message as its detail:
-/// the host as given (the address in parentheses when it prints otherwise),
-/// the port and the reason.
+/// `could not connect to server "name"` with libpq's message as its detail.
 fn connect_failed(server: &RemoteServer, failure: ConnectFailure<'_>) -> SqlError {
-    let endpoint = server.endpoint;
     let mut detail = crate::sql::eval::DiagnosticWriter::new();
-    let _ = write!(detail, "connection to server at \"{}\"", endpoint.host());
-    let address = endpoint.socket_addr().ip();
-    let mut printed = StackStr::<64>::new();
-    let _ = write!(printed, "{address}");
-    if printed.as_str() != endpoint.host() {
-        let _ = write!(detail, " ({})", printed.as_str());
-    }
-    let _ = write!(detail, ", port {} failed: ", endpoint.port());
-    match failure {
-        ConnectFailure::Socket(error) => {
-            write_strerror(&mut detail, error);
-            let _ = detail.write_str(
-                "\n\tIs the server running on that host and accepting TCP/IP connections?",
-            );
-        }
-        ConnectFailure::Receive(error) => {
-            let _ = detail.write_str("could not receive data from server: ");
-            write_strerror(&mut detail, error);
-        }
-        ConnectFailure::Closed => {
-            let _ = detail.write_str(
-                "server closed the connection unexpectedly\n\tThis probably means the server \
-                 terminated abnormally\n\tbefore or while processing the request.",
-            );
-        }
-        ConnectFailure::TimedOut => {
-            let _ = detail.write_str("timeout expired");
-        }
-        ConnectFailure::Server(diagnostic) => {
-            let _ = write!(detail, "FATAL:  {}", diagnostic.message.as_str());
-            if let Some(text) = &diagnostic.detail {
-                let _ = write!(detail, "\nDETAIL:  {}", text.as_str());
-            }
-            if let Some(text) = &diagnostic.hint {
-                let _ = write!(detail, "\nHINT:  {}", text.as_str());
-            }
-        }
-        ConnectFailure::NoPassword => {
-            let _ = detail.write_str("fe_sendauth: no password supplied");
-        }
-        ConnectFailure::Other(error) => {
-            let _ = write!(detail, "{error}");
-        }
-    }
+    write_connect_failure(&mut detail, server.endpoint, failure);
     crate::sql::eval::stash_diagnostic(Some(detail.into()), None);
     sql_err!(
         sqlstate::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
         "could not connect to server \"{}\"",
         server.name.as_str()
     )
+}
+
+/// The message libpq reports for a failed connection: the host as given (the
+/// address in parentheses when it prints otherwise), the port and the reason.
+pub(crate) fn write_connect_failure(
+    output: &mut impl core::fmt::Write,
+    endpoint: ConnectionInfo,
+    failure: ConnectFailure<'_>,
+) {
+    let _ = write!(output, "connection to server at \"{}\"", endpoint.host());
+    let address = endpoint.socket_addr().ip();
+    let mut printed = StackStr::<64>::new();
+    let _ = write!(printed, "{address}");
+    if printed.as_str() != endpoint.host() {
+        let _ = write!(output, " ({})", printed.as_str());
+    }
+    let _ = write!(output, ", port {} failed: ", endpoint.port());
+    match failure {
+        ConnectFailure::Socket(error) => {
+            write_strerror(output, error);
+            let _ = output.write_str(
+                "\n\tIs the server running on that host and accepting TCP/IP connections?",
+            );
+        }
+        ConnectFailure::Receive(error) => {
+            let _ = output.write_str("could not receive data from server: ");
+            write_strerror(output, error);
+        }
+        ConnectFailure::Closed => {
+            let _ = output.write_str(
+                "server closed the connection unexpectedly\n\tThis probably means the server \
+                 terminated abnormally\n\tbefore or while processing the request.",
+            );
+        }
+        ConnectFailure::TimedOut => {
+            let _ = output.write_str("timeout expired");
+        }
+        ConnectFailure::Server(diagnostic) => {
+            let _ = output.write_str("FATAL:  ");
+            write_server_diagnostic(output, diagnostic);
+        }
+        ConnectFailure::NoPassword => {
+            let _ = output.write_str("fe_sendauth: no password supplied");
+        }
+        ConnectFailure::Other(error) => {
+            let _ = write!(output, "{error}");
+        }
+    }
+}
+
+/// A server error's message with its DETAIL and HINT lines, as libpq's
+/// default-verbosity error message prints them after the severity.
+pub(crate) fn write_server_diagnostic(
+    output: &mut impl core::fmt::Write,
+    diagnostic: &crate::pg::replication_client::PublisherDiagnostic,
+) {
+    let _ = output.write_str(diagnostic.message.as_str());
+    if let Some(text) = &diagnostic.detail {
+        let _ = write!(output, "\nDETAIL:  {}", text.as_str());
+    }
+    if let Some(text) = &diagnostic.hint {
+        let _ = write!(output, "\nHINT:  {}", text.as_str());
+    }
 }
 
 /// postgres_fdw's `configure_remote_session` and `begin_remote_xact`: a

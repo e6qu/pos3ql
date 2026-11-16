@@ -192,7 +192,6 @@ pub(super) fn stage_subscription_record(
         | WalOp::AlterReplicationSlot { .. }
         | WalOp::DropReplicationSlot { .. }
         | WalOp::AdvanceReplicationSlot { .. }
-        | WalOp::CompleteSubscriptionCleanup { .. }
         | WalOp::FailSubscription { .. }
         | WalOp::ResetSubscriptionRelations { .. }
         | WalOp::AddSubscriptionRelation { .. }

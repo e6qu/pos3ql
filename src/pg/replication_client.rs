@@ -1076,6 +1076,22 @@ impl ReplicationClient {
         self.state == ClientState::Connecting
     }
 
+    /// Whether the connection is still being established: a failure now is
+    /// a connection failure rather than a failed command.
+    pub(crate) fn is_establishing(&self) -> bool {
+        matches!(
+            self.state,
+            ClientState::Connecting
+                | ClientState::AwaitingSslResponse
+                | ClientState::AwaitingAuthentication
+                | ClientState::AwaitingReady
+        )
+    }
+
+    pub(crate) fn endpoint(&self) -> Option<ConnectionInfo> {
+        self.endpoint
+    }
+
     fn queue_startup(&mut self) -> Result<(), ClientError> {
         let endpoint = self.endpoint.expect("bound replication worker");
         startup_packet(
@@ -2141,11 +2157,15 @@ fn alter_replication_slot(
     Ok(())
 }
 
+/// `DROP_REPLICATION_SLOT name WAIT`, as PostgreSQL's subscriber sends it: a
+/// slot still held by a walsender that is shutting down is dropped once it is
+/// released instead of failing.
 pub fn drop_replication_slot(buffer: &mut FixedBuf, slot: SqlName) -> Result<(), WireFull> {
     let mark = buffer.mark();
     let mut message = MsgOut::begin(buffer, wire::FMSG_QUERY);
     message.bytes(b"DROP_REPLICATION_SLOT ");
     append_identifier(&mut message, slot.as_str());
+    message.bytes(b" WAIT");
     message.u8(0);
     if message.finish().is_err() {
         buffer.truncate_to(mark);

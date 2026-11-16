@@ -420,7 +420,8 @@ struct SubscriptionWorker {
     retry_at: Option<std::time::Instant>,
     registered_sql_fd: Option<i32>,
     sql_want_write: bool,
-    cleanup: Option<(u64, crate::storage::SqlName)>,
+    /// The client runs DROP SUBSCRIPTION's publisher slot drop.
+    slot_drop: bool,
     detached_commit: bool,
 }
 
@@ -1031,7 +1032,7 @@ impl Server {
                     retry_at: None,
                     registered_sql_fd: None,
                     sql_want_write: false,
-                    cleanup: None,
+                    slot_drop: false,
                     detached_commit: false,
                 })
                 .expect("sized to max_subscriptions");
@@ -1278,6 +1279,9 @@ impl Server {
                     .and_then(|probe| probe.deadline())
                     .map(|deadline| deadline.saturating_duration_since(Instant::now())),
                 self.buffered_subscription_work().then_some(Duration::ZERO),
+                // A failed subscription connection retries without needing
+                // another socket event.
+                self.next_subscription_retry_timeout(),
                 // A coalesced reload must not need another socket event after installation.
                 (RELOAD_REQUESTED.load(Ordering::SeqCst) && !self.credential_reload_pending)
                     .then_some(Duration::ZERO),
@@ -2148,7 +2152,7 @@ impl Server {
         worker.bootstrap.line.clear();
         worker.name = None;
         worker.definition = None;
-        worker.cleanup = None;
+        worker.slot_drop = false;
         worker.want_write = false;
         worker.sql_want_write = false;
     }
@@ -2164,49 +2168,64 @@ impl Server {
                 self.sync_subscription_interest(slot)?;
                 continue;
             }
-            if let Some(cleanup) = self.engine.subscription_cleanup_runtime(slot) {
-                if self.subscriptions[slot].cleanup == Some((cleanup.created_at, cleanup.name)) {
-                    self.sync_subscription_interest(slot)?;
-                    continue;
-                }
-                if self.subscriptions[slot]
-                    .retry_at
-                    .is_some_and(|deadline| deadline > now)
+            if self.subscriptions[slot].slot_drop {
+                self.sync_subscription_interest(slot)?;
+                continue;
+            }
+            if let Some(request) = self.engine.start_subscription_slot_drop(slot) {
+                if self.subscriptions[slot].client.is_bound()
+                    || self.subscriptions[slot].name.is_some()
                 {
-                    continue;
-                }
-                if self.subscriptions[slot].name.is_some() {
                     self.unbind_subscription(slot);
                 }
+                self.subscriptions[slot].retry_at = None;
+                let endpoint = match request.endpoint {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        let failure =
+                            slot_drop_message(true, format_args!("{}", error.message.as_str()));
+                        self.finish_subscription_slot_drop(slot, Some(failure));
+                        continue;
+                    }
+                };
                 let worker = &mut self.subscriptions[slot];
                 match worker
                     .client
-                    .bind_drop_slot(cleanup.endpoint.connection(), cleanup.slot)
+                    .bind_drop_slot(endpoint.connection(), request.slot)
                 {
                     Ok(()) => {
-                        worker.name = Some(cleanup.name);
-                        worker.cleanup = Some((cleanup.created_at, cleanup.name));
-                        worker.retry_at = None;
+                        worker.slot_drop = true;
                         let fd = worker.client.raw_fd();
                         self.reactor
                             .register_read(fd, Self::subscription_token(slot, false))?;
                         worker.registered_fd = Some(fd);
                         self.sync_subscription_interest(slot)?;
                     }
-                    Err(_) => {
-                        worker.retry_at = Some(now + Duration::from_secs(1));
+                    Err(error) => {
+                        worker.client.unbind();
+                        let failure = slot_drop_client_failure(endpoint.connection(), &error, true);
+                        self.finish_subscription_slot_drop(slot, Some(failure));
                     }
                 }
                 continue;
             }
-            if self.subscriptions[slot].cleanup.is_some() {
-                self.unbind_subscription(slot);
+            if self.engine.subscription_slot_drop_pending(slot) {
+                // The waiting statement has not taken the outcome yet; the
+                // subscription it may still drop keeps no worker.
+                if self.subscriptions[slot].name.is_some() {
+                    self.unbind_subscription(slot);
+                }
+                self.subscriptions[slot].retry_at = None;
+                continue;
             }
             let runtime = self.engine.subscription_runtime(slot);
             let bound = self.subscriptions[slot].definition;
             match (runtime, bound) {
-                (None, Some(_)) => self.unbind_subscription(slot),
-                (None, None) => {}
+                (None, Some(_)) => {
+                    self.unbind_subscription(slot);
+                    self.subscriptions[slot].retry_at = None;
+                }
+                (None, None) => self.subscriptions[slot].retry_at = None,
                 (Some(runtime), Some(binding)) if binding == runtime.into() => {
                     self.sync_subscription_interest(slot)?;
                 }
@@ -2453,6 +2472,64 @@ impl Server {
         Ok(true)
     }
 
+    /// Advances DROP SUBSCRIPTION's publisher slot drop. Its outcome, success
+    /// or failure, goes to the waiting statement; it is never retried here.
+    fn advance_subscription_slot_drop(
+        &mut self,
+        slot: usize,
+        readable: bool,
+        writable: bool,
+    ) -> std::io::Result<()> {
+        let worker = &mut self.subscriptions[slot];
+        let endpoint = worker
+            .client
+            .endpoint()
+            .expect("a bound slot drop client has an endpoint");
+        let establishing = worker.client.is_establishing();
+        let mut result = Ok(());
+        if writable {
+            result = worker.client.writable();
+        }
+        if result.is_ok() && readable {
+            result = worker.client.readable(1, |_| {
+                Err(crate::pg::replication_client::ClientError::Protocol(
+                    crate::pg::replication_client::FrameError::Malformed,
+                ))
+            });
+        }
+        match result {
+            Err(error) => {
+                let failure = slot_drop_client_failure(endpoint, &error, establishing);
+                self.finish_subscription_slot_drop(slot, Some(failure));
+            }
+            Ok(()) if worker.client.command_complete() => {
+                self.finish_subscription_slot_drop(slot, None);
+            }
+            Ok(()) => self.sync_subscription_interest(slot)?,
+        }
+        Ok(())
+    }
+
+    /// Hands a slot drop's outcome to its waiting statement.
+    fn finish_subscription_slot_drop(
+        &mut self,
+        slot: usize,
+        failure: Option<crate::storage::SlotDropFailure>,
+    ) {
+        self.unbind_subscription(slot);
+        self.engine.finish_subscription_slot_drop(slot, failure);
+        self.wake_io_waiters();
+    }
+
+    fn next_subscription_retry_timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.subscriptions
+            .iter()
+            .filter_map(|worker| worker.retry_at)
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+    }
+
     fn advance_subscription_commits(&mut self) -> std::io::Result<()> {
         for slot in 0..self.subscriptions.len() {
             if !self.subscriptions[slot].apply.awaiting_durability() {
@@ -2510,8 +2587,10 @@ impl Server {
         if !worker.client.is_bound() {
             return Ok(());
         }
+        if worker.slot_drop {
+            return self.advance_subscription_slot_drop(slot, readable, writable);
+        }
         let mut failed = false;
-        let mut cleanup_slot_absent = false;
         let mut publisher_failure = None;
         if writable && worker.client.writable().is_err() {
             failed = true;
@@ -2542,16 +2621,6 @@ impl Server {
             });
             match readable {
                 Ok(()) => {}
-                Err(crate::pg::replication_client::ClientError::Publisher(error))
-                    if worker.cleanup.is_some()
-                        && error.sqlstate == crate::sql::eval::sqlstate::UNDEFINED_OBJECT =>
-                {
-                    // DROP is driven only by a durable managed-slot cleanup
-                    // intent. If a crash happened after the remote side effect
-                    // but before its local completion record, absence proves
-                    // that the requested state has already been reached.
-                    cleanup_slot_absent = true;
-                }
                 Err(error) => {
                     log_subscription_client_error(worker.name, &error);
                     if let crate::pg::replication_client::ClientError::Publisher(error) = error {
@@ -2567,21 +2636,6 @@ impl Server {
                     .is_err()
             {
                 failed = true;
-            }
-            if !failed
-                && (worker.client.command_complete() || cleanup_slot_absent)
-                && let Some((created_at, name)) = worker.cleanup
-            {
-                if self
-                    .engine
-                    .complete_subscription_cleanup(slot, created_at, name)
-                    .is_err()
-                {
-                    failed = true;
-                } else {
-                    self.unbind_subscription(slot);
-                    return Ok(());
-                }
             }
             if !failed
                 && worker.bootstrap.stage == SubscriptionBootstrapStage::DroppingSyncSlot
@@ -4079,6 +4133,65 @@ fn log_subscription_error(
         error.message.as_str()
     );
     crate::logging::error("subscription_apply", message.as_str().trim_end());
+}
+
+fn slot_drop_message(
+    connect: bool,
+    message: core::fmt::Arguments<'_>,
+) -> crate::storage::SlotDropFailure {
+    use core::fmt::Write as _;
+    let mut text = crate::util::StackStr::<512>::new();
+    let _ = text.write_fmt(message);
+    crate::storage::SlotDropFailure {
+        connect,
+        message: text,
+    }
+}
+
+/// libpq's text for a failed slot drop: a failure before the connection was
+/// ready is a connection failure, and the server's error is printed with its
+/// severity, as `PQerrorMessage` does.
+fn slot_drop_client_failure(
+    endpoint: crate::pg::replication_client::ConnectionInfo,
+    error: &crate::pg::replication_client::ClientError,
+    establishing: bool,
+) -> crate::storage::SlotDropFailure {
+    use crate::pg::replication_client::ClientError;
+    use crate::sql::foreign::ConnectFailure;
+    use core::fmt::Write as _;
+    let mut text = crate::util::StackStr::<512>::new();
+    if establishing {
+        let failure = match error {
+            ClientError::Io(error) => ConnectFailure::Socket(error),
+            ClientError::Closed => ConnectFailure::Closed,
+            ClientError::Publisher(diagnostic) => ConnectFailure::Server(diagnostic),
+            ClientError::Authentication if endpoint.password().is_none() => {
+                ConnectFailure::NoPassword
+            }
+            error => ConnectFailure::Other(error),
+        };
+        crate::sql::foreign::write_connect_failure(&mut text, endpoint, failure);
+    } else {
+        match error {
+            ClientError::Publisher(diagnostic) => {
+                let _ = text.write_str("ERROR:  ");
+                crate::sql::foreign::write_server_diagnostic(&mut text, diagnostic);
+            }
+            ClientError::Closed => {
+                let _ = text.write_str(
+                    "server closed the connection unexpectedly\n\tThis probably means the server \
+                     terminated abnormally\n\tbefore or while processing the request.",
+                );
+            }
+            error => {
+                let _ = write!(text, "{error}");
+            }
+        }
+    }
+    crate::storage::SlotDropFailure {
+        connect: establishing,
+        message: text,
+    }
 }
 
 fn log_subscription_client_error(

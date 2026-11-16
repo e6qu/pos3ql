@@ -291,11 +291,10 @@ pub(crate) struct SubscriptionRuntime {
     pub behavior: crate::storage::SubscriptionBehavior,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct SubscriptionCleanupRuntime {
-    pub created_at: u64,
-    pub name: SqlName,
-    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
+pub(crate) struct SubscriptionSlotDropRuntime {
+    /// An error when the connection string names no endpoint this server
+    /// can reach, which fails the drop as a connection failure.
+    pub endpoint: Result<crate::pg::replication_client::SubscriptionEndpoint, SqlError>,
     pub slot: SqlName,
 }
 
@@ -1011,6 +1010,8 @@ pub enum StatementWait {
     ClientOutput,
     /// `pg_sleep` waits until the session's recorded wake time.
     Timer,
+    /// `DROP_REPLICATION_SLOT ... WAIT` waits for the slot's release.
+    ReplicationSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3859,56 +3860,31 @@ impl Engine {
         }
     }
 
-    pub(crate) fn subscription_cleanup_runtime(
+    /// The publisher slot drop a DROP SUBSCRIPTION statement is waiting
+    /// for, which the server starts now.
+    pub(crate) fn start_subscription_slot_drop(
         &self,
         slot: usize,
-    ) -> Option<SubscriptionCleanupRuntime> {
-        let (created_at, name, connection, remote_slot) =
-            self.storage.subscription_cleanup(slot)?;
-        Some(SubscriptionCleanupRuntime {
-            created_at,
-            name,
-            endpoint: connection.endpoint_for(name)?,
+    ) -> Option<SubscriptionSlotDropRuntime> {
+        let (name, connection, remote_slot) =
+            self.storage.requested_subscription_slot_drop(slot)?;
+        self.storage.start_subscription_slot_drop(slot);
+        Some(SubscriptionSlotDropRuntime {
+            endpoint: connection.require_endpoint_for(name),
             slot: remote_slot,
         })
     }
 
-    pub(crate) fn complete_subscription_cleanup(
-        &mut self,
+    pub(crate) fn subscription_slot_drop_pending(&self, slot: usize) -> bool {
+        self.storage.subscription_slot_drop_pending(slot)
+    }
+
+    pub(crate) fn finish_subscription_slot_drop(
+        &self,
         slot: usize,
-        created_at: u64,
-        name: SqlName,
-    ) -> Result<(), SqlError> {
-        // A committed record must apply: check before journaling it.
-        self.storage.check_subscription_cleanup(slot, created_at)?;
-        let transaction_id = self.allocate_transaction_id()?;
-        let lsn =
-            self.storage.lsn().checked_add(1).ok_or_else(|| {
-                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
-            })?;
-        if let Err(error) = self.wal.stage(
-            transaction_id,
-            lsn,
-            &WalOp::CompleteSubscriptionCleanup {
-                name: name.as_str(),
-                created_at,
-            },
-        ) {
-            self.wal.discard_stage(transaction_id);
-            return Err(error);
-        }
-        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
-            Ok(lsn) => lsn,
-            Err(error) => {
-                self.wal.discard_stage(transaction_id);
-                return Err(error);
-            }
-        };
-        self.finish_atomic_journal(|storage| {
-            storage.complete_subscription_cleanup(slot, created_at)?;
-            storage.observe_lsn(commit_lsn);
-            Ok(())
-        })
+        failure: Option<crate::storage::SlotDropFailure>,
+    ) {
+        self.storage.finish_subscription_slot_drop(slot, failure);
     }
 
     pub(crate) fn fail_subscription(
@@ -5550,13 +5526,6 @@ impl Engine {
                     source_name.as_str()
                 )
             })?;
-        if source.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                source_name.as_str()
-            ));
-        }
         if source.behavior.two_phase {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5643,12 +5612,8 @@ impl Engine {
                     name.as_str()
                 )
             })?;
-        if slot.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if slot.active() {
+            return Err(slot.in_use_error());
         }
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
@@ -5694,12 +5659,8 @@ impl Engine {
                     name.as_str()
                 )
             })?;
-        if current.active {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "replication slot \"{}\" is active",
-                name.as_str()
-            ));
+        if current.active() {
+            return Err(current.in_use_error());
         }
         let transaction_id = self.allocate_transaction_id()?;
         let lsn =
@@ -5808,6 +5769,10 @@ impl Engine {
 
     pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
         self.storage.deactivate_replication_slot(name);
+    }
+
+    pub(crate) fn replication_slot_releases(&self) -> u64 {
+        self.storage.replication_slot_releases()
     }
 
     /// Validates pgoutput's publication set before a replication slot is made
@@ -12045,6 +12010,7 @@ impl Engine {
             StatementWait::ObjectIo => self.lock_generation(),
             StatementWait::CacheCapacity => self.cache_capacity_generation(),
             StatementWait::ClientOutput | StatementWait::Timer => 0,
+            StatementWait::ReplicationSlot => self.storage.replication_slot_releases(),
         }
     }
 
@@ -12217,6 +12183,7 @@ impl Engine {
 
     pub(crate) fn cancel_backend_wait(&self, pid: i32) {
         self.storage.cancel_backend_wait(pid);
+        self.storage.abandon_subscription_slot_drops(pid);
     }
 
     pub(crate) fn take_backend_signal(&self) -> Option<crate::storage::BackendSignal> {
@@ -12225,6 +12192,7 @@ impl Engine {
 
     /// Drops a closing connection's LISTEN registrations.
     pub fn drop_connection(&mut self, conn_id: i32) {
+        self.storage.abandon_subscription_slot_drops(conn_id);
         foreign::drop_backend_connections(&self.storage, conn_id);
         self.storage.unregister_backend(conn_id);
         self.notify.drop_conn(conn_id);
@@ -24641,12 +24609,17 @@ impl Engine {
                 *action,
                 responder,
             ),
-            Stmt::DropSubscription { names, if_exists } => exec::drop_subscription(
+            Stmt::DropSubscription { name, if_exists } => exec::drop_subscription(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                names,
+                name,
                 *if_exists,
+                if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic {
+                    exec::SubscriptionDropContext::TransactionBlock
+                } else {
+                    exec::SubscriptionDropContext::TopLevel
+                },
                 responder,
             ),
             Stmt::CreateTrigger(trigger) => exec::create_trigger(
@@ -32712,21 +32685,6 @@ fn apply_wal_op(
                 })?;
             storage.stage_subscription_relation(stream, schema, table, 0)?;
             storage.commit_subscription_relation_refresh(0);
-        }
-        WalOp::CompleteSubscriptionCleanup { name, created_at } => {
-            let slot = storage
-                .subscriptions_with_slots_durable()
-                .find(|(_, subscription)| {
-                    subscription.name.as_str() == name && subscription.created_at == created_at
-                })
-                .map(|(slot, _)| slot)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "journal cleanup completion targets an unknown subscription"
-                    )
-                })?;
-            storage.complete_subscription_cleanup(slot, created_at)?;
         }
         WalOp::FailSubscription {
             name,

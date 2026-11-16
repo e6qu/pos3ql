@@ -11052,7 +11052,7 @@ fn replication_slots_are_bounded_and_have_resume_positions() {
     let slot = storage.replication_slot("changes").unwrap();
     assert_eq!(slot.restart_lsn, 42);
     assert_eq!(slot.confirmed_flush_lsn, 42);
-    assert!(!slot.active);
+    assert!(!slot.active());
     assert_eq!(slot.active_pid, None);
     assert_eq!(
         storage
@@ -11079,7 +11079,7 @@ fn replication_slots_are_bounded_and_have_resume_positions() {
     );
     storage.record_replication_slot_transaction("changes", 49, 500);
     let slot = storage.replication_slot("changes").unwrap();
-    assert!(slot.active);
+    assert!(slot.active());
     assert_eq!(slot.active_pid, Some(321));
     assert_eq!(slot.sent_lsn, 49);
     assert_eq!((slot.total_txns, slot.total_bytes), (1, 500));

@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 33;
+pub(crate) const RECORD_VERSION: u8 = 34;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -204,7 +204,6 @@ wal_record_kinds! {
     KIND_SET_SUBSCRIPTION_BOOTSTRAP = 61;
     KIND_RESET_SUBSCRIPTION_RELATIONS = 62;
     KIND_ADD_SUBSCRIPTION_RELATION = 63;
-    KIND_COMPLETE_SUBSCRIPTION_CLEANUP = 64;
     KIND_FAIL_SUBSCRIPTION = 65;
     KIND_SET_SUBSCRIPTION_OWNER = 66;
     KIND_RENAME_SUBSCRIPTION = 67;
@@ -2032,10 +2031,6 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         table: &'a str,
     },
-    CompleteSubscriptionCleanup {
-        name: &'a str,
-        created_at: u64,
-    },
     FailSubscription {
         name: &'a str,
         created_at: u64,
@@ -3610,7 +3605,6 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetSubscriptionBootstrap { .. } => KIND_SET_SUBSCRIPTION_BOOTSTRAP,
         WalOp::ResetSubscriptionRelations { .. } => KIND_RESET_SUBSCRIPTION_RELATIONS,
         WalOp::AddSubscriptionRelation { .. } => KIND_ADD_SUBSCRIPTION_RELATION,
-        WalOp::CompleteSubscriptionCleanup { .. } => KIND_COMPLETE_SUBSCRIPTION_CLEANUP,
         WalOp::FailSubscription { .. } => KIND_FAIL_SUBSCRIPTION,
         WalOp::AlterSubscription { .. } => KIND_ALTER_SUBSCRIPTION,
         WalOp::SetSubscriptionOwner { .. } => KIND_SET_SUBSCRIPTION_OWNER,
@@ -4091,7 +4085,6 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             ..
         } => 1 + name.len() + 8 + 8 + 1 + schema.len() + 1 + table.len(),
-        WalOp::CompleteSubscriptionCleanup { name, .. } => 1 + name.len() + 8,
         WalOp::FailSubscription { name, message, .. } => {
             1 + name.len() + 8 + 8 + 5 + 1 + message.len()
         }
@@ -5944,9 +5937,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&definition_generation.to_le_bytes())
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
-        }
-        WalOp::CompleteSubscriptionCleanup { name, created_at } => {
-            name_bytes(buffer, name) && buffer.append(&created_at.to_le_bytes())
         }
         WalOp::FailSubscription {
             name,
@@ -9845,12 +9835,6 @@ fn decode_op_inner<'a>(
                 schema,
                 table,
             })
-        }),
-        KIND_COMPLETE_SUBSCRIPTION_CLEANUP => decode_large_op(|| {
-            let name = take_name(&mut at)?;
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
-            (at == payload.len()).then_some(WalOp::CompleteSubscriptionCleanup { name, created_at })
         }),
         KIND_FAIL_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;

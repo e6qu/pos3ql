@@ -3692,11 +3692,11 @@ fn capture_original_drops<'a>(
                 }
             }
         }
-        Stmt::DropSubscription { names, .. } => {
+        Stmt::DropSubscription { name, .. } => {
             for (slot, definition) in storage
                 .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
             {
-                if names.contains(&definition.name_for(txid).as_str()) {
+                if definition.name_for(txid).as_str() == *name {
                     remember(Some(ObjectRef::Subscription(slot)))?;
                 }
             }

@@ -477,7 +477,13 @@ that PostgreSQL does once while planning. Parameter inference walks a statement 
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. 
+`text` where PostgreSQL reports `42804`. `DROP SUBSCRIPTION` drops the
+publisher slot before it returns, as PostgreSQL does, but `CREATE
+SUBSCRIPTION` with `connect = true` still creates its slot and copies its
+tables in the background: PostgreSQL connects during the statement, reports
+`NOTICE: created replication slot "s" on publisher` (or fails the statement),
+and records each table's `pg_subscription_rel` row at commit before per-table
+synchronization workers copy them.
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead

@@ -20676,7 +20676,7 @@ fn pg_replication_slots<'a>(
                 Datum::Oid(storage.current_database_oid().get() as u32),
                 text(database_definition.name.as_str(), arena)?,
                 Datum::Bool(false),
-                Datum::Bool(slot.active),
+                Datum::Bool(slot.active()),
                 slot.active_pid.map_or(Datum::Null, Datum::Int4),
                 Datum::Null,
                 Datum::Null,
@@ -20785,13 +20785,13 @@ fn pg_stat_replication<'a>(
         arena,
         storage
             .replication_slots_with_slots()
-            .filter(|(_, slot)| slot.active)
+            .filter(|(_, slot)| slot.active())
             .count(),
     )?;
     let mut count = 0;
     for (_, slot) in storage
         .replication_slots_with_slots()
-        .filter(|(_, slot)| slot.active)
+        .filter(|(_, slot)| slot.active())
     {
         if count == rows.len() {
             return Err(sql_err!(

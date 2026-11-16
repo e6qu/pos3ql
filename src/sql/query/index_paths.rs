@@ -1178,6 +1178,10 @@ pub(crate) struct QueryShape {
     /// The scan may stop once the limit has its rows: no row lock or later
     /// filter can drop one of them.
     pub(crate) stop_at_limit: bool,
+    /// The columns the query reads above the scan (`reltarget`), which its
+    /// width counts; `None` for every column or an unknown set. Columns
+    /// only the scan's own conditions read are not among them.
+    pub(crate) output: Option<u64>,
 }
 
 /// `cost_sort` of `rows` rows of `width` bytes whose input costs
@@ -1969,7 +1973,11 @@ pub(crate) fn scan_path<'a>(
             let Some((startup, total)) = sort_cost(
                 path.total,
                 rows,
-                f64::from(output_width(definition, &statistics, needed)),
+                f64::from(output_width(
+                    definition,
+                    &statistics,
+                    shape.output.or(needed),
+                )),
                 shape.limit,
                 costs,
             ) else {
@@ -2026,7 +2034,7 @@ pub(crate) fn scan_path<'a>(
         conditions: [None; MAX_RESTRICTIONS],
         condition_count: 0,
         rows,
-        width: output_width(definition, &statistics, needed),
+        width: output_width(definition, &statistics, shape.output.or(needed)),
         startup_cost: scan.startup,
         total_cost: scan.total,
         index_cost: chosen.bitmap_index_total,
@@ -2200,10 +2208,52 @@ pub(crate) fn query_shape<'a>(
     let (Some(count), Some(skip)) = (constant(limit)?, constant(offset)?) else {
         return Ok(None);
     };
+    // The columns the select list and ordering read.
+    fn whole_row(expression: &Expr<'_>) -> bool {
+        let mut found = matches!(expression, Expr::WholeRow(_) | Expr::SchemaColumn { .. });
+        let _ = super::walk_children(expression, &mut |child| {
+            found |= whole_row(child);
+            Ok(())
+        });
+        found
+    }
+    let wildcard = items.iter().any(|item| {
+        matches!(
+            item,
+            crate::sql::ast::SelectItem::Wildcard(_)
+                | crate::sql::ast::SelectItem::TableWildcard(_)
+        )
+    });
+    let mut output = (!wildcard).then_some(0u64);
+    let mut read = |expression: &Expr<'_>| {
+        if whole_row(expression) {
+            output = None;
+        }
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            output = match (output, scope.find_column(qualifier, name)) {
+                (Some(mask), Ok(ResolvedColumn::Table(0, column))) if column < 64 => {
+                    Some(mask | 1 << column)
+                }
+                _ => None,
+            };
+        });
+    };
+    for item in items {
+        match item {
+            crate::sql::ast::SelectItem::Expr { expression, .. }
+            | crate::sql::ast::SelectItem::RecordStar(expression) => read(expression),
+            crate::sql::ast::SelectItem::Wildcard(_)
+            | crate::sql::ast::SelectItem::TableWildcard(_) => {}
+        }
+    }
+    for order in order_by {
+        read(order.expression);
+    }
     Ok(Some(QueryShape {
         order,
         limit: (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0))),
         stop_at_limit: false,
+        output,
     }))
 }
 

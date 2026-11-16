@@ -2235,13 +2235,23 @@ fn create_table_kind(
             "ON COMMIT can only be used on temporary tables"
         ));
     }
-    let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
+    // PostgreSQL reports each column merge as it merges it, before an
+    // error a later column or constraint raises.
+    let mut merged = InheritedMerge::default();
+    let built = build_partitioned_table_def(storage, statement, txn.txid, arena, &mut merged);
+    if let Err(error) = notify_inherited_column_merges(
+        storage,
+        statement,
+        txn.txid,
+        built.is_err().then_some(merged),
+        responder,
+    )? {
+        return sql_fail(error);
+    }
+    let mut def = match built {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    if let Err(error) = notify_inherited_column_merges(storage, statement, txn.txid, responder)? {
-        return sql_fail(error);
-    }
     if let Err(error) = capture_created_table_inputs(storage, &mut def, statement, txn.txid, arena)
     {
         return sql_fail(error);
@@ -2326,8 +2336,8 @@ fn create_table_kind(
     if let Err(e) = reject_multiple_primary(&def) {
         return sql_fail(e);
     }
-    // A named CHECK the table also inherits, with the same predicate, merges
-    // into the inherited one (`MergeWithExistingConstraint`).
+    // A named CHECK the table also inherits merges into the inherited one
+    // when it has the same predicate (`MergeWithExistingConstraint`).
     let declared_constraints = match arena
         .alloc_slice_with(statement.constraints.len(), |position| {
             statement.constraints[position]
@@ -2340,31 +2350,58 @@ fn create_table_kind(
         let constraint = declared_constraints[position];
         if let crate::sql::ast::TableConstraint::Check {
             name: Some(name),
+            expression,
             text,
-            no_inherit: false,
+            validation,
+            no_inherit,
             ..
         } = constraint
             && let Some(inherited) = def.checks[..def.n_checks]
                 .iter()
                 .position(|check| !check.local && check.name.as_str() == name)
         {
+            // PostgreSQL analyses the predicate before it merges it.
+            if let Err(error) =
+                ddl::analyse_check_expression(storage, txn.txid, &def, expression, true, arena)
+            {
+                return sql_fail(error);
+            }
             let stored = match ddl::stored_relation_expression(text, &def, arena) {
                 Ok(stored) => stored,
                 Err(error) => return sql_fail(error),
             };
-            if def.checks[inherited].expression.as_str() == stored {
-                responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
-                    stack_format!(
-                        160,
-                        "merging constraint \"{}\" with inherited definition",
-                        name
-                    )
-                    .as_str(),
-                )?;
-                def.checks[inherited].local = true;
-                continue;
+            let partition = def.partition.attachment.is_some();
+            if let Err(error) = ddl::merge_with_existing_check(
+                &def.checks[inherited],
+                true,
+                def.name.as_str(),
+                partition,
+                ddl::CheckAddition {
+                    stored,
+                    validation,
+                    local: true,
+                    no_inherit,
+                    allow_merge: true,
+                },
+                arena,
+            ) {
+                return sql_fail(error);
             }
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "merging constraint \"{}\" with inherited definition",
+                    name
+                )
+                .as_str(),
+            )?;
+            let merged = &mut def.checks[inherited];
+            merged.local = !partition;
+            if validation.enforced() && !merged.validation.enforced() {
+                merged.validation = crate::storage::ConstraintValidation::EnforcedValidated;
+            }
+            continue;
         }
         declared_constraints[kept] = constraint;
         kept += 1;
@@ -4889,11 +4926,12 @@ fn build_partitioned_table_def(
     statement: &CreateTable,
     txid: u32,
     arena: &Arena,
+    merged: &mut InheritedMerge,
 ) -> Result<TableDefBuilder, SqlError> {
     match statement.partition {
-        PartitionClause::None => build_inherited_table_def(storage, statement, txid, arena),
+        PartitionClause::None => build_inherited_table_def(storage, statement, txid, arena, merged),
         PartitionClause::By { strategy, columns } => {
-            let mut def = build_inherited_table_def(storage, statement, txid, arena)?;
+            let mut def = build_inherited_table_def(storage, statement, txid, arena, merged)?;
             def.partition.scheme = Some(resolve_partition_scheme(&def, strategy, columns)?);
             Ok(def)
         }
@@ -5129,12 +5167,29 @@ fn partition_column_options(
 
 /// PostgreSQL's notices for a column that several parents, or a parent and
 /// the new table itself, define.
+/// How far building an inheriting table merged its parents' columns, and
+/// then its own: the parent (or, past the last parent, the own column list)
+/// and the columns of it merged, the last one included.
+#[derive(Clone, Copy, Default)]
+struct InheritedMerge {
+    list: usize,
+    columns: usize,
+}
+
+/// Reports the column merges of `statement`, all of them, or with
+/// `failed` those made before a merge failed.
 fn notify_inherited_column_merges(
     storage: &Storage,
     statement: &CreateTable,
     txid: u32,
+    failed: Option<InheritedMerge>,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
+    let reached = |list: usize, column: usize| {
+        failed.is_none_or(|merged| {
+            list < merged.list || (list == merged.list && column < merged.columns)
+        })
+    };
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
         return Ok(Ok(()));
     };
@@ -5156,7 +5211,10 @@ fn notify_inherited_column_merges(
             Ok(parent) => storage.table_def(parent, txid),
             Err(error) => return Ok(Err(error)),
         };
-        for column in parent.columns() {
+        for (index, column) in parent.columns().iter().enumerate() {
+            if !reached(position, index) {
+                break;
+            }
             match defined_by_earlier_parent(position, column.name.as_str()) {
                 Ok(true) => responder.notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -5172,7 +5230,10 @@ fn notify_inherited_column_merges(
             }
         }
     }
-    for column in statement.columns {
+    for (index, column) in statement.columns.iter().enumerate() {
+        if !reached(parents.len(), index) {
+            break;
+        }
         match defined_by_earlier_parent(parents.len(), column.name) {
             Ok(true) => responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
@@ -5198,6 +5259,7 @@ fn build_inherited_table_def(
     statement: &CreateTable,
     txid: u32,
     arena: &Arena,
+    merged: &mut InheritedMerge,
 ) -> Result<TableDefBuilder, SqlError> {
     let own = build_declared_table_def(storage, statement, txid, arena)?;
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
@@ -5209,7 +5271,22 @@ fn build_inherited_table_def(
     definition.not_null_names = [None; MAX_COLUMNS];
     definition.not_null_name_edits = crate::storage::ColumnSet::EMPTY;
     definition.inheritance = crate::storage::TableInheritance::NONE;
-    for parent_name in parents {
+    // `DefineRelation` resolves every parent and rejects a repeated one
+    // before it merges anything.
+    for (list, parent_name) in parents.iter().enumerate() {
+        let parent = resolve_dml_table(storage, parent_name, txid)?;
+        for earlier in &parents[..list] {
+            if resolve_dml_table(storage, earlier, txid)? == parent {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" would be inherited from more than once",
+                    storage.table_def(parent, txid).name.as_str()
+                ));
+            }
+        }
+    }
+    for (list, parent_name) in parents.iter().enumerate() {
+        *merged = InheritedMerge { list, columns: 0 };
         let parent = resolve_dml_table(storage, parent_name, txid)?;
         let parent_definition = storage.table_def(parent, txid);
         if parent_definition.persistence == crate::storage::RelationPersistence::Temporary
@@ -5236,6 +5313,7 @@ fn build_inherited_table_def(
             ));
         }
         for (parent_index, parent_column) in parent_definition.columns().iter().enumerate() {
+            merged.columns = parent_index + 1;
             let mut inherited = *parent_column;
             inherited.not_null =
                 if inherited.not_null.is_required() && inherited.not_null_inheritable {
@@ -5288,6 +5366,10 @@ fn build_inherited_table_def(
         definition.inheritance.append(parent)?;
     }
     for (own_index, column) in own.columns().iter().enumerate() {
+        *merged = InheritedMerge {
+            list: parents.len(),
+            columns: own_index + 1,
+        };
         if let Some(existing) = definition.column_index(column.name.as_str()) {
             let inherited = definition.columns[existing];
             if inherited.ctype != column.ctype
@@ -5423,12 +5505,23 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
             .iter_mut()
             .find(|existing| existing.name == inherited.name)
         {
-            if existing.expression != inherited.expression {
+            if require_existing {
+                // `ALTER TABLE ... INHERIT` (`MergeConstraintsIntoExisting`).
+                ddl::merge_check_into_existing(inherited, existing, child.name.as_str(), arena)?;
+            } else if !ddl::same_check_expression(
+                existing.expression.as_str(),
+                inherited.expression.as_str(),
+                arena,
+            )? {
+                // Two parents of a new table (`MergeCheckConstraint`).
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "constraint \"{}\" conflicts with inherited constraint of the same name",
+                    "check constraint name \"{}\" appears multiple times but with different expressions",
                     inherited.name.as_str()
                 ));
+            }
+            if inherited.validation.enforced() && !existing.validation.enforced() {
+                existing.validation = crate::storage::ConstraintValidation::EnforcedValidated;
             }
             // A partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
@@ -98946,11 +99039,17 @@ fn propagated_check_name<'a>(
         .chain(definition.inheritance.parents_ref())
     {
         let parent = storage.table_def(usize::from(*parent), txid);
-        if let Some(check) = parent.checks().iter().find(|check| {
-            !check.no_inherit
-                && check.expression.as_str() == stored
+        let mut found = None;
+        for check in parent.checks() {
+            if !check.no_inherit
                 && !definition.checks().iter().any(|own| own.name == check.name)
-        }) {
+                && ddl::same_check_expression(check.expression.as_str(), stored, arena)?
+            {
+                found = Some(check);
+                break;
+            }
+        }
+        if let Some(check) = found {
             return arena
                 .alloc_str(check.name.as_str())
                 .map_err(|_| arena_full());
@@ -99176,18 +99275,20 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         {
             // The partition's constraint becomes its parent's
             // (`MergeConstraintsIntoExisting`).
-            existing.local = false;
-            if existing.expression != constraint.expression {
+            if matches!(mode, PartitionInheritance::Attach) {
+                ddl::merge_check_into_existing(constraint, existing, child.name.as_str(), arena)?;
+            } else if !ddl::same_check_expression(
+                existing.expression.as_str(),
+                constraint.expression.as_str(),
+                arena,
+            )? {
                 return Err(sql_err!(
-                    if matches!(mode, PartitionInheritance::Attach) {
-                        sqlstate::DATATYPE_MISMATCH
-                    } else {
-                        sqlstate::DUPLICATE_OBJECT
-                    },
+                    sqlstate::DUPLICATE_OBJECT,
                     "constraint \"{}\" conflicts with inherited constraint of the same name",
                     constraint.name.as_str()
                 ));
             }
+            existing.local = false;
             continue;
         }
         if matches!(mode, PartitionInheritance::Attach) {
@@ -99650,9 +99751,25 @@ fn alter_table_inheritance(
     let mut updated = TableDefBuilder::from_definition(&child_definition);
     if inherit {
         if child == parent || storage.relation_descends_from(parent, child, txn.txid) {
+            return sql_fail(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "circular inheritance not allowed"
+                ),
+                format_args!(
+                    "\"{}\" is already a child of \"{}\".",
+                    parent_name.name,
+                    updated.name.as_str()
+                ),
+            ));
+        }
+        // `CreateInheritance` rejects a parent the table already has before
+        // it merges any column or constraint.
+        if updated.inheritance.contains(parent) {
             return sql_fail(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "circular inheritance is not allowed"
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" would be inherited from more than once",
+                parent_definition.name.as_str()
             ));
         }
         for expected in parent_definition.columns() {
@@ -99763,17 +99880,22 @@ fn alter_table_inheritance(
         // A CHECK no remaining parent defines becomes the child's own.
         for position in 0..updated.n_checks {
             let check = updated.checks[position];
-            if !updated.inheritance.parents_ref().iter().any(|slot| {
-                storage
-                    .table_def(usize::from(*slot), txn.txid)
-                    .checks()
-                    .iter()
-                    .any(|parent| {
-                        !parent.no_inherit
-                            && parent.name == check.name
-                            && parent.expression == check.expression
-                    })
-            }) {
+            let mut inherited = false;
+            for slot in updated.inheritance.parents_ref() {
+                for parent in storage.table_def(usize::from(*slot), txn.txid).checks() {
+                    if !parent.no_inherit && parent.name == check.name {
+                        inherited |= match ddl::same_check_expression(
+                            parent.expression.as_str(),
+                            check.expression.as_str(),
+                            arena,
+                        ) {
+                            Ok(same) => same,
+                            Err(error) => return sql_fail(error),
+                        };
+                    }
+                }
+            }
+            if !inherited {
                 updated.checks[position].local = true;
             }
         }
@@ -103258,33 +103380,71 @@ fn alter_table_relation(
                         Err(error) => return sql_fail(error),
                     },
                 };
-                // An identical CHECK the table has merges with it
+                // A CHECK of the same name the table has merges with it
                 // (`MergeWithExistingConstraint`): a child's own or inherited
                 // one, or, added to the table itself, one it only inherits.
                 if let Some(position) = new_def.checks[..new_def.n_checks]
                     .iter()
                     .position(|check| check.name.as_str() == name)
                 {
-                    let existing = new_def.checks[position];
-                    if existing.expression.as_str() == stored
-                        && !existing.no_inherit
-                        && (propagated
-                            || (!existing.local && new_def.partition.attachment.is_none()))
-                    {
-                        responder.notice(
-                            sqlstate::SUCCESSFUL_COMPLETION,
-                            stack_format!(
-                                160,
-                                "merging constraint \"{}\" with inherited definition",
-                                name
-                            )
-                            .as_str(),
-                        )?;
-                        if !propagated {
-                            new_def.checks[position].local = true;
-                        }
-                        continue;
+                    let crate::sql::ast::TableConstraint::Check {
+                        expression,
+                        validation,
+                        no_inherit,
+                        ..
+                    } = *constraint
+                    else {
+                        unreachable!("matched a CHECK constraint");
+                    };
+                    // PostgreSQL analyses the predicate before it merges it.
+                    if let Err(error) = ddl::analyse_check_expression(
+                        storage, txn.txid, &new_def, expression, false, arena,
+                    ) {
+                        return sql_fail(error);
                     }
+                    let existing = new_def.checks[position];
+                    let partition = new_def.partition.attachment.is_some();
+                    if let Err(error) = ddl::merge_with_existing_check(
+                        &existing,
+                        crate::sql::catalog::check_inheritance_count(
+                            storage,
+                            txn.txid,
+                            table_index,
+                            &existing,
+                        ) > 0,
+                        new_def.name.as_str(),
+                        partition,
+                        ddl::CheckAddition {
+                            stored,
+                            validation,
+                            local: !propagated,
+                            no_inherit,
+                            allow_merge: propagated,
+                        },
+                        arena,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    responder.notice(
+                        sqlstate::SUCCESSFUL_COMPLETION,
+                        stack_format!(
+                            160,
+                            "merging constraint \"{}\" with inherited definition",
+                            name
+                        )
+                        .as_str(),
+                    )?;
+                    let merged = &mut new_def.checks[position];
+                    if partition {
+                        merged.local = false;
+                    } else if !propagated {
+                        merged.local = true;
+                    }
+                    merged.no_inherit |= no_inherit;
+                    if validation.enforced() && !merged.validation.enforced() {
+                        merged.validation = crate::storage::ConstraintValidation::EnforcedValidated;
+                    }
+                    continue;
                 }
                 let crate::sql::ast::TableConstraint::Check {
                     source_position,

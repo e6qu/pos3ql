@@ -15883,7 +15883,8 @@ fn inherited_foreign_key_parent(
 }
 
 /// PostgreSQL's `coninhcount` of `child`, a CHECK constraint of the table in
-/// `child_slot`: how many of its parents define it.
+/// `child_slot`: how many of its parents define an inheritable one of its
+/// name, which merging required to have the same predicate.
 pub(crate) fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
@@ -15896,11 +15897,7 @@ pub(crate) fn check_inheritance_count(
             .table_def(usize::from(attachment.parent), txid)
             .checks()
             .iter()
-            .any(|parent| {
-                !parent.no_inherit
-                    && parent.name == child.name
-                    && parent.expression == child.expression
-            })
+            .any(|parent| !parent.no_inherit && parent.name == child.name)
     }));
     partition_count
         + definition
@@ -15912,11 +15909,7 @@ pub(crate) fn check_inheritance_count(
                     .table_def(usize::from(**parent), txid)
                     .checks()
                     .iter()
-                    .any(|parent| {
-                        !parent.no_inherit
-                            && parent.name == child.name
-                            && parent.expression == child.expression
-                    })
+                    .any(|parent| !parent.no_inherit && parent.name == child.name)
             })
             .count()
 }

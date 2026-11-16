@@ -39050,8 +39050,7 @@ impl Storage {
             // distribution were allocated after `mark` and are dead here.
             unsafe { arena.rewind_to(mark) };
         }
-        for index in 0..index_count {
-            let kept = index_rows[index];
+        for (index, &kept) in index_rows.iter().enumerate() {
             if rows == 0 || kept == 0 {
                 continue;
             }

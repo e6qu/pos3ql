@@ -657,20 +657,45 @@ partial indexes whose predicate the conditions imply (`predicate_implied_by`
 for comparisons with constants, NULL tests, `IN` lists and their AND and
 OR), comparisons with constants, `IN` lists, `op ANY (array)`, NULL tests,
 boolean columns tested by themselves and their `OR`, and an `ORDER BY` of
-several columns. `EXPLAIN ANALYZE`
+several columns. Expression keys are variables of their own, as
+`examine_variable` matches them: ANALYZE gathers each index expression's
+statistics (`compute_index_stats`, over the rows a partial index keeps),
+`pg_stats` shows them under the index's name, and a condition or `ORDER BY`
+on the expression reads them and uses the index, its scan returning rows in
+the expression's order (`differential_exact/730`). A `LIKE` with a fixed
+ASCII prefix on a `text` or `varchar` column gives the prefix's range (or
+equality) as lossy index conditions under `C` or a pattern class, with
+`patternsel`'s selectivity, and a `varchar` column cast to `text` is the
+column (`731`). The scan's cost and width include its target list
+(`apply_scanjoin_target_to_paths`): each expression's type width and
+evaluation cost, and sort keys the select list lacks.
+`EXPLAIN ANALYZE`
 counts what the chosen scan reads: rows its index conditions (and a partial
 index's predicate) reach, `Rows Removed by Filter`, each bitmap index scan
 of a `BitmapAnd` or `BitmapOr`, a bitmap heap scan's `Heap Blocks` and an
 index-only scan's `Heap Fetches`, and each index scan's `Index Searches`. A
 table without index paths for the query keeps its sequential scan whatever
 its conditions. Remaining, which `EXPLAIN` rejects with `0A000` naming the
-shape whenever PostgreSQL could choose an index path: expression indexes
-(with ANALYZE's statistics of index expressions), other index access
-methods, conditions on expressions of indexed columns (`LIKE` prefixes,
-functions), extended statistics, partitioned tables and inheritance trees
-whose members have index paths (per-member paths and `Merge Append`), and,
-under `EXPLAIN ANALYZE`, `Index Searches` of an array or skip-array scan over
-several leaf pages. Grouping, `DISTINCT` and joins above the scan keep the
+shape whenever PostgreSQL could choose an index path: other index access
+methods, expression indexes over user-defined routines or types, `ILIKE`,
+regular expressions, `LIKE` with an escape or a non-ASCII prefix and other
+casts of indexed columns, extended statistics, partitioned tables and
+inheritance trees whose members have index paths (per-member paths,
+`Append` and `Merge Append` with run-time pruning, which execution must
+follow), and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
+skip-array scan over several leaf pages. Remaining inexact without
+`0A000`: a sequential scan's estimates when a condition reads an expression
+no index holds (PostgreSQL's defaults for an unanalyzed expression), btree
+sizes after out-of-order inserts (PostgreSQL's page splits, `nbtsplitloc`,
+grow an index past the `CREATE INDEX` layout the model computes, which also
+estimates a multi-column index's distinct keys as the product of its
+columns'), the heap placement of rows a large update moves (a pruned
+page's freed space), and the row order of an `UPDATE` or `DELETE` whose
+costs choose a sequential scan while its condition reaches an index: it
+takes row identity order, where PostgreSQL reads heap order, because a
+resumed attempt must select the rows in the order of the first, and its own
+changes have moved the rows' heap positions since (heap order needs each
+row's position as the statement began). Grouping, `DISTINCT` and joins above the scan keep the
 access model below. The heap and btree layouts PostgreSQL's costs read are
 emulated: rows packed in physical order, an index laid out as CREATE INDEX
 builds it, and a visibility map whose pages stay all-visible after VACUUM

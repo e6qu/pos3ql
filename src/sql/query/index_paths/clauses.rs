@@ -735,7 +735,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         if super::like::escapes(text) {
             return Ok(Ok(None));
         }
-        let text = &*self
+        let text = self
             .arena
             .alloc_str(text)
             .map_err(|_| crate::sql::eval::arena_full())?;
@@ -751,7 +751,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         let fixed = super::like::fixed_prefix(text);
         let (plain, pattern_class) = match fixed.prefix {
             Some(prefix) => {
-                let prefix = &*self
+                let prefix = self
                     .arena
                     .alloc_str(prefix)
                     .map_err(|_| crate::sql::eval::arena_full())?;

@@ -72093,13 +72093,22 @@ fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
          SELECT payload FROM indexed_documents WHERE active = true AND score = 30",
     ));
     assert!(resident.iter().any(|row| row == "alpha"));
-    // PostgreSQL's choice of an expression index, or of a partial index
-    // whose predicate tests a boolean column, is outside the modeled paths.
-    assert_explain_outside(
+    // A condition on an index's expression uses the index, as PostgreSQL's
+    // costs choose.
+    let expression = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "SELECT payload FROM indexed_documents WHERE lower(email) = 'alpha@example.com'",
-        "index",
+        "EXPLAIN (COSTS OFF) SELECT payload FROM indexed_documents
+             WHERE lower(email) = 'alpha@example.com'",
+    ));
+    assert_eq!(
+        expression,
+        [
+            "Bitmap Heap Scan on indexed_documents",
+            "  Recheck Cond: (lower(email) = 'alpha@example.com'::text)",
+            "  ->  Bitmap Index Scan on normalized_email_lookup",
+            "        Index Cond: (lower(email) = 'alpha@example.com'::text)",
+        ]
     );
     // The partial index whose predicate the conditions imply serves them,
     // as PostgreSQL's costs choose.
@@ -72149,11 +72158,18 @@ fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
             .any(|row| row.contains("Index Scan using normalized_email_lookup")),
         "{cold:?}"
     );
-    assert_explain_outside(
+    let ordered = data_rows(&run_with(
         &mut restarted,
         &mut restart_budget,
-        "SELECT id, lower(email) FROM indexed_documents ORDER BY lower(email) LIMIT 3",
-        "index",
+        "EXPLAIN (COSTS OFF) SELECT id, lower(email) FROM indexed_documents
+             ORDER BY lower(email) LIMIT 3",
+    ));
+    assert_eq!(
+        ordered,
+        [
+            "Limit",
+            "  ->  Index Scan using normalized_email_lookup on indexed_documents",
+        ]
     );
     assert!(cold.iter().any(|row| row == "1|alpha@example.com"));
     assert!(cold.iter().any(|row| row == "1"));
@@ -72185,6 +72201,30 @@ fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
     );
     assert!(changed.iter().any(|row| row == "1"));
     assert!(changed.iter().any(|row| row == "3"));
+
+    // ANALYZE keeps the index expression's statistics, keyed to the index,
+    // through a checkpoint and a cold start.
+    let analyzed = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "ANALYZE indexed_documents;
+         SELECT tablename, attname, n_distinct FROM pg_stats
+             WHERE tablename = 'normalized_email_lookup'",
+    ));
+    assert_eq!(analyzed, ["normalized_email_lookup|lower|-1"]);
+    restarted.commit_wal().unwrap();
+    assert!(restarted.checkpoint().unwrap());
+    drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut analyzed_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut restarted = Engine::new(&config, &mut analyzed_budget).unwrap();
+    let recovered = data_rows(&run_with(
+        &mut restarted,
+        &mut analyzed_budget,
+        "SELECT tablename, attname, n_distinct FROM pg_stats
+             WHERE tablename = 'normalized_email_lookup'",
+    ));
+    assert_eq!(recovered, ["normalized_email_lookup|lower|-1"]);
 
     drop(restarted);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

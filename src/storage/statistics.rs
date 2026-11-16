@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn shared_statistics_definition_admission_precedes_shape_changes_and_undo_preserves_analyze() {
         let mut config = super::super::tests::test_config();
-        config.statistics_bytes = 192;
+        config.statistics_bytes = 256;
         config.statistics_leases = 3;
         let mut budget = super::super::tests::test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -1872,7 +1872,7 @@ mod tests {
     #[test]
     fn shared_statistics_definition_depth_exhaustion_precedes_payload_reservation() {
         let mut config = super::super::tests::test_config();
-        config.statistics_bytes = 128;
+        config.statistics_bytes = 192;
         config.statistics_leases = 2;
         let mut budget = super::super::tests::test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();

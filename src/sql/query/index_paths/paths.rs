@@ -2212,10 +2212,12 @@ pub(crate) fn scan_path<'a>(
         // query without conditions.
         let unread_partial = catalog_index.partial
             && (catalog_index.method != IndexAccessMethod::Btree || !restrictions.is_empty());
-        // An expression key serves only a condition on an expression, which
-        // the model reads as no form of its own, or an ORDER BY expression.
-        let expression_served = (0..catalog_index.n_cols)
-            .any(|position| catalog_index.expression_keys[position] && !read_expression(position))
+        // An expression key serves a condition on an expression, which a
+        // condition the model has no form for may be, or an ORDER BY
+        // expression; one it reads also serves its variable's conditions.
+        let expression_served = catalog_index.expression_keys[..catalog_index.n_cols]
+            .iter()
+            .any(|&expression| expression)
             && (unmodeled.is_some() || order.contains(&OrderKey::Expression));
         // A GiST or SP-GiST index may order by a distance (`<->`).
         let orders_by_distance = matches!(

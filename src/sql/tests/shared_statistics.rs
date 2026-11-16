@@ -90,7 +90,7 @@ fn prepared_definition_statistics_resolve_cold_with_the_shared_pool_full() {
                 config.transaction_mode = mode;
                 // The committed image's records (two) and distributions,
                 // and the prepared image's one record and distribution.
-                config.statistics_bytes = 320;
+                config.statistics_bytes = 384;
                 config.statistics_leases = 4;
                 config.max_analyze_per_transaction = 1;
                 config.max_prepared_transactions = 1;

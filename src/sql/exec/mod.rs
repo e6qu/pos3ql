@@ -106368,11 +106368,7 @@ pub(super) fn collect_matches<'a>(
                 | crate::sql::query::index_paths::ScanKind::IndexOnly
         )
     });
-    // A sequential scan PostgreSQL's costs chose reads no index.
-    let chosen_seq =
-        chosen.is_some_and(|order| order.kind == crate::sql::query::index_paths::ScanKind::Seq);
     let indexed = if transition.is_none()
-        && !chosen_seq
         && def.kind != crate::storage::TableKind::Foreign
         && !storage.relation_has_descendants(table_index, txid)
     {
@@ -106390,26 +106386,30 @@ pub(super) fn collect_matches<'a>(
     } else {
         None
     };
-    // An index or bitmap scan reaches rows through their index entries,
-    // which keep an updated row's first position as its heap chain does in
-    // PostgreSQL: rows go in row identity order. A sequential scan
-    // PostgreSQL's costs chose reads them in heap order, as a SELECT does;
-    // a resumed attempt keeps the chosen scan, so its order. Without a
-    // chosen path a condition reaching an index takes row identity order.
-    let index_order = match chosen {
-        Some(order) => order.kind != crate::sql::query::index_paths::ScanKind::Seq,
-        None => {
-            indexed.is_some()
-                || (def.kind != crate::storage::TableKind::Foreign
-                    && super::query::dml_condition_reaches_index(
-                        storage,
-                        &def,
-                        alias,
-                        txid,
-                        where_clause,
-                    ))
-        }
-    };
+    // A condition an index can answer reaches rows through their index
+    // entries, which keep an updated row's first position as its heap chain
+    // does in PostgreSQL: rows go in row identity order. Otherwise the rows
+    // go in a sequential scan's physical order, as a SELECT reads them.
+    // A sequential scan keeps the selection order a resumed attempt
+    // reproduces: row identity order when the condition reaches an index,
+    // else physical order. (PostgreSQL's sequential scan reads heap order
+    // even then; a resumed attempt would need the heap positions the rows
+    // had when the statement began, which own changes move.)
+    let index_order =
+        match chosen.filter(|order| order.kind != crate::sql::query::index_paths::ScanKind::Seq) {
+            Some(_) => true,
+            None => {
+                indexed.is_some()
+                    || (def.kind != crate::storage::TableKind::Foreign
+                        && super::query::dml_condition_reaches_index(
+                            storage,
+                            &def,
+                            alias,
+                            txid,
+                            where_clause,
+                        ))
+            }
+        };
     // The write's scan of its target, as EXPLAIN ANALYZE counts it: each
     // visible row it matched or its filter removed, and each member's share
     // when the target is a partitioned table or inheritance tree.

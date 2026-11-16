@@ -129,6 +129,30 @@ struct Slot {
     /// `plpgsql.print_strict_params` values in effect when this backend first
     /// compiled it, as PostgreSQL's function cache does.
     compile_settings: Option<super::guc::PlpgsqlSettings>,
+    /// The body positions of a PL/pgSQL instance's expressions whose plan
+    /// PostgreSQL would keep: a later run of one reports its errors as
+    /// execution errors, never as planning errors.
+    planned_sites: PlannedSites,
+}
+
+/// One bit per byte position of a routine body.
+const PLANNED_SITE_WORDS: usize = crate::storage::ROUTINE_SQL_MAX.div_ceil(64);
+
+#[derive(Clone, Copy)]
+struct PlannedSites([u64; PLANNED_SITE_WORDS]);
+
+impl PlannedSites {
+    const NONE: Self = Self([0; PLANNED_SITE_WORDS]);
+
+    fn word(position: usize) -> Result<(usize, u64), SqlError> {
+        if position >= crate::storage::ROUTINE_SQL_MAX {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "PL/pgSQL expression position lies outside its routine body"
+            ));
+        }
+        Ok((position / 64, 1 << (position % 64)))
+    }
 }
 
 impl Slot {
@@ -139,6 +163,7 @@ impl Slot {
         self.invalidated = false;
         self.input_attempt = None;
         self.compile_settings = None;
+        self.planned_sites = PlannedSites::NONE;
     }
 }
 
@@ -166,6 +191,7 @@ impl RoutineInputPlans {
                     invalidated: false,
                     input_attempt: None,
                     compile_settings: None,
+                    planned_sites: PlannedSites::NONE,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -488,6 +514,7 @@ impl RoutineInputPlans {
             invalidated: false,
             input_attempt: None,
             compile_settings: None,
+            planned_sites: PlannedSites::NONE,
         };
         PlanId {
             slot: index,
@@ -903,6 +930,21 @@ impl RoutineInputPlans {
     ) -> Result<super::guc::PlpgsqlSettings, SqlError> {
         let slot = self.slot_mut(plan)?;
         Ok(*slot.compile_settings.get_or_insert(current))
+    }
+
+    /// Whether the PL/pgSQL instance `plan` kept the plan of its expression
+    /// at body `position`.
+    pub(crate) fn site_planned(&self, plan: PlanId, position: usize) -> Result<bool, SqlError> {
+        let (word, bit) = PlannedSites::word(position)?;
+        Ok(self.slot(plan)?.planned_sites.0[word] & bit != 0)
+    }
+
+    /// Records that the PL/pgSQL instance `plan` planned its expression at
+    /// body `position`.
+    pub(crate) fn plan_site(&mut self, plan: PlanId, position: usize) -> Result<(), SqlError> {
+        let (word, bit) = PlannedSites::word(position)?;
+        self.slot_mut(plan)?.planned_sites.0[word] |= bit;
+        Ok(())
     }
 
     fn slot(&self, id: PlanId) -> Result<&Slot, SqlError> {

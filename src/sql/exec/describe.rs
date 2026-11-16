@@ -2047,6 +2047,8 @@ pub(crate) enum FunctionLookupFailure {
     Ambiguous,
     /// `CALL` selected a function: `f(integer) is not a procedure`.
     NotProcedure,
+    /// A function call selected a procedure: `p(integer) is a procedure`.
+    IsProcedure,
 }
 
 pub(crate) fn function_lookup_error(
@@ -2102,8 +2104,47 @@ fn routine_lookup_error(
     let (state, noun) = match failure {
         FunctionLookupFailure::Missing => (sqlstate::UNDEFINED_FUNCTION, noun),
         FunctionLookupFailure::Ambiguous => (sqlstate::AMBIGUOUS_FUNCTION, noun),
-        FunctionLookupFailure::NotProcedure => (sqlstate::WRONG_OBJECT_TYPE, ""),
+        FunctionLookupFailure::NotProcedure | FunctionLookupFailure::IsProcedure => {
+            (sqlstate::WRONG_OBJECT_TYPE, "")
+        }
     };
+    // `ParseFuncOrColumn`'s hints for a `CALL`; a function call's come with
+    // its position from `expression_error`.
+    let hint = match (failure, noun) {
+        (FunctionLookupFailure::Missing, "procedure ") => Some(
+            "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+        ),
+        (FunctionLookupFailure::Ambiguous, "procedure ") => Some(
+            "Could not choose a best candidate procedure. You might need to add explicit type casts.",
+        ),
+        (FunctionLookupFailure::NotProcedure, _) => Some("To call a function, use SELECT."),
+        (FunctionLookupFailure::IsProcedure, _) => Some("To call a procedure, use CALL."),
+        _ => None,
+    };
+    let error = routine_signature_error(
+        state,
+        noun,
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    );
+    match hint {
+        Some(hint) => crate::sql::error_position::with_hint(error, hint),
+        None => error,
+    }
+}
+
+fn routine_signature_error(
+    state: &'static str,
+    noun: &str,
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
     crate::sql::error_position::full_message_error(state, |message| {
         let _ = write!(message, "{}{}(", noun, name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
@@ -2126,6 +2167,7 @@ fn routine_lookup_error(
             FunctionLookupFailure::Missing => ") does not exist",
             FunctionLookupFailure::Ambiguous => ") is not unique",
             FunctionLookupFailure::NotProcedure => ") is not a procedure",
+            FunctionLookupFailure::IsProcedure => ") is a procedure",
         });
         Ok(())
     })
@@ -3431,10 +3473,12 @@ fn selected_call(
             FunctionLookupFailure::Ambiguous,
             columns,
         )),
-        Some(crate::storage::RoutineCallSelection::WrongKind { .. }) => Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "{} is not a function",
-            name
+        Some(crate::storage::RoutineCallSelection::WrongKind { .. }) => Err(function_lookup_error(
+            name,
+            &arguments[..count],
+            argument_names,
+            FunctionLookupFailure::IsProcedure,
+            columns,
         )),
         _ => Ok(selection),
     }
@@ -3604,10 +3648,12 @@ pub(crate) fn resolved_set_call(
             FunctionLookupFailure::Ambiguous,
             columns,
         )),
-        crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "{} is not a function",
-            name
+        crate::storage::RoutineCallSelection::WrongKind { .. } => Err(function_lookup_error(
+            name,
+            &arguments[..args.len()],
+            argument_names,
+            FunctionLookupFailure::IsProcedure,
+            columns,
         )),
         crate::storage::RoutineCallSelection::Absent => {
             if bound_oid.is_some()

@@ -12895,10 +12895,28 @@ fn role_dependency_detail(
         let mut detail = crate::sql::eval::DiagnosticWriter::new();
         let mut reported = 0usize;
         let mut unreported = 0usize;
-        for dependency in super::catalog::shared_dependencies(storage, txid, arena)? {
-            if usize::from(dependency.role) != role || dependency.database.is_some() {
-                continue;
-            }
+        // `checkSharedDependencies` sorts this database's and shared objects
+        // by OID, catalog, unsigned sub-ID and dependency type; synthesized
+        // OIDs order as PostgreSQL's single counter would have issued them.
+        let all = super::catalog::shared_dependencies(storage, txid, arena)?;
+        let matches = |dependency: &&crate::sql::catalog::SharedDependency| {
+            usize::from(dependency.role) == role && dependency.database.is_none()
+        };
+        let mut found = all.iter().filter(matches);
+        let dependencies = arena
+            .alloc_slice_with(all.iter().filter(matches).count(), |_| {
+                *found.next().expect("counted role dependency")
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        dependencies.sort_unstable_by_key(|dependency| {
+            (
+                crate::storage::OidBand::creation_order(dependency.object),
+                dependency.class as u32,
+                dependency.sub as u32,
+                dependency.kind,
+            )
+        });
+        for dependency in dependencies.iter() {
             let Some(description) = super::eval::funcs::system::describe_object_text(
                 &catalog,
                 dependency.class,
@@ -22920,6 +22938,9 @@ enum TriggerStatement<'a> {
     Utility {
         source: &'a str,
         statement: &'a Stmt<'a>,
+        /// The tokens the parser copied from `source`, which position the
+        /// statement's analysis errors in it.
+        copies: &'a [crate::sql::error_position::SourceCopy],
     },
     /// `CALL`: output parameters are assigned to the argument variables.
     Call {
@@ -24028,7 +24049,6 @@ fn execute_plpgsql_dynamic_call<'a>(
                     context.responder,
                     Some(&mut outputs),
                     None,
-                    None,
                 )
             })
         })
@@ -24051,7 +24071,6 @@ struct PlpgsqlCallOutputs<'a> {
 /// this block may control transactions itself.
 fn execute_plpgsql_call<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    source: &str,
     statement: &'a Stmt<'a>,
     locals: &[TriggerLocalDecl],
     scope: &TriggerLocalScope<'_, 'a>,
@@ -24175,7 +24194,6 @@ fn execute_plpgsql_call<'a>(
             Some(&mut outputs),
             // A retained caller keeps the callee's waiting body with its own.
             retained.then_some(&mut *pending_call),
-            Some(source),
         )
     });
     routine_utility_outcome(outcome)?;
@@ -24228,20 +24246,23 @@ fn execute_atomic_procedure_call<'a>(
                 txid,
                 arena,
             };
-            return Err(procedure_lookup_error(
-                qualified.as_str(),
-                types,
-                argument_names,
-                match failure {
-                    crate::storage::RoutineCallSelection::Ambiguous => {
-                        FunctionLookupFailure::Ambiguous
-                    }
-                    crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                        FunctionLookupFailure::NotProcedure
-                    }
-                    _ => FunctionLookupFailure::Missing,
-                },
-                &columns,
+            return Err(crate::sql::error_position::at_subject(
+                procedure_lookup_error(
+                    qualified.as_str(),
+                    types,
+                    argument_names,
+                    match failure {
+                        crate::storage::RoutineCallSelection::Ambiguous => {
+                            FunctionLookupFailure::Ambiguous
+                        }
+                        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                            FunctionLookupFailure::NotProcedure
+                        }
+                        _ => FunctionLookupFailure::Missing,
+                    },
+                    &columns,
+                ),
+                name.schema.unwrap_or(name.name),
             ));
         }
     };
@@ -24828,12 +24849,13 @@ impl<'a> ProcedureOutputs<'a> {
                 Some(argument) if self.writable[argument] => {
                     self.assigned[argument] = Some(output);
                 }
+                // PL/pgSQL raises this itself, once SPI has planned the call.
                 _ => {
-                    return Err(sql_err!(
+                    return Err(crate::sql::error_context::raised_after_query(sql_err!(
                         sqlstate::SYNTAX_ERROR,
                         "procedure parameter \"{}\" is an output parameter but corresponding argument is not writable",
                         parameter.name.as_str()
-                    ));
+                    )));
                 }
             }
             output += 1;
@@ -28213,9 +28235,11 @@ fn parse_trigger_statement<'a>(
                 segment,
                 segment,
             )?;
+            let (statement, copies) = super::parser::parse_positioned_statement(segment, arena)?;
             return Ok(TriggerStatement::Utility {
                 source: segment,
-                statement: super::parser::parse_stored_statement(segment, arena)?,
+                statement,
+                copies,
             });
         }
     }
@@ -28376,10 +28400,13 @@ fn parse_trigger_block<'a>(
                 .next()
                 .filter(|word| !word.is_empty())
                 .unwrap_or(loop_header);
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "syntax error at or near \"{}\"",
-                word
+            return Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "syntax error at or near \"{}\"",
+                    word
+                ),
+                word,
             ));
         }
         if depth == targets.len() && (is_loop || (is_block && loop_label.is_some())) {
@@ -28513,9 +28540,12 @@ fn parse_trigger_block<'a>(
                     .is_some_and(|segment| strip_trigger_keyword(segment, "begin").is_none())
                 {
                     if segments[*at].starts_with("<<") {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "block label must be placed before DECLARE, not after"
+                        return Err(crate::sql::error_position::at_subject(
+                            sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "block label must be placed before DECLARE, not after"
+                            ),
+                            segments[*at],
                         ));
                     }
                     *at += 1;
@@ -28854,9 +28884,12 @@ fn parse_plpgsql_program_inner<'a>(
             };
             let declaration_source = declarations[..begin_at].trim();
             if declaration_source.starts_with("<<") {
-                return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "block label must be placed before DECLARE, not after"
+                return Err(crate::sql::error_position::at_subject(
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "block label must be placed before DECLARE, not after"
+                    ),
+                    declaration_source,
                 ));
             }
             let segments = split_trigger_statements(declaration_source, arena)?;
@@ -29924,10 +29957,13 @@ fn validate_plpgsql_variable_uses(
                             && binding_constant(statement.target, locals, shadowed, has_parameter)
                                 .is_none()
                         {
-                            return Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "syntax error at or near \"{}\"",
-                                keyword
+                            return Err(crate::sql::error_position::at_subject(
+                                sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "syntax error at or near \"{}\"",
+                                    keyword
+                                ),
+                                keyword,
                             ));
                         }
                         let local = ScopedLocal {
@@ -32858,35 +32894,112 @@ fn in_simple_expression<T>(
     mode: crate::sql::error_context::QueryMode,
     expression: &Expr<'_>,
     arena: &Arena,
+    plan: ExpressionPlan,
     run: impl FnOnce() -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
     let frame = crate::sql::error_context::QueryFrame::new(text, mode, true);
     crate::sql::error_context::with_frame(&frame, || {
         crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
-            // Names resolve while PostgreSQL analyzes the expression.
-            if record_reference_error(&error)
-                || matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                )
-            {
-                frame.planned();
-            } else if error.sqlstate.internal_control().is_none() {
-                let mark = arena.mark();
-                let folded = crate::sql::error_position::preserving_pending(|| {
-                    constant_fold_error(expression, arena)
-                });
-                // The probe's values are discarded with its scratch.
-                unsafe { arena.rewind_to(mark) };
-                if folded.is_some_and(|folded| {
-                    folded.sqlstate == error.sqlstate && folded.message == error.message
-                }) {
-                    frame.planned();
-                }
+            // A kept plan is not planned again: every error is raised
+            // running the expression.
+            if plan.kept {
+                return crate::sql::error_context::capture(error);
             }
-            crate::sql::error_context::capture(error)
+            let error = classify_planning(error, &frame, text, expression, arena);
+            plan.failed_planning.set(frame.is_planned());
+            error
         })
     })
+}
+
+/// Whether a PL/pgSQL instance kept the plan of the expression being run,
+/// and where to record that this run's error was raised planning it.
+#[derive(Clone, Copy)]
+struct ExpressionPlan<'p> {
+    kept: bool,
+    failed_planning: &'p core::cell::Cell<bool>,
+}
+
+/// Records the context of `error`, raised running the simple expression
+/// `text` for the first time, marking it as a planning error when
+/// PostgreSQL raises it analyzing or folding the expression.
+fn classify_planning(
+    error: SqlError,
+    frame: &crate::sql::error_context::QueryFrame<'_>,
+    text: &str,
+    expression: &Expr<'_>,
+    arena: &Arena,
+) -> SqlError {
+    // A parameter reference no parameter answers fails analysis at its `$n`.
+    if error.sqlstate == sqlstate::UNDEFINED_PARAMETER {
+        frame.planned();
+        let index = error
+            .message
+            .as_str()
+            .strip_prefix("there is no parameter $")
+            .and_then(|index| index.parse::<u32>().ok());
+        let mark = arena.mark();
+        let token = index.and_then(|index| parameter_token(text, index, arena));
+        // The lexer's copies are dead once the token is found; the token
+        // itself is a slice of `text`.
+        unsafe { arena.rewind_to(mark) };
+        let error = match token {
+            Some(token) => crate::sql::error_position::with_internal_source(text, || {
+                crate::sql::error_position::at_subject(error, token)
+            }),
+            None => error,
+        };
+        return crate::sql::error_context::capture(error);
+    }
+    // Names resolve while PostgreSQL analyzes the expression.
+    if record_reference_error(&error)
+        || matches!(
+            error.sqlstate.as_str(),
+            sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+        )
+    {
+        frame.planned();
+    } else if error.sqlstate.internal_control().is_none() {
+        let mark = arena.mark();
+        let folded = crate::sql::error_position::preserving_pending(|| {
+            constant_fold_error(expression, arena)
+        });
+        // The probe's values are discarded with its scratch.
+        unsafe { arena.rewind_to(mark) };
+        if folded.is_some_and(|folded| {
+            folded.sqlstate == error.sqlstate && folded.message == error.message
+        }) {
+            frame.planned();
+        }
+    }
+    crate::sql::error_context::capture(error)
+}
+
+/// The start of an assignment's target, where PostgreSQL positions an
+/// analysis error about the target as a whole.
+fn assignment_target_start(statement: &str) -> &str {
+    let written = statement.trim_start();
+    let end = written
+        .find(|character: char| {
+            !(super::lexer::is_identifier_continue(character) || character == '"')
+        })
+        .unwrap_or(written.len());
+    &written[..end]
+}
+
+/// The first `$index` token of `text`, where PostgreSQL's analysis reports a
+/// parameter reference no parameter answers.
+fn parameter_token<'t>(text: &'t str, index: u32, arena: &Arena) -> Option<&'t str> {
+    let mut lexer = super::lexer::Lexer::new(text, arena);
+    loop {
+        match lexer.next_token().ok()? {
+            super::lexer::Tok::Eof => return None,
+            super::lexer::Tok::Param(found) if found == index => {
+                return text.get(lexer.token_start()..lexer.token_end());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// An unassigned record's field or a missing field of a record variable,
@@ -33138,9 +33251,83 @@ fn eval_procedural_expression<'a>(
         });
     }
     let arena = context.arena;
-    in_simple_expression(text, mode, expression, arena, || {
+    let kept = expression_plan_kept(context, &row.invocation, expression)?;
+    let failed_planning = core::cell::Cell::new(false);
+    let plan = ExpressionPlan {
+        kept,
+        failed_planning: &failed_planning,
+    };
+    let result = in_simple_expression(text, mode, expression, arena, plan, || {
         eval_procedural_expression_in(context, expression, row, continuation)
-    })
+    });
+    // An assignment keeps its plan once the whole statement is planned.
+    if mode == QueryMode::Expression
+        && !failed_planning.get()
+        && result
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.sqlstate.internal_control().is_none())
+    {
+        keep_expression_plan(context, &row.invocation, expression)?;
+    }
+    result
+}
+
+/// The backend PL/pgSQL instance running `row`'s routine and the body
+/// position of `expression`, whose plan PostgreSQL keeps in that instance.
+/// An anonymous block is compiled for each run and keeps none.
+fn expression_plan_site(
+    invocation: &TriggerInvocation<'_>,
+    expression: &Expr<'_>,
+) -> Option<(super::type_input_plans::PlanId, usize)> {
+    let super::type_input_plans::Owner::Nested(plan) = invocation.input_owner else {
+        return None;
+    };
+    if !matches!(
+        invocation.input_origin,
+        super::plpgsql_inputs::Origin::Routine { .. }
+    ) {
+        return None;
+    }
+    invocation
+        .input_sites
+        .iter()
+        .find(|site| {
+            site.kind == super::plpgsql_inputs::Kind::Expression
+                && site.key == core::ptr::from_ref(expression) as usize
+        })
+        .map(|site| (plan, site.position))
+}
+
+/// Whether the routine instance already planned `expression`.
+fn expression_plan_kept(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: &TriggerInvocation<'_>,
+    expression: &Expr<'_>,
+) -> Result<bool, SqlError> {
+    match (expression_plan_site(invocation, expression), &context.host) {
+        (Some((plan, position)), PlpgsqlExecHost::Routine { sqlprep, .. }) => {
+            sqlprep.routine_inputs.site_planned(plan, position)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Records that the routine instance planned `expression`.
+fn keep_expression_plan(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    invocation: &TriggerInvocation<'_>,
+    expression: &Expr<'_>,
+) -> Result<(), SqlError> {
+    match (
+        expression_plan_site(invocation, expression),
+        &mut context.host,
+    ) {
+        (Some((plan, position)), PlpgsqlExecHost::Routine { sqlprep, .. }) => {
+            sqlprep.routine_inputs.plan_site(plan, position)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn eval_procedural_expression_in<'a>(
@@ -33355,6 +33542,8 @@ fn bind_plpgsql_dynamic_query<'a>(
         let validated =
             super::parser::parse_cursor_command(command, context.arena, &[], &[], |_| Ok(()))
                 .map(|_| ());
+        // The probe's parse, its copies included, is discarded.
+        crate::sql::error_position::set_internal_copies(command, &[]);
         unsafe { context.arena.rewind_to(mark) };
         validated?;
     }
@@ -33455,10 +33644,13 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     };
     fn reject_parameters(expression: &Expr<'_>) -> Result<(), SqlError> {
         if let Expr::Param(index) | Expr::RoutineParam { index, .. } = expression {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_PARAMETER,
-                "there is no parameter ${}",
-                index
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::UNDEFINED_PARAMETER,
+                    "there is no parameter ${}",
+                    index
+                ),
+                expression,
             ));
         }
         super::query::walk_children(expression, &mut reject_parameters)
@@ -38671,11 +38863,12 @@ fn materialize_trigger_for_dml<'a>(
         }
     };
     if !returns {
-        return Err(sql_err!(
+        // `SPI_cursor_open` checks the plan before it names the query.
+        return Err(crate::sql::error_context::raised_after_query(sql_err!(
             sqlstate::INVALID_CURSOR_DEFINITION,
             "cannot open {} query as cursor",
             command
-        ));
+        )));
     }
     with_bound_parameter_types(bound.parameter_types, || {
         for_dml_rows(
@@ -38957,6 +39150,9 @@ fn restore_plpgsql_statement<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(source, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser
+        .record_source_copies()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.set_type_inputs(inputs);
     let (statement, more) = super::parser::with_procedural_positionals(positionals, || {
         let statement = parser
@@ -38976,6 +39172,9 @@ fn restore_plpgsql_statement<'a>(
         ));
     }
     super::type_inputs::validate_restored(&parser, storage, txid)?;
+    // Analysis errors of the statement point into its text, as SPI reports
+    // them in the internal query.
+    crate::sql::error_position::set_internal_copies(source, parser.source_copies());
     arena
         .alloc(statement)
         .map(|statement| &*statement)
@@ -39119,6 +39318,8 @@ fn prepare_static_plpgsql_statement<'a>(
                 context.txn.txid,
                 context.arena,
             )?,
+            // The restored statement installs its own copies.
+            copies: &[],
         },
         TriggerStatement::Call { .. } => TriggerStatement::Call {
             source: site.text,
@@ -39768,185 +39969,255 @@ fn execute_trigger_step_in<'a>(
                 Ok(Some(TriggerFlow::Return(result)))
             }),
             TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
-                let assignment = match trigger_record_path_assignment(
-                    context, definition, locals, assignment,
-                )? {
-                    Some(assignment) => assignment,
-                    None => plpgsql_field_path_assignment(
-                        context,
-                        locals,
-                        &local_values[..locals.len()],
-                        assignment,
-                    )?,
-                };
-                if let Some(record) =
-                    trigger_record_field_target(locals, definition, assignment.name)
-                {
-                    assign_trigger_record_column(
-                        context,
-                        definition,
-                        records,
-                        locals,
-                        local_values,
-                        status.found,
-                        invocation,
-                        record,
-                        assignment,
-                        retained_parent.then_some(&mut status.pending_query),
-                    )?;
-                    return Ok(None);
-                }
-                let transition = records.transition(definition);
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let folded = assignment_folds_to_constant(
-                    assigned_value(assignment.expression),
-                    context.storage(),
-                    context.txn.txid,
-                );
-                let (expression, foldable) =
-                    plpgsql_element_assignment(context, assignment, locals, &scope)?;
-                let folded = folded && foldable;
-                let assignment = TriggerLocalAssignment {
-                    expression,
-                    ..assignment
-                };
-                if folded
-                    && let Some(statement) = crate::sql::error_context::innermost_assignment()
-                    && (locals.iter().any(|local| assignment.name.names(local))
-                        || assignment
-                            .name
-                            .record()
-                            .is_some_and(|record| locals.iter().any(|local| record.names(local))))
-                {
-                    // PostgreSQL folds a constant's conversion to the target's
-                    // (or a subscripted target's element) type while planning
-                    // the assignment, so the failure has the assignment's
-                    // context and points at a literal.
-                    // A subscripted target converts its element while the
-                    // expression runs; a plain one when the value is stored.
-                    let value = if core::ptr::eq(
-                        assigned_value(assignment.expression),
-                        assignment.expression,
-                    ) {
-                        eval_procedural_expression(
+                // PostgreSQL keeps an assignment's plan once it is planned;
+                // a later run raises every error running it.
+                let written = assignment.expression;
+                let kept = expression_plan_kept(context, &invocation, written)?;
+                let outcome = (|| {
+                    let assignment = match trigger_record_path_assignment(
+                        context, definition, locals, assignment,
+                    )? {
+                        Some(assignment) => assignment,
+                        None => plpgsql_field_path_assignment(
                             context,
-                            assignment.expression,
-                            &scope,
+                            locals,
+                            &local_values[..locals.len()],
+                            assignment,
+                        )?,
+                    };
+                    if let Some(record) =
+                        trigger_record_field_target(locals, definition, assignment.name)
+                    {
+                        assign_trigger_record_column(
+                            context,
+                            definition,
+                            records,
+                            locals,
+                            local_values,
+                            status.found,
+                            invocation,
+                            record,
+                            assignment,
                             retained_parent.then_some(&mut status.pending_query),
-                        )?
-                    } else {
-                        // The element's constant fails its conversion where it
-                        // is written.
-                        let literal = match assigned_value(assignment.expression) {
-                            Expr::Str(literal)
-                            | Expr::BoundLiteral {
-                                source: Expr::Str(literal),
-                                ..
-                            } => Some(*literal),
-                            _ => None,
+                        )?;
+                        return Ok(None);
+                    }
+                    let transition = records.transition(definition);
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let folded = assignment_folds_to_constant(
+                        assigned_value(assignment.expression),
+                        context.storage(),
+                        context.txn.txid,
+                    );
+                    let (expression, foldable) =
+                        plpgsql_element_assignment(context, assignment, locals, &scope)?;
+                    let folded = folded && foldable;
+                    let assignment = TriggerLocalAssignment {
+                        expression,
+                        ..assignment
+                    };
+                    if folded
+                        && let Some(statement) = crate::sql::error_context::innermost_assignment()
+                        && (locals.iter().any(|local| assignment.name.names(local))
+                            || assignment.name.record().is_some_and(|record| {
+                                locals.iter().any(|local| record.names(local))
+                            }))
+                    {
+                        // PostgreSQL folds a constant's conversion to the target's
+                        // (or a subscripted target's element) type while planning
+                        // the assignment, so the failure has the assignment's
+                        // context and points at a literal.
+                        // A subscripted target converts its element while the
+                        // expression runs; a plain one when the value is stored.
+                        let value = if core::ptr::eq(
+                            assigned_value(assignment.expression),
+                            assignment.expression,
+                        ) {
+                            eval_procedural_expression(
+                                context,
+                                assignment.expression,
+                                &scope,
+                                retained_parent.then_some(&mut status.pending_query),
+                            )?
+                        } else {
+                            // The element's constant fails its conversion where it
+                            // is written.
+                            let literal = match assigned_value(assignment.expression) {
+                                Expr::Str(literal)
+                                | Expr::BoundLiteral {
+                                    source: Expr::Str(literal),
+                                    ..
+                                } => Some(*literal),
+                                _ => None,
+                            };
+                            in_procedural_query(
+                                statement,
+                                crate::sql::error_context::QueryMode::Assignment,
+                                false,
+                                || {
+                                    eval_procedural_expression(
+                                        context,
+                                        assignment.expression,
+                                        &scope,
+                                        retained_parent.then_some(&mut status.pending_query),
+                                    )
+                                    .map_err(|error| {
+                                        match literal {
+                                            // Storing through the subscripts runs
+                                            // with the assignment, after planning.
+                                            _ if matches!(
+                                                error.sqlstate.as_str(),
+                                                sqlstate::ARRAY_SUBSCRIPT_ERROR
+                                                    | sqlstate::NULL_VALUE_NOT_ALLOWED
+                                            ) =>
+                                            {
+                                                crate::sql::error_context::raised_after_query(error)
+                                            }
+                                            // Analysis finds a target type without
+                                            // subscripting at the target.
+                                            _ if error.sqlstate == sqlstate::DATATYPE_MISMATCH
+                                                && error
+                                                    .message
+                                                    .as_str()
+                                                    .starts_with("cannot subscript type ") =>
+                                            {
+                                                crate::sql::error_position::at_subject(
+                                                    error,
+                                                    assignment_target_start(statement),
+                                                )
+                                            }
+                                            Some(literal)
+                                                if error.sqlstate.as_str().starts_with("22") =>
+                                            {
+                                                crate::sql::error_position::at_subject(
+                                                    error, literal,
+                                                )
+                                            }
+                                            _ => error,
+                                        }
+                                    })
+                                },
+                            )?
                         };
                         in_procedural_query(
                             statement,
                             crate::sql::error_context::QueryMode::Assignment,
                             false,
                             || {
-                                eval_procedural_expression(
+                                assign_trigger_local(
                                     context,
-                                    assignment.expression,
-                                    &scope,
-                                    retained_parent.then_some(&mut status.pending_query),
+                                    locals,
+                                    local_values,
+                                    assignment.name,
+                                    value,
                                 )
-                                .map_err(|error| match literal {
-                                    Some(literal) if error.sqlstate.as_str().starts_with("22") => {
-                                        crate::sql::error_position::at_subject(error, literal)
+                                .map_err(|error| {
+                                    // A kept plan resolves the target field
+                                    // only when the value is stored.
+                                    if kept && record_reference_error(&error) {
+                                        return crate::sql::error_context::raised_after_query(
+                                            error,
+                                        );
                                     }
-                                    _ => error,
+                                    // A row target converts a value that is not a
+                                    // row through `record_in`, which is stable, so
+                                    // the conversion runs after planning.
+                                    if !matches!(value, Datum::Record(_) | Datum::Composite { .. })
+                                        && !record_reference_error(&error)
+                                        && trigger_local_index(locals, assignment.name)
+                                            .is_ok_and(|index| plpgsql_local_is_row(&locals[index]))
+                                    {
+                                        return crate::sql::error_context::raised_after_query(
+                                            error,
+                                        );
+                                    }
+                                    // A literal's input fails where it is written; its
+                                    // value then fails a type modifier while planned.
+                                    match assignment.expression {
+                                        Expr::Str(literal)
+                                            if !local_fails_type_modifier_only(
+                                                context,
+                                                locals,
+                                                assignment.name,
+                                                value,
+                                            ) =>
+                                        {
+                                            crate::sql::error_position::at_subject(error, literal)
+                                        }
+                                        _ => error,
+                                    }
                                 })
                             },
-                        )?
-                    };
-                    in_procedural_query(
-                        statement,
-                        crate::sql::error_context::QueryMode::Assignment,
-                        false,
-                        || {
-                            assign_trigger_local(
-                                context,
-                                locals,
-                                local_values,
-                                assignment.name,
-                                value,
-                            )
-                            .map_err(|error| {
-                                // A literal's input fails where it is written; its
-                                // value then fails a type modifier while planned.
-                                match assignment.expression {
-                                    Expr::Str(literal)
-                                        if !local_fails_type_modifier_only(
-                                            context,
-                                            locals,
-                                            assignment.name,
-                                            value,
-                                        ) =>
-                                    {
-                                        crate::sql::error_position::at_subject(error, literal)
-                                    }
-                                    _ => error,
-                                }
-                            })
-                        },
-                    )?;
-                    return Ok(None);
-                }
-                let value = eval_procedural_expression(
-                    context,
-                    assignment.expression,
-                    &scope,
-                    retained_parent.then_some(&mut status.pending_query),
-                )?;
-                if locals.iter().any(|local| assignment.name.names(local)) {
-                    if let Datum::Record(fields) | Datum::Composite { fields, .. } = value
-                        && let Ok(index) = trigger_local_index(locals, assignment.name)
-                        && let Some(width) = declared_record_width(
-                            locals[index],
-                            context.storage(),
-                            context.txn.txid,
-                        )
-                    {
-                        check_multi_assignment(context.responder, width, fields.len())?;
+                        )?;
+                        return Ok(None);
                     }
-                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-                } else if assignment.name.label.is_none()
-                    && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
-                {
-                    status.found = match cast_to(value, ColType::Bool, context.arena)? {
-                        Datum::Bool(value) => Some(value),
-                        Datum::Null => None,
-                        _ => unreachable!("boolean cast preserves its datum kind"),
-                    };
-                } else if assignment.name.label.is_none()
-                    && definition.n_columns > 0
-                    && let Some(record) = TriggerRecordName::parse(assignment.name.name.as_str())
-                {
-                    assign_trigger_record(
+                    let value = eval_procedural_expression(
                         context,
-                        definition,
-                        records,
-                        record,
-                        value,
-                        RecordNullAssignment::DropStructure,
+                        assignment.expression,
+                        &scope,
+                        retained_parent.then_some(&mut status.pending_query),
                     )?;
-                } else {
-                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-                }
+                    if locals.iter().any(|local| assignment.name.names(local)) {
+                        if let Datum::Record(fields) | Datum::Composite { fields, .. } = value
+                            && let Ok(index) = trigger_local_index(locals, assignment.name)
+                            && let Some(width) = declared_record_width(
+                                locals[index],
+                                context.storage(),
+                                context.txn.txid,
+                            )
+                        {
+                            check_multi_assignment(context.responder, width, fields.len())?;
+                        }
+                        assign_trigger_local(
+                            context,
+                            locals,
+                            local_values,
+                            assignment.name,
+                            value,
+                        )?;
+                    } else if assignment.name.label.is_none()
+                        && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
+                    {
+                        status.found = match cast_to(value, ColType::Bool, context.arena)? {
+                            Datum::Bool(value) => Some(value),
+                            Datum::Null => None,
+                            _ => unreachable!("boolean cast preserves its datum kind"),
+                        };
+                    } else if assignment.name.label.is_none()
+                        && definition.n_columns > 0
+                        && let Some(record) =
+                            TriggerRecordName::parse(assignment.name.name.as_str())
+                    {
+                        assign_trigger_record(
+                            context,
+                            definition,
+                            records,
+                            record,
+                            value,
+                            RecordNullAssignment::DropStructure,
+                        )?;
+                    } else {
+                        assign_trigger_local(
+                            context,
+                            locals,
+                            local_values,
+                            assignment.name,
+                            value,
+                        )?;
+                    }
 
-                Ok(None)
+                    Ok(None)
+                })();
+                if outcome.is_ok() {
+                    keep_expression_plan(context, &invocation, written)?;
+                }
+                outcome
             }),
             TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
                 let changed = [CursorOutputSlot::Local(trigger_local_index(
@@ -40615,9 +40886,18 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
+                // PostgreSQL finds a target's record field only when it
+                // stores the row, after the query and its row checks.
                 let mut targets = [PlpgsqlIntoTarget::Local(0); MAX_COLUMNS];
+                let mut target_error = None;
                 for (index, target) in statement.targets.iter().enumerate() {
-                    targets[index] = plpgsql_into_target(locals, definition, *target)?;
+                    match plpgsql_into_target(locals, definition, *target) {
+                        Ok(target) => targets[index] = target,
+                        Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                            target_error.get_or_insert(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 let transition = records.transition(definition);
                 let scope = TriggerLocalScope {
@@ -40639,7 +40919,10 @@ fn execute_trigger_step_in<'a>(
                     )?,
                     None => query,
                 };
-                let record_target = statement.targets.len() == 1 && targets[0].takes_row(locals);
+                // A missing record field is a field target, never a row.
+                let record_target = target_error.is_none()
+                    && statement.targets.len() == 1
+                    && targets[0].takes_row(locals);
                 let arena = context.arena;
                 let mut fields = [("", 0, -1); MAX_PROJ];
                 let record_width = if record_target {
@@ -40786,6 +41069,9 @@ fn execute_trigger_step_in<'a>(
                         && let Some(level) = too_many_rows
                     {
                         check_too_many_rows(context, level, parameters)?;
+                    }
+                    if let Some(error) = target_error {
+                        return Err(error);
                     }
                     if row_count > 0 {
                         let target_width = if record_target {
@@ -41342,7 +41628,7 @@ fn execute_trigger_step_in<'a>(
                     Ok(None)
                 })
             }),
-            TriggerStatement::Call { source, statement } => execute_trigger_statement(|| {
+            TriggerStatement::Call { statement, .. } => execute_trigger_statement(|| {
                 let transition = records.transition(definition);
                 let scope = TriggerLocalScope {
                     locals,
@@ -41360,7 +41646,6 @@ fn execute_trigger_step_in<'a>(
                 );
                 let outputs = execute_plpgsql_call(
                     context,
-                    source,
                     statement,
                     locals,
                     &scope,
@@ -41381,7 +41666,14 @@ fn execute_trigger_step_in<'a>(
                 status.set_row_count(0)?;
                 Ok(None)
             }),
-            TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
+            TriggerStatement::Utility {
+                source,
+                statement,
+                copies,
+            } => execute_trigger_statement(|| {
+                if !copies.is_empty() {
+                    crate::sql::error_position::set_internal_copies(source, copies);
+                }
                 execute_bound_plpgsql_utility(
                     context,
                     BoundPlpgsqlCommand {
@@ -53014,16 +53306,23 @@ pub(crate) fn validate_routine_body(
                     txn.txid,
                     arena,
                 )?;
-                let program = super::query::parse_stored_routine_function_program(
-                    body_kind,
-                    body_text,
-                    arena,
-                    sql_result,
-                    routine.name.name,
-                    &arguments[..argument_count],
-                    body_inputs,
-                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
-                )?;
+                // `fmgr_sql_validator` names the function in the context of
+                // a body error that cannot point into the statement.
+                let validation = crate::sql::error_context::SqlFunctionValidationFrame {
+                    name: routine.name.name,
+                };
+                let program = crate::sql::error_context::within(&validation, || {
+                    super::query::parse_stored_routine_function_program(
+                        body_kind,
+                        body_text,
+                        arena,
+                        sql_result,
+                        routine.name.name,
+                        &arguments[..argument_count],
+                        body_inputs,
+                        |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
+                    )
+                })?;
                 // A SQL-standard body is part of the statement, so PostgreSQL
                 // analyses it at CREATE, positioning its errors, before it
                 // compares the final statement with the declared result.
@@ -53129,16 +53428,23 @@ pub(crate) fn validate_routine_body(
                     txn.txid,
                     arena,
                 )?;
-                let program = super::query::parse_stored_routine_function_program(
-                    body_kind,
-                    body_text,
-                    arena,
-                    sql_result,
-                    routine.name.name,
-                    &arguments[..argument_count],
-                    body_inputs,
-                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
-                )?;
+                // `fmgr_sql_validator` names the function in the context of
+                // a body error that cannot point into the statement.
+                let validation = crate::sql::error_context::SqlFunctionValidationFrame {
+                    name: routine.name.name,
+                };
+                let program = crate::sql::error_context::within(&validation, || {
+                    super::query::parse_stored_routine_function_program(
+                        body_kind,
+                        body_text,
+                        arena,
+                        sql_result,
+                        routine.name.name,
+                        &arguments[..argument_count],
+                        body_inputs,
+                        |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
+                    )
+                })?;
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
                     check_created_sql_routine_result(
                         routine.name.name,
@@ -53242,16 +53548,23 @@ pub(crate) fn validate_routine_body(
                     txn.txid,
                     arena,
                 )?;
-                let program = super::query::parse_stored_routine_function_program(
-                    body_kind,
-                    body_text,
-                    arena,
-                    sql_result,
-                    routine.name.name,
-                    &arguments[..argument_count],
-                    body_inputs,
-                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
-                )?;
+                // `fmgr_sql_validator` names the function in the context of
+                // a body error that cannot point into the statement.
+                let validation = crate::sql::error_context::SqlFunctionValidationFrame {
+                    name: routine.name.name,
+                };
+                let program = crate::sql::error_context::within(&validation, || {
+                    super::query::parse_stored_routine_function_program(
+                        body_kind,
+                        body_text,
+                        arena,
+                        sql_result,
+                        routine.name.name,
+                        &arguments[..argument_count],
+                        body_inputs,
+                        |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
+                    )
+                })?;
                 if let super::query::RoutineResultContract::Returns(declared) = sql_result {
                     check_created_sql_routine_result(
                         routine.name.name,

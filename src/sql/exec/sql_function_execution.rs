@@ -37,6 +37,9 @@ struct SqlSource {
     /// is a single plain `SELECT` of one expression into its caller, which
     /// then reports no context line for it.
     inlinable: bool,
+    /// Whether PostgreSQL's `inline_function` gets as far as checking the
+    /// body's result, which it reports `during inlining`.
+    inline_attempted: bool,
     /// PostgreSQL's planner runs an IMMUTABLE function called with constant
     /// arguments instead of inlining it.
     planned_with_constants: bool,
@@ -104,34 +107,63 @@ impl SqlSource {
         let name = arena
             .alloc_str(self.name.as_str())
             .map_err(|_| query::arena_full_pub())?;
-        let program = query::parse_stored_routine_function_program(
-            self.body_kind,
-            text,
-            arena,
-            self.result_contract(storage, transaction, arena)?,
+        // PostgreSQL parses the whole body `during startup`, then checks the
+        // final statement's result as it prepares that statement, or while
+        // the planner inlines a call of a plain expression body.
+        let startup = crate::sql::error_context::SqlFunctionFrame {
             name,
-            &self.parameters,
-            inputs,
-            |parser| match &self.stored {
-                Some(stored) => {
-                    query::validate_stored_type_inputs(parser, storage, transaction, stored.view())
-                }
-                None => type_inputs::validate_restored(parser, storage, transaction),
+            body: text,
+            statement: core::cell::Cell::new(0),
+            inlining: crate::sql::error_context::SqlFunctionInlining::Executed,
+        };
+        let program = crate::sql::error_context::within(&startup, || {
+            query::parse_stored_routine_function_program(
+                self.body_kind,
+                text,
+                arena,
+                self.result_contract(storage, transaction, arena)?,
+                name,
+                &self.parameters,
+                inputs,
+                |parser| match &self.stored {
+                    Some(stored) => query::validate_stored_type_inputs(
+                        parser,
+                        storage,
+                        transaction,
+                        stored.view(),
+                    ),
+                    None => type_inputs::validate_restored(parser, storage, transaction),
+                },
+            )
+        })?;
+        let checking = crate::sql::error_context::SqlFunctionFrame {
+            name,
+            body: text,
+            statement: core::cell::Cell::new(program.preceding.len() + 1),
+            inlining: if !self.planned_with_constants
+                && self.inline_attempted
+                && inlined_by_postgresql(&program)
+            {
+                crate::sql::error_context::SqlFunctionInlining::Inlining
+            } else {
+                crate::sql::error_context::SqlFunctionInlining::Executed
             },
-        )?;
-        super::check_called_sql_routine_result(
-            storage,
-            transaction,
-            &program,
-            self.kind,
-            &self.columns,
-            &self.parameters,
-            self.result_contract(storage, transaction, arena)?,
-            self.stored
-                .as_ref()
-                .map(|stored| (stored.path, stored.view())),
-            arena,
-        )?;
+        };
+        crate::sql::error_context::within(&checking, || {
+            super::check_called_sql_routine_result(
+                storage,
+                transaction,
+                &program,
+                self.kind,
+                &self.columns,
+                &self.parameters,
+                self.result_contract(storage, transaction, arena)?,
+                self.stored
+                    .as_ref()
+                    .map(|stored| (stored.path, stored.view())),
+                arena,
+            )
+        })?;
         Ok(ParsedSource {
             text,
             inputs,
@@ -311,14 +343,16 @@ impl SqlResult {
     }
 }
 
-/// Whether PostgreSQL's `inline_function` would replace a call of this body
-/// by its expression: one `SELECT` of one expression with no other clause,
-/// subquery or set-returning call.
 /// Whether PostgreSQL's planner may inline a call of `routine`, by its
 /// declaration alone.
 fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
+    inline_attempted(routine) && !routine.attributes.strict
+}
+
+/// Whether `inline_function` passes its declaration showstoppers and goes on
+/// to parse the body and check its result; strictness is weighed later.
+fn inline_attempted(routine: &crate::storage::RoutineDef) -> bool {
     !routine.attributes.security_definer
-        && !routine.attributes.strict
         && routine.config_count == 0
         && !routine.kind.is_set_returning()
         && routine.kind.function_result() != Some(ColType::Record)
@@ -361,6 +395,9 @@ fn choose_inlining(
     }
 }
 
+/// Whether PostgreSQL's `inline_function` would replace a call of this body
+/// by its expression: one `SELECT` of one expression with no other clause,
+/// subquery or set-returning call.
 fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
     let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
     else {
@@ -1216,6 +1253,7 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 input_source: body_inputs.source,
                 stored,
                 inlinable: inlinable_declaration(routine),
+                inline_attempted: inline_attempted(routine),
                 planned_with_constants: planned_with_constants(routine, constant_arguments),
                 catalog_reads: if routine.attributes.volatility
                     == crate::storage::RoutineVolatility::Volatile
@@ -1341,8 +1379,8 @@ fn check_polymorphic_result<'a>(
         body,
         // PostgreSQL 18 checks the final query as it prepares that statement.
         statement: core::cell::Cell::new(program.preceding.len() + 1),
-        inlining: if inlined && inlinable_declaration(routine) {
-            crate::sql::error_context::SqlFunctionInlining::Folded
+        inlining: if inlined && inline_attempted(routine) {
+            crate::sql::error_context::SqlFunctionInlining::Inlining
         } else {
             crate::sql::error_context::SqlFunctionInlining::Executed
         },

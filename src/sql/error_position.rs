@@ -13,6 +13,7 @@
 
 use core::cell::{Cell, RefCell};
 
+use crate::mem::arena::Arena;
 use crate::sql::eval::SqlError;
 
 /// A token the lexer copied into the arena (folded, unescaped or dequoted)
@@ -443,6 +444,8 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Collate { operand, .. }
         | Expr::InList { operand, .. }
         | Expr::Like { operand, .. } => expression_start(operand),
+        // A field selection starts with its row expression.
+        Expr::Field { base, .. } => expression_start(base),
         _ => None,
     }
 }
@@ -451,17 +454,6 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
 pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
     let position = expression_start(expression).map(|(at, source)| character_position(source, at));
     record(&error, position, None);
-    error
-}
-
-/// [`at_expression`] with PostgreSQL's hint.
-pub(crate) fn at_expression_with_hint(
-    error: SqlError,
-    expression: &crate::sql::ast::Expr<'_>,
-    hint: &'static str,
-) -> SqlError {
-    let position = expression_start(expression).map(|(at, source)| character_position(source, at));
-    record(&error, position, Some(hint));
     error
 }
 
@@ -602,6 +594,39 @@ pub(crate) fn at_subject(error: SqlError, subject: &str) -> SqlError {
 
 /// PostgreSQL's hint for a type without a default operator class.
 pub(crate) const DEFAULT_OPERATOR_CLASS_HINT: &str = "You must specify an operator class for the index or define a default operator class for the data type.";
+
+/// `op_error`'s hint for a binary operator no candidate matches.
+pub(crate) fn missing_binary_operator(error: SqlError) -> SqlError {
+    with_hint(error, BINARY_OPERATOR_HINT)
+}
+
+/// `ParseFuncOrColumn`'s hint for a function call no candidate matches.
+pub(crate) fn missing_function(error: SqlError) -> SqlError {
+    with_hint(error, FUNCTION_HINT)
+}
+
+/// `ParseFuncOrColumn`'s hint for a function call several candidates match.
+pub(crate) fn ambiguous_function(error: SqlError) -> SqlError {
+    with_hint(error, AMBIGUOUS_FUNCTION_HINT)
+}
+
+/// `op_error`'s hint for a binary operator several candidates match.
+pub(crate) fn ambiguous_operator(error: SqlError) -> SqlError {
+    with_hint(error, AMBIGUOUS_OPERATOR_HINT)
+}
+
+/// `get_sort_group_operators`' error for a sort key whose type has no
+/// default ordering operator.
+pub(crate) fn missing_ordering_operator(type_name: &dyn core::fmt::Display) -> SqlError {
+    with_hint(
+        crate::sql_err!(
+            crate::sql::eval::sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an ordering operator for type {}",
+            type_name
+        ),
+        "Use an explicit ordering operator or modify the query.",
+    )
+}
 
 /// Attaches PostgreSQL's `hint` to `error`.
 pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
@@ -776,6 +801,25 @@ pub(crate) fn expression_error(
                     annotated(error, None, FUNCTION_HINT)
                 }
             }
+        }
+        // NULLIF's equality operator is resolved at the call.
+        Expr::Call {
+            name: "nullif",
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            source_position,
+            ..
+        } if (state == sqlstate::UNDEFINED_FUNCTION
+            && message.starts_with("operator does not exist: "))
+            || (state == sqlstate::AMBIGUOUS_FUNCTION
+                && message.starts_with("operator is not unique: ")) =>
+        {
+            at_parsed_offset(error, source_position.get())
+        }
+        // A function call that selected a procedure.
+        Expr::Call {
+            source_position, ..
+        } if state == sqlstate::WRONG_OBJECT_TYPE && message.ends_with(") is a procedure") => {
+            at_parsed_offset(error, source_position.get())
         }
         Expr::Call {
             name,
@@ -1034,6 +1078,65 @@ pub(crate) fn set_internal_source(text: &str) {
             source.set(current);
         }
     });
+}
+
+/// Installs `copies`, the parser's record of tokens copied from `text`, for
+/// the internal query `text` while it is the installed source, so its
+/// folded names and constants can be positioned. The copies live in the
+/// arena with the statement parsed from `text`, which runs inside the
+/// internal source's scope.
+pub(crate) fn set_internal_copies(text: &str, copies: &[SourceCopy]) {
+    SOURCE.with(|source| {
+        let mut current = source.get();
+        if current.internal && current.text == text.as_ptr() && current.len == text.len() {
+            current.copies = copies.as_ptr();
+            current.copies_len = copies.len();
+            current.copies_base = 0;
+            source.set(current);
+        }
+    });
+}
+
+/// [`set_internal_copies`] for `text` parsed from its own copy of the
+/// installed internal query (a cursor keeps its query in its own arena):
+/// the whole copy is recorded as written at the query's start, ahead of the
+/// parser's copies, all in `arena`, which outlives the query's run.
+pub(crate) fn set_copied_internal_copies(
+    text: &str,
+    copies: &[SourceCopy],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let installed = SOURCE.with(Cell::get);
+    if !installed.internal || installed.text.is_null() {
+        return Ok(());
+    }
+    if installed.text == text.as_ptr() && installed.len == text.len() {
+        set_internal_copies(text, copies);
+        return Ok(());
+    }
+    // The installed text outlives its scope's statements.
+    let installed_text = unsafe { core::slice::from_raw_parts(installed.text, installed.len) };
+    if installed_text != text.as_bytes() {
+        return Ok(());
+    }
+    let whole = SourceCopy {
+        address: text.as_ptr() as usize,
+        len: text.len(),
+        at: 0,
+    };
+    let recorded = arena
+        .alloc_slice_with(copies.len() + 1, |index| {
+            if index == 0 { whole } else { copies[index - 1] }
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    SOURCE.with(|source| {
+        let mut current = source.get();
+        current.copies = recorded.as_ptr();
+        current.copies_len = recorded.len();
+        current.copies_base = 0;
+        source.set(current);
+    });
+    Ok(())
 }
 
 /// The position and hint recorded for the error being reported, if it is

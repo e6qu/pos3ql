@@ -1,23 +1,6 @@
 # Exact-error fixtures whose DETAIL, HINT, QUERY or CONTEXT still differ from
 # PostgreSQL 18.6, and the fields the exact phase leaves out for them until
 # PLAN.md's diagnostics item is done. Columns: fixture, fields, difference.
-101_shared_dependencies	detail	dependency lists follow pos3ql's catalog order, not pg_shdepend's
-116_plpgsql_row_variables	context	an extra PL/pgSQL assignment line
 162_insert_source_calls	detail	a unique index built over duplicates names another duplicate key
-172_pseudo_type_identities	context	no invalid type name line for a pseudo-type
-202_pseudo_type_values	context	an extra PL/pgSQL expression line
-208_cstring_keys_and_arrays	hint	ordering and equality operator resolution lacks its HINT
-213_plpgsql_into_new_fields	context	no SQL statement line
-231_array_element_assignment	context,query	an extra PL/pgSQL assignment line and a missing QUERY
-233_plpgsql_row_variable_fields	context	an extra PL/pgSQL assignment line
-271_cross_type_foreign_keys	context	no foreign-key query line
-287_sql_function_result_checks	context	no SQL function during inlining line
 30_constraint_declaration_errors	detail	no catalog unique violation DETAIL, whose OIDs differ
-38_cursor_query_ownership	context,detail,hint,query	cursor queries lack their QUERY, CONTEXT and some DETAIL and HINT
-400_plpgsql_aliases_and_positionals	query	no QUERY for a positional parameter
-402_common_types_and_positions	context,query	no SQL statement line or QUERY for a rule
-60_qualified_routine_calls	hint	a schema-qualified column lacks the table alias HINT
-66_routine_bodies_and_definitions	context	no SQL function line
-68_routine_calls_and_results	context,hint,query	CALL lacks its SQL statement line, QUERY and a HINT
-96_for_over_data_changes	context	no SQL statement line
-98_plpgsql_block_labels	context	an extra compilation line
+38_cursor_query_ownership	context,query	a static OPEN query's unresolved record field lacks its QUERY

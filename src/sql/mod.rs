@@ -15592,12 +15592,8 @@ impl Engine {
                 variadic,
                 ..
             } => {
-                let qualified = match name.schema {
-                    Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
-                    None => stack_format!(260, "{}", name.name),
-                };
                 let (slot, _) = match self.select_call_procedure(
-                    qualified.as_str(),
+                    *name,
                     argument_names,
                     arguments,
                     *variadic,
@@ -21786,9 +21782,11 @@ impl Engine {
         }
     }
 
+    /// Selects the procedure a `CALL` names; a failure is positioned at the
+    /// name, as `ParseFuncOrColumn` reports it.
     fn select_call_procedure(
         &self,
-        qualified: &str,
+        name: ast::QualName<'_>,
         argument_names: &[Option<&str>],
         arguments: &[&Expr<'_>],
         variadic: bool,
@@ -21805,6 +21803,11 @@ impl Engine {
         for (output, argument) in types.iter_mut().zip(arguments) {
             *output = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;
         }
+        let qualified = match name.schema {
+            Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+            None => stack_format!(260, "{}", name.name),
+        };
+        let qualified = qualified.as_str();
         match self.storage.select_routine_call(
             qualified,
             argument_names,
@@ -21826,20 +21829,23 @@ impl Engine {
                     txid,
                     arena,
                 };
-                Err(exec::procedure_lookup_error(
-                    qualified,
-                    &types[..arguments.len()],
-                    argument_names,
-                    match failure {
-                        crate::storage::RoutineCallSelection::Ambiguous => {
-                            exec::FunctionLookupFailure::Ambiguous
-                        }
-                        crate::storage::RoutineCallSelection::WrongKind { .. } => {
-                            exec::FunctionLookupFailure::NotProcedure
-                        }
-                        _ => exec::FunctionLookupFailure::Missing,
-                    },
-                    &columns,
+                Err(error_position::at_subject(
+                    exec::procedure_lookup_error(
+                        qualified,
+                        &types[..arguments.len()],
+                        argument_names,
+                        match failure {
+                            crate::storage::RoutineCallSelection::Ambiguous => {
+                                exec::FunctionLookupFailure::Ambiguous
+                            }
+                            crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                                exec::FunctionLookupFailure::NotProcedure
+                            }
+                            _ => exec::FunctionLookupFailure::Missing,
+                        },
+                        &columns,
+                    ),
+                    name.schema.unwrap_or(name.name),
                 ))
             }
             crate::storage::RoutineCallSelection::Builtin { .. } => Err(sql_err!(
@@ -21869,7 +21875,6 @@ impl Engine {
         responder: &mut Responder,
         mut capture: Option<&mut exec::ProcedureOutputs<'a>>,
         mut retention: Option<&mut Option<exec::SuspendedProcedure>>,
-        caller_statement: Option<&str>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // A saved body resumes in place of a new call: its settings, timer and
         // statistics entry already belong to the first attempt.
@@ -21891,12 +21896,8 @@ impl Engine {
                     "cannot use subquery in CALL argument"
                 )));
             }
-            let qualified = match name.schema {
-                Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
-                None => stack_format!(260, "{}", name.name),
-            };
             let (slot, type_oids) = match self.select_call_procedure(
-                qualified.as_str(),
+                name,
                 argument_names,
                 arguments,
                 variadic,
@@ -22147,11 +22148,23 @@ impl Engine {
                 };
                 type_input_plans::with_owner(body_inputs.owner, || {
                     type_inputs::with_source(body_inputs.source, body, body_inputs.bindings, || {
+                        // Errors name the statement PostgreSQL is preparing
+                        // or running, `SQL function "p" statement N`, or
+                        // `during startup` while it parses the body.
+                        let frame = error_context::SqlFunctionFrame {
+                            name: routine_name,
+                            body,
+                            statement: core::cell::Cell::new(0),
+                            inlining: error_context::SqlFunctionInlining::Executed,
+                        };
+                        let in_frame = |error: SqlError| {
+                            error_context::with_frame(&frame, || error_context::capture(error))
+                        };
                         let mut parser = match Parser::new(body, arena).and_then(|parser| {
                             parser.with_routine_parameters(routine_name, routine.arguments())
                         }) {
                             Ok(parser) => parser,
-                            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+                            Err(error) => return Ok(Err(in_frame(parse_error_to_sql(&error)))),
                         };
                         parser.set_type_inputs(body_inputs.bindings);
                         let statements = match arena
@@ -22166,7 +22179,7 @@ impl Engine {
                                 Ok(Some(statement)) => statement,
                                 Ok(None) => break,
                                 Err(error) => {
-                                    return Ok(Err(parse_error_to_sql(&error)));
+                                    return Ok(Err(in_frame(parse_error_to_sql(&error))));
                                 }
                             };
                             debug_assert!(statement_count < statements.len());
@@ -22207,10 +22220,13 @@ impl Engine {
                                         || query::statement_returns_rows(statement)
                                 })
                         {
-                            return Ok(Err(query::routine_result_mismatch(
+                            // An empty body fails parsing it, any other
+                            // preparing its final statement.
+                            frame.statement.set(statement_count);
+                            return Ok(Err(in_frame(query::routine_result_mismatch(
                                 "record",
                                 query::ROUTINE_RESULT_STATEMENT_DETAIL,
-                            )));
+                            ))));
                         }
                         let mut output_values =
                             [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -22240,14 +22256,6 @@ impl Engine {
                             output_rows = 1;
                             Ok(())
                         };
-                        // Errors name the running statement, as PostgreSQL's
-                        // `SQL function "p" statement N` context does.
-                        let frame = error_context::SqlFunctionFrame {
-                            name: routine_name,
-                            body,
-                            statement: core::cell::Cell::new(0),
-                            inlining: error_context::SqlFunctionInlining::Executed,
-                        };
                         for (index, statement) in statements[..statement_count]
                             .iter()
                             .map(|statement| {
@@ -22257,7 +22265,9 @@ impl Engine {
                         {
                             frame.statement.set(index + 1);
                             if let Some(name) = query::routine_statement_forbidden(statement) {
-                                return Ok(Err(query::routine_forbidden_statement_error(name)));
+                                return Ok(Err(in_frame(
+                                    query::routine_forbidden_statement_error(name),
+                                )));
                             }
                             let statement = match query::bind_stored_routine_statement(
                                 statement,
@@ -22405,22 +22415,7 @@ impl Engine {
                     })
                 })
             };
-            // A static PL/pgSQL `CALL` runs its procedure as an SQL statement
-            // of the calling block, which names it in the body's error context.
-            let executed = match caller_statement {
-                Some(text) => {
-                    let frame = error_context::QueryFrame::new(
-                        text,
-                        error_context::QueryMode::Statement,
-                        false,
-                    );
-                    error_context::with_frame(&frame, || match run() {
-                        Ok(Err(error)) => Ok(Err(error_context::capture(error))),
-                        other => other,
-                    })
-                }
-                None => run(),
-            };
+            let executed = run();
             if let Some((total, own)) = timed.and_then(statistics::FunctionTiming::finish)
                 && matches!(executed, Ok(Ok(())))
                 && let Err(error) = statistics::record_completed_call(
@@ -24144,7 +24139,6 @@ impl Engine {
                     responder,
                     None,
                     reset_workspace.then_some(&mut saved),
-                    None,
                 );
                 txn.pending_procedure = saved;
                 outcome

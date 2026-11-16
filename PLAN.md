@@ -1077,17 +1077,16 @@ a SQL cursor or a PL/pgSQL `FOR` loop over a query runs the query to
 completion before the first row is returned, so both fetch every remote
 batch where PostgreSQL fetches only what the reads need. The exact-error
 fixtures compare every DETAIL, HINT, QUERY and CONTEXT line, except the
-fields `tests/external/exact-diagnostics-gaps.tsv` names for 20 fixtures that
-still differ: PL/pgSQL assignments and expressions add a `PL/pgSQL
-assignment "..."` or `PL/pgSQL expression "..."` CONTEXT line PostgreSQL
-leaves out; procedural `SQL statement "..."` lines, inlined SQL functions'
-`SQL function "f" during inlining` lines, foreign-key queries' CONTEXT and
-some internal QUERY fields are missing; `ORDER BY` and `NULLIF` over a type
-without an ordering or equality operator and a schema-qualified hidden table
-lack PostgreSQL's HINT; role dependency DETAILs list objects in pos3ql's
-catalog order, not `pg_shdepend`'s; a unique index built over duplicates
-names a different duplicate key; and a catalog unique violation has no
-DETAIL. COPY FROM into a foreign table queues its rows
+fields `tests/external/exact-diagnostics-gaps.tsv` names for 3 fixtures that
+still differ: a unique index built over duplicates names the first duplicate
+pos3ql's row scan meets, where PostgreSQL names the first pair its tuplesort
+(quicksort in memory, merged runs beyond `maintenance_work_mem`) compares
+equal; a CREATE TABLE whose NOT NULL constraint repeats a CHECK constraint's
+name has no DETAIL, because the DETAIL's key names the new table's OID,
+which pos3ql assigns only after it names the constraints; and a PL/pgSQL
+`OPEN` of a static query selecting a field of an anonymous record value
+reports `could not identify column` without the query as its QUERY.
+COPY FROM into a foreign table queues its rows
 until PostgreSQL's buffering window flushes (1000 rows, 64 KB of input, a
 partition that cannot batch, the end of the data) and sends them in
 `batch_size` remote INSERTs; the queue is reserved per connection at startup

@@ -59,6 +59,21 @@ pub(crate) trait Frame {
     fn omitted_when_positioned(&self) -> bool {
         false
     }
+
+    /// Blames the error about to be raised on the routine body's statement
+    /// `index` (one-based), as PostgreSQL's `error_query_index` does.
+    fn blame_statement(&self, _index: usize) {}
+
+    /// Whether this frame is a SQL function body's validation at CREATE.
+    fn is_body_validation(&self) -> bool {
+        false
+    }
+
+    /// Whether this frame is a query a procedural statement runs, which
+    /// PostgreSQL's SPI names only while it parses, plans and executes it.
+    fn is_statement_query(&self) -> bool {
+        false
+    }
 }
 
 /// A dynamic query (`EXECUTE`) whose text is known once its string has been
@@ -95,6 +110,10 @@ impl Frame for DynamicQueryFrame {
 
     fn begin_dynamic(&self, text: *const str) -> bool {
         self.text.set(Some(text));
+        true
+    }
+
+    fn is_statement_query(&self) -> bool {
         true
     }
 }
@@ -148,6 +167,11 @@ impl<'a> QueryFrame<'a> {
     pub(crate) fn planned(&self) {
         self.planned.set(true);
     }
+
+    /// Whether the error being recorded was raised while planning.
+    pub(crate) fn is_planned(&self) -> bool {
+        self.planned.get()
+    }
 }
 
 impl Frame for QueryFrame<'_> {
@@ -165,6 +189,10 @@ impl Frame for QueryFrame<'_> {
             QueryMode::Assignment => "PL/pgSQL assignment",
         };
         write!(out, "{what} \"{}\"", self.text)
+    }
+
+    fn is_statement_query(&self) -> bool {
+        true
     }
 }
 
@@ -185,12 +213,17 @@ pub(crate) enum SqlFunctionInlining {
     Executed,
     /// The body is inlined into its caller's query: the call has no frame.
     Inlined,
-    /// The body is inlined with constant arguments and folded while it is
-    /// inlined: `SQL function "f" during inlining`.
-    Folded,
+    /// The planner is inlining the body: checking its result, or folding
+    /// its expression with constant arguments: `SQL function "f" during
+    /// inlining`.
+    Inlining,
 }
 
 impl Frame for SqlFunctionFrame<'_> {
+    fn blame_statement(&self, index: usize) {
+        self.statement.set(index);
+    }
+
     fn query(&self) -> Option<&str> {
         (self.inlining != SqlFunctionInlining::Inlined).then_some(self.body)
     }
@@ -198,7 +231,7 @@ impl Frame for SqlFunctionFrame<'_> {
     fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
         match (self.inlining, self.statement.get()) {
             (SqlFunctionInlining::Inlined, _) => Ok(()),
-            (SqlFunctionInlining::Folded, _) => {
+            (SqlFunctionInlining::Inlining, _) => {
                 write!(out, "SQL function \"{}\" during inlining", self.name)
             }
             (SqlFunctionInlining::Executed, 0) => {
@@ -220,6 +253,10 @@ pub(crate) struct SqlFunctionValidationFrame<'a> {
 }
 
 impl Frame for SqlFunctionValidationFrame<'_> {
+    fn is_body_validation(&self) -> bool {
+        true
+    }
+
     fn write_line(&self, out: &mut dyn Write, positioned: bool) -> fmt::Result {
         if positioned {
             return Ok(());
@@ -550,12 +587,63 @@ pub(crate) fn within<T>(
     with_frame(frame, || run().map_err(capture))
 }
 
-/// Runs `run` outside the innermost frame, a query whose statement goes on
-/// after the query ends, recording the context of an error it returns.
+/// Records the context of `error`, which `CREATE FUNCTION` raises
+/// transforming a SQL-standard body before `fmgr_sql_validator` runs: the
+/// innermost frame, that validation, adds no line.
+pub(crate) fn raised_before_validation(error: SqlError) -> SqlError {
+    let head = HEAD.with(Cell::get);
+    // Linked nodes and frames outlive their links.
+    if head.is_null() || !unsafe { &*(*head).frame }.is_body_validation() {
+        return error;
+    }
+    struct Relink(*const Node);
+    impl Drop for Relink {
+        fn drop(&mut self) {
+            HEAD.with(|current| current.set(self.0));
+        }
+    }
+    HEAD.with(|current| current.set(unsafe { (*head).previous }));
+    let _relink = Relink(head);
+    capture_outer(error)
+}
+
+/// [`capture`] by the frames outside the one an error is raised past. With
+/// none left, the error is recorded as having no context, so the frame it
+/// then leaves through adds none.
+fn capture_outer(error: SqlError) -> SqlError {
+    if !HEAD.with(Cell::get).is_null() {
+        return capture(error);
+    }
+    if error.sqlstate.internal_control().is_some() || probing() {
+        return error;
+    }
+    let error_key = key(&error);
+    SNAPSHOT.with(|snapshot| {
+        let mut snapshot = snapshot.borrow_mut();
+        // A context recorded by frames inside, or a line the error was
+        // raised with, stays.
+        if same_key(snapshot.key, error_key) {
+            snapshot.frames_pending = false;
+            return;
+        }
+        snapshot.context.clear();
+        snapshot.query.clear();
+        snapshot.position = None;
+        snapshot.frames_pending = false;
+        snapshot.key = Some(error_key);
+    });
+    error
+}
+
+/// Runs `run` outside the innermost frame when that frame is a statement's
+/// query, as the statement goes on after its query ends (storing `INTO`
+/// targets, checking a cursor's plan), recording the context of an error it
+/// returns.
 pub(crate) fn outside_query<T>(run: impl FnOnce() -> Result<T, SqlError>) -> Result<T, SqlError> {
     let head = HEAD.with(Cell::get);
-    if head.is_null() {
-        return run();
+    // Linked nodes and frames outlive their links.
+    if head.is_null() || !unsafe { &*(*head).frame }.is_statement_query() {
+        return run().map_err(capture);
     }
     struct Relink(*const Node);
     impl Drop for Relink {
@@ -566,7 +654,17 @@ pub(crate) fn outside_query<T>(run: impl FnOnce() -> Result<T, SqlError>) -> Res
     // The innermost node stays linked to its frame until `Relink` restores it.
     HEAD.with(|current| current.set(unsafe { (*head).previous }));
     let _relink = Relink(head);
-    run().map_err(capture)
+    run().map_err(capture_outer)
+}
+
+/// Records the context of `error`, which a procedural statement raises
+/// itself after its query was prepared: PostgreSQL's SPI no longer names the
+/// query.
+pub(crate) fn raised_after_query(error: SqlError) -> SqlError {
+    match outside_query(|| Err::<core::convert::Infallible, _>(error)) {
+        Ok(never) => match never {},
+        Err(error) => error,
+    }
 }
 
 struct Snapshot {
@@ -869,6 +967,16 @@ pub(crate) fn strict_parameters_statement<'s>() -> Option<&'s str> {
         node = unsafe { (*node).previous };
     }
     None
+}
+
+/// Blames the error about to be raised on statement `index` of the SQL
+/// function body the innermost frame runs, if it runs one.
+pub(crate) fn blame_statement(index: usize) {
+    let node = HEAD.with(Cell::get);
+    if !node.is_null() {
+        // Linked nodes and frames outlive their links.
+        unsafe { &*(*node).frame }.blame_statement(index);
+    }
 }
 
 /// Whether any frame is active, so a notice has a context.

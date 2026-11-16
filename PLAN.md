@@ -902,7 +902,10 @@ built-in function calls in the conditions are planned as PostgreSQL plans
 them (`differential_exact/740`). Other joined writes (several FROM items, a
 derived table, a FROM table with column aliases, relations without
 statistics, which PostgreSQL may merge-join, a nested loop on an equality)
-keep the row-by-row executor: they
+keep the row-by-row executor, whose EXPLAIN shows pos3ql's own costs and
+omits the `Hash Cond` (the planned join's deparser names a FROM table's
+columns from its table definition, so column aliases need it to read the
+aliased names): they
 hash their first FROM table when it is joined to the target by equality,
 as a `SELECT` of the two tables would, and join later FROM items to it in
 nested loops; PostgreSQL may instead hash the joined FROM items. A statement

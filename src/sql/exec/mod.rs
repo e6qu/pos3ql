@@ -108486,7 +108486,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             &source_def,
             Some(plan.source_name),
             &values[..source_def.n_columns],
-            plan.conditions.source,
+            plan.source_row_condition,
             arena,
             params,
             hooks,
@@ -108513,7 +108513,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             source_keys[sources * key_count + at] = match key.source_column {
                 Some(column) => values[column],
                 None => eval_row_expression(
-                    key.source,
+                    key.source_row,
                     storage,
                     source_slot,
                     &source_def,

@@ -899,13 +899,13 @@ PostgreSQL's order. The hash keys are any equalities between an
 expression of the target and one of the FROM table (`t.id = s.k + 1`), and
 a SQL-language routine's parameters, a PL/pgSQL routine's variables and
 built-in function calls in the conditions are planned as PostgreSQL plans
-them (`differential_exact/740`). Other joined writes (several FROM items, a
-derived table, a FROM table with column aliases, relations without
-statistics, which PostgreSQL may merge-join, a nested loop on an equality)
-keep the row-by-row executor, whose EXPLAIN shows pos3ql's own costs and
-omits the `Hash Cond` (the planned join's deparser names a FROM table's
-columns from its table definition, so column aliases need it to read the
-aliased names): they
+them (`differential_exact/740`). A FROM table read under column aliases
+plans the same join, its conditions and output lists printed with the
+aliased names, as the range table entry's `eref` names them
+(`differential_exact/798`). Other joined writes (several FROM items, a
+derived table, relations without statistics, which PostgreSQL may
+merge-join, a nested loop on an equality) keep the row-by-row executor,
+whose EXPLAIN shows pos3ql's own join order and costs: they
 hash their first FROM table when it is joined to the target by equality,
 as a `SELECT` of the two tables would, and join later FROM items to it in
 nested loops; PostgreSQL may instead hash the joined FROM items. A statement
@@ -960,9 +960,11 @@ argument of another type than it declares is charged its cast function
 (`length(name)` reads `text(name)`), unless the types are binary coercible,
 and an operator between two integer types or between `real` and `double
 precision` casts nothing, as PostgreSQL's cross-type operators do
-(`differential_exact/793`). EXPLAIN prints the constant of `real * 2` as
-`'2'::real` where PostgreSQL's `real * double precision` operator prints
-`'2'::double precision`. Aggregation over the chosen scan of one
+(`differential_exact/793`). `real` against an integer or `numeric` operand
+takes the `real`-`double precision` operator, so EXPLAIN and view
+definitions print the other side as `double precision` (`'2'::double
+precision`) and the result type is `double precision`
+(`differential_exact/796`). Aggregation over the chosen scan of one
 plain table is costed as PostgreSQL's `cost_agg` costs it
 (`differential_exact/790`): each transition state's function and input
 expressions per input row and each final function once per group
@@ -1338,11 +1340,14 @@ target list, and a cursor may be declared in a nested block
 (`differential_exact/743`, `744`). An exclusion constraint's build sorts the
 rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
-(`differential_exact/746`); elements of other operators are compared
-pairwise only among the rows its equality elements make equal
-(`differential_exact/792`), so a constraint without equality elements still
-compares every pair, and for a GiST constraint PostgreSQL names the partner
-its index scan finds first, where pos3ql names the first in heap order. Merged CHECK predicates
+(`differential_exact/746`); elements of other operators are compared only
+among the rows its equality elements make equal (`differential_exact/792`)
+and, with a range-overlap element, whose ranges overlap, swept in
+lower-bound order with the rows whose ranges still reach the current one
+(`differential_exact/797`). Without an equality or range-overlap element (a
+box `&&`, a multirange) every pair is compared, and for a GiST constraint
+PostgreSQL names the partner its index scan finds first, where pos3ql names
+the first in heap order. Box `&&` is PostgreSQL's `box_ov`. Merged CHECK predicates
 compare in their analysed form, as PostgreSQL's `equal()` compares cooked
 trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
 operator) conflict; a predicate outside the deparser's typed coverage compares

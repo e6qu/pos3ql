@@ -1121,13 +1121,14 @@ fn table_qual_cost<'t>(
     txid: u32,
     exposed: &'t str,
     definition: crate::storage::RelationDefinition<'t>,
+    aliases: &'t [&'t str],
     arena: &'t Arena,
 ) -> impl Fn(&Expr<'_>) -> f64 + 't {
     move |conjunct| {
         let columns = crate::sql::exec::AliasedDefCols {
             definition,
             alias: (exposed != definition.name.as_str()).then_some(exposed),
-            output_aliases: &[],
+            output_aliases: aliases,
             remote_ctid: false,
         };
         query::qual_cost(conjunct, &columns, storage, txid, arena)
@@ -1221,7 +1222,7 @@ struct JoinRelation<'a> {
     /// The name the query exposes it under.
     exposed: &'a str,
     definition: crate::storage::RelationDefinition<'a>,
-    table: Option<&'a crate::storage::TableDef>,
+    table: Option<&'a dyn crate::sql::catalog::deparse::DeparseTable>,
     columns: crate::sql::catalog::deparse::Columns<'a>,
     /// A subquery's columns as its own plan outputs them. Without a filter
     /// a join input's `Subquery Scan` is trivial and `set_plan_references`
@@ -1244,6 +1245,26 @@ impl<'a> JoinRelation<'a> {
             subquery: None,
             nameless: false,
         }
+    }
+
+    /// A table read under the column aliases `aliases`, when it has them.
+    fn aliased(
+        exposed: &'a str,
+        table: &'a crate::storage::TableDef,
+        aliases: Option<&'a [&'a str]>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let Some(aliases) = aliases else {
+            return Ok(Self::table(exposed, table));
+        };
+        let aliased: &'a dyn crate::sql::catalog::deparse::DeparseTable = arena
+            .alloc(crate::sql::catalog::deparse::AliasedTable { table, aliases })
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            table: Some(aliased),
+            columns: crate::sql::catalog::deparse::Columns::Table(aliased),
+            ..Self::table(exposed, table)
+        })
     }
 
     /// The relation as a deparsed condition names it; `removed` when its
@@ -1876,7 +1897,7 @@ fn scan_filters<'a>(
         let own = &mut own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + own_count[index]];
         order_restrictions(
             own,
-            &table_qual_cost(storage, txid, exposed, relation.definition, arena),
+            &table_qual_cost(storage, txid, exposed, relation.definition, &[], arena),
             storage,
             txid,
             arena,
@@ -2495,6 +2516,7 @@ fn single_relation_quals<'a>(
     txid: u32,
     exposed: &'a str,
     table: &'a crate::storage::TableDef,
+    aliases: &'a [&'a str],
     condition: Option<&'a Expr<'a>>,
     security: &[&'a Expr<'a>],
     index: Option<&query::IndexAccessPlan<'a>>,
@@ -2504,12 +2526,12 @@ fn single_relation_quals<'a>(
     if condition.is_none() && security.is_empty() {
         return Ok((None, None));
     }
+    // The relation's columns under the column aliases it is read with.
+    let aliased = crate::sql::catalog::deparse::AliasedTable { table, aliases };
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        use crate::sql::catalog::deparse::DeparseTable;
         if qualifier.is_none_or(|qualifier| qualifier == exposed)
-            && table
-                .columns()
-                .iter()
-                .any(|column| column.name.as_str() == name)
+            && aliased.column_index(name).is_some()
         {
             return Some(0);
         }
@@ -2559,6 +2581,7 @@ fn single_relation_quals<'a>(
         txid,
         exposed,
         crate::storage::RelationDefinition::from_definition(table),
+        aliases,
         arena,
     );
     order_restrictions(&mut conjuncts[..kept], &cost, storage, txid, arena)?;
@@ -2572,7 +2595,7 @@ fn single_relation_quals<'a>(
         let columns = crate::sql::exec::AliasedDefCols {
             definition: crate::storage::RelationDefinition::from_definition(table),
             alias: (exposed != table.name.as_str()).then_some(exposed),
-            output_aliases: &[],
+            output_aliases: aliases,
             remote_ctid: false,
         };
         let ordered = arena
@@ -2613,7 +2636,7 @@ fn single_relation_quals<'a>(
         Some((name, _)) => Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?),
         None => None,
     };
-    let own = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    let own = [crate::sql::catalog::deparse::Joined::new(exposed, &aliased)];
     let with_outer;
     let joined: &[crate::sql::catalog::deparse::Joined<'_>] =
         match (outer_name, outer_definition.as_deref()) {
@@ -2632,7 +2655,7 @@ fn single_relation_quals<'a>(
         txid,
         arena,
         dependencies: None,
-        table: Some(table),
+        table: Some(&aliased),
         parameters: &[],
         joined,
         pretty: false,
@@ -3363,6 +3386,7 @@ fn tree_member_quals<'a>(
                 txid,
                 exposed,
                 definition,
+                &[],
                 scanned,
                 security,
                 Some(index),
@@ -4709,7 +4733,7 @@ pub(crate) fn joined_write_shape<'a>(
         scope,
         1,
         &[join.source_slot],
-        join.conditions.source,
+        join.source_row_condition,
         &source_keys[..count],
         params,
         routine,
@@ -7030,6 +7054,7 @@ fn plan_pulled_select<'a>(
                 txid,
                 exposed,
                 def,
+                &[],
                 scanned,
                 security,
                 scan_indexes[0].as_ref(),
@@ -7041,6 +7066,7 @@ fn plan_pulled_select<'a>(
                 txid,
                 exposed,
                 def,
+                &[],
                 scanned,
                 security,
                 scan_indexes[0].as_ref(),
@@ -7058,6 +7084,7 @@ fn plan_pulled_select<'a>(
                     txid,
                     exposed,
                     def,
+                    &[],
                     scanned,
                     security,
                     Some(&written),
@@ -7070,6 +7097,7 @@ fn plan_pulled_select<'a>(
                     txid,
                     exposed,
                     def,
+                    &[],
                     scanned,
                     security,
                     Some(&written),
@@ -7101,6 +7129,7 @@ fn plan_pulled_select<'a>(
                                 txid,
                                 exposed,
                                 def,
+                                &[],
                                 scanned,
                                 security,
                                 Some(&leaf),
@@ -8569,6 +8598,7 @@ fn foreign_modification<'a>(
         txid,
         exposed,
         &table,
+        &[],
         planned.local_where,
         &[],
         None,
@@ -10453,17 +10483,22 @@ fn plan_write<'a>(
         }) && !scope.lateral[..scope.n].iter().any(|&lateral| lateral);
         if inner_joins && (0..scope.n).all(|table| scope.defs.stored(table).is_some()) {
             let relations = arena
-                .alloc_slice_with(relations_count, |relation| {
-                    if relation == 0 {
-                        JoinRelation::table(target_exposed, &target_definition)
-                    } else {
-                        JoinRelation::table(
-                            scope.names[relation - 1],
-                            scope.defs.stored(relation - 1).expect("stored relation"),
-                        )
-                    }
+                .alloc_slice_with(relations_count, |_| {
+                    JoinRelation::table(target_exposed, &target_definition)
                 })
                 .map_err(|_| arena_full())?;
+            // A FROM table's conditions print the column aliases it is read
+            // under.
+            let items =
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+            for (table, (relation, item)) in relations[1..].iter_mut().zip(items).enumerate() {
+                *relation = JoinRelation::aliased(
+                    scope.names[table],
+                    scope.defs.stored(table).expect("stored relation"),
+                    item.col_alias,
+                    arena,
+                )?;
+            }
             let display = arena
                 .alloc_slice_with(relations_count, |position| {
                     if position == 0 {
@@ -10862,6 +10897,7 @@ fn plan_write<'a>(
                     txid,
                     exposed,
                     &definition,
+                    &[],
                     predicate,
                     security,
                     plan,
@@ -10956,6 +10992,7 @@ fn plan_write<'a>(
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
+                &[],
                 predicate,
                 security,
                 index.as_ref().map(|(plan, _)| plan),
@@ -10967,6 +11004,7 @@ fn plan_write<'a>(
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
+                &[],
                 predicate,
                 security,
                 index.as_ref().map(|(plan, _)| plan),
@@ -11054,12 +11092,22 @@ fn plan_joined_write<'a, 'e>(
     let target_table = (*storage.table_def(target_slot, txid)).clone();
     let source_table = (*storage.table_def(join.source_slot, txid)).clone();
     let source_name = join.source_name;
+    // The FROM table's conditions print the column aliases it is read under.
+    let source_aliases = match statement {
+        Stmt::Update(update) => update.from.and_then(|from| from.base.col_alias),
+        Stmt::Delete(delete) => delete.using.and_then(|using| using.base.col_alias),
+        _ => None,
+    };
+    let aliased_source = crate::sql::catalog::deparse::AliasedTable {
+        table: &source_table,
+        aliases: source_aliases.unwrap_or(&[]),
+    };
     let lists = targets::RelationTargets::joined_write(
         storage,
         txid,
         &target_table,
         exposed,
-        &source_table,
+        &aliased_source,
         source_name,
         expansion.is_some(),
         assignments,
@@ -11072,7 +11120,7 @@ fn plan_joined_write<'a, 'e>(
             if at == 0 {
                 crate::sql::catalog::deparse::Joined::new(exposed, &target_table)
             } else {
-                crate::sql::catalog::deparse::Joined::new(source_name, &source_table)
+                crate::sql::catalog::deparse::Joined::new(source_name, &aliased_source)
             }
         })
         .map_err(|_| arena_full())?;
@@ -11179,6 +11227,7 @@ fn plan_joined_write<'a, 'e>(
             txid,
             exposed,
             &target_table,
+            &[],
             conditions.target,
             &[],
             None,
@@ -11210,6 +11259,7 @@ fn plan_joined_write<'a, 'e>(
             txid,
             source_name,
             &source_table,
+            source_aliases.unwrap_or(&[]),
             conditions.source,
             &[],
             None,
@@ -11825,6 +11875,7 @@ fn plan_merge<'a, 'e>(
             txid,
             exposed,
             target_table,
+            &[],
             target_condition,
             &[],
             None,
@@ -11859,6 +11910,7 @@ fn plan_merge<'a, 'e>(
                     txid,
                     source_name,
                     definition,
+                    &[],
                     source_condition,
                     &[],
                     None,
@@ -12167,6 +12219,7 @@ fn expanded_write<'e>(
         txid,
         exposed,
         &definition,
+        &[],
         predicate,
         security,
         None,
@@ -12178,6 +12231,7 @@ fn expanded_write<'e>(
         txid,
         exposed,
         &definition,
+        &[],
         predicate,
         security,
         None,
@@ -13608,14 +13662,19 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
             kind.node_type = "Aggregate";
             kind.strategy = Some("Sorted");
         }
-        "Nested Loop" | "Hash Join" => kind.join_type = Some("Inner"),
+        "MixedAggregate" => {
+            kind.node_type = "Aggregate";
+            kind.strategy = Some("Mixed");
+        }
+        "Nested Loop" | "Hash Join" | "Merge Join" => kind.join_type = Some("Inner"),
         // `Nested Loop Left Join`, `Hash Right Semi Join`, ...: the node
         // type, then the join type.
         _ => {
             let joined = name
                 .strip_prefix("Nested Loop ")
                 .map(|rest| ("Nested Loop", rest))
-                .or_else(|| name.strip_prefix("Hash ").map(|rest| ("Hash Join", rest)));
+                .or_else(|| name.strip_prefix("Hash ").map(|rest| ("Hash Join", rest)))
+                .or_else(|| name.strip_prefix("Merge ").map(|rest| ("Merge Join", rest)));
             if let Some((node_type, rest)) = joined
                 && let Some(join_type) = rest.strip_suffix(" Join")
             {

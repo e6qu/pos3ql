@@ -23,6 +23,44 @@ pub(crate) trait DeparseTable {
     fn table_name(&self) -> &str;
     fn columns(&self) -> &[ColumnMeta];
     fn column_index(&self, name: &str) -> Option<usize>;
+    /// The name a query reads the column at `index` under.
+    fn column_name(&self, index: usize) -> &str {
+        self.columns()[index].name.as_str()
+    }
+}
+
+/// A table a FROM item reads under column aliases (`s AS x (a, b)`): the
+/// leading columns answer to the aliases, the rest to their own names. The
+/// table's shared definition stays as it is.
+#[derive(Clone, Copy)]
+pub(crate) struct AliasedTable<'s> {
+    pub table: &'s dyn DeparseTable,
+    pub aliases: &'s [&'s str],
+}
+
+impl DeparseTable for AliasedTable<'_> {
+    fn schema_name(&self) -> &str {
+        self.table.schema_name()
+    }
+
+    fn table_name(&self) -> &str {
+        self.table.table_name()
+    }
+
+    fn columns(&self) -> &[ColumnMeta] {
+        self.table.columns()
+    }
+
+    fn column_index(&self, name: &str) -> Option<usize> {
+        (0..self.columns().len()).find(|&index| self.column_name(index) == name)
+    }
+
+    fn column_name(&self, index: usize) -> &str {
+        match self.aliases.get(index) {
+            Some(alias) => alias,
+            None => self.table.column_name(index),
+        }
+    }
 }
 
 impl<B: DefinitionBacking> DeparseTable for TableDefinition<B> {
@@ -168,7 +206,7 @@ impl<'s> Columns<'s> {
 
     pub(crate) fn name(&self, index: usize) -> &'s str {
         match self {
-            Self::Table(table) => table.columns()[index].name.as_str(),
+            Self::Table(table) => table.column_name(index),
             Self::Derived(columns) => columns[index].name,
         }
     }
@@ -935,8 +973,15 @@ impl Context<'_> {
                     left.or(right)
                 }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                    let (left, right) = self.operand_types(left, right)?;
-                    left.or(right)
+                    // A cross-type numeric operator returns the wider type.
+                    match self.operand_types(left, right)? {
+                        (Some(left), Some(right))
+                            if numeric_rank(left).is_some() && numeric_rank(right).is_some() =>
+                        {
+                            Some(common_type(left, right))
+                        }
+                        (left, right) => left.or(right),
+                    }
                 }
                 _ => None,
             },
@@ -1062,14 +1107,25 @@ impl Context<'_> {
             (None, Some(right)) => (Some(right), Some(right)),
             (None, None) => (Some(oid::TEXT), Some(oid::TEXT)),
             (Some(left), Some(right)) => {
+                // `real` against a lower family takes the `real`-`double
+                // precision` operator: both it and the `real` one need one
+                // cast, and `func_select_candidate` prefers the category's
+                // preferred type.
+                let raised = |higher: i32| {
+                    if higher == oid::FLOAT4 {
+                        oid::FLOAT8
+                    } else {
+                        higher
+                    }
+                };
                 match (numeric_rank(left), numeric_rank(right)) {
                     // Integers and floats have cross-type operators within
                     // their family; between families the lower one is cast.
                     (Some(left_rank), Some(right_rank)) if left_rank < right_rank => {
-                        (Some(right), Some(right))
+                        (Some(raised(right)), Some(right))
                     }
                     (Some(left_rank), Some(right_rank)) if left_rank > right_rank => {
-                        (Some(left), Some(left))
+                        (Some(left), Some(raised(left)))
                     }
                     _ => (Some(left), Some(right)),
                 }

@@ -820,9 +820,14 @@ its own keys, and `REINDEX TABLE` builds its indexes one at a time in OID
 order. An attempt collects every call it lacks, reads NULL in their place
 and runs them together before restarting, so a build restarts as often as
 its keys nest calls, not once per row. Remaining: a key whose calls nest
-restarts once per row, to keep their order; `REINDEX INDEX` and a write
-rebuild the table's value caches, which evaluates the other indexes' keys
-again and repeats their notices. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+restarts once per row, to keep their order; `REINDEX INDEX`, a write and a
+table rewrite (`ALTER TABLE ... TYPE`, `CLUSTER`) rebuild the table's value
+caches, which evaluates the other indexes' keys again and repeats their
+notices; a partial unique index's predicate and key calls interleave in
+another order; and an index whose expression no longer resolves after
+`ALTER COLUMN ... TYPE` fails with `routine input types do not match its
+captured signature` where PostgreSQL reports `function rw(bigint) does not
+exist`. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
 a user-defined type after inlining, a call of a SQL function PostgreSQL

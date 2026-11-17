@@ -804,7 +804,9 @@ in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
 `FROM` PostgreSQL inlines with a default, packed variadic, polymorphic or
 lateral argument or a body with `WITH`, windows or a coerced column, a
 function scan of a built-in whose support function estimates its rows
-other than `generate_series` over integers and `unnest`, a regular
+other than `generate_series` over integers, `numeric` and timestamps
+(`differential_exact/813`) and `unnest`, or whose bound or step is a stable
+expression the support function would evaluate (`now()`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
 conditions on an expression key of a statistics object, an `OR` reading
 two or more keys of a statistics object with an MCV list (estimated
@@ -815,12 +817,21 @@ timestamp and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
-skip-array scan over several leaf pages. Remaining inexact without
-`0A000`: a join one of whose inputs is a subquery the planner does not
-pull up or a function scan (its join method, order and costs), an `IN`
-subquery whose output is computed (PostgreSQL pulls it up into a semi
-join, pos3ql hashes a subplan), the width of an `INSERT`'s `Result` of
-computed values, btree sizes, which the model computes from the column statistics
+skip-array scan over several leaf pages. A query's joins are not costed
+as PostgreSQL costs them (`final_cost_hashjoin`, `final_cost_nestloop`,
+`calc_joinrel_size_estimate`), so an `EXPLAIN` showing costs of a plan
+with a join fails with `0A000` naming the join node, as does one of an
+`INSERT` whose listed values or defaults need a computation or coercion
+the model does not cost, of an `INSERT` into a view, and of a write whose
+source the planner does not model; `COSTS OFF` prints the join tree pos3ql
+runs (`differential_exact/810`). Its join method and order are pos3ql's:
+two items joined by equalities of their columns or of expressions of each
+(`s.a = (t.x + 1)`) hash the second (`differential_exact/811`), where
+PostgreSQL's costs may hash the other side or merge; a function in `FROM`
+whose arguments read no earlier item is scanned once and may be hashed,
+as PostgreSQL's analysis marks only a function reading them lateral, and
+`USING` and `NATURAL` joins hash on their synthesized condition. Remaining
+inexact without `0A000`: btree sizes, which the model computes from the column statistics
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update
 moves (a pruned page's freed space, HOT chains), which also orders an
@@ -1050,7 +1061,12 @@ rows the sort and limit return. A top-level query's `WHERE` conjunct
 `EXISTS`, `NOT EXISTS`, `x IN` or `x op ANY` over a subquery that reads one
 stored table with only a non-volatile condition (correlated for `EXISTS`;
 `IN` and `ANY` may be correlated too, as in PostgreSQL 18) becomes a semi or
-anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one:
+anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one;
+an `IN` or `ANY` output may be computed and a row operand compares its
+fields with the outputs (`(a, b) IN (SELECT x + 1, y ...)`), while an output
+that groups, windows, returns a set or calls a volatile function keeps the
+subplan, where PostgreSQL joins the unflattened subquery
+(`differential_exact/811`):
 two relations joined by column equalities hash the smaller side (`Hash Semi
 Join`, `Hash Anti Join`, or the `Hash Right` forms when the query's
 relation is smaller), others loop over a materialized copy (`Nested Loop
@@ -1194,7 +1210,15 @@ PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
-constant written inside a routine body. Target and expression count errors of an `INSERT`, also with subscripted
+constant written inside a routine body; an index or exclusion key expression
+positions an unknown column (`differential_exact/812`). The exact-error
+corpus compares each error's cursor, psql's `LINE n:` excerpt and caret.
+`tests/external/differential_exact/cursor-gaps.txt` lists the statements
+PostgreSQL positions where pos3ql reports no cursor yet (among them
+interval and other constant input failures, aggregates in `GROUP BY`,
+privilege checks and operator lookups over `cstring`); a listed statement
+pos3ql positions, or one PostgreSQL does not, fails the run, so the list
+only shrinks. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

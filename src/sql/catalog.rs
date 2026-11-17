@@ -5229,6 +5229,25 @@ pub(crate) fn builtin_binary_cast(source: i32, target: i32) -> bool {
         .any(|cast| cast.source == source && cast.target == target && cast.method == b'b')
 }
 
+/// Whether a built-in cast from `source` to `target` converts through the
+/// types' output and input functions (`castmethod` `i`, or a string type
+/// without a pg_cast row): PostgreSQL's `CoerceViaIO`, which costs both.
+pub(crate) fn builtin_io_cast(source: i32, target: i32) -> bool {
+    match builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+    {
+        Some(cast) => cast.method == b'i',
+        None => {
+            source != target
+                && [source, target].into_iter().any(|oid| {
+                    ColType::from_oid(oid)
+                        .is_some_and(|ctype| super::types::type_category(ctype) == "S")
+                })
+        }
+    }
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO
@@ -18014,7 +18033,7 @@ pub(crate) fn index_key_display<'a>(
 /// `pg_get_indexdef_worker`: an expression key is parenthesized unless it
 /// looks like a function call. A shape the deparser cannot type keeps its
 /// canonical source spelling.
-fn index_expression_display<'a>(
+pub(crate) fn index_expression_display<'a>(
     storage: &Storage,
     txid: u32,
     table: &crate::storage::TableDef,

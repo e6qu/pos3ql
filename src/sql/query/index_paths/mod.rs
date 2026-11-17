@@ -256,10 +256,18 @@ pub(crate) fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
     if layout.length > 0 {
         return f64::from(layout.length);
     }
-    // `type_maximum_size` of a length-limited character type: four bytes
-    // per UTF-8 character plus the header.
+    // `type_maximum_size`: a length-limited character type's four bytes
+    // per UTF-8 character plus the header, a bit string's bytes and its
+    // header and length, and `numeric_maximum_size` of a numeric's
+    // precision: its two-byte digits of four decimal digits each, the first
+    // possibly holding one, after an eight-byte header.
     let maximum = match ctype {
         ColType::Varchar | ColType::Bpchar if type_mod > 4 => (type_mod - 4) * 4 + 4,
+        ColType::Bit { .. } if type_mod > 0 => (type_mod + 7) / 8 + 8,
+        ColType::Numeric if type_mod >= 4 => {
+            let precision = ((type_mod - 4) >> 16) & 0xffff;
+            8 + (precision + 6) / 4 * 2
+        }
         _ => 0,
     };
     if maximum > 0 {

@@ -674,6 +674,7 @@ pub(crate) fn target_hash_plan<'a>(
         where_clause,
         &[0, 1],
         Some(0),
+        false,
         txid,
         arena,
     )?

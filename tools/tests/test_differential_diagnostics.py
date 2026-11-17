@@ -242,7 +242,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("copy_context", DIAGNOSTICS.normalize_diagnostics(
             stderr, "sqlstate", {}, input_diagnostics="verbose")[0])
 
-    def test_full_comparison_keeps_every_detail_hint_query_and_context_line(self):
+    def test_full_comparison_keeps_every_detail_hint_query_context_and_cursor_line(self):
         stderr = (
             "psql:c.sql:3: ERROR:  22P02: invalid input syntax for type json\n"
             "LINE 1: SELECT '{x'::jsonb\n"
@@ -261,16 +261,53 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertEqual(records[0], {
             "source": "c.sql", "line": 3, "severity": "ERROR", "sqlstate": "22P02",
             "message": "invalid input syntax for type json",
+            "cursor": "LINE 1: SELECT '{x'::jsonb\n               ^",
             "detail": 'Token "x" is invalid.', "query": "SELECT '{x'::jsonb",
             "context": "JSON data, line 1: {x\n"
                        "PL/pgSQL function inline_code_block line 1 at PERFORM",
         })
         self.assertEqual(records[1]["detail"], "first detail line\nsecond detail line")
         self.assertEqual(records[1]["hint"], "a hint")
+        self.assertNotIn("cursor", records[1])
         # Verbose comparison keeps none of them.
         verbose = DIAGNOSTICS.normalize_diagnostics(
             stderr, "verbose", {}, input_diagnostics="verbose")
         self.assertNotIn("detail", verbose[0])
+
+    def test_cursor_gaps_hide_listed_cursors_and_reject_stale_entries(self):
+        stderr = (
+            "psql:d/7_x.sql:3: ERROR:  42703: column \"z\" does not exist\n"
+            "LINE 1: SELECT z\n"
+            "               ^\n"
+            "psql:d/7_x.sql:4: ERROR:  42703: column \"y\" does not exist\n"
+            "LINE 1: SELECT y\n"
+            "               ^\n"
+            "psql:d/7_x.sql:5: ERROR:  42601: bad\n"
+        )
+        gaps = DIAGNOSTICS.read_cursor_gaps(
+            "# comment\n7_x.sql:3 missing\n\n7_x.sql:4 wrong  # other\n7_x.sql:5 extra\n")
+        self.assertEqual(gaps, {("7_x.sql", 3): "missing", ("7_x.sql", 4): "wrong",
+                                ("7_x.sql", 5): "extra"})
+        def records():
+            return DIAGNOSTICS.normalize_diagnostics(
+                stderr, "full", {}, input_diagnostics="verbose")
+        reference = DIAGNOSTICS.apply_cursor_gaps(records(), gaps, "d/7_x.sql", "reference")
+        self.assertTrue(all("cursor" not in record for record in reference))
+        # The candidate shows no cursor at 3 and 4 and none at 5: 3 matches,
+        # 4 and 5 are marked as no longer showing their gaps.
+        candidate = DIAGNOSTICS.apply_cursor_gaps(
+            [{key: value for key, value in record.items() if key != "cursor"}
+             for record in records()], gaps, "d/7_x.sql", "candidate")
+        self.assertNotIn("cursor", candidate[0])
+        self.assertEqual(candidate[1]["cursor"], "the wrong cursor gap is no longer shown")
+        self.assertEqual(candidate[2]["cursor"], "the extra cursor gap is no longer shown")
+        with self.assertRaisesRegex(ValueError, "on lines 5"):
+            DIAGNOSTICS.apply_cursor_gaps(records(), {("7_x.sql", 5): "missing"},
+                                          "d/7_x.sql", "reference")
+        with self.assertRaisesRegex(ValueError, "malformed cursor gap"):
+            DIAGNOSTICS.read_cursor_gaps("7_x.sql:3")
+        with self.assertRaisesRegex(ValueError, "repeated cursor gap"):
+            DIAGNOSTICS.read_cursor_gaps("7_x.sql:3 wrong\n7_x.sql:3 missing")
 
     def test_full_comparison_masks_only_the_catalog_name_key_relation_oid(self):
         violation = ('duplicate key value violates unique constraint '

@@ -1459,7 +1459,7 @@ fn retained_join_scope<'a>(
             return Ok(None);
         }
     }
-    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena)?;
+    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena, None)?;
     let columns = CatalogScopeCols {
         scope: &scope,
         outer: None,

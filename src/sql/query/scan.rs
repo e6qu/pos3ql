@@ -6590,6 +6590,83 @@ pub(super) fn hash_join_keys<'a>(
     }
 }
 
+/// The equalities between an expression of the probe table and one of the
+/// build table that are not both plain columns (`s1.a = (s2.x + 1)`), as
+/// (probe, build) pairs: PostgreSQL hashes any such equality whose sides
+/// are non-volatile, read only their own relation and compare without a
+/// collation (`check_hashjoinable`).
+fn hash_join_expression_keys<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    on: Option<&'a Expr<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+    probe_t: usize,
+    build_t: usize,
+    txid: u32,
+) -> [Option<(&'a Expr<'a>, &'a Expr<'a>)>; 8] {
+    let mut found = [None; 8];
+    let mut count = 0;
+    for source in [on, where_clause].into_iter().flatten() {
+        let mut flat = [source; MAX_CONJUNCTS];
+        let mut flat_count = 0;
+        let parts: &[&Expr] = if flatten_and(source, &mut flat, &mut flat_count) {
+            &flat[..flat_count]
+        } else {
+            core::slice::from_ref(&source)
+        };
+        for &conjunct in parts {
+            let Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } = conjunct
+            else {
+                continue;
+            };
+            if matches!(
+                (key_column(scope, left), key_column(scope, right)),
+                (
+                    Some(ResolvedColumn::Table(..)),
+                    Some(ResolvedColumn::Table(..))
+                )
+            ) {
+                continue;
+            }
+            let (probe, build) = match (expr_tables(left, scope), expr_tables(right, scope)) {
+                (Some(l), Some(r)) if l == 1 << probe_t && r == 1 << build_t => (*left, *right),
+                (Some(l), Some(r)) if l == 1 << build_t && r == 1 << probe_t => (*right, *left),
+                _ => continue,
+            };
+            if [probe, build].iter().any(|side| {
+                side.contains_subquery()
+                    || super::expression_contains_volatile(side, storage, txid, false)
+            }) {
+                continue;
+            }
+            let side_type = |side: &Expr<'_>| {
+                super::infer_scope_type(side, scope)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid))
+            };
+            let (Some(probe_type), Some(build_type)) = (side_type(probe), side_type(build)) else {
+                continue;
+            };
+            if !join_key_types_compatible(probe_type, build_type)
+                || probe_type.is_collatable()
+                || build_type.is_collatable()
+            {
+                continue;
+            }
+            if count < found.len() {
+                found[count] = Some((probe, build));
+                count += 1;
+            }
+        }
+    }
+    found
+}
+
 /// An equi-join key that selects a materialized source's candidate rows at
 /// one nested-loop level by hash instead of scanning every row for every
 /// outer row. Materialized sources (catalog relations, CTEs and subqueries)
@@ -6854,10 +6931,23 @@ impl<'a> DerivedKeyLookup<'a> {
 
 /// A selected two-table hash implementation. Planning is shared with EXPLAIN
 /// so reported and executed physical join choices remain one decision.
+/// A built hash table: its entries in build order, each bucket's first
+/// entry and each entry's next in the same bucket.
+struct BuiltHashTable<'a> {
+    entries: &'a mut [HashEntry<'a>],
+    next: &'a [u32],
+    buckets: &'a [u32],
+    buckets_len: usize,
+}
+
 pub(crate) struct HashJoinPlan<'a> {
     probe_table: usize,
     build_table: usize,
     keys: [(usize, usize); 8],
+    /// Per key, the (probe, build) expressions it hashes when it equates
+    /// expressions rather than columns (`s1.a = (s2.x + 1)`); `keys` then
+    /// holds no columns for it.
+    key_expressions: [Option<(&'a Expr<'a>, &'a Expr<'a>)>; 8],
     key_count: usize,
     key_collations: [Collation; 8],
     on: Option<&'a Expr<'a>>,
@@ -7017,7 +7107,9 @@ impl<'a> HashJoinPlan<'a> {
 /// Selects the hash implementation only when its fixed build table and
 /// equi-key representation can execute this join exactly and hash joins are
 /// enabled. Every other shape selects the ordinary nested-loop
-/// implementation before execution. `tree_probe` is the position of a
+/// implementation before execution. `expression_keys` also hashes equalities
+/// of expressions of each side, which the retained join reader and joined
+/// writes do not evaluate. `tree_probe` is the position of a
 /// write's partitioned or inheritance target, which the caller reads member
 /// by member as the probe side; any other tree leaves the join to a nested
 /// loop.
@@ -7029,6 +7121,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     where_clause: Option<&'a Expr<'a>>,
     order: &[usize],
     tree_probe: Option<usize>,
+    expression_keys: bool,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
@@ -7160,15 +7253,10 @@ pub(crate) fn select_hash_join_plan<'a>(
     } else {
         where_clause
     };
-    let Some((keys, key_count)) = hash_join_keys(scope, on, keyed_where, probe_table, build_table)?
-    else {
-        return Ok(None);
-    };
-    let build_capacity = rows;
-    // Empty builds still need buckets for NULL-preserving probes. Schema-only
-    // EXPLAIN scopes also have no materialized rows; they select the same
-    // representation without executing a derived query for planning.
-    let build_capacity = build_capacity.max(1);
+    let (mut keys, mut key_count) =
+        hash_join_keys(scope, on, keyed_where, probe_table, build_table)?
+            .unwrap_or(([(0, 0); 8], 0));
+    let mut key_expressions = [None; 8];
     let mut key_collations = [Collation::None; 8];
     for (index, &(probe_column, build_column)) in keys.iter().take(key_count).enumerate() {
         key_collations[index] = join_key_collation(
@@ -7178,10 +7266,40 @@ pub(crate) fn select_hash_join_plan<'a>(
         )
         .expect("hash keys have a collation");
     }
+    if expression_keys {
+        for (probe, build) in hash_join_expression_keys(
+            storage,
+            scope,
+            on,
+            keyed_where,
+            probe_table,
+            build_table,
+            txid,
+        )
+        .into_iter()
+        .flatten()
+        {
+            if key_count == keys.len() {
+                break;
+            }
+            keys[key_count] = (usize::MAX, usize::MAX);
+            key_expressions[key_count] = Some((probe, build));
+            key_count += 1;
+        }
+    }
+    if key_count == 0 {
+        return Ok(None);
+    }
+    let build_capacity = rows;
+    // Empty builds still need buckets for NULL-preserving probes. Schema-only
+    // EXPLAIN scopes also have no materialized rows; they select the same
+    // representation without executing a derived query for planning.
+    let build_capacity = build_capacity.max(1);
     Ok(Some(HashJoinPlan {
         probe_table,
         build_table,
         keys,
+        key_expressions,
         key_count,
         key_collations,
         on,
@@ -9033,8 +9151,35 @@ fn scan_source_mode<'a>(
             Ok(true)
         };
         let keys = plan.keys;
+        let key_expressions = plan.key_expressions;
         let nkeys = plan.key_count;
         let key_collations = plan.key_collations;
+        // A key equating expressions evaluates its side over the row of its
+        // own relation alone.
+        let side_key = |table: usize,
+                        row: BoundRow<'a>,
+                        rowid: Option<u64>,
+                        expression: &'a Expr<'a>,
+                        decode_buffers: &mut RowDecodeBuffers<'a>|
+         -> Result<Datum<'a>, SqlError> {
+            let mut bound = [None::<BoundRow>; 2];
+            let mut rowids = [None; 2];
+            bound[table] = Some(row);
+            rowids[table] = rowid;
+            let row = assemble(
+                storage,
+                txid,
+                scope,
+                &bound,
+                &rowids,
+                order,
+                2,
+                decode_buffers,
+                arena,
+            )?;
+            let chained = Chained { inner: &row, outer };
+            crate::sql::eval::eval_full(expression, arena, params, &chained, hooks)
+        };
         let on = plan.on;
         let filter_join = plan.filter_join;
         // A right anti join returns the query rows it hashed that nothing
@@ -9046,27 +9191,6 @@ fn scan_source_mode<'a>(
         let build_derived_rows = scope.derived[build_t];
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
-        let hash_loop = nodes.hash.start();
-        let build_loop = nodes.build.start();
-        let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
-        // `EXPLAIN ANALYZE` sizes the rows as PostgreSQL's table holds them.
-        let hash_columns = nodes.hash.hash_columns();
-        let mut tuple_bytes = hash_columns.map(|_| 0usize);
-        // Every array the table allocates, those it outgrows included.
-        let table_bytes = |entries: usize, buckets: usize| {
-            entries * (core::mem::size_of::<HashEntry<'_>>() + core::mem::size_of::<u32>())
-                + buckets * core::mem::size_of::<u32>()
-        };
-        let mut allocated = table_bytes(build_count, buckets_len);
-        let mut entries = arena
-            .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
-            .map_err(|_| arena_full())?;
-        let mut next = arena
-            .alloc_slice_with(build_count, |_| 0u32)
-            .map_err(|_| arena_full())?;
-        let mut buckets = arena
-            .alloc_slice_with(buckets_len, |_| u32::MAX)
-            .map_err(|_| arena_full())?;
         let mut build_schema = [ColType::Bool; MAX_COLUMNS];
         for (ctype, column) in build_schema
             .iter_mut()
@@ -9076,200 +9200,328 @@ fn scan_source_mode<'a>(
         }
         let build_schema = &build_schema[..scope.row_width(build_t)];
         let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-        let mut n = 0usize;
-        // Adds one build row. A NULL key never matches: such a row is kept,
-        // unlinked, only when unmatched build rows are returned.
-        let mut insert =
-            |rowid: Option<u64>, row: BoundRow<'a>, values: &[Datum<'a>]| -> Result<(), SqlError> {
-                if !scan_passes(build_t, row, rowid, filters.build, decode_buffers)? {
-                    nodes.build.filtered();
-                    return Ok(());
-                }
-                nodes.build.row();
-                let mut key_vals = [Datum::Null; 8];
-                let mut keyed = true;
-                for i in 0..nkeys {
-                    key_vals[i] = values[keys[i].1];
-                    if key_vals[i].is_null() {
-                        keyed = false;
-                        break;
+        // Builds the hash table from the inner rows that pass their scan's
+        // conditions.
+        let build_table =
+            |decode_buffers: &mut RowDecodeBuffers<'a>| -> Result<BuiltHashTable<'a>, SqlError> {
+                let hash_loop = nodes.hash.start();
+                let build_loop = nodes.build.start();
+                let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+                // `EXPLAIN ANALYZE` sizes the rows as PostgreSQL's table holds them.
+                let hash_columns = nodes.hash.hash_columns();
+                let mut tuple_bytes = hash_columns.map(|_| 0usize);
+                // Every array the table allocates, those it outgrows included.
+                let table_bytes = |entries: usize, buckets: usize| {
+                    entries * (core::mem::size_of::<HashEntry<'_>>() + core::mem::size_of::<u32>())
+                        + buckets * core::mem::size_of::<u32>()
+                };
+                let mut allocated = table_bytes(build_count, buckets_len);
+                let mut entries = arena
+                    .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
+                    .map_err(|_| arena_full())?;
+                let mut next = arena
+                    .alloc_slice_with(build_count, |_| 0u32)
+                    .map_err(|_| arena_full())?;
+                let mut buckets = arena
+                    .alloc_slice_with(buckets_len, |_| u32::MAX)
+                    .map_err(|_| arena_full())?;
+                let mut n = 0usize;
+                // Adds one build row. A NULL key never matches: such a row is kept,
+                // unlinked, only when unmatched build rows are returned.
+                let mut insert = |rowid: Option<u64>,
+                                  row: BoundRow<'a>,
+                                  values: &[Datum<'a>]|
+                 -> Result<(), SqlError> {
+                    if !scan_passes(build_t, row, rowid, filters.build, decode_buffers)? {
+                        nodes.build.filtered();
+                        return Ok(());
                     }
-                }
-                if !keyed && !keep_build {
-                    return Ok(());
-                }
-                // PostgreSQL's hash reports the NULL-keyed rows it keeps for
-                // returning unmatched too.
-                nodes.hash.row();
-                if let Some(columns) = &hash_columns {
-                    tuple_bytes = tuple_bytes.and_then(|bytes| {
-                        Some(
-                            bytes
-                                + instrument::hashed_row_bytes(
-                                    columns.as_slice(),
-                                    values,
-                                    build_schema,
-                                )?,
-                        )
-                    });
-                }
-                if n == entries.len() {
-                    // Double the entries and rehash them into twice as many
-                    // buckets. Chains keep their order: later rows first.
-                    let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
-                    let old_entries = &*entries;
-                    entries = arena
-                        .alloc_slice_with(grown, |index| {
-                            old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
-                        })
-                        .map_err(|_| arena_full())?;
-                    next = arena
-                        .alloc_slice_with(grown, |_| u32::MAX)
-                        .map_err(|_| arena_full())?;
-                    buckets_len = (grown * 2).next_power_of_two().max(16);
-                    allocated += table_bytes(grown, buckets_len);
-                    buckets = arena
-                        .alloc_slice_with(buckets_len, |_| u32::MAX)
-                        .map_err(|_| arena_full())?;
-                    for index in 0..n {
-                        if entries[index].keyed {
-                            let bucket = (entries[index].hash as usize) & (buckets_len - 1);
-                            next[index] = buckets[bucket];
-                            buckets[bucket] = index as u32;
+                    nodes.build.row();
+                    let mut key_vals = [Datum::Null; 8];
+                    let mut keyed = true;
+                    for i in 0..nkeys {
+                        key_vals[i] = match key_expressions[i] {
+                            Some((_, build)) => {
+                                side_key(build_t, row, rowid, build, decode_buffers)?
+                            }
+                            None => values[keys[i].1],
+                        };
+                        if key_vals[i].is_null() {
+                            keyed = false;
+                            break;
                         }
                     }
-                }
-                let hash = if keyed {
-                    hash_key_collated_catalog(
-                        storage,
+                    if !keyed && !keep_build {
+                        return Ok(());
+                    }
+                    // PostgreSQL's hash reports the NULL-keyed rows it keeps for
+                    // returning unmatched too.
+                    nodes.hash.row();
+                    if let Some(columns) = &hash_columns {
+                        tuple_bytes = tuple_bytes.and_then(|bytes| {
+                            Some(
+                                bytes
+                                    + instrument::hashed_row_bytes(
+                                        columns.as_slice(),
+                                        values,
+                                        build_schema,
+                                    )?,
+                            )
+                        });
+                    }
+                    if n == entries.len() {
+                        // Double the entries and rehash them into twice as many
+                        // buckets. Chains keep their order: later rows first.
+                        let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
+                        let old_entries = &*entries;
+                        entries = arena
+                            .alloc_slice_with(grown, |index| {
+                                old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
+                            })
+                            .map_err(|_| arena_full())?;
+                        next = arena
+                            .alloc_slice_with(grown, |_| u32::MAX)
+                            .map_err(|_| arena_full())?;
+                        buckets_len = (grown * 2).next_power_of_two().max(16);
+                        allocated += table_bytes(grown, buckets_len);
+                        buckets = arena
+                            .alloc_slice_with(buckets_len, |_| u32::MAX)
+                            .map_err(|_| arena_full())?;
+                        for index in 0..n {
+                            if entries[index].keyed {
+                                let bucket = (entries[index].hash as usize) & (buckets_len - 1);
+                                next[index] = buckets[bucket];
+                                buckets[bucket] = index as u32;
+                            }
+                        }
+                    }
+                    let hash = if keyed {
+                        hash_key_collated_catalog(
+                            storage,
+                            txid,
+                            &key_vals[..nkeys],
+                            &hash_cols[..nkeys],
+                            &key_collations[..nkeys],
+                        )?
+                    } else {
+                        0
+                    };
+                    entries[n] = HashEntry {
+                        hash,
+                        rowid,
+                        row,
+                        keyed,
+                        matched: false,
+                    };
+                    if keyed {
+                        let bucket = (hash as usize) & (buckets_len - 1);
+                        next[n] = buckets[bucket];
+                        buckets[bucket] = n as u32;
+                    }
+                    n += 1;
+                    Ok(())
+                };
+                if let Some(run) = build_external_run {
+                    let mut reader = storage.external_run_reader()?;
+                    storage
+                        .with_block_store(|blocks| reader.start(blocks, run))
+                        .expect("external run has a block store")?;
+                    while let Some(bytes) = reader.row() {
+                        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        decode_hash_source(
+                            BoundRow::Encoded(bytes),
+                            build_schema,
+                            true,
+                            arena,
+                            &mut values,
+                        )?;
+                        insert(
+                            None,
+                            BoundRow::Encoded(bytes),
+                            &values[..build_schema.len()],
+                        )?;
+                        storage
+                            .with_block_store(|blocks| reader.advance(blocks))
+                            .expect("external run has a block store")?;
+                    }
+                } else if let Some(rows) = build_derived_rows {
+                    for &bytes in rows {
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        decode_hash_source(
+                            BoundRow::Encoded(bytes),
+                            build_schema,
+                            true,
+                            arena,
+                            &mut values,
+                        )?;
+                        insert(
+                            None,
+                            BoundRow::Encoded(bytes),
+                            &values[..build_schema.len()],
+                        )?;
+                    }
+                } else if let Some(demand) = pax_demand.selected_mask(build_t)
+                    && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
+                {
+                    storage.record_relation_scan(
                         txid,
-                        &key_vals[..nkeys],
-                        &hash_cols[..nkeys],
-                        &key_collations[..nkeys],
-                    )?
+                        build_slot,
+                        None,
+                        0,
+                        crate::sql::datetime::now_micros(),
+                    )?;
+                    scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
+                        for spilled in rows {
+                            storage.record_relation_tuple_read(txid, build_slot, None)?;
+                            // Rows not yet in column blocks arrive encoded.
+                            match spilled.representation {
+                                crate::storage::SpilledRowRepresentation::Values(values) => {
+                                    insert(Some(spilled.rowid), BoundRow::Values(values), values)?;
+                                }
+                                crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                    rowenc::decode(bytes, build_schema, &mut decoded)?;
+                                    insert(
+                                        Some(spilled.rowid),
+                                        BoundRow::Encoded(bytes),
+                                        &decoded[..build_schema.len()],
+                                    )?;
+                                }
+                            }
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    })?;
                 } else {
-                    0
-                };
-                entries[n] = HashEntry {
-                    hash,
-                    rowid,
-                    row,
-                    keyed,
-                    matched: false,
-                };
-                if keyed {
-                    let bucket = (hash as usize) & (buckets_len - 1);
-                    next[n] = buckets[bucket];
-                    buckets[bucket] = n as u32;
+                    storage.record_relation_scan(
+                        txid,
+                        build_slot,
+                        None,
+                        0,
+                        crate::sql::datetime::now_micros(),
+                    )?;
+                    storage.for_each_row_state(build_slot, &mut |rowid, state| {
+                        let Some(home) =
+                            storage.visible_row_home(build_slot, rowid, state, txid)?
+                        else {
+                            return Ok(ControlFlow::Continue(()));
+                        };
+                        storage.record_relation_tuple_read(txid, build_slot, None)?;
+                        let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
+                        let mut buffer = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, build_schema, &mut buffer)?;
+                        insert(
+                            Some(rowid),
+                            BoundRow::Encoded(bytes),
+                            &buffer[..build_schema.len()],
+                        )?;
+                        Ok(ControlFlow::Continue(()))
+                    })?;
                 }
-                n += 1;
-                Ok(())
+                let entries = &mut entries[..n];
+                let next = &*next;
+                let buckets = &*buckets;
+                nodes.hash.hash_table(instrument::HashTable {
+                    tuples: n as u64,
+                    tuple_bytes,
+                    own_bytes: allocated,
+                });
+                drop(build_loop);
+                drop(hash_loop);
+                Ok(BuiltHashTable {
+                    entries,
+                    next,
+                    buckets,
+                    buckets_len,
+                })
             };
-        if let Some(run) = build_external_run {
-            let mut reader = storage.external_run_reader()?;
-            storage
-                .with_block_store(|blocks| reader.start(blocks, run))
-                .expect("external run has a block store")?;
-            while let Some(bytes) = reader.row() {
-                let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                decode_hash_source(
-                    BoundRow::Encoded(bytes),
-                    build_schema,
-                    true,
-                    arena,
-                    &mut values,
-                )?;
-                insert(
-                    None,
-                    BoundRow::Encoded(bytes),
-                    &values[..build_schema.len()],
-                )?;
+        // PostgreSQL reads the outer side's first row before building the
+        // table (`ExecHashJoin`), so an outer side without a row never runs
+        // the inner one, and an empty table leaves nothing to join unless the
+        // probe rows are returned unmatched. A join returning unmatched build
+        // rows builds first.
+        let probe_rows_kept = plan.preserves_probe_rows
+            || filter_join.is_some_and(|join| join.anti && join.probes_left);
+        // Whether a probe row passes its scan's conditions, read without
+        // counting the scan: the probe loop below reads the rows again.
+        let probe_has_row = |decode_buffers: &mut RowDecodeBuffers<'a>| -> Result<bool, SqlError> {
+            let mut passes = |rowid: Option<u64>, row: BoundRow<'a>| {
+                let mark = arena.mark();
+                let result = scan_passes(probe_t, row, rowid, filters.probe, decode_buffers);
+                // SAFETY: the check keeps no reference into the row's scratch.
+                unsafe { arena.rewind_to(mark) };
+                result
+            };
+            if let Some(run) = scope.external_runs[probe_t] {
+                let mut reader = storage.external_run_reader()?;
                 storage
-                    .with_block_store(|blocks| reader.advance(blocks))
+                    .with_block_store(|blocks| reader.start(blocks, run))
                     .expect("external run has a block store")?;
+                while let Some(bytes) = reader.row() {
+                    let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                    if passes(None, BoundRow::Encoded(owned))? {
+                        return Ok(true);
+                    }
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("external run has a block store")?;
+                }
+                return Ok(false);
             }
-        } else if let Some(rows) = build_derived_rows {
-            for &bytes in rows {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                decode_hash_source(
-                    BoundRow::Encoded(bytes),
-                    build_schema,
-                    true,
-                    arena,
-                    &mut values,
-                )?;
-                insert(
-                    None,
-                    BoundRow::Encoded(bytes),
-                    &values[..build_schema.len()],
-                )?;
-            }
-        } else if let Some(demand) = pax_demand.selected_mask(build_t)
-            && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
-        {
-            storage.record_relation_scan(
-                txid,
-                build_slot,
-                None,
-                0,
-                crate::sql::datetime::now_micros(),
-            )?;
-            scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
-                for spilled in rows {
-                    storage.record_relation_tuple_read(txid, build_slot, None)?;
-                    // Rows not yet in column blocks arrive encoded.
-                    match spilled.representation {
-                        crate::storage::SpilledRowRepresentation::Values(values) => {
-                            insert(Some(spilled.rowid), BoundRow::Values(values), values)?;
-                        }
-                        crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                            let mut decoded = [Datum::Null; MAX_COLUMNS];
-                            rowenc::decode(bytes, build_schema, &mut decoded)?;
-                            insert(
-                                Some(spilled.rowid),
-                                BoundRow::Encoded(bytes),
-                                &decoded[..build_schema.len()],
-                            )?;
-                        }
+            if let Some(rows) = scope.derived[probe_t] {
+                for &bytes in rows {
+                    if passes(None, BoundRow::Encoded(bytes))? {
+                        return Ok(true);
                     }
                 }
+                return Ok(false);
+            }
+            let probe_slot = scope.slots[probe_t];
+            let count = storage.visible_row_count(probe_slot, txid)?;
+            let snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
+            let ordered = arena
+                .alloc_slice_with(count.max(1), |_| None::<crate::storage::OrderedRowSnapshot>)
+                .map_err(|_| arena_full())?;
+            let mut filled = 0usize;
+            storage.for_each_row_state(probe_slot, &mut |rowid, state| {
+                if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
+                    ordered[filled] = Some(snapshot.retain(rowid, &home)?);
+                    filled += 1;
+                }
                 Ok(ControlFlow::Continue(()))
             })?;
+            ordered[..filled]
+                .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").sort_key());
+            for row in ordered[..filled].iter().copied().flatten() {
+                let rowid = row.rowid();
+                let home = row.read()?;
+                let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
+                if passes(Some(rowid), BoundRow::Encoded(bytes))? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let mark = arena.mark();
+        let builds = keep_build || probe_has_row(decode_buffers)?;
+        // SAFETY: the check above returned only whether a row passed.
+        unsafe { arena.rewind_to(mark) };
+        let table = if builds {
+            let built = build_table(decode_buffers)?;
+            if keep_build && built.entries.is_empty() && !probe_rows_kept {
+                return Ok(());
+            }
+            built
         } else {
-            storage.record_relation_scan(
-                txid,
-                build_slot,
-                None,
-                0,
-                crate::sql::datetime::now_micros(),
-            )?;
-            storage.for_each_row_state(build_slot, &mut |rowid, state| {
-                let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)? else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                storage.record_relation_tuple_read(txid, build_slot, None)?;
-                let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
-                let mut buffer = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, build_schema, &mut buffer)?;
-                insert(
-                    Some(rowid),
-                    BoundRow::Encoded(bytes),
-                    &buffer[..build_schema.len()],
-                )?;
-                Ok(ControlFlow::Continue(()))
-            })?;
-        }
-        let entries = &mut entries[..n];
-        let next = &*next;
-        let buckets = &*buckets;
-        nodes.hash.hash_table(instrument::HashTable {
-            tuples: n as u64,
-            tuple_bytes,
-            own_bytes: allocated,
-        });
-        drop(build_loop);
-        drop(hash_loop);
+            // No probe row passes: the table is never built and every probe
+            // row is filtered.
+            BuiltHashTable {
+                entries: &mut [],
+                next: &[],
+                buckets: &[u32::MAX],
+                buckets_len: 1,
+            }
+        };
         let _probe_loop = nodes.probe.start();
 
         // Probe: each outer row resolves its key against the build table
@@ -9287,148 +9539,102 @@ fn scan_source_mode<'a>(
         }
         let probe_schema = &probe_schema[..scope.row_width(probe_t)];
         let probe_derived = scope.derived[probe_t].is_some();
-        let mut visit_probe =
-            |rowid: Option<u64>, probe_row: BoundRow<'a>| -> Result<bool, SqlError> {
-                check_timeout()?;
-                if !scan_passes(probe_t, probe_row, rowid, filters.probe, decode_buffers)? {
-                    nodes.probe.filtered();
-                    return Ok(true);
+        let mut visit_probe = |rowid: Option<u64>,
+                               probe_row: BoundRow<'a>|
+         -> Result<bool, SqlError> {
+            check_timeout()?;
+            if !scan_passes(probe_t, probe_row, rowid, filters.probe, decode_buffers)? {
+                nodes.probe.filtered();
+                return Ok(true);
+            }
+            nodes.probe.row();
+            // An empty table joins nothing: PostgreSQL stops after reading
+            // this first outer row.
+            if table.entries.is_empty() && !probe_rows_kept {
+                return Ok(false);
+            }
+            let (entries, next, buckets, buckets_len) = (
+                &mut *table.entries,
+                table.next,
+                table.buckets,
+                table.buckets_len,
+            );
+            let mut probe_values = [Datum::Null; MAX_COLUMNS];
+            decode_hash_source(
+                probe_row,
+                probe_schema,
+                probe_derived,
+                arena,
+                &mut probe_values,
+            )?;
+            let mut key_vals = [Datum::Null; 8];
+            let mut keyed = true;
+            for i in 0..nkeys {
+                key_vals[i] = match key_expressions[i] {
+                    Some((probe, _)) => side_key(probe_t, probe_row, rowid, probe, decode_buffers)?,
+                    None => probe_values[keys[i].0],
+                };
+                if key_vals[i].is_null() {
+                    keyed = false;
+                    break;
                 }
-                nodes.probe.row();
-                let mut probe_values = [Datum::Null; MAX_COLUMNS];
-                decode_hash_source(
-                    probe_row,
-                    probe_schema,
-                    probe_derived,
-                    arena,
-                    &mut probe_values,
+            }
+            let mut matched_any = false;
+            if keyed {
+                let hash = hash_key_collated_catalog(
+                    storage,
+                    txid,
+                    &key_vals[..nkeys],
+                    &hash_cols[..nkeys],
+                    &key_collations[..nkeys],
                 )?;
-                let mut key_vals = [Datum::Null; 8];
-                let mut keyed = true;
-                for i in 0..nkeys {
-                    key_vals[i] = probe_values[keys[i].0];
-                    if key_vals[i].is_null() {
-                        keyed = false;
-                        break;
+                let mut index = buckets[(hash as usize) & (buckets_len - 1)];
+                while index != u32::MAX {
+                    let candidate = index as usize;
+                    index = next[candidate];
+                    let entry = entries[candidate];
+                    if entry.hash != hash {
+                        continue;
                     }
-                }
-                let mut matched_any = false;
-                if keyed {
-                    let hash = hash_key_collated_catalog(
-                        storage,
-                        txid,
-                        &key_vals[..nkeys],
-                        &hash_cols[..nkeys],
-                        &key_collations[..nkeys],
+                    // A bucket holds colliding hashes too: compare the keys.
+                    let mut build_values = [Datum::Null; MAX_COLUMNS];
+                    decode_hash_source(
+                        entry.row,
+                        build_schema,
+                        build_derived_rows.is_some(),
+                        arena,
+                        &mut build_values,
                     )?;
-                    let mut index = buckets[(hash as usize) & (buckets_len - 1)];
-                    while index != u32::MAX {
-                        let candidate = index as usize;
-                        index = next[candidate];
-                        let entry = entries[candidate];
-                        if entry.hash != hash {
-                            continue;
-                        }
-                        // A bucket holds colliding hashes too: compare the keys.
-                        let mut build_values = [Datum::Null; MAX_COLUMNS];
-                        decode_hash_source(
-                            entry.row,
-                            build_schema,
-                            build_derived_rows.is_some(),
-                            arena,
-                            &mut build_values,
-                        )?;
-                        let mut keys_match = true;
-                        for key in 0..nkeys {
-                            if !compare_datums_collated(
-                                storage,
-                                txid,
-                                key_collations[key],
-                                &build_values[keys[key].1],
-                                &key_vals[key],
-                            )?
-                            .is_eq()
-                            {
-                                keys_match = false;
-                                break;
+                    let mut keys_match = true;
+                    for key in 0..nkeys {
+                        let build_key = match key_expressions[key] {
+                            Some((_, build)) => {
+                                side_key(build_t, entry.row, entry.rowid, build, decode_buffers)?
                             }
-                        }
-                        if !keys_match {
-                            continue;
-                        }
-                        let mut bound = [None::<BoundRow>; 2];
-                        let mut rowids = [None; 2];
-                        bound[probe_t] = Some(probe_row);
-                        rowids[probe_t] = rowid;
-                        bound[build_t] = Some(entry.row);
-                        rowids[build_t] = entry.rowid;
-                        let row = assemble(
+                            None => build_values[keys[key].1],
+                        };
+                        if !compare_datums_collated(
                             storage,
                             txid,
-                            scope,
-                            &bound,
-                            &rowids,
-                            order,
-                            2,
-                            decode_buffers,
-                            arena,
-                        )?;
-                        let chained = Chained { inner: &row, outer };
-                        if let Some(condition) = on
-                            && !join_condition_holds(condition, arena, params, &chained, hooks)?
+                            key_collations[key],
+                            &build_key,
+                            &key_vals[key],
+                        )?
+                        .is_eq()
                         {
-                            nodes.join.join_filtered();
-                            continue;
-                        }
-                        matched_any = true;
-                        if let Some(join) = filter_join {
-                            // An anti join only notes the match; a semi join
-                            // returns each query row once.
-                            let returned = entries[candidate].matched;
-                            entries[candidate].matched = true;
-                            if join.anti {
-                                if join.probes_left {
-                                    break;
-                                }
-                                continue;
-                            }
-                            if !join.probes_left && returned {
-                                continue;
-                            }
-                            if let Some(predicate) = where_clause
-                                && !where_passes(predicate, arena, params, &chained, hooks)?
-                            {
-                                where_removed(nodes.join);
-                            } else {
-                                nodes.join.row();
-                                if !f(&row)? {
-                                    return Ok(false);
-                                }
-                            }
-                            if join.probes_left {
-                                break;
-                            }
-                            continue;
-                        }
-                        entries[candidate].matched = true;
-                        if let Some(predicate) = where_clause
-                            && !where_passes(predicate, arena, params, &chained, hooks)?
-                        {
-                            where_removed(nodes.join);
-                            continue;
-                        }
-                        nodes.join.row();
-                        if !f(&row)? {
-                            return Ok(false);
+                            keys_match = false;
+                            break;
                         }
                     }
-                }
-                let anti_probe = filter_join.is_some_and(|join| join.anti && join.probes_left);
-                if !matched_any && (plan.preserves_probe_rows || anti_probe) {
+                    if !keys_match {
+                        continue;
+                    }
                     let mut bound = [None::<BoundRow>; 2];
                     let mut rowids = [None; 2];
                     bound[probe_t] = Some(probe_row);
                     rowids[probe_t] = rowid;
+                    bound[build_t] = Some(entry.row);
+                    rowids[build_t] = entry.rowid;
                     let row = assemble(
                         storage,
                         txid,
@@ -9440,18 +9646,85 @@ fn scan_source_mode<'a>(
                         decode_buffers,
                         arena,
                     )?;
-                    if let Some(predicate) = where_clause {
-                        let chained = Chained { inner: &row, outer };
-                        if !where_passes(predicate, arena, params, &chained, hooks)? {
-                            where_removed(nodes.join);
-                            return Ok(true);
+                    let chained = Chained { inner: &row, outer };
+                    if let Some(condition) = on
+                        && !join_condition_holds(condition, arena, params, &chained, hooks)?
+                    {
+                        nodes.join.join_filtered();
+                        continue;
+                    }
+                    matched_any = true;
+                    if let Some(join) = filter_join {
+                        // An anti join only notes the match; a semi join
+                        // returns each query row once.
+                        let returned = entries[candidate].matched;
+                        entries[candidate].matched = true;
+                        if join.anti {
+                            if join.probes_left {
+                                break;
+                            }
+                            continue;
                         }
+                        if !join.probes_left && returned {
+                            continue;
+                        }
+                        if let Some(predicate) = where_clause
+                            && !where_passes(predicate, arena, params, &chained, hooks)?
+                        {
+                            where_removed(nodes.join);
+                        } else {
+                            nodes.join.row();
+                            if !f(&row)? {
+                                return Ok(false);
+                            }
+                        }
+                        if join.probes_left {
+                            break;
+                        }
+                        continue;
+                    }
+                    entries[candidate].matched = true;
+                    if let Some(predicate) = where_clause
+                        && !where_passes(predicate, arena, params, &chained, hooks)?
+                    {
+                        where_removed(nodes.join);
+                        continue;
                     }
                     nodes.join.row();
-                    return f(&row);
+                    if !f(&row)? {
+                        return Ok(false);
+                    }
                 }
-                Ok(true)
-            };
+            }
+            let anti_probe = filter_join.is_some_and(|join| join.anti && join.probes_left);
+            if !matched_any && (plan.preserves_probe_rows || anti_probe) {
+                let mut bound = [None::<BoundRow>; 2];
+                let mut rowids = [None; 2];
+                bound[probe_t] = Some(probe_row);
+                rowids[probe_t] = rowid;
+                let row = assemble(
+                    storage,
+                    txid,
+                    scope,
+                    &bound,
+                    &rowids,
+                    order,
+                    2,
+                    decode_buffers,
+                    arena,
+                )?;
+                if let Some(predicate) = where_clause {
+                    let chained = Chained { inner: &row, outer };
+                    if !where_passes(predicate, arena, params, &chained, hooks)? {
+                        where_removed(nodes.join);
+                        return Ok(true);
+                    }
+                }
+                nodes.join.row();
+                return f(&row);
+            }
+            Ok(true)
+        };
         let probe_slot = scope.slots[probe_t];
         let probed_all = if !probe_derived
             && let Some(demand) = pax_demand.selected_mask(probe_t)
@@ -9564,6 +9837,7 @@ fn scan_source_mode<'a>(
         if !probed_all || !keep_build {
             return Ok(());
         }
+        let entries = table.entries;
         // The build rows no probe row matched, in their source's row order
         // (the order a nested loop returns them in), with the probe side NULL.
         let unmatched_count = entries.iter().filter(|entry| !entry.matched).count();
@@ -11365,6 +11639,7 @@ fn scan_source_mode<'a>(
             planning_where_clause,
             order,
             None,
+            true,
             txid,
             arena,
         )?

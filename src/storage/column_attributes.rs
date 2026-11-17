@@ -262,6 +262,14 @@ impl<B: DefinitionBacking> ColumnAttributes<B> {
             .map(|position| position as u16 + 1)
     }
 
+    /// The dropped attributes, which keep their numbers.
+    pub(crate) fn dropped(&self) -> usize {
+        self.slots.as_ref()[..usize::from(self.count)]
+            .iter()
+            .filter(|slot| matches!(slot, AttributeSlot::Dropped { .. }))
+            .count()
+    }
+
     pub(crate) fn column(&self, number: u16) -> Option<usize> {
         match *self
             .slots

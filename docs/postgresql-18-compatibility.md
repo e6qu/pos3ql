@@ -1275,29 +1275,24 @@ Where pos3ql's planner has the same choice, the setting decides it:
   `cpu_tuple_cost`, `cpu_index_tuple_cost`, `cpu_operator_cost` and
   `effective_cache_size` apply as in PostgreSQL.
 - `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop` choose
-  between a hash join, a merge join and a nested loop, and
-  `enable_material` drops the `Materialize` step `EXPLAIN` shows over a
-  nested loop's inner sequential scan. For example, `SELECT * FROM a JOIN b
-  ON a.id = b.id` over two analyzed tables without indexes is planned with
-  PostgreSQL's costs: `EXPLAIN` prints the same plan and costs, and the rows
-  come back in the same order.
+  between a hash join, a merge join and a nested loop, `enable_material`
+  drops the `Materialize` step `EXPLAIN` shows over a nested loop's inner
+  sequential scan, and `enable_memoize` drops the `Memoize` cache over a
+  nested loop's inner index scan. For example, `SELECT * FROM a JOIN b ON
+  a.id = b.a_id` over two analyzed tables, with `a.id` a primary key and an
+  index on `b.a_id`, is planned with PostgreSQL's costs: `EXPLAIN` prints
+  the same plan and costs (a hash join, or a nested loop over an index scan
+  of `b` for each row of `a`), and the rows come back in the same order.
 - When every way to run a step is disabled, the step still runs and `EXPLAIN`
   marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
   followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
   `Seq Scan on t` with `Disabled: true`. A disabled sort or hashed aggregate is
   marked the same way.
 
-The other settings name plan types or cost inputs pos3ql's planner does not
-have, so they change no plan, just as disabling an unused method changes
-nothing in PostgreSQL: there is no merge join (`enable_mergejoin`), parallel
-query, JIT, genetic optimizer, memoize, incremental sort, TID scan or
-partitionwise planning, and pos3ql's costs come from its own storage model
-rather than `seq_page_cost`-style constants. Two choices PostgreSQL makes
-differently: with index scans disabled PostgreSQL can still read a B-tree
-index through a bitmap heap scan, which pos3ql does not have, so pos3ql scans
-sequentially; and with sequential scans disabled PostgreSQL can read a whole
-table through any B-tree index, while pos3ql uses an index only for a
-condition or ordering it serves.
+The other settings name plan types pos3ql's planner does not have, so they
+change no plan, just as disabling an unused method changes nothing in
+PostgreSQL: there is no parallel query, JIT, genetic optimizer, TID scan or
+partitionwise planning.
 
 ### Cursor capacity
 
@@ -1370,10 +1365,10 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
   node, a merge join's `Merge Cond` and sorts, and a nested loop's `Join
   Filter` and `Materialize` inner scan, in PostgreSQL's layout. Joins of
-  plain tables without indexes, inner-joined by column equalities, follow
-  PostgreSQL's join search and costs; other joins keep pos3ql's own order
-  and methods, without merge joins, and `EXPLAIN` with costs refuses them
-  with `0A000`. A statement a rewrite rule
+  plain tables, inner-joined by column equalities, follow PostgreSQL's join
+  search and costs, index scans and `Memoize` included; other joins keep
+  pos3ql's own order and methods, and `EXPLAIN` with costs refuses them with
+  `0A000`. A statement a rewrite rule
   changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.

@@ -46,8 +46,6 @@ struct Writer<'w, 'm, 's, 'a> {
     arena: &'a Arena,
 }
 
-const ANALYZE: &str = "EXPLAIN ANALYZE of a merge join is not supported";
-
 impl Writer<'_, '_, '_, '_> {
     fn node(&self, name: &str, path: &Path, depth: u8) -> PlanNode {
         PlanNode {
@@ -86,16 +84,40 @@ impl Writer<'_, '_, '_, '_> {
     fn path(&mut self, plan: &mut Plan<'_>, id: u32, depth: u8) -> Result<(), SqlError> {
         let path = *self.model.plan.path(id);
         match path.kind {
-            PathKind::Scan { rel } => self.scan(plan, usize::from(rel), depth),
+            PathKind::Scan { rel, path } => self.scan(plan, usize::from(rel), path, depth),
             PathKind::Material { input } => {
                 let node = self.node("Materialize", &path, depth);
                 plan.push(self.keyed(node, query::instrument::Role::Materialize, id))?;
+                self.path(plan, input, depth + 1)
+            }
+            PathKind::Memoize {
+                input,
+                keys,
+                key_count,
+                ..
+            } => {
+                let mut key = StackStr::<512>::new();
+                for (at, member) in keys[..usize::from(key_count)].iter().enumerate() {
+                    if at > 0 {
+                        let _ = write!(key, ", ");
+                    }
+                    self.column(
+                        (usize::from(member.rel), usize::from(member.column)),
+                        &mut key,
+                    );
+                }
+                let node = self
+                    .node("Memoize", &path, depth)
+                    .with_qual(QualLabel::CacheKey, Some(key))
+                    .with_qual(QualLabel::CacheMode, Some(StackStr::from_str("logical")));
+                plan.push(self.keyed(node, query::instrument::Role::Memoize, id))?;
                 self.path(plan, input, depth + 1)
             }
             PathKind::NestLoop {
                 outer,
                 inner,
                 clauses,
+                inner_unique: _,
             } => {
                 let node = self
                     .node("Nested Loop", &path, depth)
@@ -126,33 +148,44 @@ impl Writer<'_, '_, '_, '_> {
                 outer,
                 inner,
                 merge,
+                clauses,
                 outer_sort,
                 inner_sort,
                 materialize_inner,
                 ..
             } => {
                 let outer_relids = self.model.plan.path(outer).relids;
-                let node = PlanNode {
-                    analyze_unsupported: Some(ANALYZE),
-                    ..self.node("Merge Join", &path, depth).with_qual(
+                // The clauses no merge key applies are its `Join Filter`.
+                let mut filter = ClauseList::EMPTY;
+                for &clause in clauses.as_slice() {
+                    if !merge.as_slice().contains(&clause) {
+                        let _ = filter.push_id(clause);
+                    }
+                }
+                let node = self
+                    .node("Merge Join", &path, depth)
+                    .with_qual(
                         QualLabel::MergeCond,
                         self.conditions(&merge, Some(outer_relids)),
                     )
-                };
-                plan.push(node)?;
-                self.sorted(plan, outer, outer_sort, false, depth + 1)?;
-                self.sorted(plan, inner, inner_sort, materialize_inner, depth + 1)
+                    .with_qual(QualLabel::JoinFilter, self.conditions(&filter, None));
+                plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
+                self.sorted(plan, id, outer, outer_sort, false, 0, depth + 1)?;
+                self.sorted(plan, id, inner, inner_sort, materialize_inner, 1, depth + 1)
             }
         }
     }
 
     /// An input of a merge join: its sort and the `Materialize` above it.
+    #[allow(clippy::too_many_arguments)]
     fn sorted(
         &mut self,
         plan: &mut Plan<'_>,
+        join: u32,
         id: u32,
         keys: Keys,
         materialize: bool,
+        side: u8,
         depth: u8,
     ) -> Result<(), SqlError> {
         let settings = self.model.plan.settings;
@@ -182,44 +215,101 @@ impl Writer<'_, '_, '_, '_> {
                 total,
                 ..below
             };
-            plan.push(self.node("Materialize", &material, depth))?;
+            let node = self.node("Materialize", &material, depth);
+            plan.push(self.keyed(node, query::instrument::Role::Materialize, join))?;
             depth += 1;
         }
         if let Some(sorted) = sorted {
             let mut node = self.node("Sort", &sorted, depth);
             node.keys = self.sort_keys(&keys, input.relids);
-            plan.push(node)?;
+            plan.push(self.keyed(
+                node,
+                |number| query::instrument::Role::MergeSort(number, side),
+                join,
+            ))?;
             depth += 1;
         }
         self.path(plan, id, depth)
     }
 
-    fn scan(&mut self, plan: &mut Plan<'_>, rel: usize, depth: u8) -> Result<(), SqlError> {
+    /// The scan of path `path` of relation `rel`: its index conditions,
+    /// filter and recheck, a parameterized path's reading the outer
+    /// relation's columns qualified.
+    fn scan(
+        &mut self,
+        plan: &mut Plan<'_>,
+        rel: usize,
+        path: u16,
+        depth: u8,
+    ) -> Result<(), SqlError> {
         let modeled = self.model.rels[rel];
+        let scan = modeled.scan(self.storage, self.txid, path, &[], self.arena)?;
         let single =
             QueryScope::resolve_schema(self.storage, modeled.from, self.txid, self.arena, None)?;
-        let (mut node, _) = chosen_scan_node(&single, depth, &modeled.path);
+        let (mut node, used) = chosen_scan_node(&single, depth, &scan.path);
         let definition = single.defs.stored(0).expect("a plain table");
-        let filter = single_relation_quals(
-            self.storage,
-            self.txid,
-            single.names[0],
-            definition,
-            &[],
-            modeled.restriction,
-            &[],
-            None,
-            false,
-            self.arena,
-        )?
-        .1;
-        node = node.with_qual(QualLabel::Filter, filter);
+        let pushed = super::push_outer_mask(self.scope, u32::from(scan.param));
+        let quals = |index: Option<&query::IndexAccessPlan<'_>>| {
+            single_relation_quals(
+                self.storage,
+                self.txid,
+                single.names[0],
+                definition,
+                &[],
+                scan.condition,
+                &[],
+                index,
+                false,
+                self.arena,
+            )
+        };
+        let printed = (|| {
+            let (index_cond, filter) = quals(used.as_ref())?;
+            let recheck = match (scan.path.kind, used.as_ref()) {
+                (query::index_paths::ScanKind::Bitmap, Some(used)) => {
+                    quals(Some(&used.written()))?.0
+                }
+                _ => None,
+            };
+            let mut leaves = [(None, None); 64];
+            for (at, node) in scan.path.bitmap.iter().enumerate().take(64) {
+                if let query::index_paths::BitmapPlanKind::Index { conditions, .. } = node.kind {
+                    let leaf = query::IndexAccessPlan::chosen_conditions(query::ChosenConditions {
+                        conditions,
+                        recheck: &[],
+                        absorbed: &[],
+                    });
+                    leaves[at] = (quals(Some(&leaf))?.0, None);
+                }
+            }
+            Ok::<_, SqlError>((index_cond, filter, recheck, leaves))
+        })();
+        super::pop_outer_relations(pushed);
+        let (index_cond, filter, recheck, leaves) = printed?;
+        node = node
+            .with_qual(QualLabel::IndexCond, index_cond)
+            .with_qual(QualLabel::Filter, filter);
+        if recheck.is_some() {
+            node = node.with_qual(QualLabel::RecheckCond, recheck);
+        }
         node.output_unprintable = true;
+        let block = self.block.child(query::join_exec_scan_segment(rel));
         node.key = Some(query::instrument::NodeKey::new(
-            self.block.child(query::join_exec_scan_segment(rel)),
+            block,
             query::instrument::Role::Scan(0),
         ));
-        plan.push(node)
+        if scan.path.bitmap.len() > 1 {
+            let depth = node.depth;
+            super::push_scan(plan, node)?;
+            return super::push_bitmap_tree(
+                plan,
+                scan.path.bitmap,
+                &leaves[..scan.path.bitmap.len()],
+                depth,
+                block,
+            );
+        }
+        super::push_scan(plan, node)
     }
 
     /// `relation.column`, as the join prints a column.

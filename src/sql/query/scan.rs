@@ -6377,6 +6377,43 @@ pub(super) fn scan_source_with_pax_columns<'a>(
     )
 }
 
+/// The scan of one relation by the path the running query's shape
+/// describes (a join's base relation, [`super::join_exec`]): pos3ql's own
+/// lookups of an outer row's key never replace that path, whose order and
+/// counts are PostgreSQL's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_described_path<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_demand: PaxReadDemand,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    scan_source_mode(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        false,
+        None,
+        pax_demand,
+        None,
+        false,
+        f,
+    )
+}
+
 /// Recycling source scan with an explicit complete-row or proven-column PAX
 /// read mode.
 #[allow(clippy::too_many_arguments)]

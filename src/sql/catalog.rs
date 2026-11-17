@@ -10236,6 +10236,9 @@ pub(crate) struct PlannerIndex {
     /// A key uses a class defined in the catalog, or the index backs an
     /// exclusion constraint.
     pub(crate) catalog_classes: bool,
+    /// Duplicates are rejected as rows change (`indimmediate`), not at
+    /// commit by a deferrable constraint.
+    pub(crate) immediate: bool,
 }
 
 /// Visits each index of the table in `table_slot`.
@@ -10295,6 +10298,11 @@ pub(crate) fn planner_indexes(
                 column_collation,
                 pattern_keys,
                 catalog_classes,
+                immediate: index
+                    .explicit_definition
+                    .map_or(!index.timing.is_deferrable(), |definition| {
+                        definition.immediate
+                    }),
             });
         },
     );

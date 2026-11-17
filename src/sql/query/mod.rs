@@ -27,6 +27,7 @@ use super::types::{ColDesc, ColType, Datum};
 mod backward_scan;
 pub(super) mod input_progress;
 pub(crate) use backward_scan::{select_scans_backward, set_query_scans_backward};
+pub(crate) mod index_key_calls;
 mod invocation_results;
 mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
@@ -109,6 +110,7 @@ pub(crate) use catalog_images::{
     enter_statement as enter_catalog_snapshot,
 };
 pub(crate) use scope::prebuild_statement_catalog_images;
+mod collation_check;
 mod cte;
 mod view_write;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
@@ -2129,6 +2131,11 @@ pub(crate) struct RoutineInvocationState {
     /// Only calls that need the engine (PL/pgSQL bodies) go through this
     /// log; a utility statement runs other routines where it evaluates.
     engine_calls_only: bool,
+    /// Engine calls made while evaluating index keys, kept by key site.
+    key_calls: Cell<index_key_calls::KeyCalls>,
+    /// The engine is running a collected index key call, whose result
+    /// goes to [`Self::key_calls`].
+    completing_key_call: Cell<bool>,
 }
 
 /// What a statement keeps of its foreign scans across attempts.
@@ -2729,6 +2736,8 @@ impl RoutineInvocationState {
             foreign: Cell::new(None),
             pending_restricted: Cell::new(false),
             engine_calls_only: false,
+            key_calls: Cell::new(index_key_calls::KeyCalls::new()),
+            completing_key_call: Cell::new(false),
         }
     }
 
@@ -3117,6 +3126,7 @@ impl RoutineInvocationState {
     }
 
     pub(crate) fn begin_attempt(&self) {
+        self.begin_key_attempt();
         let first = self.first.get();
         self.next.set(first.calls);
         self.attempt.set(self.attempt.get().wrapping_add(1));
@@ -3140,6 +3150,34 @@ impl RoutineInvocationState {
         access: super::eval::RoutineCallAccess,
     ) -> Result<Option<Datum<'query>>, SqlError> {
         self.require_arena(statement_arena)?;
+        let pending = || -> Result<PendingRoutineInvocation, SqlError> {
+            Ok(PendingRoutineInvocation {
+                constant_arguments: call_arguments_constant(),
+                plan_owner: super::type_input_plans::owner()?,
+                source_position,
+                input_collation,
+                access,
+                target: PendingRoutineTarget::Stored(
+                    statement_arena
+                        .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "pending routine type contract exceeds statement memory"
+                            )
+                        })?,
+                ),
+                arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
+                argument_count: arguments.len(),
+            })
+        };
+        match self.key_call(statement_arena, pending)? {
+            index_key_calls::KeyCall::Unkeyed => {}
+            index_key_calls::KeyCall::Kept(value) => {
+                return Ok(Some(value.scalar(statement_arena, query_arena)?));
+            }
+            index_key_calls::KeyCall::Placeholder => return Ok(Some(Datum::Null)),
+        }
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.results.borrow().len() {
@@ -3159,25 +3197,7 @@ impl RoutineInvocationState {
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
-        self.pending.set(Some(PendingRoutineInvocation {
-            constant_arguments: call_arguments_constant(),
-            plan_owner: super::type_input_plans::owner()?,
-            source_position,
-            input_collation,
-            access,
-            target: PendingRoutineTarget::Stored(
-                statement_arena
-                    .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "pending routine type contract exceeds statement memory"
-                        )
-                    })?,
-            ),
-            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
-            argument_count: arguments.len(),
-        }));
+        self.pending.set(Some(pending()?));
         Err(sql_err!(
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable SQL routine invocation is pending"
@@ -3362,6 +3382,18 @@ impl RoutineInvocationState {
     ) -> Result<(), SqlError> {
         self.require_arena(arena)?;
         value.validate(arena)?;
+        if self.completing_key_call.get() {
+            let OwnedRoutineResult::Scalar(value) = value else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "an index key call returned rows"
+                ));
+            };
+            let mut calls = self.key_calls.get();
+            calls.complete_collected(arena, value)?;
+            self.key_calls.set(calls);
+            return Ok(());
+        }
         let replay = super::sequence::finish_replay_cursor(self.pending_replay.take(), scratch)?;
         self.results
             .borrow_mut()
@@ -6410,6 +6442,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::exec::coerce_user_type_array_element(
             value,
             super::types::ArrElem::Composite(Some(slot)),
+            super::eval::DomainCoercion::Input,
             self.storage,
             self.txid,
             arena,
@@ -8760,10 +8793,34 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             })
     }
 
+    fn coerce_domain_base<'a>(
+        &self,
+        type_name: &str,
+        value: Datum<'a>,
+        coercion: super::eval::DomainCoercion,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) else {
+            return Ok(None);
+        };
+        super::exec::constraints::coerce_domain_base_value(
+            self.storage,
+            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)),
+            value,
+            coercion,
+            self.txid,
+            arena,
+        )
+        .map(Some)
+        .map_err(|error| domain_cast_error(error, type_name))
+    }
+
     fn cast_user_type<'a>(
         &self,
         type_name: &str,
         value: Datum<'a>,
+        coercion: super::eval::DomainCoercion,
+
         arena: &'a Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
@@ -8787,24 +8844,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let element = super::types::ArrElem::from_coltype(domain.base())
                     .expect("information_schema domains have array element bases");
                 // Array text is element input, which rejects an overlong value
-                // where a cast from another array truncates it.
-                let input = matches!(value, Datum::Text(_));
-                let array = super::eval::cast_to(value, ColType::Array(element), arena)?;
-                let array = if input {
-                    super::exec::apply_typmod(
-                        array,
-                        ColType::Array(element),
-                        domain.base_type_mod(),
-                        arena,
-                    )?
+                // where a cast from another array follows the cast's context.
+                let coercion = if matches!(value, Datum::Text(_)) {
+                    super::eval::DomainCoercion::Input
                 } else {
-                    super::exec::apply_cast_typmod(
-                        array,
-                        ColType::Array(element),
-                        domain.base_type_mod(),
-                        arena,
-                    )?
+                    coercion
                 };
+                let array = super::eval::cast_to(value, ColType::Array(element), arena)?;
+                let array = super::exec::apply_coercion_typmod(
+                    array,
+                    ColType::Array(element),
+                    domain.base_type_mod(),
+                    coercion,
+                    arena,
+                )?;
                 if let Datum::Array { raw, .. } = array {
                     for item in super::array::elements(raw, element) {
                         domain.validate(&item)?;
@@ -8813,8 +8866,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 return Ok(Some(array));
             }
             let base = super::eval::cast_to(value, domain.base(), arena)?;
-            let base =
-                super::exec::apply_cast_typmod(base, domain.base(), domain.base_type_mod(), arena)?;
+            let base = super::exec::apply_coercion_typmod(
+                base,
+                domain.base(),
+                domain.base_type_mod(),
+                coercion,
+                arena,
+            )?;
+
             domain.validate(&base)?;
             return Ok(Some(base));
         }
@@ -8825,6 +8884,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     super::types::ArrElem::Enum(Some(
                         self.storage.enum_for(slot, self.txid).creation(),
                     )),
+                    coercion,
                     self.storage,
                     self.txid,
                     arena,
@@ -8845,6 +8905,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 return super::exec::coerce_user_type_array(
                     value,
                     element,
+                    coercion,
                     self.storage,
                     self.txid,
                     arena,
@@ -8858,6 +8919,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     super::types::ArrElem::Composite(Some(
                         self.storage.composite_for(slot, self.txid).creation(),
                     )),
+                    coercion,
                     self.storage,
                     self.txid,
                     arena,
@@ -8874,6 +8936,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     super::types::ArrElem::Composite(Some(
                         self.storage.relation_row_type_creation(relation),
                     )),
+                    coercion,
                     self.storage,
                     self.txid,
                     arena,
@@ -8890,31 +8953,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     slot,
                 )),
                 value,
+                coercion,
                 self.txid,
                 arena,
                 super::eval::NO_PARAMS,
                 sequences,
             )
             .map(Some)
-            .map_err(|error| {
-                // PostgreSQL names the domain, not its base type, when no
-                // cast reaches it.
-                let message = error.message.as_str();
-                match message.rfind(" to ") {
-                    Some(at)
-                        if error.sqlstate.as_str() == sqlstate::CANNOT_COERCE
-                            && message.starts_with("cannot cast type ") =>
-                    {
-                        sql_err!(
-                            sqlstate::CANNOT_COERCE,
-                            "{} to {}",
-                            &message[..at],
-                            crate::sql::type_name_miss::split_type_name(type_name).1
-                        )
-                    }
-                    _ => error,
-                }
-            });
+            .map_err(|error| domain_cast_error(error, type_name));
         }
         if let Some(slot) = self.storage.resolve_composite_slot(type_name, self.txid) {
             return match value {
@@ -12276,11 +12322,12 @@ fn rewrite_grouped_expr<'a>(
             left: rewrite(left)?,
             right: rewrite(right)?,
         }),
-        Expr::Cast { operand, type_name, type_mod, binding , .. } => alloc(Expr::Cast {source_position: e.source_position(),
+        Expr::Cast { operand, type_name, type_mod, binding, context, .. } => alloc(Expr::Cast {source_position: e.source_position(),
             operand: rewrite(operand)?,
             type_name,
             type_mod: *type_mod,
             binding: *binding,
+            context: *context,
         }),
         Expr::BoundDefault { expression, type_oid } => alloc(Expr::BoundDefault {
             expression: rewrite(expression)?,
@@ -12695,6 +12742,7 @@ fn check_select_constants_in<'a>(
         check_fromless_literal_operands(statement, arena, storage, txid)?;
     }
     let catalog = storage_catalog(storage, arena, txid);
+
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             super::eval::check_constant_errors(expression, arena, Some(&catalog))?;
@@ -12787,13 +12835,15 @@ fn fold_select_constants_in<'a>(
             check_fromless_literal_operands(statement, arena, storage, txid)
         })?;
     }
+    check_select_analysis(statement, storage, txid, arena)?;
+
     let catalog = storage_catalog(storage, arena, txid);
     let Some(from) = &statement.from else {
         return with_level_columns(None, &catalog, |columns| {
             fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
         });
     };
-    if !level_calls_sql_function(statement, storage, txid) {
+    if !level_calls_sql_function(statement, storage, txid) && !level_negates_null_test(statement) {
         return fold_select_level(statement, arena, storage, txid, &catalog, None);
     }
     // A level whose sources this folding cannot type (a view or a `WITH`
@@ -12814,6 +12864,102 @@ fn fold_select_constants_in<'a>(
     }
 }
 
+/// PostgreSQL names the domain `type_name`, not its base type, when no cast
+/// reaches it.
+fn domain_cast_error(error: SqlError, type_name: &str) -> SqlError {
+    let message = error.message.as_str();
+    match message.rfind(" to ") {
+        Some(at)
+            if error.sqlstate.as_str() == sqlstate::CANNOT_COERCE
+                && message.starts_with("cannot cast type ") =>
+        {
+            sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "{} to {}",
+                &message[..at],
+                crate::sql::type_name_miss::split_type_name(type_name).1
+            )
+        }
+        _ => error,
+    }
+}
+
+/// `process_equivalence`: a top-level condition `X = X` of a strict
+/// equality whose operand calls nothing volatile is the condition
+/// `X IS NOT NULL` (a false and a null result are the same there), which the
+/// planner prints and estimates instead. Conditions under `OR` or `NOT`, and
+/// any `=` while a user-defined `=` operator exists, keep their form.
+fn self_equalities_as_null_tests<'a>(
+    condition: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    match condition {
+        Expr::Binary {
+            source_position,
+            operator: crate::sql::ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let new_left = self_equalities_as_null_tests(left, storage, txid, arena)?;
+            let new_right = self_equalities_as_null_tests(right, storage, txid, arena)?;
+            if core::ptr::eq(new_left, *left) && core::ptr::eq(new_right, *right) {
+                return Ok(condition);
+            }
+            arena
+                .alloc(Expr::Binary {
+                    source_position: *source_position,
+                    operator: crate::sql::ast::BinaryOp::And,
+                    left: new_left,
+                    right: new_right,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } if left == right
+            && !left.is_row_constructor()
+            && !left.is_constant(true)
+            && !left.contains_subquery()
+            && !expression_contains_volatile(left, storage, txid, false)
+            && !storage.has_visible_operator_named("=", txid) =>
+        {
+            arena
+                .alloc(Expr::IsNull {
+                    operand: left,
+                    negated: true,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        _ => Ok(condition),
+    }
+}
+
+/// The checks PostgreSQL's parse analysis makes of a query level before the
+/// planner folds anything: the untyped literals of built-in functions in
+/// `FROM` convert to their parameters' types, and explicit collations meet
+/// (`assign_collations`). A declared cursor makes them even when its query
+/// runs only at its first read.
+pub(crate) fn check_select_analysis(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if let Some(from) = statement.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            srf::validate_builtin_literal_arguments(table, storage, txid, arena)?;
+        }
+    }
+    collation_check::check_level(statement, storage, txid, arena)
+}
+
 /// Whether `expression`, outside its subqueries, calls a SQL function
 /// PostgreSQL's planner may inline.
 fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
@@ -12832,6 +12978,36 @@ fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid:
         Ok(())
     });
     found
+}
+
+/// Whether a condition of this query level negates a null test, which the
+/// folding rewrites by its operand's type.
+fn level_negates_null_test(statement: &Select<'_>) -> bool {
+    fn negates(expression: &Expr<'_>) -> bool {
+        if let Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+            ..
+        } = expression
+            && matches!(operand, Expr::IsNull { .. })
+        {
+            return true;
+        }
+        let mut found = false;
+        let _ = walk_children(expression, &mut |child| {
+            found |= negates(child);
+            Ok(())
+        });
+        found
+    }
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    joins
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .any(negates)
 }
 
 /// Whether a select-list, join or condition expression of this query level
@@ -12969,7 +13145,10 @@ fn fold_select_level<'a>(
                 }
             }
             if let Some(on) = join.on {
-                let folded = fold(on)?;
+                let mut folded = fold(on)?;
+                if join.kind == crate::sql::ast::JoinKind::Inner {
+                    folded = self_equalities_as_null_tests(folded, storage, txid, arena)?;
+                }
                 folded_any |= !core::ptr::eq(folded, on);
                 join.on = Some(folded);
             }
@@ -12979,7 +13158,9 @@ fn fold_select_level<'a>(
             changed = true;
         }
     }
-    rebuilt.where_clause = fold_optional(statement.where_clause)?;
+    rebuilt.where_clause = fold_optional(statement.where_clause)?
+        .map(|clause| self_equalities_as_null_tests(clause, storage, txid, arena))
+        .transpose()?;
     rebuilt.having = fold_optional(statement.having)?;
     rebuilt.offset = fold_optional(statement.offset)?;
     rebuilt.limit = fold_optional(statement.limit)?;
@@ -13075,6 +13256,29 @@ fn fold_update_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Update<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
+    collation_check::check_expressions(
+        statement
+            .assignments
+            .iter()
+            .map(|(_, expression)| *expression)
+            .chain(returning_expressions(statement.returning.items))
+            .chain(statement.where_clause),
+        storage,
+        txid,
+        arena,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.from,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| Some(scope))
+        },
+    )?;
     let written = statement
         .assignments
         .iter()
@@ -13099,18 +13303,94 @@ fn fold_update_constants_in<'a>(
         },
         arena,
     )?;
-    match &scope {
+    let folded = match &scope {
         Some(scope) => with_level_columns(Some(scope), &catalog, |columns| {
             fold_update_level(statement, arena, &catalog, Some(columns))
         }),
         None => fold_update_level(statement, arena, &catalog, None),
+    }?;
+    if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(statement.table.schema, statement.table.name, txid)
+    {
+        check_constant_assignments(folded.assignments, slot, storage, txid, arena)?;
     }
+    Ok(folded)
+}
+
+/// PostgreSQL's planner folds the conversion of a constant assigned to a
+/// column (`expand_targetlist`'s coercion): the base type's length coercion
+/// fails while the statement is planned, whether or not a row is changed,
+/// while a domain's own rules wait for a row.
+fn check_constant_assignments<'a>(
+    assignments: &[(&'a str, &'a Expr<'a>)],
+    table: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let definition = storage.table_def(table, txid);
+    for (name, expression) in assignments {
+        if !expression.is_literal_constant() {
+            continue;
+        }
+        let Some(column) = definition
+            .column_index(name)
+            .map(|index| definition.columns()[index])
+        else {
+            continue;
+        };
+        let catalog = storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..super::eval::NO_HOOKS
+        };
+        let value = super::eval::eval_full(
+            expression,
+            arena,
+            super::eval::NO_PARAMS,
+            &super::eval::NoColumns,
+            &hooks,
+        )?;
+        if value.is_null() {
+            continue;
+        }
+        // Only the length coercion's failure is the planner's: a value the
+        // type's input or cast rejects fails at analysis, as before.
+        let coerced = match super::exec::constraints::column_domain_target(storage, &column, txid)?
+        {
+            Some(domain) => super::exec::constraints::coerce_domain_base_value(
+                storage,
+                domain,
+                value,
+                super::eval::DomainCoercion::Assignment,
+                txid,
+                arena,
+            ),
+            None if column.type_mod != -1 => super::eval::cast_to(value, column.ctype, arena)
+                .and_then(|value| {
+                    super::exec::apply_coercion_typmod(
+                        value,
+                        column.ctype,
+                        column.type_mod,
+                        super::eval::DomainCoercion::Assignment,
+                        arena,
+                    )
+                }),
+            None => continue,
+        };
+        if let Err(error) = coerced
+            && error.is_type_modifier_coercion()
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// The expressions of a `RETURNING` list.
 fn returning_expressions<'s, 'a>(
     items: &'s [SelectItem<'a>],
-) -> impl Iterator<Item = &'a Expr<'a>> + 's {
+) -> impl Iterator<Item = &'a Expr<'a>> + Clone + 's {
     items.iter().filter_map(|item| match item {
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             Some(*expression)
@@ -13416,6 +13696,24 @@ fn fold_delete_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
+    collation_check::check_expressions(
+        returning_expressions(statement.returning.items).chain(statement.where_clause),
+        storage,
+        txid,
+        arena,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.using,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| Some(scope))
+        },
+    )?;
     let written = statement
         .where_clause
         .into_iter()

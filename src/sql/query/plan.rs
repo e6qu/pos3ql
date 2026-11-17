@@ -1030,15 +1030,9 @@ pub(super) fn simplify_qual<'a>(
                     operand: inner,
                     ..
                 } => inner,
-                Expr::IsNull {
-                    operand: inner,
-                    negated,
-                } => arena
-                    .alloc(Expr::IsNull {
-                        operand: inner,
-                        negated: !negated,
-                    })
-                    .map_err(|_| arena_full())?,
+                // A null test of a row differs from its negation's
+                // (`ROW(1, NULL)` is neither null nor not null); constant
+                // folding flips one whose operand it types as a scalar.
                 // A comparison flips to its negator, as PostgreSQL's
                 // `negate_clause` does (exact under three-valued logic:
                 // both sides yield NULL together). This is load-bearing for

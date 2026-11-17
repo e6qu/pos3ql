@@ -780,14 +780,16 @@ pub(crate) fn expression_error(
                     || crate::sql::types::ColType::from_sql_name(type_name)
                         .is_some_and(crate::sql::types::ColType::is_reg_object)
                         && error.sqlstate.internal_control().is_none())
-                // A built-in type's length coercion runs after its input; a
-                // composite's or domain's input applies its fields' and
-                // base type's modifiers itself.
+                // A built-in type's and a domain's length coercion run after
+                // the input; a composite's and a domain array's input apply
+                // their fields' and base type's modifiers themselves.
+                && !error.is_type_modifier_coercion()
                 && (!is_type_modifier_failure(message)
                     || crate::sql::types::ColType::from_sql_name(
                         type_name.trim_end_matches("[]"),
                     )
                     .is_none())
+
             {
                 at_subject(error, literal)
             } else {

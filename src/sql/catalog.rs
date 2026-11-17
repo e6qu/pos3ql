@@ -4976,6 +4976,7 @@ pub(crate) fn validate_enum_input_literal(
                 super::exec::coerce_user_type_array(
                     Datum::Text(text),
                     super::types::ArrElem::Enum(creation),
+                    super::eval::DomainCoercion::Input,
                     storage,
                     txid,
                     scratch,
@@ -11591,6 +11592,32 @@ pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
         }
     }
     Some(true)
+}
+
+/// Whether a built-in operator named `name` of PostgreSQL 18.6 could take
+/// operands of the built-in types `operands` (a prefix operator's one, a
+/// binary operator's two): each the same as its parameter, implicitly
+/// castable to it, untyped, or the parameter polymorphic.
+pub(crate) fn builtin_operator_accepts(name: &str, operands: &[i32]) -> bool {
+    let kind = if operands.len() == 2 { b'b' } else { b'l' };
+    let accepts = |actual: i32, declared: i32| {
+        actual == declared
+            || actual == super::types::oid::UNKNOWN
+            || is_polymorphic_pseudo_type(declared)
+            || builtin_cast_context(actual, declared)
+                .is_some_and(crate::storage::CastContext::permits_implicit)
+    };
+    super::catalog_operator_rows::OPERATOR_ROWS
+        .iter()
+        .any(|row| {
+            row.1 == name
+                && row.2 == kind
+                && match operands {
+                    [left, right] => accepts(*left, row.5) && accepts(*right, row.6),
+                    [operand] => accepts(*operand, row.6),
+                    _ => false,
+                }
+        })
 }
 
 pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {

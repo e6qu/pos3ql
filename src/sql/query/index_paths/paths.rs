@@ -2377,10 +2377,6 @@ pub(crate) fn scan_path<'a>(
             (covered >= 2 && unreadable.is_some()) || (expressions && compares_expression)
         })
         .then_some(unreadable.unwrap_or("conditions on an expression a statistics object holds"));
-    let extended = extended.or_else(|| {
-        super::extended::or_through_statistics(planner.extended, restrictions)
-            .then_some("an OR a statistics object estimates")
-    });
     if let Some(shape) = extended {
         return Ok(Planned::Outside(shape));
     }

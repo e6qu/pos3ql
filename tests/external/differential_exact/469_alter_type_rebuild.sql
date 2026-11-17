@@ -34,8 +34,15 @@ BEGIN;
 ALTER TABLE ar_t ALTER COLUMN b TYPE bigint;
 ROLLBACK;
 ALTER TABLE ar_t ALTER COLUMN b TYPE bigint;
+-- ar_t_chk and ar_t_fk are re-added in the order PostgreSQL's pg_depend
+-- scan finds them, which follows their dependency rows' heap positions: in
+-- a fresh catalog their creation order, but after earlier objects were
+-- dropped from the same database, wherever free space put those rows. Both
+-- are ranked at the first of their new OIDs.
 SELECT kind, name, id = (SELECT b.id FROM ar_before b WHERE b.kind = a.kind AND b.name = a.name) AS kept,
-       rank() OVER (PARTITION BY kind ORDER BY id) AS position
+       rank() OVER (PARTITION BY kind ORDER BY CASE WHEN kind = 'constraint'
+         AND name IN ('ar_t_chk', 'ar_t_fk') THEN (SELECT min(oid)::int FROM pg_constraint
+         WHERE conname IN ('ar_t_chk', 'ar_t_fk')) ELSE id END) AS position
   FROM (SELECT 'constraint' AS kind, conname::text AS name, oid::int AS id
           FROM pg_constraint WHERE conrelid IN ('ar_t'::regclass, 'ar_r'::regclass, 'ar_p'::regclass)
         UNION ALL SELECT 'index', relname::text, oid::int FROM pg_class
@@ -45,7 +52,7 @@ SELECT kind, name, id = (SELECT b.id FROM ar_before b WHERE b.kind = a.kind AND 
         UNION ALL SELECT 'trigger', c.conname || ' ' || t.tgfoid::regproc, t.oid::int
           FROM pg_trigger t JOIN pg_constraint c ON c.oid = t.tgconstraint
           WHERE c.conname IN ('ar_t_fk', 'ar_r_x_fkey', 'ar_p_u_key')) AS a
- ORDER BY kind, id;
+ ORDER BY kind, position, name;
 \d ar_t
 SELECT stxname, stxowner::regrole FROM pg_statistic_ext WHERE stxname = 'ar_t_s';
 SELECT obj_description('ar_t_bi'::regclass, 'pg_class') AS index_comment,

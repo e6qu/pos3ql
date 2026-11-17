@@ -755,6 +755,7 @@ fn pull_up_one<'a>(
                             type_name: "text",
                             type_mod: -1,
                             binding: CastBinding::Builtin,
+                            context: crate::sql::ast::CastContext::Implicit,
                         })
                         .map_err(|_| Stop::full())?
                 } else {

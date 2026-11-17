@@ -412,6 +412,23 @@ pub(crate) fn prepared_target_oid(
     })
 }
 
+/// A failure converting `candidate`'s literal, at the literal: PostgreSQL
+/// runs the input under the literal's error position callback, so a domain
+/// element's check or its base type's modifier points there too.
+pub(crate) fn input_failure(error: SqlError, candidate: &Candidate<'_>) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    match candidate.expression {
+        Expr::Str(literal)
+        | Expr::Cast {
+            operand: Expr::Str(literal),
+            ..
+        } => super::error_position::at_subject(error, literal),
+        _ => error,
+    }
+}
+
 /// Array input invokes each domain element's input conversion during SQL
 /// analysis. A scalar domain cast instead checks its constraints at runtime.
 pub(crate) fn target_oid(

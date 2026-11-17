@@ -5072,6 +5072,7 @@ fn normalize_array_subquery_element<'a>(
         ColType::Composite(identity) => crate::sql::exec::coerce_user_type_array_element(
             value,
             crate::sql::types::ArrElem::Composite(identity),
+            crate::sql::eval::DomainCoercion::Input,
             storage,
             txid,
             arena,

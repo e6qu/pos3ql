@@ -118,6 +118,20 @@ pub(super) fn table_objects<'a>(
                             | ColType::Timestamp
                             | ColType::Timestamptz
                             | ColType::Uuid
+                            | ColType::Name
+                            | ColType::Char
+                            | ColType::Oid
+                            | ColType::Time
+                            | ColType::Timetz
+                            | ColType::Interval
+                            | ColType::Bytea
+                            | ColType::Money
+                            | ColType::Inet
+                            | ColType::Cidr
+                            | ColType::Macaddr
+                            | ColType::Macaddr8
+                            | ColType::Bit { .. }
+                            | ColType::PgLsn
                     ) {
                         return Ok(Err("an MCV list of a type the model does not read"));
                     }
@@ -169,6 +183,135 @@ impl<'a> super::Planner<'_, 'a> {
                     .filter(|(at, _)| estimated & (1 << at) == 0)
                     .map(|(_, condition)| (condition.range, condition.selectivity)),
             ))
+    }
+
+    /// `clauselist_selectivity_or` of an `OR`'s arms: the arms a statistics
+    /// object with an MCV list covers are estimated through it
+    /// (`statext_mcv_clauselist_selectivity` with `is_or`), each object's
+    /// result and every other arm then combined as independent.
+    pub(super) fn or_selectivity(&self, arms: &[&[Restriction<'a>]]) -> Result<f64, SqlError> {
+        let mut attnums = [0u64; 64];
+        if arms.len() > attnums.len() {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "an OR has more than 64 arms"
+            ));
+        }
+        for (at, arm) in arms.iter().enumerate() {
+            attnums[at] = arm
+                .iter()
+                .try_fold(0u64, |mask, restriction| {
+                    mcv_columns(&restriction.clause).map(|columns| mask | columns)
+                })
+                .unwrap_or(0);
+        }
+        let mut estimated = 0u64;
+        let mut selectivity = 0.0;
+        while !self.extended.is_empty() {
+            let mut best = None;
+            let (mut best_matched, mut best_keys) = (2u32, MAX_EXTENDED_STATISTICS_KEYS + 1);
+            for (position, object) in self.extended.iter().enumerate() {
+                if object.data.n_mcv == 0 {
+                    continue;
+                }
+                let keys = object.keys_mask();
+                let matched = attnums[..arms.len()]
+                    .iter()
+                    .filter(|&&mask| mask != 0 && mask & !keys == 0)
+                    .fold(0u64, |all, mask| all | mask)
+                    .count_ones();
+                if matched > best_matched || (matched == best_matched && object.n_keys < best_keys)
+                {
+                    best = Some(position);
+                    best_matched = matched;
+                    best_keys = object.n_keys;
+                }
+            }
+            let Some(best) = best else {
+                break;
+            };
+            let object = &self.extended[best];
+            let keys = object.keys_mask();
+            let n_items = usize::from(object.data.n_mcv);
+            let mut or_matches = [false; 256];
+            if n_items > or_matches.len() {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "an MCV list has more than 256 items"
+                ));
+            }
+            let (mut simple_or, mut object_selectivity) = (0.0f64, 0.0f64);
+            for (at, arm) in arms.iter().enumerate() {
+                let mask = attnums[at];
+                if mask == 0 || mask & !keys != 0 {
+                    continue;
+                }
+                estimated |= 1 << at;
+                attnums[at] = 0;
+                let simple = self.simple_selectivity(arm)?;
+                let overlap_simple = simple_or * simple;
+                simple_or = (simple_or + simple - overlap_simple).clamp(0.0, 1.0);
+                // `mcv_clause_selectivity_or`.
+                let (mut matched, mut base, mut overlap_matched, mut overlap_base, mut total) =
+                    (0.0, 0.0, 0.0, 0.0, 0.0);
+                for (item, seen) in or_matches[..n_items].iter_mut().enumerate() {
+                    let entry = &object.data.mcv[item];
+                    let frequency = entry.count as f64 / object.data.rows as f64;
+                    let base_frequency = f64::from_bits(entry.base_frequency_bits);
+                    total += frequency;
+                    let mut all = true;
+                    for restriction in arm.iter() {
+                        if !self.item_matches(object, item, &restriction.clause)? {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if all {
+                        matched += frequency;
+                        base += base_frequency;
+                        if *seen {
+                            overlap_matched += frequency;
+                            overlap_base += base_frequency;
+                        }
+                    }
+                    *seen |= all;
+                }
+                // A single-column arm keeps its simple estimate.
+                let arm_selectivity = if mask.count_ones() == 1 {
+                    simple
+                } else {
+                    combine(simple, matched, base, total)
+                };
+                let overlap = combine(overlap_simple, overlap_matched, overlap_base, total);
+                object_selectivity =
+                    (object_selectivity + arm_selectivity - overlap).clamp(0.0, 1.0);
+            }
+            selectivity = selectivity + object_selectivity - selectivity * object_selectivity;
+        }
+        for (at, arm) in arms.iter().enumerate() {
+            if estimated & (1 << at) != 0 {
+                continue;
+            }
+            let arm = self.selectivity(arm)?;
+            selectivity = selectivity + arm - selectivity * arm;
+        }
+        Ok(selectivity)
+    }
+
+    /// `clauselist_selectivity` of `restrictions` without extended
+    /// statistics.
+    fn simple_selectivity(&self, restrictions: &[Restriction<'a>]) -> Result<f64, SqlError> {
+        let mark = self.arena.mark();
+        let result = conditions(restrictions, self.arena).map(|conditions| {
+            self.clauselist(
+                conditions
+                    .iter()
+                    .map(|condition| (condition.range, condition.selectivity)),
+            )
+        });
+        // SAFETY: the conditions were consumed above.
+        unsafe { self.arena.rewind_to(mark) };
+        result
     }
 
     /// `statext_mcv_clauselist_selectivity` of an implicitly ANDed list.
@@ -571,6 +714,12 @@ impl MultivariateCounts {
     }
 }
 
+/// `mcv_combine_selectivities`.
+fn combine(simple: f64, matched: f64, base: f64, total: f64) -> f64 {
+    let other = (simple - base).clamp(0.0, 1.0).min(1.0 - total);
+    (matched + other).clamp(0.0, 1.0)
+}
+
 fn comparison_holds(comparison: Comparison, order: Ordering) -> bool {
     match comparison {
         Comparison::Lt => order.is_lt(),
@@ -580,23 +729,6 @@ fn comparison_holds(comparison: Comparison, order: Ordering) -> bool {
         Comparison::Ge => order.is_ge(),
         Comparison::Gt => order.is_gt(),
     }
-}
-
-/// Whether an `OR` among `restrictions` reads two or more keys of a
-/// statistics object with an MCV list, which PostgreSQL estimates through
-/// it (`statext_mcv_clauselist_selectivity` with `is_or`).
-pub(super) fn or_through_statistics(
-    objects: &[ExtendedObject<'_>],
-    restrictions: &[Restriction<'_>],
-) -> bool {
-    restrictions.iter().any(|restriction| {
-        matches!(restriction.clause, Clause::Or(_))
-            && mcv_columns(&restriction.clause).is_some_and(|mask| {
-                objects.iter().any(|object| {
-                    object.data.n_mcv != 0 && (mask & object.keys_mask()).count_ones() >= 2
-                })
-            })
-    })
 }
 
 /// The table columns of a clause `statext_is_compatible_clause` accepts for

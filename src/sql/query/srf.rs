@@ -1120,6 +1120,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     txid,
                     slot,
                     &input_oids[..args.len()],
+                    arena,
                 )?;
                 Some((source, routine))
             }
@@ -3433,6 +3434,7 @@ fn table_func_def_unpositioned<'a, C: ColumnLookup<'a>>(
                     txid,
                     slot,
                     &input_oids[..table_function_input_count(tref)],
+                    arena,
                 )?,
             )),
             crate::storage::RoutineCallSelection::Builtin { .. } => None,
@@ -4524,17 +4526,92 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     Ok((selection, argument_type_oids))
 }
 
+/// PostgreSQL converts an untyped literal argument of a built-in function in
+/// `FROM` to the selected overload's parameter type while it analyses the
+/// query, so a statement that reads no row (a declared cursor) still fails
+/// at the literal.
+pub(super) fn validate_builtin_literal_arguments(
+    tref: &TableRef<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let calls = match tref.rows_from {
+        Some(calls) => calls,
+        None => core::slice::from_ref(tref),
+    };
+    for call in calls {
+        let Some(written) = call.func_args else {
+            continue;
+        };
+        if sql_table_constructor(call)
+            || !written
+                .iter()
+                .any(|argument| matches!(argument, Expr::Str(_)))
+        {
+            continue;
+        }
+        // A failed selection is reported where the call is planned.
+        let Ok((crate::storage::RoutineCallSelection::Builtin { oid, .. }, _)) =
+            select_table_func_routine(
+                call,
+                storage,
+                txid,
+                arena,
+                &crate::sql::eval::NoColumns,
+                None,
+            )
+        else {
+            continue;
+        };
+        let count = table_function_input_count(call);
+        let bound = crate::sql::eval::bind_builtin_arguments(
+            oid,
+            &written[..count],
+            call.func_argument_names,
+            call.func_variadic,
+            arena,
+        )?;
+        let coerced = crate::sql::eval::coerce_unknown_builtin_arguments(
+            oid,
+            bound,
+            call.func_variadic,
+            arena,
+        )?;
+        for argument in coerced {
+            if let Expr::Cast {
+                operand: Expr::Str(text),
+                type_name,
+                ..
+            } = argument
+                && let Some(target) = ColType::from_sql_name(type_name)
+            {
+                crate::sql::catalog::validate_literal_input(
+                    storage,
+                    txid,
+                    text,
+                    target.oid(),
+                    arena,
+                )
+                .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn capture_table_func_routine(
     tref: &TableRef<'_>,
     storage: &Storage,
     txid: u32,
     slot: usize,
     argument_type_oids: &[i32],
+    arena: &Arena,
 ) -> Result<RoutineDef, SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
     let args = &args[..table_function_input_count(tref)];
     storage.require_routine_execute(slot, txid)?;
-    let (oid, _) = storage
+    let (oid, mapping) = storage
         .routine_call_mapping(
             slot,
             tref.func_argument_names,
@@ -4555,6 +4632,23 @@ fn capture_table_func_routine(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
+    // An untyped literal converts to its parameter's type while the call is
+    // analysed, so its input fails at the literal.
+    for (call_index, argument) in args.iter().enumerate() {
+        let Expr::Str(text) = argument else {
+            continue;
+        };
+        if argument_type_oids[call_index] != crate::sql::types::oid::UNKNOWN {
+            continue;
+        }
+        let Some(parameter) = routine.arguments().get(usize::from(mapping[call_index])) else {
+            continue;
+        };
+        if let Some(target) = storage.routine_type_oid(parameter.ctype, parameter.user_type, txid) {
+            crate::sql::catalog::validate_literal_input(storage, txid, text, target, arena)
+                .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+        }
+    }
     bind_column_definitions(tref, routine, storage, txid)
 }
 
@@ -4925,6 +5019,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             txid,
                             slot,
                             &input_oids[..table_function_input_count(tref)],
+                            arena,
                         )?,
                     )),
                     None,
@@ -4960,6 +5055,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 tref.func_variadic,
                 arena,
             )?;
+            let bound = crate::sql::eval::coerce_unknown_builtin_arguments(
+                oid,
+                bound,
+                tref.func_variadic,
+                arena,
+            )?;
+
             if count != written_args.len() {
                 let combined = arena
                     .alloc_slice_with(bound.len() + 1, |index| {

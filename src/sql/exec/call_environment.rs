@@ -148,6 +148,11 @@ pub(crate) fn with_session_path<R>(run: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Whether a maintenance operation's restricted search path is in force.
+pub(crate) fn maintenance_path_active() -> bool {
+    SESSION_PATH.with(core::cell::Cell::get).is_some()
+}
+
 impl MaintenancePath {
     pub(crate) fn enter(storage: &Storage, txid: u32) -> Result<Self, SqlError> {
         let config = crate::sql::guc::enter_active_restricted_search_path()?;

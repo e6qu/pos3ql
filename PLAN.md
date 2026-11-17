@@ -749,7 +749,12 @@ equality `1/DEFAULT_NUM_DISTINCT` (a boolean's 1/2), an inequality
 `DEFAULT_INEQ_SEL`, two bounds of one expression `DEFAULT_RANGE_INEQ_SEL`,
 a NULL test `DEFAULT_UNK_SEL`, a boolean function a third, and a
 comparison with a boolean constant is its other side
-(`simplify_boolean_equality`). A cast of a column to its own type is no
+(`simplify_boolean_equality`). Two expressions of the relation compared take
+`DEFAULT_EQ_SEL`, its complement or `DEFAULT_INEQ_SEL`; a top-level `X = X`
+is `X IS NOT NULL` (`process_equivalence`), and `NOT` of a comparison,
+pattern match, `IN` list, scalar null test, `AND` or `OR` folds to its
+negation (`negate_clause`, `differential_exact/834`); a row's null test keeps
+its `NOT`. An operator symbol no operator takes fails at analysis. A cast of a column to its own type is no
 node, printed and costed as the column, and a binary-coercible cast costs
 nothing; a `varchar` or `text` relabeling is the column for its index. A
 dummy relation's `Result` is as wide as the select list's expressions. An
@@ -807,29 +812,42 @@ query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
 `ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a
 call in the engine and runs again replaying the results in their order, and
 a write prepares the keys of the rows it stored as it ends, one row at a
-time. Each replay runs the statement again, so a build calling one per row
-costs time quadratic in its rows; the build also evaluates each key once to
-validate it and once more to fill the value caches, so a function's notices
-repeat. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+time. An index key's calls are kept by their site (the row, the index and
+the key's position), so the build's layers (tuple sizes, the sorted build,
+the uniqueness caches) read one result and a function's notice is raised
+once per row and index (`differential_exact/833`); a new index forms only
+its own keys, and `REINDEX TABLE` builds its indexes one at a time in OID
+order. An attempt collects every call it lacks, reads NULL in their place
+and runs them together before restarting, so a build restarts as often as
+its keys nest calls, not once per row. Remaining: a key whose calls nest
+restarts once per row, to keep their order; `REINDEX INDEX`, a write and a
+table rewrite (`ALTER TABLE ... TYPE`, `CLUSTER`) rebuild the table's value
+caches, which evaluates the other indexes' keys again and repeats their
+notices; a partial unique index's predicate and key calls interleave in
+another order; and an index whose expression no longer resolves after
+`ALTER COLUMN ... TYPE` fails with `routine input types do not match its
+captured signature` where PostgreSQL reports `function rw(bigint) does not
+exist`. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
 a user-defined type after inlining, a call of a SQL function PostgreSQL
 inlines whose arguments read an enclosing query's columns, are packed
-into a variadic array or are polymorphic, or whose body is `BEGIN ATOMIC`,
+into a variadic array or are polymorphic,
 in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
-`FROM` PostgreSQL inlines with a default, packed variadic, polymorphic or
-lateral argument or a body with `WITH`, windows or a coerced column, a
+`FROM` PostgreSQL inlines with a packed variadic, polymorphic or
+lateral argument or a body with windows or a coerced column (bodies in
+`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`), a
 function scan of a built-in whose support function estimates its rows
 other than `generate_series` over integers, `numeric` and timestamps
 (`differential_exact/813`) and `unnest`, or whose bound or step is a stable
 expression the support function would evaluate (`now()`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-conditions on an expression key of a statistics object, an `OR` reading
-two or more keys of a statistics object with an MCV list (estimated
-through it with `is_or`), conditions a
+conditions on an expression key of a statistics object (an `OR` through
+an MCV list is estimated with `is_or`, `differential_exact/836`), conditions a
 statistics object on a column past the 63rd or with an MCV list of a type
-other than the integer, floating, numeric, character, boolean, date,
-timestamp and UUID types estimates, a sub-partitioned table
+other than the integer, floating, numeric, character, `name`, `"char"`,
+`oid`, boolean, date, time, timestamp, interval, `bytea`, `money`, network,
+bit string, `pg_lsn` and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
@@ -1363,12 +1381,21 @@ utility options and domain constraints, `EXECUTE` and routine arguments
 (unknown literals and row constructors converting to their parameter's type
 at analysis) and privilege checks on a written schema are positioned too
 (`differential_exact/814`). The exact-error corpus compares every error's
-cursor, psql's `LINE n:` excerpt and caret. Remaining: a literal cast to an
-array of a domain whose input applies the base type's length
-(`'{toolong}'::d[]`) and a named-notation literal argument of a function in
-`FROM` fail without a cursor; an explicit cast to a domain over
-`varchar(n)` raises `22001` where PostgreSQL truncates; and an explicit
-collation conflict is found only when a row is compared, not at analysis. Target and expression count errors of an `INSERT`, also with subscripted
+cursor, psql's `LINE n:` excerpt and caret. A domain's base type modifier
+follows the coercion context (`differential_exact/830`): an explicit cast
+truncates, an assignment, implicit coercion or input rejects; an input
+function's failure (`'{toolong}'::d[]`, a domain element's check) points at
+the literal, and a constant's length coercion, which the planner folds,
+fails without a cursor before any row is read, also when inlining a SQL
+function. An untyped literal argument of a function in `FROM`, positional or
+named, converts to its parameter's type at analysis, and a built-in's to the
+selected overload's (`generate_series(1, '3')`, `differential_exact/831`).
+Explicit `COLLATE` clauses that meet in one expression conflict while the
+query level, its subqueries, an `UPDATE` or a `DELETE` is analysed
+(`assign_collations`, `differential_exact/832`). Remaining: an `INSERT ...
+SELECT`, `ON CONFLICT` and `MERGE` assignment of a constant fold its length
+coercion only when a row is written, and an unknown or non-collatable
+`COLLATE` fails only when a row reaches it. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

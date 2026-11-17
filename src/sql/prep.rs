@@ -678,10 +678,13 @@ pub(crate) fn coerce_argument<'a>(
     if source == oid::UNKNOWN
         && let Datum::Text(text) = value
     {
+        // `EXECUTE` converts an untyped literal as a query does: a domain's
+        // base type modifier applies as an assignment, after the input.
         return super::exec::decode_text_input(
             storage,
             target,
             text.as_bytes(),
+            super::eval::DomainCoercion::Assignment,
             arena,
             txid,
             sequences,

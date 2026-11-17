@@ -3609,6 +3609,21 @@ impl Expr<'_> {
         )
     }
 
+    /// Whether this is a written or already folded constant value.
+    pub(crate) const fn is_literal_constant(&self) -> bool {
+        matches!(
+            self,
+            Expr::Null
+                | Expr::Bool(_)
+                | Expr::Int(_)
+                | Expr::Float(_)
+                | Expr::NumericLit(_)
+                | Expr::Str(_)
+                | Expr::BitLit(_)
+                | Expr::BoundLiteral { .. }
+        )
+    }
+
     /// Whether PostgreSQL's planner folds this expression to a constant, as
     /// it does a literal, a parameter of a custom plan, and operators and
     /// casts over them.
@@ -6221,6 +6236,10 @@ pub enum Expr<'a> {
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
         type_mod: i32,
         binding: CastBinding,
+        /// The coercion context: `Explicit` for a written cast, otherwise
+        /// the implicit or assignment coercion analysis inserted, which
+        /// applies a domain's length coercion without truncating.
+        context: CastContext,
     },
     /// Input checking or catalog-default materialization has already run.
     /// Source syntax is retained for deparsers and dependency capture only.

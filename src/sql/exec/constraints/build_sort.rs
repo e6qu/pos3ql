@@ -13,6 +13,7 @@ use core::cmp::Ordering;
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Collation, Expr};
 use crate::sql::eval::{SqlError, compare_datums_collated, sqlstate};
+use crate::sql::query::index_key_calls::KeyScope;
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::{IndexOperatorClass, MAX_INDEX_COLS, SqlName, Storage};
@@ -67,6 +68,8 @@ struct BuildKey<'a> {
     n_include_cols: usize,
     nulls_not_distinct: bool,
     predicate: Option<&'a Expr<'a>>,
+    /// The index's identity, which keeps its keys' engine calls.
+    index_oid: Option<u64>,
 }
 
 impl<'a> BuildKey<'a> {
@@ -86,6 +89,7 @@ impl<'a> BuildKey<'a> {
             n_include_cols: 0,
             nulls_not_distinct: !distinct,
             predicate: None,
+            index_oid: None,
         };
         key.columns[..columns.len()].copy_from_slice(columns);
         for (position, collation) in collations.iter().enumerate() {
@@ -106,6 +110,9 @@ impl<'a> BuildKey<'a> {
             &index.collations[..index.n_cols],
             !index.nulls_not_distinct,
         );
+        key.index_oid = Some(crate::sql::query::index_key_calls::index_identity(
+            index.name_for(txid).as_str(),
+        ));
         let classes = super::resolve_index_operator_classes(index)?;
         for (position, class) in classes[..index.n_cols].iter().enumerate() {
             if let Some(source) = &index.expressions[position] {
@@ -440,10 +447,11 @@ fn sort_once<'a, B: crate::storage::DefinitionBacking>(
     let mut count = 0usize;
     let mut key_bytes = 0usize;
     let mut heap_bytes = 0u64;
-    rows(ordered, &mut |_, values, stored| {
+    rows(ordered, &mut |rowid, values, stored| {
         heap_bytes = heap_bytes.saturating_add(maxalign(24 + stored as u64) + 4);
         let length = arena
             .with_remaining_region(|region| -> Result<Option<usize>, SqlError> {
+                let _site = KeyScope::enter(rowid, key.index_oid);
                 if let Some(predicate) = key.predicate
                     && !super::index_predicate_matches(
                         storage, txid, def, values, predicate, region,
@@ -491,9 +499,10 @@ fn sort_once<'a, B: crate::storage::DefinitionBacking>(
     let mut filled = 0usize;
     let mut written = 0usize;
     let mark = arena.mark();
-    let filling = rows(ordered, &mut |_, values, _| {
+    let filling = rows(ordered, &mut |rowid, values, _| {
         let entry = arena
             .with_remaining_region(|region| -> Result<Option<Entry>, SqlError> {
+                let _site = KeyScope::enter(rowid, key.index_oid);
                 if let Some(predicate) = key.predicate
                     && !super::index_predicate_matches(
                         storage, txid, def, values, predicate, region,

@@ -205,6 +205,7 @@ fn write_projection<'a>(
 }
 
 /// `selfuncs.h`' default selectivities.
+const DEFAULT_EQ_SEL: f64 = 0.005;
 const DEFAULT_INEQ_SEL: f64 = 0.333_333_333_333_333_3;
 const DEFAULT_RANGE_INEQ_SEL: f64 = 0.005;
 const DEFAULT_NUM_DISTINCT: f64 = 200.0;

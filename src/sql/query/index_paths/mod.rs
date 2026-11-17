@@ -29,6 +29,7 @@ mod append;
 mod clauses;
 mod expressions;
 mod extended;
+mod grouping_sets;
 mod like;
 mod paths;
 mod predicate;
@@ -37,6 +38,9 @@ pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use aggregate::{AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg};
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
+pub(crate) use grouping_sets::{
+    GroupingSet, MAX_SET_COLUMNS, SetsPlan, SetsQuery, SetsStrategy, plan_grouping_sets,
+};
 pub(crate) use like::like_escape;
 pub(crate) use paths::scan_path;
 
@@ -732,6 +736,10 @@ pub(crate) struct ScanPath<'a> {
 
 /// What the model makes of a query's scan of one relation.
 #[derive(Clone, Copy)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the chosen path is returned inline; boxing would heap-allocate"
+)]
 pub(crate) enum Planned<'a> {
     /// The path PostgreSQL chooses.
     Chosen(ScanPath<'a>),
@@ -2013,6 +2021,9 @@ pub(crate) struct GroupedPath {
     pub(crate) rows: f64,
     /// The sort of the groups for the `ORDER BY`.
     pub(crate) output_sort: Option<(f64, f64)>,
+    /// The relation's cheapest path the grouping reads: its startup and
+    /// total cost, rows and width.
+    pub(crate) input: AggInput,
 }
 
 /// What the planning of one member of a partition or inheritance tree

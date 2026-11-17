@@ -1032,9 +1032,18 @@ either, the grouping taking the `ORDER BY`'s key order
 Under `EXPLAIN ANALYZE` a `GroupAggregate`'s `Sort` returns every input row
 and the aggregate one row per group in the sort's key order, and the JSON
 form names it an `Aggregate` of strategy `Sorted` (`differential_exact/794`).
-Remaining: grouping sets (PostgreSQL's `Hash Key`
-lists and `MixedAggregate` from `consider_groupingsets_paths`, which pos3ql
-prints as one `Group Key`), `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
+Grouping sets are arranged as PostgreSQL's planner arranges them: the
+sets chained into rollups (`extract_rollup_sets` with its bipartite
+matching, `reorder_grouping_sets`), then every set hashed when the tables
+fit in `hash_mem` (a `MixedAggregate` when an empty set needs the sorted
+phase), the input sorted for the first rollup with the rollups that fit
+hashed (`DiscreteKnapsack`) and the rest sorted again, or every rollup
+sorted, kept by cost; each node lists its `Hash Key`, `Group Key` and
+indented `Sort Key` lines and the JSON `Grouping Sets` groups, and over one
+plain table its costs and rows are PostgreSQL's (`differential_exact/802`).
+Outside that cost model (the shapes below) the rollups and keys are
+arranged from pos3ql's own estimates, so a sorted arrangement PostgreSQL's
+costs would pick may show as hashed. Remaining: `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
 `ORDER BY` inputs, user-defined aggregates, a select list computing
 expressions over aggregates, grouping by expressions, by a column an index
 orders (presorted and incremental paths) and over joins keep pos3ql's own

@@ -2707,6 +2707,7 @@ fn grouped<'a>(
         total: aggregate.total,
         rows: groups,
         output_sort,
+        input: hashed_input,
     });
     Ok(Ok(Planned::Chosen(path)))
 }

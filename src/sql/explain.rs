@@ -177,7 +177,13 @@ enum KeyLabel {
     None,
     Sort,
     Group,
+    /// A grouping sets node's key lines, each record a tag (`B` a rollup's
+    /// start, `S` its sort, `H` a hashed set, `G` a grouped set) and its
+    /// items, separated by [`GROUPING_SET_SEPARATOR`].
+    Sets,
 }
+
+const GROUPING_SET_SEPARATOR: char = '\u{1e}';
 
 impl PlanKeys {
     const NONE: Self = Self {
@@ -189,7 +195,7 @@ impl PlanKeys {
     /// The label and items to print, if any.
     fn shown(&self, verbose: bool) -> Option<(&'static str, impl Iterator<Item = &str>)> {
         let label = match self.label {
-            KeyLabel::None => return None,
+            KeyLabel::None | KeyLabel::Sets => return None,
             KeyLabel::Sort => "Sort Key",
             KeyLabel::Group => "Group Key",
         };
@@ -4084,6 +4090,294 @@ fn grouped_scan_path<'a>(
     }))
 }
 
+/// The grouping sets of a query of one plain table as PostgreSQL's
+/// `consider_groupingsets_paths` plans them, with the scan they read, or
+/// `None` outside the model: the shapes [`grouped_scan_path`] leaves out,
+/// a grouping key that is not a column, or an index ordering one.
+#[allow(clippy::too_many_arguments)]
+fn grouping_sets_scan_path<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    output_width: u32,
+    arena: &'a Arena,
+) -> Result<
+    Option<(
+        query::index_paths::ScanPath<'a>,
+        query::index_paths::SetsPlan<'a>,
+        u32,
+    )>,
+    SqlError,
+> {
+    use query::index_paths::{
+        GroupOrder, GroupingSet, GroupingShape, MAX_ORDER_KEYS, MAX_SET_COLUMNS, QueryShape,
+    };
+    if statement.grouping_sets.is_empty()
+        || statement.group_by.len() > MAX_ORDER_KEYS.min(MAX_SET_COLUMNS)
+        || scope.n != 1
+        || !from.joins.is_empty()
+        || from.base.sample.is_some()
+        || statement.having.is_some()
+        || statement.limit.is_some()
+        || statement.offset.is_some()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || has_window(statement)
+        || query::has_set_returning_items(statement.items, storage, txid)
+        || scope.slots[0] == usize::MAX
+        || scope.derived[0].is_some()
+    {
+        return Ok(None);
+    }
+    let slot = scope.slots[0];
+    if storage.table_def(slot, txid).partition.is_partitioned()
+        || storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(None);
+    }
+    let resolve = |expression: &'a Expr<'a>| -> &'a Expr<'a> {
+        match expression {
+            Expr::Int(position) if *position >= 1 => statement
+                .items
+                .get(*position as usize - 1)
+                .and_then(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .unwrap_or(expression),
+            _ => expression,
+        }
+    };
+    let column_of = |expression: &'a Expr<'a>| -> Option<usize> {
+        match resolve(expression) {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(query::ResolvedColumn::Table(0, column)) => Some(column),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut key_columns = [0usize; MAX_ORDER_KEYS];
+    for (at, &key) in statement.group_by.iter().enumerate() {
+        let Some(column) = column_of(key) else {
+            return Ok(None);
+        };
+        // A column named twice is one grouping key to PostgreSQL.
+        if key_columns[..at].contains(&column) {
+            return Ok(None);
+        }
+        key_columns[at] = column;
+    }
+    let expressions = arena
+        .alloc_slice_with(statement.items.len(), |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    let Some(aggregates) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let mut output_width = output_width;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Some(column) = column_of(expression)
+            && scope.defs.stored(0).is_some_and(|definition| {
+                definition.columns()[column].ctype.physical_layout().length <= 0
+            })
+        {
+            output_width = output_width - 32
+                + query::index_paths::column_width(storage, txid, scope.slots[0], column);
+        }
+    }
+    let condition = split_gating(storage, txid, statement.where_clause, arena)?.1;
+    // Each set's groups (`estimate_num_groups`), and the relation's
+    // cheapest path, from the grouping of its columns.
+    let mut scan = None;
+    let mut input = None;
+    let n_keys = statement.group_by.len();
+    let sets = arena
+        .alloc_slice_with(statement.grouping_sets.len(), |_| GroupingSet {
+            columns: [0; MAX_SET_COLUMNS],
+            len: 0,
+            groups: 1.0,
+        })
+        .map_err(|_| arena_full())?;
+    for (set, mask) in sets.iter_mut().zip(statement.grouping_sets) {
+        let mut set_columns = [0usize; MAX_ORDER_KEYS];
+        for position in (0..n_keys).filter(|&position| mask.contains(position)) {
+            set.columns[set.len] = position as u8;
+            set_columns[set.len] = key_columns[position];
+            set.len += 1;
+        }
+        if set.len == 0 && scan.is_some() {
+            continue;
+        }
+        let group_mask = key_columns[..n_keys]
+            .iter()
+            .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+        let selected = |condition| {
+            query::streaming_pax_columns_ordered(scope, from, statement.items, condition, &[])
+                .selected_mask(0)
+                .map(|mask| mask | group_mask)
+        };
+        let shape = QueryShape {
+            only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+            output: selected(None),
+            grouping: Some(GroupingShape {
+                columns: set_columns,
+                len: set.len.max(1),
+                aggregates,
+                output_width: f64::from(output_width),
+                order: GroupOrder::None,
+            }),
+            ..QueryShape::default()
+        };
+        let planned = query::index_paths::scan_path(
+            storage,
+            scope,
+            txid,
+            condition,
+            selected(statement.where_clause),
+            &[],
+            arena,
+            shape,
+        )?;
+        let query::index_paths::Planned::Chosen(path) = planned else {
+            return Ok(None);
+        };
+        let Some(grouped) = path.grouped else {
+            return Ok(None);
+        };
+        if set.len > 0 {
+            set.groups = grouped.rows;
+        }
+        input = Some(grouped.input);
+        scan = Some(query::index_paths::ScanPath {
+            grouped: None,
+            ..path
+        });
+    }
+    let (Some(scan), Some(input)) = (scan, input) else {
+        return Ok(None);
+    };
+    let order = arena
+        .alloc_slice_with(statement.order_by.len(), |at| {
+            column_of(statement.order_by[at].expression).and_then(|column| {
+                key_columns[..n_keys]
+                    .iter()
+                    .position(|&key| key == column)
+                    .map(|position| position as u8)
+            })
+        })
+        .map_err(|_| arena_full())?;
+    let plan = query::index_paths::plan_grouping_sets(
+        &query::index_paths::SetsQuery {
+            sets,
+            distinct: statement.grouping_set_quantifier
+                == crate::sql::ast::GroupingSetQuantifier::Distinct,
+            order,
+            aggregates,
+            input,
+            output_width: f64::from(output_width),
+        },
+        arena,
+    )?;
+    Ok(Some((scan, plan, output_width)))
+}
+
+/// The key lines of a grouping sets node, as `show_grouping_sets` prints
+/// them: for each rollup, the sort it reads its input from when it sorts
+/// it itself, then each set's `Hash Key` or `Group Key`.
+fn grouping_sets_keys(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    plan: &query::index_paths::SetsPlan<'_>,
+    arena: &Arena,
+) -> Result<PlanKeys, SqlError> {
+    use query::index_paths::SetsStrategy;
+    let direction = |position: u8| {
+        statement
+            .order_by
+            .iter()
+            .find(|key| *key.expression == *statement.group_by[usize::from(position)])
+            .map(|key| (key.descending, key.nulls_first))
+    };
+    let mut keys = PlanKeys {
+        label: KeyLabel::Sets,
+        plain: StackStr::new(),
+        verbose: StackStr::new(),
+    };
+    let mut record = |tag: char, items: &[u8], sort: bool| -> Result<(), SqlError> {
+        let entries = arena
+            .alloc_slice_with(items.len(), |at| {
+                let position = items[at];
+                (
+                    statement.group_by[usize::from(position)],
+                    sort.then(|| direction(position).unwrap_or((false, false))),
+                )
+            })
+            .map_err(|_| arena_full())?;
+        let label = if sort {
+            KeyLabel::Sort
+        } else {
+            KeyLabel::Group
+        };
+        let printed = plan_keys(storage, txid, scope, statement, label, entries, arena)?;
+        for (target, text) in [
+            (&mut keys.plain, printed.plain),
+            (&mut keys.verbose, printed.verbose),
+        ] {
+            if !target.as_str().is_empty() {
+                let _ = write!(target, "{GROUPING_SET_SEPARATOR}");
+            }
+            let _ = write!(target, "{tag}{}", text.as_str());
+        }
+        Ok(())
+    };
+    for (index, rollup) in plan.rollups.iter().enumerate() {
+        record('B', &[], false)?;
+        if plan.sorts(index) {
+            record('S', rollup.clause.columns(), true)?;
+        }
+        let hashed = if index == 0 {
+            matches!(plan.strategy, SetsStrategy::Hashed | SetsStrategy::Mixed)
+        } else {
+            rollup.hashed
+        };
+        for set in rollup.sets {
+            record(if hashed { 'H' } else { 'G' }, set.columns(), false)?;
+        }
+    }
+    if keys.plain.is_truncated() || keys.verbose.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "the grouping sets' keys exceed EXPLAIN's 256-byte node property"
+        ));
+    }
+    Ok(keys)
+}
+
 /// `cost_agg` of a plain aggregate over the chosen `path` of the one
 /// relation `statement` reads: `None` when its select list computes more
 /// than aggregates, columns and constants, or an aggregate is outside the
@@ -6071,7 +6365,15 @@ fn plan_pulled_select<'a>(
         _ => None,
     };
     let grouped_path = grouped.map(|grouped| grouped.path);
-    let chosen_scan = chosen_path.or(grouped_path);
+    let grouping_sets = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from)) if grouped.is_none() => {
+            grouping_sets_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+        }
+        _ => None,
+    };
+    let chosen_scan = chosen_path
+        .or(grouped_path)
+        .or(grouping_sets.map(|(path, _, _)| path));
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
     let mut object_requests = 0u64;
@@ -6306,6 +6608,128 @@ fn plan_pulled_select<'a>(
         };
         let mut aggregate_keys = group_keys(statement, arena)?;
         let mut planned_partitions = None;
+        let mut sets_keys = None;
+        // Grouping sets outside the cost model still list PostgreSQL's
+        // rollups and keys, arranged from pos3ql's own estimates.
+        if grouping_sets.is_none() && !statement.grouping_sets.is_empty() {
+            use query::index_paths::{GroupingSet, MAX_SET_COLUMNS};
+            let n_keys = statement.group_by.len();
+            if n_keys <= MAX_SET_COLUMNS {
+                let input_rows = (estimated_rows as f64).max(1.0);
+                let sets = arena
+                    .alloc_slice_with(statement.grouping_sets.len(), |at| {
+                        let mut set = GroupingSet {
+                            columns: [0; MAX_SET_COLUMNS],
+                            len: 0,
+                            groups: 1.0,
+                        };
+                        for position in
+                            (0..n_keys).filter(|&key| statement.grouping_sets[at].contains(key))
+                        {
+                            set.columns[set.len] = position as u8;
+                            set.len += 1;
+                        }
+                        if set.len > 0 {
+                            set.groups = input_rows.sqrt().ceil();
+                        }
+                        set
+                    })
+                    .map_err(|_| arena_full())?;
+                let order = arena
+                    .alloc_slice_with(statement.order_by.len(), |at| {
+                        statement
+                            .group_by
+                            .iter()
+                            .position(|key| *key == statement.order_by[at].expression)
+                            .map(|position| position as u8)
+                    })
+                    .map_err(|_| arena_full())?;
+                let sets = query::index_paths::plan_grouping_sets(
+                    &query::index_paths::SetsQuery {
+                        sets,
+                        distinct: statement.grouping_set_quantifier
+                            == crate::sql::ast::GroupingSetQuantifier::Distinct,
+                        order,
+                        aggregates: query::index_paths::AggregateCosts::default(),
+                        input: query::index_paths::AggInput {
+                            startup: 0.0,
+                            total: total_cost,
+                            rows: input_rows,
+                            width: f64::from(width),
+                        },
+                        output_width: f64::from(width),
+                    },
+                    arena,
+                )?;
+                aggregate_name = sets.strategy.node_name();
+                sets_keys = Some(grouping_sets_keys(
+                    storage,
+                    txid,
+                    scope.as_ref(),
+                    statement,
+                    &sets,
+                    arena,
+                )?);
+            }
+        }
+        if let Some((_, sets, sets_width)) = grouping_sets {
+            if let Some((startup, total)) = sets.input_sort {
+                // The input is sorted for the first rollup not hashed.
+                let first = sets
+                    .rollups
+                    .iter()
+                    .find(|rollup| !rollup.hashed)
+                    .map_or(sets.rollups[0].clause, |rollup| rollup.clause);
+                let sort_keys = arena
+                    .alloc_slice_with(first.len, |at| {
+                        let entry = statement.group_by[usize::from(first.columns[at])];
+                        let direction = statement
+                            .order_by
+                            .iter()
+                            .find(|key| *key.expression == *entry)
+                            .map_or((false, false), |key| (key.descending, key.nulls_first));
+                        (entry, Some(direction))
+                    })
+                    .map_err(|_| arena_full())?;
+                add_stage(
+                    &mut stages,
+                    &mut stage_count,
+                    PlanNode {
+                        name: StackStr::from_str("Sort"),
+                        keys: plan_keys(
+                            storage,
+                            txid,
+                            scope.as_ref(),
+                            statement,
+                            KeyLabel::Sort,
+                            sort_keys,
+                            arena,
+                        )?,
+                        startup_cost: startup,
+                        total_cost: total,
+                        rows: sets.input.rows as u64,
+                        width: sets.input.width as u32,
+                        object_requests,
+                        cache_blocks,
+                        key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
+                        ..PlanNode::EMPTY
+                    },
+                )?;
+            }
+            aggregate_name = sets.strategy.node_name();
+            aggregate_startup = sets.startup;
+            total_cost = sets.total;
+            estimated_rows = sets.rows as u64;
+            width = sets_width;
+            sets_keys = Some(grouping_sets_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                &sets,
+                arena,
+            )?);
+        }
         if let Some(grouped) = grouped
             && let Some(path) = grouped.path.grouped
         {
@@ -6353,6 +6777,7 @@ fn plan_pulled_select<'a>(
                 keys: match aggregate_keys
                     .filter(|_| !statement.group_by.is_empty() && !constant_group)
                 {
+                    _ if sets_keys.is_some() => sets_keys.unwrap_or(PlanKeys::NONE),
                     Some(keys) => plan_keys(
                         storage,
                         txid,
@@ -6491,6 +6916,9 @@ fn plan_pulled_select<'a>(
     // The chosen path may return the rows ordered; otherwise the legacy
     // ordered index does.
     let scan_ordered = match (chosen_path, grouped_path.and_then(|path| path.grouped)) {
+        _ if grouping_sets.is_some() => {
+            grouping_sets.is_some_and(|(_, sets, _)| sets.output_sort.is_none())
+        }
         (Some(path), _) => path.sort == query::index_paths::SortKind::None,
         (None, Some(grouped)) => grouped.output_sort.is_none(),
         (None, None) => ordered_index.is_some(),
@@ -6538,6 +6966,13 @@ fn plan_pulled_select<'a>(
         {
             node.startup_cost = startup;
             node.total_cost = total;
+        }
+        if let Some((_, sets, _)) = grouping_sets
+            && let Some((startup, total)) = sets.output_sort
+        {
+            node.startup_cost = startup;
+            node.total_cost = total;
+            node.rows = sets.rows as u64;
         }
         if presorted != 0 {
             let prefix = plan_keys(
@@ -7162,7 +7597,8 @@ fn plan_pulled_select<'a>(
             .iter()
             .find(|stage| !stage.passthrough && !matches!(stage.name, "Limit" | "LockRows"))
             .map_or(targets::Demand::Exact, |stage| match stage.name {
-                "Aggregate" | "HashAggregate" | "Group" | "ProjectSet" => targets::Demand::Label,
+                "Aggregate" | "HashAggregate" | "GroupAggregate" | "MixedAggregate" | "Group"
+                | "ProjectSet" => targets::Demand::Label,
                 _ => targets::Demand::Small,
             })
     };
@@ -9119,7 +9555,7 @@ fn plan_keys(
                 KeyLabel::Group => {
                     crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)
                 }
-                KeyLabel::None => Ok(None),
+                KeyLabel::None | KeyLabel::Sets => Ok(None),
             };
             let (collated, part) = match collated {
                 Ok(Some(part)) => (true, Ok(Some(part))),
@@ -12824,6 +13260,45 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(line, "Inner Unique: true");
             emit(line.as_str())?;
         }
+        if node.keys.label == KeyLabel::Sets {
+            let records = if options.verbose {
+                node.keys.verbose.as_str()
+            } else {
+                node.keys.plain.as_str()
+            };
+            // The lines after a rollup's `Sort Key` are indented by two.
+            let mut extra = 0;
+            for record in records.split(GROUPING_SET_SEPARATOR) {
+                let mut chars = record.chars();
+                let tag = chars.next().unwrap_or('B');
+                let items = chars.as_str();
+                let label = match tag {
+                    'B' => {
+                        extra = 0;
+                        continue;
+                    }
+                    'S' => "Sort Key",
+                    'H' => "Hash Key",
+                    _ => "Group Key",
+                };
+                let mut line = StackStr::<2048>::new();
+                for _ in 0..node_indent(node) + extra {
+                    let _ = write!(line, " ");
+                }
+                if items.is_empty() {
+                    let _ = write!(line, "{label}: ()");
+                } else {
+                    let _ = write!(line, "{label}: ");
+                    for (at, key) in items.split(KEY_SEPARATOR).enumerate() {
+                        let _ = write!(line, "{}{key}", if at == 0 { "" } else { ", " });
+                    }
+                }
+                emit(line.as_str())?;
+                if tag == 'S' {
+                    extra = 2;
+                }
+            }
+        }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
             for _ in 0..node_indent(node) {
@@ -13739,6 +14214,36 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// `ExplainPropertyListNested`: a list inside a list, written inline.
+    fn nested_list<'v>(&mut self, label: &str, items: impl Iterator<Item = &'v str>) {
+        match self.format {
+            ExplainFormat::Json => {
+                self.json_line_ending();
+                self.spaces(self.indent * 2);
+                self.push("[");
+                for (index, item) in items.enumerate() {
+                    if index != 0 {
+                        self.push(", ");
+                    }
+                    self.json_text(item);
+                }
+                self.push("]");
+            }
+            ExplainFormat::Yaml => {
+                self.yaml_line_starting();
+                self.push("- [");
+                for (index, item) in items.enumerate() {
+                    if index != 0 {
+                        self.push(", ");
+                    }
+                    self.json_text(item);
+                }
+                self.push("]");
+            }
+            ExplainFormat::Xml | ExplainFormat::Text => self.list(label, items),
+        }
+    }
+
     /// `ExplainDummyGroup` without a label: a group with no contents.
     fn dummy_group(&mut self, kind: &str) {
         match self.format {
@@ -14007,6 +14512,61 @@ fn structured_node(
     }
     if kind.join_type.is_some() {
         document.boolean("Inner Unique", node.inner_unique);
+    }
+    if node.keys.label == KeyLabel::Sets {
+        let records = if options.verbose {
+            node.keys.verbose.as_str()
+        } else {
+            node.keys.plain.as_str()
+        };
+        document.open_group("Grouping Sets", Some("Grouping Sets"), false);
+        // The open groups: a rollup's, then its key set's.
+        let mut open: Option<&str> = None;
+        let close = |document: &mut Document<'_>, open: &mut Option<&str>| {
+            if let Some(keys) = open.take() {
+                document.close_group(keys, false);
+                document.close_group("Grouping Set", true);
+            }
+        };
+        let mut started = false;
+        for record in records.split(GROUPING_SET_SEPARATOR) {
+            let mut chars = record.chars();
+            let tag = chars.next().unwrap_or('B');
+            let items = chars.as_str();
+            let entries = items.split(KEY_SEPARATOR).filter(|_| !items.is_empty());
+            match tag {
+                'B' => {
+                    if started {
+                        if open.is_none() {
+                            document.close_group("Grouping Set", true);
+                        }
+                        close(document, &mut open);
+                    }
+                    started = true;
+                    document.open_group("Grouping Set", None, true);
+                }
+                'S' => document.list("Sort Key", entries),
+                _ => {
+                    let (name, set) = if tag == 'H' {
+                        ("Hash Keys", "Hash Key")
+                    } else {
+                        ("Group Keys", "Group Key")
+                    };
+                    if open.is_none() {
+                        document.open_group(name, Some(name), false);
+                        open = Some(name);
+                    }
+                    document.nested_list(set, entries);
+                }
+            }
+        }
+        if started {
+            if open.is_none() {
+                document.close_group("Grouping Set", true);
+            }
+            close(document, &mut open);
+        }
+        document.close_group("Grouping Sets", false);
     }
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);

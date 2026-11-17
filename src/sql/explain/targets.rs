@@ -864,7 +864,9 @@ impl<'a> BlockTargets<'a> {
         let mut grouped = false;
         for (index, stage) in stages.iter().enumerate() {
             let current: &[Entry<'a>] = match stage.name {
-                "Aggregate" | "HashAggregate" | "Group" if aggregated && !grouped => {
+                "Aggregate" | "HashAggregate" | "GroupAggregate" | "MixedAggregate" | "Group"
+                    if aggregated && !grouped =>
+                {
                     grouped = true;
                     let list = arena
                         .alloc_slice_with(targets.len(), |_| Entry::EMPTY)

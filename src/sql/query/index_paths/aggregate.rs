@@ -36,6 +36,8 @@ pub(crate) enum AggStrategy {
     Plain,
     Sorted,
     Hashed,
+    /// Sorted input feeding hash tables too (`AGG_MIXED`).
+    Mixed,
 }
 
 /// One transition state, which aggregates of the same inputs share.
@@ -304,7 +306,7 @@ pub(crate) fn cost_agg(
                 + aggregates.final_per_tuple;
             (startup, startup + costs.cpu_tuple, 1.0)
         }
-        AggStrategy::Sorted => {
+        AggStrategy::Sorted | AggStrategy::Mixed => {
             let total = input.total
                 + aggregates.transition_startup
                 + aggregates.transition_per_tuple * input.rows
@@ -324,7 +326,7 @@ pub(crate) fn cost_agg(
             (startup, total, groups)
         }
     };
-    if strategy == AggStrategy::Hashed {
+    if matches!(strategy, AggStrategy::Hashed | AggStrategy::Mixed) {
         let entry_size = hash_agg_entry_size(
             aggregates.transitions,
             input.width,

@@ -4080,9 +4080,10 @@ impl<'a> Parser<'a> {
         }; crate::storage::MAX_ROUTINE_CONFIGS];
         let mut config_count = 0usize;
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            let option_at = self.peek_at;
             if self.eat_ident("language")? {
                 if language.is_some() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 language = Some(if self.eat_ident("sql")? {
                     crate::sql::ast::RoutineLanguage::Sql
@@ -4108,7 +4109,7 @@ impl<'a> Parser<'a> {
                 });
             } else if self.eat_ident("as")? {
                 if body.is_some() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 let source = self.str_literal("function body")?;
                 body = Some(if self.eat_op(",")? {
@@ -4121,7 +4122,7 @@ impl<'a> Parser<'a> {
                 });
             } else if self.eat_ident("return")? {
                 if body.is_some() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 let start = self.peek_at;
                 let _ = self.expression(0)?;
@@ -4130,7 +4131,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("begin")? {
                 if body.is_some() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 self.expect_ident("atomic")?;
                 let start = self.peek_at;
@@ -4156,7 +4157,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("strict")? {
                 if strict_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -4166,7 +4167,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -4175,31 +4176,31 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 strict_seen = true;
                 attributes.strict = false;
             } else if self.eat_ident("immutable")? {
                 if volatility_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Immutable;
             } else if self.eat_ident("stable")? {
                 if volatility_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Stable;
             } else if self.eat_ident("volatile")? {
                 if volatility_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Volatile;
             } else if self.eat_ident("parallel")? {
                 if parallel_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 parallel_seen = true;
                 attributes.parallel = if self.eat_ident("safe")? {
@@ -4212,7 +4213,7 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("security")? {
                 if security_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -4224,7 +4225,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("external")? {
                 self.expect_ident("security")?;
                 if security_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -4235,20 +4236,20 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("leakproof")? {
                 if leakproof_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = true;
             } else if self.eat_ident("not")? {
                 self.expect_ident("leakproof")?;
                 if leakproof_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = false;
             } else if self.eat_ident("cost")? {
                 if cost_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 cost_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -4263,7 +4264,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
             } else if self.eat_ident("rows")? {
                 if rows_seen {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 rows_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -4483,6 +4484,7 @@ impl<'a> Parser<'a> {
         let mut role_members: &'a [&'a str] = &[];
         let mut admin_members: &'a [&'a str] = &[];
         loop {
+            let option_at = self.peek_at;
             if self.role_option(&mut options, true)? {
                 continue;
             }
@@ -4491,17 +4493,17 @@ impl<'a> Parser<'a> {
                     self.expect_ident("group")?;
                 }
                 if !in_roles.is_empty() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 in_roles = self.role_name_list("role name")?;
             } else if self.eat_ident("role")? || self.eat_ident("user")? {
                 if !role_members.is_empty() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 role_members = self.role_name_list("member role name")?;
             } else if self.eat_ident("admin")? {
                 if !admin_members.is_empty() {
-                    return Err(self.err_here("conflicting or redundant options"));
+                    return Err(self.redundant_option(option_at));
                 }
                 admin_members = self.role_name_list("member role name")?;
             } else {
@@ -4659,38 +4661,39 @@ impl<'a> Parser<'a> {
         options: &mut RoleOptions<'a>,
         allow_sysid: bool,
     ) -> Result<bool, ParseError> {
+        let option_at = self.peek_at;
         if self.eat_ident("superuser")? {
-            self.set_role_option(&mut options.superuser, true)?;
+            self.set_role_option(option_at, &mut options.superuser, true)?;
         } else if self.eat_ident("nosuperuser")? {
-            self.set_role_option(&mut options.superuser, false)?;
+            self.set_role_option(option_at, &mut options.superuser, false)?;
         } else if self.eat_ident("inherit")? {
-            self.set_role_option(&mut options.inherit, true)?;
+            self.set_role_option(option_at, &mut options.inherit, true)?;
         } else if self.eat_ident("noinherit")? {
-            self.set_role_option(&mut options.inherit, false)?;
+            self.set_role_option(option_at, &mut options.inherit, false)?;
         } else if self.eat_ident("createrole")? {
-            self.set_role_option(&mut options.create_role, true)?;
+            self.set_role_option(option_at, &mut options.create_role, true)?;
         } else if self.eat_ident("nocreaterole")? {
-            self.set_role_option(&mut options.create_role, false)?;
+            self.set_role_option(option_at, &mut options.create_role, false)?;
         } else if self.eat_ident("createdb")? {
-            self.set_role_option(&mut options.create_database, true)?;
+            self.set_role_option(option_at, &mut options.create_database, true)?;
         } else if self.eat_ident("nocreatedb")? {
-            self.set_role_option(&mut options.create_database, false)?;
+            self.set_role_option(option_at, &mut options.create_database, false)?;
         } else if self.eat_ident("login")? {
-            self.set_role_option(&mut options.can_login, true)?;
+            self.set_role_option(option_at, &mut options.can_login, true)?;
         } else if self.eat_ident("nologin")? {
-            self.set_role_option(&mut options.can_login, false)?;
+            self.set_role_option(option_at, &mut options.can_login, false)?;
         } else if self.eat_ident("replication")? {
-            self.set_role_option(&mut options.replication, true)?;
+            self.set_role_option(option_at, &mut options.replication, true)?;
         } else if self.eat_ident("noreplication")? {
-            self.set_role_option(&mut options.replication, false)?;
+            self.set_role_option(option_at, &mut options.replication, false)?;
         } else if self.eat_ident("bypassrls")? {
-            self.set_role_option(&mut options.bypass_row_level_security, true)?;
+            self.set_role_option(option_at, &mut options.bypass_row_level_security, true)?;
         } else if self.eat_ident("nobypassrls")? {
-            self.set_role_option(&mut options.bypass_row_level_security, false)?;
+            self.set_role_option(option_at, &mut options.bypass_row_level_security, false)?;
         } else if self.eat_ident("connection")? {
             self.expect_ident("limit")?;
             let limit = self.signed_integer_constant()?;
-            self.set_role_option(&mut options.connection_limit, limit)?;
+            self.set_role_option(option_at, &mut options.connection_limit, limit)?;
         } else if allow_sysid && self.eat_ident("sysid")? {
             let Tok::Num(raw) = self.peeked else {
                 return Err(self.syntax_error_here());
@@ -4701,14 +4704,14 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error_here());
             };
             self.advance()?;
-            self.set_role_option(&mut options.sysid, sysid)?;
+            self.set_role_option(option_at, &mut options.sysid, sysid)?;
         } else if self.eat_ident("password")? {
             let password = self.role_password_spec()?;
-            self.set_role_option(&mut options.password, password)?;
+            self.set_role_option(option_at, &mut options.password, password)?;
         } else if self.eat_ident("encrypted")? {
             self.expect_ident("password")?;
             let password = self.role_password_spec()?;
-            self.set_role_option(&mut options.password, password)?;
+            self.set_role_option(option_at, &mut options.password, password)?;
         } else if self.eat_ident("unencrypted")? {
             self.expect_ident("password")?;
             return Err(ParseError {
@@ -4718,7 +4721,7 @@ impl<'a> Parser<'a> {
                     "UNENCRYPTED PASSWORD is no longer supported"
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                cursor: None,
+                cursor: Some(option_at),
                 hint: Some("Remove UNENCRYPTED to store the password in encrypted form instead."),
                 near: None,
                 detail: None,
@@ -4726,16 +4729,21 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
             let valid_until = self.str_literal("VALID UNTIL")?;
-            self.set_role_option(&mut options.valid_until, valid_until)?;
+            self.set_role_option(option_at, &mut options.valid_until, valid_until)?;
         } else {
             return Ok(false);
         }
         Ok(true)
     }
 
-    fn set_role_option<T>(&self, destination: &mut Option<T>, value: T) -> Result<(), ParseError> {
+    fn set_role_option<T>(
+        &self,
+        option_at: usize,
+        destination: &mut Option<T>,
+        value: T,
+    ) -> Result<(), ParseError> {
         if destination.is_some() {
-            return Err(self.err_here("conflicting or redundant options"));
+            return Err(self.redundant_option(option_at));
         }
         *destination = Some(value);
         Ok(())
@@ -4952,7 +4960,7 @@ impl<'a> Parser<'a> {
                                 "redundant NOT NULL constraint definition"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
-                            cursor: None,
+                            cursor: Some(constraint_at),
                             hint: None,
                             near: None,
                             detail: None,
@@ -4969,7 +4977,7 @@ impl<'a> Parser<'a> {
                             "not-null constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
-                        cursor: None,
+                        cursor: Some(constraint_at),
                         hint: None,
                         near: None,
                         detail: None,
@@ -4996,7 +5004,7 @@ impl<'a> Parser<'a> {
                             "check constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
-                        cursor: None,
+                        cursor: Some(constraint_at),
                         hint: None,
                         near: None,
                         detail: None,
@@ -5005,7 +5013,10 @@ impl<'a> Parser<'a> {
                 self.push(&mut checks, check)?;
             } else if self.eat_ident("default")? {
                 if default_text.is_some() {
-                    return Err(self.err_here("multiple default expressions"));
+                    return Err(ParseError {
+                        cursor: Some(constraint_at),
+                        ..self.err_here("multiple default expressions")
+                    });
                 }
                 let start = self.peek_at;
                 let _ = self.column_default_expression()?;
@@ -5918,7 +5929,10 @@ impl<'a> Parser<'a> {
             let mut expression = self.expression(0)?;
             let mut source = self.text[start..self.peek_at].trim_end();
             let mut expression_collation = None;
-            while let Expr::Collate { operand, collation } = expression {
+            while let Expr::Collate {
+                operand, collation, ..
+            } = expression
+            {
                 expression_collation.get_or_insert(*collation);
                 expression = operand;
                 source = self.index_collation_operand_source(source)?;
@@ -6702,23 +6716,24 @@ impl<'a> Parser<'a> {
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             loop {
+                let option_at = self.peek_at;
                 if self.eat_ident("publish")? {
                     if publish.is_some() {
-                        return Err(self.err_here("conflicting or redundant options"));
+                        return Err(self.redundant_option(option_at));
                     }
                     self.expect_op("=")?;
                     let value = self.str_literal("publication publish option")?;
                     publish = Some(self.publication_operations(value)?);
                 } else if self.eat_ident("publish_via_partition_root")? {
                     if publish_via_partition_root.is_some() {
-                        return Err(self.err_here("conflicting or redundant options"));
+                        return Err(self.redundant_option(option_at));
                     }
                     publish_via_partition_root =
                         Some(self.subscription_bool_option("publish_via_partition_root")?);
                 } else {
                     self.expect_ident("publish_generated_columns")?;
                     if publish_generated_columns.is_some() {
-                        return Err(self.err_here("conflicting or redundant options"));
+                        return Err(self.redundant_option(option_at));
                     }
                     publish_generated_columns = Some(
                         match self.subscription_option_value(
@@ -7028,23 +7043,24 @@ impl<'a> Parser<'a> {
                 let mut publish_via_partition_root = None;
                 let mut publish_generated_columns = None;
                 loop {
+                    let option_at = self.peek_at;
                     if self.eat_ident("publish")? {
                         if publish.is_some() {
-                            return Err(self.err_here("conflicting or redundant options"));
+                            return Err(self.redundant_option(option_at));
                         }
                         self.expect_op("=")?;
                         let value = self.str_literal("publication publish option")?;
                         publish = Some(self.publication_operations(value)?);
                     } else if self.eat_ident("publish_via_partition_root")? {
                         if publish_via_partition_root.is_some() {
-                            return Err(self.err_here("conflicting or redundant options"));
+                            return Err(self.redundant_option(option_at));
                         }
                         publish_via_partition_root =
                             Some(self.subscription_bool_option("publish_via_partition_root")?);
                     } else {
                         self.expect_ident("publish_generated_columns")?;
                         if publish_generated_columns.is_some() {
-                            return Err(self.err_here("conflicting or redundant options"));
+                            return Err(self.redundant_option(option_at));
                         }
                         publish_generated_columns = Some(
                             match self.subscription_option_value(

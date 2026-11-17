@@ -3211,10 +3211,7 @@ pub(crate) fn window_select<'a>(
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *ob.expression)
             });
             if !in_list {
-                return sql_fail(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                ));
+                return sql_fail(super::distinct_order_key_missing(ob.expression));
             }
         }
     }

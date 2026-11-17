@@ -894,6 +894,7 @@ impl<'t> Deparser<'t> {
                 operand,
                 list: [item],
                 negated: false,
+                ..
             } => (*operand, *item),
             _ => return Ok(None),
         };
@@ -1514,6 +1515,7 @@ impl<'t> Deparser<'t> {
                 operand,
                 list,
                 negated,
+                ..
             } => {
                 let element = self.in_list(operand, list)?;
                 // A one-item list is an operator, as PostgreSQL's parser
@@ -1600,12 +1602,14 @@ impl<'t> Deparser<'t> {
                 negated,
                 case_insensitive,
                 escape: None,
+                ..
             }
             | Expr::Match {
                 operand,
                 pattern,
                 negated,
                 case_insensitive,
+                ..
             } => {
                 self.pattern(operand, pattern)?;
                 let like = matches!(expression, Expr::Like { .. });
@@ -2346,6 +2350,7 @@ fn constant_columns(
                 operand,
                 list: [item],
                 negated: false,
+                ..
             } => (*operand, *item),
             _ => continue,
         };
@@ -3818,6 +3823,7 @@ impl Deparser<'_> {
                 operand,
                 list,
                 negated,
+                ..
             } => {
                 let equal = if boolean(operand) {
                     0.5

@@ -1263,14 +1263,19 @@ caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body; an index or exclusion key expression
-positions an unknown column (`differential_exact/812`). The exact-error
-corpus compares each error's cursor, psql's `LINE n:` excerpt and caret.
-`tests/external/differential_exact/cursor-gaps.txt` lists the statements
-PostgreSQL positions where pos3ql reports no cursor yet (among them
-interval and other constant input failures, aggregates in `GROUP BY`,
-privilege checks and operator lookups over `cstring`); a listed statement
-pos3ql positions, or one PostgreSQL does not, fails the run, so the list
-only shrinks. Target and expression count errors of an `INSERT`, also with subscripted
+positions an unknown column (`differential_exact/812`). Pattern, `IN`-list,
+quantified and `IS DISTINCT FROM` operators, sort and grouping keys without
+an operator, array constructors, `COLLATE` clauses, window names, repeated
+utility options and domain constraints, `EXECUTE` and routine arguments
+(unknown literals and row constructors converting to their parameter's type
+at analysis) and privilege checks on a written schema are positioned too
+(`differential_exact/814`). The exact-error corpus compares every error's
+cursor, psql's `LINE n:` excerpt and caret. Remaining: a literal cast to an
+array of a domain whose input applies the base type's length
+(`'{toolong}'::d[]`) and a named-notation literal argument of a function in
+`FROM` fail without a cursor; an explicit cast to a domain over
+`varchar(n)` raises `22001` where PostgreSQL truncates; and an explicit
+collation conflict is found only when a row is compared, not at analysis. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

@@ -346,6 +346,7 @@ impl<'a> Context<'_, 'a> {
                 operand,
                 list,
                 negated,
+                ..
             } => {
                 let column = self.operand(operand, None)?;
                 let items = self
@@ -368,6 +369,7 @@ impl<'a> Context<'_, 'a> {
                 operator,
                 array: Expr::Array(list),
                 all,
+                ..
             } if Cmp::of(*operator).is_some() => {
                 let column = self.operand(operand, None)?;
                 let items = self

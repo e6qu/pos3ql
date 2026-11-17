@@ -2291,10 +2291,12 @@ where
             Expr::Collate {
                 operand: left,
                 collation: left_collation,
+                ..
             },
             Expr::Collate {
                 operand: right,
                 collation: right_collation,
+                ..
             },
         ) => {
             left_collation == right_collation

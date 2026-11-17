@@ -296,10 +296,7 @@ impl ExternalSorter {
     /// PostgreSQL's figure for the buffered rows, still in arrival order.
     fn postgres_space(
         &mut self,
-        heap: Option<(
-            usize,
-            &mut dyn FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
-        )>,
+        heap: Option<(usize, crate::sql::query::instrument::SortCompare<'_>)>,
     ) -> Result<(), SqlError> {
         let Some(tuples) = self.postgres else {
             return Ok(());

@@ -37,7 +37,7 @@ mod predicate;
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use aggregate::{
-    AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg, hash_agg_sizing,
+    AggInput, AggStrategy, AggregateCosts, QualCosts, aggregate_costs, cost_agg, hash_agg_sizing,
 };
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{
@@ -2004,6 +2004,8 @@ pub(crate) struct GroupingShape {
     /// The width of the rows the aggregation returns.
     pub(crate) output_width: f64,
     pub(crate) order: GroupOrder,
+    /// The `HAVING` qualification's cost and selectivity.
+    pub(crate) having: Option<aggregate::QualCosts>,
 }
 
 /// How the query's `ORDER BY` relates to its grouping.
@@ -2033,6 +2035,8 @@ pub(crate) struct GroupedPath {
     pub(crate) rows: f64,
     /// The sort of the groups for the `ORDER BY`.
     pub(crate) output_sort: Option<(f64, f64)>,
+    /// The `Limit` over them: its startup and total cost and its rows.
+    pub(crate) limit: Option<(f64, f64, f64)>,
     /// The relation's cheapest path the grouping reads: its startup and
     /// total cost, rows and width.
     pub(crate) input: AggInput,
@@ -2263,6 +2267,40 @@ pub(crate) fn query_shape<'a>(
     };
     shape.limit = (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0)));
     Ok(shape)
+}
+
+/// A `LIMIT`'s rows, if any, and its `OFFSET`'s, when either is present.
+pub(crate) type LimitEstimate = Option<(Option<f64>, f64)>;
+
+/// A query's `LIMIT` and `OFFSET` as the planner estimates them
+/// (`preprocess_limit`): `Some(None)` without either, `None` when one is
+/// not a constant.
+pub(crate) fn constant_limit<'a>(
+    limit: Option<&'a Expr<'a>>,
+    offset: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<LimitEstimate>, SqlError> {
+    let constant = |expression: Option<&'a Expr<'a>>| -> Option<Option<f64>> {
+        let Some(expression) = expression else {
+            return Some(None);
+        };
+        if !expression.is_constant(false) || expression.calls_routine() {
+            return None;
+        }
+        Some(
+            match crate::sql::eval::eval(expression, arena, &[], &crate::sql::eval::NoColumns) {
+                Ok(Datum::Null) => None,
+                Ok(value) => numeric_scalar(&value),
+                Err(_) => return None,
+            },
+        )
+    };
+    let (Some(count), Some(skip)) = (constant(limit), constant(offset)) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0))),
+    ))
 }
 
 /// The target list a scan of the one plain table `scope` reads computes

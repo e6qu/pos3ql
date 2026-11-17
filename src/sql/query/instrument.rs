@@ -405,6 +405,10 @@ pub(crate) struct SortSpace {
     pub(crate) bytes: usize,
 }
 
+/// A sort's row comparison.
+pub(crate) type SortCompare<'c> =
+    &'c mut dyn FnMut(&[u8], &[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>;
+
 /// The most columns a sort tuple sized as PostgreSQL's names.
 const MAX_SORT_COLUMNS: usize = 64;
 
@@ -469,10 +473,7 @@ impl SortTuples {
         &self,
         count: usize,
         row_at: &dyn Fn(usize) -> &'r [u8],
-        heap: Option<(
-            &mut [usize],
-            &mut dyn FnMut(&[u8], &[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>,
-        )>,
+        heap: Option<(&mut [usize], SortCompare<'_>)>,
     ) -> Result<Option<usize>, crate::sql::SqlError> {
         use super::postgres_memory::{
             SortTuples as Copies, allocset_chunk_space, bounded_heap_charge, maxalign,

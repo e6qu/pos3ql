@@ -1059,11 +1059,19 @@ indented `Sort Key` lines and the JSON `Grouping Sets` groups, and over one
 plain table its costs and rows are PostgreSQL's (`differential_exact/802`).
 Outside that cost model (the shapes below) the rollups and keys are
 arranged from pos3ql's own estimates, so a sorted arrangement PostgreSQL's
-costs would pick may show as hashed. Remaining: `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
-`ORDER BY` inputs, user-defined aggregates, a select list computing
-expressions over aggregates, grouping by expressions, by a column an index
-orders (presorted and incremental paths) and over joins keep pos3ql's own
-estimate. JSON nests as
+costs would pick may show as hashed. A `HAVING` condition over aggregates
+(`=`, `<>` and inequalities against constants, combined with `AND` and
+`OR`) adds its `cost_qual_eval` per group, an aggregate costing what a
+column does, and keeps the groups its default selectivities keep
+(`DEFAULT_EQ_SEL`, `DEFAULT_INEQ_SEL`); a constant `LIMIT` or `OFFSET`
+scales the run cost of each grouped and ordered path as
+`adjust_limit_rows_costs` does (which the scan model's limit now also
+follows when both are present), bounds the sort of the groups and picks the
+cheapest limited path (`differential_exact/821`). Remaining: aggregates
+with `DISTINCT` or `ORDER BY` inputs, user-defined aggregates, a select
+list computing expressions over aggregates, an `ORDER BY` of an aggregate,
+grouping by expressions, by a column an index orders (presorted and
+incremental paths) and over joins keep pos3ql's own estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's

@@ -3975,9 +3975,6 @@ fn grouped_scan_path<'a>(
         || scope.n != 1
         || !from.joins.is_empty()
         || from.base.sample.is_some()
-        || statement.having.is_some()
-        || statement.limit.is_some()
-        || statement.offset.is_some()
         || statement.distinct
         || !statement.distinct_on.is_empty()
         || !statement.locking.is_empty()
@@ -3988,6 +3985,10 @@ fn grouped_scan_path<'a>(
     {
         return Ok(None);
     }
+    let Some(limit) = query::index_paths::constant_limit(statement.limit, statement.offset, arena)?
+    else {
+        return Ok(None);
+    };
     let slot = scope.slots[0];
     if storage.table_def(slot, txid).partition.is_partitioned()
         || storage.relation_has_descendants(slot, txid)
@@ -4050,6 +4051,9 @@ fn grouped_scan_path<'a>(
                     ordered_len += 1;
                 }
             }
+            // The groups are sorted above the grouping by whatever keys
+            // follow a leading key that is not a grouping column.
+            Some(_) | None if order == GroupOrder::Other => {}
             Some(_) => return Ok(None),
             None if at == 0 => order = GroupOrder::Other,
             None => return Ok(None),
@@ -4084,13 +4088,24 @@ fn grouped_scan_path<'a>(
                 + query::index_paths::column_width(storage, txid, scope.slots[0], column);
         }
     }
+    // A `HAVING` reading its aggregates: its cost and selectivity.
+    let having = match statement.having {
+        Some(having) => match having_quals(having, storage, txid, columns, arena)? {
+            Some(quals) => Some(quals),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     // The aggregates' costs, over a list of aggregates, columns and
-    // constants.
+    // constants, with the `HAVING` qualification's aggregates.
     let expressions = arena
-        .alloc_slice_with(statement.items.len() + statement.order_by.len(), |_| {
+        .alloc_slice_with(statement.items.len() + statement.order_by.len() + 1, |_| {
             &Expr::Null
         })
         .map_err(|_| arena_full())?;
+    if let Some(condition) = statement.having {
+        expressions[statement.items.len() + statement.order_by.len()] = condition;
+    }
     for (slot, item) in expressions.iter_mut().zip(statement.items) {
         let SelectItem::Expr { expression, .. } = item else {
             return Ok(None);
@@ -4148,7 +4163,9 @@ fn grouped_scan_path<'a>(
             aggregates,
             output_width: f64::from(output_width),
             order,
+            having,
         }),
+        limit,
         ..QueryShape::default()
     };
     let planned = query::index_paths::scan_path(
@@ -4193,6 +4210,74 @@ fn grouped_scan_path<'a>(
         sort_keys,
         group_keys,
         width: output_width,
+    }))
+}
+
+/// The cost and selectivity PostgreSQL's planner gives a `HAVING`
+/// condition that reads aggregates (`cost_qual_eval`, which costs an
+/// aggregate as a column, and `clauselist_selectivity`, whose operators find
+/// no statistics for an aggregate: `DEFAULT_EQ_SEL` for `=`, its complement
+/// for `<>`, `DEFAULT_INEQ_SEL` for an inequality). `None` for a condition
+/// outside that model, or one without an aggregate (which PostgreSQL moves to
+/// `WHERE`).
+fn having_quals(
+    having: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &Arena,
+) -> Result<Option<query::index_paths::QualCosts>, SqlError> {
+    use crate::sql::ast::BinaryOp;
+    const DEFAULT_EQ_SEL: f64 = 0.005;
+    const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+    fn selectivity(condition: &Expr<'_>) -> Option<f64> {
+        match condition {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+                ..
+            } => Some(selectivity(left)? * selectivity(right)?),
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                let (left, right) = (selectivity(left)?, selectivity(right)?);
+                Some(left + right - left * right)
+            }
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } if (left.is_aggregate_use() && right.is_constant(false))
+                || (right.is_aggregate_use() && left.is_constant(false)) =>
+            {
+                match operator {
+                    BinaryOp::Eq => Some(DEFAULT_EQ_SEL),
+                    BinaryOp::NotEq => Some(1.0 - DEFAULT_EQ_SEL),
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                        Some(DEFAULT_INEQ_SEL)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    if having.contains_subquery() {
+        return Ok(None);
+    }
+    let Some(selectivity) = selectivity(having) else {
+        return Ok(None);
+    };
+    Ok(Some(query::index_paths::QualCosts {
+        startup: 0.0,
+        per_tuple: query::qual_cost(having, columns, storage, txid, arena) / 2.0
+            * crate::sql::guc::planner_value("cpu_operator_cost"),
+        selectivity,
     }))
 }
 
@@ -4354,6 +4439,7 @@ fn grouping_sets_scan_path<'a>(
                 aggregates,
                 output_width: f64::from(output_width),
                 order: GroupOrder::None,
+                having: None,
             }),
             ..QueryShape::default()
         };
@@ -7263,15 +7349,25 @@ fn plan_pulled_select<'a>(
         add_stage(
             &mut stages,
             &mut stage_count,
-            match chosen_path.and_then(|path| path.limit_cost.map(|cost| (path, cost))) {
+            match grouped
+                .and_then(|grouped| {
+                    grouped
+                        .path
+                        .grouped
+                        .and_then(|path| path.limit)
+                        .map(|cost| (grouped.width, cost))
+                })
+                .or_else(|| {
+                    chosen_path.and_then(|path| path.limit_cost.map(|cost| (path.width, cost)))
+                }) {
                 // The chosen path's limit as PostgreSQL's planner costs it.
-                Some((path, (startup, total, rows))) => PlanNode {
+                Some((width, (startup, total, rows))) => PlanNode {
                     name: StackStr::from_str("Limit"),
                     key: key(Role::Limit),
                     startup_cost: startup,
                     total_cost: total,
                     rows: rows as u64,
-                    width: path.width,
+                    width,
                     object_requests,
                     cache_blocks,
                     ..PlanNode::EMPTY

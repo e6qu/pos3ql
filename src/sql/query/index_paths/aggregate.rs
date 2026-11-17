@@ -361,6 +361,32 @@ pub(crate) fn hash_agg_sizing(
     })
 }
 
+/// The cost and selectivity of a grouping's `HAVING` qualification
+/// (`cost_qual_eval`, `clauselist_selectivity`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct QualCosts {
+    pub(crate) startup: f64,
+    pub(crate) per_tuple: f64,
+    pub(crate) selectivity: f64,
+}
+
+/// `cost_agg`'s accounting of its `HAVING` quals over the costs and rows it
+/// computed without them: their startup cost, their per-row cost on every
+/// group, and the groups they keep (`clamp_row_est`).
+pub(crate) fn with_having(
+    (startup, total, rows): (f64, f64, f64),
+    quals: Option<QualCosts>,
+) -> (f64, f64, f64) {
+    let Some(quals) = quals else {
+        return (startup, total, rows);
+    };
+    (
+        startup + quals.startup,
+        total + quals.startup + rows * quals.per_tuple,
+        super::clamp_row_est(rows * quals.selectivity),
+    )
+}
+
 /// `cost_agg`'s startup and total costs and its output rows, before any
 /// `HAVING` qualification and the target list's own cost.
 pub(crate) fn cost_agg(

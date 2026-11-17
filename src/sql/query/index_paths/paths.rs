@@ -2619,12 +2619,15 @@ fn grouped<'a>(
         rows,
         width,
     };
-    let (startup, total, _) = cost_agg(
-        AggStrategy::Sorted,
-        &grouping.aggregates,
-        columns.len(),
-        groups,
-        sorted_input,
+    let (startup, total, _) = super::aggregate::with_having(
+        cost_agg(
+            AggStrategy::Sorted,
+            &grouping.aggregates,
+            columns.len(),
+            groups,
+            sorted_input,
+        ),
+        grouping.having,
     );
     let sorted = Candidate {
         startup,
@@ -2639,12 +2642,15 @@ fn grouped<'a>(
         rows,
         width,
     };
-    let (startup, total, _) = cost_agg(
-        AggStrategy::Hashed,
-        &grouping.aggregates,
-        columns.len(),
-        groups,
-        hashed_input,
+    let (startup, total, kept_groups) = super::aggregate::with_having(
+        cost_agg(
+            AggStrategy::Hashed,
+            &grouping.aggregates,
+            columns.len(),
+            groups,
+            hashed_input,
+        ),
+        grouping.having,
     );
     let hashed = Candidate {
         startup,
@@ -2659,7 +2665,11 @@ fn grouped<'a>(
     let cheapest_grouped = cheapest_total(grouped_paths).expect("a grouped path is kept");
     // `create_ordered_paths`: a path in the `ORDER BY` order as it is, the
     // cheapest one sorted.
-    let (sort_startup, sort_run) = tuplesort_cost(groups, grouping.output_width, None, costs);
+    let limit_tuples = shape
+        .limit
+        .and_then(|(count, offset)| count.map(|count| count + offset));
+    let (sort_startup, sort_run) =
+        tuplesort_cost(kept_groups, grouping.output_width, limit_tuples, costs);
     let sort_groups = |path: Candidate| Candidate {
         startup: path.total + sort_startup,
         total: path.total + sort_startup + sort_run,
@@ -2685,9 +2695,36 @@ fn grouped<'a>(
         };
         final_count += 1;
     }
+    let consider_startup = consider_startup(shape);
     let mut ordered = [None::<Candidate>; MAX_CANDIDATES];
-    let ordered_count = add_paths(&finals[..final_count], false, &mut ordered);
-    let chosen = cheapest_total(&ordered[..ordered_count]).expect("an ordered path is kept");
+    let ordered_count = add_paths(&finals[..final_count], consider_startup, &mut ordered);
+    // `create_limit_path` scales each path's run cost to the groups read.
+    let limited = paths
+        .arena
+        .alloc_slice_with(ordered_count, |at| {
+            let path = ordered[at].expect("dense ordered paths");
+            match shape.limit {
+                Some((count, offset)) => {
+                    let (startup, total, _) = adjust_limit_rows_costs(
+                        path.startup,
+                        path.total,
+                        kept_groups,
+                        count,
+                        offset,
+                    );
+                    Candidate {
+                        startup,
+                        total,
+                        ..path
+                    }
+                }
+                None => path,
+            }
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut final_paths = [None::<Candidate>; MAX_CANDIDATES];
+    let final_count = add_paths(limited, consider_startup, &mut final_paths);
+    let chosen = cheapest_total(&final_paths[..final_count]).expect("an ordered path is kept");
     let hashed_chosen = chosen.presorted == 0;
     let aggregate = if hashed_chosen { hashed } else { sorted };
     let output_sort = (grouping.order != super::GroupOrder::None
@@ -2715,8 +2752,12 @@ fn grouped<'a>(
             .flatten(),
         startup: aggregate.startup,
         total: aggregate.total,
-        rows: groups,
+        rows: kept_groups,
         output_sort,
+        limit: shape.limit.map(|(count, offset)| {
+            let (_, _, rows) = adjust_limit_rows_costs(0.0, 0.0, kept_groups, count, offset);
+            (chosen.startup, chosen.total, rows)
+        }),
         input: hashed_input,
     });
     Ok(Ok(Planned::Chosen(path)))
@@ -2969,16 +3010,8 @@ pub(super) fn upper_paths(
     for path in ordered[..ordered_count].iter().flatten() {
         let mut path = *path;
         if let Some((count, offset)) = shape.limit {
-            let mut rows_left = rows;
-            if offset > 0.0 {
-                let offset_rows = clamp_row_est(offset).min(rows_left);
-                path.startup += (path.total - path.startup) * offset_rows / rows;
-                rows_left = (rows_left - offset_rows).max(1.0);
-            }
-            if let Some(count) = count {
-                let count_rows = clamp_row_est(count).min(rows_left);
-                path.total = path.startup + (path.total - path.startup) * count_rows / rows;
-            }
+            (path.startup, path.total, _) =
+                adjust_limit_rows_costs(path.startup, path.total, rows, count, offset);
         }
         limited[limited_count] = Some(path);
         limited_count += 1;
@@ -3006,13 +3039,7 @@ pub(super) fn upper_paths(
             .map(|sorted| (sorted.startup, sorted.total))
     };
     let limit_cost = shape.limit.map(|(count, offset)| {
-        let mut limit_rows = rows;
-        if offset > 0.0 {
-            limit_rows = (limit_rows - clamp_row_est(offset).min(limit_rows)).max(1.0);
-        }
-        if let Some(count) = count {
-            limit_rows = clamp_row_est(count).min(limit_rows);
-        }
+        let (_, _, limit_rows) = adjust_limit_rows_costs(0.0, 0.0, rows, count, offset);
         (chosen.startup, chosen.total, limit_rows)
     });
     Ok(Upper {
@@ -3021,6 +3048,35 @@ pub(super) fn upper_paths(
         sort_cost,
         limit_cost,
     })
+}
+
+/// `adjust_limit_rows_costs`: a `Limit` of `count` rows after `offset`
+/// over a path of `rows` rows reads the offset's share of the path's run
+/// before its first row and the count's share after it.
+pub(super) fn adjust_limit_rows_costs(
+    startup: f64,
+    total: f64,
+    rows: f64,
+    count: Option<f64>,
+    offset: f64,
+) -> (f64, f64, f64) {
+    let (input_startup, input_total, input_rows) = (startup, total, rows);
+    let (mut startup, mut total, mut rows) = (startup, total, rows);
+    if offset > 0.0 {
+        let offset_rows = clamp_row_est(offset).min(rows);
+        if input_rows > 0.0 {
+            startup += (input_total - input_startup) * offset_rows / input_rows;
+        }
+        rows = (rows - offset_rows).max(1.0);
+    }
+    if let Some(count) = count {
+        let count_rows = clamp_row_est(count).min(rows);
+        if input_rows > 0.0 {
+            total = startup + (input_total - input_startup) * count_rows / input_rows;
+        }
+        rows = count_rows.max(1.0);
+    }
+    (startup, total, rows)
 }
 
 /// The chosen path as EXPLAIN and execution read it.

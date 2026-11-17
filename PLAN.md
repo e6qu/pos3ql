@@ -852,9 +852,16 @@ whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. A `SELECT` of plain columns from
-two to eight plain, analyzed local tables without row security,
-inner-joined by equalities of same-typed columns (integer, `text`,
-`numeric`, `date`, `bool`), is planned by PostgreSQL 18's join search
+two to eight plain, analyzed local tables without row security, joined by
+inner, cross, left, right and full joins on equalities of same-typed
+columns (integer, `text`, `numeric`, `date`, `bool`), comparisons (`<`,
+`<=`, `>`, `>=`) of two such columns and conditions of one relation, is
+prepared as PostgreSQL 18 prepares it (`reduce_outer_joins`, which also
+makes a left join whose `WHERE` tests a compared column `IS NULL` an anti
+join, `deconstruct_jointree` with `make_outerjoininfo` and commuting left
+joins' cloned conditions, the distribution of each condition to the scan,
+join or outer join that evaluates it, equivalence classes and
+`reconsider_outer_join_clauses`), and is planned by PostgreSQL 18's join search
 (`standard_join_search`, `add_paths_to_joinrel` with its merge, nested-loop
 and hash paths, the join costs of `costsize.c`, `eqjoinsel` over the
 columns' most common values, equivalence classes and `add_path`), and
@@ -879,6 +886,37 @@ its size (`get_foreign_key_join_selectivity`); and a merge join runs as
 (`differential_exact/844`). A join column equated with a constant
 restricts every member of its class to it and joins nothing
 (`generate_base_implied_equalities_const`, `differential_exact/845`).
+Outer joins limit the join order (`join_is_legal`,
+`have_join_order_restriction`), a full join plans its sides as separate
+join problems (`make_rel_from_joinlist`), and each join's left, right,
+full or anti paths (`populate_joinrel_with_paths`) are sized by
+`calc_joinrel_size_estimate` with the matching conditions apart from the
+filters pushed down to the join, an anti join's by `eqjoinsel_semi`
+through the clause's one cached non-inner estimate; `EXPLAIN` prints each
+join's `Join Filter` and `Filter` cheapest first, and execution returns
+unmatched rows with NULLs as `ExecNestLoop`, `ExecHashJoin` (a hash
+join's unmatched inner rows in bucket order, its NULL keys hashed as
+nothing) and `ExecMergeJoin` (its fill states) do, and an inner scan
+parameterized by an outer join's clause runs under a nested loop
+(`differential_exact/846`). A merge join's sort of a single column sorts
+datums (`ExecInitSort`), so its `Memory` counts no tuples. The semi and
+anti joins pulled-up `EXISTS`, `NOT EXISTS`, `IN` and `ANY` subqueries
+become are planned the same way: a semi join whose inner relation a unique
+index makes unique for its clauses becomes an inner join
+(`reduce_unique_semijoins`); otherwise its inner relation can also be made
+unique by its compared columns and inner-joined (`create_unique_path`,
+`join_is_legal`'s unique-ified joins), as a `Unique` over a `Sort` or a
+`HashAggregate` whose groups come back in the order `ExecAgg` walks its
+`simplehash` table, and a hash join may run as a `Hash Right Semi Join`
+returning each inner row at its first match (`differential_exact/847`). A
+query whose subqueries pull up into such a join runs in the general
+executor rather than a retained reader, and a scan's conditions name a
+pulled-up subquery's relation's columns bare, as PostgreSQL prints them.
+`USING` and `NATURAL` joins join by the equalities of their columns,
+`SELECT *` reading a merged column's left column (a right join's right
+one, a full join's both), and the top join's width is the query output's
+(`apply_scanjoin_target_to_paths`), each listed column counted
+(`differential_exact/848`).
 Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
@@ -896,8 +934,15 @@ planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
-a filter (`0A000`). Remaining for that search: other join clauses and types (outer, semi and anti joins, `USING`, non-equality join
-conditions), a class with two constants, output expressions, upper
+a filter (`0A000`). Remaining for that search: a parameterized path of a
+relation with an index that would also filter by another join clause
+movable into it (`get_baserel_parampathinfo`), output expressions other
+than columns, join conditions other than column
+equalities and comparisons, join removal, a constant equated with an
+outer join's compared column (`reconsider_outer_join_clause`), a
+parameterized hash or merge join (`get_joinrel_parampathinfo` of an outer
+join's clauses), several batches of a hash join returning unmatched inner
+rows, a class with two constants, output expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
 pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than
@@ -1413,10 +1458,14 @@ named, converts to its parameter's type at analysis, and a built-in's to the
 selected overload's (`generate_series(1, '3')`, `differential_exact/831`).
 Explicit `COLLATE` clauses that meet in one expression conflict while the
 query level, its subqueries, an `UPDATE` or a `DELETE` is analysed
-(`assign_collations`, `differential_exact/832`). Remaining: an `INSERT ...
-SELECT`, `ON CONFLICT` and `MERGE` assignment of a constant fold its length
-coercion only when a row is written, and an unknown or non-collatable
-`COLLATE` fails only when a row reaches it. Target and expression count errors of an `INSERT`, also with subscripted
+(`assign_collations`, `differential_exact/832`). An `INSERT ... SELECT`
+source PostgreSQL pulls up (`is_simple_subquery`), an `ON CONFLICT DO UPDATE`
+assignment and a `MERGE` assignment or value of a constant fail its length
+coercion while the statement is planned, as an `UPDATE`'s does; an unknown
+collation (`42704`, naming the schema-qualified name and the encoding, or
+`3F000` for a missing schema) and a `COLLATE` on a type without collation
+(`42804`) fail at the clause, with its cursor, whether or not a row reaches
+it (`differential_exact/846`). Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

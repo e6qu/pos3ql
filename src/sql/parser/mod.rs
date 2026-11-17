@@ -7926,6 +7926,7 @@ impl<'a> Parser<'a> {
             } else {
                 ColumnCompression::Default
             };
+            let collation_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
@@ -7939,6 +7940,7 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     foreign_options,
                     storage,
                     compression,

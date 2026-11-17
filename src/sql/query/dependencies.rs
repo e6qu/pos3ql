@@ -5715,13 +5715,7 @@ fn collect_expression<'a>(
                 PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
             }),
         };
-        let slot = found.ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "collation \"{}\" does not exist",
-                name.name
-            )
-        })?;
+        let slot = found.ok_or_else(|| storage.collation_miss(name.schema, name.name, txid))?;
         let definition = storage.collation(slot).definition_for(txid);
         dependencies.push(StoredQueryDependency {
             class: DependencyClass::Collation,

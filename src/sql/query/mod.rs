@@ -6114,6 +6114,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.resolve_collation(schema, name, self.txid)
     }
 
+    fn collation_miss(&self, schema: Option<&str>, name: &str) -> SqlError {
+        self.storage.collation_miss(schema, name, self.txid)
+    }
+
     fn collation_oid(&self, name: &str) -> Option<i32> {
         super::catalog::collation_oid_by_name(self.storage, self.txid, name)
     }
@@ -13330,15 +13334,29 @@ fn check_constant_assignments<'a>(
 ) -> Result<(), SqlError> {
     let definition = storage.table_def(table, txid);
     for (name, expression) in assignments {
-        if !expression.is_literal_constant() {
-            continue;
-        }
         let Some(column) = definition
             .column_index(name)
             .map(|index| definition.columns()[index])
         else {
             continue;
         };
+        check_constant_assignment(expression, &column, storage, txid, arena)?;
+    }
+    Ok(())
+}
+
+/// [`check_constant_assignments`] for one value assigned to `column`.
+fn check_constant_assignment<'a>(
+    expression: &'a Expr<'a>,
+    column: &crate::storage::ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if !expression.is_literal_constant() {
+        return Ok(());
+    }
+    {
         let catalog = storage_catalog(storage, arena, txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
@@ -13352,12 +13370,11 @@ fn check_constant_assignments<'a>(
             &hooks,
         )?;
         if value.is_null() {
-            continue;
+            return Ok(());
         }
         // Only the length coercion's failure is the planner's: a value the
         // type's input or cast rejects fails at analysis, as before.
-        let coerced = match super::exec::constraints::column_domain_target(storage, &column, txid)?
-        {
+        let coerced = match super::exec::constraints::column_domain_target(storage, column, txid)? {
             Some(domain) => super::exec::constraints::coerce_domain_base_value(
                 storage,
                 domain,
@@ -13376,7 +13393,7 @@ fn check_constant_assignments<'a>(
                         arena,
                     )
                 }),
-            None => continue,
+            None => return Ok(()),
         };
         if let Err(error) = coerced
             && error.is_type_modifier_coercion()
@@ -13492,9 +13509,75 @@ fn fold_insert_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    with_level_columns(None, &catalog, |columns| {
+    let folded = with_level_columns(None, &catalog, |columns| {
         fold_insert_level(statement, arena, &catalog, columns)
-    })
+    })?;
+    if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(statement.table.schema, statement.table.name, txid)
+    {
+        check_insert_constants(&folded, slot, storage, txid, arena)?;
+    }
+    Ok(folded)
+}
+
+/// The constants an `INSERT ... SELECT` source or `ON CONFLICT DO UPDATE`
+/// assigns, whose length coercion PostgreSQL's planner folds while planning
+/// (see [`check_constant_assignments`]). A source query is a subquery the
+/// planner pulls up, so its constants reach the target list only when
+/// `is_simple_subquery` accepts it.
+fn check_insert_constants<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    table: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let definition = storage.table_def(table, txid);
+    if let Some(select) = statement.select
+        && source_is_simple_subquery(select, storage, txid)
+    {
+        for (position, item) in select.items.iter().enumerate() {
+            let SelectItem::Expr { expression, .. } = item else {
+                break;
+            };
+            let column = match statement.columns.get(position) {
+                Some(name) => definition
+                    .column_index(name)
+                    .map(|index| definition.columns()[index]),
+                None if statement.columns.is_empty() => definition.columns().get(position).copied(),
+                None => None,
+            };
+            if let Some(column) = column {
+                check_constant_assignment(expression, &column, storage, txid, arena)?;
+            }
+        }
+    }
+    if let Some(update) = statement.on_conflict.and_then(|conflict| conflict.update) {
+        check_constant_assignments(update, table, storage, txid, arena)?;
+    }
+    Ok(())
+}
+
+/// PostgreSQL's `is_simple_subquery` for an `INSERT ... SELECT` source.
+fn source_is_simple_subquery(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    select.set_body.is_none()
+        && select.with.is_empty()
+        && select.locking.is_empty()
+        && !select.distinct
+        && select.distinct_on.is_empty()
+        && select.group_by.is_empty()
+        && select.grouping_sets.is_empty()
+        && select.having.is_none()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.windows.is_empty()
+        && select.items.iter().all(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                !cte::calls_grouping_or_set_routine(expression, storage, txid)
+            }
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
+        })
 }
 
 fn fold_insert_level<'a>(
@@ -13673,6 +13756,46 @@ pub(crate) fn fold_merge_constants<'a>(
     }
     folded.whens = whens;
     folded.on = fold(statement.on)?;
+    if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(statement.target.schema, statement.target.name, txid)
+    {
+        let definition = storage.table_def(slot, txid);
+        for when in whens.iter() {
+            match *when {
+                MergeWhen::Matched {
+                    action: MergeTargetAction::Update(assignments),
+                    ..
+                }
+                | MergeWhen::NotMatchedBySource {
+                    action: MergeTargetAction::Update(assignments),
+                    ..
+                } => check_constant_assignments(assignments, slot, storage, txid, arena)?,
+                MergeWhen::NotMatchedByTarget {
+                    action:
+                        MergeSourceAction::Insert {
+                            columns, values, ..
+                        },
+                    ..
+                } => {
+                    for (position, value) in values.iter().enumerate() {
+                        let column = match columns.get(position) {
+                            Some(name) => definition
+                                .column_index(name)
+                                .map(|index| definition.columns()[index]),
+                            None if columns.is_empty() => {
+                                definition.columns().get(position).copied()
+                            }
+                            None => None,
+                        };
+                        if let Some(column) = column {
+                            check_constant_assignment(value, &column, storage, txid, arena)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     arena
         .alloc(folded)
         .map(|merge| &*merge)

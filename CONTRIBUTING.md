@@ -69,6 +69,11 @@ needs, falls below 20 GiB. The script's header lists its settings. A stopped
 run means the workload is too large for the machine: bound it or move it to CI
 rather than raising the limits.
 
+When several worktrees or agents share one machine, run each heavy job
+(compile, test suite, differential phase, generated-query loop) through
+`tools/heavy-lock.sh <command>`. The wrapper holds a host-wide lock, so heavy
+jobs run one after another instead of at once.
+
 A focused regression on a suitable runner:
 
 ```sh

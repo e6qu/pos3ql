@@ -1,8 +1,11 @@
-//! PostgreSQL's `assign_collations` conflict check for explicit `COLLATE`
-//! clauses, run while a query level is analysed. Two explicit collations that
-//! meet in one expression fail with `42P21` at the later clause, whether or
-//! not any row ever reaches the expression. Implicit derivations do not fail
-//! here: an indeterminate collation fails only when an operation needs it.
+//! PostgreSQL's analysis of explicit `COLLATE` clauses, run while a query
+//! level is analysed. A clause on a type without collation (`42804`) or
+//! naming no collation (`42704`) fails where it is written
+//! (`transformCollateClause`), and two explicit collations that meet in one
+//! expression fail with `42P21` at the later clause (`assign_collations`),
+//! whether or not any row ever reaches the expression. Implicit derivations
+//! do not fail here: an indeterminate collation fails only when an operation
+//! needs it.
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{Collation, Expr, ParsedCollation, Select, SelectItem, SourcePosition};
@@ -30,7 +33,7 @@ pub(crate) fn check_level(
     if level_expressions(statement)
         .map(count_collate_clauses)
         .sum::<usize>()
-        < 2
+        == 0
     {
         return Ok(());
     }
@@ -43,8 +46,8 @@ pub(crate) fn check_level(
     })
 }
 
-/// Checks `expressions`, typed by the sources `resolve` gives, when two or
-/// more `COLLATE` clauses could meet in them.
+/// Checks `expressions`, typed by the sources `resolve` gives, when they hold
+/// a `COLLATE` clause.
 pub(crate) fn check_expressions<'s, 'e: 's, 'a>(
     expressions: impl Iterator<Item = &'s Expr<'e>> + Clone,
     storage: &Storage,
@@ -56,7 +59,7 @@ pub(crate) fn check_expressions<'s, 'e: 's, 'a>(
         .clone()
         .map(count_collate_clauses)
         .sum::<usize>()
-        < 2
+        == 0
     {
         return Ok(());
     }
@@ -161,14 +164,28 @@ impl Checker<'_> {
                 collation,
             } => {
                 self.check(operand)?;
+                let located =
+                    |error| crate::sql::error_position::at_source_position(error, *source_position);
+                // A type without collation fails before the name is looked up.
+                if let Some(ctype) = self.operand_type(operand)
+                    && !ctype.is_collatable()
+                {
+                    return Err(located(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "collations are not supported by type {}",
+                        ctype.name()
+                    )));
+                }
                 let value = match *collation {
-                    ParsedCollation::Builtin(value) => Some(value),
-                    ParsedCollation::Named(name) => {
-                        self.catalog.resolve_collation(name.schema, name.name)
-                    }
+                    ParsedCollation::Builtin(value) => value,
+                    ParsedCollation::Named(name) => self
+                        .catalog
+                        .resolve_collation(name.schema, name.name)
+                        .ok_or_else(|| {
+                            located(self.catalog.collation_miss(name.schema, name.name))
+                        })?,
                 };
-                // An unknown collation fails where the clause is resolved.
-                Ok(value.map(|value| Explicit {
+                Ok(Some(Explicit {
                     value,
                     at: *source_position,
                 }))
@@ -322,6 +339,16 @@ impl Checker<'_> {
                 self.result(expression, merged)
             }
         }
+    }
+
+    /// The built-in type of `expression`, when this analysis can infer it. An
+    /// untyped literal is text, as `transformCollateClause` coerces it.
+    fn operand_type(&self, expression: &Expr<'_>) -> Option<ColType> {
+        let (oid, _) = crate::sql::error_position::preserving_pending(|| {
+            crate::sql::exec::infer_type_res(expression, self.columns)
+        })
+        .ok()?;
+        ColType::from_oid(oid)
     }
 
     /// What a node passes up: its inputs' explicit collation when its own

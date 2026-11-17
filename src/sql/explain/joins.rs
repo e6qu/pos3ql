@@ -11,7 +11,7 @@ use super::{
 use crate::mem::arena::Arena;
 use crate::sql::eval::SqlError;
 use crate::sql::query::index_paths::join_query::ModeledJoin;
-use crate::sql::query::index_paths::joins::{ClauseList, Keys, Path, PathKind, Relids};
+use crate::sql::query::index_paths::joins::{ClauseList, JoinType, Keys, Path, PathKind, Relids};
 use crate::sql::query::{self, QueryScope};
 use crate::util::StackStr;
 
@@ -54,7 +54,13 @@ impl Writer<'_, '_, '_, '_> {
             startup_cost: path.startup,
             total_cost: path.total,
             rows: path.rows as u64,
-            width: path.width as u32,
+            // The top relation's paths carry the query's output
+            // (`apply_scanjoin_target_to_paths`).
+            width: if depth == 0 {
+                self.model.output_width as u32
+            } else {
+                path.width as u32
+            },
             output_unprintable: true,
             ..PlanNode::EMPTY
         }
@@ -90,6 +96,95 @@ impl Writer<'_, '_, '_, '_> {
                 plan.push(self.keyed(node, query::instrument::Role::Materialize, id))?;
                 self.path(plan, input, depth + 1)
             }
+            PathKind::Unique {
+                input,
+                method: query::index_paths::joins::UniqueMethod::Noop,
+                ..
+            } => self.path(plan, input, depth),
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                method: query::index_paths::joins::UniqueMethod::Hash,
+            } => {
+                // A `HashAggregate` grouping by the compared columns.
+                let mut node = PlanNode {
+                    analyze_unsupported: Some(
+                        "EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported",
+                    ),
+                    ..self.node("HashAggregate", &path, depth)
+                };
+                let mut shown = PlanKeys {
+                    label: KeyLabel::Group,
+                    ..PlanKeys::NONE
+                };
+                for member in &keys[..usize::from(key_count)] {
+                    let mut text = StackStr::<512>::new();
+                    self.column(
+                        (usize::from(member.rel), usize::from(member.column)),
+                        &mut text,
+                    );
+                    for held in [&mut shown.plain, &mut shown.verbose] {
+                        if !held.is_empty() {
+                            let _ = write!(held, "{}", super::KEY_SEPARATOR);
+                        }
+                        let _ = write!(held, "{}", text.as_str());
+                    }
+                }
+                node.keys = shown;
+                plan.push(node)?;
+                self.path(plan, input, depth + 1)
+            }
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                ..
+            } => {
+                // `create_unique_plan`: a `Unique` over a `Sort` of the
+                // compared columns (`label_sort_with_costsize`).
+                const UNSUPPORTED: Option<&str> =
+                    Some("EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported");
+                plan.push(PlanNode {
+                    analyze_unsupported: UNSUPPORTED,
+                    ..self.node("Unique", &path, depth)
+                })?;
+                let input_path = *self.model.plan.path(input);
+                let (startup, total) =
+                    query::index_paths::joins::sort_cost(&input_path, self.model.plan.settings);
+                let mut sort = PlanNode {
+                    analyze_unsupported: UNSUPPORTED,
+                    ..self.node(
+                        "Sort",
+                        &Path {
+                            startup,
+                            total,
+                            ..input_path
+                        },
+                        depth + 1,
+                    )
+                };
+                let mut shown = PlanKeys {
+                    label: KeyLabel::Sort,
+                    ..PlanKeys::NONE
+                };
+                for member in &keys[..usize::from(key_count)] {
+                    let mut text = StackStr::<512>::new();
+                    self.column(
+                        (usize::from(member.rel), usize::from(member.column)),
+                        &mut text,
+                    );
+                    for held in [&mut shown.plain, &mut shown.verbose] {
+                        if !held.is_empty() {
+                            let _ = write!(held, "{}", super::KEY_SEPARATOR);
+                        }
+                        let _ = write!(held, "{}", text.as_str());
+                    }
+                }
+                sort.keys = shown;
+                plan.push(sort)?;
+                self.path(plan, input, depth + 2)
+            }
             PathKind::Memoize {
                 input,
                 keys,
@@ -114,26 +209,40 @@ impl Writer<'_, '_, '_, '_> {
                 self.path(plan, input, depth + 1)
             }
             PathKind::NestLoop {
+                jointype,
                 outer,
                 inner,
                 clauses,
-                inner_unique: _,
+                ..
             } => {
+                let (join_filter, filter) =
+                    self.split(&clauses, path.relids, jointype, &ClauseList::EMPTY);
                 let node = self
-                    .node("Nested Loop", &path, depth)
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&clauses, None));
+                    .node(join_name("Nested Loop", jointype).as_str(), &path, depth)
+                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
+                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.path(plan, outer, depth + 1)?;
                 self.path(plan, inner, depth + 1)
             }
             PathKind::HashJoin {
-                outer, inner, hash, ..
+                jointype,
+                outer,
+                inner,
+                hash,
+                clauses,
+                ..
             } => {
                 let outer_relids = self.model.plan.path(outer).relids;
-                let node = self.node("Hash Join", &path, depth).with_qual(
-                    QualLabel::HashCond,
-                    self.conditions(&hash, Some(outer_relids)),
-                );
+                let (join_filter, filter) = self.split(&clauses, path.relids, jointype, &hash);
+                let node = self
+                    .node(join_name("Hash", jointype).as_str(), &path, depth)
+                    .with_qual(
+                        QualLabel::HashCond,
+                        self.conditions(&hash, Some(outer_relids))?,
+                    )
+                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
+                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.path(plan, outer, depth + 1)?;
                 let inner_path = *self.model.plan.path(inner);
@@ -145,6 +254,7 @@ impl Writer<'_, '_, '_, '_> {
                 self.path(plan, inner, depth + 2)
             }
             PathKind::MergeJoin {
+                jointype,
                 outer,
                 inner,
                 merge,
@@ -155,25 +265,38 @@ impl Writer<'_, '_, '_, '_> {
                 ..
             } => {
                 let outer_relids = self.model.plan.path(outer).relids;
-                // The clauses no merge key applies are its `Join Filter`.
-                let mut filter = ClauseList::EMPTY;
-                for &clause in clauses.as_slice() {
-                    if !merge.as_slice().contains(&clause) {
-                        let _ = filter.push_id(clause);
-                    }
-                }
+                let (join_filter, filter) = self.split(&clauses, path.relids, jointype, &merge);
                 let node = self
-                    .node("Merge Join", &path, depth)
+                    .node(join_name("Merge", jointype).as_str(), &path, depth)
                     .with_qual(
                         QualLabel::MergeCond,
-                        self.conditions(&merge, Some(outer_relids)),
+                        self.conditions(&merge, Some(outer_relids))?,
                     )
-                    .with_qual(QualLabel::JoinFilter, self.conditions(&filter, None));
+                    .with_qual(QualLabel::JoinFilter, self.conditions(&join_filter, None)?)
+                    .with_qual(QualLabel::Filter, self.conditions(&filter, None)?);
                 plan.push(self.keyed(node, query::instrument::Role::Join, id))?;
                 self.sorted(plan, id, outer, outer_sort, false, 0, depth + 1)?;
                 self.sorted(plan, id, inner, inner_sort, materialize_inner, 1, depth + 1)
             }
         }
+    }
+
+    /// The join's matching conditions and its filters, as its plan
+    /// evaluates them.
+    fn split(
+        &self,
+        clauses: &ClauseList,
+        relids: Relids,
+        jointype: JoinType,
+        keyed: &ClauseList,
+    ) -> (ClauseList, ClauseList) {
+        query::index_paths::joins::split_join_clauses(
+            self.model.plan.clauses,
+            clauses,
+            relids,
+            jointype,
+            keyed,
+        )
     }
 
     /// An input of a merge join: its sort and the `Materialize` above it.
@@ -323,13 +446,17 @@ impl Writer<'_, '_, '_, '_> {
         );
     }
 
-    /// The conditions of `clauses` ANDed, each with the column of
+    /// The conditions of `clauses` ANDed, an equality with the column of
     /// `outer` first when given (`get_switched_clauses`), as written
     /// otherwise.
-    fn conditions(&self, clauses: &ClauseList, outer: Option<Relids>) -> Option<StackStr<512>> {
+    fn conditions(
+        &self,
+        clauses: &ClauseList,
+        outer: Option<Relids>,
+    ) -> Result<Option<StackStr<512>>, SqlError> {
         let ids = clauses.as_slice();
         if ids.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut text = StackStr::<512>::new();
         if ids.len() > 1 {
@@ -340,7 +467,17 @@ impl Writer<'_, '_, '_, '_> {
                 let _ = write!(text, " AND ");
             }
             let clause = &self.model.plan.clauses[usize::from(id)];
-            let (mut left, mut right) = self.model.clause_columns(clause);
+            let Some((mut left, mut right)) = self.model.clause_columns(clause) else {
+                let expression = self.model.condition(clause).expect("a written condition");
+                let Some(part) = self.deparse(expression)? else {
+                    return Err(crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of this join condition is not supported"
+                    ));
+                };
+                let _ = write!(text, "{}", part.as_str());
+                continue;
+            };
             if let Some(outer) = outer
                 && outer & 1 << right.0 != 0
             {
@@ -355,7 +492,41 @@ impl Writer<'_, '_, '_, '_> {
         if ids.len() > 1 {
             let _ = write!(text, ")");
         }
-        Some(text)
+        Ok(Some(text))
+    }
+
+    /// A condition as `ruleutils.c` prints a join's qualification, its
+    /// columns qualified by their relations.
+    fn deparse(
+        &self,
+        expression: &crate::sql::ast::Expr<'_>,
+    ) -> Result<Option<StackStr<512>>, SqlError> {
+        let joined = self
+            .arena
+            .alloc_slice_with(self.scope.n, |table| {
+                crate::sql::catalog::deparse::Joined::new(
+                    self.scope.names[table],
+                    self.scope.defs.stored(table).expect("a plain table"),
+                )
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let context = crate::sql::catalog::deparse::Context {
+            storage: self.storage,
+            txid: self.txid,
+            arena: self.arena,
+            dependencies: None,
+            table: None,
+            parameters: &[],
+            joined,
+            pretty: false,
+            qualify: true,
+            domain_value: None,
+            sublinks: None,
+            references: None,
+            folded: true,
+            bare: None,
+        };
+        super::deparse_qual(&context, &[expression], self.arena)
     }
 
     /// A sort's keys: each class's first member among `relids`.
@@ -383,4 +554,26 @@ impl Writer<'_, '_, '_, '_> {
         }
         shown
     }
+}
+
+/// A join node's name: its method, then its join type unless an inner
+/// nested loop's.
+fn join_name(method: &str, jointype: JoinType) -> StackStr<64> {
+    let kind = match jointype {
+        JoinType::Inner | JoinType::UniqueInner | JoinType::UniqueOuter => "",
+        JoinType::Left => " Left",
+        JoinType::Full => " Full",
+        JoinType::Right => " Right",
+        JoinType::Semi => " Semi",
+        JoinType::Anti => " Anti",
+        JoinType::RightSemi => " Right Semi",
+        JoinType::RightAnti => " Right Anti",
+    };
+    let mut name = StackStr::<64>::new();
+    if method == "Nested Loop" && jointype == JoinType::Inner {
+        let _ = write!(name, "Nested Loop");
+    } else {
+        let _ = write!(name, "{method}{kind} Join");
+    }
+    name
 }

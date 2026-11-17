@@ -8420,6 +8420,7 @@ impl<'a> Parser<'a> {
                         type_name: "",
                         type_mod: -1,
                         collation: crate::sql::ast::ParsedCollation::DEFAULT,
+                        collation_position: SourcePosition::UNKNOWN,
                         foreign_options: &[],
                         storage: None,
                         compression: crate::sql::ast::ColumnCompression::Default,
@@ -8735,6 +8736,7 @@ impl<'a> Parser<'a> {
             } else {
                 crate::sql::ast::ColumnCompression::Default
             };
+            let collation_position = SourcePosition::new(Some(self.peek_at));
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
@@ -8756,6 +8758,7 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     foreign_options,
                     storage,
                     compression,

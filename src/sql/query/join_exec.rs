@@ -6,7 +6,9 @@
 //! matches newest first, as `ExecHashJoin` walks a bucket's chain; a merge
 //! join reads its sorted outer input first (its inner one only when the
 //! outer has rows) and returns each outer row's run of inner matches in
-//! inner order. Sorts order as PostgreSQL's `pg_qsort` does.
+//! inner order. An outer join returns each unmatched row of a side it keeps
+//! with NULLs for the other, as each executor node does. Sorts order as
+//! PostgreSQL's `pg_qsort` does.
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/nodeHashjoin.c>
 //! <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/nodeMergejoin.c>
 
@@ -19,7 +21,7 @@ use crate::sql::types::Datum;
 use crate::storage::Storage;
 
 use super::index_paths::join_query::ModeledJoin;
-use super::index_paths::joins::{ClauseList, Keys, MAX_JOIN_RELS, PathKind};
+use super::index_paths::joins::{ClauseList, JoinType, Keys, MAX_JOIN_RELS, PathKind, Relids};
 use super::scan::{JoinRow, JoinRowValues, PaxFullRowReason, PaxReadDemand};
 use super::{QueryScope, arena_full};
 
@@ -122,6 +124,10 @@ struct BatchTable<'a> {
     outer_files: ArenaList<'a, (u32, Bound<'a>)>,
     /// `memory` ordered by hash, newest prepend first, once loaded.
     index: &'a [u32],
+    /// Each row's match flag (`HeapTupleHeaderSetMatch`), in memory and in
+    /// the skew buckets, once loaded.
+    matched: &'a [core::cell::Cell<bool>],
+    skew_matched: &'a [core::cell::Cell<bool>],
     arena: &'a Arena,
 }
 
@@ -157,6 +163,8 @@ impl<'a> BatchTable<'a> {
             inner_files: ArenaList::new(arena),
             outer_files: ArenaList::new(arena),
             index: &[],
+            matched: &[],
+            skew_matched: &[],
             arena,
         })
     }
@@ -413,6 +421,8 @@ impl<'a> BatchTable<'a> {
         Frozen {
             memory: self.memory.as_slice(),
             index: self.index,
+            matched: self.matched,
+            buckets: self.buckets,
         }
     }
 
@@ -440,6 +450,7 @@ impl<'a> BatchTable<'a> {
         self.memory = ArenaList::new(self.arena);
         self.space_used = 0;
         self.index = &[];
+        self.matched = &[];
     }
 
     /// Orders the rows in memory for probing: by hash, newest prepend
@@ -455,18 +466,64 @@ impl<'a> BatchTable<'a> {
             (row.hashed.hash, core::cmp::Reverse(row.prepended))
         });
         self.index = index;
+        self.matched = core::cell::Cell::from_mut(
+            self.arena
+                .alloc_slice_with(rows.len(), |_| false)
+                .map_err(|_| arena_full())?,
+        )
+        .as_slice_of_cells();
+        if self.skew_matched.len() != self.skew_rows.len() {
+            self.skew_matched = core::cell::Cell::from_mut(
+                self.arena
+                    .alloc_slice_with(self.skew_rows.len(), |_| false)
+                    .map_err(|_| arena_full())?,
+            )
+            .as_slice_of_cells();
+        }
         Ok(())
     }
 
-    /// Skew bucket `bucket`'s rows, chain head (newest) first.
-    fn skew_chain(
-        &self,
-        bucket: usize,
-        out: &mut ArenaList<'a, HashedRow<'a>>,
-    ) -> Result<(), SqlError> {
-        for &(at, hashed, _) in self.skew_rows.borrowed_slice().iter().rev() {
+    /// Skew bucket `bucket`'s rows, chain head (newest) first, by their
+    /// place among the skew rows.
+    fn skew_chain(&self, bucket: usize, out: &mut ArenaList<'a, u32>) -> Result<(), SqlError> {
+        let rows = self.skew_rows.borrowed_slice();
+        for (place, &(at, _, _)) in rows.iter().enumerate().rev() {
             if at as usize == bucket {
-                out.push(hashed).map_err(|_| arena_full())?;
+                out.push(place as u32).map_err(|_| arena_full())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows no outer row matched, as `ExecScanHashTableForUnmatched`
+    /// walks them: each bucket's chain in bucket order, then each skew
+    /// bucket's.
+    fn unmatched(&self, out: &mut ArenaList<'a, Bound<'a>>) -> Result<(), SqlError> {
+        let rows = self.memory.borrowed_slice();
+        let order = self
+            .arena
+            .alloc_slice_with(rows.len(), |at| at as u32)
+            .map_err(|_| arena_full())?;
+        let mask = self.buckets - 1;
+        order.sort_unstable_by_key(|&at| {
+            let row = rows[at as usize];
+            (row.hashed.hash & mask, core::cmp::Reverse(row.prepended))
+        });
+        for &at in order.iter() {
+            if !self.matched[at as usize].get() {
+                out.push(rows[at as usize].hashed.row)
+                    .map_err(|_| arena_full())?;
+            }
+        }
+        let skew_rows = self.skew_rows.borrowed_slice();
+        for (bucket, slot) in self.skew.borrowed_slice().iter().enumerate() {
+            if slot.removed {
+                continue;
+            }
+            for (place, &(at, hashed, _)) in skew_rows.iter().enumerate().rev() {
+                if at as usize == bucket && !self.skew_matched[place].get() {
+                    out.push(hashed.row).map_err(|_| arena_full())?;
+                }
             }
         }
         Ok(())
@@ -494,21 +551,53 @@ struct Frozen<'a> {
     memory: &'a [MemoryRow<'a>],
     /// `memory` ordered by hash, newest prepend first.
     index: &'a [u32],
+    matched: &'a [core::cell::Cell<bool>],
+    buckets: u32,
 }
 
 impl<'a> Frozen<'a> {
-    /// The main table's rows of `hash`, chain head first.
-    fn chain_of(&self, hash: u32, out: &mut ArenaList<'a, HashedRow<'a>>) -> Result<(), SqlError> {
+    /// The main table's rows of `hash`, chain head first, by their place in
+    /// memory.
+    fn chain_of(&self, hash: u32, out: &mut ArenaList<'a, u32>) -> Result<(), SqlError> {
         let rows = self.memory;
         let start = self
             .index
             .partition_point(|&at| rows[at as usize].hashed.hash < hash);
         for &at in &self.index[start..] {
-            let row = rows[at as usize];
-            if row.hashed.hash != hash {
+            if rows[at as usize].hashed.hash != hash {
                 break;
             }
-            out.push(row.hashed).map_err(|_| arena_full())?;
+            out.push(at).map_err(|_| arena_full())?;
+        }
+        Ok(())
+    }
+
+    /// `ExecHashTableResetMatchFlags`.
+    fn reset_matches(&self) {
+        for flag in self.matched {
+            flag.set(false);
+        }
+    }
+
+    /// The rows no outer row matched, in bucket order.
+    fn unmatched(
+        &self,
+        arena: &'a Arena,
+        out: &mut ArenaList<'a, Bound<'a>>,
+    ) -> Result<(), SqlError> {
+        let order = arena
+            .alloc_slice_with(self.memory.len(), |at| at as u32)
+            .map_err(|_| arena_full())?;
+        let mask = self.buckets - 1;
+        order.sort_unstable_by_key(|&at| {
+            let row = self.memory[at as usize];
+            (row.hashed.hash & mask, core::cmp::Reverse(row.prepended))
+        });
+        for &at in order.iter() {
+            if !self.matched[at as usize].get() {
+                out.push(self.memory[at as usize].hashed.row)
+                    .map_err(|_| arena_full())?;
+            }
         }
         Ok(())
     }
@@ -563,6 +652,8 @@ enum MergeState {
     SkipTest,
     SkipOuterAdvance,
     SkipInnerAdvance,
+    EndOuter,
+    EndInner,
 }
 
 /// A merge join's input rows in merge order, and the nodes counting what
@@ -604,8 +695,18 @@ struct MemoCache<'a> {
     used: usize,
 }
 
+/// What a hash join's probe reads: its keys, its join conditions and
+/// filters, its join type and inner relations, and its node.
+struct Probe<'k> {
+    keys: &'k KeySides,
+    quals: (&'k ClauseList, &'k ClauseList),
+    jointype: JoinType,
+    inner_relids: u32,
+    join: super::instrument::Node,
+}
+
 /// Each key clause's (outer, inner) column; unused entries hold `usize::MAX`.
-type KeySides = [((usize, usize), (usize, usize)); 16];
+type KeySides = [((usize, usize), (usize, usize)); super::index_paths::joins::MAX_JOIN_CLAUSES];
 
 /// The rows bound so far, by FROM position.
 type Bound<'a> = [Option<BaseRow<'a>>; MAX_JOIN_RELS];
@@ -629,6 +730,11 @@ struct Runner<'r, 'a> {
     arena: &'a Arena,
     params: &'r [Datum<'a>],
     hooks: &'r EvalHooks<'r, 'a>,
+    /// Each relation's values' start in a flat row, and a row of NULLs per
+    /// relation, which an outer join binds to the side it null-extends.
+    offsets: &'a [usize],
+    width: usize,
+    nulls: &'a [&'a [Datum<'a>]],
 }
 
 /// Scans `statement`'s FROM clause: by the plan PostgreSQL's join search
@@ -738,6 +844,15 @@ fn run<'a>(
     let memos = arena
         .alloc_owned_slice_with(model.plan.paths.len(), |_| core::cell::Cell::new(None))
         .map_err(|_| arena_full())?;
+    let mut nulls = [&[][..]; MAX_JOIN_RELS];
+    for (table, held) in nulls.iter_mut().enumerate().take(n) {
+        *held = arena
+            .alloc_slice_with(scope.stored_width(table), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+    }
+    let nulls = arena
+        .alloc_slice_copy(&nulls[..n])
+        .map_err(|_| arena_full())?;
     let runner = Runner {
         built,
         frozen,
@@ -751,6 +866,9 @@ fn run<'a>(
         arena,
         params,
         hooks,
+        offsets,
+        width,
+        nulls,
     };
     let mut bound: Bound<'a> = [None; MAX_JOIN_RELS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
@@ -793,6 +911,24 @@ impl<'r, 'a> Runner<'r, 'a> {
         match path.kind {
             PathKind::Scan { rel, path } => self.scan(id, usize::from(rel), path, bound, sink),
             PathKind::Material { input } => self.exec(input, bound, sink),
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                method,
+            } => match method {
+                super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
+                super::index_paths::joins::UniqueMethod::Sort => {
+                    self.unique(input, &keys[..usize::from(key_count)], bound, sink)
+                }
+                super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
+                    input,
+                    &keys[..usize::from(key_count)],
+                    path.rows,
+                    bound,
+                    sink,
+                ),
+            },
             PathKind::Memoize {
                 input,
                 keys,
@@ -807,6 +943,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 sink,
             ),
             PathKind::NestLoop {
+                jointype,
                 outer,
                 inner,
                 clauses,
@@ -820,57 +957,152 @@ impl<'r, 'a> Runner<'r, 'a> {
                 };
                 let material_node = node(super::instrument::Role::Materialize, inner);
                 let inner_relids = self.model.plan.path(inner).relids;
-                // A unique inner relation's scan ends at the outer row's
-                // first match (`single_match`).
-                let matched = core::cell::Cell::new(false);
-                self.exec(outer, bound, &mut |bound| {
+                let (join_quals, other_quals) =
+                    self.split(&clauses, path.relids, jointype, &ClauseList::EMPTY);
+                // `ExecNestLoop`: a semi join, or a unique inner relation,
+                // ends each outer row's scan at its first match, an anti
+                // join at its first match without returning it; a left or
+                // anti join returns an unmatched outer row with NULLs.
+                let single_match = inner_unique || jointype == JoinType::Semi;
+                // A loop that stops at its first match reads its inner
+                // `Materialize` only as far as some loop needed
+                // (`ExecMaterial` fetching on demand): under `EXPLAIN
+                // ANALYZE` the inner scan counts those rows, as one read.
+                let lazy = match material {
+                    Some(input)
+                        if super::instrument::active()
+                            && (single_match || jointype == JoinType::Anti) =>
+                    {
+                        let PathKind::Scan {
+                            rel,
+                            path: scan_path,
+                        } = self.model.plan.path(input).kind
+                        else {
+                            return Err(crate::sql_err!(
+                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
+                            ));
+                        };
+                        let rel = usize::from(rel);
+                        let modeled = self.model.rels[rel];
+                        let scan = modeled.scan(
+                            self.storage,
+                            self.txid,
+                            scan_path,
+                            self.params,
+                            self.arena,
+                        )?;
+                        if modeled.restriction.is_some()
+                            && !(scan.path.kind == super::index_paths::ScanKind::Index
+                                && self.counts_lazily(rel, scan_path)?)
+                        {
+                            return Err(crate::sql_err!(
+                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
+                            ));
+                        }
+                        let _block =
+                            super::instrument::enter_block(self.block.child(scan_segment(rel)));
+                        Some(super::instrument::node(super::instrument::Role::Scan(0)))
+                    }
+                    _ => None,
+                };
+                let reached = core::cell::Cell::new(0usize);
+                let kept = self.exec(outer, bound, &mut |bound| {
+                    let mut matched = false;
+                    let mut stopped = false;
                     let mut pass = |bound: &mut Bound<'a>| -> Result<bool, SqlError> {
-                        if !self.equal(bound, &clauses)? {
+                        if !self.equal(bound, &join_quals)? {
                             join.join_filtered();
                             return Ok(true);
                         }
-                        join.row();
-                        if !sink(bound)? {
+                        matched = true;
+                        if jointype == JoinType::Anti {
                             return Ok(false);
                         }
-                        if inner_unique {
-                            matched.set(true);
-                            return Ok(false);
-                        }
-                        Ok(true)
-                    };
-                    let Some(input) = material else {
-                        let kept = self.exec(inner, bound, &mut pass)?;
-                        return Ok(kept || matched.replace(false));
-                    };
-                    let _material = material_node.start();
-                    let store = match self.built[inner as usize].get() {
-                        Some(store) => store,
-                        None => {
-                            let store = Built {
-                                rows: self.hold(input, bound)?.rows.as_slice(),
-                                index: &[],
-                            };
-                            // The tuplestore `EXPLAIN ANALYZE` reports.
-                            material_node.store_opened();
-                            for row in store.rows {
-                                material_node.store_row(self.tuple_len(row, inner).ok());
+                        if self.equal(bound, &other_quals)? {
+                            join.row();
+                            if !sink(bound)? {
+                                stopped = true;
+                                return Ok(false);
                             }
-                            self.built[inner as usize].set(Some(store));
-                            store
+                        } else {
+                            join.filtered();
                         }
+                        Ok(!single_match)
                     };
-                    for row in store.rows {
-                        material_node.row();
-                        self.bind(bound, row, inner_relids);
-                        if !pass(bound)? {
-                            return Ok(matched.replace(false));
+                    match material {
+                        None => {
+                            self.exec(inner, bound, &mut pass)?;
+                        }
+                        Some(input) => {
+                            let _material = material_node.start();
+                            let store = match self.built[inner as usize].get() {
+                                Some(store) => store,
+                                None => {
+                                    let rows = if lazy.is_some() {
+                                        let _suspended = super::instrument::suspend();
+                                        self.hold(input, bound)?.rows.as_slice()
+                                    } else {
+                                        self.hold(input, bound)?.rows.as_slice()
+                                    };
+                                    let store = Built { rows, index: &[] };
+                                    // The tuplestore `EXPLAIN ANALYZE` reports.
+                                    if lazy.is_none() {
+                                        material_node.store_opened();
+                                        for row in store.rows {
+                                            material_node
+                                                .store_row(self.tuple_len(row, inner).ok());
+                                        }
+                                    }
+                                    self.built[inner as usize].set(Some(store));
+                                    store
+                                }
+                            };
+                            for (at, row) in store.rows.iter().enumerate() {
+                                material_node.row();
+                                reached.set(reached.get().max(at + 1));
+                                self.bind(bound, row, inner_relids);
+                                if !pass(bound)? {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if stopped {
+                        return Ok(false);
+                    }
+                    if !matched && jointype.fills_outer() {
+                        self.null_extend(bound, inner_relids);
+                        if self.equal(bound, &other_quals)? {
+                            join.row();
+                            if !sink(bound)? {
+                                return Ok(false);
+                            }
+                        } else {
+                            join.filtered();
                         }
                     }
                     Ok(true)
-                })
+                })?;
+                if let Some(lazy) = lazy {
+                    let rows = self.built[inner as usize]
+                        .get()
+                        .map_or(&[][..], |store| store.rows);
+                    let reached = reached.get().min(rows.len());
+                    {
+                        let _scan = lazy.start();
+                        lazy.rows(reached as u64);
+                    }
+                    material_node.store_opened();
+                    for row in &rows[..reached] {
+                        material_node.store_row(self.tuple_len(row, inner).ok());
+                    }
+                }
+                Ok(kept)
             }
             PathKind::HashJoin {
+                jointype,
                 outer,
                 inner,
                 clauses,
@@ -881,15 +1113,17 @@ impl<'r, 'a> Runner<'r, 'a> {
                 let outer_relids = self.model.plan.path(outer).relids;
                 let inner_relids = self.model.plan.path(inner).relids;
                 let keys = self.sides(&hash, outer_relids);
+                let quals = self.split(&clauses, path.relids, jointype, &hash);
                 let join = node(super::instrument::Role::Join, id);
                 let hash_node = node(super::instrument::Role::Hash, id);
                 let _join = join.start();
                 if self.hashable(&keys) {
                     return self.batched_hash_join(
-                        id, outer, inner, &clauses, &keys, join, hash_node, bound, sink,
+                        id, jointype, outer, inner, quals, &keys, join, hash_node, bound, sink,
                     );
                 }
                 debug_assert_eq!(batches, 1, "planned batches need hashable keys");
+                debug_assert!(!jointype.fills_inner(), "planned without hashable keys");
                 let build = |bound: &mut Bound<'a>| -> Result<Built<'a>, SqlError> {
                     let _hash = hash_node.start();
                     let held = self.hold(inner, bound)?;
@@ -927,11 +1161,14 @@ impl<'r, 'a> Runner<'r, 'a> {
                     Ok(built)
                 };
                 // `ExecHashJoin` reads the first outer row before building
-                // its table when the outer plan starts cheaper than the
-                // table costs, and ends at an empty table; a rescan reuses
-                // the table and reads every outer row.
+                // its table when it returns unmatched outer rows or the
+                // outer plan starts cheaper than the table costs, and ends
+                // at an empty table unless it returns unmatched outer rows;
+                // a rescan reuses the table and reads every outer row.
+                let fill_outer = jointype.fills_outer();
                 let mut table = self.built[id as usize].get();
                 if table.is_none()
+                    && !fill_outer
                     && self.model.plan.path(outer).startup >= self.model.plan.path(inner).total
                 {
                     let built = build(bound)?;
@@ -940,33 +1177,56 @@ impl<'r, 'a> Runner<'r, 'a> {
                     }
                     table = Some(built);
                 }
+                let (join_quals, other_quals) = quals;
                 let mut ended = false;
                 let kept = self.exec(outer, bound, &mut |bound| {
                     if table.is_none() {
                         let built = build(bound)?;
-                        if built.index.is_empty() {
+                        if built.index.is_empty() && !fill_outer {
                             ended = true;
                             return Ok(false);
                         }
                         table = Some(built);
                     }
                     let Built { rows, index } = table.expect("built");
-                    let Some(start) = self.first_match(bound, rows, index, &keys)? else {
-                        return Ok(true);
-                    };
-                    for &at in &index[start..] {
-                        let row = &rows[at as usize];
-                        if self.compare_sides(bound, row, &keys)? != Ordering::Equal {
-                            break;
+                    let mut matched = false;
+                    if let Some(start) = self.first_match(bound, rows, index, &keys)? {
+                        for &at in &index[start..] {
+                            let row = &rows[at as usize];
+                            if self.compare_sides(bound, row, &keys)? != Ordering::Equal {
+                                break;
+                            }
+                            self.bind(bound, row, inner_relids);
+                            if !self.equal(bound, &join_quals)? {
+                                join.join_filtered();
+                                continue;
+                            }
+                            matched = true;
+                            if jointype == JoinType::Anti {
+                                break;
+                            }
+                            if self.equal(bound, &other_quals)? {
+                                join.row();
+                                if !sink(bound)? {
+                                    return Ok(false);
+                                }
+                            } else {
+                                join.filtered();
+                            }
+                            if jointype == JoinType::Semi {
+                                break;
+                            }
                         }
-                        self.bind(bound, row, inner_relids);
-                        if !self.equal(bound, &clauses)? {
-                            join.join_filtered();
-                            continue;
-                        }
-                        join.row();
-                        if !sink(bound)? {
-                            return Ok(false);
+                    }
+                    if !matched && fill_outer {
+                        self.null_extend(bound, inner_relids);
+                        if self.equal(bound, &other_quals)? {
+                            join.row();
+                            if !sink(bound)? {
+                                return Ok(false);
+                            }
+                        } else {
+                            join.filtered();
                         }
                     }
                     Ok(true)
@@ -974,6 +1234,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 Ok(kept || ended)
             }
             PathKind::MergeJoin {
+                jointype,
                 outer,
                 inner,
                 merge,
@@ -984,6 +1245,8 @@ impl<'r, 'a> Runner<'r, 'a> {
                 inner_unique,
             } => self.merge_join(
                 id,
+                jointype,
+                path.relids,
                 (outer, outer_sort),
                 (inner, inner_sort),
                 &merge,
@@ -996,22 +1259,26 @@ impl<'r, 'a> Runner<'r, 'a> {
         }
     }
 
-    /// A merge join as `ExecMergeJoin` runs one of an inner join: it reads
-    /// its outer input, then its inner one only for a joinable outer row,
-    /// marks the inner input at each run of equal keys and restores it for
-    /// the next outer row of the same keys, and ends when either input does.
-    /// A sorted input is read whole by its `Sort` when first fetched; an
-    /// input already in order is read only as far as the join fetches it.
+    /// A merge join as `ExecMergeJoin` runs it: it reads its outer input,
+    /// then its inner one only for a joinable outer row (or to return
+    /// unmatched inner rows), marks the inner input at each run of equal
+    /// keys and restores it for the next outer row of the same keys, returns
+    /// each unmatched row of a side it fills with NULLs for the other, and
+    /// ends when an input it does not fill ends. A sorted input is read
+    /// whole by its `Sort` when first fetched; an input already in order is
+    /// read only as far as the join fetches it.
     #[allow(clippy::too_many_arguments)]
     fn merge_join(
         &self,
         id: u32,
+        jointype: JoinType,
+        relids: Relids,
         (outer, outer_sort): (u32, Keys),
         (inner, inner_sort): (u32, Keys),
         merge: &ClauseList,
         clauses: &ClauseList,
         materialize_inner: bool,
-        single_match: bool,
+        inner_unique: bool,
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -1020,28 +1287,29 @@ impl<'r, 'a> Runner<'r, 'a> {
         let outer_relids = self.model.plan.path(outer).relids;
         let inner_relids = self.model.plan.path(inner).relids;
         let keys = self.sides(merge, outer_relids);
-        // The clauses no merge key applies, the join's `Join Filter`.
-        let mut filter = ClauseList::EMPTY;
-        for &id in clauses.as_slice() {
-            if !merge.as_slice().contains(&id) {
-                let _ = filter.push_id(id);
-            }
-        }
-        let skip_mark_restore = single_match && filter.as_slice().is_empty();
+        let (join_quals, other_quals) = self.split(clauses, relids, jointype, merge);
+        let fill_outer = jointype.fills_outer();
+        let fill_inner = jointype.fills_inner();
+        let single_match = inner_unique || jointype == JoinType::Semi;
+        let skip_mark_restore = (inner_unique
+            || matches!(jointype, JoinType::Semi | JoinType::Anti))
+            && clauses.as_slice().len() == merge.as_slice().len();
         let outer_input = self.merge_input(id, outer, &outer_sort, 0, bound)?;
         let outer_rows = outer_input.rows;
+        // `MJEvalOuterValues` and `MJEvalInnerValues`: a NULL first key ends
+        // the join unless the join returns that side's unmatched rows.
         let eval = |row: &Bound<'a>, outer_side: bool| -> MergeEval {
+            let fills = if outer_side { fill_outer } else { fill_inner };
+            let mut result = MergeEval::Matchable;
             for (at, &(o, i)) in Self::keys(&keys).enumerate() {
                 if Self::value(row, if outer_side { o } else { i }).is_null() {
-                    // NULLs sort last: a NULL first key ends the join.
-                    return if at == 0 {
-                        MergeEval::EndOfJoin
-                    } else {
-                        MergeEval::NonMatchable
-                    };
+                    if at == 0 && !fills {
+                        return MergeEval::EndOfJoin;
+                    }
+                    result = MergeEval::NonMatchable;
                 }
             }
-            MergeEval::Matchable
+            result
         };
         let mut outer_fetches = 0usize;
         let mut inner_fetches = 0usize;
@@ -1051,9 +1319,11 @@ impl<'r, 'a> Runner<'r, 'a> {
         let mut inner_at: Option<usize> = None;
         let mut inner_next = 0usize;
         let mut marked: Option<usize> = None;
+        let mut matched_outer = false;
+        let mut matched_inner = false;
         let mut state = MergeState::InitializeOuter;
         let mut stopped = false;
-        macro_rules! fetch_outer {
+        macro_rules! next_outer {
             () => {{
                 if outer_fetches < outer_rows.len() {
                     outer_fetches += 1;
@@ -1061,13 +1331,18 @@ impl<'r, 'a> Runner<'r, 'a> {
                 } else {
                     outer_at = None;
                 }
+            }};
+        }
+        macro_rules! fetch_outer {
+            () => {{
+                next_outer!();
                 match outer_at {
                     Some(at) => eval(&outer_rows[at], true),
                     None => MergeEval::EndOfJoin,
                 }
             }};
         }
-        macro_rules! fetch_inner {
+        macro_rules! next_inner {
             () => {{
                 if inner_input.is_none() {
                     inner_input = Some(self.merge_input(id, inner, &inner_sort, 1, bound)?);
@@ -1081,9 +1356,38 @@ impl<'r, 'a> Runner<'r, 'a> {
                 } else {
                     inner_at = None;
                 }
+            }};
+        }
+        macro_rules! fetch_inner {
+            () => {{
+                next_inner!();
+                let rows = inner_input.as_ref().expect("read").rows;
                 match inner_at {
                     Some(at) => eval(&rows[at], false),
                     None => MergeEval::EndOfJoin,
+                }
+            }};
+        }
+        // `MJFillOuter` and `MJFillInner`: the current row with NULLs for
+        // the other side, when the join's filters pass it.
+        macro_rules! fill {
+            ($outer_side:expr) => {{
+                let inner_rows = inner_input.as_ref().map_or(&[][..], |input| input.rows);
+                if $outer_side {
+                    self.bind(bound, &outer_rows[outer_at.expect("outer")], outer_relids);
+                    self.null_extend(bound, inner_relids);
+                } else {
+                    self.bind(bound, &inner_rows[inner_at.expect("inner")], inner_relids);
+                    self.null_extend(bound, outer_relids);
+                }
+                if self.equal(bound, &other_quals)? {
+                    join.row();
+                    if !sink(bound)? {
+                        stopped = true;
+                        break;
+                    }
+                } else {
+                    join.filtered();
                 }
             }};
         }
@@ -1103,68 +1407,124 @@ impl<'r, 'a> Runner<'r, 'a> {
                 }
                 Ok(Ordering::Equal)
             };
+        let out_of_order = || {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::INTERNAL_ERROR,
+                "mergejoin input data is out of order"
+            )
+        };
         loop {
             super::check_timeout()?;
-            let inner_rows = inner_input.as_ref().map_or(&[][..], |input| input.rows);
             match state {
                 MergeState::InitializeOuter => match fetch_outer!() {
                     MergeEval::Matchable => state = MergeState::InitializeInner,
-                    MergeEval::NonMatchable => {}
-                    MergeEval::EndOfJoin => break,
+                    MergeEval::NonMatchable => {
+                        if fill_outer {
+                            fill!(true);
+                        }
+                    }
+                    MergeEval::EndOfJoin => {
+                        if !fill_inner {
+                            break;
+                        }
+                        state = MergeState::EndOuter;
+                        matched_inner = true;
+                    }
                 },
                 MergeState::InitializeInner => match fetch_inner!() {
                     MergeEval::Matchable => state = MergeState::SkipTest,
-                    MergeEval::NonMatchable => {}
-                    MergeEval::EndOfJoin => break,
+                    MergeEval::NonMatchable => {
+                        if fill_inner {
+                            fill!(false);
+                        }
+                    }
+                    MergeEval::EndOfJoin => {
+                        if !fill_outer {
+                            break;
+                        }
+                        state = MergeState::EndInner;
+                        matched_outer = false;
+                    }
                 },
                 MergeState::JoinTuples => {
                     state = MergeState::NextInner;
+                    let inner_rows = inner_input.as_ref().expect("read").rows;
                     let (o, i) = (outer_at.expect("outer"), inner_at.expect("inner"));
                     self.bind(bound, &outer_rows[o], outer_relids);
                     self.bind(bound, &inner_rows[i], inner_relids);
-                    if self.equal(bound, &filter)? {
-                        if single_match {
-                            state = MergeState::NextOuter;
-                        }
+                    if !self.equal(bound, &join_quals)? {
+                        join.join_filtered();
+                        continue;
+                    }
+                    matched_outer = true;
+                    matched_inner = true;
+                    if jointype == JoinType::Anti {
+                        state = MergeState::NextOuter;
+                        continue;
+                    }
+                    if single_match {
+                        state = MergeState::NextOuter;
+                    }
+                    if jointype == JoinType::RightAnti {
+                        continue;
+                    }
+                    if self.equal(bound, &other_quals)? {
                         join.row();
                         if !sink(bound)? {
                             stopped = true;
                             break;
                         }
                     } else {
-                        join.join_filtered();
+                        join.filtered();
                     }
                 }
-                MergeState::NextInner => match fetch_inner!() {
-                    MergeEval::Matchable => {
-                        let order = compare(
-                            &outer_rows[outer_at.expect("outer")],
-                            &inner_input.as_ref().expect("read").rows[inner_at.expect("inner")],
-                        )?;
-                        state = match order {
-                            Ordering::Equal => MergeState::JoinTuples,
-                            Ordering::Less => MergeState::NextOuter,
-                            Ordering::Greater => {
-                                return Err(crate::sql_err!(
-                                    crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                                    "mergejoin input data is out of order"
-                                ));
+                MergeState::NextInner => {
+                    if fill_inner && !matched_inner {
+                        fill!(false);
+                    }
+                    let fetched = fetch_inner!();
+                    matched_inner = false;
+                    state = match fetched {
+                        MergeEval::Matchable => {
+                            let inner_rows = inner_input.as_ref().expect("read").rows;
+                            match compare(
+                                &outer_rows[outer_at.expect("outer")],
+                                &inner_rows[inner_at.expect("inner")],
+                            )? {
+                                Ordering::Equal => MergeState::JoinTuples,
+                                Ordering::Less => MergeState::NextOuter,
+                                Ordering::Greater => return Err(out_of_order()),
                             }
-                        };
+                        }
+                        MergeEval::NonMatchable => MergeState::NextOuter,
+                        MergeEval::EndOfJoin => {
+                            inner_at = None;
+                            MergeState::NextOuter
+                        }
+                    };
+                }
+                MergeState::NextOuter => {
+                    if fill_outer && !matched_outer {
+                        fill!(true);
                     }
-                    MergeEval::NonMatchable | MergeEval::EndOfJoin => {
-                        state = MergeState::NextOuter;
+                    let fetched = fetch_outer!();
+                    matched_outer = false;
+                    match fetched {
+                        MergeEval::Matchable => state = MergeState::TestOuter,
+                        MergeEval::NonMatchable => {}
+                        MergeEval::EndOfJoin => {
+                            if fill_inner && inner_at.is_some() {
+                                state = MergeState::EndOuter;
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                },
-                MergeState::NextOuter => match fetch_outer!() {
-                    MergeEval::Matchable => state = MergeState::TestOuter,
-                    MergeEval::NonMatchable => {}
-                    MergeEval::EndOfJoin => break,
-                },
+                }
                 MergeState::TestOuter => {
+                    let inner_rows = inner_input.as_ref().expect("read").rows;
                     let mark = marked.expect("a marked inner row");
-                    let order = compare(&outer_rows[outer_at.expect("outer")], &inner_rows[mark])?;
-                    match order {
+                    match compare(&outer_rows[outer_at.expect("outer")], &inner_rows[mark])? {
                         Ordering::Equal => {
                             if !skip_mark_restore {
                                 // `ExecRestrPos`: the next fetch follows the mark.
@@ -1174,29 +1534,30 @@ impl<'r, 'a> Runner<'r, 'a> {
                             state = MergeState::JoinTuples;
                         }
                         Ordering::Greater => {
-                            state = match inner_at {
-                                None => break,
-                                Some(at) => match eval(&inner_rows[at], false) {
-                                    MergeEval::Matchable => MergeState::SkipTest,
-                                    MergeEval::NonMatchable => MergeState::SkipInnerAdvance,
-                                    MergeEval::EndOfJoin => break,
-                                },
+                            let current = match inner_at {
+                                None => MergeEval::EndOfJoin,
+                                Some(at) => eval(&inner_rows[at], false),
                             };
+                            match current {
+                                MergeEval::Matchable => state = MergeState::SkipTest,
+                                MergeEval::NonMatchable => state = MergeState::SkipInnerAdvance,
+                                MergeEval::EndOfJoin => {
+                                    if !fill_outer {
+                                        break;
+                                    }
+                                    state = MergeState::EndInner;
+                                }
+                            }
                         }
-                        Ordering::Less => {
-                            return Err(crate::sql_err!(
-                                crate::sql::eval::sqlstate::INTERNAL_ERROR,
-                                "mergejoin input data is out of order"
-                            ));
-                        }
+                        Ordering::Less => return Err(out_of_order()),
                     }
                 }
                 MergeState::SkipTest => {
-                    let order = compare(
+                    let inner_rows = inner_input.as_ref().expect("read").rows;
+                    state = match compare(
                         &outer_rows[outer_at.expect("outer")],
                         &inner_rows[inner_at.expect("inner")],
-                    )?;
-                    state = match order {
+                    )? {
                         Ordering::Equal => {
                             marked = inner_at;
                             MergeState::JoinTuples
@@ -1205,16 +1566,62 @@ impl<'r, 'a> Runner<'r, 'a> {
                         Ordering::Greater => MergeState::SkipInnerAdvance,
                     };
                 }
-                MergeState::SkipOuterAdvance => match fetch_outer!() {
-                    MergeEval::Matchable => state = MergeState::SkipTest,
-                    MergeEval::NonMatchable => {}
-                    MergeEval::EndOfJoin => break,
-                },
-                MergeState::SkipInnerAdvance => match fetch_inner!() {
-                    MergeEval::Matchable => state = MergeState::SkipTest,
-                    MergeEval::NonMatchable => {}
-                    MergeEval::EndOfJoin => break,
-                },
+                MergeState::SkipOuterAdvance => {
+                    if fill_outer && !matched_outer {
+                        fill!(true);
+                    }
+                    let fetched = fetch_outer!();
+                    matched_outer = false;
+                    match fetched {
+                        MergeEval::Matchable => state = MergeState::SkipTest,
+                        MergeEval::NonMatchable => {}
+                        MergeEval::EndOfJoin => {
+                            if fill_inner && inner_at.is_some() {
+                                state = MergeState::EndOuter;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                MergeState::SkipInnerAdvance => {
+                    if fill_inner && !matched_inner {
+                        fill!(false);
+                    }
+                    let fetched = fetch_inner!();
+                    matched_inner = false;
+                    match fetched {
+                        MergeEval::Matchable => state = MergeState::SkipTest,
+                        MergeEval::NonMatchable => {}
+                        MergeEval::EndOfJoin => {
+                            if fill_outer && outer_at.is_some() {
+                                state = MergeState::EndInner;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                MergeState::EndOuter => {
+                    if !matched_inner {
+                        fill!(false);
+                    }
+                    next_inner!();
+                    matched_inner = false;
+                    if inner_at.is_none() {
+                        break;
+                    }
+                }
+                MergeState::EndInner => {
+                    if !matched_outer {
+                        fill!(true);
+                    }
+                    next_outer!();
+                    matched_outer = false;
+                    if outer_at.is_none() {
+                        break;
+                    }
+                }
             }
         }
         // The inputs' counts: a sort returns each row the join fetched, a
@@ -1267,10 +1674,18 @@ impl<'r, 'a> Runner<'r, 'a> {
                         Err(_) => fits = false,
                     }
                 }
+                // `ExecInitSort`: a sort of a single column sorts datums.
+                let mut columns = 0;
+                self.model.plan.target_list(relids, &mut |_| columns += 1);
+                let tuples = if columns == 1 {
+                    super::postgres_memory::SortTuples::Datum
+                } else {
+                    super::postgres_memory::SortTuples::Bump
+                };
                 let bytes = fits
                     .then(|| {
                         super::postgres_memory::tuplesort_memory(
-                            super::postgres_memory::SortTuples::Bump,
+                            tuples,
                             lengths.borrowed_slice().iter().copied(),
                             None,
                             None,
@@ -1526,9 +1941,10 @@ impl<'r, 'a> Runner<'r, 'a> {
     fn batched_hash_join(
         &self,
         id: u32,
+        jointype: JoinType,
         outer: u32,
         inner: u32,
-        clauses: &ClauseList,
+        quals: (ClauseList, ClauseList),
         keys: &KeySides,
         join: super::instrument::Node,
         hash_node: super::instrument::Node,
@@ -1537,35 +1953,44 @@ impl<'r, 'a> Runner<'r, 'a> {
     ) -> Result<bool, SqlError> {
         let inner_path = *self.model.plan.path(inner);
         let inner_relids = inner_path.relids;
+        let outer_relids = self.model.plan.path(outer).relids;
+        let (fill_outer, fill_inner) = (jointype.fills_outer(), jointype.fills_inner());
         let sizing = super::index_paths::joins::choose_hash_table_size(
             inner_path.rows,
             inner_path.width,
             self.model.plan.settings,
         );
-        // A rescan reads a one-batch table again (`ExecReScanHashJoin`).
+        let probe = Probe {
+            keys,
+            quals: (&quals.0, &quals.1),
+            jointype,
+            inner_relids,
+            join,
+        };
+        // A rescan reads a one-batch table again (`ExecReScanHashJoin`),
+        // its match flags cleared.
         if let Some(frozen) = self.frozen[id as usize].get() {
-            return self.exec(outer, bound, &mut |bound| {
-                let Some(hash) = self.key_hash(bound, keys, true)? else {
-                    return Ok(true);
-                };
-                self.probe_batch(
-                    frozen,
-                    None,
-                    hash,
-                    keys,
-                    clauses,
-                    inner_relids,
-                    join,
-                    bound,
-                    sink,
-                )
-            });
+            frozen.reset_matches();
+            if frozen.memory.is_empty() && !fill_outer {
+                return Ok(true);
+            }
+            let kept = self.exec(outer, bound, &mut |bound| {
+                let hash = self.key_hash(bound, keys, true, fill_outer)?;
+                self.probe_batch(frozen, None, hash, &probe, bound, sink)
+            })?;
+            if !kept || !fill_inner {
+                return Ok(kept);
+            }
+            let mut rows = ArenaList::new(self.arena);
+            frozen.unmatched(self.arena, &mut rows)?;
+            return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
         }
         let mut table: Option<BatchTable<'a>> = None;
-        let built_first = self.model.plan.path(outer).startup >= inner_path.total;
+        let built_first =
+            fill_inner || (!fill_outer && self.model.plan.path(outer).startup >= inner_path.total);
         if built_first {
-            let built = self.build_batches(inner, keys, sizing, hash_node, bound)?;
-            if built.total == 0 {
+            let built = self.build_batches(inner, keys, sizing, hash_node, fill_inner, bound)?;
+            if built.total == 0 && !fill_outer {
                 if built.batches == 1 {
                     self.frozen[id as usize].set(Some(built.frozen()));
                 }
@@ -1577,8 +2002,9 @@ impl<'r, 'a> Runner<'r, 'a> {
         // Batch 0: probe as the outer rows are read; save the rest.
         let kept = self.exec(outer, bound, &mut |bound| {
             if table.is_none() {
-                let built = self.build_batches(inner, keys, sizing, hash_node, bound)?;
-                if built.total == 0 {
+                let built =
+                    self.build_batches(inner, keys, sizing, hash_node, fill_inner, bound)?;
+                if built.total == 0 && !fill_outer {
                     // A rescan probes the empty table with every outer row.
                     if built.batches == 1 {
                         self.frozen[id as usize].set(Some(built.frozen()));
@@ -1590,12 +2016,13 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
             let table = table.as_mut().expect("built");
             let table = &mut *table;
-            let Some(hash) = self.key_hash(bound, keys, true)? else {
+            let hash = self.key_hash(bound, keys, true, fill_outer)?;
+            let Some(value) = hash else {
                 return Ok(true);
             };
-            let skew = table.skew_bucket(hash);
-            if skew.is_none() && table.batch_of(hash) != 0 {
-                let batch = table.batch_of(hash);
+            let skew = table.skew_bucket(value);
+            if skew.is_none() && table.batch_of(value) != 0 {
+                let batch = table.batch_of(value);
                 table
                     .outer_files
                     .push((batch, *bound))
@@ -1603,17 +2030,7 @@ impl<'r, 'a> Runner<'r, 'a> {
                 return Ok(true);
             }
             let skew = skew.map(|at| (&*table, at));
-            self.probe_batch(
-                table.frozen(),
-                skew,
-                hash,
-                keys,
-                clauses,
-                inner_relids,
-                join,
-                bound,
-                sink,
-            )
+            self.probe_batch(table.frozen(), skew, hash, &probe, bound, sink)
         })?;
         if !kept && !ended {
             return Ok(false);
@@ -1621,8 +2038,19 @@ impl<'r, 'a> Runner<'r, 'a> {
         let Some(mut table) = table else {
             return Ok(true);
         };
+        if fill_inner && table.batches > 1 {
+            return Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "a hash join returning unmatched inner rows over several batches is not supported"
+            ));
+        }
         if table.batches == 1 {
             self.frozen[id as usize].set(Some(table.frozen()));
+            if fill_inner && !ended {
+                let mut rows = ArenaList::new(self.arena);
+                table.unmatched(&mut rows)?;
+                return self.fill_inner_rows(rows.as_slice(), &probe, outer_relids, bound, sink);
+            }
             return Ok(true);
         }
         // `ExecHashJoinNewBatch`.
@@ -1636,10 +2064,17 @@ impl<'r, 'a> Runner<'r, 'a> {
             };
             let has_outer =
                 |files: &[(u32, Bound<'a>)], batch: u32| files.iter().any(|(at, _)| *at == batch);
+            // A batch lacking outer or inner rows is skipped unless the join
+            // returns the unmatched rows it has, or batches grew since.
             while current < table.batches
                 && (!has_outer(table.outer_files.borrowed_slice(), current)
                     || !has(table.inner_files.borrowed_slice(), current))
             {
+                if (has_outer(table.outer_files.borrowed_slice(), current) && fill_outer)
+                    || (has(table.inner_files.borrowed_slice(), current) && fill_inner)
+                {
+                    break;
+                }
                 if has(table.inner_files.borrowed_slice(), current)
                     && table.batches != table.original_batches
                 {
@@ -1685,10 +2120,9 @@ impl<'r, 'a> Runner<'r, 'a> {
             table.ready(self, keys)?;
             for outer_row in probes.as_slice() {
                 let mut row = *outer_row;
-                let hash = self
-                    .key_hash(&row, keys, true)?
-                    .expect("saved rows have keys");
-                let batch = table.batch_of(hash);
+                let hash = self.key_hash(&row, keys, true, fill_outer)?;
+                let value = hash.expect("saved rows have hash values");
+                let batch = table.batch_of(value);
                 if batch != table.current {
                     table
                         .outer_files
@@ -1696,22 +2130,37 @@ impl<'r, 'a> Runner<'r, 'a> {
                         .map_err(|_| arena_full())?;
                     continue;
                 }
-                if !self.probe_batch(
-                    table.frozen(),
-                    None,
-                    hash,
-                    keys,
-                    clauses,
-                    inner_relids,
-                    join,
-                    &mut row,
-                    sink,
-                )? {
+                if !self.probe_batch(table.frozen(), None, hash, &probe, &mut row, sink)? {
                     return Ok(false);
                 }
             }
             hash_node.hash_table(table.figures(id));
         }
+    }
+
+    /// Returns each unmatched inner row with NULLs for the outer relation
+    /// when the join's filters pass it (`HJ_FILL_INNER_TUPLES`).
+    fn fill_inner_rows(
+        &self,
+        rows: &[Bound<'a>],
+        probe: &Probe<'_>,
+        outer_relids: u32,
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        for row in rows {
+            self.bind(bound, row, probe.inner_relids);
+            self.null_extend(bound, outer_relids);
+            if self.equal(bound, probe.quals.1)? {
+                probe.join.row();
+                if !sink(bound)? {
+                    return Ok(false);
+                }
+            } else {
+                probe.join.filtered();
+            }
+        }
+        Ok(true)
     }
 
     /// The combined hash of a row's join keys (`ExecHashGetHashValue`):
@@ -1721,12 +2170,21 @@ impl<'r, 'a> Runner<'r, 'a> {
         row: &Bound<'a>,
         keys: &KeySides,
         outer: bool,
+        keep_nulls: bool,
     ) -> Result<Option<u32>, SqlError> {
         let mut hash = 0u32;
         for (at, &(o, i)) in Self::keys(keys).enumerate() {
             let value = Self::value(row, if outer { o } else { i });
             if value.is_null() {
-                return Ok(None);
+                // A join returning the side's unmatched rows hashes a NULL
+                // key as nothing (`EEOP_HASHDATUM_FIRST`, `NEXT32`).
+                if !keep_nulls {
+                    return Ok(None);
+                }
+                if at != 0 {
+                    hash = hash.rotate_left(1);
+                }
+                continue;
             }
             let one = datum_hash(&value).ok_or_else(|| {
                 crate::sql_err!(
@@ -1750,6 +2208,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         keys: &KeySides,
         sizing: super::index_paths::joins::HashSizing,
         hash_node: super::instrument::Node,
+        keep_nulls: bool,
         bound: &mut Bound<'a>,
     ) -> Result<BatchTable<'a>, SqlError> {
         let _hash = hash_node.start();
@@ -1761,7 +2220,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             self.build_skew(&mut table, keys[0].0, sizing)?;
         }
         for row in held.rows.borrowed_slice() {
-            let Some(hash) = self.key_hash(row, keys, false)? else {
+            let Some(hash) = self.key_hash(row, keys, false, keep_nulls)? else {
                 continue;
             };
             let size = 16 + self.tuple_len(row, inner)?;
@@ -1862,39 +2321,84 @@ impl<'r, 'a> Runner<'r, 'a> {
     }
 
     /// Probes the current batch (or skew bucket `skew`) for the bound outer
-    /// row of hash `hash`, passing each match.
-    #[allow(clippy::too_many_arguments)]
+    /// row of hash `hash`, passing each match (`HJ_SCAN_BUCKET`), then an
+    /// unmatched outer row with NULLs when the join returns those
+    /// (`HJ_FILL_OUTER_TUPLE`). A NULL key (`hash` `None`) matches nothing.
     fn probe_batch(
         &self,
         frozen: Frozen<'a>,
         skew: Option<(&BatchTable<'a>, usize)>,
-        hash: u32,
-        keys: &KeySides,
-        clauses: &ClauseList,
-        inner_relids: u32,
-        join: super::instrument::Node,
+        hash: Option<u32>,
+        probe: &Probe<'_>,
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
         let mut chain = ArenaList::new(self.arena);
-        match skew {
-            Some((table, at)) => table.skew_chain(at, &mut chain)?,
-            None => frozen.chain_of(hash, &mut chain)?,
+        if let Some(hash) = hash {
+            match skew {
+                Some((table, at)) => table.skew_chain(at, &mut chain)?,
+                None => frozen.chain_of(hash, &mut chain)?,
+            }
         }
-        for hashed in chain.as_slice() {
-            if hashed.hash != hash
-                || self.compare_sides(bound, &hashed.row, keys)? != Ordering::Equal
+        let jointype = probe.jointype;
+        let mut matched = false;
+        // A NULL key matches nothing (the hash clauses are strict).
+        let outer_null = self.has_null(bound, probe.keys, true);
+        for &place in chain.as_slice() {
+            let (row, flag) = match skew {
+                Some((table, _)) => {
+                    let (_, hashed, _) = table.skew_rows.borrowed_slice()[place as usize];
+                    (hashed, &table.skew_matched[place as usize])
+                }
+                None => (
+                    frozen.memory[place as usize].hashed,
+                    &frozen.matched[place as usize],
+                ),
+            };
+            if Some(row.hash) != hash
+                || outer_null
+                || self.has_null(&row.row, probe.keys, false)
+                || self.compare_sides(bound, &row.row, probe.keys)? != Ordering::Equal
             {
                 continue;
             }
-            self.bind(bound, &hashed.row, inner_relids);
-            if !self.equal(bound, clauses)? {
-                join.join_filtered();
+            self.bind(bound, &row.row, probe.inner_relids);
+            if !self.equal(bound, probe.quals.0)? {
+                probe.join.join_filtered();
                 continue;
             }
-            join.row();
-            if !sink(bound)? {
-                return Ok(false);
+            matched = true;
+            // A right semi join returns each inner row at its first match.
+            if flag.replace(true) && jointype == JoinType::RightSemi {
+                continue;
+            }
+            if jointype == JoinType::Anti {
+                break;
+            }
+            if jointype == JoinType::RightAnti {
+                continue;
+            }
+            if self.equal(bound, probe.quals.1)? {
+                probe.join.row();
+                if !sink(bound)? {
+                    return Ok(false);
+                }
+            } else {
+                probe.join.filtered();
+            }
+            if jointype == JoinType::Semi {
+                break;
+            }
+        }
+        if !matched && jointype.fills_outer() {
+            self.null_extend(bound, probe.inner_relids);
+            if self.equal(bound, probe.quals.1)? {
+                probe.join.row();
+                if !sink(bound)? {
+                    return Ok(false);
+                }
+            } else {
+                probe.join.filtered();
             }
         }
         Ok(true)
@@ -2041,11 +2545,13 @@ impl<'r, 'a> Runner<'r, 'a> {
 
     /// Each clause's (outer, inner) columns.
     fn sides(&self, clauses: &ClauseList, outer: u32) -> KeySides {
-        let mut sides = [((usize::MAX, 0), (usize::MAX, 0)); 16];
+        let mut sides =
+            [((usize::MAX, 0), (usize::MAX, 0)); super::index_paths::joins::MAX_JOIN_CLAUSES];
         for (at, &id) in clauses.as_slice().iter().enumerate() {
             let (left, right) = self
                 .model
-                .clause_columns(&self.model.plan.clauses[usize::from(id)]);
+                .clause_columns(&self.model.plan.clauses[usize::from(id)])
+                .expect("a hash or merge clause equates columns");
             sides[at] = if outer & 1 << left.0 != 0 {
                 (left, right)
             } else {
@@ -2055,6 +2561,74 @@ impl<'r, 'a> Runner<'r, 'a> {
         sides
     }
 
+    /// A join's clauses as its plan evaluates them
+    /// (`extract_actual_join_clauses`, `order_qual_clauses`): an outer
+    /// join's matching conditions apart from the filters pushed down to it,
+    /// each list cheapest first, without the clauses its hash or merge keys
+    /// apply.
+    fn split(
+        &self,
+        clauses: &ClauseList,
+        relids: Relids,
+        jointype: JoinType,
+        keyed: &ClauseList,
+    ) -> (ClauseList, ClauseList) {
+        crate::sql::query::index_paths::joins::split_join_clauses(
+            self.model.plan.clauses,
+            clauses,
+            relids,
+            jointype,
+            keyed,
+        )
+    }
+
+    /// Binds a row of NULLs to the relations of `relids`.
+    fn null_extend(&self, bound: &mut Bound<'a>, relids: u32) {
+        for (table, (slot, nulls)) in bound.iter_mut().zip(self.nulls).enumerate() {
+            if relids & 1 << table != 0 {
+                *slot = Some(BaseRow {
+                    values: nulls,
+                    rowid: None,
+                });
+            }
+        }
+    }
+
+    /// Whether a condition no equality models holds for the bound rows.
+    fn condition(
+        &self,
+        bound: &Bound<'a>,
+        expression: &crate::sql::ast::Expr<'a>,
+    ) -> Result<bool, SqlError> {
+        let mark = self.arena.mark();
+        let values = self
+            .arena
+            .alloc_slice_with(self.width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (table, row) in bound.iter().enumerate().take(self.scope.n) {
+            if let Some(row) = row {
+                let start = self.offsets[table];
+                values[start..start + row.values.len()].copy_from_slice(row.values);
+            }
+        }
+        let row = JoinRow {
+            scope: self.scope,
+            values: JoinRowValues::Flat {
+                values,
+                offsets: self.offsets,
+            },
+            rowids: &[],
+            visible: self.scope.n,
+        };
+        let value =
+            crate::sql::eval::eval_full(expression, self.arena, self.params, &row, self.hooks)?;
+        let holds = matches!(value, Datum::Bool(true));
+        // SAFETY: nothing the evaluation allocated outlives it: the result
+        // was read as a flag.
+        unsafe { self.arena.rewind_to(mark) };
+        Ok(holds)
+    }
+
     fn keys(keys: &KeySides) -> impl Iterator<Item = &((usize, usize), (usize, usize))> {
         keys.iter().take_while(|key| key.0.0 != usize::MAX)
     }
@@ -2062,9 +2636,14 @@ impl<'r, 'a> Runner<'r, 'a> {
     /// Whether every clause of `clauses` holds for the bound rows.
     fn equal(&self, bound: &Bound<'a>, clauses: &ClauseList) -> Result<bool, SqlError> {
         for &id in clauses.as_slice() {
-            let (left, right) = self
-                .model
-                .clause_columns(&self.model.plan.clauses[usize::from(id)]);
+            let clause = &self.model.plan.clauses[usize::from(id)];
+            let Some((left, right)) = self.model.clause_columns(clause) else {
+                let expression = self.model.condition(clause).expect("a written condition");
+                if !self.condition(bound, expression)? {
+                    return Ok(false);
+                }
+                continue;
+            };
             let (one, two) = (Self::value(bound, left), Self::value(bound, right));
             if one.is_null()
                 || two.is_null()
@@ -2295,6 +2874,265 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
         }
         Ok(Some(low))
+    }
+
+    /// A `Unique` over a `Sort` of a semi join's compared columns: the
+    /// input's rows sorted by them (`pg_qsort`, NULLs last) and the first
+    /// of each run of equal values, NULLs equal (`execTuplesUnique`).
+    fn unique(
+        &self,
+        input: u32,
+        keys: &[super::index_paths::joins::Member],
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let held = self.hold(input, bound)?;
+        let rows = held.rows.borrowed_slice();
+        let relids = self.model.plan.path(input).relids;
+        let order = self
+            .arena
+            .alloc_slice_with(rows.len(), |at| at as u32)
+            .map_err(|_| arena_full())?;
+        let column = |member: &super::index_paths::joins::Member| {
+            (usize::from(member.rel), usize::from(member.column))
+        };
+        let compare = |a: &Bound<'a>, b: &Bound<'a>| -> Result<Ordering, SqlError> {
+            for member in keys {
+                let (one, two) = (
+                    Self::value(a, column(member)),
+                    Self::value(b, column(member)),
+                );
+                let order = match (one.is_null(), two.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => crate::sql::eval::compare_datums_collated(
+                        self.storage,
+                        self.txid,
+                        self.collation(column(member)),
+                        &one,
+                        &two,
+                    )?,
+                };
+                if order != Ordering::Equal {
+                    return Ok(order);
+                }
+            }
+            Ok(Ordering::Equal)
+        };
+        crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
+            compare(&rows[a as usize], &rows[b as usize])
+        })?;
+        let mut previous: Option<u32> = None;
+        for &at in order.iter() {
+            if let Some(held) = previous
+                && compare(&rows[held as usize], &rows[at as usize])? == Ordering::Equal
+            {
+                continue;
+            }
+            previous = Some(at);
+            self.bind(bound, &rows[at as usize], relids);
+            if !sink(bound)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A `HashAggregate` making a semi join's inner relation unique: the
+    /// first input row of each group of equal compared columns (NULLs
+    /// equal), returned in the order `ExecAgg` walks its `simplehash` table
+    /// (`TupleHashTableHash`'s `murmurhash32` of the combined hashes, robin
+    /// hood insertion, growth by doubling, `SH_START_ITERATE` from the
+    /// first empty bucket backwards).
+    fn unique_hashed(
+        &self,
+        input: u32,
+        keys: &[super::index_paths::joins::Member],
+        groups: f64,
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        /// `SH_FILLFACTOR`, `SH_GROW_MAX_DIB`, `SH_GROW_MAX_MOVE` and
+        /// `SH_GROW_MIN_FILLFACTOR`.
+        const FILL: f64 = 0.9;
+        const MAX_DIB: u64 = 25;
+        const MAX_MOVE: u64 = 150;
+        const MIN_FILL: f64 = 0.1;
+        let held = self.hold(input, bound)?;
+        let rows = held.rows.borrowed_slice();
+        let relids = self.model.plan.path(input).relids;
+        let width = self.model.plan.path(input).width;
+        let column = |member: &super::index_paths::joins::Member| {
+            (usize::from(member.rel), usize::from(member.column))
+        };
+        let murmur = |mut h: u32| {
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85eb_ca6b);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xc2b2_ae35);
+            h ^ (h >> 16)
+        };
+        let row_hash = |row: &Bound<'a>| -> Result<u32, SqlError> {
+            let mut hash = 0u32;
+            for (at, member) in keys.iter().enumerate() {
+                if at != 0 {
+                    hash = hash.rotate_left(1);
+                }
+                let value = Self::value(row, column(member));
+                if value.is_null() {
+                    continue;
+                }
+                hash ^= datum_hash(&value).ok_or_else(|| {
+                    crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "a hashed unique-ified relation over keys of this type is not supported"
+                    )
+                })?;
+            }
+            Ok(murmur(hash))
+        };
+        let same = |a: &Bound<'a>, b: &Bound<'a>| -> Result<bool, SqlError> {
+            for member in keys {
+                let (one, two) = (
+                    Self::value(a, column(member)),
+                    Self::value(b, column(member)),
+                );
+                let equal = match (one.is_null(), two.is_null()) {
+                    (true, true) => true,
+                    (false, false) => {
+                        crate::sql::eval::compare_datums_collated(
+                            self.storage,
+                            self.txid,
+                            self.collation(column(member)),
+                            &one,
+                            &two,
+                        )? == Ordering::Equal
+                    }
+                    _ => false,
+                };
+                if !equal {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        // `SH_CREATE` of the planned buckets.
+        let buckets = super::index_paths::plain_hash_buckets(width, groups);
+        let sized = |elements: f64| ((elements as u64).max(2)).next_power_of_two();
+        let mut size = sized(buckets as f64 / FILL);
+        // Each bucket: the group's hash and its first row, or `None`.
+        let mut table = self
+            .arena
+            .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
+            .map_err(|_| arena_full())?;
+        let mut members = 0u64;
+        let mut threshold = (size as f64 * FILL) as u64;
+        for (row_at, row) in rows.iter().enumerate() {
+            let hash = row_hash(row)?;
+            'restart: loop {
+                if members >= threshold {
+                    // `SH_GROW`: each entry moved, from the first bucket that
+                    // is empty or holds an entry at its optimal place.
+                    let old = &*table;
+                    let old_size = size;
+                    size *= 2;
+                    let mask = size - 1;
+                    let grown = self
+                        .arena
+                        .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
+                        .map_err(|_| arena_full())?;
+                    let old_mask = old_size - 1;
+                    let start = (0..old_size)
+                        .find(|&at| {
+                            old[at as usize]
+                                .is_none_or(|(hash, _)| u64::from(hash) & old_mask == at)
+                        })
+                        .expect("an empty bucket");
+                    for step in 0..old_size {
+                        let at = (start + step) % old_size;
+                        if let Some(entry) = old[at as usize] {
+                            let mut place = u64::from(entry.0) & mask;
+                            while grown[place as usize].is_some() {
+                                place = (place + 1) & mask;
+                            }
+                            grown[place as usize] = Some(entry);
+                        }
+                    }
+                    table = grown;
+                    threshold = (size as f64 * FILL) as u64;
+                }
+                let mask = size - 1;
+                let start = u64::from(hash) & mask;
+                let mut place = start;
+                let mut distance = 0u64;
+                loop {
+                    let Some((held_hash, held_row)) = table[place as usize] else {
+                        table[place as usize] = Some((hash, row_at as u32));
+                        members += 1;
+                        break 'restart;
+                    };
+                    if held_hash == hash && same(&rows[held_row as usize], row)? {
+                        break 'restart;
+                    }
+                    let optimal = u64::from(held_hash) & mask;
+                    let held_distance = (place + size - optimal) & mask;
+                    if distance > held_distance {
+                        // Robin hood: shift the run forward to the next empty
+                        // bucket and take this one.
+                        let mut empty = place;
+                        let mut moved = 0u64;
+                        loop {
+                            empty = (empty + 1) & mask;
+                            if table[empty as usize].is_none() {
+                                break;
+                            }
+                            moved += 1;
+                            if moved > MAX_MOVE && members as f64 / size as f64 >= MIN_FILL {
+                                threshold = 0;
+                                continue 'restart;
+                            }
+                        }
+                        let mut at = empty;
+                        while at != place {
+                            let previous = (at + size - 1) & mask;
+                            table[at as usize] = table[previous as usize];
+                            at = previous;
+                        }
+                        table[place as usize] = Some((hash, row_at as u32));
+                        members += 1;
+                        break 'restart;
+                    }
+                    place = (place + 1) & mask;
+                    distance += 1;
+                    if distance > MAX_DIB && members as f64 / size as f64 >= MIN_FILL {
+                        threshold = 0;
+                        continue 'restart;
+                    }
+                }
+            }
+        }
+        // `SH_START_ITERATE` and `SH_ITERATE`: backwards from the first
+        // empty bucket.
+        let mask = size - 1;
+        let end = (0..size)
+            .find(|&at| table[at as usize].is_none())
+            .expect("an empty bucket");
+        let mut current = end;
+        loop {
+            let entry = table[current as usize];
+            current = (current + size - 1) & mask;
+            if let Some((_, row_at)) = entry {
+                self.bind(bound, &rows[row_at as usize], relids);
+                if !sink(bound)? {
+                    return Ok(false);
+                }
+            }
+            if current == end {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     /// The held rows' order after a sort by `keys` (`pg_qsort`, NULLs

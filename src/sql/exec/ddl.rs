@@ -484,12 +484,17 @@ pub(super) fn build_column(
     };
     let auto_increment = serial || is_identity;
     let collatable = ctype.is_collatable();
-    let collation = resolve_parsed_collation(storage, txid, c.collation)?;
+    let collation = resolve_parsed_collation(storage, txid, c.collation).map_err(|error| {
+        crate::sql::error_position::at_source_position(error, c.collation_position)
+    })?;
     if !collatable && collation != crate::sql::ast::Collation::Default {
-        return Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "collations are not supported by type {}",
-            ctype.name()
+        return Err(crate::sql::error_position::at_source_position(
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "collations are not supported by type {}",
+                ctype.name()
+            ),
+            c.collation_position,
         ));
     }
     let column_storage = c.storage.unwrap_or_else(|| default_column_storage(ctype));
@@ -561,13 +566,7 @@ pub(super) fn resolve_parsed_collation(
         crate::sql::ast::ParsedCollation::Builtin(collation) => Ok(collation),
         crate::sql::ast::ParsedCollation::Named(name) => storage
             .resolve_collation(name.schema, name.name, txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "collation \"{}\" does not exist",
-                    name.name
-                )
-            }),
+            .ok_or_else(|| storage.collation_miss(name.schema, name.name, txid)),
     }
 }
 

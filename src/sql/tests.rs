@@ -23615,7 +23615,7 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         .join(" ");
     let lock_query = format!("SELECT 1 FROM {joined_sources} {lock_clauses}");
     let explain_join_query = format!("EXPLAIN (COSTS OFF) SELECT 1 FROM {joined_sources}");
-    let explain_set_query = format!("EXPLAIN {set_query}");
+    let explain_set_query = format!("EXPLAIN (COSTS OFF) {set_query}");
 
     let using_query = format!(
         "SELECT * FROM statement_width_left JOIN statement_width_right USING ({column_names})"
@@ -41600,8 +41600,12 @@ fn selective_join_component_precedes_independent_cross_filters() {
             .collect::<Vec<_>>();
         assert_eq!(first_scans.len(), 2, "FROM {from}: {plan:?}");
         assert!(
-            first_scans.iter().any(|row| row.contains(" on t1 "))
-                && first_scans.iter().any(|row| row.contains(" on t6 ")),
+            first_scans
+                .iter()
+                .any(|row| row.trim_end().ends_with(" on t1"))
+                && first_scans
+                    .iter()
+                    .any(|row| row.trim_end().ends_with(" on t6")),
             "FROM {from}: {plan:?}"
         );
         let sql = format!("SELECT count(*) FROM {from} WHERE {qualification}");
@@ -55922,7 +55926,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
            WHERE e.tenant = p.tenant AND e.event_id = p.wanted + $1
            ORDER BY 1, 2;
          EXECUTE joined_offset(0);
-         EXPLAIN (GENERIC_PLAN) EXECUTE joined_offset(0)",
+         EXPLAIN (GENERIC_PLAN, COSTS OFF) EXECUTE joined_offset(0)",
     ));
     assert!(prepared.iter().any(|row| row == "one|b"), "{prepared:?}");
     assert!(prepared.iter().any(|row| row == "one|b2"), "{prepared:?}");
@@ -56207,7 +56211,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     let plan = data_rows(&run_with(
         &mut replayed,
         &mut replay_budget,
-        "EXPLAIN SELECT w.tenant, e.event_id, e.payload
+        "EXPLAIN (COSTS OFF) SELECT w.tenant, e.event_id, e.payload
          FROM range_windows w JOIN durable_events e
            ON e.tenant = w.tenant
           AND e.event_id >= w.low_id AND e.event_id < w.high_id",

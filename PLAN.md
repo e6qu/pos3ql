@@ -830,7 +830,12 @@ two items joined by equalities of their columns or of expressions of each
 PostgreSQL's costs may hash the other side or merge; a function in `FROM`
 whose arguments read no earlier item is scanned once and may be hashed,
 as PostgreSQL's analysis marks only a function reading them lateral, and
-`USING` and `NATURAL` joins hash on their synthesized condition. Remaining
+`USING` and `NATURAL` joins hash on their synthesized condition. As
+PostgreSQL's `ExecHashJoin` does, a hash join builds its table only once a
+probe row passes its scan's conditions (unless it returns unmatched build
+rows), so an empty outer side never evaluates the inner keys, and stops at
+an empty table. A retained result stream or cursor reads a join hashed on
+expressions as a nested loop, in that loop's order. Remaining
 inexact without `0A000`: btree sizes, which the model computes from the column statistics
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update

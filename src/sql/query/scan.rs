@@ -9477,6 +9477,30 @@ fn scan_source_mode<'a>(
                 return Ok(false);
             }
             let probe_slot = scope.slots[probe_t];
+            // A columnar scan reads only the columns the query demands.
+            if let Some(demand) = pax_demand.selected_mask(probe_t)
+                && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
+            {
+                let mut found = false;
+                scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
+                    for spilled in rows {
+                        let row = match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => {
+                                BoundRow::Values(values)
+                            }
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                BoundRow::Encoded(bytes)
+                            }
+                        };
+                        if passes(Some(spilled.rowid), row)? {
+                            found = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                    Ok(ControlFlow::Continue(()))
+                })?;
+                return Ok(found);
+            }
             let count = storage.visible_row_count(probe_slot, txid)?;
             let snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
             let ordered = arena

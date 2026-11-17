@@ -370,6 +370,7 @@ pub(crate) fn planned<'e>(expression: &'e Expr<'e>) -> &'e Expr<'e> {
             operand,
             collation:
                 crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::Default),
+            ..
         } if !matches!(
             operand,
             Expr::Str(_) | Expr::Null | Expr::BoundLiteral { .. }
@@ -389,7 +390,10 @@ pub(crate) fn deparse_shown<'a>(
     expression: &Expr<'_>,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Expr::Collate { operand, collation } = expression else {
+    let Expr::Collate {
+        operand, collation, ..
+    } = expression
+    else {
         return Ok(None);
     };
     if !context.folded || context.is_constant(operand) {
@@ -409,7 +413,10 @@ pub(crate) fn planned_collated_key<'a>(
     expression: &Expr<'_>,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Expr::Collate { operand, collation } = expression else {
+    let Expr::Collate {
+        operand, collation, ..
+    } = expression
+    else {
         return Ok(None);
     };
     if context.is_constant(operand) || !matches!(operand, Expr::Column { .. }) {
@@ -1236,7 +1243,9 @@ impl Context<'_> {
         // An operand shows the planner's collation relabeling.
         if self.folded
             && expected.is_some()
-            && let Expr::Collate { operand, collation } = expression
+            && let Expr::Collate {
+                operand, collation, ..
+            } = expression
         {
             return self.planned_collate(operand, collation, expected, true, output);
         }
@@ -1444,7 +1453,9 @@ impl Context<'_> {
             output.push("(")?;
             // `get_variable` shows the target's implicit coercions.
             if self.folded
-                && let Expr::Collate { operand, collation } = expression
+                && let Expr::Collate {
+                    operand, collation, ..
+                } = expression
             {
                 computed.planned_collate(operand, collation, None, true, output)?;
             } else {
@@ -1519,7 +1530,9 @@ impl Context<'_> {
             Expr::Slice { base, lower, upper } => {
                 self.subscript(base, *lower, Some(*upper), output)
             }
-            Expr::Collate { operand, collation } => self.collate(operand, collation, output),
+            Expr::Collate {
+                operand, collation, ..
+            } => self.collate(operand, collation, output),
             Expr::Call {
                 kind: CallKind::SqlSyntax,
                 name,
@@ -1701,6 +1714,7 @@ impl Context<'_> {
                 operand,
                 list,
                 negated,
+                ..
             } => match row_items(operand) {
                 // A row's `IN` list is the rows' comparisons, joined by `OR`
                 // (`AND` for `NOT IN`).
@@ -1748,6 +1762,7 @@ impl Context<'_> {
                 operator,
                 array,
                 all,
+                ..
             } => {
                 let Some(symbol) = operator.operator_name() else {
                     return output.unsupported();
@@ -1796,6 +1811,7 @@ impl Context<'_> {
                 negated,
                 case_insensitive,
                 escape,
+                ..
             } => {
                 let symbol = match (*negated, *case_insensitive) {
                     (false, false) => "~~",
@@ -1813,6 +1829,7 @@ impl Context<'_> {
                 pattern,
                 negated,
                 case_insensitive,
+                ..
             } => {
                 let symbol = match (*negated, *case_insensitive) {
                     (false, false) => "~",
@@ -2801,6 +2818,7 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
             operand,
             list,
             negated,
+            ..
         } => {
             let (array, count) = operators::in_list_shape(list);
             if row_items(operand).is_some() {

@@ -1798,6 +1798,7 @@ fn coerce_rule_transition<'a>(
     match target.collation {
         Some(collation) => arena
             .alloc(Expr::Collate {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operand: cast,
                 collation,
             })
@@ -8365,6 +8366,7 @@ impl<'a> RecursiveCteQuery<'a> {
             }
             &kept_rows[..kept]
         };
+        super::instrument::node(super::instrument::Role::SetOperation(0)).recursive_step(fresh);
         if fresh.is_empty() {
             return Ok((
                 RecursiveProgress {
@@ -8443,6 +8445,7 @@ impl<'a> RecursiveCteQuery<'a> {
             } else {
                 external_unique_run(storage, txid, base)?
             };
+            count_recursive_run(storage, all)?;
             let Some(first) = all.filter(|run| run.rows() > 0) else {
                 return Ok((
                     RecursiveProgress {
@@ -8514,6 +8517,7 @@ impl<'a> RecursiveCteQuery<'a> {
             let unique = external_unique_run(storage, txid, candidates)?;
             external_recursive_difference(storage, txid, unique, progress.all)?
         };
+        count_recursive_run(storage, fresh)?;
         let Some(fresh) = fresh.filter(|run| run.rows() > 0) else {
             return Ok((
                 RecursiveProgress {
@@ -8542,6 +8546,32 @@ impl<'a> RecursiveCteQuery<'a> {
             fresh.rows(),
         ))
     }
+}
+
+/// Under `EXPLAIN ANALYZE`, counts the rows a spilled `Recursive Union`
+/// step added (`run`) into its tuplestores.
+fn count_recursive_run(
+    storage: &Storage,
+    run: Option<crate::sql::external::ExternalRun>,
+) -> Result<(), SqlError> {
+    let node = super::instrument::node(super::instrument::Role::SetOperation(0));
+    if !node.measured() {
+        return Ok(());
+    }
+    if let Some(run) = run.filter(|run| run.rows() > 0) {
+        let mut reader = storage.external_run_reader()?;
+        storage
+            .with_block_store(|blocks| reader.start(blocks, run))
+            .expect("spill-attached block store")?;
+        while let Some(context) = reader.context() {
+            node.recursive_row(context.row);
+            storage
+                .with_block_store(|blocks| reader.advance(blocks))
+                .expect("spill-attached block store")?;
+        }
+    }
+    node.recursive_step_end();
+    Ok(())
 }
 
 /// Whether `rows` holds a row equal to `row` under SQL equality; recursive
@@ -10273,7 +10303,12 @@ fn subst_expr<'a>(
             expression: subst_expr(expression, context, arena)?,
             type_oid: *type_oid,
         },
-        Expr::Collate { operand, collation } => Expr::Collate {
+        Expr::Collate {
+            source_position,
+            operand,
+            collation,
+        } => Expr::Collate {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             collation: rewrite_stored_collation(*collation, context)?,
         },
@@ -10363,10 +10398,12 @@ fn subst_expr<'a>(
             }
         }
         Expr::InList {
+            source_position,
             operand,
             list,
             negated,
         } => Expr::InList {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             list: subst_expr_slice(list, context, arena)?,
             negated: *negated,
@@ -10377,7 +10414,9 @@ fn subst_expr<'a>(
             negated,
             case_insensitive,
             escape,
+            source_position,
         } => Expr::Like {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
@@ -10385,11 +10424,13 @@ fn subst_expr<'a>(
             escape: opt_subst(*escape, context, arena)?,
         },
         Expr::Match {
+            source_position,
             operand,
             pattern,
             negated,
             case_insensitive,
         } => Expr::Match {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
@@ -10433,11 +10474,13 @@ fn subst_expr<'a>(
             field,
         },
         Expr::AnyAll {
+            source_position,
             operand,
             operator,
             array,
             all,
         } => Expr::AnyAll {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             operator: *operator,
             array: subst_expr(array, context, arena)?,
@@ -10486,11 +10529,15 @@ fn subst_expr<'a>(
                     && written == rewrite.from
                     && !rewrite.exposed_columns.contains(name)
                 {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column {}.{} does not exist",
-                        written,
-                        name
+                    return Err(crate::sql::error_position::column_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column {}.{} does not exist",
+                            written,
+                            name
+                        ),
+                        Some(written),
+                        name,
                     ));
                 }
                 let reaches = match (*qualifier, context.qualifier) {

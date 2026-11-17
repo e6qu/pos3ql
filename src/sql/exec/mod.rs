@@ -73821,8 +73821,11 @@ pub fn create_index(
                 type_oid,
             )
         } else {
-            // Names resolve before the key's type is judged (`(zz.*)` is 42P01).
-            if let Err(error) = ddl::check_referenced_columns(index_column.expression, &tdef) {
+            // Names resolve, positioned in the statement's text, before the
+            // key's type is judged (`(zz.*)` is 42P01).
+            if let Err(error) = crate::sql::error_position::with_analysis(|| {
+                ddl::check_referenced_columns(index_column.expression, &tdef)
+            }) {
                 return sql_fail(error);
             }
             // PostgreSQL analyses the key expression in the statement's text.
@@ -103906,10 +103909,13 @@ fn alter_table_relation(
                 if inheritance_scope == AlterInheritanceScope::Direct
                     && column_supplied_by_parent(storage, &def, column, txn.txid)
                 {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_TABLE_DEFINITION,
-                        "cannot alter inherited column \"{}\"",
-                        column
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot alter inherited column \"{}\"",
+                            column
+                        ),
+                        column,
                     ));
                 }
                 if def.partition.scheme.is_some_and(|scheme| {
@@ -103917,11 +103923,14 @@ fn alter_table_relation(
                         scheme.keys[..usize::from(scheme.n_keys)].contains(&(original as u16))
                     })
                 }) {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_TABLE_DEFINITION,
-                        "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                            column,
+                            def.name.as_str()
+                        ),
                         column,
-                        def.name.as_str()
                     ));
                 }
                 if let Err(error) = require_row_type_unaltered(storage, txn.txid, table_index) {
@@ -104787,6 +104796,7 @@ fn alter_table_relation(
         for index in 0..new_def.n_exclusions {
             new_def.exclusions[index] = match crate::sql::exec::ddl::revalidate_exclusion(
                 storage,
+                &def,
                 &new_def,
                 &new_def.exclusions[index],
                 txn.txid,

@@ -36,7 +36,9 @@ mod predicate;
 
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
-pub(crate) use aggregate::{AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg};
+pub(crate) use aggregate::{
+    AggInput, AggStrategy, AggregateCosts, QualCosts, aggregate_costs, cost_agg, hash_agg_sizing,
+};
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{
     GroupingSet, MAX_SET_COLUMNS, SetsPlan, SetsQuery, SetsStrategy, plan_grouping_sets,
@@ -262,10 +264,18 @@ pub(crate) fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
     if layout.length > 0 {
         return f64::from(layout.length);
     }
-    // `type_maximum_size` of a length-limited character type: four bytes
-    // per UTF-8 character plus the header.
+    // `type_maximum_size`: a length-limited character type's four bytes
+    // per UTF-8 character plus the header, a bit string's bytes and its
+    // header and length, and `numeric_maximum_size` of a numeric's
+    // precision: its two-byte digits of four decimal digits each, the first
+    // possibly holding one, after an eight-byte header.
     let maximum = match ctype {
         ColType::Varchar | ColType::Bpchar if type_mod > 4 => (type_mod - 4) * 4 + 4,
+        ColType::Bit { .. } if type_mod > 0 => (type_mod + 7) / 8 + 8,
+        ColType::Numeric if type_mod >= 4 => {
+            let precision = ((type_mod - 4) >> 16) & 0xffff;
+            8 + (precision + 6) / 4 * 2
+        }
         _ => 0,
     };
     if maximum > 0 {
@@ -1994,6 +2004,8 @@ pub(crate) struct GroupingShape {
     /// The width of the rows the aggregation returns.
     pub(crate) output_width: f64,
     pub(crate) order: GroupOrder,
+    /// The `HAVING` qualification's cost and selectivity.
+    pub(crate) having: Option<aggregate::QualCosts>,
 }
 
 /// How the query's `ORDER BY` relates to its grouping.
@@ -2016,11 +2028,15 @@ pub(crate) struct GroupedPath {
     pub(crate) input_sort: Option<(f64, f64)>,
     /// The partitions a `HashAggregate` expects to spill its groups to.
     pub(crate) planned_partitions: Option<u32>,
+    /// What sizes a `HashAggregate`'s memory, when the model covers it.
+    pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     pub(crate) startup: f64,
     pub(crate) total: f64,
     pub(crate) rows: f64,
     /// The sort of the groups for the `ORDER BY`.
     pub(crate) output_sort: Option<(f64, f64)>,
+    /// The `Limit` over them: its startup and total cost and its rows.
+    pub(crate) limit: Option<(f64, f64, f64)>,
     /// The relation's cheapest path the grouping reads: its startup and
     /// total cost, rows and width.
     pub(crate) input: AggInput,
@@ -2251,6 +2267,40 @@ pub(crate) fn query_shape<'a>(
     };
     shape.limit = (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0)));
     Ok(shape)
+}
+
+/// A `LIMIT`'s rows, if any, and its `OFFSET`'s, when either is present.
+pub(crate) type LimitEstimate = Option<(Option<f64>, f64)>;
+
+/// A query's `LIMIT` and `OFFSET` as the planner estimates them
+/// (`preprocess_limit`): `Some(None)` without either, `None` when one is
+/// not a constant.
+pub(crate) fn constant_limit<'a>(
+    limit: Option<&'a Expr<'a>>,
+    offset: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<LimitEstimate>, SqlError> {
+    let constant = |expression: Option<&'a Expr<'a>>| -> Option<Option<f64>> {
+        let Some(expression) = expression else {
+            return Some(None);
+        };
+        if !expression.is_constant(false) || expression.calls_routine() {
+            return None;
+        }
+        Some(
+            match crate::sql::eval::eval(expression, arena, &[], &crate::sql::eval::NoColumns) {
+                Ok(Datum::Null) => None,
+                Ok(value) => numeric_scalar(&value),
+                Err(_) => return None,
+            },
+        )
+    };
+    let (Some(count), Some(skip)) = (constant(limit), constant(offset)) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        (limit.is_some() || offset.is_some()).then_some((count, skip.unwrap_or(0.0))),
+    ))
 }
 
 /// The target list a scan of the one plain table `scope` reads computes

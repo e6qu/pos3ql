@@ -1,8 +1,8 @@
 -- PostgreSQL 18 explain.c ExplainNode with ANALYZE: every node's actual
 -- rows and loops, `(never executed)` for nodes that did not run, the rows
--- each qualification removed, and the inner loops of a nested loop. The
--- memory and hash sizes PostgreSQL measures for sorts, hashes, aggregates
--- and materialized rows are its own allocator's, so those lines are left out.
+-- each qualification removed, and the inner loops of a nested loop, with
+-- the memory PostgreSQL's allocators charge sorts, hashes, aggregates and
+-- materialized rows.
 CREATE TABLE t430 (a int, b int);
 INSERT INTO t430 SELECT g % 10, g FROM generate_series(1, 100) g;
 CREATE TABLE u430 (a int, c text);
@@ -17,7 +17,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Sort Method|Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

@@ -1385,15 +1385,26 @@ fn expression_cost(
         Cast {
             operand, type_mod, ..
         } => {
+            let types = (oid_of(operand), oid_of(e));
             let free = *type_mod < 0
-                && match (oid_of(operand), oid_of(e)) {
+                && match types {
                     (Some(source), Some(target)) => {
                         source == target || crate::sql::catalog::builtin_binary_cast(source, target)
                     }
                     _ => false,
                 };
+            // `CoerceViaIO` calls the source's output and the target's
+            // input function.
+            let io = matches!(types, (Some(source), Some(target))
+                if crate::sql::catalog::builtin_io_cast(source, target));
             expression_cost(operand, columns, storage, txid, arena, use_)
-                + if free { 0.0 } else { 2.0 }
+                + if free {
+                    0.0
+                } else if io {
+                    4.0
+                } else {
+                    2.0
+                }
         }
         Collate { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_),
         Binary {
@@ -1450,6 +1461,9 @@ fn expression_cost(
                 + expression_cost(pattern, columns, storage, txid, arena, use_)
                 + 2.0
         }
+        // An aggregate's value costs what a column does: its transition and
+        // final functions are charged to the aggregation.
+        Call { .. } if e.is_aggregate_use() => 0.0,
         Call {
             name,
             bound_oid,
@@ -1705,6 +1719,7 @@ pub(super) fn fold_catalog_inputs<'a>(
             })
         }
         Expr::InList {
+            source_position,
             operand,
             list,
             negated,
@@ -1721,6 +1736,7 @@ pub(super) fn fold_catalog_inputs<'a>(
                 return Ok(expression);
             }
             alloc(Expr::InList {
+                source_position: *source_position,
                 operand: folded_operand,
                 list: items,
                 negated: *negated,

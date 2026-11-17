@@ -39,7 +39,8 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    -- Memory figures are each server's own.
+    -- A window's tuplestore trimming and its sorts' rows are not modelled yet
+    -- (PLAN.md), so their memory figures are masked.
     RETURN NEXT regexp_replace(line, '(Memory|Maximum Storage): \d+kB', '\1: NkB');
   END LOOP;
 END

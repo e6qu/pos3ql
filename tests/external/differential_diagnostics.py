@@ -3,7 +3,8 @@
 
 `sqlstate` compares each diagnostic's severity and SQLSTATE, `verbose` adds
 its primary message and COPY context, and `full` adds every DETAIL, HINT,
-QUERY and CONTEXT line as well."""
+QUERY and CONTEXT line and the error cursor (psql's `LINE n:` excerpt and
+its caret line, which place the reported position in the statement)."""
 
 import argparse
 import json
@@ -23,7 +24,7 @@ AUXILIARY = re.compile(
     r"CONSTRAINT NAME|DATATYPE NAME):|^LINE [0-9]+:"
 )
 # The auxiliary fields `full` compares, each with its continuation lines.
-FULL_FIELDS = ("detail", "hint", "query", "context")
+FULL_FIELDS = ("detail", "hint", "query", "context", "cursor")
 # CREATE TABLE repeating a constraint name fails pg_constraint's unique index,
 # whose DETAIL names the new table's OID. Each server draws that OID from its
 # own counter, so only that one number is masked, and only in that DETAIL.
@@ -118,10 +119,12 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
             current = None
             result.append({"client": line})
         elif auxiliary := AUXILIARY.match(line):
-            # A cursor line and its caret line are compared through the
-            # statement's source position, not as text.
+            # A cursor's `LINE n:` excerpt and its caret line are kept
+            # verbatim: the caret's column is the reported position.
             field = auxiliary[1].lower() if auxiliary[1] else "cursor"
-            if field in FULL_FIELDS:
+            if field == "cursor":
+                current["fields"].setdefault(field, []).append(line)
+            elif field in FULL_FIELDS:
                 current["fields"].setdefault(field, []).append(
                     line[len(auxiliary[0]):].lstrip(" "))
             if field == "location":

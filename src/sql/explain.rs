@@ -61,6 +61,9 @@ struct PlanNode {
     /// The node's target list is outside the deparser's coverage:
     /// `VERBOSE` rejects the plan rather than print a wrong `Output:`.
     output_unprintable: bool,
+    /// The node's estimates are pos3ql's own rather than PostgreSQL's
+    /// cost model: an `EXPLAIN` showing costs rejects the plan.
+    unmodeled_costs: bool,
     depth: u8,
     startup_cost: f64,
     total_cost: f64,
@@ -125,6 +128,8 @@ struct PlanNode {
     /// The partitions a hash aggregate expects to spill its groups to,
     /// which text shows only when there are any.
     planned_partitions: Option<u32>,
+    /// What sizes a hash aggregate's memory as PostgreSQL's.
+    hash_agg: Option<query::postgres_memory::HashAggSizing>,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -264,6 +269,34 @@ impl QualLabel {
 }
 
 impl PlanNode {
+    /// A `HashAggregate` keeping distinct rows (no transition states) of
+    /// `groups` estimated groups over its key columns: its memory sizing,
+    /// or `EXPLAIN ANALYZE`'s refusal past the modelled key columns.
+    fn with_distinct_hash(mut self, groups: u64, width: u32) -> Self {
+        if self.name.as_str() != "HashAggregate" {
+            return self;
+        }
+        let columns = self
+            .keys
+            .plain
+            .as_str()
+            .split(KEY_SEPARATOR)
+            .filter(|key| !key.is_empty())
+            .count();
+        self.hash_agg = query::index_paths::hash_agg_sizing(
+            &query::index_paths::AggregateCosts::default(),
+            groups as f64,
+            f64::from(width),
+            columns,
+        );
+        if self.hash_agg.is_none() {
+            self.analyze_unsupported = Some(
+                "EXPLAIN ANALYZE of a hash aggregate of more grouping columns than PostgreSQL's memory figure is modelled for is not supported",
+            );
+        }
+        self
+    }
+
     /// This node with `qual` under `label`.
     fn with_qual(mut self, label: QualLabel, qual: Option<StackStr<512>>) -> Self {
         if let Some(qual) = qual {
@@ -386,6 +419,7 @@ impl PlanNode {
         relations: StackStr::new(),
         plain_relations: StackStr::new(),
         output_unprintable: false,
+        unmodeled_costs: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -397,6 +431,7 @@ impl PlanNode {
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
 }
 
@@ -561,7 +596,9 @@ impl<'a> Plan<'a> {
         let nodes = &self.nodes[..self.count];
         let slots = arena
             .alloc_slice_with(self.count, |index| {
-                Slot::new(nodes[index].key).with_hash_columns(nodes[index].hash_columns)
+                Slot::new(nodes[index].key)
+                    .with_hash_columns(nodes[index].hash_columns)
+                    .with_hash_agg(nodes[index].hash_agg)
             })
             .map_err(|_| query::arena_full_pub())?;
         let result = query::instrument::analyze(slots, timing, execute);
@@ -570,7 +607,50 @@ impl<'a> Plan<'a> {
             .map_err(|_| query::arena_full_pub())?;
         mirror_passthrough(nodes, counters);
         self.measured = Some(counters);
+        if counters
+            .iter()
+            .any(|counters| counters.cte_stored == Some(query::instrument::StoredSpace::Unsized))
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE of a WITH query returning values without a PostgreSQL storage size is not supported"
+            ));
+        }
         Ok(result)
+    }
+
+    /// What the tuplestore a `CTE Scan` at `index` reads held at most
+    /// (`show_ctescan_info`): its `WITH` query's rows once read, else the
+    /// empty store PostgreSQL creates with the scan.
+    fn cte_storage(&self, index: usize) -> Option<(bool, usize)> {
+        let node = &self.nodes[index];
+        if node.name.as_str() != "CTE Scan" {
+            return None;
+        }
+        let measured = self.measured?;
+        let named = |at: &usize| {
+            self.nodes[*at].subplan.as_ref().is_some_and(|(_, name)| {
+                name.as_str()
+                    .strip_prefix("CTE ")
+                    .is_some_and(|name| name == node.relation.as_str())
+            })
+        };
+        let root = (0..index)
+            .rev()
+            .find(named)
+            .or_else(|| (index + 1..self.count).find(named));
+        let stored = root.and_then(|root| {
+            let depth = self.nodes[root].depth;
+            (root..self.count)
+                .take_while(|&at| at == root || self.nodes[at].depth > depth)
+                .find_map(|at| measured[at].cte_stored)
+        });
+        Some(match stored {
+            Some(query::instrument::StoredSpace::Sized { disk, bytes }) => (disk, bytes),
+            Some(query::instrument::StoredSpace::Unsized) | None => {
+                (false, query::postgres_memory::Tuplestore::new().finish().1)
+            }
+        })
     }
 
     /// What the node at `index` did under `EXPLAIN ANALYZE`, as PostgreSQL
@@ -1200,11 +1280,33 @@ fn equijoin<'e>(
     else {
         return Ok(None);
     };
-    let side = |expression: &Expr<'_>| match expression {
-        Expr::Column { qualifier, name } => resolve(*qualifier, name),
-        _ => None,
+    // The one relation a side's columns all read; a key may be any
+    // expression of it (`s1.a = (s2.x + 1)`).
+    fn relations(
+        expression: &Expr<'_>,
+        resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
+    ) -> Option<u64> {
+        if expression.contains_subquery() {
+            return None;
+        }
+        if let Expr::Column { qualifier, name } = expression {
+            return resolve(*qualifier, name).and_then(|read| 1u64.checked_shl(read as u32));
+        }
+        let mut mask = Some(0u64);
+        let _ = query::walk_children(expression, &mut |child| {
+            mask = mask
+                .zip(relations(child, resolve))
+                .map(|(held, read)| held | read);
+            Ok(())
+        });
+        mask
+    }
+    let side = |expression: &Expr<'_>, resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>| {
+        relations(expression, resolve)
+            .filter(|mask| mask.count_ones() == 1)
+            .map(|mask| mask.trailing_zeros() as usize)
     };
-    match (side(left), side(right)) {
+    match (side(left, resolve), side(right, resolve)) {
         (Some(a), Some(b)) if a == outer && b != outer => Ok(Some(conjunct)),
         (Some(a), Some(b)) if b == outer && a != outer => {
             let swapped = arena
@@ -2019,6 +2121,7 @@ fn outer_join_quals<'a>(
     txid: u32,
     relations: &[JoinRelation<'a>],
     joins: &'a [crate::sql::ast::Join<'a>],
+    join_on: &[Option<&'a Expr<'a>>],
     condition: Option<&'a Expr<'a>>,
     hash: bool,
     indexes: &[Option<query::IndexAccessPlan<'a>>],
@@ -2084,10 +2187,12 @@ fn outer_join_quals<'a>(
     };
     // `ON` conjuncts of each join, then the `WHERE` conjuncts (depth 0).
     for depth in (1..count).chain(core::iter::once(0)) {
+        // A `USING` or `NATURAL` join's condition is the one analysis
+        // synthesized.
         let source = if depth == 0 {
             condition
         } else {
-            joins[depth - 1].on
+            joins[depth - 1].on.or(join_on[depth - 1])
         };
         let Some(source) = source else {
             continue;
@@ -3117,6 +3222,7 @@ fn push_members(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3869,9 +3975,6 @@ fn grouped_scan_path<'a>(
         || scope.n != 1
         || !from.joins.is_empty()
         || from.base.sample.is_some()
-        || statement.having.is_some()
-        || statement.limit.is_some()
-        || statement.offset.is_some()
         || statement.distinct
         || !statement.distinct_on.is_empty()
         || !statement.locking.is_empty()
@@ -3882,6 +3985,10 @@ fn grouped_scan_path<'a>(
     {
         return Ok(None);
     }
+    let Some(limit) = query::index_paths::constant_limit(statement.limit, statement.offset, arena)?
+    else {
+        return Ok(None);
+    };
     let slot = scope.slots[0];
     if storage.table_def(slot, txid).partition.is_partitioned()
         || storage.relation_has_descendants(slot, txid)
@@ -3944,6 +4051,9 @@ fn grouped_scan_path<'a>(
                     ordered_len += 1;
                 }
             }
+            // The groups are sorted above the grouping by whatever keys
+            // follow a leading key that is not a grouping column.
+            Some(_) | None if order == GroupOrder::Other => {}
             Some(_) => return Ok(None),
             None if at == 0 => order = GroupOrder::Other,
             None => return Ok(None),
@@ -3978,13 +4088,24 @@ fn grouped_scan_path<'a>(
                 + query::index_paths::column_width(storage, txid, scope.slots[0], column);
         }
     }
+    // A `HAVING` reading its aggregates: its cost and selectivity.
+    let having = match statement.having {
+        Some(having) => match having_quals(having, storage, txid, columns, arena)? {
+            Some(quals) => Some(quals),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     // The aggregates' costs, over a list of aggregates, columns and
-    // constants.
+    // constants, with the `HAVING` qualification's aggregates.
     let expressions = arena
-        .alloc_slice_with(statement.items.len() + statement.order_by.len(), |_| {
+        .alloc_slice_with(statement.items.len() + statement.order_by.len() + 1, |_| {
             &Expr::Null
         })
         .map_err(|_| arena_full())?;
+    if let Some(condition) = statement.having {
+        expressions[statement.items.len() + statement.order_by.len()] = condition;
+    }
     for (slot, item) in expressions.iter_mut().zip(statement.items) {
         let SelectItem::Expr { expression, .. } = item else {
             return Ok(None);
@@ -4042,7 +4163,9 @@ fn grouped_scan_path<'a>(
             aggregates,
             output_width: f64::from(output_width),
             order,
+            having,
         }),
+        limit,
         ..QueryShape::default()
     };
     let planned = query::index_paths::scan_path(
@@ -4087,6 +4210,74 @@ fn grouped_scan_path<'a>(
         sort_keys,
         group_keys,
         width: output_width,
+    }))
+}
+
+/// The cost and selectivity PostgreSQL's planner gives a `HAVING`
+/// condition that reads aggregates (`cost_qual_eval`, which costs an
+/// aggregate as a column, and `clauselist_selectivity`, whose operators find
+/// no statistics for an aggregate: `DEFAULT_EQ_SEL` for `=`, its complement
+/// for `<>`, `DEFAULT_INEQ_SEL` for an inequality). `None` for a condition
+/// outside that model, or one without an aggregate (which PostgreSQL moves to
+/// `WHERE`).
+fn having_quals(
+    having: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    arena: &Arena,
+) -> Result<Option<query::index_paths::QualCosts>, SqlError> {
+    use crate::sql::ast::BinaryOp;
+    const DEFAULT_EQ_SEL: f64 = 0.005;
+    const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+    fn selectivity(condition: &Expr<'_>) -> Option<f64> {
+        match condition {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+                ..
+            } => Some(selectivity(left)? * selectivity(right)?),
+            Expr::Binary {
+                operator: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                let (left, right) = (selectivity(left)?, selectivity(right)?);
+                Some(left + right - left * right)
+            }
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } if (left.is_aggregate_use() && right.is_constant(false))
+                || (right.is_aggregate_use() && left.is_constant(false)) =>
+            {
+                match operator {
+                    BinaryOp::Eq => Some(DEFAULT_EQ_SEL),
+                    BinaryOp::NotEq => Some(1.0 - DEFAULT_EQ_SEL),
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                        Some(DEFAULT_INEQ_SEL)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    if having.contains_subquery() {
+        return Ok(None);
+    }
+    let Some(selectivity) = selectivity(having) else {
+        return Ok(None);
+    };
+    Ok(Some(query::index_paths::QualCosts {
+        startup: 0.0,
+        per_tuple: query::qual_cost(having, columns, storage, txid, arena) / 2.0
+            * crate::sql::guc::planner_value("cpu_operator_cost"),
+        selectivity,
     }))
 }
 
@@ -4248,6 +4439,7 @@ fn grouping_sets_scan_path<'a>(
                 aggregates,
                 output_width: f64::from(output_width),
                 order: GroupOrder::None,
+                having: None,
             }),
             ..QueryShape::default()
         };
@@ -5073,6 +5265,7 @@ fn predicate_selectivity<'a>(
             operand,
             list,
             negated: false,
+            ..
         } if list.iter().all(|item| item.is_constant(false)) => {
             let Expr::Column { qualifier, name } = **operand else {
                 return 1.0;
@@ -5350,6 +5543,7 @@ fn scan_node<'a>(
         relations: StackStr::new(),
         plain_relations: StackStr::new(),
         output_unprintable: false,
+        unmodeled_costs: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -5361,6 +5555,7 @@ fn scan_node<'a>(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -6116,8 +6311,10 @@ fn plan_pulled_select<'a>(
         Some(pushed) => pushed.local_statement(statement, arena)?,
         None => statement,
     };
+    // The plan reads `USING` and `NATURAL` joins by their conditions, as
+    // execution does.
     let scope = match &statement.from {
-        Some(from) => Some(QueryScope::resolve_schema(
+        Some(from) => Some(QueryScope::resolve_schema_with_join_conditions(
             storage, from, txid, arena, outer,
         )?),
         None => None,
@@ -6453,6 +6650,7 @@ fn plan_pulled_select<'a>(
                 statement.where_clause,
                 &table_order[..scope.n],
                 None,
+                true,
                 txid,
                 arena,
             )?
@@ -6571,6 +6769,10 @@ fn plan_pulled_select<'a>(
                 width,
                 object_requests,
                 cache_blocks,
+                // PostgreSQL's join costs (`final_cost_hashjoin`,
+                // `final_cost_nestloop`) and join size estimates are not
+                // modeled for a query's joins.
+                unmodeled_costs: true,
                 ..PlanNode::EMPTY
             },
         )?;
@@ -6608,6 +6810,7 @@ fn plan_pulled_select<'a>(
         };
         let mut aggregate_keys = group_keys(statement, arena)?;
         let mut planned_partitions = None;
+        let mut hash_agg_sizing = None;
         let mut sets_keys = None;
         // Grouping sets outside the cost model still list PostgreSQL's
         // rollups and keys, arranged from pos3ql's own estimates.
@@ -6761,12 +6964,47 @@ fn plan_pulled_select<'a>(
                 aggregate_name = "GroupAggregate";
             }
             planned_partitions = path.planned_partitions;
+            hash_agg_sizing = Some(path.hash_agg);
             aggregate_keys = Some(grouped.group_keys);
             aggregate_startup = path.startup;
             total_cost = path.total;
             estimated_rows = path.rows as u64;
             width = grouped.width;
         }
+        // A hash table's memory, sized from pos3ql's own estimates outside
+        // the cost model.
+        let hash_agg = if aggregate_name == "HashAggregate" && sets_keys.is_none() {
+            match hash_agg_sizing {
+                Some(sizing) => sizing,
+                None => {
+                    let expressions = arena
+                        .alloc_slice_with(statement.items.len() + 1, |at| {
+                            match statement.items.get(at) {
+                                Some(SelectItem::Expr { expression, .. }) => *expression,
+                                _ => statement.having.unwrap_or(&Expr::Null),
+                            }
+                        })
+                        .map_err(|_| arena_full())?;
+                    query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+                        .and_then(|aggregates| {
+                            query::index_paths::hash_agg_sizing(
+                                &aggregates,
+                                estimated_rows as f64,
+                                f64::from(width),
+                                statement.group_by.len(),
+                            )
+                        })
+                }
+            }
+        } else {
+            None
+        };
+        let hash_agg_unsupported = (aggregate_name == "HashAggregate"
+            && sets_keys.is_none()
+            && hash_agg.is_none())
+        .then_some(
+            "EXPLAIN ANALYZE of a hash aggregate whose transition states or grouping columns PostgreSQL's memory figure is not modelled for is not supported",
+        );
         add_stage(
             &mut stages,
             &mut stage_count,
@@ -6774,6 +7012,8 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str(aggregate_name),
                 key: Some(NodeKey::new(aggregated_block, Role::Aggregate)),
                 planned_partitions,
+                hash_agg,
+                analyze_unsupported: hash_agg_unsupported,
                 keys: match aggregate_keys
                     .filter(|_| !statement.group_by.is_empty() && !constant_group)
                 {
@@ -7077,7 +7317,8 @@ fn plan_pulled_select<'a>(
                 object_requests,
                 cache_blocks,
                 ..PlanNode::EMPTY
-            },
+            }
+            .with_distinct_hash(estimated_rows, width),
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's
@@ -7109,15 +7350,25 @@ fn plan_pulled_select<'a>(
         add_stage(
             &mut stages,
             &mut stage_count,
-            match chosen_path.and_then(|path| path.limit_cost.map(|cost| (path, cost))) {
+            match grouped
+                .and_then(|grouped| {
+                    grouped
+                        .path
+                        .grouped
+                        .and_then(|path| path.limit)
+                        .map(|cost| (grouped.width, cost))
+                })
+                .or_else(|| {
+                    chosen_path.and_then(|path| path.limit_cost.map(|cost| (path.width, cost)))
+                }) {
                 // The chosen path's limit as PostgreSQL's planner costs it.
-                Some((path, (startup, total, rows))) => PlanNode {
+                Some((width, (startup, total, rows))) => PlanNode {
                     name: StackStr::from_str("Limit"),
                     key: key(Role::Limit),
                     startup_cost: startup,
                     total_cost: total,
                     rows: rows as u64,
-                    width: path.width,
+                    width,
                     object_requests,
                     cache_blocks,
                     ..PlanNode::EMPTY
@@ -7170,17 +7421,17 @@ fn plan_pulled_select<'a>(
         scope.n >= 2
             && statement.from.as_ref().is_some_and(|from| {
                 from.joins.iter().all(|join| {
-                    join.kind.is_cross()
-                        || (join.kind == crate::sql::ast::JoinKind::Inner
-                            && join.using.is_none()
-                            && !join.natural)
+                    join.kind.is_cross() || join.kind == crate::sql::ast::JoinKind::Inner
                 }) && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
             })
     });
     let mut join_condition = statement.where_clause;
-    if inner_joins && let Some(from) = statement.from.as_ref() {
-        for join in from.joins {
-            join_condition = query::and_where(join_condition, join.on, arena)?;
+    if inner_joins && let (Some(from), Some(scope)) = (statement.from.as_ref(), scope.as_ref()) {
+        // A `USING` or `NATURAL` join's condition is the one analysis
+        // synthesized.
+        for (index, join) in from.joins.iter().enumerate() {
+            join_condition =
+                query::and_where(join_condition, join.on.or(scope.join_on[index]), arena)?;
         }
     }
     // Whether each relation's scan is a parameterized index scan.
@@ -7244,28 +7495,35 @@ fn plan_pulled_select<'a>(
                             None => None,
                         }
                     }
-                    // A `WITH` query's rows, read by a `CTE Scan`.
-                    (None, None) if item.cte.is_some() => match scope.defs.get(table) {
-                        Some(definition) => Some(JoinRelation {
-                            exposed: scope.names[table],
-                            definition,
-                            table: None,
-                            columns: crate::sql::catalog::deparse::Columns::Derived(
-                                arena
-                                    .alloc_slice_with(definition.n_columns, |index| {
-                                        crate::sql::catalog::deparse::Column {
-                                            name: definition.columns[index].name.as_str(),
-                                            type_oid: None,
-                                            merged: None,
-                                        }
-                                    })
-                                    .map_err(|_| arena_full())?,
-                            ),
-                            subquery: None,
-                            nameless: false,
-                        }),
-                        None => None,
-                    },
+                    // A `WITH` query's rows, read by a `CTE Scan`, and a
+                    // function's, read by a `Function Scan`.
+                    (None, None)
+                        if item.cte.is_some()
+                            || ((item.func_args.is_some() || item.rows_from.is_some())
+                                && !scope.lateral[table]) =>
+                    {
+                        match scope.defs.get(table) {
+                            Some(definition) => Some(JoinRelation {
+                                exposed: scope.names[table],
+                                definition,
+                                table: None,
+                                columns: crate::sql::catalog::deparse::Columns::Derived(
+                                    arena
+                                        .alloc_slice_with(definition.n_columns, |index| {
+                                            crate::sql::catalog::deparse::Column {
+                                                name: definition.columns[index].name.as_str(),
+                                                type_oid: None,
+                                                merged: None,
+                                            }
+                                        })
+                                        .map_err(|_| arena_full())?,
+                                ),
+                                subquery: None,
+                                nameless: false,
+                            }),
+                            None => None,
+                        }
+                    }
                     _ => None,
                 };
             }
@@ -7487,10 +7745,6 @@ fn plan_pulled_select<'a>(
             joined_index_conditions(storage, txid, relations, scan_indexes, index_conds, arena)?;
         } else if scope.n >= 2
             && let Some(from) = statement.from.as_ref()
-            && from
-                .joins
-                .iter()
-                .all(|join| join.using.is_none() && !join.natural)
             && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
             && table_order[..scope.n]
                 .iter()
@@ -7508,6 +7762,7 @@ fn plan_pulled_select<'a>(
                 txid,
                 relations,
                 from.joins,
+                scope.join_on,
                 statement.where_clause,
                 hash_join,
                 scan_indexes,
@@ -7945,7 +8200,6 @@ fn plan_pulled_select<'a>(
                         }),
                         hash_columns: block_targets
                             .as_ref()
-                            .filter(|_| hash_join)
                             .and_then(|found| found.hashed_columns(table)),
                         depth: scan.depth,
                         total_cost: scan.total_cost,
@@ -8107,13 +8361,20 @@ fn plan_pulled_select<'a>(
             let derived = plan_derived(storage, txid, body, Some(&enclosing), derived_block, arena);
             OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= left_relations);
             let derived = derived?;
-            for node in derived.nodes[..derived.count].iter_mut() {
+            for at in 0..derived.count {
+                let node = &mut derived.nodes[at];
                 if node.relation.as_str().is_empty() {
                     continue;
                 }
-                let unique = unique_rtable_name(node.exposed_name(), used.as_slice());
-                if unique.as_str() != node.exposed_name() {
+                let exposed = StackStr::<96>::from_str(node.exposed_name());
+                let unique = unique_rtable_name(exposed.as_str(), used.as_slice());
+                if unique.as_str() != exposed.as_str() {
                     node.alias = unique;
+                    // The derived query's keys and conditions name the
+                    // relation as `set_rtable_names` renamed it.
+                    for other in derived.nodes[..derived.count].iter_mut() {
+                        other.requalify(exposed.as_str(), unique.as_str());
+                    }
                 }
                 used.push(unique).map_err(|_| arena_full())?;
             }
@@ -8155,6 +8416,104 @@ struct FunctionScanEstimate {
 /// `prorows`, or what its support function computes of constant
 /// arguments), its call evaluated once at startup, then each row with the
 /// conditions; the width is `get_typavgwidth` of its columns.
+/// The rows a `generate_series` support function estimates from its
+/// constant, non-NULL `start`, `finish` and optional step, `None` where it
+/// gives no estimate: `generate_series_int4_support` and `_int8_support`
+/// compute `floor((finish - start + step) / step)` in floating point,
+/// `_numeric_support` `trunc((finish - start) / step) + 1` exactly (no rows
+/// when the step's sign differs from the difference's, a zero difference
+/// counting as positive; none for NaN or infinite values) and
+/// `_timestamp_support` `floor(diff / step + 1)` over microseconds, a month
+/// counting 30 days (none for an infinite bound).
+fn series_rows<'v>(
+    support: &str,
+    values: &[Option<Datum<'v>>],
+    arena: &Arena,
+) -> Result<Option<f64>, SqlError> {
+    match support {
+        "generate_series_numeric_support" => {
+            fn numeric<'v>(value: &Option<Datum<'v>>) -> Option<crate::sql::numeric::Numeric<'v>> {
+                match value {
+                    Some(Datum::Numeric(value)) if !value.is_special() => Some(*value),
+                    _ => None,
+                }
+            }
+            let (Some(start), Some(finish)) = (numeric(&values[0]), numeric(&values[1])) else {
+                return Ok(None);
+            };
+            let step = match values.get(2) {
+                Some(step) => match numeric(step) {
+                    Some(step) => Some(step),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
+            if step.is_some_and(|step| step.is_zero()) {
+                return Ok(None);
+            }
+            let difference = crate::sql::numeric::sub(&finish, &start, arena)?;
+            let negative =
+                |value: &crate::sql::numeric::Numeric<'_>| !value.is_zero() && value.is_negative();
+            if step.is_some_and(|step| negative(&step) != negative(&difference)) {
+                return Ok(Some(0.0));
+            }
+            let steps = match step {
+                Some(step) => crate::sql::numeric::trunc_div(&difference, &step, arena)?,
+                None => crate::sql::numeric::trunc_div(
+                    &difference,
+                    &crate::sql::numeric::Numeric::from_i64(1, arena)?,
+                    arena,
+                )?,
+            };
+            Ok(Some(steps.to_f64() + 1.0))
+        }
+        "generate_series_timestamp_support" => {
+            let instant = |value: &Option<Datum<'_>>| match value {
+                Some(Datum::Timestamp(at) | Datum::Timestamptz(at))
+                    if *at != i64::MIN && *at != i64::MAX =>
+                {
+                    Some(*at)
+                }
+                _ => None,
+            };
+            let (Some(start), Some(finish), Some(Some(Datum::Interval(step)))) =
+                (instant(&values[0]), instant(&values[1]), values.get(2))
+            else {
+                return Ok(None);
+            };
+            let Some(difference) = finish.checked_sub(start) else {
+                return Ok(None);
+            };
+            let step = (f64::from(step.months) * 30.0 + f64::from(step.days)) * 86_400_000_000.0
+                + step.micros as f64;
+            if step == 0.0 {
+                return Ok(None);
+            }
+            Ok(Some((difference as f64 / step + 1.0).floor()))
+        }
+        _ => {
+            let number = |value: &Option<Datum<'_>>| match value {
+                Some(Datum::Int4(value)) => Some(f64::from(*value)),
+                Some(Datum::Int8(value)) => Some(*value as f64),
+                Some(Datum::Int2(value)) => Some(f64::from(*value)),
+                _ => None,
+            };
+            Ok(
+                match (
+                    number(&values[0]),
+                    number(&values[1]),
+                    values.get(2).map_or(Some(1.0), number),
+                ) {
+                    (Some(start), Some(finish), Some(step)) if step != 0.0 => {
+                        Some(((finish - start + step) / step).floor())
+                    }
+                    _ => None,
+                },
+            )
+        }
+    }
+}
+
 fn function_scan_estimate<'a>(
     storage: &Storage,
     txid: u32,
@@ -8260,42 +8619,58 @@ fn function_scan_estimate<'a>(
                     .ok_or_else(|| unsupported(source.table))?;
                 let rows = match signature.catalog.support_name {
                     "" | "-" => signature.catalog.rows,
-                    "generate_series_int4_support"
+                    support @ ("generate_series_int4_support"
                     | "generate_series_int8_support"
-                    | "generate_series_numeric_support" => {
+                    | "generate_series_numeric_support"
+                    | "generate_series_timestamp_support") => {
                         let values = arena
                             .alloc_slice_with(args.len(), |_| None)
                             .map_err(|_| arena_full())?;
-                        for (value, argument) in values.iter_mut().zip(args) {
-                            *value = constant(argument);
+                        // Each constant as the parameter type it is coerced
+                        // to (`10` to `numeric`, `'2024-01-02'` to a
+                        // timestamp).
+                        for ((value, argument), &oid) in
+                            values.iter_mut().zip(args).zip(signature.arguments)
+                        {
+                            let Some(ctype) = crate::sql::types::ColType::from_oid(oid) else {
+                                continue;
+                            };
+                            let cast = arena
+                                .alloc(Expr::Cast {
+                                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                                    operand: argument,
+                                    type_name: ctype.name(),
+                                    type_mod: -1,
+                                    binding: crate::sql::ast::CastBinding::Builtin,
+                                })
+                                .map_err(|_| arena_full())?;
+                            *value = if argument.is_constant(false) {
+                                constant(cast)
+                            } else {
+                                None
+                            };
                         }
-                        let number = |value: &Option<Datum<'_>>| match value {
-                            Some(Datum::Int4(value)) => Some(f64::from(*value)),
-                            Some(Datum::Int8(value)) => Some(*value as f64),
-                            Some(Datum::Int2(value)) => Some(f64::from(*value)),
-                            _ => None,
-                        };
-                        if values
-                            .iter()
-                            .any(|value| matches!(value, Some(Datum::Null)))
-                        {
+                        // The bounds and step the support function reads; a
+                        // timestamp series also takes a time zone.
+                        let read = &values[..values.len().min(3)];
+                        if read.iter().any(|value| matches!(value, Some(Datum::Null))) {
                             0.0
-                        } else if signature.catalog.support_name
-                            == "generate_series_numeric_support"
-                            && values.iter().any(Option::is_some)
-                        {
-                            return Err(unsupported(source.table));
-                        } else {
-                            match (
-                                number(&values[0]),
-                                number(&values[1]),
-                                values.get(2).map_or(Some(1.0), number),
-                            ) {
-                                (Some(start), Some(finish), Some(step)) if step != 0.0 => {
-                                    ((finish - start + step) / step).floor()
+                        } else if read.iter().any(Option::is_none) {
+                            // `estimate_expression_value` also evaluates a
+                            // stable call (`now()`), which is not modeled; an
+                            // argument reading a column gives no estimate.
+                            for (value, argument) in read.iter().zip(args) {
+                                if value.is_none() {
+                                    let mut found = false;
+                                    argument.for_each_column_reference(&mut |_, _| found = true);
+                                    if !found {
+                                        return Err(unsupported(source.table));
+                                    }
                                 }
-                                _ => signature.catalog.rows,
                             }
+                            signature.catalog.rows
+                        } else {
+                            series_rows(support, read, arena)?.unwrap_or(signature.catalog.rows)
                         }
                     }
                     "array_unnest_support" if args.len() == 1 => match constant(args[0]) {
@@ -9920,6 +10295,7 @@ fn physical_scan_node(
         relations: StackStr::new(),
         plain_relations: StackStr::new(),
         output_unprintable: false,
+        unmodeled_costs: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -9931,6 +10307,7 @@ fn physical_scan_node(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     }
 }
 
@@ -10095,6 +10472,7 @@ fn push_set_tree(
                 relations: StackStr::new(),
                 plain_relations: StackStr::new(),
                 output_unprintable: left.output_unprintable,
+                unmodeled_costs: left.unmodeled_costs,
                 remote_sql: StackStr::new(),
                 batch_size: None,
                 passthrough: false,
@@ -10106,6 +10484,13 @@ fn push_set_tree(
                 bitmap_index_estimate: None,
                 analyze_unsupported: None,
                 planned_partitions: None,
+                hash_agg: None,
+            };
+            let node = if hashed_union {
+                let width = node.width;
+                node.with_distinct_hash(rows, width)
+            } else {
+                node
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -10715,6 +11100,7 @@ fn plan_write<'a>(
         relations: StackStr::new(),
         plain_relations: StackStr::new(),
         output_unprintable: false,
+        unmodeled_costs: false,
         remote_sql: StackStr::new(),
         batch_size: None,
         passthrough: false,
@@ -10726,6 +11112,7 @@ fn plan_write<'a>(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -11268,6 +11655,7 @@ fn plan_write<'a>(
             rows: insert.rows.len() as u64,
             width: 32,
             total_cost: 0.01,
+            unmodeled_costs: true,
             ..PlanNode::EMPTY
         };
         child.set_output(None);
@@ -11301,20 +11689,17 @@ fn plan_write<'a>(
                 arena,
             )?;
             plan.nodes[0].set_output(lists.returning(insert.returning)?);
+            let (width, total_cost, unmodeled_costs) =
+                inserted_rows_estimate(storage, txid, &definition, insert, arena);
             let mut values = PlanNode {
                 name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
                 alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
                 key: Some(NodeKey::new(block, Role::Values)),
                 depth: 1,
-                rows: match statement {
-                    Stmt::Insert(insert) => insert.rows.len() as u64,
-                    _ => 1,
-                },
-                width: storage
-                    .table_statistics(slot, txid)
-                    .average_row_width
-                    .max(1),
-                total_cost: 0.01,
+                rows: insert.rows.len() as u64,
+                width,
+                total_cost,
+                unmodeled_costs,
                 ..PlanNode::EMPTY
             };
             values.set_output(if several {
@@ -11506,18 +11891,136 @@ fn plan_write<'a>(
             rows: 1_000,
             width: 32,
             total_cost: 10.0,
+            unmodeled_costs: true,
             ..PlanNode::EMPTY
         };
         plan.push(child)?;
         child
     };
-    // `create_modifytable_path`: the write costs what its input does.
+    // `create_modifytable_path`: the write costs what its input does and,
+    // with a `RETURNING` list, returns its rows at its width.
     plan.nodes[0].startup_cost = child.startup_cost;
     plan.nodes[0].total_cost = child.total_cost;
+    if !write_returning(statement).is_empty() {
+        plan.nodes[0].rows = child.rows;
+        plan.nodes[0].width = child.width;
+    }
     plan.nodes[0].object_requests = child.object_requests;
     plan.nodes[0].cache_blocks = child.cache_blocks;
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// A write's `RETURNING` items.
+fn write_returning<'e>(statement: &Stmt<'e>) -> &'e [SelectItem<'e>] {
+    match statement {
+        Stmt::Insert(insert) => insert.returning.items,
+        Stmt::Update(update) => update.returning.items,
+        Stmt::Delete(delete) => delete.returning.items,
+        Stmt::Merge(merge) => merge.returning.items,
+        _ => &[],
+    }
+}
+
+/// The width and total cost of the `Result` or `Values Scan` an `INSERT`
+/// of listed rows reads, and whether they are outside the model. Its
+/// target list holds every attribute of the table: each live column's
+/// value coerced to the column's type, whose `get_typavgwidth` it adds,
+/// and a NULL `integer` for each dropped one (`expand_insert_targetlist`).
+/// A `Result` costs `cpu_tuple_cost` and its values' evaluation
+/// (`cost_qual_eval`); a `Values Scan` costs `cpu_operator_cost` and
+/// `cpu_tuple_cost` per row (`cost_valuesscan`). A value that is not a
+/// constant of its column's type, or an omitted column with a computed
+/// default, is evaluated or coerced at a cost this does not model.
+fn inserted_rows_estimate<'e>(
+    storage: &Storage,
+    txid: u32,
+    definition: &crate::storage::TableDef,
+    insert: &crate::sql::ast::Insert<'e>,
+    arena: &Arena,
+) -> (u32, f64, bool) {
+    let mut width = 4.0 * definition.attributes.dropped() as f64;
+    for column in definition.columns() {
+        width += query::index_paths::type_average_width(column.ctype, column.type_mod);
+    }
+    let constant = |value: &Expr<'_>| {
+        matches!(
+            value,
+            Expr::Null
+                | Expr::DefaultMarker
+                | Expr::BoundLiteral { .. }
+                | Expr::Bool(_)
+                | Expr::Int(_)
+                | Expr::Float(_)
+                | Expr::NumericLit(_)
+                | Expr::Str(_)
+        )
+    };
+    let mut evaluation = 0.0;
+    let mut unmodeled = false;
+    for (index, column) in definition.columns().iter().enumerate() {
+        let written = if insert.columns.is_empty() {
+            Some(index)
+        } else {
+            insert
+                .columns
+                .iter()
+                .position(|named| *named == column.name.as_str())
+        };
+        // A value omitted (a `DEFAULT VALUES` row lists none) or written
+        // `DEFAULT` is the column's default.
+        let value_of = |row: &[&'e Expr<'e>]| {
+            written
+                .and_then(|at| row.get(at).copied())
+                .filter(|value| !matches!(value, Expr::DefaultMarker))
+        };
+        // A default is folded to a constant of the column's type unless it
+        // computes its value.
+        if insert.rows.iter().any(|row| value_of(row).is_none()) {
+            match &column.default {
+                crate::storage::ColumnDefault::None
+                | crate::storage::ColumnDefault::Constant { .. } => {}
+                crate::storage::ColumnDefault::Expression(text)
+                    if !column.is_identity && !column.auto_increment =>
+                {
+                    match arena
+                        .alloc_str(text.as_str())
+                        .ok()
+                        .and_then(|text| crate::sql::parser::parse_expr(text, arena).ok())
+                    {
+                        Some(default) if constant(default) => {}
+                        Some(Expr::Cast { operand, .. }) if constant(operand) => {}
+                        _ => unmodeled = true,
+                    }
+                }
+                _ => unmodeled = true,
+            }
+        }
+        for value in insert.rows.iter().filter_map(|row| value_of(row)) {
+            if constant(value) {
+                continue;
+            }
+            // A computed value of the column's own type costs its
+            // evaluation; a coercion to the column's type is not modeled.
+            let typed =
+                crate::sql::exec::infer_routine_argument_oid(value, &crate::sql::exec::NoCols)
+                    .ok()
+                    .and_then(crate::sql::types::ColType::from_oid);
+            if typed != Some(column.ctype) {
+                unmodeled = true;
+            }
+            evaluation += query::qual_cost(value, &crate::sql::exec::NoCols, storage, txid, arena)
+                / 2.0
+                * CPU_OPERATOR_COST;
+        }
+    }
+    let rows = insert.rows.len() as f64;
+    let total = if insert.rows.len() > 1 {
+        (CPU_OPERATOR_COST + CPU_TUPLE_COST) * rows
+    } else {
+        CPU_TUPLE_COST + evaluation
+    };
+    (width as u32, total, unmodeled)
 }
 
 /// Plans an `UPDATE ... FROM` or `DELETE ... USING` joined as execution
@@ -13324,6 +13827,34 @@ pub(super) fn visit_text_rows<E>(
             );
             emit(line.as_str())?;
         }
+        // `show_hashagg_info`, which an aggregate prints between its
+        // `Filter` and the rows that removed.
+        let planned = options
+            .costs
+            .then_some(node.planned_partitions)
+            .flatten()
+            .filter(|&partitions| partitions > 0);
+        let peak = match node_actual {
+            NodeActual::Ran(counters) => counters.hash_agg_peak,
+            NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
+        };
+        let hash_agg_line = (planned.is_some() || peak.is_some()).then(|| {
+            let mut line = StackStr::<128>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            if let Some(partitions) = planned {
+                let _ = write!(line, "Planned Partitions: {partitions}");
+            }
+            if let Some(bytes) = peak {
+                if planned.is_some() {
+                    let _ = write!(line, "  ");
+                }
+                let _ = write!(line, "Batches: 1  Memory Usage: {}kB", bytes.div_ceil(1024));
+            }
+            line
+        });
+        let mut hash_agg_shown = false;
         for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
             for _ in 0..node_indent(node) {
@@ -13331,6 +13862,10 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(qual, "{}: {}", label.text(), text);
             emit(qual.as_str())?;
+            if let Some(line) = hash_agg_line.as_ref().filter(|_| !hash_agg_shown) {
+                emit(line.as_str())?;
+                hash_agg_shown = true;
+            }
             // In text PostgreSQL leaves out a count of no rows.
             if let Some((removed_label, removed)) = removed_count(node, node_actual, label)
                 && removed > 0.0
@@ -13343,14 +13878,7 @@ pub(super) fn visit_text_rows<E>(
                 emit(line.as_str())?;
             }
         }
-        if options.costs
-            && let Some(partitions) = node.planned_partitions.filter(|&partitions| partitions > 0)
-        {
-            let mut line = StackStr::<64>::new();
-            for _ in 0..node_indent(node) {
-                let _ = write!(line, " ");
-            }
-            let _ = write!(line, "Planned Partitions: {partitions}");
+        if let Some(line) = hash_agg_line.as_ref().filter(|_| !hash_agg_shown) {
             emit(line.as_str())?;
         }
         for line in index_scan_details(node, node_actual) {
@@ -13398,6 +13926,21 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(
                 line,
                 "Storage: Memory  Maximum Storage: {}kB",
+                bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
+        if actual.is_some()
+            && let Some((disk, bytes)) = plan.cte_storage(index)
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Storage: {}  Maximum Storage: {}kB",
+                if disk { "Disk" } else { "Memory" },
                 bytes.div_ceil(1024)
             );
             emit(line.as_str())?;
@@ -14602,6 +15145,15 @@ fn structured_node(
     {
         document.number("Planned Partitions", partitions);
     }
+    if let NodeActual::Ran(NodeCounters {
+        hash_agg_peak: Some(bytes),
+        ..
+    }) = node_actual
+    {
+        document.number("HashAgg Batches", 1);
+        document.number("Peak Memory Usage", bytes.div_ceil(1024));
+        document.number("Disk Usage", 0);
+    }
     let counters = match node_actual {
         NodeActual::Unmeasured => None,
         NodeActual::NeverExecuted => Some(NodeCounters::default()),
@@ -14655,6 +15207,12 @@ fn structured_node(
     }) = node_actual
     {
         document.text("Storage", "Memory");
+        document.number("Maximum Storage", bytes.div_ceil(1024));
+    }
+    if actual.is_some()
+        && let Some((disk, bytes)) = plan.cte_storage(at)
+    {
+        document.text("Storage", if disk { "Disk" } else { "Memory" });
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if !node.relations.is_empty() {
@@ -14804,9 +15362,21 @@ fn render_document<'a>(
     document.finish()
 }
 
-/// Rejects a `VERBOSE` plan holding a target list outside the deparser's
-/// coverage rather than print a wrong `Output:`.
-fn verbose_printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+/// Rejects a plan showing costs pos3ql does not model as PostgreSQL does,
+/// and a `VERBOSE` plan holding a target list outside the deparser's
+/// coverage, rather than print wrong estimates or a wrong `Output:`.
+fn printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), SqlError> {
+    if options.costs
+        && let Some(node) = plan.nodes[..plan.count]
+            .iter()
+            .find(|node| node.unmodeled_costs)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN cannot print the estimated costs of node \"{}\"",
+            node.name.as_str()
+        ));
+    }
     if !options.verbose {
         return Ok(());
     }
@@ -14823,13 +15393,13 @@ fn verbose_printable(plan: &Plan<'_>, options: ExplainOptions) -> Result<(), Sql
     }
 }
 
-/// [`verbose_printable`] for each query a rule produces.
+/// [`printable`] for each query a rule produces.
 fn rewritten_printable(
     queries: &[RewrittenQuery<'_>],
     options: ExplainOptions,
 ) -> Result<(), SqlError> {
     queries.iter().try_for_each(|query| match query {
-        RewrittenQuery::Planned(plan) => verbose_printable(plan, options),
+        RewrittenQuery::Planned(plan) => printable(plan, options),
         RewrittenQuery::Notify => Ok(()),
     })
 }
@@ -14842,7 +15412,7 @@ pub(super) fn visit_plan_rows(
     arena: &Arena,
     mut emit: impl FnMut(&str) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    verbose_printable(plan, options)?;
+    printable(plan, options)?;
     if options.format == ExplainFormat::Text {
         return visit_text_rows(plan, options, actual, settings, |line| emit(line));
     }
@@ -14927,7 +15497,9 @@ pub(super) fn analyze_rewritten<'a, R>(
             if let RewrittenQuery::Planned(plan) = query {
                 if index < plan.count {
                     let node = &plan.nodes[index];
-                    return Slot::new(node.key).with_hash_columns(node.hash_columns);
+                    return Slot::new(node.key)
+                        .with_hash_columns(node.hash_columns)
+                        .with_hash_agg(node.hash_agg);
                 }
                 index -= plan.count;
             }
@@ -15073,7 +15645,7 @@ pub(super) fn emit_plan(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    if let Err(error) = verbose_printable(plan, options) {
+    if let Err(error) = printable(plan, options) {
         return Ok(Err(error));
     }
     if options.format == ExplainFormat::Text {

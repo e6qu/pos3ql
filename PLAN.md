@@ -807,7 +807,9 @@ in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
 `FROM` PostgreSQL inlines with a default, packed variadic, polymorphic or
 lateral argument or a body with `WITH`, windows or a coerced column, a
 function scan of a built-in whose support function estimates its rows
-other than `generate_series` over integers and `unnest`, a regular
+other than `generate_series` over integers, `numeric` and timestamps
+(`differential_exact/813`) and `unnest`, or whose bound or step is a stable
+expression the support function would evaluate (`now()`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
 conditions on an expression key of a statistics object, an `OR` reading
 two or more keys of a statistics object with an MCV list (estimated
@@ -818,12 +820,26 @@ timestamp and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
-skip-array scan over several leaf pages. Remaining inexact without
-`0A000`: a join one of whose inputs is a subquery the planner does not
-pull up or a function scan (its join method, order and costs), an `IN`
-subquery whose output is computed (PostgreSQL pulls it up into a semi
-join, pos3ql hashes a subplan), the width of an `INSERT`'s `Result` of
-computed values, btree sizes, which the model computes from the column statistics
+skip-array scan over several leaf pages. A query's joins are not costed
+as PostgreSQL costs them (`final_cost_hashjoin`, `final_cost_nestloop`,
+`calc_joinrel_size_estimate`), so an `EXPLAIN` showing costs of a plan
+with a join fails with `0A000` naming the join node, as does one of an
+`INSERT` whose listed values or defaults need a computation or coercion
+the model does not cost, of an `INSERT` into a view, and of a write whose
+source the planner does not model; `COSTS OFF` prints the join tree pos3ql
+runs (`differential_exact/810`). Its join method and order are pos3ql's:
+two items joined by equalities of their columns or of expressions of each
+(`s.a = (t.x + 1)`) hash the second (`differential_exact/811`), where
+PostgreSQL's costs may hash the other side or merge; a function in `FROM`
+whose arguments read no earlier item is scanned once and may be hashed,
+as PostgreSQL's analysis marks only a function reading them lateral, and
+`USING` and `NATURAL` joins hash on their synthesized condition. As
+PostgreSQL's `ExecHashJoin` does, a hash join builds its table only once a
+probe row passes its scan's conditions (unless it returns unmatched build
+rows), so an empty outer side never evaluates the inner keys, and stops at
+an empty table. A retained result stream or cursor reads a join hashed on
+expressions as a nested loop, in that loop's order. Remaining
+inexact without `0A000`: btree sizes, which the model computes from the column statistics
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update
 moves (a pruned page's freed space, HOT chains), which also orders an
@@ -1043,11 +1059,19 @@ indented `Sort Key` lines and the JSON `Grouping Sets` groups, and over one
 plain table its costs and rows are PostgreSQL's (`differential_exact/802`).
 Outside that cost model (the shapes below) the rollups and keys are
 arranged from pos3ql's own estimates, so a sorted arrangement PostgreSQL's
-costs would pick may show as hashed. Remaining: `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
-`ORDER BY` inputs, user-defined aggregates, a select list computing
-expressions over aggregates, grouping by expressions, by a column an index
-orders (presorted and incremental paths) and over joins keep pos3ql's own
-estimate. JSON nests as
+costs would pick may show as hashed. A `HAVING` condition over aggregates
+(`=`, `<>` and inequalities against constants, combined with `AND` and
+`OR`) adds its `cost_qual_eval` per group, an aggregate costing what a
+column does, and keeps the groups its default selectivities keep
+(`DEFAULT_EQ_SEL`, `DEFAULT_INEQ_SEL`); a constant `LIMIT` or `OFFSET`
+scales the run cost of each grouped and ordered path as
+`adjust_limit_rows_costs` does (which the scan model's limit now also
+follows when both are present), bounds the sort of the groups and picks the
+cheapest limited path (`differential_exact/821`). Remaining: aggregates
+with `DISTINCT` or `ORDER BY` inputs, user-defined aggregates, a select
+list computing expressions over aggregates, an `ORDER BY` of an aggregate,
+grouping by expressions, by a column an index orders (presorted and
+incremental paths) and over joins keep pos3ql's own estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's
@@ -1064,18 +1088,49 @@ locked; rows read in scan order are locked as the scan returns them, and the
 scan stops once the limit has its rows, as the `Limit` pulls them. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
 `top-N heapsort` when a limit directly above bounds it and it read more than
 twice the bound, which pos3ql then also keeps to a heap of the bounded rows;
-`external merge` when its rows spilled to disk) and the space of the rows it
-held in pos3ql's own encoding, which differs from PostgreSQL's allocator
-figures. Each window clause plans its own `WindowAgg` in PostgreSQL's
+`external merge` when its rows spilled to disk) and the memory
+`tuplesort_get_stats` reports: its `SortTuple` array (1024 slots, grown as
+`grow_memtuples` grows it) and each row's minimal tuple, a maxaligned bump
+chunk, an aset.c chunk when a limit may bound the sort, nothing for a datum
+sort of one column; a bounded heap charges the rows `make_bounded_heap`
+leaves charged, including the rows it replaced while heapifying
+(`differential_exact/476`, `820`). A sort's rows hold its output columns,
+the sort keys that are not among them and the `ctid`s a row lock reads; a
+`GroupAggregate`'s input sort is sized only when its aggregates read no
+column (pos3ql's grouping keys lack the aggregates' inputs), and a value of
+a type without a PostgreSQL size here (`jsonb`, arrays, records) or a sort
+past `work_mem` keeps pos3ql's own figure. A hash aggregate prints `Batches:
+1  Memory Usage` as `hash_agg_update_metrics` measures it once its input
+ends: the meta context (first block, the bucket array `simplehash` sizes
+from the planned groups and grows at its 0.9 fill factor, the table's
+expressions measured on PostgreSQL 18.6 for one to seven grouping columns,
+and the expression context under it), the bump context of the entries and
+the context of by-reference transition states (array initial values and the
+`Int128AggState` of integer averages and sums are modelled). `EXPLAIN
+ANALYZE` of a hash aggregate with another by-reference state (`numeric`
+sums, text `min`/`max`, collecting aggregates) or more than seven grouping
+columns fails with `0A000`; a table that would spill (`Batches` above 1) is
+not modelled, and outside the cost model the bucket array is sized from
+pos3ql's group estimate. A `CTE Scan` prints its query's tuplestore
+(`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
+last free slot, and each row's generation chunk), also when it never ran;
+a `Recursive Union` the sum of its working and intermediate tables, each
+cleared before it is refilled; a nested loop's `Materialize` the tuplestore
+of the inner rows its scan read (`differential_exact/537`, `561`, `534`,
+`536`, `820`). Each window clause plans its own `WindowAgg` in PostgreSQL's
 evaluation order, named `w1`, `w2`, ... when unnamed and printing its
 `Window:` definition (with the `ROWS UNBOUNDED PRECEDING` frame PostgreSQL
 gives windows of frame-independent functions), over a `Sort` of its input
 or an `Incremental Sort` when the rows already follow a prefix of its keys;
 a query `ORDER BY` the last window's rows follow needs no sort. Under
-`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own, and
-the query's `Incremental Sort` over a window prints its `Full-sort Groups`
-and `Pre-sorted Groups` lines, batched as `nodeIncrementalSort.c` batches
-its input (the memory figures pos3ql's own). A
+`ANALYZE` a window prints its `Storage:` line, and the query's `Incremental
+Sort` over a window prints its `Full-sort Groups` and `Pre-sorted Groups`
+lines, batched as `nodeIncrementalSort.c` batches its input. Remaining: the
+window's storage, the sorts under windows and the incremental sort's group
+memory are pos3ql's own figures; PostgreSQL's need the window's
+`tuplestore_trim` points (its read and mark pointers per frame) and each
+batch's tuplesort reuse, which `differential_exact/472` and `564` still
+mask. A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated
@@ -1097,7 +1152,12 @@ rows the sort and limit return. A top-level query's `WHERE` conjunct
 `EXISTS`, `NOT EXISTS`, `x IN` or `x op ANY` over a subquery that reads one
 stored table with only a non-volatile condition (correlated for `EXISTS`;
 `IN` and `ANY` may be correlated too, as in PostgreSQL 18) becomes a semi or
-anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one:
+anti join, as PostgreSQL's `pull_up_sublinks` makes it, and runs as one;
+an `IN` or `ANY` output may be computed and a row operand compares its
+fields with the outputs (`(a, b) IN (SELECT x + 1, y ...)`), while an output
+that groups, windows, returns a set or calls a volatile function keeps the
+subplan, where PostgreSQL joins the unflattened subquery
+(`differential_exact/811`):
 two relations joined by column equalities hash the smaller side (`Hash Semi
 Join`, `Hash Anti Join`, or the `Hash Right` forms when the query's
 relation is smaller), others loop over a materialized copy (`Nested Loop
@@ -1157,8 +1217,10 @@ limited rows, and a subquery's `LIMIT` without `ORDER BY` stops its scan
 once it has its rows. Still differing: an ordinary `WITH` query PostgreSQL
 runs once still runs whole when first read, and a recursive one read by a
 join, or by a recursive term that reads only part of an iteration, runs an
-iteration at a time where PostgreSQL pulls single rows; `ANALYZE` prints no
-`Storage:` lines for `CTE Scan` and `Recursive Union`; a `CTE Scan` in a
+iteration at a time where PostgreSQL pulls single rows (so a `WITH` query
+PostgreSQL never reads, or reads only partly under a `LIMIT`, runs whole
+here, evaluating and erroring on rows PostgreSQL never computes, and its
+`CTE Scan`'s storage counts every row); a `CTE Scan` in a
 scalar subquery's `InitPlan` prints `never executed`; a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
@@ -1194,7 +1256,7 @@ use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
-list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
+list (the output columns' names are printed there), per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
 scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
 ANALYZE` of a joined `UPDATE` or `DELETE` counts the scans (each member's
@@ -1241,7 +1303,20 @@ PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
-constant written inside a routine body. Target and expression count errors of an `INSERT`, also with subscripted
+constant written inside a routine body; an index or exclusion key expression
+positions an unknown column (`differential_exact/812`). Pattern, `IN`-list,
+quantified and `IS DISTINCT FROM` operators, sort and grouping keys without
+an operator, array constructors, `COLLATE` clauses, window names, repeated
+utility options and domain constraints, `EXECUTE` and routine arguments
+(unknown literals and row constructors converting to their parameter's type
+at analysis) and privilege checks on a written schema are positioned too
+(`differential_exact/814`). The exact-error corpus compares every error's
+cursor, psql's `LINE n:` excerpt and caret. Remaining: a literal cast to an
+array of a domain whose input applies the base type's length
+(`'{toolong}'::d[]`) and a named-notation literal argument of a function in
+`FROM` fail without a cursor; an explicit cast to a domain over
+`varchar(n)` raises `22001` where PostgreSQL truncates; and an explicit
+collation conflict is found only when a row is compared, not at analysis. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

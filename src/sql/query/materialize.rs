@@ -1732,16 +1732,13 @@ pub(super) fn prepare_materialization<'a>(
         statement.distinct_on,
     )?;
     if statement.distinct && n_on == 0 {
-        for expression in order_exprs.iter().take(n_order) {
+        for (expression, written) in order_exprs.iter().take(n_order).zip(statement.order_by) {
             let target = expression.expect("resolved").expression;
             let in_list = statement.items.iter().any(|item| {
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
             if !in_list {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                ));
+                return Err(super::distinct_order_key_missing(written.expression));
             }
         }
     }
@@ -2147,6 +2144,14 @@ pub(crate) fn materialized_rows<'a>(
     let mut live = rows.len();
     let scanned = live;
     if statement.distinct && n_on == 0 {
+        super::group::record_distinct_hash_memory(
+            stages.unique,
+            &[&rows[..]],
+            width,
+            storage,
+            txid,
+            arena,
+        )?;
         live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
@@ -2184,6 +2189,32 @@ pub(crate) fn materialized_rows<'a>(
                 b,
             )
         };
+        let mut columns = [0usize; MAX_PROJ];
+        let count = super::postgres_sort_columns(
+            width,
+            statement.items,
+            &order_exprs[..n_keys],
+            &mut columns,
+        );
+        // The memory PostgreSQL's sort reports, from the rows in arrival
+        // order.
+        let bounded = rank_window.filter(|_| !statement.distinct && n_on == 0);
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
+                rows,
+                Some(&columns[..count]),
+                n_identities,
+                bound,
+                arena,
+                compare,
+            )?,
+            _ => instrument::SortSpace::postgres_locking(
+                rows,
+                Some(&columns[..count]),
+                n_identities,
+                rank_window.is_some(),
+            ),
+        };
         match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| {
@@ -2192,9 +2223,7 @@ pub(crate) fn materialized_rows<'a>(
             }
             None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
         }
-        stages
-            .sort
-            .sorted(instrument::SortSpace::in_memory(rows, bound.is_some()));
+        stages.sort.sorted(space);
     }
     // A sort under a DISTINCT returns every row it sorted.
     if stages.unique.measured() {
@@ -2698,6 +2727,24 @@ pub(crate) fn external_materialized_into<'a>(
     };
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
+    if stages.sort.measured() {
+        let mut columns = [0usize; MAX_PROJ];
+        let count = super::postgres_sort_columns(
+            plan.width,
+            statement.items,
+            &plan.order_exprs[..plan.n_keys],
+            &mut columns,
+        );
+        sorter.size_as_postgres(instrument::SortTuples::new(
+            Some(&columns[..count]),
+            plan.n_identities,
+            statement.limit.is_some()
+                && limit != u64::MAX
+                && !statement.with_ties
+                && !statement.distinct
+                && plan.n_on == 0,
+        ));
+    }
     let mut compare = |left: &[u8], right: &[u8]| {
         compare_materialized_rows(
             storage,
@@ -2728,6 +2775,10 @@ pub(crate) fn external_materialized_into<'a>(
         None => None,
     };
     let mut locked = 0u64;
+    // A hashed DISTINCT's rows, which size its table under `EXPLAIN ANALYZE`.
+    let mut distinct_rows =
+        (statement.distinct && plan.n_on == 0 && stages.unique.hash_agg_sizing().is_some())
+            .then(|| ArenaList::new_persistent(arena));
     let mut push = |row: &JoinRow<'_, 'a, '_>| {
         let mark = arena.mark();
         let result = for_each_materialized_projection(
@@ -2781,6 +2832,28 @@ pub(crate) fn external_materialized_into<'a>(
                             sorter.push_encoded(blocks, encoded, &mut compare)
                         })
                         .expect("spill-attached block store");
+                }
+                if let Some(distinct_rows) = distinct_rows.as_mut() {
+                    // Kept past the rewind below, in the arena's tail.
+                    let mut values = [Datum::Null; MAX_PROJ];
+                    for (index, value) in values.iter_mut().enumerate().take(plan.width) {
+                        *value = materialized_value_at(
+                            scope,
+                            row,
+                            projected,
+                            keys,
+                            plan.width,
+                            plan.n_keys,
+                            plan.identities_at,
+                            plan.raw_columns.as_ref(),
+                            index,
+                        );
+                    }
+                    let encoded = crate::sql::exec::encode_projected_persistent_pub(
+                        &values[..plan.width],
+                        arena,
+                    )?;
+                    distinct_rows.push(encoded).map_err(|_| arena_full())?;
                 }
                 storage
                     .with_block_store(|blocks| {
@@ -2842,6 +2915,16 @@ pub(crate) fn external_materialized_into<'a>(
             outer,
             pax_columns,
             &mut push,
+        )?;
+    }
+    if let Some(rows) = distinct_rows.as_ref() {
+        super::group::record_distinct_hash_memory(
+            stages.unique,
+            &[rows.as_slice()],
+            plan.width,
+            storage,
+            txid,
+            arena,
         )?;
     }
     // A limit directly over the sort bounds it, as in the in-memory path.

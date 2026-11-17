@@ -6,7 +6,8 @@
 -- number before the query's own subqueries. A recursive query is a
 -- Recursive Union whose recursive term scans the working table. A relation
 -- read twice through inlined queries gets a unique range-table name.
--- Materialize and CTE memory lines are the allocator's own and are left out.
+-- Each CTE Scan reports its query's tuplestore (tuplestore_get_stats), and a
+-- Recursive Union the sum of its working and intermediate tables.
 CREATE TABLE t537 (a int, b text);
 INSERT INTO t537 SELECT g, 'v' || g FROM generate_series(1, 30) g;
 ANALYZE t537;
@@ -15,7 +16,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

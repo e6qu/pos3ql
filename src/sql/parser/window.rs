@@ -91,21 +91,36 @@ impl<'a> Parser<'a> {
         // `OVER name` uses the named window as it stands, frame included; only
         // the parenthesized form copies it, and a copy may not carry a frame.
         if !matches!(self.peeked, Tok::Op("(")) {
+            let name_at = self.peek_at;
             let name = self.any_ident("window name or '('")?;
-            return Ok(Some(self.named_window(name)?));
+            return Ok(Some(self.named_window(name, name_at)?));
         }
+        let paren_at = self.peek_at;
         self.expect_op("(")?;
-        let spec = self.window_spec_body()?;
+        let spec = self.window_spec_body(paren_at)?;
         Ok(Some(self.arena_window(spec)?))
     }
 
-    /// Resolves a name against the query's `WINDOW` definitions.
-    pub(super) fn named_window(&mut self, name: &str) -> Result<&'a WindowSpec<'a>, ParseError> {
-        for entry in self.windows.as_slice() {
-            match entry {
-                Some((defined, spec)) if *defined == name => return Ok(spec),
-                _ => {}
-            }
+    /// A `WINDOW` definition of the query named `name`.
+    fn defined_window(&self, name: &str) -> Option<&'a WindowSpec<'a>> {
+        self.windows
+            .as_slice()
+            .iter()
+            .find_map(|entry| match entry {
+                Some((defined, spec)) if *defined == name => Some(*spec),
+                _ => None,
+            })
+    }
+
+    /// Resolves a name against the query's `WINDOW` definitions; a missing
+    /// one is reported at `at`, where its window specification was written.
+    pub(super) fn named_window(
+        &mut self,
+        name: &str,
+        at: usize,
+    ) -> Result<&'a WindowSpec<'a>, ParseError> {
+        if let Some(spec) = self.defined_window(name) {
+            return Ok(spec);
         }
         Err(ParseError {
             at: self.peek_at,
@@ -115,7 +130,7 @@ impl<'a> Parser<'a> {
                 name
             ),
             sqlstate: sqlstate::UNDEFINED_OBJECT,
-            cursor: None,
+            cursor: Some(at),
             hint: None,
             near: None,
             detail: None,
@@ -141,7 +156,10 @@ impl<'a> Parser<'a> {
         self.windows.truncate(0);
         loop {
             let name = self.any_ident("window name")?;
-            if self.named_window(name).is_ok() {
+            self.expect_ident("as")?;
+            // A definition is reported at its specification's `(`.
+            let paren_at = self.peek_at;
+            if self.defined_window(name).is_some() {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
@@ -150,17 +168,16 @@ impl<'a> Parser<'a> {
                         name
                     ),
                     sqlstate: sqlstate::WINDOWING_ERROR,
-                    cursor: None,
+                    cursor: Some(paren_at),
                     hint: None,
                     near: None,
                     detail: None,
                 });
             }
-            self.expect_ident("as")?;
             self.expect_op("(")?;
             let spec = WindowSpec {
                 name: Some(name),
-                ..self.window_spec_body()?
+                ..self.window_spec_body(paren_at)?
             };
             let entry = Some((name, self.arena_window(spec)?));
             self.windows
@@ -174,7 +191,10 @@ impl<'a> Parser<'a> {
 
     /// The inside of a window specification, `(` already consumed: an optional
     /// existing window name to copy, then PARTITION BY / ORDER BY / frame.
-    pub(super) fn window_spec_body(&mut self) -> Result<WindowSpec<'a>, ParseError> {
+    pub(super) fn window_spec_body(
+        &mut self,
+        paren_at: usize,
+    ) -> Result<WindowSpec<'a>, ParseError> {
         // A leading identifier that is not one of the clause keywords names an
         // existing window to copy, as in `OVER (w ORDER BY x)`. PostgreSQL
         // resolves the name only after parsing, so `OVER (exclude current
@@ -185,11 +205,11 @@ impl<'a> Parser<'a> {
                 if !matches!(name, "partition" | "order" | "rows" | "range" | "groups") =>
             {
                 self.advance()?;
-                Some((name, self.named_window(name).copied()))
+                Some((name, self.named_window(name, paren_at).copied()))
             }
             Tok::QuotedIdent(name) => {
                 self.advance()?;
-                Some((name, self.named_window(name).copied()))
+                Some((name, self.named_window(name, paren_at).copied()))
             }
             _ => None,
         };

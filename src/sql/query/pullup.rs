@@ -460,7 +460,7 @@ fn spell_out_merged_columns<'a>(
     if from.joins.iter().any(|join| join.table.lateral) || from.base.lateral {
         return Err(Stop::Keep);
     }
-    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena)?;
+    let scope = QueryScope::resolve_schema_with_join_conditions(storage, from, txid, arena, None)?;
     let rewrite = Rewrite {
         storage,
         txid,
@@ -2385,20 +2385,52 @@ fn sublink_join<'a>(
             }
             None
         }
-        Some(_) => match subquery.items {
-            [
-                SelectItem::Expr {
-                    expression: column @ Expr::Column { .. },
-                    ..
-                },
-            ] => Some(*column),
-            _ => return Ok(None),
-        },
+        // Each output, which may be computed (`x + 1`); a row operand
+        // compares its fields with the outputs in order.
+        Some((operand, _)) => {
+            let fields = match operand {
+                Expr::Call { name, args, .. } if *name == "row" && args.len() > 1 => args.len(),
+                _ => 1,
+            };
+            if subquery.items.len() != fields
+                || super::has_set_returning_items(subquery.items, storage, txid)
+            {
+                return Ok(None);
+            }
+            let outputs = arena
+                .alloc_slice_with(fields, |_| &Expr::Null)
+                .map_err(|_| Stop::full())?;
+            for (output, item) in outputs.iter_mut().zip(subquery.items) {
+                let SelectItem::Expr { expression, .. } = item else {
+                    return Ok(None);
+                };
+                *output = *expression;
+            }
+            Some(&*outputs)
+        }
     };
     let inner_scope = match QueryScope::resolve_schema(storage, sub_from, txid, arena, None) {
         Ok(scope) => scope,
         Err(_) => return Ok(None),
     };
+    // A computed output pulls up when it neither groups nor windows rows
+    // nor calls a volatile function.
+    let inner_columns = CatalogScopeCols {
+        scope: &inner_scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    for &output in compared.into_iter().flatten() {
+        if output.contains_subquery()
+            || super::expr_has_window(output)
+            || super::expr_has_aggregate(output, storage, txid, &inner_columns).unwrap_or(true)
+            || super::expression_contains_volatile(output, storage, txid, false)
+        {
+            return Ok(None);
+        }
+    }
     let inner_name = inner_scope.names[0];
     // EXPLAIN names the joined relation as written, which must stay unique.
     if inner_scope.derived[0].is_some() || outer_scope.names[..outer_scope.n].contains(&inner_name)
@@ -2459,9 +2491,17 @@ fn sublink_join<'a>(
         })
         .map_err(|_: crate::mem::arena::ArenaFull| Stop::full())
     };
-    // The compared column is the subquery's own.
+    // The compared outputs read the subquery's own columns.
     let compared = match compared {
-        Some(compared) => Some(requalify(compared)?),
+        Some(compared) => {
+            let requalified = arena
+                .alloc_slice_with(compared.len(), |_| &Expr::Null)
+                .map_err(|_| Stop::full())?;
+            for (slot, output) in requalified.iter_mut().zip(compared) {
+                *slot = requalify(output)?;
+            }
+            Some(&*requalified)
+        }
         None => None,
     };
     let item_reads_outer = correlated.get();
@@ -2489,17 +2529,25 @@ fn sublink_join<'a>(
             if !operand_columns || !operand_reads || has_unbound_node(operand) {
                 return Ok(None);
             }
-            let equality = &*arena
-                .alloc(Expr::Binary {
-                    source_position: SourcePosition::UNKNOWN,
-                    operator,
-                    left: operand,
-                    right: compared,
-                })
-                .map_err(|_| Stop::full())?;
+            let fields: &[&Expr<'a>] = match operand {
+                Expr::Call { args, .. } if compared.len() > 1 => args,
+                _ => core::slice::from_ref(&operand),
+            };
             // PostgreSQL's pulled-up condition lists the subquery's own
-            // conjuncts before the comparison.
-            super::and_where(condition, Some(equality), arena)?
+            // conjuncts before the comparisons.
+            let mut condition = condition;
+            for (&field, &output) in fields.iter().zip(compared) {
+                let equality = &*arena
+                    .alloc(Expr::Binary {
+                        source_position: SourcePosition::UNKNOWN,
+                        operator,
+                        left: field,
+                        right: output,
+                    })
+                    .map_err(|_| Stop::full())?;
+                condition = super::and_where(condition, Some(equality), arena)?;
+            }
+            condition
         }
         _ => {
             if !read_outer {

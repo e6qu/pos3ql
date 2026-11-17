@@ -364,12 +364,14 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
         return Some((copy.at + source.copies_base, source));
     }
     let start = source.text as usize;
-    if address < start || address + subject.len() > start + source.len {
-        return within_copy(copies, source, address, subject.len());
-    }
-    let at = address - start;
-    // A quoted token parsed without a copy map (a routine's query) is a
-    // slice inside its quotes; PostgreSQL points at the opening quote.
+    let at = if address < start || address + subject.len() > start + source.len {
+        within_copy(copies, source, address, subject.len())?.0
+    } else {
+        address - start
+    };
+    // A quoted token parsed without a copy map (a routine's query, or a
+    // copy of the client's text) is a slice inside its quotes; PostgreSQL
+    // points at the opening quote.
     let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
     let quoted = at > 0
         && matches!(text[at - 1], b'\'' | b'"')
@@ -398,6 +400,7 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Bool(_)
         | Expr::Null
         | Expr::Param(_)
+        | Expr::Array(_)
         | Expr::Subquery(_) => {
             let address = core::ptr::from_ref(expression) as usize;
             // with_statement_source keeps the copy map alive with its text.
@@ -444,8 +447,10 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Collate { operand, .. }
         | Expr::InList { operand, .. }
         | Expr::Like { operand, .. } => expression_start(operand),
-        // A field selection starts with its row expression.
-        Expr::Field { base, .. } => expression_start(base),
+        // A field selection or subscript starts with its base expression.
+        Expr::Field { base, .. } | Expr::Subscript { base, .. } | Expr::Slice { base, .. } => {
+            expression_start(base)
+        }
         _ => None,
     }
 }
@@ -752,16 +757,37 @@ pub(crate) fn expression_error(
         } => {
             if crate::sql::type_name_miss::is_type_name_miss(&error) {
                 at_subject(error, type_name)
+            } else if state == sqlstate::CANNOT_COERCE
+                && message.starts_with("cannot cast type ")
+                && type_name.ends_with("[]")
+                && let Some(element) = first_array_element(operand)
+            {
+                // A cast of an `ARRAY[...]` to an array type coerces its
+                // elements, the first of which fails.
+                at_expression(error, element)
             } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
                 at_parsed_offset(error, source_position.get())
-            } else if let Expr::Str(literal) = operand
+            } else if state.starts_with("22")
+                && let Some(literal) = failed_array_literal(operand, message)
+            {
+                // A cast of an `ARRAY[...]` converts each element: the
+                // literal whose input failed is the one the message quotes.
+                at_subject(error, literal)
+            } else if let Expr::Str(literal) = unknown_literal(operand)
                 && (state.starts_with("22")
                     // An object-identifier type's input looks the name up:
                     // any failure of it is the literal's.
                     || crate::sql::types::ColType::from_sql_name(type_name)
                         .is_some_and(crate::sql::types::ColType::is_reg_object)
                         && error.sqlstate.internal_control().is_none())
-                && !is_type_modifier_failure(message)
+                // A built-in type's length coercion runs after its input; a
+                // composite's or domain's input applies its fields' and
+                // base type's modifiers itself.
+                && (!is_type_modifier_failure(message)
+                    || crate::sql::types::ColType::from_sql_name(
+                        type_name.trim_end_matches("[]"),
+                    )
+                    .is_none())
             {
                 at_subject(error, literal)
             } else {
@@ -856,18 +882,43 @@ pub(crate) fn expression_error(
         }
         // The operator a pattern match, IN list or quantified comparison
         // resolves.
-        Expr::Like { .. }
-        | Expr::Match { .. }
-        | Expr::InList { .. }
-        | Expr::AnyAll { .. }
-        | Expr::InSubquery { .. }
-        | Expr::QuantifiedSubquery { .. }
+        Expr::Like {
+            source_position, ..
+        }
+        | Expr::Match {
+            source_position, ..
+        }
+        | Expr::InList {
+            source_position, ..
+        }
+        | Expr::AnyAll {
+            source_position, ..
+        } if state == sqlstate::UNDEFINED_FUNCTION
+            && message.starts_with("operator does not exist: ") =>
+        {
+            annotated(error, source_position.get(), BINARY_OPERATOR_HINT)
+        }
+        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
             if state == sqlstate::UNDEFINED_FUNCTION
                 && message.starts_with("operator does not exist: ") =>
         {
-            with_hint(error, BINARY_OPERATOR_HINT)
+            operator_at_node(error, expression)
         }
         Expr::Param(_) if state == sqlstate::UNDEFINED_PARAMETER => {
+            at_expression(error, expression)
+        }
+        Expr::AnyAll {
+            source_position, ..
+        } if state == sqlstate::WRONG_OBJECT_TYPE
+            && message == "op ANY/ALL (array) requires array on right side" =>
+        {
+            at_parsed_offset(error, source_position.get())
+        }
+        // An `ARRAY[]` with no type to take, at its `ARRAY`.
+        Expr::Array([])
+            if state == sqlstate::INDETERMINATE_DATATYPE
+                && message == "cannot determine type of empty array" =>
+        {
             at_expression(error, expression)
         }
         // A named row type without the field is reported where the row got
@@ -918,6 +969,52 @@ pub(crate) fn expression_error(
             at_expression(error, base)
         }
         _ => error,
+    }
+}
+
+/// A literal through casts to `unknown`, which leave it an untyped literal.
+fn unknown_literal<'e, 'a>(
+    mut expression: &'e crate::sql::ast::Expr<'a>,
+) -> &'e crate::sql::ast::Expr<'a> {
+    while let crate::sql::ast::Expr::Cast {
+        operand, type_name, ..
+    } = expression
+        && type_name.eq_ignore_ascii_case("unknown")
+    {
+        expression = operand;
+    }
+    expression
+}
+
+/// The first literal element of an `ARRAY[...]` constructor, looking through
+/// nested constructors, that an input failure's `message` quotes.
+fn failed_array_literal<'e>(
+    expression: &'e crate::sql::ast::Expr<'_>,
+    message: &str,
+) -> Option<&'e str> {
+    let crate::sql::ast::Expr::Array(elements) = expression else {
+        return None;
+    };
+    elements.iter().find_map(|element| match element {
+        crate::sql::ast::Expr::Str(literal)
+            if message.match_indices(*literal).any(|(at, _)| {
+                message[..at].ends_with('"') && message[at + literal.len()..].starts_with('"')
+            }) =>
+        {
+            Some(*literal)
+        }
+        nested => failed_array_literal(nested, message),
+    })
+}
+
+/// The first scalar element of an `ARRAY[...]` constructor, looking through
+/// nested constructors.
+fn first_array_element<'e, 'a>(
+    expression: &'e crate::sql::ast::Expr<'a>,
+) -> Option<&'e crate::sql::ast::Expr<'a>> {
+    match expression {
+        crate::sql::ast::Expr::Array([first, ..]) => first_array_element(first).or(Some(*first)),
+        _ => None,
     }
 }
 
@@ -1039,6 +1136,9 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: CopiedText, run: impl F
             installed.replace(Source {
                 copies: copies.as_ptr(),
                 copies_len: copies.len(),
+                // The copy was parsed on its own: its parsed offsets start
+                // where `written` does.
+                offset_base: at,
                 ..current
             })
         }),

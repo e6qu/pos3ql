@@ -1,8 +1,8 @@
 -- PostgreSQL 18 EXPLAIN ANALYZE of data-modifying WITH queries: the write
 -- runs once as the statement's "CTE name" InitPlan, its ModifyTable node
 -- returns its RETURNING rows (none without RETURNING), and its scan reports
--- the rows it read and removed. Hash and CTE storage lines are the
--- allocator's own and are left out.
+-- the rows it read and removed; each CTE Scan reports the tuplestore of the
+-- rows the write returned.
 CREATE TABLE t561 (a int, b text);
 INSERT INTO t561 SELECT g, 'v' || g FROM generate_series(1, 20) g;
 ANALYZE t561;
@@ -11,7 +11,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

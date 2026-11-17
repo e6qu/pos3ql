@@ -27,8 +27,7 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    -- Memory figures are each server's own.
-    RETURN NEXT regexp_replace(line, '(Memory|Memory Usage): \d+kB', '\1: NkB');
+    RETURN NEXT line;
   END LOOP;
 END
 $$;

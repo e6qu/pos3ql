@@ -1,8 +1,9 @@
 -- PostgreSQL 18 explain.c show_sort_info prints how an analyzed sort ran:
 -- `quicksort` in memory, or `top-N heapsort` when a Limit directly above
 -- bounds it and it read more than twice the bound (tuplesort.c
--- puttuple_common). The memory each sort took is measured by each server's
--- own allocator, so the figures are masked.
+-- puttuple_common), and the memory its SortTuple array and rows took:
+-- maxaligned bump chunks, aset.c chunks when a limit may bound it, and only
+-- the array for a one-column datum sort.
 CREATE TABLE t476 (a int, b int);
 INSERT INTO t476 SELECT g % 10, g FROM generate_series(1, 100) g;
 CREATE TABLE u476 (a int, c text);
@@ -14,10 +15,7 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    -- HashAggregate's batch line is not shown by pos3ql yet, and its hash
-    -- tables size their buckets differently.
-    CONTINUE WHEN line ~ '^\s*(Batches):';
-    RETURN NEXT regexp_replace(line, '(Memory|Memory Usage): \d+kB', '\1: NkB');
+    RETURN NEXT line;
   END LOOP;
 END
 $$;
@@ -46,6 +44,6 @@ DECLARE
 BEGIN
   EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
     || 'SELECT * FROM t476 WHERE a = 3 ORDER BY b' INTO plan;
-  RAISE NOTICE '%', regexp_replace(plan, '"Sort Space Used": \d+', '"Sort Space Used": N');
+  RAISE NOTICE '%', plan;
 END
 $$;

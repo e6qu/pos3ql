@@ -2458,8 +2458,12 @@ pub(super) fn attach_constraints(
                         crate::storage::MAX_EXCLUSIONS
                     ));
                 }
+                // PostgreSQL analyses the predicate as an expression, which
+                // positions an unknown column.
                 if let Some(expression) = predicate {
-                    let _ = check_referenced_columns(expression, def)?;
+                    let _ = crate::sql::error_position::with_analysis(|| {
+                        check_referenced_columns(expression, def)
+                    })?;
                 }
                 exclusion.method = *method;
                 exclusion.timing = storage_timing(*timing);
@@ -2555,7 +2559,11 @@ fn resolve_exclusion_element<'a>(
             meta.collation,
         )
     } else {
-        check_referenced_columns(key.expression, def)?;
+        // An expression element is analysed as an expression, which
+        // positions an unknown column (`transformExpr`).
+        crate::sql::error_position::with_analysis(|| {
+            check_referenced_columns(key.expression, def)
+        })?;
         let (input, type_oid) =
             exclusion_expression_type(storage, def, key.expression, method, txid, arena)?;
         let natural = super::constraints::index_key_collations(
@@ -2625,10 +2633,13 @@ fn exclusion_expression_type(
 }
 
 /// Re-analyzes `exclusion` over `def` after its columns changed type, as
-/// PostgreSQL rebuilds the constraint from its definition: each expression
-/// is resolved again and each operator looked up for the new element type.
+/// PostgreSQL rebuilds the constraint from its definition: each expression,
+/// as `before` (the table before the change) deparses it, is resolved again
+/// (a literal the original call coerced keeps its type, `'[]'::text`) and
+/// each operator looked up for the new element type.
 pub(crate) fn revalidate_exclusion(
     storage: &Storage,
+    before: &crate::storage::TableDef,
     def: &TableDefBuilder,
     exclusion: &crate::storage::ExclusionConstraint,
     txid: u32,
@@ -2657,14 +2668,36 @@ pub(crate) fn revalidate_exclusion(
                 let source = arena
                     .alloc_str(text)
                     .map_err(|_| crate::sql::eval::arena_full())?;
-                let expression = super::expression_bindings::bind_table_expression(
+                let owner =
+                    crate::storage::ExpressionOwner::ExclusionKey(exclusion.name, position as u8);
+                let written = super::expression_bindings::bind_table_expression(
                     crate::sql::parser::parse_expr(source, arena)?,
                     storage,
-                    def,
-                    crate::storage::ExpressionOwner::ExclusionKey(exclusion.name, position as u8),
+                    before,
+                    owner,
                     txid,
                     arena,
                 )?;
+                // A constraint the same statement adds is analyzed as written.
+                let existed = before
+                    .exclusions()
+                    .iter()
+                    .any(|existing| existing.name == exclusion.name);
+                let expression = if existed {
+                    let deparsed = crate::sql::catalog::index_expression_display(
+                        storage, txid, before, written, source, false, arena,
+                    )?;
+                    crate::sql::parser::parse_expr(deparsed, arena)?
+                } else {
+                    super::expression_bindings::bind_table_expression(
+                        crate::sql::parser::parse_expr(source, arena)?,
+                        storage,
+                        def,
+                        owner,
+                        txid,
+                        arena,
+                    )?
+                };
                 // The stored definition, not the statement, is analyzed.
                 let (input, type_oid) = exclusion_expression_type(
                     storage,

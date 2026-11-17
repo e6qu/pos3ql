@@ -1,0 +1,35 @@
+-- An IN or ANY subquery whose output is computed pulls up into a semi
+-- join, as PostgreSQL's convert_ANY_sublink_to_join makes it, and hashes
+-- on the expressions it equates. A join on expressions of each side hashes
+-- them too.
+CREATE TABLE s811 (a int, b int);
+CREATE TABLE t811 (x int, y int);
+INSERT INTO s811 SELECT g, g % 7 FROM generate_series(1, 200) g;
+INSERT INTO s811 VALUES (NULL, 1), (5, NULL);
+INSERT INTO t811 SELECT g, g % 5 FROM generate_series(1, 50) g;
+INSERT INTO t811 VALUES (NULL, 2);
+ANALYZE s811, t811;
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE a IN (SELECT x FROM t811);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE a IN (SELECT x + 1 FROM t811);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE a + 1 IN (SELECT x * 2 FROM t811 WHERE y > 1);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE (a, b) IN (SELECT x + 1, y FROM t811);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE a = ANY (SELECT abs(x - 3) FROM t811);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 WHERE a NOT IN (SELECT x + 1 FROM t811);
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM s811 WHERE a IN (SELECT x + 1 FROM t811);
+EXPLAIN (COSTS OFF, VERBOSE) SELECT * FROM s811 WHERE a IN (SELECT x + 1 FROM t811);
+SELECT count(*), sum(a), sum(b) FROM s811 WHERE a IN (SELECT x + 1 FROM t811);
+SELECT count(*), sum(a) FROM s811 WHERE a + 1 IN (SELECT x * 2 FROM t811 WHERE y > 1);
+SELECT * FROM s811 WHERE (a, b) IN (SELECT x + 1, y FROM t811) ORDER BY a;
+SELECT count(*) FROM s811 WHERE a = ANY (SELECT abs(x - 3) FROM t811);
+SELECT count(*) FROM s811 WHERE a NOT IN (SELECT x + 1 FROM t811);
+SELECT count(*) FROM s811 WHERE a IN (SELECT 10 / (x - x) FROM t811 WHERE x > 100);
+SELECT count(*) FROM s811 WHERE a IN (SELECT 10 / (x - 3) FROM t811);
+EXPLAIN (COSTS OFF) SELECT * FROM s811 JOIN (SELECT x + 1 AS k FROM t811) d ON s811.a = d.k;
+EXPLAIN (COSTS OFF) SELECT * FROM s811 JOIN t811 ON s811.a + 1 = t811.x * 2;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT * FROM s811 JOIN (SELECT x + 1 AS k FROM t811 WHERE y > 1) d ON s811.a = d.k;
+SELECT count(*), sum(k) FROM s811 JOIN (SELECT x + 1 AS k FROM t811) d ON s811.a = d.k;
+SELECT count(*) FROM s811 JOIN t811 ON s811.a + 1 = t811.x * 2;
+SELECT count(*) FROM s811 LEFT JOIN t811 ON s811.a + 1 = t811.x * 2;
+DROP TABLE s811, t811;

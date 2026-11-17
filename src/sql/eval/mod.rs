@@ -2339,7 +2339,7 @@ pub(crate) fn ambiguous_procedural_reference(qualifier: Option<&str>, name: &str
 }
 
 pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> SqlError {
-    match qualifier {
+    let error = match qualifier {
         Some(table) => sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "missing FROM-clause entry for table \"{}\"",
@@ -2350,7 +2350,8 @@ pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> S
             "column \"{}\" does not exist",
             name
         ),
-    }
+    };
+    crate::sql::error_position::column_reference(error, qualifier, name)
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
@@ -5934,7 +5935,7 @@ fn pattern_operator_undefined<'a>(
 fn validate_quantified_pattern<'a>(
     operator: BinaryOp,
     operand: &Expr<'a>,
-    element: super::types::ArrElem,
+    element_oid: i32,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(), SqlError> {
@@ -5959,7 +5960,7 @@ fn validate_quantified_pattern<'a>(
             .map_or(type_oid, ColType::oid)
     };
     let left = base(expression_type_identity(operand, row, hooks)?.routine_argument_oid());
-    let right = base(element.element_oid());
+    let right = base(element_oid);
     let string = |type_oid: i32| {
         matches!(
             type_oid,
@@ -6250,6 +6251,7 @@ pub(crate) fn require_node_builtin_execute<'a>(
             operand,
             list,
             negated,
+            ..
         } => {
             for item in *list {
                 require_builtin_operator_execute(
@@ -6284,6 +6286,7 @@ pub(crate) fn require_node_builtin_execute<'a>(
             pattern,
             negated,
             case_insensitive,
+            ..
         } => require_builtin_operator_execute(
             match (negated, case_insensitive) {
                 (false, false) => "~",
@@ -7132,21 +7135,37 @@ fn literal_operand_error<'a>(
     arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
 ) -> SqlError {
-    let Expr::Binary { left, right, .. } = expression else {
-        return error;
-    };
     if !error.sqlstate.as_str().starts_with("22") {
         return error;
     }
-    let (literal, other) = match (*left, *right) {
-        (Expr::Str(literal), other) | (other, Expr::Str(literal))
-            if !matches!(other, Expr::Str(_)) =>
-        {
-            (literal, other)
-        }
+    // A type probe's own errors leave `error`'s annotations in place.
+    let probed_type = |expression: &Expr<'a>| {
+        crate::sql::error_position::preserving_pending(|| static_type(expression, row))
+    };
+    let (literal, target) = match expression {
+        Expr::Binary { left, right, .. } => match (*left, *right) {
+            (Expr::Str(literal), other) | (other, Expr::Str(literal))
+                if !matches!(other, Expr::Str(_)) =>
+            {
+                (*literal, probed_type(other))
+            }
+            _ => return error,
+        },
+        // An unknown operand of `= ANY (array)` takes the element type.
+        Expr::AnyAll {
+            operand: Expr::Str(literal),
+            array,
+            ..
+        } => (
+            *literal,
+            match probed_type(array) {
+                Some(ColType::Array(element)) => Some(element.to_coltype()),
+                _ => None,
+            },
+        ),
         _ => return error,
     };
-    let Some(target) = static_type(other, row) else {
+    let Some(target) = target else {
         return error;
     };
     if matches!(target, ColType::Text | ColType::Pseudo(_) | ColType::Record) {
@@ -7175,13 +7194,17 @@ fn complete_function_mismatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> SqlError {
+    // Typing the operands probes them; their own errors are discarded and
+    // must leave `error`'s position and hint in place.
     let type_of = |argument: &Expr<'a>| match argument {
         Expr::Str(_) | Expr::Null => "unknown",
-        argument => match expression_type_identity(argument, row, hooks) {
-            Ok(ExpressionTypeIdentity::Known(oid)) => ColType::from_oid(oid).map(ColType::name),
-            _ => None,
-        }
-        .or_else(|| static_type(argument, row).map(ColType::name))
+        argument => crate::sql::error_position::preserving_pending(|| {
+            match expression_type_identity(argument, row, hooks) {
+                Ok(ExpressionTypeIdentity::Known(oid)) => ColType::from_oid(oid).map(ColType::name),
+                _ => None,
+            }
+            .or_else(|| static_type(argument, row).map(ColType::name))
+        })
         .unwrap_or("unknown"),
     };
     // An operand check names one type, or the lookup only the symbol; PostgreSQL
@@ -7815,6 +7838,11 @@ fn eval_subquery_list<'a>(
                 row,
                 hooks,
             )?;
+            if let [column_type] = list.column_types {
+                validate_quantified_pattern(operator, operand, *column_type, row, hooks).map_err(
+                    |error| crate::sql::error_position::operator_at_node(error, expression),
+                )?;
+            }
             let value = materialize_named_composite(
                 single_column_row_constructor(
                     operand,
@@ -7823,7 +7851,21 @@ fn eval_subquery_list<'a>(
                 hooks,
                 arena,
             )?;
-            let value = coerce_unknown(value, &list.witness)?;
+            // A comparison converts an unknown operand to the column's type;
+            // a pattern operator resolves on the types as they are.
+            let value = if matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) {
+                coerce_unknown(value, &list.witness)?
+            } else {
+                value
+            };
             let collations = effective_quantified_collations(
                 operand,
                 list.collations,
@@ -8777,6 +8819,7 @@ fn eval_full_inner<'a>(
             operand,
             list,
             negated,
+            ..
         } => {
             require_node_builtin_execute(expression, row, hooks)?;
             let v = eval_full(operand, arena, params, row, hooks)?;
@@ -8841,6 +8884,7 @@ fn eval_full_inner<'a>(
             negated,
             case_insensitive,
             escape,
+            ..
         } => {
             require_node_builtin_execute(expression, row, hooks)?;
             validate_cstring_operator_types(
@@ -8922,6 +8966,7 @@ fn eval_full_inner<'a>(
             pattern,
             negated,
             case_insensitive,
+            ..
         } => {
             require_node_builtin_execute(expression, row, hooks)?;
             let v = eval_full(operand, arena, params, row, hooks)?;
@@ -9195,7 +9240,10 @@ fn eval_full_inner<'a>(
                                     arena.alloc_str_display(value).map_err(|_| arena_full())?
                                 }
                                 other => {
-                                    return Err(jsonb_subscript_mismatch(&other));
+                                    return Err(crate::sql::error_position::at_expression(
+                                        jsonb_subscript_mismatch(&other),
+                                        index,
+                                    ));
                                 }
                             };
                             tree.get_field(key)
@@ -9212,7 +9260,10 @@ fn eval_full_inner<'a>(
                                     index
                                 }
                                 other => {
-                                    return Err(jsonb_subscript_mismatch(&other));
+                                    return Err(crate::sql::error_position::at_expression(
+                                        jsonb_subscript_mismatch(&other),
+                                        index,
+                                    ));
                                 }
                             };
                             tree.get_index(index)
@@ -9469,6 +9520,7 @@ fn eval_full_inner<'a>(
             operator,
             array,
             all,
+            ..
         } => {
             require_node_builtin_execute(expression, row, hooks)?;
             let collation = resolve_comparison_collation(operand, array, row, hooks.catalog)?;
@@ -9502,7 +9554,7 @@ fn eval_full_inner<'a>(
                     ));
                 }
             };
-            validate_quantified_pattern(operator, operand, element, row, hooks)?;
+            validate_quantified_pattern(operator, operand, element.element_oid(), row, hooks)?;
             // An unknown literal operand takes the element type, as PostgreSQL
             // resolves `'1' = ANY (integer[])`.
             let lhs = match lhs {
@@ -9604,6 +9656,7 @@ fn effective_quantified_collations<'a>(
                 .map(|field| DerivedCollation {
                     value: row.collation(Some(table), field.name),
                     explicit: false,
+                    explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
                     indeterminate: false,
                 })
         } else if index == 0 {
@@ -9614,6 +9667,7 @@ fn effective_quantified_collations<'a>(
         let right = (right != Collation::None).then_some(DerivedCollation {
             value: right,
             explicit: false,
+            explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
             indeterminate: false,
         });
         output[index] = required_comparison_collation(merge_derived_collations(left, right)?)?;
@@ -9851,11 +9905,15 @@ pub(crate) fn merge_derived_collations(
         (Some(left), Some(right))
             if left.explicit && right.explicit && left.value != right.value =>
         {
-            Err(sql_err!(
-                sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between explicit collations \"{}\" and \"{}\"",
-                left.value.name(),
-                right.value.name()
+            // Reported at the later of the two `COLLATE` clauses.
+            Err(crate::sql::error_position::at_source_position(
+                sql_err!(
+                    sqlstate::COLLATION_MISMATCH,
+                    "collation mismatch between explicit collations \"{}\" and \"{}\"",
+                    left.value.name(),
+                    right.value.name()
+                ),
+                right.explicit_at,
             ))
         }
         (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
@@ -9870,6 +9928,7 @@ pub(crate) fn merge_derived_collations(
             Ok(Some(DerivedCollation {
                 value: crate::sql::ast::Collation::None,
                 explicit: false,
+                explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
                 indeterminate: true,
             }))
         }
@@ -9890,6 +9949,8 @@ pub(crate) fn merge_derived_collations(
 pub struct DerivedCollation {
     value: crate::sql::ast::Collation,
     explicit: bool,
+    /// Where an explicit collation's `COLLATE` was written.
+    explicit_at: crate::sql::ast::SourcePosition,
     indeterminate: bool,
 }
 
@@ -9898,6 +9959,7 @@ impl DerivedCollation {
         (value != Collation::None || collatable).then_some(Self {
             value,
             explicit: false,
+            explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
             indeterminate: value == Collation::None && collatable,
         })
     }
@@ -9914,6 +9976,7 @@ impl DerivedCollation {
             Some(source.unwrap_or(Self {
                 value: Collation::Default,
                 explicit: false,
+                explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
                 indeterminate: false,
             }))
         } else {
@@ -9928,7 +9991,11 @@ fn expression_collation<'a>(
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<Option<DerivedCollation>, SqlError> {
     match expression {
-        Expr::Collate { operand, collation } => {
+        Expr::Collate {
+            source_position,
+            operand,
+            collation,
+        } => {
             let collatable = static_type(operand, row).is_none_or(ColType::is_collatable);
             if !collatable {
                 return Err(sql_err!(
@@ -9954,12 +10021,14 @@ fn expression_collation<'a>(
             Ok(Some(DerivedCollation {
                 value,
                 explicit: true,
+                explicit_at: *source_position,
                 indeterminate: false,
             }))
         }
         Expr::BoundLiteral { collation, .. } => Ok(collation.map(|value| DerivedCollation {
             value,
             explicit: false,
+            explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
             indeterminate: false,
         })),
         Expr::BoundDefault { expression, .. } => expression_collation(expression, row, catalog),
@@ -10241,6 +10310,7 @@ pub(crate) fn routine_argument_collation<'a>(
             .then_some(DerivedCollation {
                 value: Collation::Default,
                 explicit: false,
+                explicit_at: crate::sql::ast::SourcePosition::UNKNOWN,
                 indeterminate: false,
             })
     }))
@@ -10835,8 +10905,14 @@ pub(crate) fn array_constructor_type<'a>(
             candidate = Some(match candidate {
                 None => physical,
                 Some(prior) => {
-                    let next = super::types::common_builtin_candidate(prior, physical)
-                        .map_err(|error| common_type_error(error, "ARRAY"))?;
+                    let next = super::types::common_builtin_candidate(prior, physical).map_err(
+                        |error| {
+                            crate::sql::error_position::at_expression(
+                                common_type_error(error, "ARRAY"),
+                                item,
+                            )
+                        },
+                    )?;
                     needs_validation |= !super::types::builtin_implicit_cast(prior, next)
                         || !super::types::builtin_implicit_cast(physical, next);
                     next
@@ -10883,12 +10959,15 @@ pub(crate) fn array_constructor_type<'a>(
                 let from = constructor_type_from_oid(type_oid, domain_base)
                     .expect("validated constructor declaration");
                 if !super::types::builtin_implicit_cast(from, candidate) {
-                    return Err(common_type_error(
-                        super::types::CommonTypeError::Conversion {
-                            from,
-                            to: candidate,
-                        },
-                        "ARRAY",
+                    return Err(crate::sql::error_position::at_expression(
+                        common_type_error(
+                            super::types::CommonTypeError::Conversion {
+                                from,
+                                to: candidate,
+                            },
+                            "ARRAY",
+                        ),
+                        item,
                     ));
                 }
             }
@@ -12587,6 +12666,7 @@ fn builtin_function_expression<'a>(
                     let negated = name.starts_with('!');
                     match name.trim_start_matches('!') {
                         "~~" | "~~*" => Expr::Like {
+                            source_position: super::ast::SourcePosition::UNKNOWN,
                             operand: left,
                             pattern: right,
                             negated,
@@ -12594,6 +12674,7 @@ fn builtin_function_expression<'a>(
                             escape: None,
                         },
                         "~" | "~*" => Expr::Match {
+                            source_position: super::ast::SourcePosition::UNKNOWN,
                             operand: left,
                             pattern: right,
                             negated,

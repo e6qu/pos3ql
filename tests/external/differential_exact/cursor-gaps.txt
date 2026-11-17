@@ -1,0 +1,6 @@
+# Statements of the exact-error corpus whose error cursor (psql's `LINE n:`
+# excerpt and caret) pos3ql does not yet report as PostgreSQL 18.6 does:
+# `missing` where PostgreSQL positions the error and pos3ql does not,
+# `wrong` where both position it differently, `extra` where only pos3ql does.
+# Recorded from the first run that compared cursors; a fixed statement is
+# removed, since the comparison fails once pos3ql reports what PostgreSQL does.

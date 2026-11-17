@@ -2670,13 +2670,14 @@ impl<'d> QueryScope<'d> {
 
     /// [`Self::resolve_schema`] that also synthesizes the `USING` and
     /// `NATURAL` join conditions, for rewrites that spell those joins out.
-    pub(super) fn resolve_schema_with_join_conditions<'a>(
+    pub(crate) fn resolve_schema_with_join_conditions<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        Self::resolve_schema_from(storage, from, txid, arena, None, 0, true)
+        Self::resolve_schema_from(storage, from, txid, arena, outer, 0, true)
     }
 
     fn resolve_schema_from<'a>(
@@ -3030,6 +3031,44 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
+    /// Whether a table function's arguments read this query's FROM items. A
+    /// subquery argument is taken to read them.
+    fn function_reads_items(&self, tref: &TableRef<'_>) -> bool {
+        fn reads(scope: &QueryScope<'_>, expression: &Expr<'_>) -> bool {
+            if expression.contains_subquery() {
+                return true;
+            }
+            match *expression {
+                Expr::Column { qualifier, name }
+                    if matches!(
+                        scope.find_column_unpositioned(qualifier, name),
+                        Ok(ResolvedColumn::Table(..))
+                    ) =>
+                {
+                    return true;
+                }
+                // A whole row of an item, or a column named with its schema.
+                Expr::WholeRow(name) if scope.names[..scope.n].contains(&name) => return true,
+                Expr::SchemaColumn { .. } => return true,
+                _ => {}
+            }
+            let mut found = false;
+            let _ = super::subquery::walk_children(expression, &mut |child| {
+                found = found || reads(scope, child);
+                Ok(())
+            });
+            found
+        }
+        self.n > 0
+            && tref
+                .rows_from
+                .unwrap_or(core::slice::from_ref(tref))
+                .iter()
+                .filter_map(|function| function.func_args)
+                .flatten()
+                .any(|argument| reads(self, argument))
+    }
+
     /// Registers a table function (`FROM func(args) alias`) as a derived-table
     /// entry. `materialize` false = schema only (Describe / synth-def path).
     #[allow(clippy::too_many_arguments)]
@@ -3076,11 +3115,13 @@ impl<'d> QueryScope<'d> {
         if !exposed.is_empty() {
             self.duplicate_name(exposed)?;
         }
-        // A table function is implicitly lateral to preceding FROM items
-        // (the keyword is optional for functions in PostgreSQL) unless it is
-        // the nullable side of a RIGHT or FULL join. Lateral rows are built
-        // per left-hand row by the scan.
-        if (tref.lateral || self.n > 0) && !self.right_of_outer_join {
+        // A table function reads preceding FROM items without the LATERAL
+        // keyword, and PostgreSQL's analysis marks it lateral only when its
+        // arguments do (`contain_vars_of_level`); otherwise it is scanned
+        // once, as the first item is, and may be hashed. Lateral rows are
+        // built per left-hand row by the scan, except on the nullable side
+        // of a RIGHT or FULL join.
+        if (tref.lateral || self.function_reads_items(tref)) && !self.right_of_outer_join {
             self.names[self.n] = exposed;
             self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);
@@ -3141,6 +3182,18 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'d Arena,
     ) -> Result<(), SqlError> {
+        // A written schema is looked up first, which needs USAGE on it; the
+        // error points at the relation's name.
+        if tref.bound_table.is_none()
+            && let Some(schema) = tref.schema
+            && storage.find_schema_visible(schema, txid).is_some()
+            && let Some(current_role) = storage.current_role_slot(txid)
+        {
+            let role = tref.authorization_role.map_or(current_role, usize::from);
+            storage
+                .require_schema_usage_as(schema, role, txid)
+                .map_err(|error| crate::sql::error_position::at_reference(error, schema))?;
+        }
         // `txid == 0` (schema-only / Describe) resolves against the committed
         // catalog; a real transaction sees its own uncommitted CREATE/DROP.
         let slot = tref.bound_table.map(usize::from).or_else(|| {

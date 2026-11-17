@@ -1,7 +1,7 @@
 -- PostgreSQL 18 LockRows under a Limit: the Limit pulls only the rows it
 -- returns, so a locking query read in scan order stops its scan once the
 -- limit has its rows; a sorted one locks the sorted rows the Limit reads.
--- Sort memory is the allocator's own and is left out.
+-- The sort's tuples carry the ctid the lock reads.
 CREATE TABLE t560 (a int, b int);
 INSERT INTO t560 SELECT g % 5, g FROM generate_series(1, 99) g;
 ANALYZE t560;
@@ -10,7 +10,7 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    RETURN NEXT regexp_replace(line, '  Memory: \d+kB', '');
+    RETURN NEXT line;
   END LOOP;
 END
 $$;

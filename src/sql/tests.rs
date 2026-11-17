@@ -6806,7 +6806,7 @@ fn wide_join_trees_execute_without_allocation() {
                 String::from_utf8_lossy(&output)
             );
 
-            let explain = format!("EXPLAIN {cross}");
+            let explain = format!("EXPLAIN (COSTS OFF) {cross}");
             let output = run_with_fixed_memory(&mut engine, &budget, &explain, 32 << 20);
             assert!(
                 !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -23614,8 +23614,8 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         .collect::<Vec<_>>()
         .join(" ");
     let lock_query = format!("SELECT 1 FROM {joined_sources} {lock_clauses}");
-    let explain_join_query = format!("EXPLAIN SELECT 1 FROM {joined_sources}");
-    let explain_set_query = format!("EXPLAIN {set_query}");
+    let explain_join_query = format!("EXPLAIN (COSTS OFF) SELECT 1 FROM {joined_sources}");
+    let explain_set_query = format!("EXPLAIN (COSTS OFF) {set_query}");
 
     let using_query = format!(
         "SELECT * FROM statement_width_left JOIN statement_width_right USING ({column_names})"
@@ -39138,6 +39138,7 @@ fn collate_is_retained_in_the_expression_tree() {
         crate::sql::ast::Expr::Collate {
             operand: crate::sql::ast::Expr::Column { name: "value", .. },
             collation: crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::C,),
+            ..
         }
     ));
 }
@@ -41591,7 +41592,7 @@ fn selective_join_component_precedes_independent_cross_filters() {
         let plan = data_rows(&run_with(
             &mut e,
             &mut b,
-            &format!("EXPLAIN SELECT count(*) FROM {from} WHERE {qualification}"),
+            &format!("EXPLAIN (COSTS OFF) SELECT count(*) FROM {from} WHERE {qualification}"),
         ));
         let first_scans = plan
             .iter()
@@ -41600,8 +41601,12 @@ fn selective_join_component_precedes_independent_cross_filters() {
             .collect::<Vec<_>>();
         assert_eq!(first_scans.len(), 2, "FROM {from}: {plan:?}");
         assert!(
-            first_scans.iter().any(|row| row.contains(" on t1 "))
-                && first_scans.iter().any(|row| row.contains(" on t6 ")),
+            first_scans
+                .iter()
+                .any(|row| row.trim_end().ends_with(" on t1"))
+                && first_scans
+                    .iter()
+                    .any(|row| row.trim_end().ends_with(" on t6")),
             "FROM {from}: {plan:?}"
         );
         let sql = format!("SELECT count(*) FROM {from} WHERE {qualification}");
@@ -54979,6 +54984,7 @@ fn explain_analyze_counts_each_node_of_the_plan_it_runs() {
             "  Rows Removed by Join Filter: 15",
             "  ->  Seq Scan on nb x (actual rows=5.00 loops=1)",
             "  ->  Materialize (actual rows=5.00 loops=5)",
+            "        Storage: Memory  Maximum Storage: 17kB",
             "        ->  Seq Scan on nb y (actual rows=5.00 loops=1)",
         ]
     );
@@ -55198,7 +55204,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     let join_plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN SELECT count(*) FROM ep_large, ep_small",
+        "EXPLAIN (COSTS OFF) SELECT count(*) FROM ep_large, ep_small",
     ));
     let small = join_plan
         .iter()
@@ -55570,7 +55576,7 @@ fn constraint_and_default_catalogs_have_postgresql_18_shapes() {
         let plan = data_rows(&run_with(
             &mut engine,
             &mut budget,
-            &format!("EXPLAIN {query}"),
+            &format!("EXPLAIN (COSTS OFF) {query}"),
         ));
         assert!(
             plan.iter().any(|line| line.contains("Hash Join")),
@@ -55611,7 +55617,7 @@ fn hash_join_decodes_derived_sources_and_preserves_left_join_semantics() {
         let plan = data_rows(&run_with(
             &mut engine,
             &mut budget,
-            &format!("EXPLAIN {query}"),
+            &format!("EXPLAIN (COSTS OFF) {query}"),
         ));
         assert!(
             plan.iter().any(|line| line.contains("Hash Left Join")),
@@ -55685,7 +55691,7 @@ fn hash_join_matches_nested_loop() {
     let hash_plan = data_rows(&run_with(
         &mut e,
         &mut b,
-        "EXPLAIN SELECT e.name, d.dep FROM emp e JOIN d ON e.did = d.id",
+        "EXPLAIN (COSTS OFF) SELECT e.name, d.dep FROM emp e JOIN d ON e.did = d.id",
     ));
     assert!(
         hash_plan.iter().any(|line| line.contains("Hash Join")),
@@ -55708,7 +55714,7 @@ fn hash_join_matches_nested_loop() {
     let nested_plan = data_rows(&run_with(
         &mut e,
         &mut b,
-        "EXPLAIN SELECT e.name, d.dep FROM emp e CROSS JOIN d",
+        "EXPLAIN (COSTS OFF) SELECT e.name, d.dep FROM emp e CROSS JOIN d",
     ));
     assert!(
         nested_plan.iter().any(|line| line.contains("Nested Loop")),
@@ -55871,7 +55877,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     let plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN SELECT p.label, e.payload
+        "EXPLAIN (COSTS OFF) SELECT p.label, e.payload
          FROM probe_keys p JOIN indexed_events e
            ON e.tenant = p.tenant AND e.event_id = p.wanted",
     ));
@@ -55922,7 +55928,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
            WHERE e.tenant = p.tenant AND e.event_id = p.wanted + $1
            ORDER BY 1, 2;
          EXECUTE joined_offset(0);
-         EXPLAIN (GENERIC_PLAN) EXECUTE joined_offset(0)",
+         EXPLAIN (GENERIC_PLAN, COSTS OFF) EXECUTE joined_offset(0)",
     ));
     assert!(prepared.iter().any(|row| row == "one|b"), "{prepared:?}");
     assert!(prepared.iter().any(|row| row == "one|b2"), "{prepared:?}");
@@ -55939,7 +55945,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     let range_plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN SELECT p.label, e.event_id FROM probe_keys p JOIN indexed_events e
+        "EXPLAIN (COSTS OFF) SELECT p.label, e.event_id FROM probe_keys p JOIN indexed_events e
            ON e.tenant = p.tenant
           AND e.event_id >= p.low AND e.event_id < p.high",
     ));
@@ -56027,7 +56033,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     let multiway_plan = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "EXPLAIN SELECT p.label, e.payload, d.note
+        "EXPLAIN (COSTS OFF) SELECT p.label, e.payload, d.note
          FROM probe_keys p
          JOIN indexed_events e
            ON e.tenant = p.tenant AND e.event_id = p.wanted
@@ -56194,7 +56200,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     let exact_plan = data_rows(&run_with(
         &mut replayed,
         &mut replay_budget,
-        "EXPLAIN SELECT w.tenant, e.payload
+        "EXPLAIN (COSTS OFF) SELECT w.tenant, e.payload
          FROM range_windows w JOIN durable_events e
            ON e.tenant = w.tenant AND e.event_id = w.low_id",
     ));
@@ -56207,7 +56213,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     let plan = data_rows(&run_with(
         &mut replayed,
         &mut replay_budget,
-        "EXPLAIN SELECT w.tenant, e.event_id, e.payload
+        "EXPLAIN (COSTS OFF) SELECT w.tenant, e.event_id, e.payload
          FROM range_windows w JOIN durable_events e
            ON e.tenant = w.tenant
           AND e.event_id >= w.low_id AND e.event_id < w.high_id",
@@ -72260,7 +72266,7 @@ fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
              ORDER BY lower(email) LIMIT 3;
          SELECT id, score FROM indexed_documents
              WHERE active AND score > 100 ORDER BY score DESC NULLS LAST LIMIT 3;
-         EXPLAIN SELECT d.id FROM normalized_needles n
+         EXPLAIN (COSTS OFF) SELECT d.id FROM normalized_needles n
              JOIN indexed_documents d ON lower(d.email) = n.normalized;
          SELECT d.id FROM normalized_needles n
              JOIN indexed_documents d ON lower(d.email) = n.normalized;

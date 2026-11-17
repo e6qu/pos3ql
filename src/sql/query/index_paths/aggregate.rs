@@ -361,6 +361,15 @@ pub(crate) fn hash_agg_sizing(
     })
 }
 
+/// The buckets `build_hash_table` asks of a hash aggregate without
+/// transition states over `groups` estimated groups of rows `width` bytes
+/// wide (`hash_choose_num_buckets`).
+pub(crate) fn plain_hash_buckets(width: f64, groups: f64) -> usize {
+    let entry_size = hash_agg_entry_size(0, width, 0.0);
+    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
+    crate::sql::query::postgres_memory::HashAggSizing::buckets(entry_size, groups, memory, 0)
+}
+
 /// The cost and selectivity of a grouping's `HAVING` qualification
 /// (`cost_qual_eval`, `clauselist_selectivity`).
 #[derive(Clone, Copy, Debug, PartialEq)]

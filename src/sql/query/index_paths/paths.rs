@@ -2876,6 +2876,36 @@ fn index_columns_mask(index: &PlannerIndex) -> u64 {
 }
 
 /// The same scope, borrowed for the analyzer's lifetime.
+/// `clause_selectivity` of one relation's condition evaluated at a join,
+/// and its per-row evaluation cost; `None` when the model does not estimate
+/// it.
+pub(super) fn restriction_estimate<'a>(
+    planner: &Planner<'_, 'a>,
+    scope: &QueryScope<'_>,
+    condition: &'a Expr<'a>,
+    params: &[Datum<'a>],
+    arena: &'a Arena,
+) -> Result<Option<(f64, f64)>, SqlError> {
+    let mut seen = [&Expr::Null; 64];
+    let mut analyzer = Analyzer {
+        planner,
+        scope: scope_ref(scope),
+        params,
+        arena,
+        seen: &mut seen,
+        seen_count: 0,
+        expressions: [&Expr::Null; clauses::MAX_CONJUNCTS],
+        expression_count: 0,
+        outer_operands: &[],
+    };
+    Ok(match analyzer.restriction(condition, 0)? {
+        Ok(restriction) if restriction.clause.unmodeled().is_none() => {
+            Some((restriction.selectivity, restriction.cost.per_tuple))
+        }
+        _ => None,
+    })
+}
+
 fn scope_ref<'p>(scope: &'p QueryScope<'_>) -> &'p QueryScope<'p> {
     // SAFETY: `QueryScope` is covariant in its lifetime; the analyzer only
     // reads through it while `scope` lives.

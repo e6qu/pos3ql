@@ -2627,6 +2627,8 @@ pub(crate) fn external_materialized_into<'a>(
     } else {
         None
     };
+    let stages = materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     if !statement.with_ties
         && statement.locking.is_empty()
         && let Some(indexed) = ordered_candidates.as_ref()
@@ -2671,6 +2673,9 @@ pub(crate) fn external_materialized_into<'a>(
                     outer,
                     &mut |_row, projected, _keys| {
                         if logical_index >= offset {
+                            // The rows an index returns in order need no
+                            // sort: the `Limit` reads them from the scan.
+                            stages.limit.row();
                             keep_emitting = emit(projected, source_rowids)?;
                             emitted += 1;
                         }
@@ -2683,8 +2688,6 @@ pub(crate) fn external_materialized_into<'a>(
         )?;
         return Ok(emitted);
     }
-    let stages = materialized_stages(limit != u64::MAX);
-    let _stages = stages.start();
     let below_limit = stages.below_limit();
     // A sort under a DISTINCT returns every row it sorted; one under row
     // locks returns the rows the lock pass reads.

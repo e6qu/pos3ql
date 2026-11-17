@@ -2630,7 +2630,7 @@ impl Server {
                         }
                     }
                     (SubscriptionConnectStage::ListingTables, SqlEvent::DataRow(row)) => {
-                        let [schema, name] = row.columns() else {
+                        let [schema, name, _] = row.columns() else {
                             return Err(ClientError::PublisherError);
                         };
                         engine.record_subscription_connect_table(
@@ -2677,10 +2677,12 @@ impl Server {
                     self.engine
                         .record_subscription_connect_missing(slot, all & !work.found);
                     work.stage = SubscriptionConnectStage::ListingTables;
+                    // Each table once per distinct column list
+                    // (`fetch_table_list`).
                     subscription_connect_query(
-                        "SELECT DISTINCT schemaname::text, tablename::text FROM pg_catalog.pg_publication_tables WHERE pubname IN (",
+                        "SELECT DISTINCT n.nspname::text, c.relname::text, gpt.attrs FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN (SELECT (pg_catalog.pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_catalog.pg_publication WHERE pubname IN (",
                         publications,
-                        ") ORDER BY 1, 2",
+                        ")) AS gpt ON gpt.relid = c.oid ORDER BY 1, 2",
                     )
                 }
                 _ => {

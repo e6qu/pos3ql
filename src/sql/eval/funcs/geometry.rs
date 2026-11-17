@@ -414,6 +414,15 @@ fn line_intersects_geo(line: &Geo, other: &Geo) -> bool {
 }
 
 fn geo_intersects(left: &Geo, right: &Geo) -> bool {
+    // `box_ov`: the boxes' extents overlap on both axes.
+    if left.kind == GeometryKind::Box && right.kind == GeometryKind::Box {
+        let (left_high_x, left_high_y, left_low_x, left_low_y) = bounds(left);
+        let (right_high_x, right_high_y, right_low_x, right_low_y) = bounds(right);
+        return fp_compare("<=", left_low_x, right_high_x)
+            && fp_compare("<=", right_low_x, left_high_x)
+            && fp_compare("<=", left_low_y, right_high_y)
+            && fp_compare("<=", right_low_y, left_high_y);
+    }
     if left.kind == GeometryKind::Line {
         return line_intersects_geo(left, right);
     }

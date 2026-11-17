@@ -122,6 +122,9 @@ struct PlanNode {
     bitmap_index_estimate: Option<(f64, u64)>,
     /// Why `EXPLAIN ANALYZE` cannot count this node as PostgreSQL does.
     analyze_unsupported: Option<&'static str>,
+    /// The partitions a hash aggregate expects to spill its groups to,
+    /// which text shows only when there are any.
+    planned_partitions: Option<u32>,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -174,7 +177,13 @@ enum KeyLabel {
     None,
     Sort,
     Group,
+    /// A grouping sets node's key lines, each record a tag (`B` a rollup's
+    /// start, `S` its sort, `H` a hashed set, `G` a grouped set) and its
+    /// items, separated by [`GROUPING_SET_SEPARATOR`].
+    Sets,
 }
+
+const GROUPING_SET_SEPARATOR: char = '\u{1e}';
 
 impl PlanKeys {
     const NONE: Self = Self {
@@ -186,7 +195,7 @@ impl PlanKeys {
     /// The label and items to print, if any.
     fn shown(&self, verbose: bool) -> Option<(&'static str, impl Iterator<Item = &str>)> {
         let label = match self.label {
-            KeyLabel::None => return None,
+            KeyLabel::None | KeyLabel::Sets => return None,
             KeyLabel::Sort => "Sort Key",
             KeyLabel::Group => "Group Key",
         };
@@ -387,6 +396,7 @@ impl PlanNode {
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
 }
 
@@ -1117,13 +1127,14 @@ fn table_qual_cost<'t>(
     txid: u32,
     exposed: &'t str,
     definition: crate::storage::RelationDefinition<'t>,
+    aliases: &'t [&'t str],
     arena: &'t Arena,
 ) -> impl Fn(&Expr<'_>) -> f64 + 't {
     move |conjunct| {
         let columns = crate::sql::exec::AliasedDefCols {
             definition,
             alias: (exposed != definition.name.as_str()).then_some(exposed),
-            output_aliases: &[],
+            output_aliases: aliases,
             remote_ctid: false,
         };
         query::qual_cost(conjunct, &columns, storage, txid, arena)
@@ -1217,7 +1228,7 @@ struct JoinRelation<'a> {
     /// The name the query exposes it under.
     exposed: &'a str,
     definition: crate::storage::RelationDefinition<'a>,
-    table: Option<&'a crate::storage::TableDef>,
+    table: Option<&'a dyn crate::sql::catalog::deparse::DeparseTable>,
     columns: crate::sql::catalog::deparse::Columns<'a>,
     /// A subquery's columns as its own plan outputs them. Without a filter
     /// a join input's `Subquery Scan` is trivial and `set_plan_references`
@@ -1240,6 +1251,26 @@ impl<'a> JoinRelation<'a> {
             subquery: None,
             nameless: false,
         }
+    }
+
+    /// A table read under the column aliases `aliases`, when it has them.
+    fn aliased(
+        exposed: &'a str,
+        table: &'a crate::storage::TableDef,
+        aliases: Option<&'a [&'a str]>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let Some(aliases) = aliases else {
+            return Ok(Self::table(exposed, table));
+        };
+        let aliased: &'a dyn crate::sql::catalog::deparse::DeparseTable = arena
+            .alloc(crate::sql::catalog::deparse::AliasedTable { table, aliases })
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            table: Some(aliased),
+            columns: crate::sql::catalog::deparse::Columns::Table(aliased),
+            ..Self::table(exposed, table)
+        })
     }
 
     /// The relation as a deparsed condition names it; `removed` when its
@@ -1872,7 +1903,7 @@ fn scan_filters<'a>(
         let own = &mut own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + own_count[index]];
         order_restrictions(
             own,
-            &table_qual_cost(storage, txid, exposed, relation.definition, arena),
+            &table_qual_cost(storage, txid, exposed, relation.definition, &[], arena),
             storage,
             txid,
             arena,
@@ -2491,6 +2522,7 @@ fn single_relation_quals<'a>(
     txid: u32,
     exposed: &'a str,
     table: &'a crate::storage::TableDef,
+    aliases: &'a [&'a str],
     condition: Option<&'a Expr<'a>>,
     security: &[&'a Expr<'a>],
     index: Option<&query::IndexAccessPlan<'a>>,
@@ -2500,12 +2532,12 @@ fn single_relation_quals<'a>(
     if condition.is_none() && security.is_empty() {
         return Ok((None, None));
     }
+    // The relation's columns under the column aliases it is read with.
+    let aliased = crate::sql::catalog::deparse::AliasedTable { table, aliases };
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        use crate::sql::catalog::deparse::DeparseTable;
         if qualifier.is_none_or(|qualifier| qualifier == exposed)
-            && table
-                .columns()
-                .iter()
-                .any(|column| column.name.as_str() == name)
+            && aliased.column_index(name).is_some()
         {
             return Some(0);
         }
@@ -2555,6 +2587,7 @@ fn single_relation_quals<'a>(
         txid,
         exposed,
         crate::storage::RelationDefinition::from_definition(table),
+        aliases,
         arena,
     );
     order_restrictions(&mut conjuncts[..kept], &cost, storage, txid, arena)?;
@@ -2568,7 +2601,7 @@ fn single_relation_quals<'a>(
         let columns = crate::sql::exec::AliasedDefCols {
             definition: crate::storage::RelationDefinition::from_definition(table),
             alias: (exposed != table.name.as_str()).then_some(exposed),
-            output_aliases: &[],
+            output_aliases: aliases,
             remote_ctid: false,
         };
         let ordered = arena
@@ -2609,7 +2642,7 @@ fn single_relation_quals<'a>(
         Some((name, _)) => Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?),
         None => None,
     };
-    let own = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    let own = [crate::sql::catalog::deparse::Joined::new(exposed, &aliased)];
     let with_outer;
     let joined: &[crate::sql::catalog::deparse::Joined<'_>] =
         match (outer_name, outer_definition.as_deref()) {
@@ -2628,7 +2661,7 @@ fn single_relation_quals<'a>(
         txid,
         arena,
         dependencies: None,
-        table: Some(table),
+        table: Some(&aliased),
         parameters: &[],
         joined,
         pretty: false,
@@ -3083,6 +3116,7 @@ fn push_members(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -3358,6 +3392,7 @@ fn tree_member_quals<'a>(
                 txid,
                 exposed,
                 definition,
+                &[],
                 scanned,
                 security,
                 Some(index),
@@ -3679,6 +3714,20 @@ fn projected_shape<'a>(
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?,
+        // A query without FROM types its subqueries' values as the
+        // statement's description does.
+        None if statement.set_body.is_none() && outer.is_none() => {
+            let statement = arena.alloc(*statement).map_err(|_| arena_full())?;
+            query::describe_select(
+                statement,
+                storage,
+                txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?
+        }
         None => {
             let outer_types = outer.map(query::OuterColumnTypes);
             let statement = arena.alloc(*statement).map_err(|_| arena_full())?;
@@ -3781,6 +3830,604 @@ fn has_aggregate(
         }
     }
     Ok(false)
+}
+
+/// The scan and grouping PostgreSQL's planner chooses for a query grouping
+/// the rows of one table by its columns, with the keys its sort and its
+/// `Group Key` list in the order the grouping uses.
+#[derive(Clone, Copy)]
+struct GroupedScan<'a> {
+    path: query::index_paths::ScanPath<'a>,
+    sort_keys: &'a [KeyItem<'a>],
+    group_keys: &'a [KeyItem<'a>],
+    /// The width of the rows the grouping returns, each column of the
+    /// table its analyzed width.
+    width: u32,
+}
+
+/// [`GroupedScan`] of `statement`, or `None` when the query is outside the
+/// model: a `HAVING`, `LIMIT`, `DISTINCT`, window or set-returning list, a
+/// grouping key other than a column of the table, a select list computing
+/// more than aggregates, columns and constants, an `ORDER BY` sharing only
+/// part of its leading keys with the grouping, or a scan the model of
+/// [`query::index_paths`] leaves out.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+fn grouped_scan_path<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    output_width: u32,
+    arena: &'a Arena,
+) -> Result<Option<GroupedScan<'a>>, SqlError> {
+    use query::index_paths::{GroupOrder, GroupingShape, MAX_ORDER_KEYS, QueryShape};
+    if statement.group_by.is_empty()
+        || !statement.grouping_sets.is_empty()
+        || statement.group_by.len() > MAX_ORDER_KEYS
+        || scope.n != 1
+        || !from.joins.is_empty()
+        || from.base.sample.is_some()
+        || statement.having.is_some()
+        || statement.limit.is_some()
+        || statement.offset.is_some()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || has_window(statement)
+        || query::has_set_returning_items(statement.items, storage, txid)
+        || scope.slots[0] == usize::MAX
+        || scope.derived[0].is_some()
+    {
+        return Ok(None);
+    }
+    let slot = scope.slots[0];
+    if storage.table_def(slot, txid).partition.is_partitioned()
+        || storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(None);
+    }
+    // An ordinal names a select-list entry.
+    let resolve = |expression: &'a Expr<'a>| -> &'a Expr<'a> {
+        match expression {
+            Expr::Int(position) if *position >= 1 => statement
+                .items
+                .get(*position as usize - 1)
+                .and_then(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .unwrap_or(expression),
+            _ => expression,
+        }
+    };
+    let column_of = |expression: &'a Expr<'a>| -> Option<usize> {
+        match resolve(expression) {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(query::ResolvedColumn::Table(0, column)) => Some(column),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut group = [0usize; MAX_ORDER_KEYS];
+    let mut group_len = 0;
+    for &key in statement.group_by {
+        let Some(column) = column_of(key) else {
+            return Ok(None);
+        };
+        if !group[..group_len].contains(&column) {
+            group[group_len] = column;
+            group_len += 1;
+        }
+    }
+    // `preprocess_groupclause`: the grouping takes the `ORDER BY`'s order
+    // and directions when its keys lead with grouping columns.
+    let mut ordered = [None::<(usize, (bool, bool))>; MAX_ORDER_KEYS];
+    let mut ordered_len = 0;
+    let mut order = if statement.order_by.is_empty() {
+        GroupOrder::None
+    } else {
+        GroupOrder::Grouped
+    };
+    for (at, key) in statement.order_by.iter().enumerate() {
+        let column = column_of(key.expression).filter(|column| group[..group_len].contains(column));
+        match column {
+            Some(column) if order == GroupOrder::Grouped => {
+                if !ordered[..ordered_len]
+                    .iter()
+                    .flatten()
+                    .any(|(seen, _)| *seen == column)
+                {
+                    ordered[ordered_len] = Some((column, (key.descending, key.nulls_first)));
+                    ordered_len += 1;
+                }
+            }
+            Some(_) => return Ok(None),
+            None if at == 0 => order = GroupOrder::Other,
+            None => return Ok(None),
+        }
+    }
+    if order == GroupOrder::Other {
+        ordered_len = 0;
+    }
+    let mut columns_in_order = [0usize; MAX_ORDER_KEYS];
+    let mut directions = [None::<(bool, bool)>; MAX_ORDER_KEYS];
+    for (at, (column, direction)) in ordered[..ordered_len].iter().flatten().enumerate() {
+        columns_in_order[at] = *column;
+        directions[at] = Some(*direction);
+    }
+    let mut count = ordered_len;
+    for &column in &group[..group_len] {
+        if !columns_in_order[..count].contains(&column) {
+            columns_in_order[count] = column;
+            count += 1;
+        }
+    }
+    // A column of a variable-length type is as wide as ANALYZE measured.
+    let mut output_width = output_width;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Some(column) = column_of(expression)
+            && scope.defs.stored(0).is_some_and(|definition| {
+                definition.columns()[column].ctype.physical_layout().length <= 0
+            })
+        {
+            output_width = output_width - 32
+                + query::index_paths::column_width(storage, txid, scope.slots[0], column);
+        }
+    }
+    // The aggregates' costs, over a list of aggregates, columns and
+    // constants.
+    let expressions = arena
+        .alloc_slice_with(statement.items.len() + statement.order_by.len(), |_| {
+            &Expr::Null
+        })
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    for (slot, key) in expressions[statement.items.len()..]
+        .iter_mut()
+        .zip(statement.order_by)
+    {
+        *slot = resolve(key.expression);
+    }
+    let Some(aggregates) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let group_mask = columns_in_order[..count]
+        .iter()
+        .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+    let output = query::streaming_pax_columns_ordered(
+        scope,
+        from,
+        statement.items,
+        None,
+        statement.order_by,
+    )
+    .selected_mask(0)
+    .map(|mask| mask | group_mask);
+    let needed = query::streaming_pax_columns_ordered(
+        scope,
+        from,
+        statement.items,
+        statement.where_clause,
+        statement.order_by,
+    )
+    .selected_mask(0)
+    .map(|mask| mask | group_mask);
+    let shape = QueryShape {
+        only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+        output,
+        grouping: Some(GroupingShape {
+            columns: columns_in_order,
+            len: count,
+            aggregates,
+            output_width: f64::from(output_width),
+            order,
+        }),
+        ..QueryShape::default()
+    };
+    let planned = query::index_paths::scan_path(
+        storage,
+        scope,
+        txid,
+        split_gating(storage, txid, statement.where_clause, arena)?.1,
+        needed,
+        &[],
+        arena,
+        shape,
+    )?;
+    let query::index_paths::Planned::Chosen(path) = planned else {
+        return Ok(None);
+    };
+    if path.grouped.is_none() {
+        return Ok(None);
+    }
+    // The keys as the plan prints them: each grouping column by the
+    // `GROUP BY` entry naming it.
+    let entry = |column: usize| -> &'a Expr<'a> {
+        statement
+            .group_by
+            .iter()
+            .copied()
+            .find(|key| column_of(key) == Some(column))
+            .expect("a grouping column has its entry")
+    };
+    let sort_keys = arena
+        .alloc_slice_with(count, |at| {
+            (
+                entry(columns_in_order[at]),
+                Some(directions[at].unwrap_or((false, false))),
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let group_keys = arena
+        .alloc_slice_with(count, |at| (entry(columns_in_order[at]), None))
+        .map_err(|_| arena_full())?;
+    Ok(Some(GroupedScan {
+        path,
+        sort_keys,
+        group_keys,
+        width: output_width,
+    }))
+}
+
+/// The grouping sets of a query of one plain table as PostgreSQL's
+/// `consider_groupingsets_paths` plans them, with the scan they read, or
+/// `None` outside the model: the shapes [`grouped_scan_path`] leaves out,
+/// a grouping key that is not a column, or an index ordering one.
+#[allow(clippy::too_many_arguments)]
+fn grouping_sets_scan_path<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a crate::sql::ast::FromClause<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    output_width: u32,
+    arena: &'a Arena,
+) -> Result<
+    Option<(
+        query::index_paths::ScanPath<'a>,
+        query::index_paths::SetsPlan<'a>,
+        u32,
+    )>,
+    SqlError,
+> {
+    use query::index_paths::{
+        GroupOrder, GroupingSet, GroupingShape, MAX_ORDER_KEYS, MAX_SET_COLUMNS, QueryShape,
+    };
+    if statement.grouping_sets.is_empty()
+        || statement.group_by.len() > MAX_ORDER_KEYS.min(MAX_SET_COLUMNS)
+        || scope.n != 1
+        || !from.joins.is_empty()
+        || from.base.sample.is_some()
+        || statement.having.is_some()
+        || statement.limit.is_some()
+        || statement.offset.is_some()
+        || statement.distinct
+        || !statement.distinct_on.is_empty()
+        || !statement.locking.is_empty()
+        || has_window(statement)
+        || query::has_set_returning_items(statement.items, storage, txid)
+        || scope.slots[0] == usize::MAX
+        || scope.derived[0].is_some()
+    {
+        return Ok(None);
+    }
+    let slot = scope.slots[0];
+    if storage.table_def(slot, txid).partition.is_partitioned()
+        || storage.relation_has_descendants(slot, txid)
+    {
+        return Ok(None);
+    }
+    let resolve = |expression: &'a Expr<'a>| -> &'a Expr<'a> {
+        match expression {
+            Expr::Int(position) if *position >= 1 => statement
+                .items
+                .get(*position as usize - 1)
+                .and_then(|item| match item {
+                    SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .unwrap_or(expression),
+            _ => expression,
+        }
+    };
+    let column_of = |expression: &'a Expr<'a>| -> Option<usize> {
+        match resolve(expression) {
+            Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
+                Ok(query::ResolvedColumn::Table(0, column)) => Some(column),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut key_columns = [0usize; MAX_ORDER_KEYS];
+    for (at, &key) in statement.group_by.iter().enumerate() {
+        let Some(column) = column_of(key) else {
+            return Ok(None);
+        };
+        // A column named twice is one grouping key to PostgreSQL.
+        if key_columns[..at].contains(&column) {
+            return Ok(None);
+        }
+        key_columns[at] = column;
+    }
+    let expressions = arena
+        .alloc_slice_with(statement.items.len(), |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    let Some(aggregates) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let mut output_width = output_width;
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && let Some(column) = column_of(expression)
+            && scope.defs.stored(0).is_some_and(|definition| {
+                definition.columns()[column].ctype.physical_layout().length <= 0
+            })
+        {
+            output_width = output_width - 32
+                + query::index_paths::column_width(storage, txid, scope.slots[0], column);
+        }
+    }
+    let condition = split_gating(storage, txid, statement.where_clause, arena)?.1;
+    // Each set's groups (`estimate_num_groups`), and the relation's
+    // cheapest path, from the grouping of its columns.
+    let mut scan = None;
+    let mut input = None;
+    let n_keys = statement.group_by.len();
+    let sets = arena
+        .alloc_slice_with(statement.grouping_sets.len(), |_| GroupingSet {
+            columns: [0; MAX_SET_COLUMNS],
+            len: 0,
+            groups: 1.0,
+        })
+        .map_err(|_| arena_full())?;
+    for (set, mask) in sets.iter_mut().zip(statement.grouping_sets) {
+        let mut set_columns = [0usize; MAX_ORDER_KEYS];
+        for position in (0..n_keys).filter(|&position| mask.contains(position)) {
+            set.columns[set.len] = position as u8;
+            set_columns[set.len] = key_columns[position];
+            set.len += 1;
+        }
+        if set.len == 0 && scan.is_some() {
+            continue;
+        }
+        let group_mask = key_columns[..n_keys]
+            .iter()
+            .fold(0u64, |mask, &column| mask | (1u64 << column.min(63)));
+        let selected = |condition| {
+            query::streaming_pax_columns_ordered(scope, from, statement.items, condition, &[])
+                .selected_mask(0)
+                .map(|mask| mask | group_mask)
+        };
+        let shape = QueryShape {
+            only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+            output: selected(None),
+            grouping: Some(GroupingShape {
+                columns: set_columns,
+                len: set.len.max(1),
+                aggregates,
+                output_width: f64::from(output_width),
+                order: GroupOrder::None,
+            }),
+            ..QueryShape::default()
+        };
+        let planned = query::index_paths::scan_path(
+            storage,
+            scope,
+            txid,
+            condition,
+            selected(statement.where_clause),
+            &[],
+            arena,
+            shape,
+        )?;
+        let query::index_paths::Planned::Chosen(path) = planned else {
+            return Ok(None);
+        };
+        let Some(grouped) = path.grouped else {
+            return Ok(None);
+        };
+        if set.len > 0 {
+            set.groups = grouped.rows;
+        }
+        input = Some(grouped.input);
+        scan = Some(query::index_paths::ScanPath {
+            grouped: None,
+            ..path
+        });
+    }
+    let (Some(scan), Some(input)) = (scan, input) else {
+        return Ok(None);
+    };
+    let order = arena
+        .alloc_slice_with(statement.order_by.len(), |at| {
+            column_of(statement.order_by[at].expression).and_then(|column| {
+                key_columns[..n_keys]
+                    .iter()
+                    .position(|&key| key == column)
+                    .map(|position| position as u8)
+            })
+        })
+        .map_err(|_| arena_full())?;
+    let plan = query::index_paths::plan_grouping_sets(
+        &query::index_paths::SetsQuery {
+            sets,
+            distinct: statement.grouping_set_quantifier
+                == crate::sql::ast::GroupingSetQuantifier::Distinct,
+            order,
+            aggregates,
+            input,
+            output_width: f64::from(output_width),
+        },
+        arena,
+    )?;
+    Ok(Some((scan, plan, output_width)))
+}
+
+/// The key lines of a grouping sets node, as `show_grouping_sets` prints
+/// them: for each rollup, the sort it reads its input from when it sorts
+/// it itself, then each set's `Hash Key` or `Group Key`.
+fn grouping_sets_keys(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    plan: &query::index_paths::SetsPlan<'_>,
+    arena: &Arena,
+) -> Result<PlanKeys, SqlError> {
+    use query::index_paths::SetsStrategy;
+    let direction = |position: u8| {
+        statement
+            .order_by
+            .iter()
+            .find(|key| *key.expression == *statement.group_by[usize::from(position)])
+            .map(|key| (key.descending, key.nulls_first))
+    };
+    let mut keys = PlanKeys {
+        label: KeyLabel::Sets,
+        plain: StackStr::new(),
+        verbose: StackStr::new(),
+    };
+    let mut record = |tag: char, items: &[u8], sort: bool| -> Result<(), SqlError> {
+        let entries = arena
+            .alloc_slice_with(items.len(), |at| {
+                let position = items[at];
+                (
+                    statement.group_by[usize::from(position)],
+                    sort.then(|| direction(position).unwrap_or((false, false))),
+                )
+            })
+            .map_err(|_| arena_full())?;
+        let label = if sort {
+            KeyLabel::Sort
+        } else {
+            KeyLabel::Group
+        };
+        let printed = plan_keys(storage, txid, scope, statement, label, entries, arena)?;
+        for (target, text) in [
+            (&mut keys.plain, printed.plain),
+            (&mut keys.verbose, printed.verbose),
+        ] {
+            if !target.as_str().is_empty() {
+                let _ = write!(target, "{GROUPING_SET_SEPARATOR}");
+            }
+            let _ = write!(target, "{tag}{}", text.as_str());
+        }
+        Ok(())
+    };
+    for (index, rollup) in plan.rollups.iter().enumerate() {
+        record('B', &[], false)?;
+        if plan.sorts(index) {
+            record('S', rollup.clause.columns(), true)?;
+        }
+        let hashed = if index == 0 {
+            matches!(plan.strategy, SetsStrategy::Hashed | SetsStrategy::Mixed)
+        } else {
+            rollup.hashed
+        };
+        for set in rollup.sets {
+            record(if hashed { 'H' } else { 'G' }, set.columns(), false)?;
+        }
+    }
+    if keys.plain.is_truncated() || keys.verbose.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "the grouping sets' keys exceed EXPLAIN's 256-byte node property"
+        ));
+    }
+    Ok(keys)
+}
+
+/// `cost_agg` of a plain aggregate over the chosen `path` of the one
+/// relation `statement` reads: `None` when its select list computes more
+/// than aggregates, columns and constants, or an aggregate is outside the
+/// model of [`query::index_paths::aggregate_costs`].
+fn plain_aggregate_cost<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+    path: &query::index_paths::ScanPath<'_>,
+    arena: &'a Arena,
+) -> Result<Option<(f64, f64)>, SqlError> {
+    let expressions = arena
+        .alloc_slice_with(statement.items.len(), |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    for (slot, item) in expressions.iter_mut().zip(statement.items) {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Ok(None);
+        };
+        // The target list's own cost is outside the model.
+        if !matches!(expression, Expr::Call { .. } | Expr::Column { .. })
+            && !expression.is_constant(false)
+        {
+            return Ok(None);
+        }
+        if matches!(expression, Expr::Call { .. })
+            && query::aggregate_routine(expression, storage, txid, columns)?.is_none()
+        {
+            return Ok(None);
+        }
+        *slot = expression;
+    }
+    let Some(costs) =
+        query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+    else {
+        return Ok(None);
+    };
+    let (startup, total, _) = query::index_paths::cost_agg(
+        query::index_paths::AggStrategy::Plain,
+        &costs,
+        0,
+        1.0,
+        query::index_paths::AggInput {
+            startup: path.startup_cost,
+            total: path.total_cost,
+            rows: path.rows,
+            width: f64::from(path.width),
+        },
+    );
+    Ok(Some((startup, total)))
 }
 
 fn has_window(statement: &Select<'_>) -> bool {
@@ -3962,184 +4609,6 @@ fn expression_statistics_selectivity(
             let column = data.expression_statistics[key];
             let non_null = 1.0 - f64::from(column.null_fraction);
             return Some((non_null / column.distinct_values.max(1) as f64).clamp(0.0, 1.0));
-        }
-    }
-    None
-}
-
-/// Consumes a named PostgreSQL extended-statistics object only when the
-/// conjunction supplies every plain-column key with a constant equality.
-fn extended_statistics_selectivity<'a>(
-    storage: &Storage,
-    scope: &QueryScope<'_>,
-    table: usize,
-    expression: &Expr<'a>,
-    txid: u32,
-    arena: &Arena,
-) -> Option<f64> {
-    fn collect<'a>(
-        expression: &Expr<'a>,
-        scope: &QueryScope<'_>,
-        table: usize,
-        arena: &'a Arena,
-        columns: &mut [usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        values: &mut [Datum<'a>; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        count: &mut usize,
-    ) -> bool {
-        fn column_constant<'e>(
-            candidate: &Expr<'e>,
-            other: &'e Expr<'e>,
-            scope: &QueryScope<'_>,
-            table: usize,
-        ) -> Option<(usize, &'e Expr<'e>)> {
-            let Expr::Column { qualifier, name } = candidate else {
-                return None;
-            };
-            if !other.is_constant(false) || other.contains_call() {
-                return None;
-            }
-            match scope.find_column(*qualifier, name).ok()? {
-                query::ResolvedColumn::Table(owner, column) if owner == table => {
-                    Some((column, other))
-                }
-                _ => None,
-            }
-        }
-        match expression {
-            Expr::Binary {
-                operator: BinaryOp::And,
-                left,
-                right,
-                ..
-            } => {
-                collect(left, scope, table, arena, columns, values, count)
-                    && collect(right, scope, table, arena, columns, values, count)
-            }
-            Expr::Binary {
-                operator: BinaryOp::Eq,
-                left,
-                right,
-                ..
-            } => {
-                let Some((column, constant)) = column_constant(left, right, scope, table)
-                    .or_else(|| column_constant(right, left, scope, table))
-                else {
-                    return false;
-                };
-                if *count == columns.len() || columns[..*count].contains(&column) {
-                    return false;
-                }
-                let Ok(value) = crate::sql::eval::eval(
-                    constant,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &crate::sql::eval::NoColumns,
-                ) else {
-                    return false;
-                };
-                columns[*count] = column;
-                values[*count] = value;
-                *count += 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    if scope.derived[table].is_some() || scope.slots[table] == usize::MAX {
-        return None;
-    }
-    let mut columns = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-    let mut values = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-    let mut count = 0usize;
-    if !collect(
-        expression,
-        scope,
-        table,
-        arena,
-        &mut columns,
-        &mut values,
-        &mut count,
-    ) || count < 2
-    {
-        return None;
-    }
-    for (slot, statistics) in storage.extended_statistics_for_table(scope.slots[table], txid) {
-        if statistics.keys_for(txid).len() != count
-            || statistics.keys_for(txid).iter().any(|key| {
-                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                    return true;
-                };
-                let definition = storage.table_def(scope.slots[table], txid);
-                definition
-                    .column_index(column.as_str())
-                    .is_none_or(|column| !columns[..count].contains(&column))
-            })
-        {
-            continue;
-        }
-        let data = storage.extended_statistics_data(slot, txid);
-        if !data.valid || data.rows == 0 {
-            continue;
-        }
-        let mut ordered = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-        let indices = [0u16, 1, 2, 3, 4, 5, 6, 7];
-        for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-            let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                unreachable!("expression keys were rejected above")
-            };
-            let column = storage
-                .table_def(scope.slots[table], txid)
-                .column_index(column.as_str())?;
-            let source = columns[..count]
-                .iter()
-                .position(|candidate| *candidate == column)?;
-            ordered[position] = values[source];
-        }
-        if statistics.kinds.mcv() {
-            let hash = crate::sql::eval::hash_key_identified(&ordered[..count], &indices[..count])?;
-            if let Some(entry) = data.mcv[..usize::from(data.n_mcv)]
-                .iter()
-                .find(|entry| entry.hash == hash)
-            {
-                return Some((entry.count as f64 / data.rows as f64).clamp(0.0, 1.0));
-            }
-        }
-        if statistics.kinds.ndistinct() {
-            return Some(
-                (data.non_null_rows as f64 / data.rows as f64 / data.distinct_values.max(1) as f64)
-                    .clamp(0.0, 1.0),
-            );
-        }
-        if statistics.kinds.dependencies() {
-            let mut selectivities = [1.0f64; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-            for (position, key) in statistics.keys_for(txid).iter().enumerate() {
-                let crate::storage::ExtendedStatisticsKey::Column(column) = key else {
-                    unreachable!("expression keys were rejected above")
-                };
-                let column = storage
-                    .table_def(scope.slots[table], txid)
-                    .column_index(column.as_str())?;
-                selectivities[position] =
-                    column_selectivity(storage, scope, table, column, txid, 0.005);
-            }
-            let mut estimate = selectivities.iter().take(count).product::<f64>();
-            for determinant in 0..count {
-                for dependent in 0..count {
-                    let strength = f64::from(
-                        data.dependencies_ppm[determinant
-                            * crate::storage::MAX_EXTENDED_STATISTICS_KEYS
-                            + dependent],
-                    ) / 1_000_000.0;
-                    if strength > 0.0 {
-                        let independent = selectivities[determinant] * selectivities[dependent];
-                        let dependent_estimate = selectivities[determinant]
-                            * (strength + (1.0 - strength) * selectivities[dependent]);
-                        estimate *= dependent_estimate / independent.max(f64::MIN_POSITIVE);
-                        return Some(estimate.clamp(0.0, 1.0));
-                    }
-                }
-            }
         }
     }
     None
@@ -4380,7 +4849,7 @@ pub(crate) fn joined_write_shape<'a>(
         scope,
         1,
         &[join.source_slot],
-        join.conditions.source,
+        join.source_row_condition,
         &source_keys[..count],
         params,
         routine,
@@ -4536,11 +5005,6 @@ fn predicate_selectivity<'a>(
             right,
             ..
         } => {
-            if let Some(selectivity) =
-                extended_statistics_selectivity(storage, scope, table, expression, txid, arena)
-            {
-                return selectivity;
-            }
             let left = predicate_selectivity(storage, scope, table, left, txid, arena);
             let right = predicate_selectivity(storage, scope, table, right, txid, arena);
             (left * right).clamp(0.0, 1.0)
@@ -4896,6 +5360,7 @@ fn scan_node<'a>(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -4957,6 +5422,13 @@ fn plan_select_with_ctes<'a>(
     // execution runs.
     if let Some(rewritten) =
         crate::sql::foreign::deparse::minmax_subquery(storage, txid, statement, arena)?
+    {
+        return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
+    }
+    // `min` and `max` of a local table are planned, and executed, as
+    // PostgreSQL plans them when an index orders them.
+    if outer.is_none()
+        && let Some(rewritten) = query::local_minmax_subquery(storage, txid, statement, arena)?
     {
         return plan_select_with_ctes(storage, txid, rewritten, ctes, outer, block, arena);
     }
@@ -5189,7 +5661,7 @@ fn plan_sublinks<'a>(
             txid,
             select,
             outer,
-            block.child(Segment::Sublink(core::ptr::from_ref(select) as usize as u64)),
+            block.child(Segment::Sublink(select.instrument_identity())),
             arena,
         );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
@@ -5668,7 +6140,7 @@ fn plan_pulled_select<'a>(
         scope.n * 3 + MAX_EXPLAIN_STAGES + members
     });
     let mut plan = Plan::new(arena, capacity)?;
-    let (width, mut output) =
+    let (mut width, mut output) =
         projected_shape(statement, scope.as_ref(), outer, storage, txid, arena)?;
     if let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
         && scope.n == 1
@@ -5885,6 +6357,23 @@ fn plan_pulled_select<'a>(
         }
         _ => None,
     };
+    // The grouping PostgreSQL's planner chooses over the scan of one table.
+    let grouped = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from)) if chosen_path.is_none() => {
+            grouped_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+        }
+        _ => None,
+    };
+    let grouped_path = grouped.map(|grouped| grouped.path);
+    let grouping_sets = match (scope.as_ref(), statement.from.as_ref()) {
+        (Some(scope), Some(from)) if grouped.is_none() => {
+            grouping_sets_scan_path(storage, txid, statement, scope, from, columns, width, arena)?
+        }
+        _ => None,
+    };
+    let chosen_scan = chosen_path
+        .or(grouped_path)
+        .or(grouping_sets.map(|(path, _, _)| path));
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
     let mut object_requests = 0u64;
@@ -5948,7 +6437,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-                chosen_path,
+                chosen_scan,
             )?;
             scan_indexes[table] = index;
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
@@ -6090,27 +6579,205 @@ fn plan_pulled_select<'a>(
     // A FROM-less query grouped by constants groups its one row.
     let constant_group = fromless && constant_keys(statement.group_by)?;
     if aggregate {
+        // PostgreSQL's `cost_agg` over the chosen scan of one relation.
+        let exact = match chosen_path {
+            Some(path) if statement.group_by.is_empty() && statement.having.is_none() => {
+                plain_aggregate_cost(storage, txid, statement, columns, &path, arena)?
+            }
+            _ => None,
+        };
         estimated_rows = if statement.group_by.is_empty() {
             1
         } else {
             (estimated_rows as f64).sqrt().ceil().max(1.0) as u64
         };
-        total_cost += estimated_rows as f64 * 0.02;
+        let mut aggregate_startup = 0.0;
+        match exact {
+            Some((startup, total)) => {
+                aggregate_startup = startup;
+                total_cost = total;
+            }
+            None => total_cost += estimated_rows as f64 * 0.02,
+        }
+        let mut aggregate_name = if statement.group_by.is_empty() {
+            "Aggregate"
+        } else if constant_group {
+            "Group"
+        } else {
+            "HashAggregate"
+        };
+        let mut aggregate_keys = group_keys(statement, arena)?;
+        let mut planned_partitions = None;
+        let mut sets_keys = None;
+        // Grouping sets outside the cost model still list PostgreSQL's
+        // rollups and keys, arranged from pos3ql's own estimates.
+        if grouping_sets.is_none() && !statement.grouping_sets.is_empty() {
+            use query::index_paths::{GroupingSet, MAX_SET_COLUMNS};
+            let n_keys = statement.group_by.len();
+            if n_keys <= MAX_SET_COLUMNS {
+                let input_rows = (estimated_rows as f64).max(1.0);
+                let sets = arena
+                    .alloc_slice_with(statement.grouping_sets.len(), |at| {
+                        let mut set = GroupingSet {
+                            columns: [0; MAX_SET_COLUMNS],
+                            len: 0,
+                            groups: 1.0,
+                        };
+                        for position in
+                            (0..n_keys).filter(|&key| statement.grouping_sets[at].contains(key))
+                        {
+                            set.columns[set.len] = position as u8;
+                            set.len += 1;
+                        }
+                        if set.len > 0 {
+                            set.groups = input_rows.sqrt().ceil();
+                        }
+                        set
+                    })
+                    .map_err(|_| arena_full())?;
+                let order = arena
+                    .alloc_slice_with(statement.order_by.len(), |at| {
+                        statement
+                            .group_by
+                            .iter()
+                            .position(|key| *key == statement.order_by[at].expression)
+                            .map(|position| position as u8)
+                    })
+                    .map_err(|_| arena_full())?;
+                let sets = query::index_paths::plan_grouping_sets(
+                    &query::index_paths::SetsQuery {
+                        sets,
+                        distinct: statement.grouping_set_quantifier
+                            == crate::sql::ast::GroupingSetQuantifier::Distinct,
+                        order,
+                        aggregates: query::index_paths::AggregateCosts::default(),
+                        input: query::index_paths::AggInput {
+                            startup: 0.0,
+                            total: total_cost,
+                            rows: input_rows,
+                            width: f64::from(width),
+                        },
+                        output_width: f64::from(width),
+                    },
+                    arena,
+                )?;
+                aggregate_name = sets.strategy.node_name();
+                sets_keys = Some(grouping_sets_keys(
+                    storage,
+                    txid,
+                    scope.as_ref(),
+                    statement,
+                    &sets,
+                    arena,
+                )?);
+            }
+        }
+        if let Some((_, sets, sets_width)) = grouping_sets {
+            if let Some((startup, total)) = sets.input_sort {
+                // The input is sorted for the first rollup not hashed.
+                let first = sets
+                    .rollups
+                    .iter()
+                    .find(|rollup| !rollup.hashed)
+                    .map_or(sets.rollups[0].clause, |rollup| rollup.clause);
+                let sort_keys = arena
+                    .alloc_slice_with(first.len, |at| {
+                        let entry = statement.group_by[usize::from(first.columns[at])];
+                        let direction = statement
+                            .order_by
+                            .iter()
+                            .find(|key| *key.expression == *entry)
+                            .map_or((false, false), |key| (key.descending, key.nulls_first));
+                        (entry, Some(direction))
+                    })
+                    .map_err(|_| arena_full())?;
+                add_stage(
+                    &mut stages,
+                    &mut stage_count,
+                    PlanNode {
+                        name: StackStr::from_str("Sort"),
+                        keys: plan_keys(
+                            storage,
+                            txid,
+                            scope.as_ref(),
+                            statement,
+                            KeyLabel::Sort,
+                            sort_keys,
+                            arena,
+                        )?,
+                        startup_cost: startup,
+                        total_cost: total,
+                        rows: sets.input.rows as u64,
+                        width: sets.input.width as u32,
+                        object_requests,
+                        cache_blocks,
+                        key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
+                        ..PlanNode::EMPTY
+                    },
+                )?;
+            }
+            aggregate_name = sets.strategy.node_name();
+            aggregate_startup = sets.startup;
+            total_cost = sets.total;
+            estimated_rows = sets.rows as u64;
+            width = sets_width;
+            sets_keys = Some(grouping_sets_keys(
+                storage,
+                txid,
+                scope.as_ref(),
+                statement,
+                &sets,
+                arena,
+            )?);
+        }
+        if let Some(grouped) = grouped
+            && let Some(path) = grouped.path.grouped
+        {
+            if let Some((startup, total)) = path.input_sort {
+                add_stage(
+                    &mut stages,
+                    &mut stage_count,
+                    PlanNode {
+                        name: StackStr::from_str("Sort"),
+                        keys: plan_keys(
+                            storage,
+                            txid,
+                            scope.as_ref(),
+                            statement,
+                            KeyLabel::Sort,
+                            grouped.sort_keys,
+                            arena,
+                        )?,
+                        startup_cost: startup,
+                        total_cost: total,
+                        rows: grouped.path.rows as u64,
+                        width: grouped.path.width,
+                        object_requests,
+                        cache_blocks,
+                        key: Some(NodeKey::new(aggregated_block, Role::GroupSort)),
+                        ..PlanNode::EMPTY
+                    },
+                )?;
+                aggregate_name = "GroupAggregate";
+            }
+            planned_partitions = path.planned_partitions;
+            aggregate_keys = Some(grouped.group_keys);
+            aggregate_startup = path.startup;
+            total_cost = path.total;
+            estimated_rows = path.rows as u64;
+            width = grouped.width;
+        }
         add_stage(
             &mut stages,
             &mut stage_count,
             PlanNode {
-                name: StackStr::from_str(if statement.group_by.is_empty() {
-                    "Aggregate"
-                } else if constant_group {
-                    "Group"
-                } else {
-                    "HashAggregate"
-                }),
+                name: StackStr::from_str(aggregate_name),
                 key: Some(NodeKey::new(aggregated_block, Role::Aggregate)),
-                keys: match group_keys(statement, arena)?
+                planned_partitions,
+                keys: match aggregate_keys
                     .filter(|_| !statement.group_by.is_empty() && !constant_group)
                 {
+                    _ if sets_keys.is_some() => sets_keys.unwrap_or(PlanKeys::NONE),
                     Some(keys) => plan_keys(
                         storage,
                         txid,
@@ -6122,6 +6789,7 @@ fn plan_pulled_select<'a>(
                     )?,
                     None => PlanKeys::NONE,
                 },
+                startup_cost: aggregate_startup,
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -6247,9 +6915,13 @@ fn plan_pulled_select<'a>(
     };
     // The chosen path may return the rows ordered; otherwise the legacy
     // ordered index does.
-    let scan_ordered = match chosen_path {
-        Some(path) => path.sort == query::index_paths::SortKind::None,
-        None => ordered_index.is_some(),
+    let scan_ordered = match (chosen_path, grouped_path.and_then(|path| path.grouped)) {
+        _ if grouping_sets.is_some() => {
+            grouping_sets.is_some_and(|(_, sets, _)| sets.output_sort.is_none())
+        }
+        (Some(path), _) => path.sort == query::index_paths::SortKind::None,
+        (None, Some(grouped)) => grouped.output_sort.is_none(),
+        (None, None) => ordered_index.is_some(),
     };
     if !sorted_keys.is_empty()
         && !scan_ordered
@@ -6288,6 +6960,19 @@ fn plan_pulled_select<'a>(
             node.total_cost = total;
             node.rows = path.rows as u64;
             node.width = path.width;
+        }
+        if let Some(grouped) = grouped_path.and_then(|path| path.grouped)
+            && let Some((startup, total)) = grouped.output_sort
+        {
+            node.startup_cost = startup;
+            node.total_cost = total;
+        }
+        if let Some((_, sets, _)) = grouping_sets
+            && let Some((startup, total)) = sets.output_sort
+        {
+            node.startup_cost = startup;
+            node.total_cost = total;
+            node.rows = sets.rows as u64;
         }
         if presorted != 0 {
             let prefix = plan_keys(
@@ -6621,6 +7306,7 @@ fn plan_pulled_select<'a>(
                 txid,
                 exposed,
                 def,
+                &[],
                 scanned,
                 security,
                 scan_indexes[0].as_ref(),
@@ -6632,6 +7318,7 @@ fn plan_pulled_select<'a>(
                 txid,
                 exposed,
                 def,
+                &[],
                 scanned,
                 security,
                 scan_indexes[0].as_ref(),
@@ -6649,6 +7336,7 @@ fn plan_pulled_select<'a>(
                     txid,
                     exposed,
                     def,
+                    &[],
                     scanned,
                     security,
                     Some(&written),
@@ -6661,6 +7349,7 @@ fn plan_pulled_select<'a>(
                     txid,
                     exposed,
                     def,
+                    &[],
                     scanned,
                     security,
                     Some(&written),
@@ -6692,6 +7381,7 @@ fn plan_pulled_select<'a>(
                                 txid,
                                 exposed,
                                 def,
+                                &[],
                                 scanned,
                                 security,
                                 Some(&leaf),
@@ -6907,7 +7597,8 @@ fn plan_pulled_select<'a>(
             .iter()
             .find(|stage| !stage.passthrough && !matches!(stage.name, "Limit" | "LockRows"))
             .map_or(targets::Demand::Exact, |stage| match stage.name {
-                "Aggregate" | "HashAggregate" | "Group" | "ProjectSet" => targets::Demand::Label,
+                "Aggregate" | "HashAggregate" | "GroupAggregate" | "MixedAggregate" | "Group"
+                | "ProjectSet" => targets::Demand::Label,
                 _ => targets::Demand::Small,
             })
     };
@@ -7051,7 +7742,7 @@ fn plan_pulled_select<'a>(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-                chosen_path,
+                chosen_scan,
             )?;
             // A join's outer relation, and an inner one it rescans directly,
             // may return their physical columns; one under a `Hash` or
@@ -7164,6 +7855,19 @@ fn plan_pulled_select<'a>(
                     StackStr::from_str(scope.names[table])
                 };
                 scan.schema = function_schema(storage, txid, source);
+                let estimate = function_scan_estimate(
+                    storage,
+                    txid,
+                    scope,
+                    table,
+                    source,
+                    statement.where_clause.filter(|_| n == 1),
+                    arena,
+                )?;
+                scan.startup_cost = estimate.startup;
+                scan.total_cost = estimate.total;
+                scan.rows = estimate.rows;
+                scan.width = estimate.width;
                 scan = scan.with_verbose_qual(
                     QualLabel::FunctionCall,
                     function_call(storage, txid, scope, statement, source, arena)?,
@@ -7437,6 +8141,216 @@ fn function_schema(
         .map_or(StackStr::from_str("pg_catalog"), |schema| {
             StackStr::from_str(schema.as_str())
         })
+}
+
+struct FunctionScanEstimate {
+    startup: f64,
+    total: f64,
+    rows: u64,
+    width: u32,
+}
+
+/// `cost_functionscan` of the function `source`, FROM item `table` of
+/// `scope`, under the conditions `predicate`: the function's rows (its
+/// `prorows`, or what its support function computes of constant
+/// arguments), its call evaluated once at startup, then each row with the
+/// conditions; the width is `get_typavgwidth` of its columns.
+fn function_scan_estimate<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    table: usize,
+    source: &crate::sql::ast::TableRef<'a>,
+    predicate: Option<&Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<FunctionScanEstimate, SqlError> {
+    let Some(args) = source.func_args else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a function scan has no function call"
+        ));
+    };
+    let unsupported = |name: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a function scan of {} with a row-estimating support function is not supported",
+            name
+        )
+    };
+    let mark = arena.mark();
+    let result = (|| {
+        let definition = scope
+            .defs
+            .get(table)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "function scan has no columns"))?;
+        let empty = crate::sql::exec::CatalogCols {
+            remote_ctid: false,
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let mut oids = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() > oids.len() {
+            return Err(unsupported(source.table));
+        }
+        for (oid, argument) in oids.iter_mut().zip(args) {
+            *oid = crate::sql::exec::infer_routine_argument_oid(argument, &empty)
+                .unwrap_or(crate::sql::types::oid::UNKNOWN);
+        }
+        let name = match source.schema {
+            Some(schema) => arena
+                .alloc_str_display(format_args!("{schema}.{}", source.table))
+                .map_err(|_| arena_full())?,
+            None => source.table,
+        };
+        let constant = |argument: &'a Expr<'a>| -> Option<Datum<'a>> {
+            if !argument.is_constant(false) {
+                return None;
+            }
+            let catalog = query::storage_catalog(storage, arena, txid);
+            let hooks = crate::sql::eval::EvalHooks {
+                catalog: Some(&catalog),
+                ..crate::sql::eval::NO_HOOKS
+            };
+            crate::sql::eval::eval_full(
+                argument,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &crate::sql::eval::NoColumns,
+                &hooks,
+            )
+            .ok()
+        };
+        // The function's own cost (`procost`) and rows (`prorows`).
+        let (procost, tuples) = match storage.select_routine_call(
+            name,
+            source.func_argument_names,
+            &oids[..args.len()],
+            source.func_variadic,
+            txid,
+            crate::storage::RoutineCallKind::Function,
+        ) {
+            crate::storage::RoutineCallSelection::Stored(slot) => {
+                let routine = storage.routine_for(slot, txid);
+                let set = routine.kind.is_set_returning();
+                (
+                    routine.attributes.cost_bits.map_or(
+                        if matches!(
+                            routine.language,
+                            crate::storage::RoutineLanguage::Native(_)
+                                | crate::storage::RoutineLanguage::Internal
+                        ) {
+                            1.0
+                        } else {
+                            100.0
+                        },
+                        f64::from_bits,
+                    ),
+                    routine
+                        .attributes
+                        .rows_bits
+                        .map_or(if set { 1000.0 } else { 1.0 }, f64::from_bits),
+                )
+            }
+            crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                let signature = crate::sql::catalog::builtin_callable_by_oid(oid)
+                    .ok_or_else(|| unsupported(source.table))?;
+                let rows = match signature.catalog.support_name {
+                    "" | "-" => signature.catalog.rows,
+                    "generate_series_int4_support"
+                    | "generate_series_int8_support"
+                    | "generate_series_numeric_support" => {
+                        let values = arena
+                            .alloc_slice_with(args.len(), |_| None)
+                            .map_err(|_| arena_full())?;
+                        for (value, argument) in values.iter_mut().zip(args) {
+                            *value = constant(argument);
+                        }
+                        let number = |value: &Option<Datum<'_>>| match value {
+                            Some(Datum::Int4(value)) => Some(f64::from(*value)),
+                            Some(Datum::Int8(value)) => Some(*value as f64),
+                            Some(Datum::Int2(value)) => Some(f64::from(*value)),
+                            _ => None,
+                        };
+                        if values
+                            .iter()
+                            .any(|value| matches!(value, Some(Datum::Null)))
+                        {
+                            0.0
+                        } else if signature.catalog.support_name
+                            == "generate_series_numeric_support"
+                            && values.iter().any(Option::is_some)
+                        {
+                            return Err(unsupported(source.table));
+                        } else {
+                            match (
+                                number(&values[0]),
+                                number(&values[1]),
+                                values.get(2).map_or(Some(1.0), number),
+                            ) {
+                                (Some(start), Some(finish), Some(step)) if step != 0.0 => {
+                                    ((finish - start + step) / step).floor()
+                                }
+                                _ => signature.catalog.rows,
+                            }
+                        }
+                    }
+                    "array_unnest_support" if args.len() == 1 => match constant(args[0]) {
+                        Some(Datum::Null) => 0.0,
+                        Some(Datum::Array { raw, .. }) => crate::sql::array::len(raw) as f64,
+                        // `estimate_array_length` of a non-constant array.
+                        _ => 10.0,
+                    },
+                    _ => return Err(unsupported(source.table)),
+                };
+                (signature.catalog.cost, rows)
+            }
+            _ => return Err(unsupported(source.table)),
+        };
+        // `expression_returns_set_rows` clamps the estimate (`clamp_row_est`).
+        let tuples = if tuples <= 1.0 {
+            1.0
+        } else {
+            tuples.round_ties_even()
+        };
+        // The call's argument costs, in `cost_qual_eval`'s half-operator units.
+        let arguments: f64 = args
+            .iter()
+            .map(|argument| query::qual_cost(argument, &empty, storage, txid, arena))
+            .sum();
+        let startup = procost * 0.0025 + arguments / 2.0 * 0.0025;
+        let columns = crate::sql::exec::AliasedDefCols {
+            definition,
+            alias: Some(scope.names[table]),
+            output_aliases: &[],
+            remote_ctid: false,
+        };
+        let (selectivity, qual) = match predicate {
+            Some(predicate) => (
+                predicate_selectivity(storage, scope, table, predicate, txid, arena),
+                query::qual_cost(predicate, &columns, storage, txid, arena) / 2.0 * 0.0025,
+            ),
+            None => (1.0, 0.0),
+        };
+        let rows = (tuples * selectivity).round_ties_even().max(1.0);
+        let width = definition
+            .columns()
+            .iter()
+            .map(|column| query::index_paths::type_average_width(column.ctype, column.type_mod))
+            .sum::<f64>();
+        Ok(FunctionScanEstimate {
+            startup,
+            total: startup + (0.01 + qual) * tuples,
+            rows: rows as u64,
+            width: width as u32,
+        })
+    })();
+    // SAFETY: the estimate holds no arena data.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// A `Function Scan`'s `Function Call`, its call as `VERBOSE` prints it.
@@ -8160,6 +9074,7 @@ fn foreign_modification<'a>(
         txid,
         exposed,
         &table,
+        &[],
         planned.local_where,
         &[],
         None,
@@ -8640,7 +9555,7 @@ fn plan_keys(
                 KeyLabel::Group => {
                     crate::sql::catalog::deparse::deparse_shown(&context, expression, arena)
                 }
-                KeyLabel::None => Ok(None),
+                KeyLabel::None | KeyLabel::Sets => Ok(None),
             };
             let (collated, part) = match collated {
                 Ok(Some(part)) => (true, Ok(Some(part))),
@@ -9015,6 +9930,7 @@ fn physical_scan_node(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     }
 }
 
@@ -9189,6 +10105,7 @@ fn push_set_tree(
                 inner_unique: false,
                 bitmap_index_estimate: None,
                 analyze_unsupported: None,
+                planned_partitions: None,
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -9649,9 +10566,7 @@ fn write_initplans<'a, 'e>(
             txid,
             select,
             None,
-            block.child(Segment::Sublink(
-                core::ptr::from_ref(*select) as usize as u64
-            )),
+            block.child(Segment::Sublink(select.instrument_identity())),
             arena,
         );
         SUBLINK_DEPTH.with(|depth| depth.set(depth.get() - 1));
@@ -9810,6 +10725,7 @@ fn plan_write<'a>(
         inner_unique: false,
         bitmap_index_estimate: None,
         analyze_unsupported: None,
+        planned_partitions: None,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -10043,17 +10959,22 @@ fn plan_write<'a>(
         }) && !scope.lateral[..scope.n].iter().any(|&lateral| lateral);
         if inner_joins && (0..scope.n).all(|table| scope.defs.stored(table).is_some()) {
             let relations = arena
-                .alloc_slice_with(relations_count, |relation| {
-                    if relation == 0 {
-                        JoinRelation::table(target_exposed, &target_definition)
-                    } else {
-                        JoinRelation::table(
-                            scope.names[relation - 1],
-                            scope.defs.stored(relation - 1).expect("stored relation"),
-                        )
-                    }
+                .alloc_slice_with(relations_count, |_| {
+                    JoinRelation::table(target_exposed, &target_definition)
                 })
                 .map_err(|_| arena_full())?;
+            // A FROM table's conditions print the column aliases it is read
+            // under.
+            let items =
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+            for (table, (relation, item)) in relations[1..].iter_mut().zip(items).enumerate() {
+                *relation = JoinRelation::aliased(
+                    scope.names[table],
+                    scope.defs.stored(table).expect("stored relation"),
+                    item.col_alias,
+                    arena,
+                )?;
+            }
             let display = arena
                 .alloc_slice_with(relations_count, |position| {
                     if position == 0 {
@@ -10452,6 +11373,7 @@ fn plan_write<'a>(
                     txid,
                     exposed,
                     &definition,
+                    &[],
                     predicate,
                     security,
                     plan,
@@ -10546,6 +11468,7 @@ fn plan_write<'a>(
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
+                &[],
                 predicate,
                 security,
                 index.as_ref().map(|(plan, _)| plan),
@@ -10557,6 +11480,7 @@ fn plan_write<'a>(
                 txid,
                 alias.unwrap_or(target.name),
                 &definition,
+                &[],
                 predicate,
                 security,
                 index.as_ref().map(|(plan, _)| plan),
@@ -10644,12 +11568,22 @@ fn plan_joined_write<'a, 'e>(
     let target_table = (*storage.table_def(target_slot, txid)).clone();
     let source_table = (*storage.table_def(join.source_slot, txid)).clone();
     let source_name = join.source_name;
+    // The FROM table's conditions print the column aliases it is read under.
+    let source_aliases = match statement {
+        Stmt::Update(update) => update.from.and_then(|from| from.base.col_alias),
+        Stmt::Delete(delete) => delete.using.and_then(|using| using.base.col_alias),
+        _ => None,
+    };
+    let aliased_source = crate::sql::catalog::deparse::AliasedTable {
+        table: &source_table,
+        aliases: source_aliases.unwrap_or(&[]),
+    };
     let lists = targets::RelationTargets::joined_write(
         storage,
         txid,
         &target_table,
         exposed,
-        &source_table,
+        &aliased_source,
         source_name,
         expansion.is_some(),
         assignments,
@@ -10662,7 +11596,7 @@ fn plan_joined_write<'a, 'e>(
             if at == 0 {
                 crate::sql::catalog::deparse::Joined::new(exposed, &target_table)
             } else {
-                crate::sql::catalog::deparse::Joined::new(source_name, &source_table)
+                crate::sql::catalog::deparse::Joined::new(source_name, &aliased_source)
             }
         })
         .map_err(|_| arena_full())?;
@@ -10769,6 +11703,7 @@ fn plan_joined_write<'a, 'e>(
             txid,
             exposed,
             &target_table,
+            &[],
             conditions.target,
             &[],
             None,
@@ -10800,6 +11735,7 @@ fn plan_joined_write<'a, 'e>(
             txid,
             source_name,
             &source_table,
+            source_aliases.unwrap_or(&[]),
             conditions.source,
             &[],
             None,
@@ -11415,6 +12351,7 @@ fn plan_merge<'a, 'e>(
             txid,
             exposed,
             target_table,
+            &[],
             target_condition,
             &[],
             None,
@@ -11449,6 +12386,7 @@ fn plan_merge<'a, 'e>(
                     txid,
                     source_name,
                     definition,
+                    &[],
                     source_condition,
                     &[],
                     None,
@@ -11757,6 +12695,7 @@ fn expanded_write<'e>(
         txid,
         exposed,
         &definition,
+        &[],
         predicate,
         security,
         None,
@@ -11768,6 +12707,7 @@ fn expanded_write<'e>(
         txid,
         exposed,
         &definition,
+        &[],
         predicate,
         security,
         None,
@@ -12320,6 +13260,45 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(line, "Inner Unique: true");
             emit(line.as_str())?;
         }
+        if node.keys.label == KeyLabel::Sets {
+            let records = if options.verbose {
+                node.keys.verbose.as_str()
+            } else {
+                node.keys.plain.as_str()
+            };
+            // The lines after a rollup's `Sort Key` are indented by two.
+            let mut extra = 0;
+            for record in records.split(GROUPING_SET_SEPARATOR) {
+                let mut chars = record.chars();
+                let tag = chars.next().unwrap_or('B');
+                let items = chars.as_str();
+                let label = match tag {
+                    'B' => {
+                        extra = 0;
+                        continue;
+                    }
+                    'S' => "Sort Key",
+                    'H' => "Hash Key",
+                    _ => "Group Key",
+                };
+                let mut line = StackStr::<2048>::new();
+                for _ in 0..node_indent(node) + extra {
+                    let _ = write!(line, " ");
+                }
+                if items.is_empty() {
+                    let _ = write!(line, "{label}: ()");
+                } else {
+                    let _ = write!(line, "{label}: ");
+                    for (at, key) in items.split(KEY_SEPARATOR).enumerate() {
+                        let _ = write!(line, "{}{key}", if at == 0 { "" } else { ", " });
+                    }
+                }
+                emit(line.as_str())?;
+                if tag == 'S' {
+                    extra = 2;
+                }
+            }
+        }
         if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
             let mut line = StackStr::<2048>::new();
             for _ in 0..node_indent(node) {
@@ -12363,6 +13342,16 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
+        }
+        if options.costs
+            && let Some(partitions) = node.planned_partitions.filter(|&partitions| partitions > 0)
+        {
+            let mut line = StackStr::<64>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "Planned Partitions: {partitions}");
+            emit(line.as_str())?;
         }
         for line in index_scan_details(node, node_actual) {
             let mut text = StackStr::<128>::new();
@@ -12629,16 +13618,18 @@ fn plan_statement_nodes<'a>(
     // raises the folding's notices and errors (`eval_const_expressions`).
     // PostgreSQL's folding also replaces a call of a SQL function whose body
     // is one plain expression by that expression (`inline_function`), which
-    // then prints, costs, estimates and matches index keys in its place;
-    // pos3ql plans the call itself, so it refuses such a statement.
-    let (statement, inlinable) = crate::sql::eval::folding_inlinable_calls(|| {
+    // then prints, costs, estimates and matches index keys in its place. A
+    // call the folding could not decide (an argument reading an enclosing
+    // query's column, a packed variadic or polymorphic call, a `BEGIN
+    // ATOMIC` body) is refused.
+    let (statement, uninlined) = crate::sql::eval::folding_uninlined_calls(|| {
         fold_statement(storage, txid, statement, arena)
     });
     let statement = statement?;
-    if inlinable {
+    if uninlined {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a call of a SQL function PostgreSQL inlines is not supported"
+            "EXPLAIN of a call of a SQL function PostgreSQL inlines, with an outer column, packed variadic or polymorphic argument or a BEGIN ATOMIC body, is not supported"
         ));
     }
     if block != BlockId::ROOT {
@@ -12779,7 +13770,7 @@ fn fold_statement<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let folded = match statement {
         Stmt::Select(select) if select.with.iter().all(|cte| cte.dml.is_none()) => {
-            let folded = query::fold_select_constants(select, arena, storage, txid)?;
+            let folded = preprocess_select(select, storage, txid, arena)?;
             if core::ptr::eq(folded, select) {
                 return Ok(statement);
             }
@@ -12799,6 +13790,134 @@ fn fold_statement<'a>(
     arena
         .alloc(folded)
         .map(|folded| &*folded)
+        .map_err(|_| arena_full())
+}
+
+/// `subquery_planner`'s preprocessing of a query level: its views expanded
+/// (the rewriter's), its set-returning SQL functions in FROM inlined, each
+/// subquery in FROM preprocessed in turn, then its expressions folded, so a
+/// subquery the planner pulls up brings its folded, inlined expressions.
+fn preprocess_select<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let expanded = if select.with.is_empty() && storage.has_any_view() {
+        query::expand_ctes(select, storage, txid, arena)?
+    } else {
+        select
+    };
+    let inlined = inline_set_returning_functions(expanded, storage, txid, arena)?;
+    let inlined = match &inlined.from {
+        Some(from) if inlined.with.is_empty() => {
+            let preprocess = |item: &crate::sql::ast::TableRef<'a>| {
+                Ok::<_, SqlError>(match item.subquery {
+                    Some(body) if !item.lateral && item.join_members.is_none() => {
+                        let folded = preprocess_select(body, storage, txid, arena)?;
+                        (!core::ptr::eq(folded, body)).then_some(folded)
+                    }
+                    _ => None,
+                })
+            };
+            let base = preprocess(&from.base)?;
+            let mut joins = None;
+            for (at, join) in from.joins.iter().enumerate() {
+                if let Some(folded) = preprocess(&join.table)? {
+                    let copy = match &mut joins {
+                        Some(copy) => copy,
+                        None => joins.insert(
+                            arena
+                                .alloc_slice_copy(from.joins)
+                                .map_err(|_| arena_full())?,
+                        ),
+                    };
+                    copy[at].table.subquery = Some(folded);
+                }
+            }
+            if base.is_none() && joins.is_none() {
+                inlined
+            } else {
+                let mut copy = *inlined;
+                let mut from = *from;
+                if let Some(base) = base {
+                    from.base.subquery = Some(base);
+                }
+                if let Some(joins) = joins {
+                    from.joins = joins;
+                }
+                copy.from = Some(from);
+                arena
+                    .alloc(copy)
+                    .map(|copy| &*copy)
+                    .map_err(|_| arena_full())?
+            }
+        }
+        _ => inlined,
+    };
+    let folded = query::fold_select_constants(inlined, arena, storage, txid)?;
+    Ok(
+        if core::ptr::eq(folded, expanded) && core::ptr::eq(expanded, select) {
+            select
+        } else {
+            folded
+        },
+    )
+}
+
+/// `inline_set_returning_functions`: each FROM item calling a SQL function
+/// PostgreSQL inlines becomes a subquery of its body, which the planner then
+/// pulls up like any other.
+fn inline_set_returning_functions<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    use crate::sql::planner_inputs::inline::{SetInlining, inline_set_returning_call};
+    let Some(from) = &select.from else {
+        return Ok(select);
+    };
+    let inline = |item: &crate::sql::ast::TableRef<'a>| {
+        Ok(
+            match inline_set_returning_call(item, storage, txid, arena)? {
+                SetInlining::Kept => None,
+                SetInlining::Inlined(inlined) => Some(*inlined),
+                SetInlining::Unmodeled => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "EXPLAIN of a SQL function in FROM PostgreSQL inlines, with a default, variadic, polymorphic or lateral argument, a body with WITH, windows or a column coercion, is not supported"
+                    ));
+                }
+            },
+        )
+    };
+    let base = inline(&from.base)?;
+    let mut joins = None;
+    for (at, join) in from.joins.iter().enumerate() {
+        if let Some(inlined) = inline(&join.table)? {
+            let copy = match &mut joins {
+                Some(copy) => copy,
+                None => joins.insert(
+                    arena
+                        .alloc_slice_copy(from.joins)
+                        .map_err(|_| arena_full())?,
+                ),
+            };
+            copy[at].table = inlined;
+        }
+    }
+    if base.is_none() && joins.is_none() {
+        return Ok(select);
+    }
+    let mut copy = *select;
+    copy.from = Some(crate::sql::ast::FromClause {
+        base: base.unwrap_or(from.base),
+        joins: joins.map_or(from.joins, |joins| &*joins),
+    });
+    arena
+        .alloc(copy)
+        .map(|copy| &*copy)
         .map_err(|_| arena_full())
 }
 
@@ -13095,6 +14214,36 @@ impl<'a> Document<'a> {
         }
     }
 
+    /// `ExplainPropertyListNested`: a list inside a list, written inline.
+    fn nested_list<'v>(&mut self, label: &str, items: impl Iterator<Item = &'v str>) {
+        match self.format {
+            ExplainFormat::Json => {
+                self.json_line_ending();
+                self.spaces(self.indent * 2);
+                self.push("[");
+                for (index, item) in items.enumerate() {
+                    if index != 0 {
+                        self.push(", ");
+                    }
+                    self.json_text(item);
+                }
+                self.push("]");
+            }
+            ExplainFormat::Yaml => {
+                self.yaml_line_starting();
+                self.push("- [");
+                for (index, item) in items.enumerate() {
+                    if index != 0 {
+                        self.push(", ");
+                    }
+                    self.json_text(item);
+                }
+                self.push("]");
+            }
+            ExplainFormat::Xml | ExplainFormat::Text => self.list(label, items),
+        }
+    }
+
     /// `ExplainDummyGroup` without a label: a group with no contents.
     fn dummy_group(&mut self, kind: &str) {
         match self.format {
@@ -13184,14 +14333,23 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
             kind.node_type = "Aggregate";
             kind.strategy = Some("Hashed");
         }
-        "Nested Loop" | "Hash Join" => kind.join_type = Some("Inner"),
+        "GroupAggregate" => {
+            kind.node_type = "Aggregate";
+            kind.strategy = Some("Sorted");
+        }
+        "MixedAggregate" => {
+            kind.node_type = "Aggregate";
+            kind.strategy = Some("Mixed");
+        }
+        "Nested Loop" | "Hash Join" | "Merge Join" => kind.join_type = Some("Inner"),
         // `Nested Loop Left Join`, `Hash Right Semi Join`, ...: the node
         // type, then the join type.
         _ => {
             let joined = name
                 .strip_prefix("Nested Loop ")
                 .map(|rest| ("Nested Loop", rest))
-                .or_else(|| name.strip_prefix("Hash ").map(|rest| ("Hash Join", rest)));
+                .or_else(|| name.strip_prefix("Hash ").map(|rest| ("Hash Join", rest)))
+                .or_else(|| name.strip_prefix("Merge ").map(|rest| ("Merge Join", rest)));
             if let Some((node_type, rest)) = joined
                 && let Some(join_type) = rest.strip_suffix(" Join")
             {
@@ -13355,6 +14513,61 @@ fn structured_node(
     if kind.join_type.is_some() {
         document.boolean("Inner Unique", node.inner_unique);
     }
+    if node.keys.label == KeyLabel::Sets {
+        let records = if options.verbose {
+            node.keys.verbose.as_str()
+        } else {
+            node.keys.plain.as_str()
+        };
+        document.open_group("Grouping Sets", Some("Grouping Sets"), false);
+        // The open groups: a rollup's, then its key set's.
+        let mut open: Option<&str> = None;
+        let close = |document: &mut Document<'_>, open: &mut Option<&str>| {
+            if let Some(keys) = open.take() {
+                document.close_group(keys, false);
+                document.close_group("Grouping Set", true);
+            }
+        };
+        let mut started = false;
+        for record in records.split(GROUPING_SET_SEPARATOR) {
+            let mut chars = record.chars();
+            let tag = chars.next().unwrap_or('B');
+            let items = chars.as_str();
+            let entries = items.split(KEY_SEPARATOR).filter(|_| !items.is_empty());
+            match tag {
+                'B' => {
+                    if started {
+                        if open.is_none() {
+                            document.close_group("Grouping Set", true);
+                        }
+                        close(document, &mut open);
+                    }
+                    started = true;
+                    document.open_group("Grouping Set", None, true);
+                }
+                'S' => document.list("Sort Key", entries),
+                _ => {
+                    let (name, set) = if tag == 'H' {
+                        ("Hash Keys", "Hash Key")
+                    } else {
+                        ("Group Keys", "Group Key")
+                    };
+                    if open.is_none() {
+                        document.open_group(name, Some(name), false);
+                        open = Some(name);
+                    }
+                    document.nested_list(set, entries);
+                }
+            }
+        }
+        if started {
+            if open.is_none() {
+                document.close_group("Grouping Set", true);
+            }
+            close(document, &mut open);
+        }
+        document.close_group("Grouping Sets", false);
+    }
     if let Some((label, keys)) = node.keys.shown(options.verbose) {
         document.list(label, keys);
     }
@@ -13383,6 +14596,11 @@ fn structured_node(
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));
         }
+    }
+    if options.costs
+        && let Some(partitions) = node.planned_partitions
+    {
+        document.number("Planned Partitions", partitions);
     }
     let counters = match node_actual {
         NodeActual::Unmeasured => None,

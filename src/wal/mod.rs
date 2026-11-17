@@ -176,6 +176,7 @@ wal_record_kinds! {
     KIND_CREATE_ENUM_V2 = 147;
     KIND_CREATE_ENUM_V3 = 149;
     KIND_ANALYZE_EXTENDED_STATISTICS_V2 = 150;
+    KIND_ANALYZE_EXTENDED_STATISTICS_V3 = 180;
     KIND_CREATE_DOMAIN_TYPED = 151;
     KIND_CREATE_VIEW_BOUND = 152;
     KIND_UPSERT_V2 = 153;
@@ -832,42 +833,56 @@ pub(crate) fn decode_builtin_routine_image(
 pub(crate) enum WalExtendedStatisticsData<'a> {
     Captured(&'a ExtendedStatisticsData),
     Encoded(&'a [u8]),
-    LegacyEnumHashes(&'a [u8]),
 }
 
-impl WalExtendedStatisticsData<'_> {
-    pub(crate) fn has_legacy_enum_hashes(self) -> bool {
-        matches!(self, Self::LegacyEnumHashes(_))
-    }
+/// Leads the extended-statistics image of the current format; journals of
+/// earlier formats are rejected.
+const EXTENDED_STATISTICS_MAGIC: &[u8; 4] = b"XST3";
 
+impl WalExtendedStatisticsData<'_> {
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(data) => {
-                2 + 8 * 4
-                    + data.dependencies_ppm.len() * 4
+                EXTENDED_STATISTICS_MAGIC.len()
+                    + 2
+                    + 8 * 2
+                    + 1
+                    + 2
+                    + usize::from(data.ndistinct_built) * data.ndistinct.len() * 8
+                    + 1
+                    + 2
+                    + usize::from(data.dependencies_built) * data.dependency_degree_bits.len() * 8
                     + data.expression_statistics.len() * (1 + 4 + 8 + 4 + 4)
                     + 2
                     + data.mcv[..usize::from(data.n_mcv)]
                         .iter()
                         .map(|entry| 8 + 8 + 2 + entry.values.as_str().len())
                         .sum::<usize>()
-                    + 4
-                    + usize::from(data.n_mcv) * 8
             }
-            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => bytes.len(),
+            Self::Encoded(bytes) => bytes.len(),
         }
     }
 
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(data) => {
-                let mut ok = buffer.append(&[u8::from(data.valid), u8::from(data.inherited)])
+                let mut ok = buffer.append(EXTENDED_STATISTICS_MAGIC)
+                    && buffer.append(&[u8::from(data.valid), u8::from(data.inherited)])
                     && buffer.append(&data.analyzed_generation.to_le_bytes())
-                    && buffer.append(&data.rows.to_le_bytes())
-                    && buffer.append(&data.non_null_rows.to_le_bytes())
-                    && buffer.append(&data.distinct_values.to_le_bytes());
-                for strength in data.dependencies_ppm {
-                    ok &= buffer.append(&strength.to_le_bytes());
+                    && buffer.append(&data.rows.to_le_bytes());
+                ok &= buffer.append(&[u8::from(data.ndistinct_built)])
+                    && buffer.append(&(data.ndistinct.len() as u16).to_le_bytes());
+                if data.ndistinct_built {
+                    for value in data.ndistinct {
+                        ok &= buffer.append(&value.to_le_bytes());
+                    }
+                }
+                ok &= buffer.append(&[u8::from(data.dependencies_built)])
+                    && buffer.append(&(data.dependency_degree_bits.len() as u16).to_le_bytes());
+                if data.dependencies_built {
+                    for bits in data.dependency_degree_bits {
+                        ok &= buffer.append(&bits.to_le_bytes());
+                    }
                 }
                 for column in data.expression_statistics {
                     ok &= buffer.append(&[u8::from(column.valid)])
@@ -878,32 +893,26 @@ impl WalExtendedStatisticsData<'_> {
                 }
                 ok &= buffer.append(&data.n_mcv.to_le_bytes());
                 for entry in &data.mcv[..usize::from(data.n_mcv)] {
-                    ok &= buffer.append(&entry.hash.to_le_bytes())
-                        && buffer.append(&entry.count.to_le_bytes())
+                    ok &= buffer.append(&entry.count.to_le_bytes())
+                        && buffer.append(&entry.base_frequency_bits.to_le_bytes())
                         && buffer.append(&(entry.values.as_str().len() as u16).to_le_bytes())
                         && buffer.append(entry.values.as_str().as_bytes());
                 }
-                ok &= buffer.append(b"MCV2");
-                for entry in &data.mcv[..usize::from(data.n_mcv)] {
-                    ok &= buffer.append(&entry.base_frequency_bits.to_le_bytes());
-                }
                 ok
             }
-            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => buffer.append(bytes),
+            Self::Encoded(bytes) => buffer.append(bytes),
         }
     }
 
     pub(crate) fn materialize(self) -> Result<ExtendedStatisticsData, SqlError> {
         match self {
             Self::Captured(data) => Ok(*data),
-            Self::Encoded(bytes) | Self::LegacyEnumHashes(bytes) => {
-                decode_extended_statistics_data(bytes).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "corrupt extended statistics in journal"
-                    )
-                })
-            }
+            Self::Encoded(bytes) => decode_extended_statistics_data(bytes).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt extended statistics in journal"
+                )
+            }),
         }
     }
 }
@@ -3715,13 +3724,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Analyze { .. } => KIND_ANALYZE,
         WalOp::SetExtendedStatistics { .. } => KIND_SET_EXTENDED_STATISTICS,
         WalOp::DropExtendedStatistics { .. } => KIND_DROP_EXTENDED_STATISTICS,
-        WalOp::AnalyzeExtendedStatistics { statistics, .. } => {
-            if statistics.has_legacy_enum_hashes() {
-                KIND_ANALYZE_EXTENDED_STATISTICS
-            } else {
-                KIND_ANALYZE_EXTENDED_STATISTICS_V2
-            }
-        }
+        WalOp::AnalyzeExtendedStatistics { .. } => KIND_ANALYZE_EXTENDED_STATISTICS_V3,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
         WalOp::RenameRole { .. } => KIND_RENAME_ROLE,
@@ -7694,56 +7697,58 @@ fn decode_table_statistics(
 }
 
 fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsData> {
-    let mut at = 0usize;
-    let valid = match *payload.get(at)? {
-        0 => false,
-        1 => true,
-        _ => return None,
+    let mut at = EXTENDED_STATISTICS_MAGIC.len();
+    if payload.get(..at)? != EXTENDED_STATISTICS_MAGIC {
+        return None;
+    }
+    let take_bool = |at: &mut usize| {
+        let value = match *payload.get(*at)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        *at += 1;
+        Some(value)
     };
-    at += 1;
-    let inherited = match *payload.get(at)? {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    at += 1;
     let take_u64 = |at: &mut usize| {
         let value = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
         *at += 8;
         Some(value)
     };
-    let analyzed_generation = take_u64(&mut at)?;
-    let rows = take_u64(&mut at)?;
-    let non_null_rows = take_u64(&mut at)?;
-    let distinct_values = take_u64(&mut at)?;
-    let mut data = ExtendedStatisticsData {
-        valid,
-        inherited,
-        analyzed_generation,
-        rows,
-        non_null_rows,
-        distinct_values,
-        dependencies_ppm: [0; crate::storage::MAX_EXTENDED_STATISTICS_KEYS
-            * crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        expression_statistics: [ColumnStatistics::EMPTY;
-            crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
-        mcv: [ExtendedStatisticsMcv::EMPTY; crate::storage::MAX_EXTENDED_STATISTICS_MCV],
-        n_mcv: 0,
+    let take_u16 = |at: &mut usize| {
+        let value = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+        *at += 2;
+        Some(usize::from(value))
     };
-    for strength in &mut data.dependencies_ppm {
-        *strength = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-        at += 4;
-        if *strength > 1_000_000 {
-            return None;
+    let mut data = ExtendedStatisticsData::EMPTY;
+    data.valid = take_bool(&mut at)?;
+    data.inherited = take_bool(&mut at)?;
+    data.analyzed_generation = take_u64(&mut at)?;
+    data.rows = take_u64(&mut at)?;
+    data.ndistinct_built = take_bool(&mut at)?;
+    if take_u16(&mut at)? != data.ndistinct.len() {
+        return None;
+    }
+    if data.ndistinct_built {
+        for value in &mut data.ndistinct {
+            *value = take_u64(&mut at)?;
+        }
+    }
+    data.dependencies_built = take_bool(&mut at)?;
+    if take_u16(&mut at)? != data.dependency_degree_bits.len() {
+        return None;
+    }
+    if data.dependencies_built {
+        for bits in &mut data.dependency_degree_bits {
+            *bits = take_u64(&mut at)?;
+            let degree = f64::from_bits(*bits);
+            if !(0.0..=1.0).contains(&degree) {
+                return None;
+            }
         }
     }
     for column in &mut data.expression_statistics {
-        let column_valid = match *payload.get(at)? {
-            0 => false,
-            1 => true,
-            _ => return None,
-        };
-        at += 1;
+        let column_valid = take_bool(&mut at)?;
         let null_fraction = f32::from_bits(u32::from_le_bytes(
             payload.get(at..at + 4)?.try_into().ok()?,
         ));
@@ -7766,16 +7771,18 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
             return None;
         }
     }
-    let n_mcv = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-    at += 2;
+    let n_mcv = take_u16(&mut at)?;
     if n_mcv > crate::storage::MAX_EXTENDED_STATISTICS_MCV {
         return None;
     }
     for entry in &mut data.mcv[..n_mcv] {
-        let hash = take_u64(&mut at)?;
         let count = take_u64(&mut at)?;
-        let length = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-        at += 2;
+        let base_frequency_bits = take_u64(&mut at)?;
+        let base_frequency = f64::from_bits(base_frequency_bits);
+        if !(0.0..=1.0).contains(&base_frequency) {
+            return None;
+        }
+        let length = take_u16(&mut at)?;
         let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
         at += length;
         let values = StackStr::from_str(value);
@@ -7783,30 +7790,12 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
             return None;
         }
         *entry = ExtendedStatisticsMcv {
-            valid: true,
-            hash,
             count,
-            base_frequency_bits: 0,
+            base_frequency_bits,
             values,
         };
     }
     data.n_mcv = n_mcv as u16;
-    if at == payload.len() {
-        // Legacy journal records predate exact MCV base frequencies. Zero
-        // deliberately select the compatibility estimate in catalog code.
-        return Some(data);
-    }
-    if payload.get(at..at + 4)? != b"MCV2" {
-        return None;
-    }
-    at += 4;
-    for entry in &mut data.mcv[..n_mcv] {
-        entry.base_frequency_bits = take_u64(&mut at)?;
-        let base_frequency = f64::from_bits(entry.base_frequency_bits);
-        if !base_frequency.is_finite() || !(0.0..=1.0).contains(&base_frequency) {
-            return None;
-        }
-    }
     (at == payload.len()).then_some(data)
 }
 
@@ -12397,28 +12386,23 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropExtendedStatistics { schema, name })
         }),
-        KIND_ANALYZE_EXTENDED_STATISTICS | KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
-            decode_large_op(|| {
-                let schema = take_name(&mut at)?;
-                let name = take_name(&mut at)?;
-                let encoded = payload.get(at..)?;
-                let decoded = decode_extended_statistics_data(encoded)?;
-                if kind == KIND_ANALYZE_EXTENDED_STATISTICS_V2
-                    && WalExtendedStatisticsData::Captured(&decoded).encoded_len() != encoded.len()
-                {
-                    return None;
-                }
-                Some(WalOp::AnalyzeExtendedStatistics {
-                    schema,
-                    name,
-                    statistics: if kind == KIND_ANALYZE_EXTENDED_STATISTICS {
-                        WalExtendedStatisticsData::LegacyEnumHashes(encoded)
-                    } else {
-                        WalExtendedStatisticsData::Encoded(encoded)
-                    },
-                })
+        // Statistics of earlier formats (hashed MCV items, approximate
+        // estimators) are rejected; ANALYZE computes them again.
+        KIND_ANALYZE_EXTENDED_STATISTICS | KIND_ANALYZE_EXTENDED_STATISTICS_V2 => None,
+        KIND_ANALYZE_EXTENDED_STATISTICS_V3 => decode_large_op(|| {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let encoded = payload.get(at..)?;
+            let decoded = decode_extended_statistics_data(encoded)?;
+            if WalExtendedStatisticsData::Captured(&decoded).encoded_len() != encoded.len() {
+                return None;
+            }
+            Some(WalOp::AnalyzeExtendedStatistics {
+                schema,
+                name,
+                statistics: WalExtendedStatisticsData::Encoded(encoded),
             })
-        }
+        }),
         KIND_UPSERT_ROLE => decode_large_op(|| {
             let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
                 payload.get(at..at + 4)?.try_into().ok()?,
@@ -14840,22 +14824,22 @@ mod tests {
     }
 
     #[test]
-    fn extended_statistics_codec_retains_exact_mcv_base_frequency() {
+    fn extended_statistics_codec_round_trips_every_kind_and_rejects_bad_degrees() {
         let mut data = crate::storage::ExtendedStatisticsData::EMPTY;
         data.valid = true;
         data.rows = 100;
-        data.non_null_rows = 100;
-        data.distinct_values = 3;
+        data.ndistinct_built = true;
+        data.ndistinct[0] = 7;
+        data.dependencies_built = true;
+        data.dependency_degree_bits[1] = 0.5f64.to_bits();
         data.mcv[0] = crate::storage::ExtendedStatisticsMcv {
-            valid: true,
-            hash: 17,
             count: 80,
             base_frequency_bits: 0.81f64.to_bits(),
             values: StackStr::from_str("{1,1}"),
         };
         data.n_mcv = 1;
         let captured = WalExtendedStatisticsData::Captured(&data);
-        let mut budget = Budget::new(4096);
+        let mut budget = Budget::new(65536);
         let mut encoded = FixedBuf::new(
             &mut budget,
             "extended statistics wal",
@@ -14863,18 +14847,28 @@ mod tests {
         )
         .unwrap();
         assert!(captured.append(&mut encoded));
+        assert_eq!(encoded.len(), captured.encoded_len());
         assert_eq!(
             WalExtendedStatisticsData::Encoded(encoded.readable())
                 .materialize()
                 .unwrap(),
             data
         );
-
-        let legacy_len = encoded.len() - 4 - core::mem::size_of::<u64>();
-        let legacy = WalExtendedStatisticsData::Encoded(&encoded.readable()[..legacy_len])
-            .materialize()
-            .unwrap();
-        assert_eq!(legacy.mcv[0].base_frequency_bits, 0);
+        // An earlier format, without the leading magic, is rejected.
+        assert!(
+            WalExtendedStatisticsData::Encoded(&encoded.readable()[4..])
+                .materialize()
+                .is_err()
+        );
+        data.dependency_degree_bits[1] = 1.5f64.to_bits();
+        let captured = WalExtendedStatisticsData::Captured(&data);
+        encoded.clear();
+        assert!(captured.append(&mut encoded));
+        assert!(
+            WalExtendedStatisticsData::Encoded(encoded.readable())
+                .materialize()
+                .is_err()
+        );
     }
 
     #[test]
@@ -15072,7 +15066,7 @@ mod tests {
                 },
             ),
             (
-                KIND_ANALYZE_EXTENDED_STATISTICS_V2,
+                KIND_ANALYZE_EXTENDED_STATISTICS_V3,
                 WalOp::AnalyzeExtendedStatistics {
                     schema: "public",
                     name: "state_statistics",
@@ -15141,14 +15135,13 @@ mod tests {
                             columns.default_at(0)
                         );
                     }
-                    KIND_ANALYZE_EXTENDED_STATISTICS_V2 => {
-                        let old = decode_op(KIND_ANALYZE_EXTENDED_STATISTICS, payload.readable())
-                            .unwrap();
-                        assert_eq!(op_kind(&old), KIND_ANALYZE_EXTENDED_STATISTICS);
-                        let WalOp::AnalyzeExtendedStatistics { statistics, .. } = old else {
-                            panic!("expected old statistics");
-                        };
-                        assert!(statistics.has_legacy_enum_hashes());
+                    KIND_ANALYZE_EXTENDED_STATISTICS_V3 => {
+                        for retired in [
+                            KIND_ANALYZE_EXTENDED_STATISTICS,
+                            KIND_ANALYZE_EXTENDED_STATISTICS_V2,
+                        ] {
+                            assert!(decode_op(retired, payload.readable()).is_none());
+                        }
                     }
                     KIND_UPSERT_V2 => {
                         let old = decode_op(KIND_UPSERT, payload.readable()).unwrap();

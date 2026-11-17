@@ -101,6 +101,7 @@ impl<'a> TreePath<'a> {
             searches_unmodeled: false,
             sort_cost: self.sort_cost,
             limit_cost: self.limit_cost,
+            grouped: None,
         }
     }
 }
@@ -815,6 +816,7 @@ pub(super) fn tree_path<'a>(
         },
         costs,
         indexes: &[],
+        extended: &[],
         arena,
     };
     let groups = |presorted: usize| {

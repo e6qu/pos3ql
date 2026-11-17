@@ -1142,6 +1142,9 @@ pub(crate) struct JoinedWriteJoin<'a> {
     /// filter each relation's scan, `hash` holds the key equalities and
     /// `join` the join's filter.
     pub(crate) conditions: MergeConditions<'a>,
+    /// The FROM table's own conditions as its row alone reads them: by its
+    /// columns' names where the query reads them under column aliases.
+    pub(crate) source_row_condition: Option<&'a Expr<'a>>,
 }
 
 /// One hash key of a joined write: the expressions an equality between the
@@ -1153,6 +1156,8 @@ pub(crate) struct JoinedWriteJoin<'a> {
 pub(crate) struct JoinedWriteKey<'a> {
     pub(crate) target: &'a Expr<'a>,
     pub(crate) source: &'a Expr<'a>,
+    /// `source` as the FROM table's row alone reads it.
+    pub(crate) source_row: &'a Expr<'a>,
     pub(crate) target_column: Option<usize>,
     pub(crate) source_column: Option<usize>,
 }
@@ -1161,6 +1166,7 @@ impl JoinedWriteKey<'_> {
     const NONE: Self = Self {
         target: &Expr::Null,
         source: &Expr::Null,
+        source_row: &Expr::Null,
         target_column: None,
         source_column: None,
     };
@@ -1289,7 +1295,6 @@ pub(crate) fn joined_write_join<'a>(
         || base.rows_from.is_some()
         || base.join_members.is_some()
         || base.sample.is_some()
-        || base.col_alias.is_some()
         || base.lateral
         || leaves.is_empty()
     {
@@ -1355,6 +1360,7 @@ pub(crate) fn joined_write_join<'a>(
         method: JoinedWriteMethod::Rescanned,
         inner_unique: false,
         conditions: MergeConditions::default(),
+        source_row_condition: None,
     };
     let column = |side: &Expr<'_>| match side {
         Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
@@ -1449,6 +1455,7 @@ pub(crate) fn joined_write_join<'a>(
         plan.keys[plan.key_count] = JoinedWriteKey {
             target: target_side,
             source: source_side,
+            source_row: source_side,
             target_column,
             source_column,
         };
@@ -1479,6 +1486,7 @@ pub(crate) fn joined_write_join<'a>(
         *slot = super::and_where(*slot, Some(conjunct), arena)?;
     }
     plan.conditions = conditions;
+    plan.source_row_condition = conditions.source;
     // The columns each relation's conditions read, and whether only as a
     // hash key.
     let reads = |table: usize, column_index: usize| {
@@ -1545,6 +1553,40 @@ pub(crate) fn joined_write_join<'a>(
         &|column| reads(1, column),
         &|column| key_only(1, column),
     );
+    // The FROM table's own conditions and keys read its row alone, by its
+    // columns' names: a column alias reads the column it names.
+    if base.col_alias.is_some() {
+        let source_name = plan.source_name;
+        let renamed = |expression: &'a Expr<'a>| {
+            crate::sql::ast::rewrite_expression(
+                expression,
+                arena,
+                &mut |node: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, crate::mem::arena::ArenaFull> {
+                    let Expr::Column { qualifier, name } = node else {
+                        return Ok(None);
+                    };
+                    let Ok(super::ResolvedColumn::Table(1, column)) =
+                        scope.find_column(*qualifier, name)
+                    else {
+                        return Ok(None);
+                    };
+                    let definition = scope.defs.stored(1).expect("a plain FROM table");
+                    let actual = arena.alloc_str(definition.columns()[column].name.as_str())?;
+                    Ok(Some(&*arena.alloc(Expr::Column {
+                        qualifier: Some(source_name),
+                        name: actual,
+                    })?))
+                },
+            )
+            .map_err(|_| arena_full())
+        };
+        if let Some(condition) = plan.source_row_condition {
+            plan.source_row_condition = Some(renamed(condition)?);
+        }
+        for key in &mut plan.keys[..plan.key_count] {
+            key.source_row = renamed(key.source)?;
+        }
+    }
     let Some((source_outer, method)) = crate::sql::explain::joined_write_shape(
         storage, &mut scope, leaves, &plan, params, routine, txid, arena,
     )?

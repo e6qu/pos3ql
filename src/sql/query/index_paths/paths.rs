@@ -273,7 +273,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     fn with_predicate(&self, index: usize, clauses: &[IndexClause<'a>]) -> Result<f64, SqlError> {
         let planner = self.planner;
         let arena = self.arena;
-        let mut extra = [None::<(Option<(usize, bool)>, f64)>; clauses::MAX_CONJUNCTS];
+        let mut extra = [None::<&'a Restriction<'a>>; clauses::MAX_CONJUNCTS];
         let mut extra_count = 0;
         let predicate = self.predicate(index);
         if !predicate.is_empty() {
@@ -290,18 +290,43 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             for part in predicate {
                 let target = Prop::of(part, arena)?;
                 if !predicate::implied_by(&target, &quals, &compare, arena)? {
-                    extra[extra_count] = Some((range_bound(&part.clause), part.selectivity));
+                    extra[extra_count] = Some(part);
                     extra_count += 1;
                 }
             }
         }
-        Ok(planner.clauselist(
-            extra[..extra_count].iter().flatten().copied().chain(
-                clauses
-                    .iter()
-                    .map(|clause| (clause.range(), clause.selectivity)),
-            ),
-        ))
+        // An `OR` turned into an array condition is no clause the
+        // statistics objects read.
+        const ARRAY_OF_OR: Clause<'static> = Clause::Other {
+            columns: 0,
+            shape: "an OR as an array",
+            indexable: false,
+            pattern_only: false,
+        };
+        let conditions = arena
+            .alloc_slice_with(extra_count + clauses.len(), |at| {
+                if at < extra_count {
+                    let part = extra[at].expect("counted predicate part");
+                    super::extended::Condition {
+                        clause: &part.clause,
+                        range: range_bound(&part.clause),
+                        selectivity: part.selectivity,
+                    }
+                } else {
+                    let clause = &clauses[at - extra_count];
+                    super::extended::Condition {
+                        clause: if clause.or_array.is_some() {
+                            &ARRAY_OF_OR
+                        } else {
+                            &clause.restriction.clause
+                        },
+                        range: clause.range(),
+                        selectivity: clause.selectivity,
+                    }
+                }
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        planner.clauselist_ext(conditions)
     }
 
     /// The index conditions a `LIKE` restriction's fixed prefix gives key
@@ -1424,7 +1449,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let mut selectivity = 0.0;
         let mut cost = QualCost::default();
         for arm in selected {
-            let arm_selectivity = self.planner.selectivity(arm);
+            let arm_selectivity = self.planner.selectivity(arm)?;
             selectivity = selectivity + arm_selectivity - selectivity * arm_selectivity;
             cost = arm
                 .iter()
@@ -1770,6 +1795,8 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
     let mut product = 1.0;
     let mut largest = 1.0f64;
     let mut count = 0;
+    let mut grouped = [0usize; 64];
+    let mut grouped_count = 0;
     for (at, &column) in columns.iter().enumerate() {
         if columns[..at].contains(&column) {
             continue;
@@ -1778,6 +1805,26 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
             groups *= 2.0;
             continue;
         }
+        if grouped_count < grouped.len() {
+            grouped[grouped_count] = column;
+            grouped_count += 1;
+            continue;
+        }
+        let variable = planner.variable(column);
+        let distinct = planner.distinct(&variable).0;
+        product *= distinct;
+        largest = largest.max(distinct);
+        count += 1;
+    }
+    // `estimate_multivariate_ndistinct`: column sets a statistics object
+    // counts, then each remaining column.
+    let multivariate = planner.multivariate_distinct(&mut grouped, &mut grouped_count);
+    for &distinct in multivariate.values() {
+        product *= distinct;
+        largest = largest.max(distinct);
+        count += 1;
+    }
+    for &column in &grouped[..grouped_count] {
         let variable = planner.variable(column);
         let distinct = planner.distinct(&variable).0;
         product *= distinct;
@@ -1934,6 +1981,11 @@ pub(crate) fn scan_path<'a>(
             }
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
+    let (extended, unreadable) =
+        match super::extended::table_objects(storage, txid, slot, definition, arena)? {
+            Ok(objects) => (objects, None),
+            Err(shape) => (&[][..], Some(shape)),
+        };
     let mut planner = Planner {
         variables,
         storage,
@@ -1945,6 +1997,7 @@ pub(crate) fn scan_path<'a>(
         size,
         costs: Costs::current(),
         indexes,
+        extended,
         arena,
     };
     // The btree layouts, which read the planner's distinct estimates.
@@ -2294,9 +2347,9 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    // Conditions on two or more keys of one statistics object (or on an
-    // expression, which an expression key may be) are estimated from it by
-    // `statext_clauselist_selectivity`, which the model leaves out.
+    // Conditions on an expression a statistics object's expression key may
+    // be are estimated from it by `statext_clauselist_selectivity`, which
+    // the model leaves out, as it does statistics objects it cannot read.
     let restricted = restrictions.iter().fold(0u64, |mask, restriction| {
         mask | restriction.clause.columns()
     });
@@ -2321,9 +2374,13 @@ pub(crate) fn scan_path<'a>(
                     crate::storage::ExtendedStatisticsKey::Expression(_) => expressions = true,
                 }
             }
-            covered >= 2 || (expressions && compares_expression)
+            (covered >= 2 && unreadable.is_some()) || (expressions && compares_expression)
         })
-        .then_some("conditions a statistics object estimates");
+        .then_some(unreadable.unwrap_or("conditions on an expression a statistics object holds"));
+    let extended = extended.or_else(|| {
+        super::extended::or_through_statistics(planner.extended, restrictions)
+            .then_some("an OR a statistics object estimates")
+    });
     if let Some(shape) = extended {
         return Ok(Planned::Outside(shape));
     }
@@ -2334,7 +2391,7 @@ pub(crate) fn scan_path<'a>(
             Err(shape) => Planned::Outside(shape),
         });
     }
-    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions));
+    let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
     paths.rows = rows;
     match build(
         &mut paths,
@@ -2474,6 +2531,11 @@ fn build<'a>(
         }
         super::Member::No => {}
     }
+    if let Some(grouping) = shape.grouping {
+        return grouped(
+            paths, kept, shape, grouping, definition, needed, rows, width,
+        );
+    }
     let order = paths.order;
     let groups = |presorted: usize| {
         let mut columns = [0usize; super::MAX_ORDER_KEYS];
@@ -2505,6 +2567,148 @@ fn build<'a>(
     )?);
     path.sort_cost = upper.sort_cost;
     path.limit_cost = upper.limit_cost;
+    Ok(Ok(Planned::Chosen(path)))
+}
+
+/// `add_paths_to_grouping_rel` over the relation's `kept` paths, which no
+/// index orders by a grouping column: a `GroupAggregate` over the cheapest
+/// path sorted and a `HashAggregate` over it, kept as `add_path` keeps
+/// them, then `create_ordered_paths` for the query's `ORDER BY`.
+#[expect(clippy::too_many_arguments, reason = "planner inputs are explicit")]
+fn grouped<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    kept: &[Candidate],
+    shape: QueryShape,
+    grouping: super::GroupingShape,
+    definition: &crate::storage::TableDef,
+    needed: Option<u64>,
+    rows: f64,
+    width: f64,
+) -> Built<Planned<'a>> {
+    use super::aggregate::{AggInput, AggStrategy, cost_agg};
+    let planner = paths.planner;
+    let costs = planner.costs;
+    let methods = crate::sql::guc::planner_methods();
+    let columns = &grouping.columns[..grouping.len];
+    // An index ordered by a grouping column gives PostgreSQL presorted
+    // input paths, which the model leaves out.
+    for (index, info) in planner.indexes.iter().enumerate() {
+        let catalog = &info.catalog;
+        if paths.usable[index]
+            && catalog.n_cols > 0
+            && columns.contains(&usize::from(catalog.columns[0]))
+        {
+            return Ok(Err("a grouping column an index orders"));
+        }
+    }
+    let kept_options = paths
+        .arena
+        .alloc_slice_with(kept.len(), |at| Some(kept[at]))
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let cheapest = cheapest_total(kept_options).expect("the relation keeps a path");
+    let groups = estimate_groups(planner, columns, rows);
+    // The sorted strategy over the cheapest path, sorted.
+    let (sort_startup, sort_run) = tuplesort_cost(rows, width, None, costs);
+    let input_sort = (
+        cheapest.total + sort_startup,
+        cheapest.total + sort_startup + sort_run,
+    );
+    let sorted_input = AggInput {
+        startup: input_sort.0,
+        total: input_sort.1,
+        rows,
+        width,
+    };
+    let (startup, total, _) = cost_agg(
+        AggStrategy::Sorted,
+        &grouping.aggregates,
+        columns.len(),
+        groups,
+        sorted_input,
+    );
+    let sorted = Candidate {
+        startup,
+        total,
+        presorted: columns.len(),
+        disabled: cheapest.disabled + u32::from(!methods.sort),
+        ..cheapest
+    };
+    let hashed_input = AggInput {
+        startup: cheapest.startup,
+        total: cheapest.total,
+        rows,
+        width,
+    };
+    let (startup, total, _) = cost_agg(
+        AggStrategy::Hashed,
+        &grouping.aggregates,
+        columns.len(),
+        groups,
+        hashed_input,
+    );
+    let hashed = Candidate {
+        startup,
+        total,
+        presorted: 0,
+        disabled: cheapest.disabled + u32::from(!methods.hashagg),
+        ..cheapest
+    };
+    let mut grouped_paths = [None::<Candidate>; MAX_CANDIDATES];
+    let grouped_count = add_paths(&[sorted, hashed], false, &mut grouped_paths);
+    let grouped_paths = &grouped_paths[..grouped_count];
+    let cheapest_grouped = cheapest_total(grouped_paths).expect("a grouped path is kept");
+    // `create_ordered_paths`: a path in the `ORDER BY` order as it is, the
+    // cheapest one sorted.
+    let (sort_startup, sort_run) = tuplesort_cost(groups, grouping.output_width, None, costs);
+    let sort_groups = |path: Candidate| Candidate {
+        startup: path.total + sort_startup,
+        total: path.total + sort_startup + sort_run,
+        disabled: path.disabled + u32::from(!methods.sort),
+        ..path
+    };
+    let mut finals = [cheapest; MAX_CANDIDATES];
+    let mut final_count = 0;
+    for path in grouped_paths.iter().flatten() {
+        let satisfied = match grouping.order {
+            super::GroupOrder::None => true,
+            super::GroupOrder::Grouped => path.presorted > 0,
+            super::GroupOrder::Other => false,
+        };
+        finals[final_count] = if satisfied {
+            *path
+        } else if path.presorted == cheapest_grouped.presorted
+            && path.total == cheapest_grouped.total
+        {
+            sort_groups(*path)
+        } else {
+            continue;
+        };
+        final_count += 1;
+    }
+    let mut ordered = [None::<Candidate>; MAX_CANDIDATES];
+    let ordered_count = add_paths(&finals[..final_count], false, &mut ordered);
+    let chosen = cheapest_total(&ordered[..ordered_count]).expect("an ordered path is kept");
+    let hashed_chosen = chosen.presorted == 0;
+    let aggregate = if hashed_chosen { hashed } else { sorted };
+    let output_sort = (grouping.order != super::GroupOrder::None
+        && (hashed_chosen || grouping.order == super::GroupOrder::Other))
+        .then_some((
+            aggregate.total + sort_startup,
+            aggregate.total + sort_startup + sort_run,
+        ));
+    let mut path = outside!(describe(
+        paths, &cheapest, &cheapest, shape, definition, needed, rows
+    )?);
+    path.grouped = Some(super::GroupedPath {
+        input_sort: (!hashed_chosen).then_some(input_sort),
+        planned_partitions: hashed_chosen
+            .then(|| super::aggregate::planned_partitions(&grouping.aggregates, groups, width)),
+        startup: aggregate.startup,
+        total: aggregate.total,
+        rows: groups,
+        output_sort,
+        input: hashed_input,
+    });
     Ok(Ok(Planned::Chosen(path)))
 }
 
@@ -2848,6 +3052,7 @@ fn describe<'a>(
         predicate: &[],
         sort_cost: None,
         limit_cost: None,
+        grouped: None,
         // A scan that returns the requested order stops when its limit has
         // the rows it needs.
         stop_after: match shape.limit {

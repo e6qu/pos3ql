@@ -3634,7 +3634,8 @@ fn triggers_fetch_streaming_session_cursors() {
         &mut engine,
         "CREATE TABLE streamed (a int); INSERT INTO streamed SELECT generate_series(1, 4); \
          CREATE TABLE fetched (v int); CREATE TABLE fired (a int); \
-         CREATE FUNCTION plus(x int) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT x + 1'; \
+         CREATE FUNCTION plus(x int) RETURNS int LANGUAGE plpgsql VOLATILE \
+           AS 'BEGIN RETURN x + 1; END'; \
          CREATE FUNCTION take() RETURNS trigger LANGUAGE plpgsql AS $$ \
          DECLARE v int; c refcursor := 'streaming'; \
          BEGIN FETCH c INTO v; INSERT INTO fetched VALUES (v); RETURN NEW; END $$; \

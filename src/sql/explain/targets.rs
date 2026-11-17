@@ -864,7 +864,9 @@ impl<'a> BlockTargets<'a> {
         let mut grouped = false;
         for (index, stage) in stages.iter().enumerate() {
             let current: &[Entry<'a>] = match stage.name {
-                "Aggregate" | "HashAggregate" | "Group" if aggregated && !grouped => {
+                "Aggregate" | "HashAggregate" | "GroupAggregate" | "MixedAggregate" | "Group"
+                    if aggregated && !grouped =>
+                {
                     grouped = true;
                     let list = arena
                         .alloc_slice_with(targets.len(), |_| Entry::EMPTY)
@@ -1892,7 +1894,7 @@ impl<'a> RelationTargets<'a> {
         txid: u32,
         target: &'a TableDef,
         target_exposed: &'a str,
-        source: &'a TableDef,
+        source: &'a dyn crate::sql::catalog::deparse::DeparseTable,
         source_exposed: &'a str,
         tree: bool,
         assignments: &[(&str, &'a Expr<'a>)],
@@ -1931,7 +1933,7 @@ impl<'a> RelationTargets<'a> {
     /// reads; `None` for a whole row or another name.
     fn joined_owner(
         &self,
-        source: &TableDef,
+        source: &dyn crate::sql::catalog::deparse::DeparseTable,
         source_exposed: &str,
         column: &Expr<'_>,
     ) -> Option<usize> {
@@ -1952,7 +1954,7 @@ impl<'a> RelationTargets<'a> {
     /// `reads`, first use first; `false` when one is outside the lists.
     fn joined_reads(
         &self,
-        source: &TableDef,
+        source: &dyn crate::sql::catalog::deparse::DeparseTable,
         source_exposed: &str,
         expression: &'a Expr<'a>,
         reads: &mut [ArenaList<'a, (Entry<'a>, HashColumn)>; 2],
@@ -1994,7 +1996,7 @@ impl<'a> RelationTargets<'a> {
 
     fn joined_lists(
         &self,
-        source: &'a TableDef,
+        source: &'a dyn crate::sql::catalog::deparse::DeparseTable,
         source_exposed: &'a str,
         tree: bool,
         assignments: &[(&str, &'a Expr<'a>)],
@@ -2024,7 +2026,7 @@ impl<'a> RelationTargets<'a> {
             let mut name = StackStr::<160>::new();
             crate::sql::catalog::write_identifier(&mut name, source_exposed);
             let _ = name.write_char('.');
-            crate::sql::catalog::write_identifier(&mut name, source.columns()[index].name.as_str());
+            crate::sql::catalog::write_identifier(&mut name, source.column_name(index));
             Ok(Entry {
                 text: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
                 var: true,

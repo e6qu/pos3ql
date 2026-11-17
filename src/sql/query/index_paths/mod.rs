@@ -24,16 +24,23 @@ use crate::storage::{ColumnDistribution, MAX_COLUMNS, Storage, TableDef, TableSt
 
 use super::scope::{QueryScope, ResolvedColumn};
 
+mod aggregate;
 mod append;
 mod clauses;
 mod expressions;
+mod extended;
+mod grouping_sets;
 mod like;
 mod paths;
 mod predicate;
 
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
+pub(crate) use aggregate::{AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg};
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
+pub(crate) use grouping_sets::{
+    GroupingSet, MAX_SET_COLUMNS, SetsPlan, SetsQuery, SetsStrategy, plan_grouping_sets,
+};
 pub(crate) use like::like_escape;
 pub(crate) use paths::scan_path;
 
@@ -250,7 +257,7 @@ pub(crate) struct RelationSize {
 }
 
 /// `get_typavgwidth` for a column without a statistics width.
-fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
+pub(crate) fn type_average_width(ctype: ColType, type_mod: i32) -> f64 {
     let layout = ctype.physical_layout();
     if layout.length > 0 {
         return f64::from(layout.length);
@@ -723,10 +730,16 @@ pub(crate) struct ScanPath<'a> {
     pub(crate) sort_cost: Option<(f64, f64)>,
     /// The startup and total cost and the rows of the `Limit` above it.
     pub(crate) limit_cost: Option<(f64, f64, f64)>,
+    /// The grouping above the scan, for a [`QueryShape::grouping`].
+    pub(crate) grouped: Option<GroupedPath>,
 }
 
 /// What the model makes of a query's scan of one relation.
 #[derive(Clone, Copy)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the chosen path is returned inline; boxing would heap-allocate"
+)]
 pub(crate) enum Planned<'a> {
     /// The path PostgreSQL chooses.
     Chosen(ScanPath<'a>),
@@ -822,6 +835,8 @@ pub(super) struct Planner<'s, 'a> {
     pub(super) costs: Costs,
     /// Every index of the table, newest first.
     pub(super) indexes: &'s [IndexInfo],
+    /// The table's statistics objects.
+    pub(super) extended: &'a [extended::ExtendedObject<'a>],
     pub(super) arena: &'a Arena,
 }
 
@@ -1656,14 +1671,18 @@ impl<'s, 'a> Planner<'s, 'a> {
         Ok(Ok(selectivity))
     }
 
-    /// `clauselist_selectivity` of `restrictions`.
-    pub(super) fn selectivity(&self, restrictions: &[clauses::Restriction<'_>]) -> f64 {
-        self.clauselist(restrictions.iter().map(|restriction| {
-            (
-                paths::range_bound(&restriction.clause),
-                restriction.selectivity,
-            )
-        }))
+    /// `clauselist_selectivity` of `restrictions`, with the table's
+    /// extended statistics.
+    pub(super) fn selectivity(
+        &self,
+        restrictions: &[clauses::Restriction<'a>],
+    ) -> Result<f64, SqlError> {
+        let mark = self.arena.mark();
+        let result = extended::conditions(restrictions, self.arena)
+            .and_then(|conditions| self.clauselist_ext(conditions));
+        // SAFETY: the conditions were consumed above.
+        unsafe { self.arena.rewind_to(mark) };
+        result
     }
 
     /// `clauselist_selectivity` of clauses given as each one's range bound
@@ -1960,6 +1979,51 @@ pub(crate) struct QueryShape {
     /// The width of the row identity a write's scan returns beside its
     /// columns: `ctid`, and `tableoid` for a tree's member.
     pub(crate) identity_width: u32,
+    /// The query groups the relation's rows: the model chooses between
+    /// sorting and hashing them (`add_paths_to_grouping_rel`).
+    pub(crate) grouping: Option<GroupingShape>,
+}
+
+/// A `GROUP BY` of the relation's columns, aggregated above its scan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupingShape {
+    /// The grouping columns, in the order a sort for them would use.
+    pub(crate) columns: [usize; MAX_ORDER_KEYS],
+    pub(crate) len: usize,
+    pub(crate) aggregates: AggregateCosts,
+    /// The width of the rows the aggregation returns.
+    pub(crate) output_width: f64,
+    pub(crate) order: GroupOrder,
+}
+
+/// How the query's `ORDER BY` relates to its grouping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupOrder {
+    None,
+    /// The rows a sorted grouping returns are in the `ORDER BY` order.
+    Grouped,
+    /// The `ORDER BY` needs a sort of the groups whichever way they are
+    /// formed.
+    Other,
+}
+
+/// How the relation's groups are formed and ordered, with each step's
+/// startup and total cost.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupedPath {
+    /// A `GroupAggregate` over its input sorted by the grouping columns,
+    /// whose sort costs these, or a `HashAggregate`.
+    pub(crate) input_sort: Option<(f64, f64)>,
+    /// The partitions a `HashAggregate` expects to spill its groups to.
+    pub(crate) planned_partitions: Option<u32>,
+    pub(crate) startup: f64,
+    pub(crate) total: f64,
+    pub(crate) rows: f64,
+    /// The sort of the groups for the `ORDER BY`.
+    pub(crate) output_sort: Option<(f64, f64)>,
+    /// The relation's cheapest path the grouping reads: its startup and
+    /// total cost, rows and width.
+    pub(crate) input: AggInput,
 }
 
 /// What the planning of one member of a partition or inheritance tree
@@ -2019,6 +2083,7 @@ impl Default for QueryShape {
             projection: None,
             member: Member::No,
             identity_width: 0,
+            grouping: None,
         }
     }
 }
@@ -2027,6 +2092,16 @@ impl QueryShape {
     pub(crate) fn order(&self) -> &[OrderKey] {
         &self.order[..self.order_len]
     }
+}
+
+/// The width PostgreSQL's planner gives `column` of the table in `slot` in
+/// a target list (`get_attavgwidth`): its analyzed width, or its type's.
+pub(crate) fn column_width(storage: &Storage, txid: u32, slot: usize, column: usize) -> u32 {
+    output_width(
+        &storage.table_def(slot, txid),
+        &storage.table_statistics(slot, txid),
+        Some(1 << column.min(63)),
+    )
 }
 
 /// The width of the columns the scan returns (`set_rel_width`): each

@@ -44,8 +44,9 @@ def clones(root, minimum):
             if (path, start) in covered:
                 continue
             window = tuple(values[start : start + minimum])
-            prior = seen.setdefault(hash(window), (path, start, window))
-            prior_path, prior_start, prior_window = prior
+            # Each window keeps the source line it starts at in its own file.
+            prior = seen.setdefault(hash(window), (path, start, window, lines[start][0], values))
+            prior_path, prior_start, prior_window, prior_line, prior_values = prior
             if prior_window != window or (prior_path == path and prior_start == start):
                 continue
             key = (prior_path, prior_start, path, start)
@@ -53,16 +54,16 @@ def clones(root, minimum):
                 continue
             length = minimum
             while (
-                prior_start + length < len(values)
+                prior_start + length < len(prior_values)
                 and start + length < len(values)
-                and values[prior_start + length] == values[start + length]
+                and prior_values[prior_start + length] == values[start + length]
             ):
                 length += 1
             reported.add(key)
             for offset in range(length - minimum + 1):
                 covered.add((prior_path, prior_start + offset))
                 covered.add((path, start + offset))
-            matches.append((prior_path, lines[prior_start][0], path, lines[start][0], length))
+            matches.append((prior_path, prior_line, path, lines[start][0], length))
     return total, matches
 
 

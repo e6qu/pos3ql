@@ -56,8 +56,10 @@ pub(crate) use joined_from::{
     recheck_joined_from_match, target_hash_plan, with_joined_from_row,
 };
 mod materialize;
+mod minmax;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
+pub(crate) use minmax::local_minmax_subquery;
 
 pub(crate) mod partition_prune;
 mod scan;
@@ -934,8 +936,8 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 pub(crate) use srf::{
-    builtin_set_routine_name, describe_derived_definition, expression_has_project_set,
-    is_srf_name as is_builtin_set_routine, table_func_rows_outer,
+    builtin_set_routine_name, column_definition_list_present, describe_derived_definition,
+    expression_has_project_set, is_srf_name as is_builtin_set_routine, table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -5433,6 +5435,23 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn inline_sql_function<'a>(
+        &self,
+        call: &'a Expr<'a>,
+        columns: &dyn super::exec::ColTypeResolver,
+        active: &dyn Fn(i32) -> bool,
+        arena: &'a Arena,
+    ) -> Result<super::eval::Inlining<'a>, SqlError> {
+        super::planner_inputs::inline::inline_call(
+            call,
+            columns,
+            active,
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
     fn names_inlinable_sql_function(&self, name: &str) -> bool {
         let (schema, bare) = match name.rsplit_once('.') {
             Some((schema, bare)) => (Some(schema), bare),
@@ -11274,6 +11293,26 @@ pub(super) fn selected_aggregate_call(
     txid: u32,
     columns: &dyn super::exec::ColTypeResolver,
 ) -> Result<bool, SqlError> {
+    Ok(aggregate_routine(expression, storage, txid, columns)?.is_some())
+}
+
+/// The routine an aggregate call runs, as the call's resolution selects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateRoutine {
+    /// An aggregate the SQL grammar spells (`xmlagg`), with no catalog call.
+    Syntax,
+    Builtin(i32),
+    Stored(usize),
+}
+
+/// The aggregate `expression` calls, or `None` when it is not an aggregate
+/// call.
+pub(crate) fn aggregate_routine(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<Option<AggregateRoutine>, SqlError> {
     use crate::storage::{RoutineCallKind, RoutineCallSelection, RoutineKind};
     let Expr::Call {
         name,
@@ -11289,10 +11328,12 @@ pub(super) fn selected_aggregate_call(
         ..
     } = expression
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if super::eval::is_sql_syntax_call(expression) {
-        return Ok(expression.is_aggregate());
+        return Ok(expression
+            .is_aggregate()
+            .then_some(AggregateRoutine::Syntax));
     }
     let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
     if args.len() > argument_oids.len() {
@@ -11372,13 +11413,13 @@ pub(super) fn selected_aggregate_call(
                 ));
             }
             match kind {
-                RoutineKind::Aggregate(_) => Ok(true),
+                RoutineKind::Aggregate(_) => Ok(Some(AggregateRoutine::Stored(slot))),
                 RoutineKind::Procedure => Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "{} is a procedure",
                     name
                 )),
-                _ => Ok(false),
+                _ => Ok(None),
             }
         }
         RoutineCallSelection::Builtin { oid, .. } => {
@@ -11402,7 +11443,7 @@ pub(super) fn selected_aggregate_call(
                     name
                 ));
             }
-            Ok(signature.kind == b'a')
+            Ok((signature.kind == b'a').then_some(AggregateRoutine::Builtin(oid)))
         }
         RoutineCallSelection::Ambiguous => Err(super::exec::function_lookup_error(
             name,
@@ -11429,10 +11470,10 @@ pub(super) fn selected_aggregate_call(
                     columns,
                 ));
             }
-            Ok(false)
+            Ok(None)
         }
     }?;
-    if !aggregate
+    if aggregate.is_none()
         && over.is_none()
         && (*star || *distinct || !order_by.is_empty() || filter.is_some())
     {
@@ -12277,6 +12318,27 @@ fn check_select_constants_in<'a>(
     Ok(())
 }
 
+/// Runs `run` with the column types of a query level whose sources `scope`
+/// resolved (none for a level without sources, or a catalog without SQL
+/// functions to inline).
+fn with_level_columns<'a, R>(
+    scope: Option<&QueryScope<'a>>,
+    catalog: &dyn super::eval::CatalogAccess,
+    run: impl FnOnce(&dyn super::exec::ColTypeResolver) -> R,
+) -> R {
+    let empty = super::eval::NoColumns;
+    let schema = scope.map(materialize::ScopeSchema);
+    let row: &dyn ColumnLookup<'_> = match &schema {
+        Some(schema) => schema,
+        None => &empty,
+    };
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(catalog),
+    };
+    run(&columns)
+}
+
 /// PostgreSQL's planner folding of a SELECT about to run: the analysis checks
 /// [`check_select_constants`] makes, then each clause's constant
 /// subexpressions replaced with their values (see
@@ -12306,8 +12368,82 @@ fn fold_select_constants_in<'a>(
         })?;
     }
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let Some(from) = &statement.from else {
+        return with_level_columns(None, &catalog, |columns| {
+            fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
+        });
+    };
+    if !level_calls_sql_function(statement, storage, txid) {
+        return fold_select_level(statement, arena, storage, txid, &catalog, None);
+    }
+    // A level whose sources this folding cannot type (a view or a `WITH`
+    // query not yet expanded, a routine's variables) has no column types
+    // here: its calls of inlinable functions stay calls, which `EXPLAIN`
+    // refuses.
+    let mark = arena.mark();
+    match QueryScope::resolve_schema(storage, from, txid, arena, None) {
+        Ok(scope) => with_level_columns(Some(&scope), &catalog, |columns| {
+            fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
+        }),
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => Err(error),
+        Err(_) => {
+            // SAFETY: the failed resolution's scratch is not referenced.
+            unsafe { arena.rewind_to(mark) };
+            fold_select_level(statement, arena, storage, txid, &catalog, None)
+        }
+    }
+}
+
+/// Whether `expression`, outside its subqueries, calls a SQL function
+/// PostgreSQL's planner may inline.
+fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        ..
+    } = expression
+        && super::planner_inputs::inline::storage_names_sql_function(storage, txid, name)
+    {
+        return true;
+    }
+    let mut found = false;
+    let _ = walk_children(expression, &mut |child| {
+        found |= expression_calls_sql_function(child, storage, txid);
+        Ok(())
+    });
+    found
+}
+
+/// Whether a select-list, join or condition expression of this query level
+/// calls a SQL function PostgreSQL's planner may inline.
+fn level_calls_sql_function(statement: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    let items = returning_expressions(statement.items);
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    items
+        .chain(joins)
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .chain(statement.order_by.iter().map(|key| key.expression))
+        .chain(statement.group_by.iter().copied())
+        .chain(statement.distinct_on.iter().copied())
+        .any(|expression| expression_calls_sql_function(expression, storage, txid))
+}
+
+fn fold_select_level<'a>(
+    statement: &'a Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: Option<&dyn super::exec::ColTypeResolver>,
+) -> Result<&'a Select<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| match columns {
+        Some(columns) => super::eval::fold_constants_in_scope(expression, arena, catalog, columns),
+        None => super::eval::fold_constants(expression, arena, Some(catalog)),
+    };
     let mut changed = false;
     let mut rebuilt = *statement;
     let items = arena
@@ -12315,9 +12451,8 @@ fn fold_select_constants_in<'a>(
         .map_err(|_| arena_full())?;
     for item in items.iter_mut() {
         match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                *expression = fold(expression)?;
-            }
+            SelectItem::Expr { expression, alias } => fold_named(expression, alias, &fold)?,
+            SelectItem::RecordStar(expression) => *expression = fold(expression)?,
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
@@ -12518,8 +12653,86 @@ fn fold_update_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Update<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    let written = statement
+        .assignments
+        .iter()
+        .map(|(_, expression)| *expression)
+        .chain(statement.where_clause)
+        .chain(returning_expressions(statement.returning.items));
+    let scope = dml_level_scope(
+        written,
+        storage,
+        txid,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.from,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    match &scope {
+        Some(scope) => with_level_columns(Some(scope), &catalog, |columns| {
+            fold_update_level(statement, arena, &catalog, Some(columns))
+        }),
+        None => fold_update_level(statement, arena, &catalog, None),
+    }
+}
+
+/// The expressions of a `RETURNING` list.
+fn returning_expressions<'s, 'a>(
+    items: &'s [SelectItem<'a>],
+) -> impl Iterator<Item = &'a Expr<'a>> + 's {
+    items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+    })
+}
+
+/// The scope a data change's folding types its calls of inlinable SQL
+/// functions with: `None` when no expression of `written` calls one, or the
+/// sources cannot be typed here (a routine's variables), when its calls stay
+/// calls, which `EXPLAIN` refuses.
+fn dml_level_scope<'a, 'e>(
+    mut written: impl Iterator<Item = &'e Expr<'e>>,
+    storage: &Storage,
+    txid: u32,
+    resolve: impl FnOnce() -> Result<QueryScope<'a>, SqlError>,
+    arena: &Arena,
+) -> Result<Option<QueryScope<'a>>, SqlError> {
+    if !written.any(|expression| expression_calls_sql_function(expression, storage, txid)) {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    match resolve() {
+        Ok(scope) => Ok(Some(scope)),
+        Err(error) if error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED => Err(error),
+        Err(_) => {
+            // SAFETY: the failed resolution's scratch is not referenced.
+            unsafe { arena.rewind_to(mark) };
+            Ok(None)
+        }
+    }
+}
+
+fn fold_update_level<'a>(
+    statement: &crate::sql::ast::Update<'a>,
+    arena: &'a Arena,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: Option<&dyn super::exec::ColTypeResolver>,
+) -> Result<crate::sql::ast::Update<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| match columns {
+        Some(columns) => super::eval::fold_constants_in_scope(expression, arena, catalog, columns),
+        None => super::eval::fold_constants(expression, arena, Some(catalog)),
+    };
     let mut folded = *statement;
     if statement
         .assignments
@@ -12577,8 +12790,20 @@ fn fold_insert_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
+    with_level_columns(None, &catalog, |columns| {
+        fold_insert_level(statement, arena, &catalog, columns)
+    })
+}
+
+fn fold_insert_level<'a>(
+    statement: &crate::sql::ast::Insert<'a>,
+    arena: &'a Arena,
+    catalog: &dyn super::eval::CatalogAccess,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<crate::sql::ast::Insert<'a>, SqlError> {
+    let fold = |expression: &'a Expr<'a>| {
+        super::eval::fold_constants_in_scope(expression, arena, catalog, columns)
+    };
     let mut folded = *statement;
     let fold_rows = || -> Result<&'a [&'a [&'a Expr<'a>]], SqlError> {
         if statement.select.is_some() || statement.rows.is_empty() {
@@ -12774,12 +12999,60 @@ fn fold_delete_constants_in<'a>(
     txid: u32,
 ) -> Result<crate::sql::ast::Delete<'a>, SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
-    let fold =
-        |expression: &'a Expr<'a>| super::eval::fold_constants(expression, arena, Some(&catalog));
-    let mut folded = *statement;
-    folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
-    folded.where_clause = statement.where_clause.map(fold).transpose()?;
-    Ok(folded)
+    let written = statement
+        .where_clause
+        .into_iter()
+        .chain(returning_expressions(statement.returning.items));
+    let scope = dml_level_scope(
+        written,
+        storage,
+        txid,
+        || {
+            dml_join_scope(
+                storage,
+                statement.table,
+                statement.alias,
+                statement.using,
+                txid,
+                arena,
+                None,
+            )
+            .map(|(scope, _)| scope)
+        },
+        arena,
+    )?;
+    with_level_columns(scope.as_ref(), &catalog, |columns| {
+        let in_scope = scope.is_some();
+        let fold = |expression: &'a Expr<'a>| {
+            if in_scope {
+                super::eval::fold_constants_in_scope(expression, arena, &catalog, columns)
+            } else {
+                super::eval::fold_constants(expression, arena, Some(&catalog))
+            }
+        };
+        let mut folded = *statement;
+        folded.returning.items = fold_returning_items(statement.returning.items, &fold, arena)?;
+        folded.where_clause = statement.where_clause.map(fold).transpose()?;
+        Ok(folded)
+    })
+}
+
+/// Folds a select or `RETURNING` item's expression; an inlined call keeps
+/// the name its analysis gave the column.
+fn fold_named<'a>(
+    expression: &mut &'a Expr<'a>,
+    alias: &mut Option<&'a str>,
+    fold: &dyn Fn(&'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError>,
+) -> Result<(), SqlError> {
+    let written = *expression;
+    *expression = fold(written)?;
+    if alias.is_none() && !core::ptr::eq(*expression, written) {
+        let name = super::exec::derived_name(written);
+        if name != super::exec::derived_name(expression) {
+            *alias = Some(name);
+        }
+    }
+    Ok(())
 }
 
 fn fold_returning_items<'a>(
@@ -12793,9 +13066,8 @@ fn fold_returning_items<'a>(
     let folded = arena.alloc_slice_copy(items).map_err(|_| arena_full())?;
     for item in folded.iter_mut() {
         match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                *expression = fold(expression)?;
-            }
+            SelectItem::Expr { expression, alias } => fold_named(expression, alias, fold)?,
+            SelectItem::RecordStar(expression) => *expression = fold(expression)?,
             SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
@@ -13212,6 +13484,101 @@ pub fn select_query<'a>(
     )
 }
 
+/// Enters the scan context of a query of one relation: its scan follows
+/// the path PostgreSQL chooses for the query's ordering and row limit, and
+/// stops when an ordered path has the rows its limit needs.
+#[allow(clippy::too_many_arguments)]
+fn enter_scan_context<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    params: &[Datum<'a>],
+    resolved_columns: &dyn super::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<index_paths::ScanContextScope>, SqlError> {
+    Ok(
+        if scope.n == 1
+            && statement
+                .where_clause
+                .is_none_or(|condition| !condition.contains_subquery())
+            && from.joins.is_empty()
+            && from.base.sample.is_none()
+            && statement.group_by.is_empty()
+            && !statement.distinct
+            && statement.distinct_on.is_empty()
+            && !statement
+                .order_by
+                .iter()
+                .any(|order| expr_has_window(order.expression))
+            && !has_set_returning_items(statement.items, storage, txid)
+        {
+            let aggregated = statement.having.is_some()
+                || statement.items.iter().any(|item| match item {
+                    SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                        expr_has_aggregate(expression, storage, txid, resolved_columns)
+                            .unwrap_or(true)
+                    }
+                    _ => false,
+                });
+            let windowed = statement.items.iter().any(|item| {
+            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
+        });
+            let shape = if windowed {
+                None
+            } else if aggregated {
+                Some(index_paths::QueryShape {
+                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    ..index_paths::QueryShape::default()
+                })
+            } else {
+                let shape = index_paths::query_shape(
+                    storage,
+                    txid,
+                    scope,
+                    statement.items,
+                    statement.order_by,
+                    statement.limit,
+                    statement.offset,
+                    params,
+                    arena,
+                )?;
+                Some(index_paths::QueryShape {
+                    stop_at_limit: statement.locking.is_empty(),
+                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
+                    // The scan returns the columns the select list and
+                    // ordering read, as EXPLAIN plans it.
+                    output: streaming_pax_columns_ordered(
+                        scope,
+                        from,
+                        statement.items,
+                        None,
+                        statement.order_by,
+                    )
+                    .selected_mask(0),
+                    ..shape
+                })
+            };
+            Some(index_paths::enter_query(
+                scope.slots[0],
+                statement.where_clause,
+                streaming_pax_columns_ordered(
+                    scope,
+                    from,
+                    statement.items,
+                    statement.where_clause,
+                    statement.order_by,
+                )
+                .selected_mask(0),
+                shape,
+            ))
+        } else {
+            None
+        },
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_query_resumable<'a>(
     storage: &'a Storage,
@@ -13332,6 +13699,25 @@ pub(crate) fn select_query_resumable<'a>(
         Ok(None) => {}
         Err(error) => return sql_fail(error),
     }
+    // `min` and `max` of a local table read the first row of each ordered
+    // index scan when the planner prefers those InitPlans.
+    match local_minmax_subquery(storage, txid, statement, arena) {
+        Ok(Some(rewritten)) => {
+            return constant_select_resumable(
+                storage,
+                txid,
+                rewritten,
+                arena,
+                params,
+                seq,
+                invocations,
+                statement_arena,
+                responder,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return sql_fail(error),
+    }
     // A query of one foreign table sends its shippable conditions, order and
     // limit to the server; the rest runs here over the rows it returns.
     let pushed = match crate::sql::foreign::deparse::plan_select(storage, txid, statement, arena) {
@@ -13378,83 +13764,18 @@ pub(crate) fn select_query_resumable<'a>(
     };
     // The scan of one relation follows the path PostgreSQL chooses for the
     // query's ordering and row limit.
-    let _scan_context = if scope.n == 1
-        && statement
-            .where_clause
-            .is_none_or(|condition| !condition.contains_subquery())
-        && from.joins.is_empty()
-        && from.base.sample.is_none()
-        && statement.group_by.is_empty()
-        && !statement.distinct
-        && statement.distinct_on.is_empty()
-        && !statement
-            .order_by
-            .iter()
-            .any(|order| expr_has_window(order.expression))
-        && !has_set_returning_items(statement.items, storage, txid)
-    {
-        let aggregated = statement.having.is_some()
-            || statement.items.iter().any(|item| match item {
-                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                    expr_has_aggregate(expression, storage, txid, &resolved_columns).unwrap_or(true)
-                }
-                _ => false,
-            });
-        let windowed = statement.items.iter().any(|item| {
-            matches!(item, SelectItem::Expr { expression, .. } if expr_has_window(expression))
-        });
-        let shape = if windowed {
-            None
-        } else if aggregated {
-            Some(index_paths::QueryShape {
-                only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
-                ..index_paths::QueryShape::default()
-            })
-        } else {
-            match index_paths::query_shape(
-                storage,
-                txid,
-                &scope,
-                statement.items,
-                statement.order_by,
-                statement.limit,
-                statement.offset,
-                params,
-                arena,
-            ) {
-                Ok(shape) => Some(index_paths::QueryShape {
-                    stop_at_limit: statement.locking.is_empty(),
-                    only: from.base.inheritance == crate::sql::ast::RelationInheritance::Only,
-                    // The scan returns the columns the select list and
-                    // ordering read, as EXPLAIN plans it.
-                    output: streaming_pax_columns_ordered(
-                        &scope,
-                        from,
-                        statement.items,
-                        None,
-                        statement.order_by,
-                    )
-                    .selected_mask(0),
-                    ..shape
-                }),
-                Err(error) => return sql_fail(error),
-            }
-        };
-        Some(index_paths::enter_query(
-            scope.slots[0],
-            statement.where_clause,
-            streaming_pax_columns_ordered(
-                &scope,
-                from,
-                statement.items,
-                statement.where_clause,
-                statement.order_by,
-            )
-            .selected_mask(0),
-            shape,
-        ))
-    } else {
-        None
+    let _scan_context = match enter_scan_context(
+        storage,
+        txid,
+        statement,
+        &scope,
+        from,
+        params,
+        &resolved_columns,
+        arena,
+    ) {
+        Ok(context) => context,
+        Err(error) => return sql_fail(error),
     };
     let relation_mode = if statement.locking.is_empty() {
         crate::sql::ast::TableLockMode::AccessShare
@@ -14955,6 +15276,23 @@ fn select_into_rows_mode<'a>(
 ) -> Result<(), SqlError> {
     let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let statement = pullup::pull_up_subqueries(statement, storage, txid, arena, outer)?;
+    // `min` and `max` of a local table read the first row of each ordered
+    // index scan when the planner prefers those InitPlans.
+    if outer.is_none()
+        && let Some(rewritten) = local_minmax_subquery(storage, txid, statement, arena)?
+    {
+        return select_into_rows_mode(
+            storage,
+            txid,
+            rewritten,
+            arena,
+            params,
+            outer,
+            seq,
+            recycle_rows,
+            emit,
+        );
+    }
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {
@@ -15512,6 +15850,28 @@ fn select_into_rows_mode<'a>(
             txid,
             arena,
         },
+    };
+    // Under a limit, or when EXPLAIN ANALYZE counts it, the scan of one
+    // relation follows the path PostgreSQL chooses for the query's ordering
+    // and row limit, stopping when an ordered path has the limit's rows. A
+    // query reading an enclosing query's or routine's names keeps its own
+    // scan.
+    let _scan_context = if (!instrument::active()
+        && (statement.order_by.is_empty() || statement.limit.is_none()))
+        || (outer.is_some() && subquery::select_correlated(statement, storage, txid, arena)?)
+    {
+        None
+    } else {
+        enter_scan_context(
+            storage,
+            txid,
+            statement,
+            &scope,
+            from,
+            params,
+            &resolved_columns,
+            arena,
+        )?
     };
     let join_subqueries = ProceduralSubqueries { storage, txid };
     let row_schema = ScopeSchema(&scope);

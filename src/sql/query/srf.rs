@@ -4584,6 +4584,11 @@ fn reject_unnest_column_definitions(tref: &TableRef<'_>) -> Result<(), SqlError>
 
 /// The column definition list a function in FROM was written with: the
 /// `__json_record_columns` call the parser keeps as its last argument.
+/// Whether a function in FROM carries a column definition list.
+pub(crate) fn column_definition_list_present(tref: &TableRef<'_>) -> bool {
+    column_definition_list(tref).is_some()
+}
+
 fn column_definition_list<'a>(tref: &TableRef<'a>) -> Option<&'a Expr<'a>> {
     match tref.func_args?.last()? {
         definitions @ Expr::Call {

@@ -1146,6 +1146,78 @@ fn routine_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txid
     }
 }
 
+/// The argument types of the built-in function a call runs, when it runs
+/// one.
+fn builtin_arguments(
+    e: &Expr,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+) -> Option<&'static [i32]> {
+    let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    if !argument_names.is_empty() || *variadic {
+        return None;
+    }
+    let oid = match bound_oid {
+        Some(oid) => *oid,
+        None => {
+            let mut types = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > types.len() {
+                return None;
+            }
+            for (slot, argument) in types.iter_mut().zip(*args) {
+                *slot = crate::sql::exec::infer_routine_argument_oid(argument, columns).ok()?;
+            }
+            match storage.select_routine_call(
+                name,
+                argument_names,
+                &types[..args.len()],
+                *variadic,
+                txid,
+                crate::storage::RoutineCallKind::Function,
+            ) {
+                crate::storage::RoutineCallSelection::Builtin { oid, .. } => oid,
+                _ => return None,
+            }
+        }
+    };
+    let signature = crate::sql::catalog::builtin_callable_by_oid(oid)?;
+    (signature.kind == b'f'
+        && signature.variadic_element.is_none()
+        && signature.arguments.len() == args.len())
+    .then_some(signature.arguments)
+}
+
+/// A pseudo-type a function declares to accept arguments of several types.
+fn polymorphic(oid: i32) -> bool {
+    matches!(
+        oid,
+        2276 | 2277
+            | 2283
+            | 2776
+            | 3500
+            | 3831
+            | 4537
+            | 4538
+            | 5077
+            | 5078
+            | 5079
+            | 5080
+            | 2249
+            | 2275
+    )
+}
+
 /// The `procost` of a user-defined operator's function; built-in operators
 /// cost 1.
 fn operator_cost(e: &Expr, columns: &dyn ColTypeResolver, storage: &Storage, txid: u32) -> f64 {
@@ -1262,9 +1334,16 @@ fn expression_cost(
     // One implicit cast (2 half-ops) when a numeric-family pair mixes types —
     // free when the coerced side is a constant, which PostgreSQL folds into a
     // pre-cast Const at plan time.
+    // PostgreSQL has cross-type operators among the integer types and
+    // between `real` and `double precision`, which cast nothing.
+    let family = |rank: u32| match rank {
+        0..=2 => 0,
+        3 => 1,
+        _ => 2,
+    };
     let coercion = |l: &Expr, r: &Expr| -> f64 {
         match (oid_of(l).and_then(rank), oid_of(r).and_then(rank)) {
-            (Some(a), Some(b)) if a != b => {
+            (Some(a), Some(b)) if family(a) != family(b) => {
                 let coerced = if a < b { l } else { r };
                 if coerced.is_constant(false) { 0.0 } else { 2.0 }
             }
@@ -1407,6 +1486,27 @@ fn expression_cost(
                 .map(|a| expression_cost(a, columns, storage, txid, arena, use_))
                 .sum::<f64>()
                 + node;
+            // An argument of another type than the built-in function
+            // declares is coerced by a cast function (`length(name)` reads
+            // `text(name)`), unless the types are binary coercible or the
+            // argument is a constant the planner folds.
+            if node > 0.0
+                && let Some(declared) = builtin_arguments(e, columns, storage, txid)
+            {
+                for (argument, &target) in args.iter().zip(declared) {
+                    if argument.is_constant(false) || polymorphic(target) {
+                        continue;
+                    }
+                    // A user type (a domain) relabels to its base type.
+                    if let Some(source) = oid_of(argument)
+                        && source < 16384
+                        && source != target
+                        && !crate::sql::catalog::builtin_binary_cast(source, target)
+                    {
+                        c += 2.0;
+                    }
+                }
+            }
             if unifying {
                 let unified = oid_of(e).and_then(rank);
                 for a in *args {

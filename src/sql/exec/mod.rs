@@ -1879,6 +1879,7 @@ pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 mod alter_type_rebuild;
 pub(crate) mod analyze_indexes;
 pub(crate) mod constraints;
+mod extended_statistics_build;
 mod foreign_key_clones;
 mod foreign_key_equality;
 use constraints::{
@@ -20895,8 +20896,16 @@ fn connect_subscription_publisher(
     // The publisher's tables must exist locally as ordinary or partitioned
     // tables before the slot is created.
     let mut missing = 0u64;
-    let resolved = storage.subscription_connect_result(discovered, |tables, absent| {
+    let resolved = storage.subscription_connect_result(discovered, |tables, absent, mismatched| {
         missing = absent;
+        if mismatched && let Some(table) = tables.last() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use different column lists for table \"{}.{}\" in different publications",
+                table.schema.as_str(),
+                table.name.as_str()
+            ));
+        }
         let mut found = [0usize; crate::storage::MAX_PUBLICATION_TABLES];
         let mut count = 0usize;
         for table in tables {
@@ -73019,40 +73028,12 @@ pub(crate) fn analyze_extended_statistics(
     selected_columns: &[usize],
     arena: &mut Arena,
 ) -> Result<(), SqlError> {
-    let transaction = txn.txid;
     let _snapshot = storage.analyze_snapshot();
     use crate::storage::{
-        ColumnStatistics, EXTENDED_STATISTICS_MCV_TEXT_MAX, ExtendedStatisticsData,
-        ExtendedStatisticsKey, ExtendedStatisticsMcv, MAX_EXTENDED_STATISTICS_KEYS,
-        MAX_EXTENDED_STATISTICS_MCV,
+        EXTENDED_STATISTICS_MCV_TEXT_MAX, ExtendedStatisticsData, ExtendedStatisticsKey,
+        ExtendedStatisticsMcv, MAX_EXTENDED_STATISTICS_KEYS, MAX_EXTENDED_STATISTICS_MCV,
     };
     use core::fmt::Write as _;
-
-    const REGISTERS: usize = 64;
-
-    fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
-        let index = (hash as usize) & (REGISTERS - 1);
-        let tail = hash >> REGISTERS.trailing_zeros();
-        let rank = tail.leading_zeros().saturating_add(1).min(63) as u8;
-        registers[index] = registers[index].max(rank);
-    }
-
-    fn distinct_estimate(registers: &[u8; REGISTERS]) -> u64 {
-        let mut inverse_sum = 0.0f64;
-        let mut zeros = 0usize;
-        for &register in registers {
-            inverse_sum += 2.0f64.powi(-i32::from(register));
-            zeros += usize::from(register == 0);
-        }
-        let count = REGISTERS as f64;
-        let raw = 0.709 * count * count / inverse_sum;
-        let corrected = if raw <= 2.5 * count && zeros > 0 {
-            count * (count / zeros as f64).ln()
-        } else {
-            raw
-        };
-        corrected.round().max(0.0) as u64
-    }
 
     fn render_mcv_values(
         values: &[Datum<'_>],
@@ -73071,9 +73052,9 @@ pub(crate) fn analyze_extended_statistics(
             let text = datum_to_text(value, arena)?;
             let needs_quotes = text.is_empty()
                 || text.eq_ignore_ascii_case("null")
-                || text
-                    .bytes()
-                    .any(|byte| matches!(byte, b',' | b'{' | b'}' | b'"' | b'\\'));
+                || text.bytes().any(|byte| {
+                    matches!(byte, b',' | b'{' | b'}' | b'"' | b'\\') || byte.is_ascii_whitespace()
+                });
             if needs_quotes {
                 let _ = rendered.write_char('"');
             }
@@ -73151,18 +73132,23 @@ pub(crate) fn analyze_extended_statistics(
         }
         let analyzed_generation = storage.table(table).generation();
         arena.reset();
+        // The keys in PostgreSQL's order: columns by attribute number, then
+        // expressions as written.
+        let order = crate::sql::catalog::extended_statistics_order(storage, &definition, txn.txid);
+        let n_keys = usize::from(definition.n_keys);
+        let keys = definition.keys_for(txn.txid);
         let mut sql = StackStr::<8192>::new();
         let _ = sql.write_str("SELECT ");
-        for (index, key) in definition.keys_for(txn.txid).iter().enumerate() {
+        for (index, &position) in order.positions[..n_keys].iter().enumerate() {
             if index != 0 {
                 let _ = sql.write_str(", ");
             }
-            match key {
+            match &keys[usize::from(position)] {
                 ExtendedStatisticsKey::Column(column) => {
                     write_identifier(&mut sql, column.as_str())
                 }
                 ExtendedStatisticsKey::Expression(expression) => {
-                    let _ = sql.write_str(expression.as_str());
+                    let _ = write!(sql, "({})", expression.as_str());
                 }
             }
         }
@@ -73178,19 +73164,101 @@ pub(crate) fn analyze_extended_statistics(
         }
         let query_text = arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?;
         let statement = super::parser::parse_query(query_text, arena)?;
-        let n_keys = definition.n_keys as usize;
-        let mut rows = 0u64;
-        let mut non_null_rows = 0u64;
-        let mut full_registers = [0u8; REGISTERS];
-        let mut key_registers = [[0u8; REGISTERS]; MAX_EXTENDED_STATISTICS_KEYS];
-        let mut pair_registers =
-            [[[0u8; REGISTERS]; MAX_EXTENDED_STATISTICS_KEYS]; MAX_EXTENDED_STATISTICS_KEYS];
-        let mut nulls = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
-        let mut non_nulls = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
-        let mut widths = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
-        let mut mcv = [ExtendedStatisticsMcv::EMPTY; MAX_EXTENDED_STATISTICS_MCV];
-        let mut n_mcv = 0usize;
-        let indices = [0u16, 1, 2, 3, 4, 5, 6, 7];
+        // Each key's type and collation, as the sort orders it.
+        let mut types = [ColType::Bool; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut collations = [crate::sql::ast::Collation::None; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut column_target = -1i32;
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        for (index, &position) in order.positions[..n_keys].iter().enumerate() {
+            match &keys[usize::from(position)] {
+                ExtendedStatisticsKey::Column(column) => {
+                    let column = table_definition
+                        .column_index(column.as_str())
+                        .expect("a statistics column remains in its table");
+                    let meta = table_definition.columns()[column];
+                    types[index] = meta.ctype;
+                    collations[index] = meta.collation;
+                    column_target = column_target.max(match meta.statistics_target {
+                        target if target < 0 => super::guc::default_statistics_target() as i32,
+                        target => i32::from(target),
+                    });
+                }
+                ExtendedStatisticsKey::Expression(expression) => {
+                    let text = arena
+                        .alloc_str(expression.as_str())
+                        .map_err(|_| arena_full())?;
+                    let parsed = super::parser::parse_expr(text, arena)?;
+                    let (type_oid, _) = infer_type_catalog(
+                        parsed,
+                        Some(&table_definition),
+                        storage,
+                        txn.txid,
+                        arena,
+                    )?;
+                    types[index] = catalog_column_type(storage, txn.txid, type_oid)
+                        .map_or(ColType::Text, |(ctype, _)| ctype);
+                    let row = RowCtx {
+                        def: crate::storage::RelationDefinition::from_definition(&table_definition),
+                        values: &[],
+                        alias: None,
+                        table_oid: None,
+                    };
+                    collations[index] = crate::sql::eval::resolved_expression_collation(
+                        parsed,
+                        &row,
+                        Some(&catalog),
+                    )?;
+                }
+            }
+        }
+        // `statext_compute_stattarget`: the object's target, else its
+        // columns' largest, else `default_statistics_target`.
+        let target = match definition.definition_for(txn.txid).target {
+            Some(target) => usize::from(target),
+            None if column_target >= 0 => column_target as usize,
+            None => super::guc::default_statistics_target(),
+        };
+        // ANALYZE's sample: every row of a table of up to `300 * target`
+        // rows, else a reservoir sample of that many.
+        let sample_target = 300 * target.max(super::guc::default_statistics_target()).max(1);
+        let mut total = 0u64;
+        super::query::select_into_rows_recycling(
+            storage,
+            txn.txid,
+            statement,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            None,
+            None,
+            &mut |_| {
+                total += 1;
+                Ok(())
+            },
+        )?;
+        if total == 0 {
+            // PostgreSQL computes no statistics without sampled rows.
+            continue;
+        }
+        let sampled = (total as usize).min(sample_target);
+        let positions = arena
+            .alloc_persistent_slice_with(sampled, |position| position as u64)
+            .map_err(|_| arena_full())?;
+        if total as usize > sampled {
+            let mut random =
+                crate::prng::Pcg32::new(crate::sql::datetime::now_micros() as u64, slot as u64);
+            for position in sampled as u64..total {
+                let draw = (u64::from(random.next_u32()) << 32) | u64::from(random.next_u32());
+                let chosen = (draw % (position + 1)) as usize;
+                if chosen < sampled {
+                    positions[chosen] = position;
+                }
+            }
+            positions.sort_unstable();
+        }
+        let copies = arena
+            .alloc_persistent_slice_with(sampled, |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let (mut position, mut next) = (0u64, 0usize);
         super::query::select_into_rows_recycling(
             storage,
             txn.txid,
@@ -73200,242 +73268,112 @@ pub(crate) fn analyze_extended_statistics(
             None,
             None,
             &mut |values| {
-                rows = rows.saturating_add(1);
-                let all_non_null = values[..n_keys].iter().all(|value| !value.is_null());
-                for key in 0..n_keys {
-                    let value = values[key];
-                    if value.is_null() {
-                        nulls[key] = nulls[key].saturating_add(1);
-                        continue;
-                    }
-                    non_nulls[key] = non_nulls[key].saturating_add(1);
-                    widths[key] = widths[key].saturating_add(
-                        rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3) as u64,
-                    );
-                    add_distinct(
-                        &mut key_registers[key],
-                        crate::sql::eval::hash_key_catalog(
-                            storage,
-                            transaction,
-                            values,
-                            &indices[key..key + 1],
-                        )?,
-                    );
-                }
-                let full_hash = crate::sql::eval::hash_key_catalog(
-                    storage,
-                    transaction,
-                    values,
-                    &indices[..n_keys],
-                )?;
-                if all_non_null {
-                    non_null_rows = non_null_rows.saturating_add(1);
-                    add_distinct(&mut full_registers, full_hash);
-                    for (determinant, dependencies) in
-                        pair_registers[..n_keys].iter_mut().enumerate()
-                    {
-                        for (dependent, registers) in dependencies[..n_keys].iter_mut().enumerate()
-                        {
-                            if determinant == dependent {
-                                continue;
-                            }
-                            let pair = [determinant as u16, dependent as u16];
-                            add_distinct(
-                                registers,
-                                crate::sql::eval::hash_key_catalog(
-                                    storage,
-                                    transaction,
-                                    values,
-                                    &pair,
-                                )?,
-                            );
-                        }
-                    }
-                }
-                if !definition.kinds.mcv() {
-                    return Ok(());
-                }
-                let rendered = render_mcv_values(&values[..n_keys], arena)?;
-                if let Some(entry) = mcv[..n_mcv]
-                    .iter_mut()
-                    .find(|entry| entry.hash == full_hash && entry.values == rendered)
-                {
-                    entry.count = entry.count.saturating_add(1);
-                } else if let Some(entry) = mcv[..n_mcv].iter_mut().find(|entry| !entry.valid) {
-                    *entry = ExtendedStatisticsMcv {
-                        valid: true,
-                        hash: full_hash,
-                        count: 1,
-                        base_frequency_bits: 0,
-                        values: rendered,
-                    };
-                } else if n_mcv < mcv.len() {
-                    mcv[n_mcv] = ExtendedStatisticsMcv {
-                        valid: true,
-                        hash: full_hash,
-                        count: 1,
-                        base_frequency_bits: 0,
-                        values: rendered,
-                    };
-                    n_mcv += 1;
-                } else {
-                    // Misra-Gries selects bounded candidates. A second scan
-                    // below gives those candidates exact frequencies.
-                    for entry in &mut mcv {
-                        entry.count = entry.count.saturating_sub(1);
-                        if entry.count == 0 {
-                            entry.valid = false;
-                        }
-                    }
+                let this = position;
+                position += 1;
+                if next < sampled && positions[next] == this {
+                    let encoded = encode_projected_pub(&values[..n_keys], arena)?;
+                    let copy = arena
+                        .alloc_persistent_slice_with(encoded.len(), |at| encoded[at])
+                        .map_err(|_| arena_full())?;
+                    copies[next] = copy;
+                    next += 1;
                 }
                 Ok(())
             },
         )?;
-        let mut compacted = 0usize;
-        for index in 0..n_mcv {
-            if mcv[index].valid {
-                mcv[compacted] = mcv[index];
-                compacted += 1;
+        if next != sampled {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "ANALYZE sample rows changed between passes"
+            ));
+        }
+        let values = arena
+            .alloc_slice_with(sampled * n_keys, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let too_wide = arena
+            .alloc_slice_with(sampled * n_keys, |_| false)
+            .map_err(|_| arena_full())?;
+        for (row, copy) in copies.iter().enumerate() {
+            let decoded = &mut values[row * n_keys..(row + 1) * n_keys];
+            if decode_projected_row_into(copy, arena, decoded)? != n_keys {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "ANALYZE sample row has the wrong width"
+                ));
+            }
+            for key in 0..n_keys {
+                let value = &decoded[key];
+                too_wide[row * n_keys + key] = !value.is_null()
+                    && types[key].physical_layout().length < 0
+                    && crate::storage::statistics::scalar::raw_value_length(value) + 4
+                        > crate::storage::statistics::scalar::WIDTH_THRESHOLD;
             }
         }
-        n_mcv = compacted;
-        if n_mcv != 0 {
-            let mut marginal_counts =
-                [[0u64; MAX_EXTENDED_STATISTICS_KEYS]; MAX_EXTENDED_STATISTICS_MCV];
-            for entry in &mut mcv[..n_mcv] {
-                entry.count = 0;
-                entry.base_frequency_bits = 0;
-            }
-            let mut candidate_values = [&[][..]; crate::storage::MAX_EXTENDED_STATISTICS_MCV];
-            for (candidate, entry) in mcv[..n_mcv].iter().enumerate() {
-                let source = arena
-                    .alloc_str(entry.values.as_str())
-                    .map_err(|_| arena_full())?;
-                candidate_values[candidate] =
-                    super::array::parse_literal(source, crate::sql::types::ArrElem::Text, arena)?;
-            }
-            super::query::select_into_rows_recycling(
-                storage,
-                txn.txid,
-                statement,
-                arena,
-                crate::sql::eval::NO_PARAMS,
-                None,
-                None,
-                &mut |values| {
-                    let hash = crate::sql::eval::hash_key_catalog(
-                        storage,
-                        transaction,
-                        values,
-                        &indices[..n_keys],
-                    )?;
-                    let mut rendered_keys = [None; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
-                    for (rendered, value) in
-                        rendered_keys[..n_keys].iter_mut().zip(&values[..n_keys])
-                    {
-                        if !value.is_null() {
-                            *rendered = Some(datum_to_text(*value, arena)?);
-                        }
-                    }
-                    let rendered = render_mcv_values(&values[..n_keys], arena)?;
-                    for candidate in 0..n_mcv {
-                        let entry = &mut mcv[candidate];
-                        if entry.hash == hash && entry.values == rendered {
-                            entry.count = entry.count.saturating_add(1);
-                        }
-                        for (key, actual) in rendered_keys[..n_keys].iter().copied().enumerate() {
-                            let candidate_value = super::array::get(
-                                candidate_values[candidate],
-                                crate::sql::types::ArrElem::Text,
-                                key,
-                            )
-                            .expect("ANALYZE candidate retains every statistics key");
-                            let equal = match (candidate_value, actual) {
-                                (Datum::Null, None) => true,
-                                (Datum::Text(candidate), Some(actual)) => candidate == actual,
-                                _ => false,
-                            };
-                            if equal {
-                                marginal_counts[candidate][key] =
-                                    marginal_counts[candidate][key].saturating_add(1);
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            for (candidate, entry) in mcv[..n_mcv].iter_mut().enumerate() {
-                let mut base_frequency = 1.0f64;
-                for marginal in &marginal_counts[candidate][..n_keys] {
-                    base_frequency *= *marginal as f64 / rows.max(1) as f64;
-                }
-                entry.base_frequency_bits = base_frequency.to_bits();
-            }
-        }
-        // PostgreSQL retains encounter order for equal-frequency MCVs. A
-        // stable in-place insertion sort preserves that contract without the
-        // scratch allocation used by the standard stable slice sort.
-        for index in 1..n_mcv {
-            let mut position = index;
-            while position != 0 && mcv[position - 1].count < mcv[position].count {
-                mcv.swap(position - 1, position);
-                position -= 1;
-            }
-        }
-        let target = usize::from(definition.definition_for(txn.txid).target.unwrap_or(100));
-        n_mcv = n_mcv.min(target).min(MAX_EXTENDED_STATISTICS_MCV);
-        if rows == 0 {
-            storage.write_extended_statistics_data(
-                slot,
-                txn.txid,
-                ExtendedStatisticsData::EMPTY,
-            )?;
-            if let Err(error) = txn.record_extended_statistics(slot as u32) {
-                storage.rollback_extended_statistics_data(slot, txn.txid);
-                return Err(error);
-            }
-            continue;
-        }
+        let sample = extended_statistics_build::Sample {
+            rows: sampled,
+            keys: n_keys,
+            values,
+            too_wide,
+            collations,
+        };
+        let total_rows = total as f64;
         let mut data = ExtendedStatisticsData::EMPTY;
         data.valid = true;
         data.inherited = table_definition.partition.is_partitioned();
         data.analyzed_generation = analyzed_generation;
-        data.rows = rows;
-        data.non_null_rows = non_null_rows;
-        data.distinct_values = distinct_estimate(&full_registers).min(non_null_rows);
-        for key in 0..n_keys {
-            data.expression_statistics[key] = ColumnStatistics {
-                valid: rows != 0,
-                null_fraction: if rows == 0 {
-                    0.0
-                } else {
-                    (nulls[key] as f64 / rows as f64) as f32
-                },
-                distinct_values: distinct_estimate(&key_registers[key]).min(non_nulls[key]),
-                distinct_fraction: 0.0,
-                average_width: widths[key]
-                    .checked_div(non_nulls[key])
-                    .unwrap_or(0)
-                    .min(u64::from(u32::MAX)) as u32,
-            };
-            if definition.kinds.dependencies() {
-                let determinant_distinct = distinct_estimate(&key_registers[key]);
-                for (dependent, registers) in pair_registers[key][..n_keys].iter().enumerate() {
-                    if key == dependent {
-                        continue;
-                    }
-                    let pair_distinct = distinct_estimate(registers);
-                    data.dependencies_ppm[key * MAX_EXTENDED_STATISTICS_KEYS + dependent] =
-                        determinant_distinct
-                            .saturating_mul(1_000_000)
-                            .checked_div(pair_distinct.max(1))
-                            .unwrap_or(0)
-                            .min(1_000_000) as u32;
-                }
-            }
+        data.rows = sampled as u64;
+        if definition.kinds.ndistinct() && n_keys >= 2 {
+            data.ndistinct = extended_statistics_build::ndistinct(
+                storage, txn.txid, &sample, total_rows, arena,
+            )?;
+            data.ndistinct_built = true;
         }
-        data.mcv[..n_mcv].copy_from_slice(&mcv[..n_mcv]);
-        data.n_mcv = n_mcv as u16;
+        if definition.kinds.dependencies() && n_keys >= 2 {
+            data.dependency_degree_bits =
+                extended_statistics_build::dependencies(storage, txn.txid, &sample, arena)?;
+            // Without a dependency of nonzero degree none is stored.
+            data.dependencies_built = data.dependency_degree_bits.iter().any(|&bits| bits != 0);
+        }
+        if definition.kinds.mcv() {
+            let mut items = [extended_statistics_build::McvItem {
+                row: 0,
+                count: 0,
+                base_frequency: 0.0,
+            }; MAX_EXTENDED_STATISTICS_MCV];
+            let kept = extended_statistics_build::mcv(
+                storage, txn.txid, &sample, total_rows, target, &mut items, arena,
+            )?;
+            for (entry, item) in data.mcv.iter_mut().zip(&items[..kept]) {
+                let row = item.row as usize;
+                *entry = ExtendedStatisticsMcv {
+                    count: item.count,
+                    base_frequency_bits: item.base_frequency.to_bits(),
+                    values: render_mcv_values(&values[row * n_keys..(row + 1) * n_keys], arena)?,
+                };
+            }
+            data.n_mcv = kept as u16;
+        }
+        // Each expression's own statistics (`compute_expr_stats`).
+        for (index, &position) in order.positions[..n_keys].iter().enumerate() {
+            if !matches!(
+                keys[usize::from(position)],
+                ExtendedStatisticsKey::Expression(_)
+            ) {
+                continue;
+            }
+            let (column, _) = storage.analyzed_values(
+                txn.txid,
+                types[index],
+                collations[index],
+                target,
+                sampled,
+                total,
+                true,
+                &mut |row| Ok(values[row * n_keys + index]),
+                arena,
+            )?;
+            data.expression_statistics[usize::from(position)] = column;
+        }
         storage.write_extended_statistics_data(slot, txn.txid, data)?;
         if let Err(error) = txn.record_extended_statistics(slot as u32) {
             storage.rollback_extended_statistics_data(slot, txn.txid);
@@ -85171,7 +85109,7 @@ fn merge_source<'a>(
         set_body: None,
         locking: &[],
         written: crate::sql::ast::WrittenQuery::PLAIN,
-        minmax_subquery: false,
+        minmax_subquery: None,
     };
     // Keep temporary source descriptions by value. Retaining full copies here
     // would consume the fixed statement arena before selecting source rows.
@@ -108478,7 +108416,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             &source_def,
             Some(plan.source_name),
             &values[..source_def.n_columns],
-            plan.conditions.source,
+            plan.source_row_condition,
             arena,
             params,
             hooks,
@@ -108505,7 +108443,7 @@ fn collect_planned_join<'a, Definition0: crate::storage::DefinitionBacking>(
             source_keys[sources * key_count + at] = match key.source_column {
                 Some(column) => values[column],
                 None => eval_row_expression(
-                    key.source,
+                    key.source_row,
                     storage,
                     source_slot,
                     &source_def,

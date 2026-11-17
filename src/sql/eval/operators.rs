@@ -994,24 +994,6 @@ fn hash_catalog(
     Ok(hasher.finish())
 }
 
-/// Planner estimates can use a selective hash only when every enum constant
-/// already has a typed member identity. Legacy row bytes require hash_key_catalog.
-pub(crate) fn hash_key_identified(values: &[Datum], columns: &[u16]) -> Option<u64> {
-    use core::hash::Hasher;
-    let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
-    for &column in columns {
-        match &values[usize::from(column)] {
-            Datum::Enum { member, .. } => {
-                let member = member.as_ref()?;
-                hasher.write(&[31]);
-                hasher.write(&member.ordinal().to_le_bytes());
-            }
-            datum => hash_datum(datum, &mut hasher),
-        }
-    }
-    Some(hasher.finish())
-}
-
 fn hash_integer(value: i64, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
     use core::hash::Hasher as _;
     // int2/int4 convert to OID through their unsigned 32-bit representation.

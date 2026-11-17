@@ -492,10 +492,13 @@ in `pg_subscription_rel` at commit as `i` (`r` without `copy_data`)
 (`differential_exact/782`). Remaining: the initial copy still runs as one
 bootstrap under one synchronization slot, so a table moves from `i` to `r`
 when the whole copy commits, without PostgreSQL's per-table `d`, `f` and `s`
-states, and a publication's differing column lists for one table are
-rejected by that copy rather than by the statement. The publisher connection
-needs a numeric host, port, user, dbname and sslmode (`22023` otherwise),
-where libpq resolves names and defaults.
+states. A table its publications publish with different column lists fails
+`CREATE SUBSCRIPTION` with PostgreSQL's `0A000` before any slot is created,
+as `fetch_table_list` does; `ALTER SUBSCRIPTION ... REFRESH PUBLICATION`
+still rejects it in its copy rather than in the statement. The publisher connection
+needs a port, user, dbname and sslmode (`22023` otherwise), where libpq
+applies its defaults, and a numeric host: resolving a host name as libpq does
+is blocked by the fixed-memory rule ([B-351](BUGS.md)).
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
@@ -741,6 +744,50 @@ dummy relation's `Result` is as wide as the select list's expressions. An
 in heap order and reads no index; a resumed attempt reads the same order
 under the statement's snapshot. A btree's distinct keys are counted as
 `estimate_num_groups` clamps a product of columns' distinct values.
+A call of a SQL function whose body is one plain expression is replaced
+by that expression before planning and execution (`inline_function`,
+`differential_exact/800`): its arguments, converted to the parameters'
+types, take the parameters' places, under PostgreSQL's checks (a SQL,
+non-`SECURITY DEFINER` function without `SET` clauses returning no
+`record`, a body no more volatile than the function, strict when the
+function is, using a strict function's every parameter, no argument used
+twice that is volatile, a subquery or costs over ten operators, and no
+recursion), and the body then folds in the call's place, its errors
+`during inlining`. A column keeps the name the call gave it. An index key
+over such a call is read as its body, so a condition on the call or on
+the body uses the index. A set-returning SQL function in `FROM` that is
+neither strict nor volatile becomes a subquery of its body
+(`inline_set_returning_function`), which the planner pulls up, and
+`EXPLAIN` preprocesses each subquery in `FROM` (views expanded, functions
+inlined, constants folded) before pulling it up. A `Function Scan` costs
+its call once and each row (`cost_functionscan`), its rows the function's
+`prorows` or, for `generate_series` over integers and `unnest`, what their
+support functions compute of constant arguments.
+ANALYZE builds each statistics object's kinds over its sample
+(`differential_exact/801`): every row of a table of up to `300 *` its
+target rows (the object's, else its columns' largest, else
+`default_statistics_target`), else a reservoir sample of that many, as
+`statext_ndistinct_build` (each combination of two or more keys, the
+Haas-Stokes estimate), `statext_dependencies_build` (each degree, those
+of zero left out) and `statext_mcv_build` (groups sorted by count with
+PostgreSQL's quicksort, kept while above `get_mincount_for_mcv_list`,
+with base frequencies) do, rows with a value wider than 1024 bytes left
+out of the MCV list and the dependencies; a table without rows keeps its
+earlier statistics. An MCV list holds at most 100 items and each item's
+values at most 128 bytes of text; more fail with `54000`. pg_stats_ext
+and pg_statistic_ext_data show them in PostgreSQL's key order (columns
+by attribute number, then expressions). The single-table planner applies
+them as `statext_clauselist_selectivity` does: conditions on two or more
+keys from the MCV list (`mcv_clauselist_selectivity` combined with the
+simple estimate), then equality conditions from the strongest
+dependencies (`dependencies_clauselist_selectivity`), and
+`estimate_num_groups` counts the groups of a statistics object's keys
+from its ndistinct (`estimate_multivariate_ndistinct`). Remaining: the
+estimates of joins, of plans outside the single-table planner (the
+general `GROUP BY` costing among them), and of an index condition PostgreSQL derives from an `OR` ignore the
+statistics objects without `0A000`, and pg_stats_ext_exprs shows an
+expression key's null fraction, distinct values and width, not its MCV
+list or histogram.
 An index key or predicate may call a PL/pgSQL function
 (`differential_exact/755`): a utility statement that evaluates outside a
 query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
@@ -752,21 +799,31 @@ costs time quadratic in its rows; the build also evaluates each key once to
 validate it and once more to fill the value caches, so a function's notices
 repeat. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
-methods, expression indexes over user-defined routines or types, a call
-of a SQL function PostgreSQL inlines (`inline_function` puts a body of one
-plain expression in the call's place, so it prints, costs, estimates and
-matches index keys as that expression; pos3ql refuses `EXPLAIN` of any
-statement calling one), a regular
+methods, expression indexes whose keys still call a user-defined routine or read
+a user-defined type after inlining, a call of a SQL function PostgreSQL
+inlines whose arguments read an enclosing query's columns, are packed
+into a variadic array or are polymorphic, or whose body is `BEGIN ATOMIC`,
+in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
+`FROM` PostgreSQL inlines with a default, packed variadic, polymorphic or
+lateral argument or a body with `WITH`, windows or a coerced column, a
+function scan of a built-in whose support function estimates its rows
+other than `generate_series` over integers and `unnest`, a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-conditions on two or more keys of a statistics object (ANALYZE stores
-approximations, not `statext_ndistinct_build`, `statext_dependencies_build`
-and `statext_mcv_build` over PostgreSQL's sample, and the planner does not
-apply them), a sub-partitioned table
+conditions on an expression key of a statistics object, an `OR` reading
+two or more keys of a statistics object with an MCV list (estimated
+through it with `is_or`), conditions a
+statistics object on a column past the 63rd or with an MCV list of a type
+other than the integer, floating, numeric, character, boolean, date,
+timestamp and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. Remaining inexact without
-`0A000`: btree sizes, which the model computes from the column statistics
+`0A000`: a join one of whose inputs is a subquery the planner does not
+pull up or a function scan (its join method, order and costs), an `IN`
+subquery whose output is computed (PostgreSQL pulls it up into a semi
+join, pos3ql hashes a subplan), the width of an `INSERT`'s `Result` of
+computed values, btree sizes, which the model computes from the column statistics
 where PostgreSQL counts the pages its build (`nbtsort`) and later page
 splits (`nbtsplitloc`) made, and the heap placement of rows a large update
 moves (a pruned page's freed space, HOT chains), which also orders an
@@ -896,10 +953,13 @@ PostgreSQL's order. The hash keys are any equalities between an
 expression of the target and one of the FROM table (`t.id = s.k + 1`), and
 a SQL-language routine's parameters, a PL/pgSQL routine's variables and
 built-in function calls in the conditions are planned as PostgreSQL plans
-them (`differential_exact/740`). Other joined writes (several FROM items, a
-derived table, a FROM table with column aliases, relations without
-statistics, which PostgreSQL may merge-join, a nested loop on an equality)
-keep the row-by-row executor: they
+them (`differential_exact/740`). A FROM table read under column aliases
+plans the same join, its conditions and output lists printed with the
+aliased names, as the range table entry's `eref` names them
+(`differential_exact/798`). Other joined writes (several FROM items, a
+derived table, relations without statistics, which PostgreSQL may
+merge-join, a nested loop on an equality) keep the row-by-row executor,
+whose EXPLAIN shows pos3ql's own join order and costs: they
 hash their first FROM table when it is joined to the target by equality,
 as a `SELECT` of the two tables would, and join later FROM items to it in
 nested loops; PostgreSQL may instead hash the joined FROM items. A statement
@@ -940,13 +1000,54 @@ InitPlan's output (a constant of unknown value: `var_eq_non_const` and
 and with a stable expression estimated from its value at planning
 (`estimate_expression_value`), whose evaluation an index scan charges once at
 startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
-Remaining there: a stable expression the model cannot evaluate (a
-user-defined function) leaves the crude estimate, and PostgreSQL's
-`min`/`max` InitPlan of a local table (`preprocess_minmax_aggregates`) and the
-cost of an implicit coercion function inside a condition (`length(name)`
-casting to `text`) are not modelled. A plain `Aggregate`'s cost is not
-PostgreSQL's `cost_agg` (its input cost plus each aggregate's transition
-function per input row): EXPLAIN shows pos3ql's own estimate. JSON nests as
+`min` and `max` of the columns of one plain table are explained as
+PostgreSQL's `preprocess_minmax_aggregates` plans them: each an InitPlan
+reading the first row of the index scan ordered by its column with nulls
+excluded, when those scans cost less than the aggregate
+(`differential_exact/791`). Execution runs those InitPlans, and a nested
+query's `ORDER BY ... LIMIT` over a scan returning rows in its order stops
+at the limit as PostgreSQL's `Limit` does, so `EXPLAIN ANALYZE` counts one
+row per InitPlan and the rows a filtered scan passed over
+(`differential_exact/795`). Remaining there: a stable expression the model cannot evaluate
+(a user-defined function) leaves the crude estimate. A built-in function's
+argument of another type than it declares is charged its cast function
+(`length(name)` reads `text(name)`), unless the types are binary coercible,
+and an operator between two integer types or between `real` and `double
+precision` casts nothing, as PostgreSQL's cross-type operators do
+(`differential_exact/793`). `real` against an integer or `numeric` operand
+takes the `real`-`double precision` operator, so EXPLAIN and view
+definitions print the other side as `double precision` (`'2'::double
+precision`) and the result type is `double precision`
+(`differential_exact/796`). Aggregation over the chosen scan of one
+plain table is costed as PostgreSQL's `cost_agg` costs it
+(`differential_exact/790`): each transition state's function and input
+expressions per input row and each final function once per group
+(`get_agg_clause_costs`, from PostgreSQL 18.6's `pg_aggregate`, states shared
+as `find_compatible_trans` shares them), a plain `Aggregate`, and for a
+`GROUP BY` of the table's columns a `GroupAggregate` over a `Sort` weighed
+against a `HashAggregate` with its spill model (`hash_agg_entry_size`,
+`hash_agg_set_limits`, `Planned Partitions`) and the `ORDER BY` sort above
+either, the grouping taking the `ORDER BY`'s key order
+(`preprocess_groupclause`) and the groups `estimate_num_groups`.
+Under `EXPLAIN ANALYZE` a `GroupAggregate`'s `Sort` returns every input row
+and the aggregate one row per group in the sort's key order, and the JSON
+form names it an `Aggregate` of strategy `Sorted` (`differential_exact/794`).
+Grouping sets are arranged as PostgreSQL's planner arranges them: the
+sets chained into rollups (`extract_rollup_sets` with its bipartite
+matching, `reorder_grouping_sets`), then every set hashed when the tables
+fit in `hash_mem` (a `MixedAggregate` when an empty set needs the sorted
+phase), the input sorted for the first rollup with the rollups that fit
+hashed (`DiscreteKnapsack`) and the rest sorted again, or every rollup
+sorted, kept by cost; each node lists its `Hash Key`, `Group Key` and
+indented `Sort Key` lines and the JSON `Grouping Sets` groups, and over one
+plain table its costs and rows are PostgreSQL's (`differential_exact/802`).
+Outside that cost model (the shapes below) the rollups and keys are
+arranged from pos3ql's own estimates, so a sorted arrangement PostgreSQL's
+costs would pick may show as hashed. Remaining: `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
+`ORDER BY` inputs, user-defined aggregates, a select list computing
+expressions over aggregates, grouping by expressions, by a column an index
+orders (presorted and incremental paths) and over joins keep pos3ql's own
+estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's
@@ -1302,9 +1403,14 @@ target list, and a cursor may be declared in a nested block
 (`differential_exact/743`, `744`). An exclusion constraint's build sorts the
 rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
-(`differential_exact/746`); other operators still compare every pair, and
-for a GiST constraint PostgreSQL names the partner its index scan finds
-first, where pos3ql names the first in heap order. Merged CHECK predicates
+(`differential_exact/746`); elements of other operators are compared only
+among the rows its equality elements make equal (`differential_exact/792`)
+and, with a range-overlap element, whose ranges overlap, swept in
+lower-bound order with the rows whose ranges still reach the current one
+(`differential_exact/797`). Without an equality or range-overlap element (a
+box `&&`, a multirange) every pair is compared, and for a GiST constraint
+PostgreSQL names the partner its index scan finds first, where pos3ql names
+the first in heap order. Box `&&` is PostgreSQL's `box_ov`. Merged CHECK predicates
 compare in their analysed form, as PostgreSQL's `equal()` compares cooked
 trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
 operator) conflict; a predicate outside the deparser's typed coverage compares

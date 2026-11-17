@@ -17574,14 +17574,14 @@ fn extended_statistics_drive_plans_and_follow_schema_evolution() {
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
     );
-    // PostgreSQL estimates conditions on two keys of a statistics object
-    // from it, which the access model leaves out: EXPLAIN refuses them.
-    assert!(
-        String::from_utf8_lossy(&explained).contains(
-            "EXPLAIN of a scan of one table with conditions a statistics object estimates is not supported"
-        ),
-        "{}",
-        String::from_utf8_lossy(&explained)
+    // Conditions on two keys of a statistics object are estimated from its
+    // MCV list, as PostgreSQL 18.6 estimates them.
+    assert_eq!(
+        data_rows(&explained),
+        [
+            "Seq Scan on correlated_statistics  (cost=0.00..2.50 rows=10 width=10)",
+            "  Filter: ((a = 1) AND (b = 1))"
+        ]
     );
     let rolled_back = run_with(
         &mut engine,
@@ -54610,8 +54610,8 @@ fn vacuum_and_analyze() {
         .extended_statistics_slot("public", "vt_ab_stats", 0)
         .unwrap();
     let composite = e.storage.extended_statistics_data(statistics_slot, 0);
-    assert_eq!(composite.non_null_rows, 2);
-    assert_eq!(composite.distinct_values, 2);
+    assert!(composite.ndistinct_built);
+    assert_eq!(composite.ndistinct[0], 2);
     run_with(&mut e, &mut b, "ANALYZE vt (a)");
     assert!(e.storage.extended_statistics_data(statistics_slot, 0).valid);
     run_with(&mut e, &mut b, "DROP STATISTICS vt_ab_stats");
@@ -54922,8 +54922,9 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body()
         .expect("WAL recovery retains the statistics definition");
     let composite = engine.storage.extended_statistics_data(composite_slot, 0);
     assert!(composite.valid);
-    assert_eq!(composite.non_null_rows, 2);
-    assert_eq!(composite.distinct_values, 2);
+    assert!(composite.ndistinct_built);
+    // PostgreSQL counts the NULL combination as a value.
+    assert_eq!(composite.ndistinct[0], 3);
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -55368,7 +55369,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 }
 
 #[test]
-fn explain_refuses_conditions_estimated_by_joint_statistics() {
+fn explain_estimates_conditions_from_joint_statistics() {
     let mut config = test_config("correlated-composite-explain");
     config.wal_buffer_bytes = 1 << 20;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
@@ -55388,17 +55389,19 @@ fn explain_refuses_conditions_estimated_by_joint_statistics() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    // Equalities on both keys are estimated from the object's MCV list and
-    // dependencies, which the access model leaves out; one key alone is not.
+    // Equalities on both keys are estimated from the object's MCV list, as
+    // PostgreSQL 18.6 estimates them; one key alone from its column.
     let both = run_with(
         &mut engine,
         &mut budget,
         "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
     );
-    assert!(
-        String::from_utf8_lossy(&both).contains("conditions a statistics object estimates"),
-        "{}",
-        String::from_utf8_lossy(&both)
+    assert_eq!(
+        data_rows(&both),
+        [
+            "Seq Scan on correlated_statistics  (cost=0.00..20.00 rows=100 width=8)",
+            "  Filter: ((a = 1) AND (b = 1))"
+        ]
     );
     let rows = data_rows(&run_with(
         &mut engine,
@@ -79364,20 +79367,24 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
         )
     );
     session.success(&mut engine, "ROLLBACK", false);
-    let discover =
-        |session: &mut ConfiguredTransactionSession, engine: &mut Engine, table: &str| {
-            let status = session.execute_status(engine, create, false);
-            assert!(
-                matches!(status, ExecutionStatus::Blocked { .. }),
-                "{status:?}"
-            );
-            let slot = (0..config.max_subscriptions)
-                .find(|slot| engine.subscription_connect_pending(*slot))
-                .expect("the waiting CREATE asked for its publisher");
-            let (step, request) = engine.start_subscription_connect(slot).unwrap();
-            assert_eq!(step, crate::storage::SubscriptionConnectStep::Discover);
-            assert_eq!(request.publication_count, 2);
-            engine.record_subscription_connect_missing(slot, 0b10);
+    let discover = |session: &mut ConfiguredTransactionSession,
+                    engine: &mut Engine,
+                    table: &str,
+                    lists: usize| {
+        let status = session.execute_status(engine, create, false);
+        assert!(
+            matches!(status, ExecutionStatus::Blocked { .. }),
+            "{status:?}"
+        );
+        let slot = (0..config.max_subscriptions)
+            .find(|slot| engine.subscription_connect_pending(*slot))
+            .expect("the waiting CREATE asked for its publisher");
+        let (step, request) = engine.start_subscription_connect(slot).unwrap();
+        assert_eq!(step, crate::storage::SubscriptionConnectStep::Discover);
+        assert_eq!(request.publication_count, 2);
+        engine.record_subscription_connect_missing(slot, 0b10);
+        // The publisher lists a table once per distinct column list.
+        for _ in 0..lists {
             engine.record_subscription_connect_table(
                 slot,
                 crate::storage::PublisherTable {
@@ -79385,11 +79392,24 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
                     name: crate::storage::SqlName::parse(table).unwrap(),
                 },
             );
-            engine.finish_subscription_connect(slot, None);
-            slot
-        };
+        }
+        engine.finish_subscription_connect(slot, None);
+        slot
+    };
+    // Different column lists for one table fail the statement, after the
+    // missing publication's warning.
+    discover(&mut session, &mut engine, "items", 2);
+    let mismatched =
+        String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
+    assert!(
+        mismatched.contains("Mpublication \"absent\" does not exist on the publisher")
+            && mismatched.contains(
+                "C0A000\0Mcannot use different column lists for table \"public.items\" in different publications"
+            ),
+        "{mismatched}"
+    );
     // A published table missing locally fails before any slot is created.
-    discover(&mut session, &mut engine, "items");
+    discover(&mut session, &mut engine, "items", 1);
     let missing = String::from_utf8_lossy(&session.execute(&mut engine, create, false)).to_string();
     assert!(
         missing.contains("Mpublication \"absent\" does not exist on the publisher")
@@ -79397,7 +79417,7 @@ fn subscription_create_connects_and_creates_its_slot_before_it_commits() {
         "{missing}"
     );
     session.success(&mut engine, "CREATE TABLE items (id int)", false);
-    let slot = discover(&mut session, &mut engine, "items");
+    let slot = discover(&mut session, &mut engine, "items", 1);
     let status = session.execute_status(&mut engine, create, false);
     assert!(
         matches!(status, ExecutionStatus::Blocked { .. }),
@@ -82513,8 +82533,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         .storage
         .extended_statistics_data(composite_slot, 0);
     assert!(composite.valid);
-    assert_eq!(composite.non_null_rows, 2);
-    assert_eq!(composite.distinct_values, 2);
+    assert!(composite.ndistinct_built);
+    assert_eq!(composite.ndistinct[0], 2);
     assert!(
         !restarted.storage.value_cache_complete(restarted_slot, &[0])
             && restarted.storage.value_probe_complete(restarted_slot, &[0]),

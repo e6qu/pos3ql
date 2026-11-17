@@ -3263,8 +3263,19 @@ pub struct Select<'a> {
     pub written: WrittenQuery<'a>,
     /// The subquery `preprocess_minmax_aggregates` builds for a `min` or
     /// `max` aggregate: its `LIMIT 1` runs over the ordered path the
-    /// planner built by hand, so postgres_fdw does not ship it.
-    pub minmax_subquery: bool,
+    /// planner built by hand, so postgres_fdw does not ship it. It holds
+    /// the address of the aggregate call it replaces, which identifies the
+    /// subquery to `EXPLAIN ANALYZE` wherever the rewrite is built.
+    pub minmax_subquery: Option<usize>,
+}
+
+impl Select<'_> {
+    /// The identity `EXPLAIN ANALYZE` counts this subquery's operators by:
+    /// its address, or for a `min`/`max` subquery its aggregate's.
+    pub(crate) fn instrument_identity(&self) -> u64 {
+        self.minmax_subquery
+            .unwrap_or(core::ptr::from_ref(self) as usize) as u64
+    }
 }
 
 /// The written form of a query level that its executable fields expand,
@@ -3321,7 +3332,7 @@ impl Select<'_> {
         set_body: None,
         locking: &[],
         written: WrittenQuery::PLAIN,
-        minmax_subquery: false,
+        minmax_subquery: None,
     };
 }
 

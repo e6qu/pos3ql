@@ -1238,7 +1238,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 // `clauselist_selectivity_or`.
                 let mut selectivity = 0.0;
                 for arm in arms {
-                    let arm = planner.selectivity(arm);
+                    let arm = planner.selectivity(arm)?;
                     selectivity = selectivity + arm - selectivity * arm;
                 }
                 selectivity

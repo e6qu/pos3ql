@@ -2720,7 +2720,7 @@ pub(crate) fn minmax_subquery<'a>(
             order_by,
             limit: Some(one),
             offset: None,
-            minmax_subquery: true,
+            minmax_subquery: Some(core::ptr::from_ref(aggregate) as usize),
             ..*statement
         })
         .map_err(|_| arena_full())?;
@@ -3610,7 +3610,7 @@ fn plan_with<'a>(
     let mut limit_text = RemoteText::new();
     let limit_params = deparser.param_mark();
     let limit_pushed = (statement.limit.is_some() || statement.offset.is_some())
-        && !statement.minmax_subquery
+        && statement.minmax_subquery.is_none()
         && kept.is_empty()
         && !grouped
         && simple_items

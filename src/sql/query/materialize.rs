@@ -2041,6 +2041,11 @@ pub(crate) fn materialized_rows<'a>(
         None => None,
     };
     let mut locked = 0u64;
+    // Rows an index returns in the query's order need no sort: under a
+    // limit the scan stops once the limit has its rows, as PostgreSQL's
+    // `Limit` stops pulling from the index scan.
+    let scan_window = rank_window
+        .filter(|_| ordered_candidates.is_some() && lock_pass.is_none() && !any_postponed);
     // Evaluate each projection once, in scan order. Encoded rows and their
     // references survive the scan's per-row scratch rewinds in the arena tail.
     let mut encode = |row: &JoinRow<'_, 'a, '_>| {
@@ -2101,7 +2106,8 @@ pub(crate) fn materialized_rows<'a>(
         )?;
         Ok(lock_pass
             .as_ref()
-            .is_none_or(|(_, _, window)| locked < *window))
+            .is_none_or(|(_, _, window)| locked < *window)
+            && scan_window.is_none_or(|window| rows.len() < window))
     };
     if let Some(indexed) = ordered_candidates.as_ref() {
         scan_source_recycling_with_indexed_candidates(
@@ -2621,6 +2627,8 @@ pub(crate) fn external_materialized_into<'a>(
     } else {
         None
     };
+    let stages = materialized_stages(limit != u64::MAX);
+    let _stages = stages.start();
     if !statement.with_ties
         && statement.locking.is_empty()
         && let Some(indexed) = ordered_candidates.as_ref()
@@ -2665,6 +2673,9 @@ pub(crate) fn external_materialized_into<'a>(
                     outer,
                     &mut |_row, projected, _keys| {
                         if logical_index >= offset {
+                            // The rows an index returns in order need no
+                            // sort: the `Limit` reads them from the scan.
+                            stages.limit.row();
                             keep_emitting = emit(projected, source_rowids)?;
                             emitted += 1;
                         }
@@ -2677,8 +2688,6 @@ pub(crate) fn external_materialized_into<'a>(
         )?;
         return Ok(emitted);
     }
-    let stages = materialized_stages(limit != u64::MAX);
-    let _stages = stages.start();
     let below_limit = stages.below_limit();
     // A sort under a DISTINCT returns every row it sorted; one under row
     // locks returns the rows the lock pass reads.

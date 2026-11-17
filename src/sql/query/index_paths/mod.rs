@@ -31,6 +31,7 @@ mod expressions;
 mod extended;
 mod grouping_sets;
 pub(crate) mod join_query;
+mod join_tree;
 pub(crate) mod joins;
 mod like;
 mod paths;

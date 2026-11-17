@@ -1365,10 +1365,13 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
   node, a merge join's `Merge Cond` and sorts, and a nested loop's `Join
   Filter` and `Materialize` inner scan, in PostgreSQL's layout. Joins of
-  plain tables, inner-joined by column equalities, follow PostgreSQL's join
-  search and costs, index scans and `Memoize` included; other joins keep
-  pos3ql's own order and methods, and `EXPLAIN` with costs refuses them with
-  `0A000`. A statement a rewrite rule
+  plain tables, joined by inner, left, right or full joins on column
+  equalities, follow PostgreSQL's join search and costs, index scans and
+  `Memoize` included: `SELECT a.id, b.y FROM a LEFT JOIN b ON a.id = b.a_id`
+  prints the same `Hash Right Join` (or merge or nested-loop join) as
+  PostgreSQL and returns its rows, those of `a` without a match padded with
+  NULLs, in the same order. Other joins keep pos3ql's own order and
+  methods, and `EXPLAIN` with costs refuses them with `0A000`. A statement a rewrite rule
   changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.

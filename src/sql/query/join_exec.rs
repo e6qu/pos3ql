@@ -873,8 +873,14 @@ fn run<'a>(
     let mut bound: Bound<'a> = [None; MAX_JOIN_RELS];
     runner.exec(model.plan.top, &mut bound, &mut |bound| {
         for table in 0..n {
-            let row = bound[table].expect("the top join binds every relation");
             let start = offsets[table];
+            // A removed join's relation reads as NULLs, which nothing reads.
+            if model.plan.removed & 1 << table != 0 {
+                values[start..start + nulls[table].len()].copy_from_slice(nulls[table]);
+                rowids[table] = None;
+                continue;
+            }
+            let row = bound[table].expect("the top join binds every relation");
             values[start..start + row.values.len()].copy_from_slice(row.values);
             rowids[table] = row.rowid;
         }
@@ -934,11 +940,12 @@ impl<'r, 'a> Runner<'r, 'a> {
                 keys,
                 key_count,
                 single_row,
+                binary,
             } => self.memoize(
                 id,
                 input,
                 &keys[..usize::from(key_count)],
-                single_row,
+                (single_row, binary),
                 bound,
                 sink,
             ),
@@ -1110,6 +1117,13 @@ impl<'r, 'a> Runner<'r, 'a> {
                 buckets,
                 batches,
             } => {
+                // An inner input reading the values of an outer row above
+                // changes at each rescan, which builds the table again
+                // (`ExecReScanHashJoin` with the inner plan's `chgParam`).
+                if self.model.plan.path(inner).param != 0 {
+                    self.built[id as usize].set(None);
+                    self.frozen[id as usize].set(None);
+                }
                 let outer_relids = self.model.plan.path(outer).relids;
                 let inner_relids = self.model.plan.path(inner).relids;
                 let keys = self.sides(&hash, outer_relids);
@@ -1764,7 +1778,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         id: u32,
         input: u32,
         keys: &[super::index_paths::joins::Member],
-        single_row: bool,
+        (single_row, binary): (bool, bool),
         bound: &mut Bound<'a>,
         sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
     ) -> Result<bool, SqlError> {
@@ -1784,7 +1798,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         });
         let mut found = None;
         for (at, entry) in cache.entries.borrowed_slice().iter().enumerate() {
-            if self.same_key(&entry.key[..keys.len()], key, keys)? {
+            if self.same_key(&entry.key[..keys.len()], key, keys, binary)? {
                 found = Some(at);
                 break;
             }
@@ -1892,6 +1906,7 @@ impl<'r, 'a> Runner<'r, 'a> {
         held: &[Datum<'a>],
         key: &[Datum<'a>],
         members: &[super::index_paths::joins::Member],
+        binary: bool,
     ) -> Result<bool, SqlError> {
         for ((left, right), member) in held.iter().zip(key).zip(members) {
             match (left.is_null(), right.is_null()) {
@@ -1907,6 +1922,14 @@ impl<'r, 'a> Runner<'r, 'a> {
                 left,
                 right,
             )? != Ordering::Equal
+            {
+                return Ok(false);
+            }
+            // Binary mode tells apart equal numerics of different scales,
+            // which the other modeled types' bytes never do.
+            if binary
+                && let (Datum::Numeric(one), Datum::Numeric(two)) = (left, right)
+                && one.dscale != two.dscale
             {
                 return Ok(false);
             }

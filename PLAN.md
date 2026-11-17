@@ -916,7 +916,27 @@ pulled-up subquery's relation's columns bare, as PostgreSQL prints them.
 `SELECT *` reading a merged column's left column (a right join's right
 one, a full join's both), and the top join's width is the query output's
 (`apply_scanjoin_target_to_paths`), each listed column counted
-(`differential_exact/848`).
+(`differential_exact/848`). A parameterized index scan also filters by
+every other join clause its parameterization moves into it
+(`get_baserel_parampathinfo`): an outer join's equalities and column
+comparisons no index applies, several clauses of one key column (each
+applied, a class's equality once), and a clause reading a column an outer
+join nulls, whose path then waits for that join; a `Memoize` over such a
+scan keys by the moved clauses' outer columns, in binary mode when one is
+not a hash equality (`differential_exact/849`). Nested loops, hash joins
+and merge joins may themselves be parameterized where an outer join
+allows it (`param_source_rels`), each evaluating the join clauses its
+parameterization moves into it (`get_joinrel_parampathinfo`, its own
+`joininfo` clauses included) and sized by its `ppi_rows`; a hash join
+whose hashed input reads an outer row's values builds its table again at
+each rescan (`differential_exact/850`). A left join to one relation no row
+above reads, which a unique index's keys (each equated with the join's
+left side or a constant) make match at most one row, is removed with its
+conditions (`remove_useless_joins`); a column only the removed join read
+stays in its relation's scan width, and a query left with one relation
+scans it with the query's output width (`differential_exact/851`). A
+single-column btree's NULL keys are laid out as a run of their own at the
+end of the index, sharing posting lists when it deduplicates.
 Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
@@ -934,14 +954,15 @@ planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
-a filter (`0A000`). Remaining for that search: a parameterized path of a
-relation with an index that would also filter by another join clause
-movable into it (`get_baserel_parampathinfo`), output expressions other
+a filter (`0A000`). Remaining for that search: output expressions other
 than columns, join conditions other than column
-equalities and comparisons, join removal, a constant equated with an
-outer join's compared column (`reconsider_outer_join_clause`), a
-parameterized hash or merge join (`get_joinrel_parampathinfo` of an outer
-join's clauses), several batches of a hash join returning unmatched inner
+equalities and comparisons, a class holding two columns of one relation
+(`ON a.k = b.k AND a.v = b.k`), a merge join over a partly sorted outer
+input (`Incremental Sort`), parenthesized joins (pulled up as
+`pull_up_subqueries` flattens them), self-join removal
+(`remove_useless_self_joins`), a constant equated with an
+outer join's compared column (`reconsider_outer_join_clause`), several
+batches of a hash join returning unmatched inner
 rows, a class with two constants, output expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
 pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
@@ -952,7 +973,13 @@ with `0A000`). A parameterized index scan's cost reads its index's pages:
 an index built over loaded rows is sized as `_bt_buildadd` fills its
 pages (a page closes when its free space and its last tuple's posting
 list fall under the fill factor's reserve, that tuple moving on), but one
-grown by inserts is the btree size estimate below. The local reference used to verify costs runs
+grown by inserts is the btree size estimate below. The layout is computed
+from the key columns' statistics, so equal keys share posting lists only
+when the keys repeat twice on average: a column whose keys mostly repeat
+twice but average fewer (`g % 1501` over 3000 rows) is laid out one page
+larger than PostgreSQL's real build, which needs the index's own key
+counts. An index's `pg_class` row reports no pages or tuples where
+PostgreSQL's reports its size. The local reference used to verify costs runs
 on arm64, whose compiler fuses multiply-adds, so a cost there can differ
 from x86-64's (and pos3ql's) in its last printed digit. Other queries'
 joins are not costed as PostgreSQL costs them (`final_cost_hashjoin`,
@@ -1446,7 +1473,11 @@ an operator, array constructors, `COLLATE` clauses, window names, repeated
 utility options and domain constraints, `EXECUTE` and routine arguments
 (unknown literals and row constructors converting to their parameter's type
 at analysis) and privilege checks on a written schema are positioned too
-(`differential_exact/814`). The exact-error corpus compares every error's
+(`differential_exact/814`). Remaining: an unknown table named in a
+query's select list over a derived table whose `EXISTS` subquery reads the
+same name (`SELECT sum(a.id) FROM (SELECT a.id FROM a WHERE EXISTS (SELECT
+1 FROM b WHERE b.k = a.id)) s`) is positioned at the subquery's reference
+rather than the select list's. The exact-error corpus compares every error's
 cursor, psql's `LINE n:` excerpt and caret. A domain's base type modifier
 follows the coercion context (`differential_exact/830`): an explicit cast
 truncates, an assignment, implicit coercion or input rejects; an input

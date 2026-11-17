@@ -30,6 +30,8 @@ pub(crate) const MAX_CLASSES: usize = 24;
 pub(crate) const MAX_PLACED: usize = 96;
 /// Outer, semi and anti joins of one query.
 pub(crate) const MAX_SPECIALS: usize = MAX_JOIN_RELS;
+/// No qual: a column a class needs.
+pub(crate) const NO_QUAL: u8 = u8::MAX;
 
 /// A column of a base relation: `(relation, column)`.
 pub(crate) type Var = (u8, u16);
@@ -271,8 +273,10 @@ pub(crate) struct Prepared {
     pub(crate) class_constant: [Option<u8>; MAX_CLASSES],
     pub(crate) placed: [Placed; MAX_PLACED],
     pub(crate) placed_count: usize,
-    /// Each column some join reads (`attr_needed`).
-    pub(crate) needed: [(Var, Relids); 64],
+    /// Each column some join reads (`attr_needed`), with the qual that
+    /// reads it there ([`NO_QUAL`] for a class's); a removed join's column
+    /// is needed only by its own relation.
+    pub(crate) needed: [(Var, Relids, u8); 64],
     pub(crate) needed_count: usize,
 }
 
@@ -285,13 +289,105 @@ impl Prepared {
         &self.classes[..self.class_count]
     }
 
+    /// `remove_leftjoinrel_from_query`: drops left join `at`, whose inner
+    /// relation (its whole right side) no row above reads, with that
+    /// relation's restrictions and the join's clauses; a clause pushed
+    /// down from above keeps its place without them.
+    pub(crate) fn remove_left_join(&mut self, at: usize) -> Result<(), Outside> {
+        let info = self.specials[at];
+        let gone = info.min_right | info.oj;
+        let join_plus_commute =
+            info.min_left | info.min_right | info.oj | info.commute_above_r | info.commute_below_l;
+        if self.classes().iter().any(|class| {
+            !class.has_const && class.count > 1 && class.relids() & info.min_right != 0
+        }) {
+            return Err("a removable join's relation in an equivalence class");
+        }
+        let mut kept = 0;
+        let mut dropped_quals = [false; MAX_QUALS];
+        for index in 0..self.placed_count {
+            let mut entry = self.placed[index];
+            let keep = match &mut entry {
+                Placed::Restriction { rel, .. } => 1 << *rel & info.min_right == 0,
+                Placed::Implied { member, .. } => member.relids() & gone == 0,
+                Placed::Join(join) if join.required & gone == 0 && join.relids & gone == 0 => true,
+                Placed::Join(join) => {
+                    if join.relids & info.min_right != 0
+                        || !(join.pushed_down || join.required & !join_plus_commute != 0)
+                    {
+                        dropped_quals[usize::from(join.qual)] = true;
+                        false
+                    } else {
+                        join.relids &= !gone;
+                        join.required &= !gone;
+                        join.outer_relids &= !gone;
+                        join.incompatible &= !gone;
+                        true
+                    }
+                }
+            };
+            if keep {
+                self.placed[kept] = entry;
+                kept += 1;
+            }
+        }
+        self.placed_count = kept;
+        let mut kept = 0;
+        for index in 0..self.needed_count {
+            let (var, relids, qual) = self.needed[index];
+            if 1 << var.0 & info.min_right != 0 {
+                continue;
+            }
+            // A column only a dropped clause read stays in its relation's
+            // target list (`reltarget` is not rebuilt), needed by no join.
+            let relids = if qual != NO_QUAL && dropped_quals[usize::from(qual)] {
+                1 << var.0
+            } else {
+                relids & !gone
+            };
+            self.needed[kept] = (var, relids, qual);
+            kept += 1;
+        }
+        self.needed_count = kept;
+        for index in at..self.special_count - 1 {
+            self.specials[index] = self.specials[index + 1];
+        }
+        self.special_count -= 1;
+        for special in &mut self.specials[..self.special_count] {
+            for set in [
+                &mut special.min_left,
+                &mut special.min_right,
+                &mut special.syn_left,
+                &mut special.syn_right,
+                &mut special.commute_above_l,
+                &mut special.commute_above_r,
+                &mut special.commute_below_l,
+                &mut special.commute_below_r,
+            ] {
+                *set &= !gone;
+            }
+        }
+        for problem in &mut self.subproblems[..self.subproblem_count] {
+            let mut kept = 0;
+            for index in 0..usize::from(problem.count) {
+                let item = problem.items[index] & !gone;
+                if item != 0 {
+                    problem.items[kept] = item;
+                    kept += 1;
+                }
+            }
+            problem.count = kept as u8;
+        }
+        Ok(())
+    }
+
     /// The relations and outer joins that need column `var` above its
     /// scan.
     pub(crate) fn needed_by(&self, var: Var) -> Relids {
         self.needed[..self.needed_count]
             .iter()
-            .filter(|(held, _)| *held == var)
-            .fold(0, |relids, (_, needed)| relids | needed)
+            .filter(|(held, ..)| *held == var)
+            .fold(0, |relids, (_, needed, _)| relids | needed)
     }
 }
 
@@ -343,7 +439,7 @@ struct Prep<'t> {
     placed_count: usize,
     sources: [(u8, u8); MAX_QUALS],
     source_count: usize,
-    needed: [(Var, Relids); 64],
+    needed: [(Var, Relids, u8); 64],
     needed_count: usize,
     left_join: [Pending; MAX_QUALS],
     left_count: usize,
@@ -413,7 +509,7 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
         placed_count: 0,
         sources: [(0, 0); MAX_QUALS],
         source_count: 0,
-        needed: [((0, 0), 0); 64],
+        needed: [((0, 0), 0, NO_QUAL); 64],
         needed_count: 0,
         left_join: [Pending { join: empty_join() }; MAX_QUALS],
         left_count: 0,
@@ -1300,7 +1396,7 @@ impl Prep<'_> {
                 relids
             };
             for &var in qual.vars.as_slice() {
-                self.note_needed(var, where_needed)?;
+                self.note_needed(var, where_needed, qual_id)?;
             }
         }
         let mut join = JoinQual {
@@ -1405,8 +1501,8 @@ impl Prep<'_> {
         Ok(())
     }
 
-    fn note_needed(&mut self, var: Var, relids: Relids) -> Result<(), Outside> {
-        *self.needed.get_mut(self.needed_count).ok_or(FULL)? = (var, relids);
+    fn note_needed(&mut self, var: Var, relids: Relids, qual: u8) -> Result<(), Outside> {
+        *self.needed.get_mut(self.needed_count).ok_or(FULL)? = (var, relids, qual);
         self.needed_count += 1;
         Ok(())
     }
@@ -1658,7 +1754,7 @@ impl Prep<'_> {
             }
             let relids = held.class.relids();
             for &member in members {
-                self.note_needed((member.rel, member.column), relids)?;
+                self.note_needed((member.rel, member.column), relids, NO_QUAL)?;
             }
         }
         Ok(())

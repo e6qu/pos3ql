@@ -5131,6 +5131,8 @@ pub struct ColumnDef<'a> {
     pub type_mod: i32,
     /// The collation selected by `COLLATE` or the database default.
     pub collation: ParsedCollation<'a>,
+    /// The `COLLATE` keyword's location, which positions a collation error.
+    pub collation_position: SourcePosition,
     /// Foreign-column options are parsed only by CREATE FOREIGN TABLE. An
     /// ordinary table can therefore reach execution only with an empty list.
     pub foreign_options: &'a [ForeignOption<'a>],

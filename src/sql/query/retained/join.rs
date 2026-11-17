@@ -507,7 +507,9 @@ pub(super) fn join_shape<'a>(
     // The general executor's physical choice for the same statement: a hash
     // join is read as one, building the same side, and per-row index lookups
     // keep the join there, so a retained reader never turns an indexed or
-    // hashed join into a full nested loop.
+    // column-hashed join into a full nested loop. A join hashed on
+    // expressions of each side (`b.k = a.id + 1`) is read here as a nested
+    // loop, which returns the same rows in its own order.
     let mut hash = None;
     if let Some(plan) = crate::sql::query::scan::select_hash_join_plan(
         storage,
@@ -516,6 +518,7 @@ pub(super) fn join_shape<'a>(
         where_clause,
         order,
         None,
+        false,
         txid,
         arena,
     )? {

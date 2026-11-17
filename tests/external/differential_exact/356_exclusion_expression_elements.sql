@@ -11,6 +11,27 @@ EXCEPTION WHEN exclusion_violation THEN
   RETURN detail;
 END
 $$;
+-- PostgreSQL finds the objects that depend on a column through
+-- pg_depend's reference index, whose equal keys follow the rows' heap
+-- positions. Free space that vacuum and page pruning leave in pg_depend
+-- decides where a constraint's dependency rows land, so with several
+-- constraints on one column the order of a DROP's dependency list, and
+-- which constraint a failed retype rebuilds first, depend on the cluster's
+-- history. These checks therefore sort the listed dependents, and retype a
+-- column only one constraint reads.
+CREATE FUNCTION ee356_dependents(statement text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  message text;
+  detail text;
+BEGIN
+  EXECUTE statement;
+  RETURN 'ok';
+EXCEPTION WHEN dependent_objects_still_exist THEN
+  GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL;
+  RETURN message || E'\n' || (SELECT string_agg(line, E'\n' ORDER BY line)
+                              FROM regexp_split_to_table(detail, E'\n') AS line);
+END
+$$;
 CREATE TABLE ee356 (a int, b int, r int4range, active boolean,
   EXCLUDE USING gist (int4range(a, b) WITH &&),
   EXCLUDE USING gist ((r * '[1,10)'::int4range) WITH &&,
@@ -51,14 +72,21 @@ CREATE TABLE ee356_child (c int) INHERITS (ee356);
 \d ee356_child
 ALTER TABLE ee356 RENAME COLUMN a TO start_at;
 \d ee356
-ALTER TABLE ee356 ALTER COLUMN b TYPE bigint;
+CREATE TABLE ee356_retype (a int, b int, EXCLUDE USING gist (int4range(a, b) WITH &&));
+ALTER TABLE ee356_retype ALTER COLUMN b TYPE bigint;
+ALTER TABLE ee356_retype DROP CONSTRAINT ee356_retype_int4range_excl,
+  ADD EXCLUDE USING gist (int4range(a, b, '[]') WITH -|-);
+ALTER TABLE ee356_retype ALTER COLUMN b TYPE bigint;
+DROP TABLE ee356_retype;
 ALTER TABLE ee356 ALTER COLUMN b TYPE smallint;
 SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
  WHERE conrelid = 'ee356'::regclass ORDER BY conname;
 SELECT ee356_detail($$INSERT INTO ee356 VALUES (2, 4, NULL, false)$$);
 DROP TABLE ee356_child;
-ALTER TABLE ee356 DROP COLUMN b;
+SELECT ee356_dependents($$ALTER TABLE ee356 DROP COLUMN b$$);
+SET client_min_messages = warning;
 ALTER TABLE ee356 DROP COLUMN b CASCADE;
+RESET client_min_messages;
 \d ee356
 -- Deferred checks evaluate the expressions at commit.
 CREATE TABLE ee356_deferred (s timestamp, e timestamp,
@@ -89,4 +117,4 @@ INSERT INTO ee356_parts VALUES (1, 5, '[2,3)');
 SELECT ee356_detail($$INSERT INTO ee356_parts VALUES (3, 7, '[2,3)')$$);
 INSERT INTO ee356_parts VALUES (3, 7, '[1,2)');
 DROP TABLE ee356, ee356_like, ee356_deferred, ee356_parts;
-DROP FUNCTION ee356_detail(text);
+DROP FUNCTION ee356_detail(text), ee356_dependents(text);

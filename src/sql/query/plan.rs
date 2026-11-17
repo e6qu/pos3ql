@@ -1385,15 +1385,26 @@ fn expression_cost(
         Cast {
             operand, type_mod, ..
         } => {
+            let types = (oid_of(operand), oid_of(e));
             let free = *type_mod < 0
-                && match (oid_of(operand), oid_of(e)) {
+                && match types {
                     (Some(source), Some(target)) => {
                         source == target || crate::sql::catalog::builtin_binary_cast(source, target)
                     }
                     _ => false,
                 };
+            // `CoerceViaIO` calls the source's output and the target's
+            // input function.
+            let io = matches!(types, (Some(source), Some(target))
+                if crate::sql::catalog::builtin_io_cast(source, target));
             expression_cost(operand, columns, storage, txid, arena, use_)
-                + if free { 0.0 } else { 2.0 }
+                + if free {
+                    0.0
+                } else if io {
+                    4.0
+                } else {
+                    2.0
+                }
         }
         Collate { operand, .. } => expression_cost(operand, columns, storage, txid, arena, use_),
         Binary {

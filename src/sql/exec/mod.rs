@@ -73821,8 +73821,11 @@ pub fn create_index(
                 type_oid,
             )
         } else {
-            // Names resolve before the key's type is judged (`(zz.*)` is 42P01).
-            if let Err(error) = ddl::check_referenced_columns(index_column.expression, &tdef) {
+            // Names resolve, positioned in the statement's text, before the
+            // key's type is judged (`(zz.*)` is 42P01).
+            if let Err(error) = crate::sql::error_position::with_analysis(|| {
+                ddl::check_referenced_columns(index_column.expression, &tdef)
+            }) {
                 return sql_fail(error);
             }
             // PostgreSQL analyses the key expression in the statement's text.
@@ -104787,6 +104790,7 @@ fn alter_table_relation(
         for index in 0..new_def.n_exclusions {
             new_def.exclusions[index] = match crate::sql::exec::ddl::revalidate_exclusion(
                 storage,
+                &def,
                 &new_def,
                 &new_def.exclusions[index],
                 txn.txid,

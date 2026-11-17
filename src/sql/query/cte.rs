@@ -8444,6 +8444,7 @@ impl<'a> RecursiveCteQuery<'a> {
             } else {
                 external_unique_run(storage, txid, base)?
             };
+            count_recursive_run(storage, all)?;
             let Some(first) = all.filter(|run| run.rows() > 0) else {
                 return Ok((
                     RecursiveProgress {
@@ -8515,6 +8516,7 @@ impl<'a> RecursiveCteQuery<'a> {
             let unique = external_unique_run(storage, txid, candidates)?;
             external_recursive_difference(storage, txid, unique, progress.all)?
         };
+        count_recursive_run(storage, fresh)?;
         let Some(fresh) = fresh.filter(|run| run.rows() > 0) else {
             return Ok((
                 RecursiveProgress {
@@ -8543,6 +8545,32 @@ impl<'a> RecursiveCteQuery<'a> {
             fresh.rows(),
         ))
     }
+}
+
+/// Under `EXPLAIN ANALYZE`, counts the rows a spilled `Recursive Union`
+/// step added (`run`) into its tuplestores.
+fn count_recursive_run(
+    storage: &Storage,
+    run: Option<crate::sql::external::ExternalRun>,
+) -> Result<(), SqlError> {
+    let node = super::instrument::node(super::instrument::Role::SetOperation(0));
+    if !node.measured() {
+        return Ok(());
+    }
+    if let Some(run) = run.filter(|run| run.rows() > 0) {
+        let mut reader = storage.external_run_reader()?;
+        storage
+            .with_block_store(|blocks| reader.start(blocks, run))
+            .expect("spill-attached block store")?;
+        while let Some(context) = reader.context() {
+            node.recursive_row(context.row);
+            storage
+                .with_block_store(|blocks| reader.advance(blocks))
+                .expect("spill-attached block store")?;
+        }
+    }
+    node.recursive_step_end();
+    Ok(())
 }
 
 /// Whether `rows` holds a row equal to `row` under SQL equality; recursive

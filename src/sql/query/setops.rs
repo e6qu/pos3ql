@@ -614,6 +614,38 @@ fn external_set_tree<'a>(
     let right_run = external_set_tree(right, context, target, sorted || merge_inputs, numbers)?;
     input.rows(left_run.map_or(0, ExternalRun::rows) + right_run.map_or(0, ExternalRun::rows));
     drop(input_loop);
+    if *operator == SetOp::Union && !*all && node.hash_agg_sizing().is_some() {
+        // The hashed union's rows, read back from its inputs' runs in
+        // order; pos3ql's runs are sorted, so the rows arrive in each
+        // input's key order rather than its scan's.
+        let mut rows = ArenaList::new(context.arena);
+        let mut reader = context.storage.external_run_reader()?;
+        for run in [left_run, right_run].into_iter().flatten() {
+            context
+                .storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("spill-attached block store")?;
+            while let Some(row) = reader.row() {
+                let row: &[u8] = context
+                    .arena
+                    .alloc_slice_copy(row)
+                    .map_err(|_| arena_full())?;
+                rows.push(row).map_err(|_| arena_full())?;
+                context
+                    .storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("spill-attached block store")?;
+            }
+        }
+        super::group::record_distinct_hash_memory(
+            node,
+            &[rows.as_slice()],
+            target.len(),
+            context.storage,
+            context.txid,
+            context.arena,
+        )?;
+    }
 
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
@@ -856,6 +888,11 @@ pub(crate) fn external_set_body_into<'a>(
         let mut reader = storage.external_run_reader()?;
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
+        sorter.size_as_postgres(instrument::SortTuples::new(
+            None,
+            0,
+            set_sort_bound(limit_written, with_ties, limit, offset).is_some(),
+        ));
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(
                 storage,
@@ -997,6 +1034,11 @@ fn external_set_query<'a>(
             Err(error) => return sql_fail(error),
         };
         sorter.reset();
+        sorter.size_as_postgres(instrument::SortTuples::new(
+            None,
+            0,
+            set_sort_bound(query.limit.is_some(), query.with_ties, limit, offset).is_some(),
+        ));
         let mut compare = |left: &[u8], right: &[u8]| {
             compare_set_order(storage, txid, columns, left, right, &keys[..key_count])
         };

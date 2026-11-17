@@ -405,14 +405,125 @@ pub(crate) struct SortSpace {
     pub(crate) bytes: usize,
 }
 
+/// The most columns a sort tuple sized as PostgreSQL's names.
+const MAX_SORT_COLUMNS: usize = 64;
+
+/// The tuples a PostgreSQL sort holds for rows pos3ql sorts as projected
+/// rows: the values at its columns (every value when `all`), then `tids`
+/// row identities; `bounded` names a sort a limit may bound, whose rows are
+/// aset.c chunks.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SortTuples {
+    columns: [u16; MAX_SORT_COLUMNS],
+    count: usize,
+    all: bool,
+    tids: usize,
+    bounded: bool,
+}
+
+impl SortTuples {
+    /// `None` past the columns a sized tuple names.
+    pub(crate) fn new(columns: Option<&[usize]>, tids: usize, bounded: bool) -> Option<Self> {
+        let mut tuples = Self {
+            columns: [0; MAX_SORT_COLUMNS],
+            count: 0,
+            all: columns.is_none(),
+            tids,
+            bounded,
+        };
+        for &column in columns.unwrap_or(&[]) {
+            *tuples.columns.get_mut(tuples.count)? = u16::try_from(column).ok()?;
+            tuples.count += 1;
+        }
+        Some(tuples)
+    }
+
+    fn length(&self, row: &[u8]) -> Option<usize> {
+        let mut columns = [0usize; MAX_SORT_COLUMNS];
+        for (column, &held) in columns.iter_mut().zip(&self.columns[..self.count]) {
+            *column = usize::from(held);
+        }
+        super::postgres_memory::projected_tuple_len_with_tids(
+            row,
+            (!self.all).then_some(&columns[..self.count]),
+            self.tids,
+        )
+    }
+
+    fn width(&self, row: Option<&[u8]>) -> usize {
+        let values = if self.all {
+            row.map_or(0, crate::sql::exec::projected_row_width)
+        } else {
+            self.count
+        };
+        values + self.tids
+    }
+
+    /// What PostgreSQL's in-memory sort of `count` rows (`row_at`, in
+    /// arrival order) reports (`tuplesort_get_stats` after the sort); with
+    /// `heap`, a sort bounded to its first rows, whose bounded heap
+    /// `compare` orders in a scratch array of the bound's positions. `None`
+    /// when a value has no PostgreSQL size here or the rows overflow
+    /// `work_mem`.
+    pub(crate) fn space<'r>(
+        &self,
+        count: usize,
+        row_at: &dyn Fn(usize) -> &'r [u8],
+        heap: Option<(
+            &mut [usize],
+            &mut dyn FnMut(&[u8], &[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>,
+        )>,
+    ) -> Result<Option<usize>, crate::sql::SqlError> {
+        use super::postgres_memory::{
+            SortTuples as Copies, allocset_chunk_space, bounded_heap_charge, maxalign,
+            tuplesort_memory,
+        };
+        let copies = if self.width((count > 0).then(|| row_at(0))) == 1 {
+            Copies::Datum
+        } else if self.bounded || heap.is_some() {
+            Copies::AllocSet
+        } else {
+            Copies::Bump
+        };
+        let charge = |length: usize| match copies {
+            Copies::Datum => 0,
+            Copies::Bump => maxalign(length),
+            Copies::AllocSet => allocset_chunk_space(length),
+        };
+        for row in 0..count {
+            if self.length(row_at(row)).is_none() {
+                return Ok(None);
+            }
+        }
+        let length = |row: usize| self.length(row_at(row)).unwrap_or(0);
+        let (bound, heap_charge) = match heap {
+            Some((positions, compare)) if count > positions.len() * 2 && !positions.is_empty() => {
+                let bound = positions.len();
+                let held = bounded_heap_charge(
+                    count,
+                    |row| charge(length(row)),
+                    positions,
+                    |new, worst| Ok(compare(row_at(new), row_at(worst))?.is_lt()),
+                )?;
+                (Some(bound), Some(held))
+            }
+            _ => (None, None),
+        };
+        Ok(tuplesort_memory(
+            copies,
+            (0..count).map(length),
+            bound,
+            heap_charge,
+        ))
+    }
+}
+
 impl SortSpace {
-    /// PostgreSQL's in-memory sort of `rows`, whose tuples hold the values
-    /// at `columns` (`tuplesort_get_stats` after the sort): `bound` names a
-    /// bounded heap that kept the first rows, and `bounded` a sort a limit
-    /// may bound, whose rows are aset.c chunks. pos3ql's own figure when a
-    /// value has no PostgreSQL size here or the rows overflow `work_mem`.
+    /// PostgreSQL's in-memory sort of `rows` (in arrival order), whose
+    /// tuples hold the values at `columns`; pos3ql's own figure when a value
+    /// has no PostgreSQL size here or the rows overflow `work_mem`.
     pub(crate) fn postgres(rows: &[&[u8]], columns: Option<&[usize]>, bounded: bool) -> Self {
-        Self::postgres_sorted(rows, columns, 0, bounded, None)
+        Self::postgres_locking(rows, columns, 0, bounded)
     }
 
     /// [`Self::postgres`] of rows that also carry `tids` row identities a
@@ -423,7 +534,17 @@ impl SortSpace {
         tids: usize,
         bounded: bool,
     ) -> Self {
-        Self::postgres_sorted(rows, columns, tids, bounded, None)
+        let own = Self::in_memory(rows, false);
+        let space = SortTuples::new(columns, tids, bounded).and_then(|tuples| {
+            tuples
+                .space(rows.len(), &|row| rows[row], None)
+                .ok()
+                .flatten()
+        });
+        Self {
+            method: own.method,
+            bytes: space.unwrap_or(own.bytes),
+        }
     }
 
     /// [`Self::postgres_locking`] of a sort a limit of `bound` rows bounds,
@@ -437,77 +558,24 @@ impl SortSpace {
         arena: &crate::mem::arena::Arena,
         mut compare: impl FnMut(&&[u8], &&[u8]) -> Result<core::cmp::Ordering, crate::sql::SqlError>,
     ) -> Result<Self, crate::sql::SqlError> {
-        use super::postgres_memory::{allocset_chunk_space, bounded_heap_charge};
-        if rows.len() <= bound * 2 || bound == 0 {
-            return Ok(Self::postgres_sorted(rows, columns, tids, true, None));
-        }
-        let mut chunks = crate::mem::arena::ArenaList::new(arena);
-        for row in rows {
-            let Some(length) =
-                super::postgres_memory::projected_tuple_len_with_tids(row, columns, tids)
-            else {
-                return Ok(Self::in_memory(rows, true));
-            };
-            chunks
-                .push(allocset_chunk_space(length))
-                .map_err(|_| super::arena_full_pub())?;
-        }
-        let heap = arena
+        let heap = rows.len() > bound * 2 && bound > 0;
+        let own = Self::in_memory(rows, heap);
+        let Some(tuples) = SortTuples::new(columns, tids, true) else {
+            return Ok(own);
+        };
+        let positions = arena
             .alloc_slice_with(bound, |_| 0usize)
             .map_err(|_| super::arena_full_pub())?;
-        let charge = bounded_heap_charge(chunks.as_slice(), bound, heap, |new, worst| {
-            Ok(compare(&rows[new], &rows[worst])?.is_lt())
-        })?;
-        Ok(Self::postgres_sorted(
-            rows,
-            columns,
-            tids,
-            true,
-            Some((bound, charge)),
-        ))
-    }
-
-    fn postgres_sorted(
-        rows: &[&[u8]],
-        columns: Option<&[usize]>,
-        tids: usize,
-        bounded: bool,
-        heap: Option<(usize, usize)>,
-    ) -> Self {
-        use super::postgres_memory::{SortTuples, projected_tuple_len_with_tids, tuplesort_memory};
-        let own = Self::in_memory(rows, heap.is_some());
-        let width = match columns {
-            Some(columns) => columns.len(),
-            None => rows
-                .first()
-                .map_or(0, |row| crate::sql::exec::projected_row_width(row)),
-        };
-        let tuples = if width + tids == 1 {
-            SortTuples::Datum
-        } else if bounded {
-            SortTuples::AllocSet
-        } else {
-            SortTuples::Bump
-        };
-        let length = |row: &&[u8]| projected_tuple_len_with_tids(row, columns, tids);
-        if rows.iter().any(|row| length(row).is_none()) {
-            return own;
-        }
-        let lengths = rows.iter().map(|row| length(row).unwrap_or(0));
-        let charge = heap.map(|(_, charge)| {
-            if tuples == SortTuples::Datum {
-                0
-            } else {
-                charge
-            }
-        });
-        match tuplesort_memory(tuples, lengths, heap.map(|(bound, _)| bound), charge) {
-            Some(bytes) => Self {
-                method: own.method,
-                bytes,
-            },
-            None => own,
-        }
+        let mut compare = |left: &[u8], right: &[u8]| compare(&left, &right);
+        let space = tuples.space(
+            rows.len(),
+            &|row| rows[row],
+            Some((positions, &mut compare)),
+        )?;
+        Ok(Self {
+            method: own.method,
+            bytes: space.unwrap_or(own.bytes),
+        })
     }
 
     /// An in-memory sort of `rows`, which pos3ql holds whole: their bytes
@@ -950,6 +1018,8 @@ struct RecursiveStores {
     tables: [super::postgres_memory::Tuplestore; 2],
     scanned: super::postgres_memory::Tuplestore,
     steps: usize,
+    /// The current step added a row.
+    filling: bool,
     unsized_rows: bool,
 }
 
@@ -960,6 +1030,7 @@ impl RecursiveStores {
             tables: [empty; 2],
             scanned: empty,
             steps: 0,
+            filling: false,
             unsized_rows: false,
         }
     }
@@ -1256,24 +1327,47 @@ impl Node {
     /// working and intermediate tables, each cleared before it is refilled,
     /// and the store its `CTE Scan`s read, which holds every row.
     pub(crate) fn recursive_step(self, rows: &[&[u8]]) {
+        for row in rows {
+            self.recursive_row(row);
+        }
+        self.recursive_step_end();
+    }
+
+    /// Adds one row of the current `Recursive Union` step (see
+    /// [`Self::recursive_step`]).
+    pub(crate) fn recursive_row(self, row: &[u8]) {
         self.with(|slot, _| {
             let stores = slot.recursive.get_or_insert_with(RecursiveStores::new);
             if stores.unsized_rows {
                 return;
             }
-            let table = &mut stores.tables[stores.steps % 2];
-            if stores.steps >= 2 {
-                table.clear();
+            if !stores.filling {
+                stores.filling = true;
+                if stores.steps >= 2 {
+                    stores.tables[stores.steps % 2].clear();
+                }
             }
-            for row in rows {
-                let Some(length) = super::postgres_memory::projected_tuple_len(row, None) else {
-                    stores.unsized_rows = true;
-                    slot.counters.cte_stored = Some(StoredSpace::Unsized);
-                    return;
-                };
-                table.put(length);
-                stores.scanned.put(length);
+            let Some(length) = super::postgres_memory::projected_tuple_len(row, None) else {
+                stores.unsized_rows = true;
+                slot.counters.cte_stored = Some(StoredSpace::Unsized);
+                return;
+            };
+            stores.tables[stores.steps % 2].put(length);
+            stores.scanned.put(length);
+        });
+    }
+
+    /// Ends a `Recursive Union` step.
+    pub(crate) fn recursive_step_end(self) {
+        self.with(|slot, _| {
+            let stores = slot.recursive.get_or_insert_with(RecursiveStores::new);
+            if stores.unsized_rows {
+                return;
             }
+            if !stores.filling && stores.steps >= 2 {
+                stores.tables[stores.steps % 2].clear();
+            }
+            stores.filling = false;
             stores.steps += 1;
             let (_, working) = stores.tables[0].finish();
             let (_, intermediate) = stores.tables[1].finish();

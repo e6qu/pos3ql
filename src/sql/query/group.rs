@@ -210,6 +210,17 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
+        // PostgreSQL sorts the grouping columns, when the aggregates read
+        // no column (see the in-memory path).
+        if input_sort.measured() && grouping_sort_is_keys(statement, agg_nodes, mask) {
+            let columns: [usize; crate::sql::parser::MAX_GROUP_TERMS] =
+                core::array::from_fn(|column| column);
+            sorter.size_as_postgres(instrument::SortTuples::new(
+                Some(&columns[..n_keys]),
+                0,
+                false,
+            ));
+        }
         // Equal keys keep input order, so each group reports its first input
         // row's key, as PostgreSQL's hashed grouping does.
         let input_position = |row: &[u8]| match crate::sql::exec::decode_projected_pub(row, n_keys)
@@ -407,13 +418,7 @@ pub(super) fn groups_for_mask<'a>(
             // PostgreSQL sorts the rows its scan returns: the grouping
             // columns, and the aggregates' input columns, which pos3ql's
             // key rows do not hold.
-            let key_only = (0..n_keys).all(|key| mask.contains(key))
-                && agg_nodes.iter().all(|(_, aggregate)| match aggregate {
-                    Expr::Call { args, filter, .. } => {
-                        filter.is_none() && args.iter().all(|argument| argument.is_constant(false))
-                    }
-                    _ => false,
-                });
+            let key_only = grouping_sort_is_keys(statement, agg_nodes, mask);
             let space = if key_only {
                 let rows = arena
                     .alloc_slice_with(keys.len(), |at| keys[at].0)
@@ -1716,4 +1721,21 @@ pub(super) fn record_distinct_hash_memory(
         columns,
         arena,
     )
+}
+
+/// Whether PostgreSQL's sort of a `GroupAggregate`'s input holds only the
+/// grouping columns pos3ql's key rows hold: every key is in the set and no
+/// aggregate reads a column.
+fn grouping_sort_is_keys(
+    statement: &Select<'_>,
+    agg_nodes: &[(*const Expr<'_>, &Expr<'_>)],
+    mask: GroupingSet<'_>,
+) -> bool {
+    (0..statement.group_by.len()).all(|key| mask.contains(key))
+        && agg_nodes.iter().all(|(_, aggregate)| match aggregate {
+            Expr::Call { args, filter, .. } => {
+                filter.is_none() && args.iter().all(|argument| argument.is_constant(false))
+            }
+            _ => false,
+        })
 }

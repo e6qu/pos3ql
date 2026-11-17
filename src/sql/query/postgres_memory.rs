@@ -284,22 +284,23 @@ pub(crate) fn tuplesort_memory(
 /// (`make_bounded_heap`, then `TSS_BOUNDED`): the heap keeps the `bound`
 /// best rows of the first `2 * bound + 1` and frees each row no better
 /// than its worst, but a row that replaces the worst there leaves that one
-/// charged; past them a row better than the worst frees it. `chunks` are
+/// charged; past them a row better than the worst frees it. `chunk` gives
 /// the rows' charges in arrival order and `better(new, worst)` whether a
-/// row sorts strictly before another; `heap` holds `bound` positions.
+/// row sorts strictly before another; `heap` holds the bound's positions.
 pub(crate) fn bounded_heap_charge<E>(
-    chunks: &[usize],
-    bound: usize,
+    count: usize,
+    chunk: impl Fn(usize) -> usize,
     heap: &mut [usize],
     mut better: impl FnMut(usize, usize) -> Result<bool, E>,
 ) -> Result<usize, E> {
-    let heapify_at = (bound * 2 + 1).min(chunks.len());
-    let mut charge: usize = chunks[..heapify_at].iter().sum();
+    let bound = heap.len();
+    let heapify_at = (bound * 2 + 1).min(count);
+    let mut charge: usize = (0..heapify_at).map(&chunk).sum();
     let mut size = 0usize;
     // A heap whose top is its worst row: `worse(a, b)` when `b` is better.
     let sift_down = |heap: &mut [usize],
-                         size: usize,
-                         better: &mut dyn FnMut(usize, usize) -> Result<bool, E>|
+                     size: usize,
+                     better: &mut dyn FnMut(usize, usize) -> Result<bool, E>|
      -> Result<(), E> {
         let mut at = 0;
         loop {
@@ -318,9 +319,9 @@ pub(crate) fn bounded_heap_charge<E>(
             at = worst;
         }
     };
-    for row in 0..chunks.len() {
+    for row in 0..count {
         if row >= heapify_at {
-            charge += chunks[row];
+            charge += chunk(row);
         }
         if size < bound {
             heap[size] = row;
@@ -338,11 +339,11 @@ pub(crate) fn bounded_heap_charge<E>(
             continue;
         }
         if !better(row, heap[0])? {
-            charge -= chunks[row];
+            charge -= chunk(row);
             continue;
         }
         if row >= heapify_at {
-            charge -= chunks[heap[0]];
+            charge -= chunk(heap[0]);
         }
         heap[0] = row;
         sift_down(heap, size, &mut better)?;
@@ -681,10 +682,10 @@ mod tests {
         );
         // Ascending input to a descending bounded sort: each row of the
         // first seven replaces the heap's worst, which stays charged.
-        let chunks = [40usize; 100];
         let mut heap = [0usize; 3];
         let charge =
-            bounded_heap_charge::<()>(&chunks, 3, &mut heap, |new, worst| Ok(new > worst)).unwrap();
+            bounded_heap_charge::<()>(100, |_| 40, &mut heap, |new, worst| Ok(new > worst))
+                .unwrap();
         assert_eq!(charge, 7 * 40);
         assert_eq!(
             tuplesort_memory(

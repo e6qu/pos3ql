@@ -2990,6 +2990,26 @@ impl<'a> RetainedSelect<'a> {
         {
             return Ok(None);
         }
+        // Subqueries the planner pulls up into a join PostgreSQL's join
+        // search plans run in the general executor, which follows that plan.
+        if statement
+            .where_clause
+            .is_some_and(|condition| condition.contains_subquery())
+        {
+            let pulled = super::pullup::pull_up_subqueries(statement, storage, txid, arena, None)?;
+            if let Some(from) = pulled.from.as_ref()
+                && from.joins.iter().any(|join| join.kind.is_semi_or_anti())
+            {
+                let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+                if super::index_paths::join_query::modeled_join(
+                    storage, txid, pulled, &scope, params, arena,
+                )?
+                .is_some()
+                {
+                    return Ok(None);
+                }
+            }
+        }
         if let Some(from) = statement.from.as_ref()
             && !from.joins.is_empty()
         {

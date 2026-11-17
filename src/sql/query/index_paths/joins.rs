@@ -191,6 +191,13 @@ pub(crate) struct SpecialJoin {
     pub(crate) commute_above_r: Relids,
     pub(crate) commute_below_l: Relids,
     pub(crate) commute_below_r: Relids,
+    /// A semi join's inner columns its equalities compare, by which its
+    /// inner relation can be made unique (`semi_rhs_exprs`), and whether
+    /// sorting or hashing can (`semi_can_btree`, `semi_can_hash`).
+    pub(crate) semi_rhs: [Member; MAX_KEYS],
+    pub(crate) semi_count: u8,
+    pub(crate) semi_can_btree: bool,
+    pub(crate) semi_can_hash: bool,
 }
 
 /// The join type of a join path (`JoinType`).
@@ -204,6 +211,11 @@ pub(crate) enum JoinType {
     Right,
     RightSemi,
     RightAnti,
+    /// An inner join of a semi join's unique-ified inner relation, or of
+    /// its unique-ified outer one (`JOIN_UNIQUE_INNER`, `JOIN_UNIQUE_OUTER`):
+    /// the paths are inner joins.
+    UniqueInner,
+    UniqueOuter,
 }
 
 impl JoinType {
@@ -415,6 +427,15 @@ pub(crate) enum PathKind {
     Material {
         input: u32,
     },
+    /// A semi join's inner relation made unique by its compared columns
+    /// (`create_unique_path`): sorted and deduplicated, hashed, or already
+    /// unique by an index (`UNIQUE_PATH_NOOP`, which plans no node).
+    Unique {
+        input: u32,
+        keys: [Member; MAX_KEYS],
+        key_count: u8,
+        method: UniqueMethod,
+    },
     NestLoop {
         jointype: JoinType,
         outer: u32,
@@ -458,6 +479,14 @@ pub(crate) enum PathKind {
     },
 }
 
+/// How a unique-ified relation is made unique (`UniquePathMethod`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UniqueMethod {
+    Noop,
+    Sort,
+    Hash,
+}
+
 /// A path of a base or join relation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Path {
@@ -494,6 +523,8 @@ struct Rel {
     /// The pair that built a join relation, whose target lists its own
     /// concatenates (`build_joinrel_tlist`).
     first: (Relids, Relids),
+    /// `cheapest_unique_path`, once a semi join asked for it.
+    unique: Option<Option<u32>>,
 }
 
 /// The chosen plan: every path the search built, and the cheapest of the
@@ -584,6 +615,8 @@ pub(crate) struct JoinProblem<'p> {
 
 struct Search<'p, 'a, 's> {
     problem: &'p JoinProblem<'p>,
+    /// `join_info_list` after `reduce_unique_semijoins`.
+    specials: &'a [SpecialJoin],
     statistics: &'s dyn JoinStatistics,
     arena: &'a Arena,
     clauses: ArenaList<'a, Clause>,
@@ -625,6 +658,7 @@ pub(crate) fn search<'a>(
     let full = arena_slice(arena, 1usize << n, |_| None::<Rel>)?;
     let mut search = Search {
         problem,
+        specials: &[],
         statistics,
         arena,
         clauses: ArenaList::new(arena),
@@ -662,6 +696,7 @@ pub(crate) fn search<'a>(
             parameterized: [0; MAX_REL_PATHS],
             parameterized_count: 0,
             first: (relids, 0),
+            unique: None,
         });
         for (at, base) in rel.paths.iter().enumerate() {
             search.add_path(
@@ -684,6 +719,7 @@ pub(crate) fn search<'a>(
         }
         search.set_cheapest(relids);
     }
+    search.reduce_unique_semijoins()?;
     for subproblem in problem.subproblems {
         let items = &subproblem.items[..usize::from(subproblem.count)];
         if items.len() < 2 {
@@ -764,6 +800,15 @@ struct JoinInputs {
 }
 
 impl JoinInputs {
+    /// The join type of the paths: a unique-ified relation's join is an
+    /// inner join.
+    fn path_jointype(&self) -> JoinType {
+        match self.jointype {
+            JoinType::UniqueInner | JoinType::UniqueOuter => JoinType::Inner,
+            jointype => jointype,
+        }
+    }
+
     /// The executor stops at an outer row's first match.
     fn first_match(&self) -> bool {
         matches!(self.jointype, JoinType::Semi | JoinType::Anti) || self.inner_unique
@@ -811,7 +856,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     }
 
     fn special(&self, id: u8) -> &SpecialJoin {
-        &self.problem.specials[usize::from(id)]
+        &self.specials[usize::from(id)]
     }
 
     /// The sides of a mergeable clause: its left and right members and
@@ -860,6 +905,58 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
     }
 
+    /// `reduce_unique_semijoins`: a semi join whose inner relation is one
+    /// base relation unique for its clauses with the outer relations is an
+    /// inner join.
+    fn reduce_unique_semijoins(&mut self) -> Result<(), SqlError> {
+        let held = self.problem.specials;
+        let kept = self
+            .arena
+            .alloc_slice_with(held.len(), |at| held[at])
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        for special in held {
+            let inner = special.min_right;
+            let reduced = special.kind == SpecialKind::Semi
+                && inner.count_ones() == 1
+                && inner & !BASE_RELIDS == 0
+                && !self.problem.rels[inner.trailing_zeros() as usize]
+                    .unique
+                    .is_empty()
+                && {
+                    let joined = special.min_left | inner;
+                    let mut restrict = ClauseList::EMPTY;
+                    for (class_id, class) in self.problem.classes.iter().enumerate() {
+                        if class.has_const || class.count <= 1 {
+                            continue;
+                        }
+                        let members = class.members();
+                        let first = |side: Relids| {
+                            members.iter().position(|member| {
+                                member.relids() & !joined == 0 && member.relids() & !side == 0
+                            })
+                        };
+                        if let (Some(outer), Some(within)) = (first(special.min_left), first(inner))
+                        {
+                            let id =
+                                self.class_clause(class_id as u8, outer as u8, within as u8)?;
+                            restrict.push(id).ok_or_else(too_many)?;
+                        }
+                    }
+                    for &id in self.rel(inner).joininfo.as_slice() {
+                        restrict.push(id).ok_or_else(too_many)?;
+                    }
+                    self.inner_unique(joined, special.min_left, inner, JoinType::Semi, &restrict)
+                };
+            if !reduced {
+                kept[count] = *special;
+                count += 1;
+            }
+        }
+        self.specials = &kept[..count];
+        Ok(())
+    }
+
     /// `has_relevant_eclass_joinclause`.
     fn has_eclass_joins(&self, relids: Relids) -> bool {
         self.problem.classes.iter().any(|class| {
@@ -904,7 +1001,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// `has_join_restriction`.
     fn has_join_restriction(&self, relids: Relids) -> bool {
-        self.problem.specials.iter().any(|special| {
+        self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
                 && !(special.min_left & !relids == 0 && special.min_right & !relids == 0)
                 && (special.min_left & relids != 0 || special.min_right & relids != 0)
@@ -913,7 +1010,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
 
     /// `have_join_order_restriction`.
     fn order_restriction(&mut self, left: Relids, right: Relids) -> Result<bool, SqlError> {
-        let restricted = self.problem.specials.iter().any(|special| {
+        let restricted = self.specials.iter().any(|special| {
             special.kind != SpecialKind::Full
                 && ((special.min_left & !left == 0 && special.min_right & !right == 0)
                     || (special.min_left & !right == 0 && special.min_right & !left == 0)
@@ -954,7 +1051,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut reversed = false;
         let mut must_be_left = false;
         let subset = |small: Relids, big: Relids| small & !big == 0;
-        for (id, special) in self.problem.specials.iter().enumerate() {
+        for (id, special) in self.specials.iter().enumerate() {
             let id = id as u8;
             if special.min_right & joined == 0 || subset(joined, special.min_right) {
                 continue;
@@ -983,11 +1080,23 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 matched = Some(id);
                 reversed = true;
             } else if special.kind == SpecialKind::Semi
-                && (special.syn_right == rel2 || special.syn_right == rel1)
+                && special.syn_right == rel2
+                && self.unique_path(rel2, id)?.is_some()
             {
-                // A semi join of a unique-ified inner relation.
-                self.outside = Some("a semi join of a unique-ified relation");
-                return Ok(None);
+                if matched.is_some() {
+                    return Ok(None);
+                }
+                matched = Some(id);
+                reversed = false;
+            } else if special.kind == SpecialKind::Semi
+                && special.syn_right == rel1
+                && self.unique_path(rel1, id)?.is_some()
+            {
+                if matched.is_some() {
+                    return Ok(None);
+                }
+                matched = Some(id);
+                reversed = true;
             } else {
                 if special.min_right & rel1 != 0 && special.min_right & rel2 != 0 {
                     continue;
@@ -1009,6 +1118,149 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         Ok(Some((matched, reversed)))
     }
 
+    /// `create_unique_path` of relation `relids`, the inner relation of
+    /// semi join `special`: its cheapest path made unique by the join's
+    /// compared columns, already unique when a unique index covers them,
+    /// else sorted or hashed as is cheaper; `None` when it cannot be.
+    fn unique_path(&mut self, relids: Relids, special: u8) -> Result<Option<u32>, SqlError> {
+        let mut rel = self.rel(relids);
+        if let Some(held) = rel.unique {
+            return Ok(held);
+        }
+        let info = *self.special(special);
+        let mut result = None;
+        if info.semi_can_btree || info.semi_can_hash {
+            // The compared columns, each class once (`pathkey_is_redundant`).
+            let mut keys = [Member::plain(0, 0); MAX_KEYS];
+            let mut classes = [u8::MAX; MAX_KEYS];
+            let mut count = 0;
+            for &member in &info.semi_rhs[..usize::from(info.semi_count)] {
+                let class = self
+                    .problem
+                    .classes
+                    .iter()
+                    .position(|class| class.members().contains(&member));
+                if let Some(class) = class {
+                    if self.problem.classes[class].has_const
+                        || classes[..count].contains(&(class as u8))
+                    {
+                        continue;
+                    }
+                    classes[count] = class as u8;
+                }
+                keys[count] = member;
+                count += 1;
+            }
+            if count > 0 {
+                result = self.build_unique_path(&rel, &keys[..count], &info)?;
+            }
+        }
+        rel.unique = Some(result);
+        self.rels[(relids & BASE_RELIDS) as usize] = Some(rel);
+        Ok(result)
+    }
+
+    fn build_unique_path(
+        &mut self,
+        rel: &Rel,
+        keys: &[Member],
+        info: &SpecialJoin,
+    ) -> Result<Option<u32>, SqlError> {
+        let settings = self.problem.settings;
+        let input = self.path(rel.cheapest_total);
+        let mut held = [Member::plain(0, 0); MAX_KEYS];
+        held[..keys.len()].copy_from_slice(keys);
+        let unique = |method: UniqueMethod| PathKind::Unique {
+            input: rel.cheapest_total,
+            keys: held,
+            key_count: keys.len() as u8,
+            method,
+        };
+        // A unique index of a base relation over the columns, with its
+        // restrictions' constant equalities, makes it unique already.
+        if info.semi_can_btree && rel.relids.count_ones() == 1 {
+            let base = &self.problem.rels[rel.relids.trailing_zeros() as usize];
+            let mut matched = base.fixed;
+            for key in keys {
+                if key.column < 64 {
+                    matched |= 1 << key.column;
+                }
+            }
+            if base.unique.iter().any(|&index| index & !matched == 0) {
+                return self
+                    .push_path(Path {
+                        kind: unique(UniqueMethod::Noop),
+                        rows: rel.rows,
+                        ..input
+                    })
+                    .map(Some);
+            }
+        }
+        let rows = self.statistics.groups(keys, rel.rows)?;
+        let columns = keys.len() as f64;
+        let costs = settings.costs;
+        let sorted = info.semi_can_btree.then(|| {
+            let (startup, run) = super::paths::tuplesort_cost(rel.rows, input.width, None, costs);
+            let startup = startup + input.total;
+            (
+                startup,
+                startup + run + costs.cpu_operator * rel.rows * columns,
+                input.disabled + u32::from(!settings.sort),
+            )
+        });
+        let hashed = (info.semi_can_hash && (input.width + 64.0) * rows <= settings.hash_mem_bytes)
+            .then(|| {
+                let (startup, total, _) = super::aggregate::cost_agg(
+                    super::aggregate::AggStrategy::Hashed,
+                    &super::aggregate::AggregateCosts::default(),
+                    keys.len(),
+                    rows,
+                    super::aggregate::AggInput {
+                        startup: input.startup,
+                        total: input.total,
+                        rows: rel.rows,
+                        width: input.width,
+                    },
+                );
+                (startup, total, input.disabled)
+            });
+        let (startup, total, disabled, hash) = match (sorted, hashed) {
+            (Some(sort), Some(hash)) => {
+                if hash.2 < sort.2 || (hash.2 == sort.2 && hash.1 < sort.1) {
+                    (hash.0, hash.1, hash.2, true)
+                } else {
+                    (sort.0, sort.1, sort.2, false)
+                }
+            }
+            (Some(sort), None) => (sort.0, sort.1, sort.2, false),
+            (None, Some(hash)) => (hash.0, hash.1, hash.2, true),
+            (None, None) => return Ok(None),
+        };
+        self.push_path(Path {
+            kind: unique(if hash {
+                UniqueMethod::Hash
+            } else {
+                UniqueMethod::Sort
+            }),
+            rows,
+            startup,
+            total,
+            disabled,
+            keys: Keys::NONE,
+            ..input
+        })
+        .map(Some)
+    }
+
+    /// The unique-ified path of a semi join's inner relation, which
+    /// `join_is_legal` already built.
+    fn unique_of(&mut self, relids: Relids, special: Option<u8>) -> Result<u32, SqlError> {
+        let special = special.expect("a semi join");
+        Ok(self
+            .unique_path(relids, special)?
+            .expect("a unique-ified relation"))
+    }
+
     /// `add_outer_joins_to_relids`.
     fn add_outer_joins(&self, input: Relids, special: Option<u8>) -> Relids {
         let Some(special) = special.map(|id| self.special(id)) else {
@@ -1026,7 +1278,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut relids = input | special.oj;
         if special.commute_above_l != 0 {
             let mut above = special.commute_above_l;
-            for other in self.problem.specials {
+            for other in self.specials {
                 if core::ptr::eq(other, special) || other.oj == 0 || other.kind != SpecialKind::Left
                 {
                     continue;
@@ -1136,6 +1388,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     parameterized: [0; MAX_REL_PATHS],
                     parameterized_count: 0,
                     first: (rel1, rel2),
+                    unique: None,
                 });
                 self.levels[level].push(joined).map_err(|_| arena_full())?;
             }
@@ -1157,7 +1410,16 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 (rel2, rel1, JoinType::RightAnti),
             ],
             Some(SpecialKind::Semi) => {
-                self.outside = Some("a semi join");
+                let id = special.expect("a semi join");
+                let info = *self.special(id);
+                if info.min_left & !rel1 == 0 && info.min_right & !rel2 == 0 {
+                    self.add_paths(joined, rel1, rel2, JoinType::Semi, special, restrict)?;
+                    self.add_paths(joined, rel2, rel1, JoinType::RightSemi, special, restrict)?;
+                }
+                if info.syn_right == rel2 && self.unique_path(rel2, id)?.is_some() {
+                    self.add_paths(joined, rel1, rel2, JoinType::UniqueInner, special, restrict)?;
+                    self.add_paths(joined, rel2, rel1, JoinType::UniqueOuter, special, restrict)?;
+                }
                 return Ok(());
             }
         };
@@ -1701,6 +1963,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let settings = self.problem.settings;
         let inner_unique = match jointype {
             JoinType::Semi | JoinType::Anti => false,
+            JoinType::UniqueInner => {
+                let special = self.special(special.expect("a semi join"));
+                special.min_left & !outer == 0
+            }
+            JoinType::UniqueOuter => {
+                self.inner_unique(joined, outer, inner, JoinType::Inner, &restrict)
+            }
             _ => self.inner_unique(joined, outer, inner, jointype, &restrict),
         };
         let (mergeable, merge_allowed) = if settings.mergejoin || jointype == JoinType::Full {
@@ -1715,7 +1984,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 (1.0, 1.0)
             };
         let mut param_source = 0;
-        for other in self.problem.specials {
+        for other in self.specials {
             if joined & other.min_right != 0 && joined & other.min_left == 0 {
                 param_source |= self.all_baserels & !other.min_right;
             }
@@ -1796,12 +2065,21 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         if inputs.mergeable.len == 0 {
             return Ok(());
         }
-        let outer_path = self.rel(inputs.outer).cheapest_total;
-        let inner_path = self.rel(inputs.inner).cheapest_total;
+        let mut outer_path = self.rel(inputs.outer).cheapest_total;
+        let mut inner_path = self.rel(inputs.inner).cheapest_total;
         if self.path(outer_path).param & inputs.inner != 0
             || self.path(inner_path).param & inputs.outer != 0
         {
             return Ok(());
+        }
+        match inputs.jointype {
+            JoinType::UniqueOuter => {
+                outer_path = self.unique_of(inputs.outer, inputs.special)?;
+            }
+            JoinType::UniqueInner => {
+                inner_path = self.unique_of(inputs.inner, inputs.special)?;
+            }
+            _ => {}
         }
         let all = self.outer_pathkeys_for_merge(joined, inputs);
         for front in 0..usize::from(all.len) {
@@ -1814,7 +2092,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             }
             let merge = self.mergeclauses_for_outer_keys(&outer_keys, inputs);
             let inner_keys = self.inner_keys_for_merge(&merge, inputs);
-            let keys = self.join_keys(joined, inputs.jointype, &outer_keys);
+            let keys = self.join_keys(joined, inputs.path_jointype(), &outer_keys);
             self.try_mergejoin(
                 joined,
                 inputs,
@@ -1870,27 +2148,48 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> Result<(), SqlError> {
         let (nestloop_ok, use_all) = match inputs.jointype {
             JoinType::RightSemi => return Ok(()),
-            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti => (true, false),
+            JoinType::Inner
+            | JoinType::Left
+            | JoinType::Semi
+            | JoinType::Anti
+            | JoinType::UniqueInner
+            | JoinType::UniqueOuter => (true, false),
             JoinType::Right | JoinType::RightAnti | JoinType::Full => (false, true),
         };
         let outer_rel = self.rel(inputs.outer);
         let inner_rel = self.rel(inputs.inner);
         let settings = self.problem.settings;
-        let inner_total = Some(inner_rel.cheapest_total)
+        let mut inner_total = Some(inner_rel.cheapest_total)
             .filter(|&path| self.path(path).param & inputs.outer == 0);
-        let material = match inner_total {
-            Some(total) if nestloop_ok && settings.material && !self.materializes_output(total) => {
-                Some(self.material_path(total)?)
+        let mut material = None;
+        if inputs.jointype == JoinType::UniqueInner {
+            if inner_total.is_none() {
+                return Ok(());
             }
-            _ => None,
-        };
-        for &outer in &outer_rel.paths[..usize::from(outer_rel.count)] {
+            inner_total = Some(self.unique_of(inputs.inner, inputs.special)?);
+        } else if let Some(total) = inner_total
+            && nestloop_ok
+            && settings.material
+            && !self.materializes_output(total)
+        {
+            material = Some(self.material_path(total)?);
+        }
+        for &held_outer in &outer_rel.paths[..usize::from(outer_rel.count)] {
             // An outer path reading the inner relation's values cannot be.
-            if self.path(outer).param & inputs.inner != 0 {
+            if self.path(held_outer).param & inputs.inner != 0 {
                 continue;
             }
-            let keys = self.join_keys(joined, inputs.jointype, &self.path(outer).keys);
-            if nestloop_ok {
+            let mut outer = held_outer;
+            if inputs.jointype == JoinType::UniqueOuter {
+                if outer != outer_rel.cheapest_total {
+                    continue;
+                }
+                outer = self.unique_of(inputs.outer, inputs.special)?;
+            }
+            let keys = self.join_keys(joined, inputs.path_jointype(), &self.path(outer).keys);
+            if inputs.jointype == JoinType::UniqueInner {
+                self.try_nestloop(joined, inputs, outer, inner_total.expect("unique"), keys)?;
+            } else if nestloop_ok {
                 // The cheapest inner path of each parameterization, the
                 // unparameterized one first.
                 for &inner in &inner_rel.parameterized[..usize::from(inner_rel.parameterized_count)]
@@ -1903,6 +2202,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 if let Some(material) = material {
                     self.try_nestloop(joined, inputs, outer, material, keys)?;
                 }
+            }
+            if inputs.jointype == JoinType::UniqueOuter {
+                continue;
             }
             let Some(inner_total) = inner_total else {
                 continue;
@@ -2201,7 +2503,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             PathKind::Scan { rel, path } => {
                 self.problem.rels[usize::from(rel)].paths[usize::from(path)].enforced
             }
-            PathKind::Material { input } | PathKind::Memoize { input, .. } => self.enforced(input),
+            PathKind::Material { input }
+            | PathKind::Memoize { input, .. }
+            | PathKind::Unique { input, .. } => self.enforced(input),
             PathKind::NestLoop {
                 outer,
                 inner,
@@ -2357,6 +2661,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             None,
             Some(inner_keys),
         )?;
+        if inputs.jointype == JoinType::UniqueInner {
+            return Ok(());
+        }
         let (mut cheapest_total, mut cheapest_startup) =
             if inner_keys.contained_in(&self.path(inner_total).keys) {
                 (Some(inner_total), Some(inner_total))
@@ -2487,7 +2794,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             if required & inputs.param_source == 0 && !star {
                 return Ok(());
             }
-            if !self.problem.specials.is_empty() {
+            if !self.specials.is_empty() {
                 self.outside = Some("a parameterized join of a query with outer joins");
                 return Ok(());
             }
@@ -2602,7 +2909,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             joined,
             Path {
                 kind: PathKind::NestLoop {
-                    jointype: inputs.jointype,
+                    jointype: inputs.path_jointype(),
                     outer,
                     inner,
                     clauses,
@@ -2753,7 +3060,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         // A semi or anti join, or a unique inner relation, every clause of
         // which merges needs no mark.
         let skip_mark_restore = inputs.first_match() && inputs.restrict.len == merge.len;
-        let rescanned = if skip_mark_restore {
+        let rescanned = if skip_mark_restore || matches!(outer_path.kind, PathKind::Unique { .. }) {
             0.0
         } else {
             (merged - inner_path.rows).max(0.0)
@@ -2787,7 +3094,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             joined,
             Path {
                 kind: PathKind::MergeJoin {
-                    jointype: inputs.jointype,
+                    jointype: inputs.path_jointype(),
                     outer,
                     inner,
                     clauses: inputs.restrict,
@@ -2861,6 +3168,21 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             || self.path(total_inner).param & inputs.outer != 0
         {
             return Ok(());
+        }
+        match inputs.jointype {
+            JoinType::UniqueOuter => {
+                let outer = self.unique_of(inputs.outer, inputs.special)?;
+                return self.try_hashjoin(joined, inputs, outer, total_inner, hash);
+            }
+            JoinType::UniqueInner => {
+                let inner = self.unique_of(inputs.inner, inputs.special)?;
+                self.try_hashjoin(joined, inputs, total_outer, inner, hash)?;
+                if startup_outer != total_outer {
+                    self.try_hashjoin(joined, inputs, startup_outer, inner, hash)?;
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         self.try_hashjoin(joined, inputs, startup_outer, total_inner, hash)?;
         for &outer in &outer_rel.parameterized[..usize::from(outer_rel.parameterized_count)] {
@@ -2936,7 +3258,13 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let virtual_buckets = f64::from(sizing.buckets) * f64::from(sizing.batches);
         let mut bucket_size: f64 = 1.0;
         let mut mcv_frequency: f64 = 1.0;
-        for &id in hash.as_slice() {
+        // A unique-ified inner relation hashes well.
+        let unique_inner = matches!(inner_path.kind, PathKind::Unique { .. });
+        if unique_inner {
+            bucket_size = 1.0 / virtual_buckets;
+            mcv_frequency = 0.0;
+        }
+        for &id in hash.as_slice().iter().filter(|_| !unique_inner) {
             let (left, right, ..) = self.sides(id).expect("a hash clause");
             let outer_is_left = self
                 .outer_is_left(id, inputs.outer, inputs.inner)
@@ -2988,7 +3316,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             joined,
             Path {
                 kind: PathKind::HashJoin {
-                    jointype: inputs.jointype,
+                    jointype: inputs.path_jointype(),
                     outer,
                     inner,
                     clauses: inputs.restrict,

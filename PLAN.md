@@ -899,7 +899,19 @@ join's unmatched inner rows in bucket order, its NULL keys hashed as
 nothing) and `ExecMergeJoin` (its fill states) do, and an inner scan
 parameterized by an outer join's clause runs under a nested loop
 (`differential_exact/846`). A merge join's sort of a single column sorts
-datums (`ExecInitSort`), so its `Memory` counts no tuples.
+datums (`ExecInitSort`), so its `Memory` counts no tuples. The semi and
+anti joins pulled-up `EXISTS`, `NOT EXISTS`, `IN` and `ANY` subqueries
+become are planned the same way: a semi join whose inner relation a unique
+index makes unique for its clauses becomes an inner join
+(`reduce_unique_semijoins`); otherwise its inner relation can also be made
+unique by its compared columns and inner-joined (`create_unique_path`,
+`join_is_legal`'s unique-ified joins), as a `Unique` over a `Sort` or a
+`HashAggregate` whose groups come back in the order `ExecAgg` walks its
+`simplehash` table, and a hash join may run as a `Hash Right Semi Join`
+returning each inner row at its first match (`differential_exact/847`). A
+query whose subqueries pull up into such a join runs in the general
+executor rather than a retained reader, and a scan's conditions name a
+pulled-up subquery's relation's columns bare, as PostgreSQL prints them.
 Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
@@ -917,9 +929,9 @@ planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
 join over an input in index order that is not a plain index scan without
-a filter (`0A000`). Remaining for that search: semi joins (pulled-up
-`EXISTS`, `IN` and `ANY` subqueries, with their unique-ified inner
-relations), `USING` and `NATURAL`, join conditions other than column
+a filter (`0A000`). Remaining for that search: a parameterized path of a
+relation with an index that would also filter by another join clause
+movable into it (`get_baserel_parampathinfo`), `USING` and `NATURAL`, join conditions other than column
 equalities and comparisons, join removal, a constant equated with an
 outer join's compared column (`reconsider_outer_join_clause`), a
 parameterized hash or merge join (`get_joinrel_parampathinfo` of an outer

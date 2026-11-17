@@ -41,6 +41,7 @@ pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
 pub(crate) use aggregate::{
     AggInput, AggStrategy, AggregateCosts, QualCosts, aggregate_costs, cost_agg, hash_agg_sizing,
+    plain_hash_buckets,
 };
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{

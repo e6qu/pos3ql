@@ -90,6 +90,95 @@ impl Writer<'_, '_, '_, '_> {
                 plan.push(self.keyed(node, query::instrument::Role::Materialize, id))?;
                 self.path(plan, input, depth + 1)
             }
+            PathKind::Unique {
+                input,
+                method: query::index_paths::joins::UniqueMethod::Noop,
+                ..
+            } => self.path(plan, input, depth),
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                method: query::index_paths::joins::UniqueMethod::Hash,
+            } => {
+                // A `HashAggregate` grouping by the compared columns.
+                let mut node = PlanNode {
+                    analyze_unsupported: Some(
+                        "EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported",
+                    ),
+                    ..self.node("HashAggregate", &path, depth)
+                };
+                let mut shown = PlanKeys {
+                    label: KeyLabel::Group,
+                    ..PlanKeys::NONE
+                };
+                for member in &keys[..usize::from(key_count)] {
+                    let mut text = StackStr::<512>::new();
+                    self.column(
+                        (usize::from(member.rel), usize::from(member.column)),
+                        &mut text,
+                    );
+                    for held in [&mut shown.plain, &mut shown.verbose] {
+                        if !held.is_empty() {
+                            let _ = write!(held, "{}", super::KEY_SEPARATOR);
+                        }
+                        let _ = write!(held, "{}", text.as_str());
+                    }
+                }
+                node.keys = shown;
+                plan.push(node)?;
+                self.path(plan, input, depth + 1)
+            }
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                ..
+            } => {
+                // `create_unique_plan`: a `Unique` over a `Sort` of the
+                // compared columns (`label_sort_with_costsize`).
+                const UNSUPPORTED: Option<&str> =
+                    Some("EXPLAIN ANALYZE of a semi join's unique-ified relation is not supported");
+                plan.push(PlanNode {
+                    analyze_unsupported: UNSUPPORTED,
+                    ..self.node("Unique", &path, depth)
+                })?;
+                let input_path = *self.model.plan.path(input);
+                let (startup, total) =
+                    query::index_paths::joins::sort_cost(&input_path, self.model.plan.settings);
+                let mut sort = PlanNode {
+                    analyze_unsupported: UNSUPPORTED,
+                    ..self.node(
+                        "Sort",
+                        &Path {
+                            startup,
+                            total,
+                            ..input_path
+                        },
+                        depth + 1,
+                    )
+                };
+                let mut shown = PlanKeys {
+                    label: KeyLabel::Sort,
+                    ..PlanKeys::NONE
+                };
+                for member in &keys[..usize::from(key_count)] {
+                    let mut text = StackStr::<512>::new();
+                    self.column(
+                        (usize::from(member.rel), usize::from(member.column)),
+                        &mut text,
+                    );
+                    for held in [&mut shown.plain, &mut shown.verbose] {
+                        if !held.is_empty() {
+                            let _ = write!(held, "{}", super::KEY_SEPARATOR);
+                        }
+                        let _ = write!(held, "{}", text.as_str());
+                    }
+                }
+                sort.keys = shown;
+                plan.push(sort)?;
+                self.path(plan, input, depth + 2)
+            }
             PathKind::Memoize {
                 input,
                 keys,
@@ -465,7 +554,7 @@ impl Writer<'_, '_, '_, '_> {
 /// nested loop's.
 fn join_name(method: &str, jointype: JoinType) -> StackStr<64> {
     let kind = match jointype {
-        JoinType::Inner => "",
+        JoinType::Inner | JoinType::UniqueInner | JoinType::UniqueOuter => "",
         JoinType::Left => " Left",
         JoinType::Full => " Full",
         JoinType::Right => " Right",

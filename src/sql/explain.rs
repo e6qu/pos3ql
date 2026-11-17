@@ -2797,7 +2797,10 @@ fn single_relation_quals<'a>(
         sublinks: Some(&registered_sublink),
         references: None,
         folded: true,
-        bare: (outer_count != 0 && !verbose).then_some(exposed),
+        // Its own columns print bare, a pulled-up subquery's relation
+        // under its hidden name included.
+        bare: (outer_count != 0 && !verbose)
+            .then_some(crate::sql::catalog::deparse::printed_name(exposed)),
     };
     let index_cond = match index {
         Some(index) => index_condition(&context, exposed, index, verbose, arena)?,
@@ -3759,7 +3762,7 @@ fn index_condition<'a>(
     let mut count = 0;
     if let Some(chosen) = index.chosen_parts() {
         let context = crate::sql::catalog::deparse::Context {
-            bare: (!verbose).then_some(exposed),
+            bare: (!verbose).then_some(crate::sql::catalog::deparse::printed_name(exposed)),
             ..*context
         };
         if index.as_written() {

@@ -575,6 +575,8 @@ pub(crate) fn modeled_join<'a>(
                 | JoinKind::Left
                 | JoinKind::Right
                 | JoinKind::Full
+                | JoinKind::Semi
+                | JoinKind::Anti
         ) || join.using.is_some()
             || join.natural
             || scope.join_on[index].is_some()
@@ -636,6 +638,21 @@ pub(crate) fn modeled_join<'a>(
     // (each join's range table entry numbered in written order), then the
     // `FROM` list holding the `WHERE` conditions.
     let mut tree = Tree::new(n);
+    tree.enable_hashagg = value("enable_hashagg") != 0.0;
+    // The pulled-up `EXISTS` and `IN` subqueries' semi and anti joins come
+    // last; each wraps the joins and `WHERE` before it
+    // (`pull_up_sublinks`).
+    let semi_start = from
+        .joins
+        .iter()
+        .position(|join| join.kind.is_semi_or_anti())
+        .unwrap_or(from.joins.len());
+    if from.joins[semi_start..]
+        .iter()
+        .any(|join| !join.kind.is_semi_or_anti())
+    {
+        return Ok(None);
+    }
     let mut items = [0u8; MAX_JOIN_RELS];
     let mut item_count = 0;
     let mut join_nodes = [None::<u8>; MAX_JOIN_RELS];
@@ -643,7 +660,7 @@ pub(crate) fn modeled_join<'a>(
         return Ok(None);
     };
     let mut rtindex = 0u8;
-    for (index, join) in from.joins.iter().enumerate() {
+    for (index, join) in from.joins[..semi_start].iter().enumerate() {
         let table = (index + 1) as u8;
         let Some(right) = tree.node(TreeNode::Rel(table)) else {
             return Ok(None);
@@ -676,8 +693,37 @@ pub(crate) fn modeled_join<'a>(
     }
     items[item_count] = current;
     item_count += 1;
-    let Some(root) = tree.list_of(&items[..item_count]) else {
+    let Some(inner_root) = tree.list_of(&items[..item_count]) else {
         return Ok(None);
+    };
+    let mut current = inner_root;
+    for (index, join) in from.joins.iter().enumerate().skip(semi_start) {
+        let Some(right) = tree.node(TreeNode::Rel((index + 1) as u8)) else {
+            return Ok(None);
+        };
+        let kind = if join.kind == JoinKind::Semi {
+            TreeJoin::Semi
+        } else {
+            TreeJoin::Anti
+        };
+        let Some(node) = tree.node(TreeNode::Join {
+            kind,
+            left: current,
+            right,
+            rtindex: None,
+        }) else {
+            return Ok(None);
+        };
+        join_nodes[index] = Some(node);
+        current = node;
+    }
+    let root = if semi_start == from.joins.len() {
+        inner_root
+    } else {
+        let Some(root) = tree.list_of(&[current]) else {
+            return Ok(None);
+        };
+        root
     };
     tree.root = root;
     // The conditions: each join's `ON`, then `WHERE`.
@@ -694,7 +740,7 @@ pub(crate) fn modeled_join<'a>(
         .chain(
             statement
                 .where_clause
-                .map(|condition| (Some(root), condition)),
+                .map(|condition| (Some(inner_root), condition)),
         );
     for (node, condition) in sources {
         let Some(node) = node else {
@@ -1509,9 +1555,30 @@ pub(crate) fn modeled_join<'a>(
     let Ok(plan) = super::joins::search(&problem, &reader, arena)? else {
         return Ok(None);
     };
+    // A hashed unique-ified relation returns its groups in its hash table's
+    // order, by the hash values only some key types have here.
+    if reaches_hashed_unique(&plan, &|member| {
+        let ctype = scope
+            .defs
+            .stored(usize::from(member.rel))
+            .expect("plain table")
+            .columns()[usize::from(member.column)]
+        .ctype;
+        matches!(
+            ctype,
+            ColType::Int2
+                | ColType::Int4
+                | ColType::Int8
+                | ColType::Date
+                | ColType::Bool
+                | ColType::Text
+        )
+    }) {
+        return Ok(None);
+    }
     // A hash join planned with several batches, or one returning its
-    // inner rows without a match, walks its table by the keys' hash
-    // values, which only some key types have here.
+    // inner rows without a match or at their first match, walks its table
+    // by the keys' hash values, which only some key types have here.
     for path in plan.paths {
         if let super::joins::PathKind::HashJoin {
             hash,
@@ -1519,7 +1586,9 @@ pub(crate) fn modeled_join<'a>(
             jointype,
             ..
         } = path.kind
-            && (batches > 1 || jointype.fills_inner())
+            && (batches > 1
+                || jointype.fills_inner()
+                || jointype == super::joins::JoinType::RightSemi)
             && hash.as_slice().iter().any(|&id| {
                 let clause = &plan.clauses[usize::from(id)];
                 let member = match clause.form {
@@ -1993,4 +2062,34 @@ impl JoinStatistics for RelStatistics<'_, '_, '_> {
         }
         Ok(Some(range))
     }
+}
+
+/// Whether the chosen plan hashes a unique-ified relation by a key
+/// `hashable` rejects.
+fn reaches_hashed_unique(plan: &JoinPlan<'_>, hashable: &dyn Fn(&Member) -> bool) -> bool {
+    fn reaches(plan: &JoinPlan<'_>, id: u32, hashable: &dyn Fn(&Member) -> bool) -> bool {
+        use super::joins::PathKind;
+        match plan.path(id).kind {
+            PathKind::Unique {
+                method,
+                input,
+                keys,
+                key_count,
+            } => {
+                (method == super::joins::UniqueMethod::Hash
+                    && !keys[..usize::from(key_count)].iter().all(hashable))
+                    || reaches(plan, input, hashable)
+            }
+            PathKind::Scan { .. } => false,
+            PathKind::Material { input } | PathKind::Memoize { input, .. } => {
+                reaches(plan, input, hashable)
+            }
+            PathKind::NestLoop { outer, inner, .. }
+            | PathKind::HashJoin { outer, inner, .. }
+            | PathKind::MergeJoin { outer, inner, .. } => {
+                reaches(plan, outer, hashable) || reaches(plan, inner, hashable)
+            }
+        }
+    }
+    reaches(plan, plan.top, hashable)
 }

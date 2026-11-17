@@ -911,6 +911,24 @@ impl<'r, 'a> Runner<'r, 'a> {
         match path.kind {
             PathKind::Scan { rel, path } => self.scan(id, usize::from(rel), path, bound, sink),
             PathKind::Material { input } => self.exec(input, bound, sink),
+            PathKind::Unique {
+                input,
+                keys,
+                key_count,
+                method,
+            } => match method {
+                super::index_paths::joins::UniqueMethod::Noop => self.exec(input, bound, sink),
+                super::index_paths::joins::UniqueMethod::Sort => {
+                    self.unique(input, &keys[..usize::from(key_count)], bound, sink)
+                }
+                super::index_paths::joins::UniqueMethod::Hash => self.unique_hashed(
+                    input,
+                    &keys[..usize::from(key_count)],
+                    path.rows,
+                    bound,
+                    sink,
+                ),
+            },
             PathKind::Memoize {
                 input,
                 keys,
@@ -946,7 +964,51 @@ impl<'r, 'a> Runner<'r, 'a> {
                 // join at its first match without returning it; a left or
                 // anti join returns an unmatched outer row with NULLs.
                 let single_match = inner_unique || jointype == JoinType::Semi;
-                self.exec(outer, bound, &mut |bound| {
+                // A loop that stops at its first match reads its inner
+                // `Materialize` only as far as some loop needed
+                // (`ExecMaterial` fetching on demand): under `EXPLAIN
+                // ANALYZE` the inner scan counts those rows, as one read.
+                let lazy = match material {
+                    Some(input)
+                        if super::instrument::active()
+                            && (single_match || jointype == JoinType::Anti) =>
+                    {
+                        let PathKind::Scan {
+                            rel,
+                            path: scan_path,
+                        } = self.model.plan.path(input).kind
+                        else {
+                            return Err(crate::sql_err!(
+                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
+                            ));
+                        };
+                        let rel = usize::from(rel);
+                        let modeled = self.model.rels[rel];
+                        let scan = modeled.scan(
+                            self.storage,
+                            self.txid,
+                            scan_path,
+                            self.params,
+                            self.arena,
+                        )?;
+                        if modeled.restriction.is_some()
+                            && !(scan.path.kind == super::index_paths::ScanKind::Index
+                                && self.counts_lazily(rel, scan_path)?)
+                        {
+                            return Err(crate::sql_err!(
+                                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                "EXPLAIN ANALYZE of a materialized join read in part is not supported"
+                            ));
+                        }
+                        let _block =
+                            super::instrument::enter_block(self.block.child(scan_segment(rel)));
+                        Some(super::instrument::node(super::instrument::Role::Scan(0)))
+                    }
+                    _ => None,
+                };
+                let reached = core::cell::Cell::new(0usize);
+                let kept = self.exec(outer, bound, &mut |bound| {
                     let mut matched = false;
                     let mut stopped = false;
                     let mut pass = |bound: &mut Bound<'a>| -> Result<bool, SqlError> {
@@ -978,21 +1040,28 @@ impl<'r, 'a> Runner<'r, 'a> {
                             let store = match self.built[inner as usize].get() {
                                 Some(store) => store,
                                 None => {
-                                    let store = Built {
-                                        rows: self.hold(input, bound)?.rows.as_slice(),
-                                        index: &[],
+                                    let rows = if lazy.is_some() {
+                                        let _suspended = super::instrument::suspend();
+                                        self.hold(input, bound)?.rows.as_slice()
+                                    } else {
+                                        self.hold(input, bound)?.rows.as_slice()
                                     };
+                                    let store = Built { rows, index: &[] };
                                     // The tuplestore `EXPLAIN ANALYZE` reports.
-                                    material_node.store_opened();
-                                    for row in store.rows {
-                                        material_node.store_row(self.tuple_len(row, inner).ok());
+                                    if lazy.is_none() {
+                                        material_node.store_opened();
+                                        for row in store.rows {
+                                            material_node
+                                                .store_row(self.tuple_len(row, inner).ok());
+                                        }
                                     }
                                     self.built[inner as usize].set(Some(store));
                                     store
                                 }
                             };
-                            for row in store.rows {
+                            for (at, row) in store.rows.iter().enumerate() {
                                 material_node.row();
+                                reached.set(reached.get().max(at + 1));
                                 self.bind(bound, row, inner_relids);
                                 if !pass(bound)? {
                                     break;
@@ -1015,7 +1084,22 @@ impl<'r, 'a> Runner<'r, 'a> {
                         }
                     }
                     Ok(true)
-                })
+                })?;
+                if let Some(lazy) = lazy {
+                    let rows = self.built[inner as usize]
+                        .get()
+                        .map_or(&[][..], |store| store.rows);
+                    let reached = reached.get().min(rows.len());
+                    {
+                        let _scan = lazy.start();
+                        lazy.rows(reached as u64);
+                    }
+                    material_node.store_opened();
+                    for row in &rows[..reached] {
+                        material_node.store_row(self.tuple_len(row, inner).ok());
+                    }
+                }
+                Ok(kept)
             }
             PathKind::HashJoin {
                 jointype,
@@ -2284,7 +2368,10 @@ impl<'r, 'a> Runner<'r, 'a> {
                 continue;
             }
             matched = true;
-            flag.set(true);
+            // A right semi join returns each inner row at its first match.
+            if flag.replace(true) && jointype == JoinType::RightSemi {
+                continue;
+            }
             if jointype == JoinType::Anti {
                 break;
             }
@@ -2787,6 +2874,265 @@ impl<'r, 'a> Runner<'r, 'a> {
             }
         }
         Ok(Some(low))
+    }
+
+    /// A `Unique` over a `Sort` of a semi join's compared columns: the
+    /// input's rows sorted by them (`pg_qsort`, NULLs last) and the first
+    /// of each run of equal values, NULLs equal (`execTuplesUnique`).
+    fn unique(
+        &self,
+        input: u32,
+        keys: &[super::index_paths::joins::Member],
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let held = self.hold(input, bound)?;
+        let rows = held.rows.borrowed_slice();
+        let relids = self.model.plan.path(input).relids;
+        let order = self
+            .arena
+            .alloc_slice_with(rows.len(), |at| at as u32)
+            .map_err(|_| arena_full())?;
+        let column = |member: &super::index_paths::joins::Member| {
+            (usize::from(member.rel), usize::from(member.column))
+        };
+        let compare = |a: &Bound<'a>, b: &Bound<'a>| -> Result<Ordering, SqlError> {
+            for member in keys {
+                let (one, two) = (
+                    Self::value(a, column(member)),
+                    Self::value(b, column(member)),
+                );
+                let order = match (one.is_null(), two.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => crate::sql::eval::compare_datums_collated(
+                        self.storage,
+                        self.txid,
+                        self.collation(column(member)),
+                        &one,
+                        &two,
+                    )?,
+                };
+                if order != Ordering::Equal {
+                    return Ok(order);
+                }
+            }
+            Ok(Ordering::Equal)
+        };
+        crate::sql::pg_qsort::pg_qsort(order, &mut |a, b| {
+            compare(&rows[a as usize], &rows[b as usize])
+        })?;
+        let mut previous: Option<u32> = None;
+        for &at in order.iter() {
+            if let Some(held) = previous
+                && compare(&rows[held as usize], &rows[at as usize])? == Ordering::Equal
+            {
+                continue;
+            }
+            previous = Some(at);
+            self.bind(bound, &rows[at as usize], relids);
+            if !sink(bound)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A `HashAggregate` making a semi join's inner relation unique: the
+    /// first input row of each group of equal compared columns (NULLs
+    /// equal), returned in the order `ExecAgg` walks its `simplehash` table
+    /// (`TupleHashTableHash`'s `murmurhash32` of the combined hashes, robin
+    /// hood insertion, growth by doubling, `SH_START_ITERATE` from the
+    /// first empty bucket backwards).
+    fn unique_hashed(
+        &self,
+        input: u32,
+        keys: &[super::index_paths::joins::Member],
+        groups: f64,
+        bound: &mut Bound<'a>,
+        sink: &mut dyn FnMut(&mut Bound<'a>) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        /// `SH_FILLFACTOR`, `SH_GROW_MAX_DIB`, `SH_GROW_MAX_MOVE` and
+        /// `SH_GROW_MIN_FILLFACTOR`.
+        const FILL: f64 = 0.9;
+        const MAX_DIB: u64 = 25;
+        const MAX_MOVE: u64 = 150;
+        const MIN_FILL: f64 = 0.1;
+        let held = self.hold(input, bound)?;
+        let rows = held.rows.borrowed_slice();
+        let relids = self.model.plan.path(input).relids;
+        let width = self.model.plan.path(input).width;
+        let column = |member: &super::index_paths::joins::Member| {
+            (usize::from(member.rel), usize::from(member.column))
+        };
+        let murmur = |mut h: u32| {
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85eb_ca6b);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xc2b2_ae35);
+            h ^ (h >> 16)
+        };
+        let row_hash = |row: &Bound<'a>| -> Result<u32, SqlError> {
+            let mut hash = 0u32;
+            for (at, member) in keys.iter().enumerate() {
+                if at != 0 {
+                    hash = hash.rotate_left(1);
+                }
+                let value = Self::value(row, column(member));
+                if value.is_null() {
+                    continue;
+                }
+                hash ^= datum_hash(&value).ok_or_else(|| {
+                    crate::sql_err!(
+                        crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                        "a hashed unique-ified relation over keys of this type is not supported"
+                    )
+                })?;
+            }
+            Ok(murmur(hash))
+        };
+        let same = |a: &Bound<'a>, b: &Bound<'a>| -> Result<bool, SqlError> {
+            for member in keys {
+                let (one, two) = (
+                    Self::value(a, column(member)),
+                    Self::value(b, column(member)),
+                );
+                let equal = match (one.is_null(), two.is_null()) {
+                    (true, true) => true,
+                    (false, false) => {
+                        crate::sql::eval::compare_datums_collated(
+                            self.storage,
+                            self.txid,
+                            self.collation(column(member)),
+                            &one,
+                            &two,
+                        )? == Ordering::Equal
+                    }
+                    _ => false,
+                };
+                if !equal {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        // `SH_CREATE` of the planned buckets.
+        let buckets = super::index_paths::plain_hash_buckets(width, groups);
+        let sized = |elements: f64| ((elements as u64).max(2)).next_power_of_two();
+        let mut size = sized(buckets as f64 / FILL);
+        // Each bucket: the group's hash and its first row, or `None`.
+        let mut table = self
+            .arena
+            .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
+            .map_err(|_| arena_full())?;
+        let mut members = 0u64;
+        let mut threshold = (size as f64 * FILL) as u64;
+        for (row_at, row) in rows.iter().enumerate() {
+            let hash = row_hash(row)?;
+            'restart: loop {
+                if members >= threshold {
+                    // `SH_GROW`: each entry moved, from the first bucket that
+                    // is empty or holds an entry at its optimal place.
+                    let old = &*table;
+                    let old_size = size;
+                    size *= 2;
+                    let mask = size - 1;
+                    let grown = self
+                        .arena
+                        .alloc_slice_with(size as usize, |_| None::<(u32, u32)>)
+                        .map_err(|_| arena_full())?;
+                    let old_mask = old_size - 1;
+                    let start = (0..old_size)
+                        .find(|&at| {
+                            old[at as usize]
+                                .is_none_or(|(hash, _)| u64::from(hash) & old_mask == at)
+                        })
+                        .expect("an empty bucket");
+                    for step in 0..old_size {
+                        let at = (start + step) % old_size;
+                        if let Some(entry) = old[at as usize] {
+                            let mut place = u64::from(entry.0) & mask;
+                            while grown[place as usize].is_some() {
+                                place = (place + 1) & mask;
+                            }
+                            grown[place as usize] = Some(entry);
+                        }
+                    }
+                    table = grown;
+                    threshold = (size as f64 * FILL) as u64;
+                }
+                let mask = size - 1;
+                let start = u64::from(hash) & mask;
+                let mut place = start;
+                let mut distance = 0u64;
+                loop {
+                    let Some((held_hash, held_row)) = table[place as usize] else {
+                        table[place as usize] = Some((hash, row_at as u32));
+                        members += 1;
+                        break 'restart;
+                    };
+                    if held_hash == hash && same(&rows[held_row as usize], row)? {
+                        break 'restart;
+                    }
+                    let optimal = u64::from(held_hash) & mask;
+                    let held_distance = (place + size - optimal) & mask;
+                    if distance > held_distance {
+                        // Robin hood: shift the run forward to the next empty
+                        // bucket and take this one.
+                        let mut empty = place;
+                        let mut moved = 0u64;
+                        loop {
+                            empty = (empty + 1) & mask;
+                            if table[empty as usize].is_none() {
+                                break;
+                            }
+                            moved += 1;
+                            if moved > MAX_MOVE && members as f64 / size as f64 >= MIN_FILL {
+                                threshold = 0;
+                                continue 'restart;
+                            }
+                        }
+                        let mut at = empty;
+                        while at != place {
+                            let previous = (at + size - 1) & mask;
+                            table[at as usize] = table[previous as usize];
+                            at = previous;
+                        }
+                        table[place as usize] = Some((hash, row_at as u32));
+                        members += 1;
+                        break 'restart;
+                    }
+                    place = (place + 1) & mask;
+                    distance += 1;
+                    if distance > MAX_DIB && members as f64 / size as f64 >= MIN_FILL {
+                        threshold = 0;
+                        continue 'restart;
+                    }
+                }
+            }
+        }
+        // `SH_START_ITERATE` and `SH_ITERATE`: backwards from the first
+        // empty bucket.
+        let mask = size - 1;
+        let end = (0..size)
+            .find(|&at| table[at as usize].is_none())
+            .expect("an empty bucket");
+        let mut current = end;
+        loop {
+            let entry = table[current as usize];
+            current = (current + size - 1) & mask;
+            if let Some((_, row_at)) = entry {
+                self.bind(bound, &rows[row_at as usize], relids);
+                if !sink(bound)? {
+                    return Ok(false);
+                }
+            }
+            if current == end {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     /// The held rows' order after a sort by `keys` (`pg_qsort`, NULLs

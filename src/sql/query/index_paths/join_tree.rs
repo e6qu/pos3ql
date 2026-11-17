@@ -136,6 +136,9 @@ pub(crate) struct Tree {
     pub(crate) qual_count: usize,
     /// Base relations.
     pub(crate) rels: usize,
+    /// `enable_hashagg`, which lets a semi join's inner relation be made
+    /// unique by hashing.
+    pub(crate) enable_hashagg: bool,
 }
 
 impl Tree {
@@ -157,6 +160,7 @@ impl Tree {
             qual_node: [0; MAX_QUALS],
             qual_count: 0,
             rels,
+            enable_hashagg: true,
         }
     }
 
@@ -384,6 +388,10 @@ pub(crate) fn prepare(tree: &Tree) -> Result<Prepared, Outside> {
             commute_above_r: 0,
             commute_below_l: 0,
             commute_below_r: 0,
+            semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
+            semi_count: 0,
+            semi_can_btree: false,
+            semi_can_hash: false,
         }; MAX_SPECIALS],
         special_count: 0,
         items: [0; MAX_NODES],
@@ -985,7 +993,14 @@ impl Prep<'_> {
             commute_above_r: 0,
             commute_below_l: 0,
             commute_below_r: 0,
+            semi_rhs: [Member::plain(0, 0); super::joins::MAX_KEYS],
+            semi_count: 0,
+            semi_can_btree: false,
+            semi_can_hash: false,
         };
+        if kind == TreeJoin::Semi {
+            self.compute_semijoin_info(node, &mut info, nulling);
+        }
         if kind == TreeJoin::Full {
             self.specials[id] = info;
             self.special_count += 1;
@@ -1077,6 +1092,49 @@ impl Prep<'_> {
         self.specials[id] = info;
         self.special_count += 1;
         Ok(id as u8)
+    }
+
+    /// `compute_semijoin_info`: a semi join's inner columns compared by
+    /// equalities with the outer relations, when every condition reading
+    /// both sides is one.
+    fn compute_semijoin_info(
+        &self,
+        node: u8,
+        info: &mut SpecialJoin,
+        nulling: &[Relids; MAX_JOIN_RELS],
+    ) {
+        let right = info.syn_right;
+        let mut count = 0usize;
+        for qual in self.tree.quals_of(node) {
+            let qual = self.qual(qual);
+            let mut all = qual.rels;
+            for &(rel, _) in qual.vars.as_slice() {
+                all |= nulling[usize::from(rel)];
+            }
+            if all & right == 0 || all & !right == 0 {
+                continue;
+            }
+            let Shape::Columns(left, other) = qual.shape else {
+                return;
+            };
+            let inside = |var: Var| right & 1 << var.0 != 0;
+            let member = match (inside(left), inside(other)) {
+                (false, true) => other,
+                (true, false) => left,
+                _ => return,
+            };
+            if count == info.semi_rhs.len() {
+                return;
+            }
+            info.semi_rhs[count] = Member::plain(member.0, member.1);
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        info.semi_count = count as u8;
+        info.semi_can_btree = true;
+        info.semi_can_hash = self.tree.enable_hashagg;
     }
 
     /// `deconstruct_distribute_oj_quals`.

@@ -761,7 +761,9 @@ dummy relation's `Result` is as wide as the select list's expressions. An
 `UPDATE` or `DELETE` whose costs choose a sequential scan changes its rows
 in heap order and reads no index; a resumed attempt reads the same order
 under the statement's snapshot. A btree's distinct keys are counted as
-`estimate_num_groups` clamps a product of columns' distinct values.
+`estimate_num_groups` clamps a product of columns' distinct values; the
+NULLs of a single key column form one more group the build deduplicates,
+in tuples of a header and a null bitmap (`differential_exact/862`).
 A call of a SQL function whose body is one plain expression is replaced
 by that expression before planning and execution (`inline_function`,
 `differential_exact/800`): its arguments, converted to the parameters'
@@ -1420,7 +1422,11 @@ coercion while the statement is planned, as an `UPDATE`'s does; an unknown
 collation (`42704`, naming the schema-qualified name and the encoding, or
 `3F000` for a missing schema) and a `COLLATE` on a type without collation
 (`42804`) fail at the clause, with its cursor, whether or not a row reaches
-it (`differential_exact/846`). Target and expression count errors of an `INSERT`, also with subscripted
+it (`differential_exact/860`), also in an index key, an `ALTER COLUMN ...
+TYPE`, an attribute of `ALTER TYPE` and a domain-typed value or column, which
+the message names by the domain (`differential_exact/861`). Remaining:
+`CREATE DOMAIN ... COLLATE` is a syntax error where PostgreSQL gives the
+domain a collation its columns inherit. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

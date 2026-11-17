@@ -66812,13 +66812,16 @@ fn build_composite_spec(
             ));
         }
         let collatable = ctype.is_collatable();
-        let collation = ddl::resolve_parsed_collation(storage, txid, field.collation)?;
+        let located =
+            |error| crate::sql::error_position::at_source_position(error, field.collation_position);
+        let collation =
+            ddl::resolve_parsed_collation(storage, txid, field.collation).map_err(located)?;
         if !collatable && collation != crate::sql::ast::Collation::Default {
-            return Err(sql_err!(
+            return Err(located(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "collations are not supported by type {}",
                 ctype.name()
-            ));
+            )));
         }
         out[index] = crate::storage::CompositeFieldDef {
             attribute_number: (index + 1) as u16,
@@ -70361,6 +70364,7 @@ fn alter_composite_type(
             type_name,
             type_mod,
             collation,
+            collation_position,
             cascade: _,
         } => {
             let Some(index) = altered.active_field_index(name) else {
@@ -70376,6 +70380,7 @@ fn alter_composite_type(
                 type_name,
                 type_mod: *type_mod,
                 collation: *collation,
+                collation_position: *collation_position,
             };
             let spec =
                 match build_composite_spec(storage, txn.txid, core::slice::from_ref(&synthetic)) {
@@ -73925,6 +73930,20 @@ pub fn create_index(
                     .unwrap_or_else(|| crate::util::StackStr::from_str(input.ctype.name())),
                 Err(error) => return sql_fail(error),
             };
+        // `ComputeIndexAttrs` resolves the key's collation, and rejects one on
+        // a type without collation, before it looks at the operator class.
+        if let Some(collation) = index_column.collation {
+            if let Err(error) = ddl::resolve_parsed_collation(storage, txn.txid, collation) {
+                return sql_fail(error);
+            }
+            if !input.ctype.is_collatable() {
+                return sql_fail(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "collations are not supported by type {}",
+                    input_type_name.as_str()
+                ));
+            }
+        }
         if let Some(operator_class) = index_column.operator_class {
             if command.method == crate::sql::ast::IndexAccessMethod::Hash {
                 if !index_column.operator_class_options.is_empty() {
@@ -103962,6 +103981,7 @@ fn alter_table_relation(
                 type_name,
                 type_mod,
                 collation,
+                collation_position,
                 using,
             } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -104064,19 +104084,29 @@ fn alter_table_relation(
                 }
                 let source_type = new_def.columns[i].ctype;
                 let source_collation = new_def.columns[i].collation;
+                let located = |error| {
+                    crate::sql::error_position::at_source_position(error, *collation_position)
+                };
                 let target_collation = match (*collation, target.is_collatable()) {
                     (Some(collation), true) => {
                         match ddl::resolve_parsed_collation(storage, txn.txid, collation) {
                             Ok(collation) => collation,
-                            Err(error) => return sql_fail(error),
+                            Err(error) => return sql_fail(located(error)),
                         }
                     }
-                    (Some(_), false) => {
-                        return sql_fail(sql_err!(
+                    // `GetColumnDefCollation` looks the name up before it
+                    // rejects the type.
+                    (Some(collation), false) => {
+                        if let Err(error) =
+                            ddl::resolve_parsed_collation(storage, txn.txid, collation)
+                        {
+                            return sql_fail(located(error));
+                        }
+                        return sql_fail(located(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "collations are not supported by type {}",
                             target.name()
-                        ));
+                        )));
                     }
                     (None, true) if source_type.is_collatable() => source_collation,
                     (None, true) => crate::sql::ast::Collation::Default,

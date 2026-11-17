@@ -1,0 +1,75 @@
+-- CREATE INDEX deduplicates NULL keys like any equal keys, so the entries of
+-- an index with NULLs and repeated keys fill the pages PostgreSQL's build
+-- fills, and an index scan's cost counts those pages.
+CREATE TABLE bn862a (id int, k int);
+INSERT INTO bn862a SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g % 100 END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862a_k ON bn862a (k);
+ANALYZE bn862a;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862a;
+EXPLAIN SELECT * FROM bn862a WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862a WHERE k = 5;
+EXPLAIN SELECT * FROM bn862a WHERE k < 3;
+DROP TABLE bn862a;
+CREATE TABLE bn862b (id int, k int);
+INSERT INTO bn862b SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g % 7 END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862b_k ON bn862b (k);
+ANALYZE bn862b;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862b;
+EXPLAIN SELECT * FROM bn862b WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862b WHERE k = 5;
+EXPLAIN SELECT * FROM bn862b WHERE k < 3;
+DROP TABLE bn862b;
+CREATE TABLE bn862c (id int, k int);
+INSERT INTO bn862c SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862c_k ON bn862c (k);
+ANALYZE bn862c;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862c;
+EXPLAIN SELECT * FROM bn862c WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862c WHERE k = 5;
+EXPLAIN SELECT * FROM bn862c WHERE k < 3;
+DROP TABLE bn862c;
+CREATE TABLE bn862d (id int, k int);
+INSERT INTO bn862d SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g / 3 END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862d_k ON bn862d (k);
+ANALYZE bn862d;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862d;
+EXPLAIN SELECT * FROM bn862d WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862d WHERE k = 5;
+EXPLAIN SELECT * FROM bn862d WHERE k < 3;
+DROP TABLE bn862d;
+CREATE TABLE bn862e (id int, k int);
+INSERT INTO bn862e SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g % 1000 END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862e_k ON bn862e (k);
+ANALYZE bn862e;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862e;
+EXPLAIN SELECT * FROM bn862e WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862e WHERE k = 5;
+EXPLAIN SELECT * FROM bn862e WHERE k < 3;
+DROP TABLE bn862e;
+CREATE TABLE bn862f (id int, k int);
+INSERT INTO bn862f SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g % 2 END
+  FROM generate_series(1, 3000) g;
+CREATE INDEX bn862f_k ON bn862f (k);
+ANALYZE bn862f;
+SELECT count(*) FILTER (WHERE k IS NULL) AS nulls, count(*) FROM bn862f;
+EXPLAIN SELECT * FROM bn862f WHERE k IS NULL;
+EXPLAIN SELECT * FROM bn862f WHERE k = 5;
+EXPLAIN SELECT * FROM bn862f WHERE k < 3;
+DROP TABLE bn862f;
+CREATE TABLE bu862 (id int, k int, s text);
+INSERT INTO bu862 SELECT g, CASE WHEN g % 11 = 0 OR g = 1 THEN NULL ELSE g END,
+  CASE WHEN g % 5 = 0 THEN NULL ELSE 'v' || (g % 40) END
+  FROM generate_series(1, 3000) g;
+CREATE UNIQUE INDEX bu862_k ON bu862 (k);
+CREATE INDEX bu862_s ON bu862 (s);
+ANALYZE bu862;
+EXPLAIN SELECT * FROM bu862 WHERE k IS NULL;
+EXPLAIN SELECT * FROM bu862 WHERE k = 7;
+EXPLAIN SELECT * FROM bu862 WHERE s IS NULL;
+EXPLAIN SELECT * FROM bu862 WHERE s = 'v3';
+DROP TABLE bu862;

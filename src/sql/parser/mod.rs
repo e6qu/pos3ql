@@ -5646,6 +5646,7 @@ impl<'a> Parser<'a> {
     /// after the `TYPE` keyword.
     fn alter_column_type(&mut self, column: &'a str) -> Result<AlterAction<'a>, ParseError> {
         let (type_name, type_mod) = self.type_name_mod()?;
+        let collation_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         let collation = if self.eat_ident("collate")? {
             Some(self.collation_name()?)
         } else {
@@ -5661,6 +5662,7 @@ impl<'a> Parser<'a> {
             type_name,
             type_mod,
             collation,
+            collation_position,
             using,
         })
     }

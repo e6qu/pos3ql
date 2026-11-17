@@ -10302,12 +10302,28 @@ fn expression_collation<'a>(
                 |error| crate::sql::error_position::at_source_position(error, *source_position);
             let collatable = static_type(operand, row).is_none_or(ColType::is_collatable);
             if !collatable {
+                // A domain is named as written, not by its base type.
+                let declared = match operand {
+                    Expr::Column { qualifier, name } => row.column_user_type(*qualifier, name),
+                    _ => None,
+                };
+                let domain = match declared {
+                    Some(user) => Some(StackStr::<260>::from_str(user.name.as_str())),
+                    None => {
+                        super::exec::infer_type_res(operand, &RuntimeColumnTypes { row, catalog })
+                            .ok()
+                            .and_then(|(oid, _)| catalog?.type_name_fixed(oid).ok().flatten())
+                    }
+                };
                 return Err(located(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "collations are not supported by type {}",
-                    static_type(operand, row)
-                        .expect("known noncollatable type")
-                        .name()
+                    domain.as_ref().map_or_else(
+                        || static_type(operand, row)
+                            .expect("known noncollatable type")
+                            .name(),
+                        |name| name.as_str()
+                    )
                 )));
             }
             let value = match *collation {

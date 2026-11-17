@@ -369,10 +369,14 @@ pub(crate) struct BtreeSize {
     pub(crate) height: u32,
 }
 
+/// `null_entries` of `entries` hold a NULL in a single key column: a
+/// deduplicating build merges them like any equal keys, in tuples of a
+/// header and a null bitmap, `distinct` counting the other keys.
 pub(crate) fn btree_size(
     entries: f64,
     key_width: f64,
     distinct: f64,
+    null_entries: f64,
     deduplicate: bool,
 ) -> BtreeSize {
     let key = (key_width.ceil() as usize).next_multiple_of(8);
@@ -381,17 +385,37 @@ pub(crate) fn btree_size(
     // posting list (padding included) a page's fill test discounts as
     // truncatable (`truncextra`), else one tuple per entry.
     let entries = entries.max(0.0);
-    let (leaf_tuples, leaf_size, truncatable) =
+    let null_entries = null_entries.clamp(0.0, entries);
+    let entries = entries - null_entries;
+    let postings_of = |size: usize, per_key: f64| {
+        let per_posting = ((812 - size) / 6).max(1) as f64;
+        let postings = (per_key / per_posting).ceil();
+        let posting =
+            ((size as f64 + 6.0 * per_key / postings).ceil() as usize).next_multiple_of(8);
+        (postings, posting)
+    };
+    let (key_tuples, key_size, truncatable) =
         if deduplicate && distinct >= 1.0 && entries / distinct >= 2.0 {
-            let per_key = entries / distinct;
-            let per_posting = ((812 - tuple) / 6).max(1) as f64;
-            let postings = (per_key / per_posting).ceil();
-            let posting =
-                ((tuple as f64 + 6.0 * per_key / postings).ceil() as usize).next_multiple_of(8);
+            let (postings, posting) = postings_of(tuple, entries / distinct);
             (distinct * postings, posting, posting - tuple)
         } else {
             (entries, tuple, 0)
         };
+    // A NULL key's tuple has no value, only the null bitmap.
+    let null_tuple = 16;
+    let (null_tuples, null_size) = if null_entries >= 2.0 && deduplicate {
+        let (postings, posting) = postings_of(null_tuple, null_entries);
+        (postings, posting)
+    } else {
+        (null_entries, null_tuple)
+    };
+    let leaf_tuples = key_tuples + null_tuples;
+    let leaf_size = if leaf_tuples > 0.0 {
+        ((key_tuples * key_size as f64 + null_tuples * null_size as f64) / leaf_tuples).round()
+            as usize
+    } else {
+        key_size
+    };
     let leaves = level_pages(leaf_tuples, leaf_size, truncatable, 819, true);
     // Inner levels hold one pivot per page below, filled to 70%.
     let mut level = leaves;
@@ -569,7 +593,17 @@ fn btree_layout(planner: &Planner<'_, '_>, info: &IndexInfo, entries: f64) -> (f
         (product * doubled).ceil().max(1.0)
     };
     let distinct = distinct.min(entries.max(1.0));
-    let size = btree_size(entries, width, distinct, deduplicate);
+    // A single key column's NULLs, which the statistics count apart from
+    // its distinct values.
+    let null_entries = match (index.n_cols, index.expression_keys[0]) {
+        (1, false) => (entries
+            * planner
+                .variable(usize::from(index.columns[0]))
+                .null_fraction)
+            .round(),
+        _ => 0.0,
+    };
+    let size = btree_size(entries, width, distinct, null_entries, deduplicate);
     (size.pages, size.height, deduplicate)
 }
 

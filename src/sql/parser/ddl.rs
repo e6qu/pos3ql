@@ -5191,6 +5191,7 @@ impl<'a> Parser<'a> {
                         type_name,
                         type_mod,
                         collation,
+                        collation_position: SourcePosition::UNKNOWN,
                     },
                 )?;
                 if !self.eat_op(",")? {
@@ -5215,6 +5216,7 @@ impl<'a> Parser<'a> {
             if self.eat_ident("attribute")? {
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
@@ -5225,6 +5227,7 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                 })
             } else {
                 self.expect_ident("value")?;
@@ -5289,6 +5292,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("data")?;
                 self.expect_ident("type")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
@@ -5305,10 +5309,12 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     cascade,
                 }
             } else if self.eat_ident("type")? {
                 let (type_name, type_mod) = self.type_name_mod()?;
+                let collation_position = SourcePosition::new(Some(self.peek_at));
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
@@ -5325,6 +5331,7 @@ impl<'a> Parser<'a> {
                     type_name,
                     type_mod,
                     collation,
+                    collation_position,
                     cascade,
                 }
             } else {

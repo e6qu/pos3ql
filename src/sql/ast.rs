@@ -1779,6 +1779,9 @@ pub struct CompositeField<'a> {
     pub type_name: &'a str,
     pub type_mod: i32,
     pub collation: ParsedCollation<'a>,
+    /// The `COLLATE` keyword's location where PostgreSQL positions a
+    /// collation error (`ALTER TYPE`); unknown in `CREATE TYPE`.
+    pub collation_position: SourcePosition,
 }
 
 /// A parsed ALTER INDEX operation. Keeping the supported operation typed
@@ -5096,6 +5099,7 @@ pub enum AlterTypeAction<'a> {
         type_name: &'a str,
         type_mod: i32,
         collation: ParsedCollation<'a>,
+        collation_position: SourcePosition,
         cascade: bool,
     },
 }
@@ -5723,6 +5727,8 @@ pub enum AlterAction<'a> {
         type_name: &'a str,
         type_mod: i32,
         collation: Option<ParsedCollation<'a>>,
+        /// The `COLLATE` keyword's location, which positions a collation error.
+        collation_position: SourcePosition,
         using: Option<&'a Expr<'a>>,
     },
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows

@@ -9,3 +9,8 @@ libc = { workspace = true }
 
 [lib]
 path = "lib.rs"
+
+# The shared src/mem modules gate their tests on the main crate's
+# `sql-fixture-suite` feature, which this model crate never enables.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("sql-fixture-suite"))'] }

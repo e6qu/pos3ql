@@ -5183,6 +5183,22 @@ pub(crate) fn user_routine_call_result(
         })
 }
 
+/// The operand types of an operator call when each is a built-in type, so
+/// the built-in operators decide whether one accepts them.
+fn builtin_operand_oids(
+    args: &[&Expr],
+    columns: &dyn ColTypeResolver,
+) -> Result<Option<[i32; 2]>, SqlError> {
+    let mut operands = [oid::UNKNOWN; 2];
+    for (operand, argument) in operands.iter_mut().zip(args) {
+        *operand = infer_routine_argument_oid(argument, columns)?;
+        if ColType::from_oid(*operand).is_none() && *operand != oid::UNKNOWN {
+            return Ok(None);
+        }
+    }
+    Ok(Some(operands))
+}
+
 pub(crate) fn routine_result_metadata(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -5860,6 +5876,45 @@ fn infer_type_unpositioned(
     }
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));
+    }
+    // An operator symbol no built-in operator has and no user-defined one
+    // takes these operand types fails while the expression is analysed.
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = expression
+        && let Some((schema, symbol)) = crate::sql::ast::catalog_operator_call(name)
+        && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+        && (1..=2).contains(&args.len())
+        && let Some(operands) = builtin_operand_oids(args, columns)?
+        && !crate::sql::catalog::builtin_operator_accepts(symbol, &operands[..args.len()])
+    {
+        let mut names = [None, None];
+        for (name, oid) in names.iter_mut().zip(&operands[..args.len()]) {
+            *name = columns.type_name_fixed(*oid)?;
+        }
+        return Err(match (args.len(), names) {
+            (2, [Some(left), Some(right)]) => sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                left.as_str(),
+                symbol,
+                right.as_str()
+            ),
+            (1, [Some(operand), _]) => sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {}",
+                symbol,
+                operand.as_str()
+            ),
+            _ => sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {}",
+                symbol
+            ),
+        });
     }
     if matches!(
         selected,

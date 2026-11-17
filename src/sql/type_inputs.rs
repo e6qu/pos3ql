@@ -430,7 +430,6 @@ pub(crate) fn input_failure(error: SqlError, candidate: &Candidate<'_>) -> SqlEr
 }
 
 /// Array input invokes each domain element's input conversion during SQL
-
 /// analysis. A scalar domain cast instead checks its constraints at runtime.
 pub(crate) fn target_oid(
     storage: &crate::storage::Storage,

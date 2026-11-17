@@ -3044,6 +3044,7 @@ fn describe_cursor_rows(
                         exec::DescriptionTarget::Wire,
                         None,
                     )?;
+                    query::check_select_analysis(select, storage, txid, work)?;
                     Ok((count, query::select_scans_backward(select, storage, txid)))
                 })
             }

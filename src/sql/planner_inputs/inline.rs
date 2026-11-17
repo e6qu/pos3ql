@@ -1116,9 +1116,6 @@ pub(crate) fn inline_call<'a>(
     ) {
         return Ok(Inlining::Kept);
     }
-    if routine.body_kind == crate::storage::RoutineBodyKind::Atomic {
-        return Ok(Inlining::Unmodeled);
-    }
     let Some((_, mapping)) =
         storage.routine_call_mapping(slot, argument_names, args.len(), *variadic, txid)
     else {
@@ -1311,9 +1308,12 @@ pub(crate) fn inline_call<'a>(
         return Ok(Inlining::Unmodeled);
     }
     let mut statements = statements.as_slice();
-    // A SQL-standard body names the objects it was bound to when created.
-    if routine.body_kind == crate::storage::RoutineBodyKind::Return
-        && let [statement] = statements
+    // A SQL-standard body (`RETURN` or a one-statement `BEGIN ATOMIC`)
+    // names the objects it was bound to when created.
+    if matches!(
+        routine.body_kind,
+        crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic
+    ) && let [statement] = statements
     {
         let bound = crate::sql::query::bind_stored_routine_statement(
             statement,
@@ -1534,7 +1534,7 @@ pub(crate) fn inline_set_returning_call<'a>(
     {
         return Ok(SetInlining::Kept);
     }
-    if routine.body_kind != crate::storage::RoutineBodyKind::String {
+    if routine.body_kind == crate::storage::RoutineBodyKind::Return {
         return Ok(SetInlining::Unmodeled);
     }
     let Some((_, mapping)) = storage.routine_call_mapping(
@@ -1565,9 +1565,34 @@ pub(crate) fn inline_set_returning_call<'a>(
                 txid,
             )
             .ok_or_else(missing_contract)?;
-        // A default, a packed variadic or a polymorphic input.
-        let (Some(argument), 1) = (supplied, count) else {
-            return Ok(SetInlining::Unmodeled);
+        // `expand_function_arguments`: an omitted input takes its default;
+        // a packed variadic or a polymorphic input is not modeled.
+        let argument = match (supplied, count) {
+            (Some(argument), 1) => argument,
+            (None, 0) => {
+                let parameter = routine
+                    .parameter_for_input(input)
+                    .ok_or_else(missing_contract)?;
+                let source = parameter.mode.default().ok_or_else(missing_contract)?;
+                let parameter_index = routine
+                    .parameters()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, parameter)| parameter.mode.is_input())
+                    .nth(input)
+                    .ok_or_else(missing_contract)?
+                    .0;
+                let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
+                crate::sql::query::bind_routine_parameter_default(
+                    source.as_str(),
+                    parameter_index,
+                    storage,
+                    txid,
+                    dependencies.view(),
+                    arena,
+                )?
+            }
+            _ => return Ok(SetInlining::Unmodeled),
         };
         if crate::sql::catalog::is_polymorphic_pseudo_type(target)
             || routine.parameter_for_input(input).is_some_and(|parameter| {
@@ -1621,7 +1646,23 @@ pub(crate) fn inline_set_returning_call<'a>(
             .push(statement)
             .map_err(|_| crate::sql::eval::arena_full())?;
     }
-    let [Stmt::Select(select)] = statements.as_slice() else {
+    let mut statements = statements.as_slice();
+    // A `BEGIN ATOMIC` body names the objects it was bound to when created.
+    if routine.body_kind == crate::storage::RoutineBodyKind::Atomic
+        && let [statement] = statements
+    {
+        let bound = crate::sql::query::bind_stored_routine_statement(
+            statement,
+            storage,
+            slot,
+            &routine,
+            txid,
+            arena,
+            &[],
+        )?;
+        statements = core::slice::from_ref(bound);
+    }
+    let [Stmt::Select(select)] = statements else {
         return Ok(SetInlining::Kept);
     };
     if !select.locking.is_empty() {
@@ -1643,6 +1684,8 @@ pub(crate) fn inline_set_returning_call<'a>(
     let output = crate::sql::query::describe_derived_definition(
         storage, &select, "", None, txid, arena, None,
     )?;
+    // `check_sql_fn_retval` would coerce a column of another type, which
+    // the plan prints as the bare column; the model does not print that.
     if output.n_columns != declared.n_columns
         || output
             .columns()
@@ -1709,11 +1752,24 @@ fn substitute_select<'a>(
         inputs: &[&'a Expr<'a>],
         arena: &'a Arena,
     ) -> Result<Select<'a>, Failure> {
-        if !select.with.is_empty() || !select.windows.is_empty() || !select.grouping_sets.is_empty()
-        {
+        if !select.grouping_sets.is_empty() {
             return Err(Failure::Uncovered);
         }
         let mut copy = *select;
+        if !select.with.is_empty() {
+            let ctes = arena.alloc_slice_copy(select.with)?;
+            for cte in ctes.iter_mut() {
+                if cte.dml.is_some() || cte.search.is_some() || cte.cycle.is_some() {
+                    return Err(Failure::Uncovered);
+                }
+                cte.query = arena.alloc(query(cte.query, inputs, arena)?)?;
+            }
+            copy.with = ctes;
+        }
+        // A window above the inlined subquery is not costed by the model.
+        if !select.windows.is_empty() {
+            return Err(Failure::Uncovered);
+        }
         let expression = |value: &'a Expr<'a>| expression(value, inputs, arena);
         let items = arena.alloc_slice_copy(select.items)?;
         for item in items.iter_mut() {

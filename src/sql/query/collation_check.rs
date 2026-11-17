@@ -275,14 +275,30 @@ impl Checker<'_> {
                 }
                 self.result(expression, merged)
             }
-            // `x IN (a, b)` compares `x` with an array of the list.
+            // `transformAExprIn`: `x IN (a, b)` compares `x` with an array of
+            // the elements that read no column when there are two or more,
+            // and with each other element on its own.
             Expr::InList { operand, list, .. } => {
-                let mut elements = None;
-                for element in *list {
-                    merge(&mut elements, self.state(element)?)?;
+                let left = self.state(operand)?;
+                let constants = list
+                    .iter()
+                    .filter(|element| !reads_columns(element))
+                    .count();
+                if constants > 1 {
+                    let mut elements = None;
+                    for element in list.iter().filter(|element| !reads_columns(element)) {
+                        merge(&mut elements, self.state(element)?)?;
+                    }
+                    let mut merged = left;
+                    merge(&mut merged, elements)?;
                 }
-                let mut merged = self.state(operand)?;
-                merge(&mut merged, elements)?;
+                for element in list
+                    .iter()
+                    .filter(|element| constants <= 1 || reads_columns(element))
+                {
+                    let mut merged = left;
+                    merge(&mut merged, self.state(element)?)?;
+                }
                 Ok(None)
             }
             _ => {
@@ -328,6 +344,22 @@ impl Checker<'_> {
         .is_some_and(ColType::is_collatable);
         Ok(if collatable { merged } else { None })
     }
+}
+
+/// Whether `expression` reads a column of its query level.
+fn reads_columns(expression: &Expr<'_>) -> bool {
+    if matches!(
+        expression,
+        Expr::Column { .. } | Expr::SchemaColumn { .. } | Expr::WholeRow(_)
+    ) {
+        return true;
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found |= reads_columns(child);
+        Ok(())
+    });
+    found
 }
 
 /// `merge_collation_state` for explicit collations: the first one met wins,

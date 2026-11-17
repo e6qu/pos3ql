@@ -5385,6 +5385,11 @@ fn fold<'a>(
             if let Some(known) = known {
                 return settled(!known);
             }
+            if folding.replace
+                && let Some(negated) = negate_clause(new_operand, arena, catalog, folding.columns)?
+            {
+                return Ok((negated, None));
+            }
             if core::ptr::eq(new_operand, *operand) {
                 return Ok((expression, None));
             }
@@ -5528,6 +5533,26 @@ fn fold<'a>(
                 }
             }
             let new_otherwise = match otherwise {
+                // `IS DISTINCT FROM`'s `NOT (left = right)` is one node,
+                // whose operands fold but whose negation stays as written.
+                Some(Expr::Unary {
+                    source_position,
+                    operator: operator @ super::ast::UnaryOp::Not,
+                    operand,
+                }) if reached_otherwise
+                    && matches!(origin, super::ast::CaseOrigin::DistinctFrom { .. }) =>
+                {
+                    let (new_operand, _) = fold(operand, arena, folding)?;
+                    Some(if core::ptr::eq(new_operand, *operand) {
+                        otherwise.expect("matched")
+                    } else {
+                        alloc(Expr::Unary {
+                            source_position: *source_position,
+                            operator: *operator,
+                            operand: new_operand,
+                        })?
+                    })
+                }
                 Some(otherwise) if reached_otherwise => Some(fold(otherwise, arena, folding)?.0),
                 _ => *otherwise,
             };
@@ -5742,6 +5767,157 @@ fn fold<'a>(
             Ok((rebuilt, None))
         }
     }
+}
+
+/// `negate_clause`, as `eval_const_expressions` simplifies `NOT clause`: a
+/// built-in comparison becomes its negator, `NOT` of `NOT` its operand, and
+/// `AND` and `OR` exchange over their negated arms (De Morgan, which holds
+/// under three-valued logic). `None` keeps the `NOT`: an operator a
+/// user-defined one may stand for, a row comparison and a null test, whose
+/// operand may be a row, keep their form.
+fn negate_clause<'a>(
+    clause: &'a Expr<'a>,
+    arena: &'a Arena,
+    catalog: Option<&dyn CatalogAccess>,
+    columns: Option<&dyn crate::sql::exec::ColTypeResolver>,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    use super::ast::BinaryOp;
+    let alloc = |node: Expr<'a>| -> Result<&'a Expr<'a>, SqlError> {
+        arena
+            .alloc(node)
+            .map(|node| &*node)
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    let user_operator =
+        |symbol: &str| catalog.is_some_and(|catalog| catalog.has_operator_candidate(symbol));
+    let negate_or_wrap = |arm: &'a Expr<'a>| -> Result<&'a Expr<'a>, SqlError> {
+        match negate_clause(arm, arena, catalog, columns)? {
+            Some(negated) => Ok(negated),
+            None => alloc(Expr::Unary {
+                source_position: super::ast::SourcePosition::UNKNOWN,
+                operator: super::ast::UnaryOp::Not,
+                operand: arm,
+            }),
+        }
+    };
+    Ok(match clause {
+        Expr::Unary {
+            operator: super::ast::UnaryOp::Not,
+            operand,
+            ..
+        } => Some(*operand),
+        Expr::Binary {
+            source_position,
+            operator: operator @ (BinaryOp::And | BinaryOp::Or),
+            left,
+            right,
+        } => Some(alloc(Expr::Binary {
+            source_position: *source_position,
+            operator: if *operator == BinaryOp::And {
+                BinaryOp::Or
+            } else {
+                BinaryOp::And
+            },
+            left: negate_or_wrap(left)?,
+            right: negate_or_wrap(right)?,
+        })?),
+        Expr::Binary {
+            source_position,
+            operator,
+            left,
+            right,
+        } if !left.is_row_constructor() && !right.is_row_constructor() => {
+            let (symbol, negator, negated) = match operator {
+                BinaryOp::Eq => ("=", "<>", BinaryOp::NotEq),
+                BinaryOp::NotEq => ("<>", "=", BinaryOp::Eq),
+                BinaryOp::Lt => ("<", ">=", BinaryOp::GtEq),
+                BinaryOp::GtEq => (">=", "<", BinaryOp::Lt),
+                BinaryOp::LtEq => ("<=", ">", BinaryOp::Gt),
+                BinaryOp::Gt => (">", "<=", BinaryOp::LtEq),
+                BinaryOp::PatternLt => ("~<~", "~>=~", BinaryOp::PatternGtEq),
+                BinaryOp::PatternGtEq => ("~>=~", "~<~", BinaryOp::PatternLt),
+                BinaryOp::PatternLtEq => ("~<=~", "~>~", BinaryOp::PatternGt),
+                BinaryOp::PatternGt => ("~>~", "~<=~", BinaryOp::PatternLtEq),
+                _ => return Ok(None),
+            };
+            if user_operator(symbol) || user_operator(negator) {
+                return Ok(None);
+            }
+            Some(alloc(Expr::Binary {
+                source_position: *source_position,
+                operator: negated,
+                left,
+                right,
+            })?)
+        }
+        Expr::Like {
+            source_position,
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+            escape,
+        } if !user_operator(if *case_insensitive { "~~*" } else { "~~" }) => {
+            Some(alloc(Expr::Like {
+                source_position: *source_position,
+                operand,
+                pattern,
+                negated: !negated,
+                case_insensitive: *case_insensitive,
+                escape: *escape,
+            })?)
+        }
+        Expr::Match {
+            source_position,
+            operand,
+            pattern,
+            negated,
+            case_insensitive,
+        } if !user_operator(if *case_insensitive { "~*" } else { "~" }) => {
+            Some(alloc(Expr::Match {
+                source_position: *source_position,
+                operand,
+                pattern,
+                negated: !negated,
+                case_insensitive: *case_insensitive,
+            })?)
+        }
+        // A null test of a row differs from its negation's; a scalar's is
+        // exact, when the level's column types show the operand is one.
+        Expr::IsNull { operand, negated }
+            if !operand.is_row_constructor()
+                && columns.is_some_and(|columns| {
+                    crate::sql::error_position::preserving_pending(|| {
+                        crate::sql::exec::infer_type_res(operand, columns)
+                    })
+                    .ok()
+                    .and_then(|(oid, _)| {
+                        ColType::from_oid(oid)
+                            .or_else(|| catalog.and_then(|catalog| catalog.domain_base_type(oid)))
+                    })
+                    .is_some_and(|ctype| !matches!(ctype, ColType::Composite(_) | ColType::Record))
+                }) =>
+        {
+            Some(alloc(Expr::IsNull {
+                operand,
+                negated: !negated,
+            })?)
+        }
+        Expr::InList {
+            source_position,
+            operand,
+            list,
+            negated,
+        } if !operand.is_row_constructor() && !user_operator("=") && !user_operator("<>") => {
+            Some(alloc(Expr::InList {
+                source_position: *source_position,
+                operand,
+                list,
+                negated: !negated,
+            })?)
+        }
+        _ => None,
+    })
 }
 
 /// Whether `expression` is a NULL constant: written, cast or folded.

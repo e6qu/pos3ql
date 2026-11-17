@@ -336,6 +336,23 @@ impl<'a> Analyzer<'_, '_, 'a> {
             (left, right, true)
         } else if constant(left) && self.estimated_expression(right) {
             (right, left, false)
+        } else if self.estimated_expression(left) && self.estimated_expression(right) {
+            // Two expressions of the relation: no side is a pseudoconstant,
+            // so `eqsel`, `neqsel` and `scalarineqsel` take their defaults.
+            let Some(comparison) = Comparison::of(operator, true) else {
+                return Ok(None);
+            };
+            return Ok(Some(Clause::Expression {
+                columns: self.columns_of(left) | self.columns_of(right),
+                bound: None,
+                selectivity: match comparison {
+                    Comparison::Eq => super::DEFAULT_EQ_SEL,
+                    Comparison::Ne => 1.0 - super::DEFAULT_EQ_SEL,
+                    Comparison::Lt | Comparison::Le | Comparison::Gt | Comparison::Ge => {
+                        super::DEFAULT_INEQ_SEL
+                    }
+                },
+            }));
         } else {
             return Ok(None);
         };
@@ -1238,15 +1255,8 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 Ok(selectivity) => selectivity,
                 Err(shape) => return Ok(Err(shape)),
             },
-            Clause::Or(arms) => {
-                // `clauselist_selectivity_or`.
-                let mut selectivity = 0.0;
-                for arm in arms {
-                    let arm = planner.selectivity(arm)?;
-                    selectivity = selectivity + arm - selectivity * arm;
-                }
-                selectivity
-            }
+            // `clauselist_selectivity_or`.
+            Clause::Or(arms) => planner.or_selectivity(arms)?,
             Clause::Like {
                 column,
                 kind,

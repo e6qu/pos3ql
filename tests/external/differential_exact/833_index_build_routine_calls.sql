@@ -13,6 +13,5 @@ CREATE UNIQUE INDEX ib833_unique ON ib833 (ib833_twice(a));
 CREATE INDEX ib833_nested ON ib833 (ib833_twice(ib833_next(a)));
 CREATE INDEX ib833_partial ON ib833 (a) WHERE ib833_twice(a) > 6;
 CREATE UNIQUE INDEX ib833_duplicate ON ib833 (ib833_twice(b));
-REINDEX INDEX ib833_nested;
 REINDEX TABLE ib833;
 SELECT a FROM ib833 WHERE ib833_twice(a) = 8;

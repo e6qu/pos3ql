@@ -12835,14 +12835,7 @@ fn fold_select_constants_in<'a>(
             check_fromless_literal_operands(statement, arena, storage, txid)
         })?;
     }
-    // The analysis converts the untyped literals of built-in functions in
-    // FROM and assigns collations before the planner folds anything.
-    if let Some(from) = statement.from {
-        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
-            srf::validate_builtin_literal_arguments(table, storage, txid, arena)?;
-        }
-    }
-    collation_check::check_level(statement, storage, txid, arena)?;
+    check_select_analysis(statement, storage, txid, arena)?;
 
     let catalog = storage_catalog(storage, arena, txid);
     let Some(from) = &statement.from else {
@@ -12850,7 +12843,7 @@ fn fold_select_constants_in<'a>(
             fold_select_level(statement, arena, storage, txid, &catalog, Some(columns))
         });
     };
-    if !level_calls_sql_function(statement, storage, txid) {
+    if !level_calls_sql_function(statement, storage, txid) && !level_negates_null_test(statement) {
         return fold_select_level(statement, arena, storage, txid, &catalog, None);
     }
     // A level whose sources this folding cannot type (a view or a `WITH`
@@ -12891,6 +12884,82 @@ fn domain_cast_error(error: SqlError, type_name: &str) -> SqlError {
     }
 }
 
+/// `process_equivalence`: a top-level condition `X = X` of a strict
+/// equality whose operand calls nothing volatile is the condition
+/// `X IS NOT NULL` (a false and a null result are the same there), which the
+/// planner prints and estimates instead. Conditions under `OR` or `NOT`, and
+/// any `=` while a user-defined `=` operator exists, keep their form.
+fn self_equalities_as_null_tests<'a>(
+    condition: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    match condition {
+        Expr::Binary {
+            source_position,
+            operator: crate::sql::ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let new_left = self_equalities_as_null_tests(left, storage, txid, arena)?;
+            let new_right = self_equalities_as_null_tests(right, storage, txid, arena)?;
+            if core::ptr::eq(new_left, *left) && core::ptr::eq(new_right, *right) {
+                return Ok(condition);
+            }
+            arena
+                .alloc(Expr::Binary {
+                    source_position: *source_position,
+                    operator: crate::sql::ast::BinaryOp::And,
+                    left: new_left,
+                    right: new_right,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } if left == right
+            && !left.is_row_constructor()
+            && !left.is_constant(true)
+            && !left.contains_subquery()
+            && !expression_contains_volatile(left, storage, txid, false)
+            && !storage.has_visible_operator_named("=", txid) =>
+        {
+            arena
+                .alloc(Expr::IsNull {
+                    operand: left,
+                    negated: true,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        _ => Ok(condition),
+    }
+}
+
+/// The checks PostgreSQL's parse analysis makes of a query level before the
+/// planner folds anything: the untyped literals of built-in functions in
+/// `FROM` convert to their parameters' types, and explicit collations meet
+/// (`assign_collations`). A declared cursor makes them even when its query
+/// runs only at its first read.
+pub(crate) fn check_select_analysis(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if let Some(from) = statement.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            srf::validate_builtin_literal_arguments(table, storage, txid, arena)?;
+        }
+    }
+    collation_check::check_level(statement, storage, txid, arena)
+}
+
 /// Whether `expression`, outside its subqueries, calls a SQL function
 /// PostgreSQL's planner may inline.
 fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
@@ -12909,6 +12978,36 @@ fn expression_calls_sql_function(expression: &Expr<'_>, storage: &Storage, txid:
         Ok(())
     });
     found
+}
+
+/// Whether a condition of this query level negates a null test, which the
+/// folding rewrites by its operand's type.
+fn level_negates_null_test(statement: &Select<'_>) -> bool {
+    fn negates(expression: &Expr<'_>) -> bool {
+        if let Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+            ..
+        } = expression
+            && matches!(operand, Expr::IsNull { .. })
+        {
+            return true;
+        }
+        let mut found = false;
+        let _ = walk_children(expression, &mut |child| {
+            found |= negates(child);
+            Ok(())
+        });
+        found
+    }
+    let joins = statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on));
+    joins
+        .chain(statement.where_clause)
+        .chain(statement.having)
+        .any(negates)
 }
 
 /// Whether a select-list, join or condition expression of this query level
@@ -13046,7 +13145,10 @@ fn fold_select_level<'a>(
                 }
             }
             if let Some(on) = join.on {
-                let folded = fold(on)?;
+                let mut folded = fold(on)?;
+                if join.kind == crate::sql::ast::JoinKind::Inner {
+                    folded = self_equalities_as_null_tests(folded, storage, txid, arena)?;
+                }
                 folded_any |= !core::ptr::eq(folded, on);
                 join.on = Some(folded);
             }
@@ -13056,7 +13158,9 @@ fn fold_select_level<'a>(
             changed = true;
         }
     }
-    rebuilt.where_clause = fold_optional(statement.where_clause)?;
+    rebuilt.where_clause = fold_optional(statement.where_clause)?
+        .map(|clause| self_equalities_as_null_tests(clause, storage, txid, arena))
+        .transpose()?;
     rebuilt.having = fold_optional(statement.having)?;
     rebuilt.offset = fold_optional(statement.offset)?;
     rebuilt.limit = fold_optional(statement.limit)?;

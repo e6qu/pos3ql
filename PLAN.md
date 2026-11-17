@@ -749,7 +749,12 @@ equality `1/DEFAULT_NUM_DISTINCT` (a boolean's 1/2), an inequality
 `DEFAULT_INEQ_SEL`, two bounds of one expression `DEFAULT_RANGE_INEQ_SEL`,
 a NULL test `DEFAULT_UNK_SEL`, a boolean function a third, and a
 comparison with a boolean constant is its other side
-(`simplify_boolean_equality`). A cast of a column to its own type is no
+(`simplify_boolean_equality`). Two expressions of the relation compared take
+`DEFAULT_EQ_SEL`, its complement or `DEFAULT_INEQ_SEL`; a top-level `X = X`
+is `X IS NOT NULL` (`process_equivalence`), and `NOT` of a comparison,
+pattern match, `IN` list, scalar null test, `AND` or `OR` folds to its
+negation (`negate_clause`, `differential_exact/834`); a row's null test keeps
+its `NOT`. An operator symbol no operator takes fails at analysis. A cast of a column to its own type is no
 node, printed and costed as the column, and a binary-coercible cast costs
 nothing; a `varchar` or `text` relabeling is the column for its index. A
 dummy relation's `Result` is as wide as the select list's expressions. An
@@ -807,29 +812,37 @@ query (`CREATE INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`,
 `ALTER TABLE`, `CREATE TABLE AS`, materialized view population) runs such a
 call in the engine and runs again replaying the results in their order, and
 a write prepares the keys of the rows it stored as it ends, one row at a
-time. Each replay runs the statement again, so a build calling one per row
-costs time quadratic in its rows; the build also evaluates each key once to
-validate it and once more to fill the value caches, so a function's notices
-repeat. Remaining, which `EXPLAIN` rejects with `0A000` naming the
+time. An index key's calls are kept by their site (the row, the index and
+the key's position), so the build's layers (tuple sizes, the sorted build,
+the uniqueness caches) read one result and a function's notice is raised
+once per row and index (`differential_exact/833`); a new index forms only
+its own keys, and `REINDEX TABLE` builds its indexes one at a time in OID
+order. An attempt collects every call it lacks, reads NULL in their place
+and runs them together before restarting, so a build restarts as often as
+its keys nest calls, not once per row. Remaining: a key whose calls nest
+restarts once per row, to keep their order; `REINDEX INDEX` and a write
+rebuild the table's value caches, which evaluates the other indexes' keys
+again and repeats their notices. Remaining, which `EXPLAIN` rejects with `0A000` naming the
 shape whenever PostgreSQL could choose an index path: other index access
 methods, expression indexes whose keys still call a user-defined routine or read
 a user-defined type after inlining, a call of a SQL function PostgreSQL
 inlines whose arguments read an enclosing query's columns, are packed
-into a variadic array or are polymorphic, or whose body is `BEGIN ATOMIC`,
+into a variadic array or are polymorphic,
 in a `MERGE` or an `INSERT`'s `RETURNING`, a set-returning SQL function in
-`FROM` PostgreSQL inlines with a default, packed variadic, polymorphic or
-lateral argument or a body with `WITH`, windows or a coerced column, a
+`FROM` PostgreSQL inlines with a packed variadic, polymorphic or
+lateral argument or a body with windows or a coerced column (bodies in
+`BEGIN ATOMIC`, defaults and `WITH` queries inline, `differential_exact/835`), a
 function scan of a built-in whose support function estimates its rows
 other than `generate_series` over integers, `numeric` and timestamps
 (`differential_exact/813`) and `unnest`, or whose bound or step is a stable
 expression the support function would evaluate (`now()`), a regular
 expression with embedded options or a director (`(?i)`, `***=`),
-conditions on an expression key of a statistics object, an `OR` reading
-two or more keys of a statistics object with an MCV list (estimated
-through it with `is_or`), conditions a
+conditions on an expression key of a statistics object (an `OR` through
+an MCV list is estimated with `is_or`, `differential_exact/836`), conditions a
 statistics object on a column past the 63rd or with an MCV list of a type
-other than the integer, floating, numeric, character, boolean, date,
-timestamp and UUID types estimates, a sub-partitioned table
+other than the integer, floating, numeric, character, `name`, `"char"`,
+`oid`, boolean, date, time, timestamp, interval, `bytea`, `money`, network,
+bit string, `pg_lsn` and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or

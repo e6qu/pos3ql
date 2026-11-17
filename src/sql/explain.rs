@@ -5265,6 +5265,7 @@ fn predicate_selectivity<'a>(
             operand,
             list,
             negated: false,
+            ..
         } if list.iter().all(|item| item.is_constant(false)) => {
             let Expr::Column { qualifier, name } = **operand else {
                 return 1.0;

@@ -2030,13 +2030,18 @@ where
         }
     }
     if set_tree_requires_equality(tree) {
-        for ctype in &target[..n_cols] {
+        for (c, ctype) in target[..n_cols].iter().enumerate() {
             if missing_equality(*ctype) {
-                return Err(sql_err!(
+                let error = sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
                     "could not identify an equality operator for type {}",
                     ctype.name()
-                ));
+                );
+                // PostgreSQL reports it at the first input's column.
+                return Err(match leaves.first() {
+                    Some(leaf) => at_leaf_column(error, leaf, c),
+                    None => error,
+                });
             }
         }
     }

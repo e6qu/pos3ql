@@ -745,6 +745,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 negated,
                 case_insensitive,
                 escape,
+                ..
             } => {
                 let kind = if *case_insensitive {
                     super::like::PatternKind::ILike
@@ -762,6 +763,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 pattern,
                 negated,
                 case_insensitive,
+                ..
             } => {
                 let kind = if *case_insensitive {
                     super::like::PatternKind::IRegex
@@ -795,6 +797,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 operand,
                 list,
                 negated,
+                ..
             } => {
                 let Some(column) = self.column_of(operand)? else {
                     return Ok(Ok(other(self, "an IN list over an expression")));
@@ -865,6 +868,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 operator,
                 array,
                 all,
+                ..
             } => {
                 let Some(column) = self.column_of(operand)? else {
                     return Ok(Ok(other(self, "an ANY or ALL over an expression")));

@@ -1623,13 +1623,12 @@ fi
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
 # Data stays byte-exact; diagnostic records retain the failing SQL line.
 run_corpus() { # host port outfile file diagnostics
-  local diagnostics=$5 status=0 role=candidate
+  local diagnostics=$5 status=0
   case "$diagnostics" in
     sqlstate|verbose|full) ;;
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    role=reference
     PGOPTIONS="$REFERENCE_PGOPTIONS" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
@@ -1647,14 +1646,9 @@ run_corpus() { # host port outfile file diagnostics
     cat "$3.stderr" >&2
     return 1
   fi
-  # Full comparison checks each error's cursor, except at the statements
-  # listed as not yet positioned by pos3ql.
-  local gaps=()
-  [[ "$diagnostics" == full ]] \
-    && gaps=(--cursor-gaps "$EXT/differential_exact/cursor-gaps.txt" --role "$role")
   python3 "$EXT/differential_diagnostics.py" --source "$4" --stdout "$3.stdout" \
     --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" \
-    ${gaps[@]+"${gaps[@]}"} > "$3" || return 1
+    > "$3" || return 1
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \

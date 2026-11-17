@@ -205,8 +205,9 @@ pub(crate) fn dispatch<'a>(
             let text = match value {
                 Datum::Text(text) | Datum::Xml(text) => text,
                 other => {
-                    return Err(crate::sql::eval::argument_type_mismatch(
-                        "XMLPARSE", "text", &other,
+                    return Err(crate::sql::error_position::at_expression(
+                        crate::sql::eval::argument_type_mismatch("XMLPARSE", "text", &other),
+                        args[0],
                     ));
                 }
             };
@@ -229,10 +230,9 @@ pub(crate) fn dispatch<'a>(
             let text = match value {
                 Datum::Xml(text) => text,
                 other => {
-                    return Err(crate::sql::eval::argument_type_mismatch(
-                        "XMLSERIALIZE",
-                        "xml",
-                        &other,
+                    return Err(crate::sql::error_position::at_expression(
+                        crate::sql::eval::argument_type_mismatch("XMLSERIALIZE", "xml", &other),
+                        args[0],
                     ));
                 }
             };
@@ -352,10 +352,9 @@ pub(crate) fn dispatch<'a>(
                         out.write_str(text).map_err(|_| arena_full())?;
                     }
                     other => {
-                        return Err(crate::sql::eval::argument_type_mismatch(
-                            "XMLCONCAT",
-                            "xml",
-                            &other,
+                        return Err(crate::sql::error_position::at_expression(
+                            crate::sql::eval::argument_type_mismatch("XMLCONCAT", "xml", &other),
+                            expression,
                         ));
                     }
                 }
@@ -427,8 +426,9 @@ pub(crate) fn dispatch<'a>(
             let text = match value {
                 Datum::Xml(text) => text,
                 other => {
-                    return Err(crate::sql::eval::argument_type_mismatch(
-                        "XMLROOT", "xml", &other,
+                    return Err(crate::sql::error_position::at_expression(
+                        crate::sql::eval::argument_type_mismatch("XMLROOT", "xml", &other),
+                        args[0],
                     ));
                 }
             };

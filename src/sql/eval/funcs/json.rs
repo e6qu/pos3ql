@@ -1891,10 +1891,13 @@ pub(crate) fn dispatch<'a>(
                     })?,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
-                        return Err(crate::sql_err!(
-                            crate::sql::eval::sqlstate::CANNOT_COERCE,
-                            "cannot cast type {} to json",
-                            crate::sql::eval::type_name_of_pub(&other)
+                        return Err(crate::sql::error_position::at_expression(
+                            crate::sql_err!(
+                                crate::sql::eval::sqlstate::CANNOT_COERCE,
+                                "cannot cast type {} to json",
+                                crate::sql::eval::type_name_of_pub(&other)
+                            ),
+                            args[0],
                         ));
                     }
                 };

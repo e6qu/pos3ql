@@ -3120,7 +3120,9 @@ fn expression_static_metadata(
                 collation,
             })
         }
-        Expr::Collate { operand, collation } => {
+        Expr::Collate {
+            operand, collation, ..
+        } => {
             let mut meta = expression_static_metadata(operand, columns)?;
             meta.collation = collation.builtin()?;
             Some(meta)
@@ -3816,6 +3818,16 @@ fn record_shape_metadata_dyn(
             args,
             ..
         } if name.eq_ignore_ascii_case("row") => {
+            // Reported at the `ROW` the entries overflow.
+            let too_many = || {
+                crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "ROW expressions can have at most 1664 entries"
+                    ),
+                    base,
+                )
+            };
             let mut count = 0usize;
             for arg in *args {
                 let expansion = match arg {
@@ -3837,17 +3849,11 @@ fn record_shape_metadata_dyn(
                         return Ok(None);
                     }
                     if overflow {
-                        return Err(sql_err!(
-                            sqlstate::TOO_MANY_COLUMNS,
-                            "ROW expressions can have at most 1664 entries"
-                        ));
+                        return Err(too_many());
                     }
                 } else {
                     if count == RECORD_FIELD_NAMES.len() {
-                        return Err(sql_err!(
-                            sqlstate::TOO_MANY_COLUMNS,
-                            "ROW expressions can have at most 1664 entries"
-                        ));
+                        return Err(too_many());
                     }
                     let Some(metadata) = expression_static_metadata(arg, columns) else {
                         return Ok(None);
@@ -4093,10 +4099,13 @@ pub fn record_field_metadata(
         && bound_parameter_context_active()
         && !bound_parameter_exists(*index)
     {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_PARAMETER,
-            "there is no parameter ${}",
-            index
+        return Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::UNDEFINED_PARAMETER,
+                "there is no parameter ${}",
+                index
+            ),
+            base,
         ));
     }
     if let Expr::Param(index) = base

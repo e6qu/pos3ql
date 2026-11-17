@@ -3324,12 +3324,14 @@ fn conditions<'a>(
             (Some(array), _) => {
                 let expression = if array.comparison == Comparison::Eq {
                     Expr::InList {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         operand: array.key,
                         list: array.operands,
                         negated: false,
                     }
                 } else {
                     Expr::AnyAll {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         operand: array.key,
                         operator: array.comparison.binary(),
                         array: arena

@@ -6241,6 +6241,8 @@ pub enum Expr<'a> {
     /// An explicit collation that remains part of expression identity until
     /// the comparison, ordering, or key path consumes it.
     Collate {
+        /// The `COLLATE` keyword's location.
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         collation: ParsedCollation<'a>,
     },
@@ -6276,14 +6278,16 @@ pub enum Expr<'a> {
         /// are excluded from that aggregate.
         filter: Option<&'a Expr<'a>>,
     },
-    /// `expression [NOT] IN (list)`.
+    /// `expression [NOT] IN (list)`, located at its `IN` (or `NOT`).
     InList {
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         list: &'a [&'a Expr<'a>],
         negated: bool,
     },
-    /// `expression [NOT] LIKE/ILIKE pattern`.
+    /// `expression [NOT] LIKE/ILIKE pattern`, located at its operator.
     Like {
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         pattern: &'a Expr<'a>,
         negated: bool,
@@ -6295,6 +6299,8 @@ pub enum Expr<'a> {
     },
     /// POSIX regex match: `operand ~ pattern` (`!~`, `~*`, `!~*`).
     Match {
+        /// The operator's location.
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         pattern: &'a Expr<'a>,
         negated: bool,
@@ -6388,6 +6394,8 @@ pub enum Expr<'a> {
     },
     /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
+        /// The operator's location.
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         operator: BinaryOp,
         array: &'a Expr<'a>,

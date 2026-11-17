@@ -39138,6 +39138,7 @@ fn collate_is_retained_in_the_expression_tree() {
         crate::sql::ast::Expr::Collate {
             operand: crate::sql::ast::Expr::Column { name: "value", .. },
             collation: crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::C,),
+            ..
         }
     ));
 }

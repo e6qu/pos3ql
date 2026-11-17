@@ -103909,10 +103909,13 @@ fn alter_table_relation(
                 if inheritance_scope == AlterInheritanceScope::Direct
                     && column_supplied_by_parent(storage, &def, column, txn.txid)
                 {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_TABLE_DEFINITION,
-                        "cannot alter inherited column \"{}\"",
-                        column
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot alter inherited column \"{}\"",
+                            column
+                        ),
+                        column,
                     ));
                 }
                 if def.partition.scheme.is_some_and(|scheme| {
@@ -103920,11 +103923,14 @@ fn alter_table_relation(
                         scheme.keys[..usize::from(scheme.n_keys)].contains(&(original as u16))
                     })
                 }) {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_TABLE_DEFINITION,
-                        "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                    return sql_fail(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::INVALID_TABLE_DEFINITION,
+                            "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                            column,
+                            def.name.as_str()
+                        ),
                         column,
-                        def.name.as_str()
                     ));
                 }
                 if let Err(error) = require_row_type_unaltered(storage, txn.txid, table_index) {

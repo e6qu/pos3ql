@@ -3196,6 +3196,18 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'d Arena,
     ) -> Result<(), SqlError> {
+        // A written schema is looked up first, which needs USAGE on it; the
+        // error points at the relation's name.
+        if tref.bound_table.is_none()
+            && let Some(schema) = tref.schema
+            && storage.find_schema_visible(schema, txid).is_some()
+            && let Some(current_role) = storage.current_role_slot(txid)
+        {
+            let role = tref.authorization_role.map_or(current_role, usize::from);
+            storage
+                .require_schema_usage_as(schema, role, txid)
+                .map_err(|error| crate::sql::error_position::at_reference(error, schema))?;
+        }
         // `txid == 0` (schema-only / Describe) resolves against the committed
         // catalog; a real transaction sees its own uncommitted CREATE/DROP.
         let slot = tref.bound_table.map(usize::from).or_else(|| {

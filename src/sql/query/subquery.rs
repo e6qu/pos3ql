@@ -856,23 +856,40 @@ fn check_compared_literals<'a>(
                         && let Err(error) =
                             crate::sql::eval::cast_to(Datum::Text(literal), ctype, arena)
                     {
-                        failure = Some(crate::sql::error_position::at_subject(error, literal));
+                        failure = Some((error, *literal));
                     }
                     column += 1;
                     Ok(())
                 },
             )
         });
-        failure.map_or(Ok(()), Err)
+        // The probe keeps no position of its own; the failure is reported
+        // at its literal once the probe is over.
+        failure.map_or(Ok(()), |(error, literal)| {
+            Err(crate::sql::error_position::at_subject(error, literal))
+        })
     };
     match expression {
         Expr::InSubquery {
             operand, select, ..
         }
         | Expr::QuantifiedSubquery {
-            operand, select, ..
+            operand,
+            select,
+            operator:
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq,
+            ..
         } => {
             check(operand, select)?;
+            check_compared_literals(operand, outer, storage, txid, arena)
+        }
+        // A pattern operator takes no conversion of its literal operand.
+        Expr::QuantifiedSubquery { operand, .. } => {
             check_compared_literals(operand, outer, storage, txid, arena)
         }
         Expr::Binary {

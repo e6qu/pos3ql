@@ -1719,6 +1719,7 @@ pub(super) fn fold_catalog_inputs<'a>(
             })
         }
         Expr::InList {
+            source_position,
             operand,
             list,
             negated,
@@ -1735,6 +1736,7 @@ pub(super) fn fold_catalog_inputs<'a>(
                 return Ok(expression);
             }
             alloc(Expr::InList {
+                source_position: *source_position,
                 operand: folded_operand,
                 list: items,
                 negated: *negated,

@@ -11636,7 +11636,9 @@ impl Engine {
                 let ambiguity =
                     param_types::infer(&self.storage, statement, txn.txid, arena, parameter_oids);
                 parameter_oids[..types.len()].copy_from_slice(types);
-                reject_unknown_parameter_fields(parser.parameter_fields(), parameter_oids)?;
+                error_position::with_analysis_of_parsed(sql, Some(parser.source_copies()), || {
+                    reject_unknown_parameter_fields(parser.parameter_fields(), parameter_oids)
+                })?;
                 param_types::finish_unresolved(sql, arena, parameter_oids, ambiguity)
             },
         );
@@ -22747,10 +22749,15 @@ impl Engine {
             ..NO_HOOKS
         };
         for (index, argument) in arguments.iter().enumerate() {
+            // Analysis rejects a subquery and coerces each argument to its
+            // parameter's type at the argument.
             if argument.contains_subquery() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot use subquery in EXECUTE parameter"
+                return Err(error_position::at_expression(
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in EXECUTE parameter"
+                    ),
+                    argument,
                 ));
             }
             let source = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;
@@ -22764,7 +22771,15 @@ impl Engine {
                 declared[index],
                 arena,
                 Some(&sequences),
-            )?;
+            )
+            // A domain's constraints run with the statement, not its analysis.
+            .map_err(|error| {
+                if error.sqlstate.as_str().starts_with("23") {
+                    error
+                } else {
+                    error_position::at_expression(error, argument)
+                }
+            })?;
         }
         Ok((values, declared))
     }
@@ -34387,17 +34402,26 @@ impl Engine {
 
 /// PostgreSQL rejects a field of a parameter whose type its use leaves
 /// undetermined (`SELECT ($1).a`) while that type is still `unknown`.
-fn reject_unknown_parameter_fields(fields: &[(u32, &str)], oids: &[i32]) -> Result<(), SqlError> {
-    for &(index, field) in fields {
-        if (index as usize)
+fn reject_unknown_parameter_fields(
+    fields: &[(&ast::Expr<'_>, &str)],
+    oids: &[i32],
+) -> Result<(), SqlError> {
+    for &(parameter, field) in fields {
+        let ast::Expr::Param(index) = parameter else {
+            continue;
+        };
+        if (*index as usize)
             .checked_sub(1)
             .and_then(|index| oids.get(index))
             .is_some_and(|oid| *oid == types::oid::UNKNOWN)
         {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "column notation .{} applied to type unknown, which is not a composite type",
-                field
+            return Err(error_position::at_expression(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "column notation .{} applied to type unknown, which is not a composite type",
+                    field
+                ),
+                parameter,
             ));
         }
     }

@@ -1732,16 +1732,13 @@ pub(super) fn prepare_materialization<'a>(
         statement.distinct_on,
     )?;
     if statement.distinct && n_on == 0 {
-        for expression in order_exprs.iter().take(n_order) {
+        for (expression, written) in order_exprs.iter().take(n_order).zip(statement.order_by) {
             let target = expression.expect("resolved").expression;
             let in_list = statement.items.iter().any(|item| {
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
             if !in_list {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                ));
+                return Err(super::distinct_order_key_missing(written.expression));
             }
         }
     }

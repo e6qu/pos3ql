@@ -2777,6 +2777,9 @@ fn validate_assignment_expression(
     )? {
         return Ok(());
     }
+    if let ColType::Composite(Some(slot)) = column.ctype {
+        super::check_row_constructor_fields(expression, slot, storage, txid, arena)?;
+    }
     validate_assignment_type(
         crate::sql::exec::infer_routine_argument_oid(expression, columns)?,
         column,
@@ -2799,6 +2802,20 @@ fn validate_assigned_literal(
     let Expr::Str(text) = expression else {
         return Ok(());
     };
+    // A composite column runs `record_in`, which converts each field.
+    if let ColType::Composite(Some(slot)) = column.ctype {
+        return crate::sql::eval::probe_constants(|| {
+            arena
+                .with_remaining_region(|scratch| {
+                    crate::sql::exec::decode_composite_text(
+                        text, slot, storage, txid, scratch, None,
+                    )
+                    .map(|_| ())
+                })
+                .map_err(|_| super::arena_full_pub())?
+        })
+        .map_err(|error| crate::sql::error_position::at_subject(error, text));
+    }
     let Some(target_oid) = storage.routine_type_oid(column.ctype, column.user_type, txid) else {
         return Ok(());
     };
@@ -3020,6 +3037,7 @@ fn validate_assignment_path(
     };
     let mut target = crate::util::StackStr::<64>::from_str(column.name.as_str());
     let mut subscripted = false;
+    let mut selected_field = false;
     let mut operands = operands.iter();
     for kind in kinds.bytes() {
         if kind != b'f' {
@@ -3031,11 +3049,17 @@ fn validate_assignment_path(
                 operands.next();
             }
             let Some(element) = crate::sql::assignment_path::element_type_oid(container) else {
-                return Err(at_target(sql_err!(
+                let error = sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "cannot subscript type {} because it does not support subscripting",
                     type_name(container)?.as_str()
-                )));
+                );
+                // A field's value has no written location to point at.
+                return Err(if selected_field {
+                    error
+                } else {
+                    at_target(error)
+                });
             };
             // A slice assigns an array of the container's type.
             if kind == b'e' {
@@ -3050,6 +3074,7 @@ fn validate_assignment_path(
                 "assignment field step lacks its name"
             ));
         };
+        selected_field = true;
         let creation = match crate::storage::NamedTypeKind::from_oid(container) {
             Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
             _ => None,

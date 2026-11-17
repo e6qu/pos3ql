@@ -242,11 +242,19 @@ fn skeleton<'a>(
                 binding,
             }
         }
-        Expr::Collate { operand, collation } => {
+        Expr::Collate {
+            source_position,
+            operand,
+            collation,
+        } => {
             let Some(operand) = part(operand, conditional)? else {
                 return Ok(None);
             };
-            Expr::Collate { operand, collation }
+            Expr::Collate {
+                source_position,
+                operand,
+                collation,
+            }
         }
         Expr::IsNull { operand, negated } => {
             let Some(operand) = part(operand, conditional)? else {
@@ -752,7 +760,12 @@ impl<'a> DeferredSource<'a> {
                 type_mod,
                 binding,
             },
-            Expr::Collate { operand, collation } => Expr::Collate {
+            Expr::Collate {
+                source_position,
+                operand,
+                collation,
+            } => Expr::Collate {
+                source_position,
                 operand: self.bind(operand, offset, values, arena)?,
                 collation,
             },

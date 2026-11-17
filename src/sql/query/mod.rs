@@ -4467,12 +4467,45 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
                     .filter(|&target| target != super::types::oid::RECORD)
             {
-                return Err(sql_err!(
-                    sqlstate::CANNOT_COERCE,
-                    "cannot cast type record to {}",
-                    crate::sql::catalog::format_type_name(self.storage, self.txid, target)?
-                        .as_str()
+                return Err(crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::CANNOT_COERCE,
+                        "cannot cast type record to {}",
+                        crate::sql::catalog::format_type_name(self.storage, self.txid, target)?
+                            .as_str()
+                    ),
+                    arguments[call_index],
                 ));
+            }
+            // An unknown literal converts to its parameter's type while the
+            // call is analysed, before any argument is evaluated.
+            if let Some(call_index) = supplied
+                && !expanded_variadic
+                && let Expr::Str(text) = arguments[call_index]
+                && argument_type_oids[call_index] == super::types::oid::UNKNOWN
+                && let Some(target) =
+                    self.storage
+                        .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+            {
+                crate::sql::catalog::validate_literal_input(
+                    self.storage,
+                    self.txid,
+                    text,
+                    target,
+                    arena,
+                )
+                .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+            }
+            if let Some(call_index) = supplied
+                && let ColType::Composite(Some(composite)) = parameter.ctype
+            {
+                check_row_constructor_fields(
+                    arguments[call_index],
+                    composite,
+                    self.storage,
+                    self.txid,
+                    arena,
+                )?;
             }
             input_type_oids[input_index] = match supplied {
                 Some(call_index) if !expanded_variadic => argument_type_oids[call_index],
@@ -10494,10 +10527,13 @@ fn check_key_types<'a>(
         .chain(distinct_items)
     {
         if let Some(ctype) = noncomparable(key) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "could not identify an equality operator for type {}",
-                ctype.name()
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an equality operator for type {}",
+                    ctype.name()
+                ),
+                key,
             ));
         }
         // Grouping and duplicate removal call the key type's `=` function,
@@ -10549,15 +10585,80 @@ fn check_key_types<'a>(
             if let SelectItem::Expr { expression, .. } = item
                 && let Some(ctype) = noncomparable(expression)
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "could not identify an equality operator for type {}",
-                    ctype.name()
+                return Err(crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "could not identify an equality operator for type {}",
+                        ctype.name()
+                    ),
+                    expression,
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// `coerce_record_to_complex`: a row constructor given as the composite
+/// type `slot` converts field by field while the statement is analysed. An
+/// unknown literal field runs the field type's input, and the constructor
+/// must have exactly the type's fields; both are reported where written.
+pub(crate) fn check_row_constructor_fields<'a>(
+    argument: &'a Expr<'a>,
+    slot: crate::storage::TypeCreation,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Expr::Call { args, .. } = argument else {
+        return Ok(());
+    };
+    if !argument.is_row_constructor() {
+        return Ok(());
+    }
+    let definition = storage.require_row_type_definition(slot, txid)?;
+    let mismatch = |detail: &'static str| -> Result<(), SqlError> {
+        let target = super::types::oid::composite_oid(slot);
+        let error = sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type record to {}",
+            crate::sql::catalog::format_type_name(storage, txid, target)?.as_str()
+        );
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::sql::eval::DiagnosticText::copy(detail)),
+            None,
+        );
+        Err(crate::sql::error_position::at_expression(error, argument))
+    };
+    let mut width = 0;
+    for (index, field) in definition.active_fields().enumerate() {
+        width += 1;
+        let Some(value) = args.get(index) else {
+            return mismatch("Input has too few columns.");
+        };
+        if let Expr::Str(text) = value
+            && let Some(field_oid) = storage.routine_type_oid(field.ctype, field.user_type, txid)
+        {
+            crate::sql::catalog::validate_literal_input(storage, txid, text, field_oid, arena)
+                .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+        }
+    }
+    if args.len() > width {
+        return mismatch("Input has too many columns.");
+    }
+    Ok(())
+}
+
+/// `SELECT DISTINCT`'s error for an `ORDER BY` key, as written, that is not
+/// in the select list.
+pub(super) fn distinct_order_key_missing(written: &Expr<'_>) -> SqlError {
+    crate::sql::error_position::at_expression(
+        sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+        ),
+        written,
+    )
 }
 
 /// An aggregate's `DISTINCT` arguments and `ORDER BY` keys need their types'
@@ -10576,10 +10677,13 @@ fn check_aggregate_key_types<'a>(
     {
         for argument in args.iter().filter(|_| *distinct) {
             if let Some(ctype) = type_of(argument).filter(|ctype| !ctype.has_default_equality()) {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "could not identify an equality operator for type {}",
-                    ctype.name()
+                return Err(crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "could not identify an equality operator for type {}",
+                        ctype.name()
+                    ),
+                    argument,
                 ));
             }
         }
@@ -10587,8 +10691,9 @@ fn check_aggregate_key_types<'a>(
             if let Some(ctype) =
                 type_of(order.expression).filter(|ctype| !ctype.has_builtin_ordering())
             {
-                return Err(crate::sql::error_position::missing_ordering_operator(
-                    &ctype.name(),
+                return Err(crate::sql::error_position::at_expression(
+                    crate::sql::error_position::missing_ordering_operator(&ctype.name()),
+                    order.expression,
                 ));
             }
         }
@@ -10654,10 +10759,13 @@ fn resolve_group_ordinals<'a>(
         for key in keys {
             let mut nodes = ArenaList::new(arena);
             collect_aggs(key, &mut nodes, storage, txid, columns)?;
-            if !nodes.is_empty() {
-                return Err(sql_err!(
-                    sqlstate::GROUPING_ERROR,
-                    "aggregate functions are not allowed in GROUP BY"
+            if let Some((_, aggregate)) = nodes.as_slice().first() {
+                return Err(crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::GROUPING_ERROR,
+                        "aggregate functions are not allowed in GROUP BY"
+                    ),
+                    aggregate,
                 ));
             }
         }
@@ -11619,11 +11727,14 @@ pub(crate) fn aggregate_routine(
         distinct,
         filter,
         over,
+        source_position,
         ..
     } = expression
     else {
         return Ok(None);
     };
+    // Analysis reports a call used against its kind at the call.
+    let at_call = |error| crate::sql::error_position::at_source_position(error, *source_position);
     if super::eval::is_sql_syntax_call(expression) {
         return Ok(expression
             .is_aggregate()
@@ -11700,11 +11811,11 @@ pub(crate) fn aggregate_routine(
         RoutineCallSelection::Stored(slot) => {
             let kind = storage.routine_for(slot, txid).kind;
             if over.is_some() && !matches!(kind, RoutineKind::Aggregate(_)) {
-                return Err(sql_err!(
+                return Err(at_call(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "OVER specified, but {} is not a window function nor an aggregate function",
                     name
-                ));
+                )));
             }
             match kind {
                 RoutineKind::Aggregate(_) => Ok(Some(AggregateRoutine::Stored(slot))),
@@ -11724,18 +11835,18 @@ pub(crate) fn aggregate_routine(
                 )
             })?;
             if over.is_some() && !matches!(signature.kind, b'a' | b'w') {
-                return Err(sql_err!(
+                return Err(at_call(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "OVER specified, but {} is not a window function nor an aggregate function",
                     name
-                ));
+                )));
             }
             if over.is_none() && signature.kind == b'w' {
-                return Err(sql_err!(
+                return Err(at_call(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "window function {} requires an OVER clause",
                     name
-                ));
+                )));
             }
             Ok((signature.kind == b'a').then_some(AggregateRoutine::Builtin(oid)))
         }
@@ -11780,12 +11891,12 @@ pub(crate) fn aggregate_routine(
         } else {
             "*"
         };
-        return Err(sql_err!(
+        return Err(at_call(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "{} specified, but {} is not an aggregate function",
             decoration,
             name
-        ));
+        )));
     }
     Ok(aggregate)
 }
@@ -12171,25 +12282,28 @@ fn rewrite_grouped_expr<'a>(
             expression: rewrite(expression)?,
             type_oid: *type_oid,
         }),
-        Expr::Collate { operand, collation } => alloc(Expr::Collate {
+        Expr::Collate { source_position, operand, collation } => alloc(Expr::Collate {
+            source_position: *source_position,
             operand: rewrite(operand)?,
             collation: *collation,
         }),
         Expr::IsNull { operand, negated } => {
             alloc(Expr::IsNull { operand: rewrite(operand)?, negated: *negated })
         }
-        Expr::InList { operand, list, negated } => {
+        Expr::InList { source_position, operand, list, negated } => {
             let mut items = ArenaList::new(arena);
             for x in list.iter() {
                 items.push(rewrite(x)?).map_err(|_| arena_full())?;
             }
             alloc(Expr::InList {
+                source_position: *source_position,
                 operand: rewrite(operand)?,
                 list: items.as_slice(),
                 negated: *negated,
             })
         }
-        Expr::Like { operand, pattern, negated, case_insensitive, escape } => alloc(Expr::Like {
+        Expr::Like { source_position, operand, pattern, negated, case_insensitive, escape } => alloc(Expr::Like {
+            source_position: *source_position,
             operand: rewrite(operand)?,
             pattern: rewrite(pattern)?,
             negated: *negated,
@@ -12199,7 +12313,8 @@ fn rewrite_grouped_expr<'a>(
                 None => None,
             },
         }),
-        Expr::Match { operand, pattern, negated, case_insensitive } => alloc(Expr::Match {
+        Expr::Match { source_position, operand, pattern, negated, case_insensitive } => alloc(Expr::Match {
+            source_position: *source_position,
             operand: rewrite(operand)?,
             pattern: rewrite(pattern)?,
             negated: *negated,
@@ -12340,7 +12455,8 @@ fn rewrite_grouped_expr<'a>(
         Expr::RecordFieldIndex { base, index } => {
             alloc(Expr::RecordFieldIndex { base: rewrite(base)?, index: *index })
         }
-        Expr::AnyAll { operand, operator, array, all } => alloc(Expr::AnyAll {
+        Expr::AnyAll { source_position, operand, operator, array, all } => alloc(Expr::AnyAll {
+            source_position: *source_position,
             operand: rewrite(operand)?,
             operator: *operator,
             array: rewrite(array)?,
@@ -12355,11 +12471,17 @@ fn validate_projection_source(
     scope: &QueryScope<'_>,
 ) -> Result<(), SqlError> {
     match item {
-        SelectItem::Wildcard(_) if scope.n == 0 => Err(sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "SELECT * with no tables specified is not valid"
+        SelectItem::Wildcard(_) if scope.n == 0 => Err(crate::sql::error_position::at_item(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "SELECT * with no tables specified is not valid"
+            ),
+            item,
         )),
-        SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier).map(|_| ()),
+        SelectItem::TableWildcard(qualifier) => scope
+            .qualified_star_columns(qualifier)
+            .map(|_| ())
+            .map_err(|error| crate::sql::error_position::at_item(error, item)),
         _ => Ok(()),
     }
 }
@@ -12751,7 +12873,8 @@ fn fold_select_level<'a>(
         }
     }
     // The folded select item a key repeats, which PostgreSQL's analysis made
-    // the key's target entry.
+    // the key's target entry. A key whose item folding left as written stays
+    // the written key, which errors about the key point at.
     let item_entry = |key: &'a Expr<'a>| {
         statement
             .items
@@ -12763,12 +12886,13 @@ fn fold_select_level<'a>(
                     SelectItem::Expr {
                         expression: folded, ..
                     },
-                ) if *expression == key => Some(*folded),
+                ) if *expression == key => Some((*expression, *folded)),
                 _ => None,
             })
     };
     let fold_key = |key: &'a Expr<'a>| match item_entry(key) {
-        Some(folded) => Ok(folded),
+        Some((written, folded)) if core::ptr::eq(written, folded) => Ok(key),
+        Some((_, folded)) => Ok(folded),
         None => fold(key),
     };
     let order_by = arena
@@ -13220,23 +13344,21 @@ pub(crate) fn fold_merge_constants<'a>(
     let whens = arena
         .alloc_slice_copy(statement.whens)
         .map_err(|_| arena_full())?;
+    // Analysis converts each action's condition before its values.
     for when in whens.iter_mut() {
         *when = match *when {
             MergeWhen::Matched { cond, action } => {
+                let cond = cond.map(fold).transpose()?;
                 let action = fold_target_action(action)?;
-                MergeWhen::Matched {
-                    cond: cond.map(fold).transpose()?,
-                    action,
-                }
+                MergeWhen::Matched { cond, action }
             }
             MergeWhen::NotMatchedBySource { cond, action } => {
+                let cond = cond.map(fold).transpose()?;
                 let action = fold_target_action(action)?;
-                MergeWhen::NotMatchedBySource {
-                    cond: cond.map(fold).transpose()?,
-                    action,
-                }
+                MergeWhen::NotMatchedBySource { cond, action }
             }
             MergeWhen::NotMatchedByTarget { cond, action } => {
+                let cond = cond.map(fold).transpose()?;
                 let action = match action {
                     MergeSourceAction::Insert {
                         columns,
@@ -13261,10 +13383,7 @@ pub(crate) fn fold_merge_constants<'a>(
                     }
                     MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
                 };
-                MergeWhen::NotMatchedByTarget {
-                    cond: cond.map(fold).transpose()?,
-                    action,
-                }
+                MergeWhen::NotMatchedByTarget { cond, action }
             }
         };
     }
@@ -14815,6 +14934,9 @@ pub(crate) fn constant_select_resumable<'a>(
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
+    // Analysis errors point into the statement as written, before its
+    // record calls expand and its constants fold.
+    let written = statement;
     let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
         Ok(statement) => statement,
         Err(error) => return sql_fail(error),
@@ -14878,16 +15000,23 @@ pub(crate) fn constant_select_resumable<'a>(
     // DISTINCT compares whole rows with each type's default equality.
     if statement.distinct
         && statement.distinct_on.is_empty()
-        && let Some(ctype) = columns[..n]
+        && let Some((index, ctype)) = columns[..n]
             .iter()
-            .filter_map(|column| ColType::from_oid(column.type_oid))
-            .find(|ctype| !ctype.has_default_equality())
+            .enumerate()
+            .filter_map(|(index, column)| Some((index, ColType::from_oid(column.type_oid)?)))
+            .find(|(_, ctype)| !ctype.has_default_equality())
     {
-        return sql_fail(sql_err!(
+        let error = sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
             "could not identify an equality operator for type {}",
             ctype.name()
-        ));
+        );
+        return sql_fail(match written.items.get(index) {
+            Some(SelectItem::Expr { expression, .. }) => {
+                crate::sql::error_position::at_expression(error, expression)
+            }
+            _ => error,
+        });
     }
     // A window function needs rows to compute over, and this path has no scan
     // to give it. A FROM-less SELECT is exactly one row, though, so it can be
@@ -15177,9 +15306,11 @@ pub(crate) fn constant_select_resumable<'a>(
             })
             .map(|i| col_start[i]);
         if statement.distinct && order_item[j].is_none() {
-            return sql_fail(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+            return sql_fail(distinct_order_key_missing(
+                written
+                    .order_by
+                    .get(j)
+                    .map_or(ob.expression, |key| key.expression),
             ));
         }
     }
@@ -15194,8 +15325,12 @@ pub(crate) fn constant_select_resumable<'a>(
         if let Some(ctype) = key_type.and_then(ColType::from_oid)
             && !ctype.has_builtin_ordering()
         {
-            return sql_fail(crate::sql::error_position::missing_ordering_operator(
-                &ctype.name(),
+            return sql_fail(crate::sql::error_position::at_expression(
+                crate::sql::error_position::missing_ordering_operator(&ctype.name()),
+                written
+                    .order_by
+                    .get(j)
+                    .map_or(ob.expression, |key| key.expression),
             ));
         }
     }

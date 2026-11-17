@@ -116,12 +116,16 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, '_, '_, 'a> {
             }
         }
         self.scope.find_column(qualifier, name)?;
-        Err(sql_err!(
-            sqlstate::GROUPING_ERROR,
-            "subquery uses ungrouped column \"{}{}{}\" from outer query",
-            qualifier.unwrap_or(""),
-            if qualifier.is_some() { "." } else { "" },
-            name
+        Err(crate::sql::error_position::column_reference(
+            sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "subquery uses ungrouped column \"{}{}{}\" from outer query",
+                qualifier.unwrap_or(""),
+                if qualifier.is_some() { "." } else { "" },
+                name
+            ),
+            qualifier,
+            name,
         ))
     }
 
@@ -1103,16 +1107,13 @@ pub(super) fn grouped_rows<'a>(
     if statement.distinct {
         // DISTINCT over the grouped output. ORDER BY keys must be select-list
         // members (as in PostgreSQL); then dedupe on the visible prefix.
-        for oe in order_exprs.iter() {
+        for (oe, written) in order_exprs.iter().zip(statement.order_by) {
             let target = oe.expect("resolved").expression;
             let in_list = statement.items.iter().any(|item| {
                 matches!(item, SelectItem::Expr { expression, .. } if **expression == *target)
             });
             if !in_list {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
-                ));
+                return Err(super::distinct_order_key_missing(written.expression));
             }
         }
         live = crate::sql::exec::sort_dedup_projected(storage, txid, out_rows, width)?;

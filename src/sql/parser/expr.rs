@@ -95,7 +95,8 @@ impl<'a> Parser<'a> {
             );
         loop {
             let subscript_allowed = core::mem::take(&mut subscriptable);
-            let source_position = SourcePosition::new(Some(self.peek_at));
+            let token_at = self.peek_at;
+            let source_position = SourcePosition::new(Some(token_at));
             // Postfix `::type` binds tightest.
             if self.peeked == Tok::Op("::") {
                 self.advance()?;
@@ -251,7 +252,7 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("distinct")? {
                     self.expect_ident("from")?;
                     let right = self.expression(5)?;
-                    left = self.build_distinct_from(left, right, negated)?;
+                    left = self.build_distinct_from(source_position, left, right, negated)?;
                     continue;
                 }
                 return Err(self.syntax_error_here());
@@ -305,6 +306,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 let collation = self.collation_name()?;
                 left = self.arena_expr(Expr::Collate {
+                    source_position,
                     operand: left,
                     collation,
                 })?;
@@ -398,7 +400,7 @@ impl<'a> Parser<'a> {
                     };
                     let all = self.peeked == Tok::Ident("all");
                     self.advance()?;
-                    left = self.quantified_pattern(left, quantified, false, all)?;
+                    left = self.quantified_pattern(token_at, left, quantified, false, all)?;
                     continue;
                 }
                 let right = self.expression(5)?;
@@ -466,6 +468,7 @@ impl<'a> Parser<'a> {
                     }
                     self.expect_op(")")?;
                     left = self.arena_expr(Expr::InList {
+                        source_position: SourcePosition::new(Some(keyword_at)),
                         operand: left,
                         list: list.as_slice(),
                         negated,
@@ -531,12 +534,13 @@ impl<'a> Parser<'a> {
                         } else {
                             BinaryOp::Like
                         };
-                        left = self.quantified_pattern(left, operator, negated, all)?;
+                        left = self.quantified_pattern(token_at, left, operator, negated, all)?;
                         continue;
                     }
                     let pattern = self.expression(5)?;
                     let escape = self.escape_clause()?;
                     left = self.arena_expr(Expr::Like {
+                        source_position,
                         operand: left,
                         pattern,
                         negated,
@@ -614,10 +618,11 @@ impl<'a> Parser<'a> {
                 ) {
                     let all = self.peeked == Tok::Ident("all");
                     self.advance()?;
-                    self.quantified_pattern(left, operator, negated, all)?
+                    self.quantified_pattern(token_at, left, operator, negated, all)?
                 } else {
                     let pattern = self.expression(5)?;
                     self.arena_expr(Expr::Like {
+                        source_position,
                         operand: left,
                         pattern,
                         negated,
@@ -643,11 +648,13 @@ impl<'a> Parser<'a> {
                     } else {
                         BinaryOp::RegexMatch
                     };
-                    left = self.quantified_pattern(left, operator, o.starts_with('!'), all)?;
+                    left =
+                        self.quantified_pattern(token_at, left, operator, o.starts_with('!'), all)?;
                     continue;
                 }
                 let pattern = self.expression(5)?;
                 left = self.arena_expr(Expr::Match {
+                    source_position,
                     operand: left,
                     pattern,
                     negated: o.starts_with('!'),
@@ -721,6 +728,7 @@ impl<'a> Parser<'a> {
                 let array = self.expression(0)?;
                 self.expect_op(")")?;
                 left = self.arena_expr(Expr::AnyAll {
+                    source_position: SourcePosition::new(Some(operator_at)),
                     operand: left,
                     operator,
                     array,
@@ -1260,7 +1268,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
-                    return self.array_bracket_constructor(0);
+                    return self.array_bracket_constructor(0, name_at);
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
@@ -1398,7 +1406,11 @@ impl<'a> Parser<'a> {
                     // that field, so it is folded into the literal before
                     // the cast rather than left dangling.
                     let (lit, type_mod) = if name.eq_ignore_ascii_case("interval") {
-                        self.interval_with_qualifier(lit, Some(name_at))?
+                        self.interval_with_qualifier(
+                            lit,
+                            Some(name_at),
+                            Some(literal_source.start),
+                        )?
                     } else {
                         (lit, -1)
                     };
@@ -2049,7 +2061,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn array_bracket_constructor(&mut self, depth: usize) -> Result<&'a Expr<'a>, ParseError> {
+    /// `ARRAY[...]` written at `at` (its `ARRAY`, or a nested list's `[`).
+    fn array_bracket_constructor(
+        &mut self,
+        depth: usize,
+        at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
         if depth == MAX_ARRAY_BRACKET_NESTING {
             return Err(self.limit("array constructor nesting", MAX_ARRAY_BRACKET_NESTING));
         }
@@ -2062,7 +2079,7 @@ impl<'a> Parser<'a> {
                     if self.peeked != Tok::Op("[") {
                         return Err(self.syntax_error_here());
                     }
-                    self.array_bracket_constructor(depth + 1)?
+                    self.array_bracket_constructor(depth + 1, self.peek_at)?
                 } else {
                     if self.peeked == Tok::Op("[") {
                         return Err(self.syntax_error_here());
@@ -2076,7 +2093,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("]")?;
-        self.arena_expr(Expr::Array(items.as_slice()))
+        self.arena_expr_at(Expr::Array(items.as_slice()), at)
     }
 
     fn sql_json_array_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -3005,6 +3022,7 @@ impl<'a> Parser<'a> {
     /// negated match is the negation of the opposite quantifier.
     fn quantified_pattern(
         &mut self,
+        operator_at: usize,
         operand: &'a Expr<'a>,
         operator: BinaryOp,
         negated: bool,
@@ -3029,16 +3047,20 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(select)
                 .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-            self.arena_expr(Expr::QuantifiedSubquery {
-                operand,
-                operator,
-                select,
-                all,
-            })
+            self.arena_expr_at(
+                Expr::QuantifiedSubquery {
+                    operand,
+                    operator,
+                    select,
+                    all,
+                },
+                operator_at,
+            )
         } else {
             let array = self.expression(0)?;
             self.expect_op(")")?;
             self.arena_expr(Expr::AnyAll {
+                source_position: SourcePosition::new(Some(operator_at)),
                 operand,
                 operator,
                 array,
@@ -3132,6 +3154,7 @@ impl<'a> Parser<'a> {
             && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
         {
             return self.arena_expr(Expr::Match {
+                source_position,
                 operand: left,
                 pattern: right,
                 negated: operator.starts_with('!'),
@@ -3248,10 +3271,13 @@ impl<'a> Parser<'a> {
     /// columns and domains. Compact range input is normalized to the verbose
     /// form consumed by the interval value parser; ordinary unit-bearing input
     /// stays intact and is constrained later by the typed coercion boundary.
+    /// `literal_at` is where the literal was written, which a value the
+    /// qualifier rejects is reported at.
     pub(super) fn interval_with_qualifier(
         &mut self,
         lit: &'a str,
         type_at: Option<usize>,
+        literal_at: Option<usize>,
     ) -> Result<(&'a str, i32), ParseError> {
         let Some((word, _)) = self.peek_interval_field() else {
             return Ok((lit, -1));
@@ -3284,7 +3310,7 @@ impl<'a> Parser<'a> {
                     let normalized = if lit.bytes().any(|byte| byte.is_ascii_alphabetic()) {
                         lit
                     } else {
-                        self.year_to_month(lit)?
+                        self.year_to_month(lit, literal_at)?
                     };
                     let modifier = crate::sql::types::TypeMod::IntervalMod {
                         range: crate::sql::types::IntervalRange::YearToMonth,
@@ -3323,7 +3349,7 @@ impl<'a> Parser<'a> {
             let normalized = if lit.bytes().any(|byte| byte.is_ascii_alphabetic()) {
                 lit
             } else {
-                self.clock_range(lit, start, end)?
+                self.clock_range(lit, start, end, literal_at)?
             };
             let modifier = crate::sql::types::TypeMod::IntervalMod { range, precision }.encode();
             return Ok((normalized, modifier));
@@ -3537,7 +3563,11 @@ impl<'a> Parser<'a> {
     /// to both. The month part must be 0..11, since twelve months is a year;
     /// PostgreSQL rejects `1-13` as out of range. The value is rewritten to the
     /// `N year M month` form the interval parser already understands.
-    fn year_to_month(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
+    fn year_to_month(
+        &mut self,
+        lit: &'a str,
+        literal_at: Option<usize>,
+    ) -> Result<&'a str, ParseError> {
         let out_of_range = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
@@ -3546,7 +3576,7 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
-            cursor: None,
+            cursor: literal_at,
             hint: None,
             near: None,
             detail: None,
@@ -3561,7 +3591,7 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
-            cursor: None,
+            cursor: literal_at,
             hint: None,
             near: None,
             detail: None,
@@ -3611,7 +3641,13 @@ impl<'a> Parser<'a> {
     /// is decoded here into components and re-emitted as the unambiguous
     /// `N day N hour N minute N second` form the parser already sums. Day and
     /// clock carry independent signs, as PostgreSQL keeps them.
-    fn clock_range(&mut self, lit: &'a str, start: u8, end: u8) -> Result<&'a str, ParseError> {
+    fn clock_range(
+        &mut self,
+        lit: &'a str,
+        start: u8,
+        end: u8,
+        literal_at: Option<usize>,
+    ) -> Result<&'a str, ParseError> {
         let bad = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
@@ -3620,7 +3656,7 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
-            cursor: None,
+            cursor: literal_at,
             hint: None,
             near: None,
             detail: None,
@@ -3788,13 +3824,14 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `left IS [NOT] DISTINCT FROM right`, located at its `IS`.
     pub(super) fn build_distinct_from(
         &self,
+        source_position: SourcePosition,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
-        let source_position = SourcePosition::new(Some(self.peek_at));
         if left.is_row_constructor() && right.is_row_constructor() {
             // Row constructors are never NULL themselves; their fields are
             // compared pairwise, so NULL fields make neither side unknown.

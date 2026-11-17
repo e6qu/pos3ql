@@ -436,9 +436,10 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
-    /// `$n.field` selections, kept so a parameter whose type stays undetermined
-    /// reports PostgreSQL's `unknown` composite error.
-    parameter_fields: core::cell::RefCell<ArenaList<'a, (u32, &'a str)>>,
+    /// `$n.field` selections (the `$n` node and the field), kept so a
+    /// parameter whose type stays undetermined reports PostgreSQL's `unknown`
+    /// composite error at the `$n`.
+    parameter_fields: core::cell::RefCell<ArenaList<'a, (&'a Expr<'a>, &'a str)>>,
 }
 
 /// One step of an assignment target after its column: a field of a
@@ -1382,7 +1383,7 @@ impl<'a> Parser<'a> {
     }
 
     /// The `$n.field` selections parsed so far.
-    pub(crate) fn parameter_fields(&self) -> &'a [(u32, &'a str)] {
+    pub(crate) fn parameter_fields(&self) -> &'a [(&'a Expr<'a>, &'a str)] {
         self.parameter_fields.borrow().as_slice()
     }
 
@@ -2748,7 +2749,8 @@ impl<'a> Parser<'a> {
                     let (value, type_mod) = if let Some(type_mod) = precision {
                         (literal, type_mod)
                     } else {
-                        let (value, type_mod) = self.interval_with_qualifier(literal, None)?;
+                        let (value, type_mod) =
+                            self.interval_with_qualifier(literal, None, None)?;
                         let valid_range = matches!(
                             TypeMod::decode(super::types::ColType::Interval, type_mod),
                             TypeMod::None
@@ -2940,9 +2942,10 @@ impl<'a> Parser<'a> {
             language = Some(self.any_ident("procedural language")?);
         }
         let body = self.str_literal("anonymous code block")?;
+        let option_at = self.peek_at;
         if self.eat_ident("language")? {
             if language.is_some() {
-                return Err(self.err_here("conflicting or redundant options"));
+                return Err(self.redundant_option(option_at));
             }
             language = Some(self.any_ident("procedural language")?);
         }
@@ -10991,12 +10994,12 @@ impl<'a> Parser<'a> {
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
         }
         if let Expr::Field { base, field } = e
-            && let Expr::Param(index) = base
+            && let Expr::Param(_) = base
             && field != "*"
         {
             self.parameter_fields
                 .borrow_mut()
-                .push((*index, field))
+                .push((base, field))
                 .map_err(|_| self.arena_full("parameter field list exceeds SQL arena"))?;
         }
         let expression = self
@@ -11555,6 +11558,15 @@ impl<'a> Parser<'a> {
         ParseError::new(self.peek_at, message)
     }
 
+    /// `errorConflictingDefElem`: an option given twice, or contradicting an
+    /// earlier one, reported at the option written at `at`.
+    pub(super) fn redundant_option(&self, at: usize) -> ParseError {
+        ParseError {
+            cursor: Some(at),
+            ..ParseError::new(at, "conflicting or redundant options")
+        }
+    }
+
     /// A statement's `ORDER BY` or `GROUP BY` key. `findTargetlistEntrySQL92`
     /// reads an integer constant as a select-list position and rejects any
     /// other constant.
@@ -11565,14 +11577,17 @@ impl<'a> Parser<'a> {
             expression,
             Expr::Str(_) | Expr::NumericLit(_) | Expr::Bool(_) | Expr::Null | Expr::BitLit(_)
         ) {
-            return Err(ParseError::new(
-                at,
-                if clause == "GROUP BY" {
-                    "non-integer constant in GROUP BY"
-                } else {
-                    "non-integer constant in ORDER BY"
-                },
-            ));
+            return Err(ParseError {
+                cursor: Some(at),
+                ..ParseError::new(
+                    at,
+                    if clause == "GROUP BY" {
+                        "non-integer constant in GROUP BY"
+                    } else {
+                        "non-integer constant in ORDER BY"
+                    },
+                )
+            });
         }
         Ok(expression)
     }

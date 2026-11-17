@@ -1794,6 +1794,7 @@ fn coerce_rule_transition<'a>(
     match target.collation {
         Some(collation) => arena
             .alloc(Expr::Collate {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operand: cast,
                 collation,
             })
@@ -10302,7 +10303,12 @@ fn subst_expr<'a>(
             expression: subst_expr(expression, context, arena)?,
             type_oid: *type_oid,
         },
-        Expr::Collate { operand, collation } => Expr::Collate {
+        Expr::Collate {
+            source_position,
+            operand,
+            collation,
+        } => Expr::Collate {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             collation: rewrite_stored_collation(*collation, context)?,
         },
@@ -10392,10 +10398,12 @@ fn subst_expr<'a>(
             }
         }
         Expr::InList {
+            source_position,
             operand,
             list,
             negated,
         } => Expr::InList {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             list: subst_expr_slice(list, context, arena)?,
             negated: *negated,
@@ -10406,7 +10414,9 @@ fn subst_expr<'a>(
             negated,
             case_insensitive,
             escape,
+            source_position,
         } => Expr::Like {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
@@ -10414,11 +10424,13 @@ fn subst_expr<'a>(
             escape: opt_subst(*escape, context, arena)?,
         },
         Expr::Match {
+            source_position,
             operand,
             pattern,
             negated,
             case_insensitive,
         } => Expr::Match {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             pattern: subst_expr(pattern, context, arena)?,
             negated: *negated,
@@ -10462,11 +10474,13 @@ fn subst_expr<'a>(
             field,
         },
         Expr::AnyAll {
+            source_position,
             operand,
             operator,
             array,
             all,
         } => Expr::AnyAll {
+            source_position: *source_position,
             operand: subst_expr(operand, context, arena)?,
             operator: *operator,
             array: subst_expr(array, context, arena)?,
@@ -10515,11 +10529,15 @@ fn subst_expr<'a>(
                     && written == rewrite.from
                     && !rewrite.exposed_columns.contains(name)
                 {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column {}.{} does not exist",
-                        written,
-                        name
+                    return Err(crate::sql::error_position::column_reference(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column {}.{} does not exist",
+                            written,
+                            name
+                        ),
+                        Some(written),
+                        name,
                     ));
                 }
                 let reaches = match (*qualifier, context.qualifier) {

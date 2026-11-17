@@ -679,7 +679,7 @@ fn runtime_type_checks_report_postgresql_errors() {
             ),
             (
                 "SELECT ('{}'::jsonb)[true]",
-                "ERROR 42804 subscript type boolean is not supported hint: jsonb subscript must be coercible to either integer or text.".to_owned(),
+                "ERROR 42804 subscript type boolean is not supported @22 hint: jsonb subscript must be coercible to either integer or text.".to_owned(),
             ),
             (
                 "SELECT ('{1}'::int[])[1:true]",

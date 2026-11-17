@@ -54,7 +54,13 @@ impl Writer<'_, '_, '_, '_> {
             startup_cost: path.startup,
             total_cost: path.total,
             rows: path.rows as u64,
-            width: path.width as u32,
+            // The top relation's paths carry the query's output
+            // (`apply_scanjoin_target_to_paths`).
+            width: if depth == 0 {
+                self.model.output_width as u32
+            } else {
+                path.width as u32
+            },
             output_unprintable: true,
             ..PlanNode::EMPTY
         }

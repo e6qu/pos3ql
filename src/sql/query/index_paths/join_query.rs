@@ -228,6 +228,8 @@ pub(crate) struct ModeledJoin<'a> {
     pub(crate) columns: &'a [[(usize, usize); MAX_MEMBERS]],
     /// The query's conditions, by [`Clause::source`].
     pub(crate) quals: &'a [&'a Expr<'a>],
+    /// The width of the query's output, which the top join's paths carry.
+    pub(crate) output_width: f64,
 }
 
 impl<'a> ModeledJoin<'a> {
@@ -552,7 +554,6 @@ pub(crate) fn modeled_join<'a>(
         || statement.offset.is_some()
         || !statement.windows.is_empty()
         || !statement.locking.is_empty()
-        || scope.n_merged != 0
     {
         return Ok(None);
     }
@@ -577,9 +578,7 @@ pub(crate) fn modeled_join<'a>(
                 | JoinKind::Full
                 | JoinKind::Semi
                 | JoinKind::Anti
-        ) || join.using.is_some()
-            || join.natural
-            || scope.join_on[index].is_some()
+        ) || ((join.using.is_some() || join.natural) && scope.join_on[index].is_none())
         {
             return Ok(None);
         }
@@ -609,8 +608,39 @@ pub(crate) fn modeled_join<'a>(
             .stored(table)
             .map_or(0, |def| def.columns().len().min(64))
     };
+    // A merged `USING` column reads its left column, a right join's its
+    // right one, a full join's both (`COALESCE`).
+    let merged_parts = |merged: usize| -> &[(usize, usize)] {
+        let parts = scope.merged[merged].parts;
+        let right = parts.last().map_or(0, |&(table, _)| table);
+        match from.joins.get(right.wrapping_sub(1)).map(|join| join.kind) {
+            Some(JoinKind::Full) => parts,
+            Some(JoinKind::Right) => &parts[parts.len() - 1..],
+            _ => &parts[..1],
+        }
+    };
     for item in statement.items {
         match item {
+            SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
+                for &entry in scope.merged_output() {
+                    let single;
+                    let columns = match entry {
+                        ResolvedColumn::Table(table, column) => {
+                            single = [(table, column)];
+                            &single[..]
+                        }
+                        ResolvedColumn::Merged(merged) => merged_parts(merged),
+                        _ => return Ok(None),
+                    };
+                    for &(table, column) in columns {
+                        if column >= 64 {
+                            return Ok(None);
+                        }
+                        output[table] |= 1 << column;
+                        note(table, column);
+                    }
+                }
+            }
             SelectItem::Wildcard(_) => {
                 for (table, mask) in output.iter_mut().enumerate().take(n) {
                     *mask = u64::MAX;
@@ -736,7 +766,12 @@ pub(crate) fn modeled_join<'a>(
         .joins
         .iter()
         .enumerate()
-        .filter_map(|(index, join)| join.on.map(|on| (join_nodes[index], on)))
+        .filter_map(|(index, join)| {
+            // `USING` and `NATURAL` join by the equalities they imply.
+            join.on
+                .or(scope.join_on[index])
+                .map(|on| (join_nodes[index], on))
+        })
         .chain(
             statement
                 .where_clause
@@ -1633,11 +1668,62 @@ pub(crate) fn modeled_join<'a>(
     let quals = arena
         .alloc_slice_copy(quals)
         .map_err(|_| crate::sql::eval::arena_full())?;
+    // The output's width (`apply_scanjoin_target_to_paths`): each output
+    // column's, a full join's merged column at its type's.
+    let column_width = |(table, column): (usize, usize)| {
+        f64::from(super::column_width(
+            storage,
+            txid,
+            scope.slots[table],
+            column,
+        ))
+    };
+    let mut output_width = 0.0;
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard(_) if !scope.merged_output().is_empty() => {
+                for &entry in scope.merged_output() {
+                    output_width += match entry {
+                        ResolvedColumn::Table(table, column) => column_width((table, column)),
+                        ResolvedColumn::Merged(merged) => {
+                            let parts = merged_parts(merged);
+                            if parts.len() == 1 {
+                                column_width(parts[0])
+                            } else {
+                                type_width(scope.merged[merged].ctype)
+                            }
+                        }
+                        ResolvedColumn::TableOid(_) => return Ok(None),
+                    };
+                }
+            }
+            SelectItem::Wildcard(_) => {
+                for table in 0..n {
+                    for column in 0..width(table) {
+                        output_width += column_width((table, column));
+                    }
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                let table = (0..n)
+                    .find(|&table| scope.names[table] == *qualifier)
+                    .expect("resolved");
+                for column in 0..width(table) {
+                    output_width += column_width((table, column));
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                output_width += column_width(column_of(scope, expression).expect("a column"));
+            }
+            SelectItem::RecordStar(_) => return Ok(None),
+        }
+    }
     Ok(Some(ModeledJoin {
         plan,
         rels,
         columns,
         quals,
+        output_width,
     }))
 }
 
@@ -2092,4 +2178,15 @@ fn reaches_hashed_unique(plan: &JoinPlan<'_>, hashable: &dyn Fn(&Member) -> bool
         }
     }
     reaches(plan, plan.top, hashable)
+}
+
+/// `get_typavgwidth` of a column type without a type modifier.
+fn type_width(ctype: ColType) -> f64 {
+    match ctype {
+        ColType::Bool => 1.0,
+        ColType::Int2 => 2.0,
+        ColType::Int4 | ColType::Date => 4.0,
+        ColType::Int8 => 8.0,
+        _ => 32.0,
+    }
 }

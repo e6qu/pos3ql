@@ -912,6 +912,11 @@ returning each inner row at its first match (`differential_exact/847`). A
 query whose subqueries pull up into such a join runs in the general
 executor rather than a retained reader, and a scan's conditions name a
 pulled-up subquery's relation's columns bare, as PostgreSQL prints them.
+`USING` and `NATURAL` joins join by the equalities of their columns,
+`SELECT *` reading a merged column's left column (a right join's right
+one, a full join's both), and the top join's width is the query output's
+(`apply_scanjoin_target_to_paths`), each listed column counted
+(`differential_exact/848`).
 Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
@@ -931,7 +936,8 @@ table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a 
 join over an input in index order that is not a plain index scan without
 a filter (`0A000`). Remaining for that search: a parameterized path of a
 relation with an index that would also filter by another join clause
-movable into it (`get_baserel_parampathinfo`), `USING` and `NATURAL`, join conditions other than column
+movable into it (`get_baserel_parampathinfo`), output expressions other
+than columns, join conditions other than column
 equalities and comparisons, join removal, a constant equated with an
 outer join's compared column (`reconsider_outer_join_clause`), a
 parameterized hash or merge join (`get_joinrel_parampathinfo` of an outer

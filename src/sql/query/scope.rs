@@ -3604,6 +3604,12 @@ impl<'d> QueryScope<'d> {
     }
 
     /// The exposed name of a join-tree output column.
+    /// The join tree's output columns when a `USING` or `NATURAL` join
+    /// merged some, else empty.
+    pub(crate) fn merged_output(&self) -> &[ResolvedColumn] {
+        &self.output[..self.n_output]
+    }
+
     pub(crate) fn output_name(&self, entry: ResolvedColumn) -> &'d str {
         match entry {
             ResolvedColumn::Table(t, c) => self.defs.column_name(t, c),

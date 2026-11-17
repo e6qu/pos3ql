@@ -47,6 +47,10 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
+mod join_exec;
+pub(crate) use join_exec::{
+    node_number as join_exec_node_number, scan_segment as join_exec_scan_segment,
+};
 mod joined_from;
 #[cfg(test)]
 pub(crate) use joined_from::target_hash_builds;
@@ -14500,7 +14504,9 @@ pub(crate) fn select_query_resumable<'a>(
         let stages = instrument::Stages::current();
         let _stages = stages.start();
         let scan_output = instrument::ScanOutput::current(scope.n);
-        let scan = scan_source_recycling_with_pax_columns(
+        let scan = join_exec::scan_statement_source(
+            statement,
+            true,
             storage,
             &scope,
             from,
@@ -16649,35 +16655,21 @@ fn select_into_rows_mode<'a>(
         Ok(produced < stop_after)
     };
     let pax_columns = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-    if recycle_rows {
-        scan_source_recycling_with_pax_columns(
-            storage,
-            &scope,
-            from,
-            txid,
-            where_in_scan,
-            arena,
-            params,
-            &hooks,
-            outer,
-            pax_columns,
-            &mut visit,
-        )
-    } else {
-        scan_source_with_pax_columns(
-            storage,
-            &scope,
-            from,
-            txid,
-            where_in_scan,
-            arena,
-            params,
-            &hooks,
-            outer,
-            pax_columns,
-            &mut visit,
-        )
-    }
+    join_exec::scan_statement_source(
+        statement,
+        recycle_rows,
+        storage,
+        &scope,
+        from,
+        txid,
+        where_in_scan,
+        arena,
+        params,
+        &hooks,
+        outer,
+        pax_columns,
+        &mut visit,
+    )
 }
 
 pub(super) fn streaming_pax_columns<'a>(

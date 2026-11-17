@@ -2797,9 +2797,10 @@ fn rel_candidates<'a>(
         kind: ScanKind::Seq,
         path: usize::MAX,
         startup: paths.all_cost.startup,
+        // PostgreSQL adds the CPU cost before the pages' cost.
         total: paths.all_cost.startup
-            + costs.seq_page * size.pages
-            + (costs.cpu_tuple + paths.all_cost.per_tuple) * size.tuples,
+            + (costs.cpu_tuple + paths.all_cost.per_tuple) * size.tuples
+            + costs.seq_page * size.pages,
         disabled: u32::from(!methods.seqscan),
         presorted: 0,
         sort: SortKind::None,

@@ -1479,6 +1479,13 @@ fn retained_join_scope<'a>(
     {
         return Ok(None);
     }
+    // A join PostgreSQL's join search plans runs in the general executor,
+    // which follows that plan.
+    if super::index_paths::join_query::modeled_join(storage, txid, statement, &scope, &[], arena)?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let Some(shape) = join::join_shape(storage, txid, from, statement.where_clause, &scope, arena)?
     else {
         return Ok(None);

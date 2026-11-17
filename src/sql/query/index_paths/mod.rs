@@ -30,6 +30,8 @@ mod clauses;
 mod expressions;
 mod extended;
 mod grouping_sets;
+pub(crate) mod join_query;
+pub(crate) mod joins;
 mod like;
 mod paths;
 mod predicate;
@@ -212,14 +214,14 @@ const MAX_RESTRICTIONS: usize = 32;
 const MAX_INDEXES: usize = 32;
 
 /// The planner's cost settings.
-#[derive(Clone, Copy)]
-pub(super) struct Costs {
-    pub(super) seq_page: f64,
-    pub(super) random_page: f64,
-    pub(super) cpu_tuple: f64,
-    pub(super) cpu_index_tuple: f64,
-    pub(super) cpu_operator: f64,
-    pub(super) effective_cache_size: f64,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Costs {
+    pub(crate) seq_page: f64,
+    pub(crate) random_page: f64,
+    pub(crate) cpu_tuple: f64,
+    pub(crate) cpu_index_tuple: f64,
+    pub(crate) cpu_operator: f64,
+    pub(crate) effective_cache_size: f64,
 }
 
 impl Costs {

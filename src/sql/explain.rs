@@ -26,6 +26,7 @@ use crate::storage::Storage;
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
 
+mod joins;
 mod rewrite;
 mod targets;
 
@@ -218,6 +219,7 @@ enum QualLabel {
     OneTimeFilter,
     Filter,
     HashCond,
+    MergeCond,
     IndexCond,
     RecheckCond,
     JoinFilter,
@@ -239,6 +241,7 @@ impl QualLabel {
             | Self::FunctionCall
             | Self::OneTimeFilter
             | Self::HashCond
+            | Self::MergeCond
             | Self::IndexCond
             | Self::RecheckCond => 0,
             Self::JoinFilter => 1,
@@ -253,6 +256,7 @@ impl QualLabel {
             Self::OneTimeFilter => "One-Time Filter",
             Self::Filter => "Filter",
             Self::HashCond => "Hash Cond",
+            Self::MergeCond => "Merge Cond",
             Self::IndexCond => "Index Cond",
             Self::RecheckCond => "Recheck Cond",
             Self::JoinFilter => "Join Filter",
@@ -463,6 +467,7 @@ impl NodeActual {
             QualLabel::IndexCond | QualLabel::RecheckCond => 0,
             QualLabel::OneTimeFilter
             | QualLabel::HashCond
+            | QualLabel::MergeCond
             | QualLabel::Window
             | QualLabel::PresortedKey
             | QualLabel::FunctionCall
@@ -481,6 +486,7 @@ impl QualLabel {
             Self::IndexCond | Self::RecheckCond => Some("Rows Removed by Index Recheck"),
             Self::OneTimeFilter
             | Self::HashCond
+            | Self::MergeCond
             | Self::Window
             | Self::PresortedKey
             | Self::FunctionCall
@@ -6367,6 +6373,24 @@ fn plan_pulled_select<'a>(
         |columns| columns,
     );
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
+    // A join PostgreSQL's join search plans is explained as that plan.
+    if !aggregate
+        && outer.is_none()
+        && foreign_scan.is_none()
+        && let Some(scope) = scope.as_ref()
+        && let Some(model) = query::index_paths::join_query::modeled_join(
+            storage,
+            txid,
+            statement,
+            scope,
+            &[],
+            arena,
+        )?
+    {
+        let mut plan = joins::join_plan(storage, txid, scope, &model, block, arena)?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     let ordered_index = if !statement.distinct
         && statement.distinct_on.is_empty()
         && !statement.order_by.is_empty()

@@ -1191,14 +1191,56 @@ pub(crate) fn inline_call<'a>(
         }
         let fact = argument_facts(&[*argument], columns, storage, txid, arena)?[0];
         let source = fact.type_oid;
+        // An untyped literal's input runs while the call is analysed, at
+        // the literal; its length coercion while the call is planned.
+        let converted =
+            convert_argument(fact, target, storage, txid, arena).map_err(
+                |error| match argument {
+                    Expr::Str(literal)
+                        if source == oid::UNKNOWN && !error.is_type_modifier_coercion() =>
+                    {
+                        crate::sql::error_position::at_subject(error, literal)
+                    }
+                    _ => error,
+                },
+            )?;
         facts
-            .push(convert_argument(fact, target, storage, txid, arena)?)
+            .push(converted)
             .map_err(|_| crate::sql::eval::arena_full())?;
+
         if source != target {
             let type_name = crate::sql::catalog::format_type_name(storage, txid, target)?;
             let type_name = arena
                 .alloc_str(type_name.as_str())
                 .map_err(|_| crate::sql::eval::arena_full())?;
+            // The call's analysis coerced a constant argument, whose base
+            // length coercion the planner folds before inlining the body.
+            if argument.is_literal_constant()
+                && matches!(
+                    crate::storage::NamedTypeKind::from_oid(target),
+                    Some((crate::storage::NamedTypeKind::Domain, _, false))
+                )
+            {
+                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                let hooks = crate::sql::eval::EvalHooks {
+                    catalog: Some(&catalog),
+                    ..crate::sql::eval::NO_HOOKS
+                };
+                let value = crate::sql::eval::eval_full(
+                    argument,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &crate::sql::eval::NoColumns,
+                    &hooks,
+                )?;
+                crate::sql::eval::CatalogAccess::coerce_domain_base(
+                    &catalog,
+                    type_name,
+                    value,
+                    crate::sql::eval::DomainCoercion::Assignment,
+                    arena,
+                )?;
+            }
             *argument = arena
                 .alloc(Expr::Cast {
                     source_position: ast::SourcePosition::UNKNOWN,
@@ -1206,6 +1248,7 @@ pub(crate) fn inline_call<'a>(
                     type_name,
                     type_mod: -1,
                     binding: CastBinding::Resolve,
+                    context: ast::CastContext::Implicit,
                 })
                 .map_err(|_| crate::sql::eval::arena_full())?;
         }
@@ -1376,6 +1419,7 @@ pub(crate) fn inline_call<'a>(
                 type_name,
                 type_mod: -1,
                 binding: CastBinding::Resolve,
+                context: ast::CastContext::Assignment,
             })
             .map_err(|_| crate::sql::eval::arena_full())?
     } else {
@@ -1554,6 +1598,7 @@ pub(crate) fn inline_set_returning_call<'a>(
                     type_name,
                     type_mod: -1,
                     binding: CastBinding::Resolve,
+                    context: ast::CastContext::Implicit,
                 })
                 .map_err(|_| crate::sql::eval::arena_full())?
         };

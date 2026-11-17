@@ -114,6 +114,7 @@ impl super::CatalogAccess for InputCatalog {
         &self,
         _: &str,
         _: super::Datum<'a>,
+        _: super::DomainCoercion,
         _: &'a Arena,
         _: Option<&dyn super::SequenceAccess>,
     ) -> Result<Option<super::Datum<'a>>, SqlError> {

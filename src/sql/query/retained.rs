@@ -134,7 +134,8 @@ enum RetainedSource<'a> {
     /// constant arguments are evaluated when fetching starts.
     Generated {
         function: &'a TableRef<'a>,
-        kinds: &'a [super::generator::GeneratorKind],
+        /// Each call's generator and its selected built-in's OID.
+        kinds: &'a [(super::generator::GeneratorKind, i32)],
         generator: Option<super::generator::FunctionRows<'a>>,
     },
     /// A data-modifying `WITH` query read as it runs: each row past the
@@ -886,6 +887,7 @@ fn bind_expression<'a>(
             type_name,
             type_mod,
             binding,
+            context,
             ..
         } if columns.is_some() => {
             let operand = bind_expression(operand, arena, columns, defaults)?;
@@ -937,6 +939,7 @@ fn bind_expression<'a>(
                 type_name,
                 type_mod: *type_mod,
                 binding,
+                context: *context,
             }
         }
         Expr::Call {
@@ -1258,7 +1261,7 @@ fn retained_function_source<'a>(
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Option<&'a [super::generator::GeneratorKind]> {
+) -> Option<&'a [(super::generator::GeneratorKind, i32)]> {
     if tref.lateral || super::srf::sql_table_constructor(tref) {
         return None;
     }
@@ -1267,7 +1270,9 @@ fn retained_function_source<'a>(
         None => core::slice::from_ref(tref),
     };
     let kinds = arena
-        .alloc_slice_with(calls.len(), |_| super::generator::GeneratorKind::Numeric)
+        .alloc_slice_with(calls.len(), |_| {
+            (super::generator::GeneratorKind::Numeric, 0)
+        })
         .ok()?;
     for (kind, call) in kinds.iter_mut().zip(calls) {
         let args = call.func_args?;
@@ -1292,7 +1297,10 @@ fn retained_function_source<'a>(
         };
         crate::sql::catalog::builtin_callable_by_oid(oid)
             .filter(|signature| signature.catalog.volatility != "v")?;
-        *kind = super::generator::GeneratorKind::for_builtin(oid, args.len())?;
+        *kind = (
+            super::generator::GeneratorKind::for_builtin(oid, args.len())?,
+            oid,
+        );
     }
     Some(kinds)
 }
@@ -1576,8 +1584,15 @@ fn start_generator_source<'a>(
             super::generator::RowGenerator::Elements(None)
         })
         .map_err(|_| arena_full())?;
-    for ((call, source), kind) in calls.iter_mut().zip(calls_source).zip(kinds.iter()) {
+    for ((call, source), (kind, oid)) in calls.iter_mut().zip(calls_source).zip(kinds.iter()) {
         let args = source.func_args.expect("retained function arguments");
+        // The call's analysis converted its untyped literals.
+        let args = crate::sql::eval::coerce_unknown_builtin_arguments(
+            *oid,
+            args,
+            source.func_variadic,
+            state_arena,
+        )?;
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (value, argument) in values.iter_mut().zip(args) {
             *value = eval_full(

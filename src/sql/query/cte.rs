@@ -1792,6 +1792,7 @@ fn coerce_rule_transition<'a>(
             type_name: target.type_name,
             type_mod: target.type_mod,
             binding: crate::sql::ast::CastBinding::Resolve,
+            context: crate::sql::ast::CastContext::Explicit,
         })
         .map(|expression| &*expression)
         .map_err(|_| arena_full())?;
@@ -3408,6 +3409,7 @@ fn rule_insert_values<'a>(
                         type_name: target_types[slot],
                         type_mod: -1,
                         binding: crate::sql::ast::CastBinding::Resolve,
+                        context: crate::sql::ast::CastContext::Assignment,
                     })
                     .map_err(|_| arena_full())?
             };
@@ -9891,6 +9893,7 @@ fn rewrite_stored_text_search_arguments<'a>(
             type_name: "regconfig",
             type_mod: -1,
             binding: crate::sql::ast::CastBinding::Resolve,
+            context: crate::sql::ast::CastContext::Explicit,
         })
         .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
@@ -9938,6 +9941,7 @@ fn rewrite_stored_sequence_arguments<'a>(
             type_name: "regclass",
             type_mod: -1,
             binding: crate::sql::ast::CastBinding::Resolve,
+            context: crate::sql::ast::CastContext::Explicit,
         })
         .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
@@ -10285,6 +10289,7 @@ fn subst_expr<'a>(
             type_name,
             type_mod,
             binding,
+            context: cast_context,
             ..
         } => {
             let operand = subst_expr(operand, context, arena)?;
@@ -10294,6 +10299,7 @@ fn subst_expr<'a>(
                 type_name: rewrite_stored_type_name(type_name, context, arena)?,
                 type_mod: *type_mod,
                 binding: *binding,
+                context: *cast_context,
             }
         }
         Expr::BoundDefault {

@@ -230,6 +230,7 @@ fn skeleton<'a>(
             type_name,
             type_mod,
             binding,
+            context,
         } => {
             let Some(operand) = part(operand, conditional)? else {
                 return Ok(None);
@@ -240,6 +241,7 @@ fn skeleton<'a>(
                 type_name,
                 type_mod,
                 binding,
+                context,
             }
         }
         Expr::Collate {
@@ -753,12 +755,14 @@ impl<'a> DeferredSource<'a> {
                 type_name,
                 type_mod,
                 binding,
+                context,
             } => Expr::Cast {
                 source_position,
                 operand: self.bind(operand, offset, values, arena)?,
                 type_name,
                 type_mod,
                 binding,
+                context,
             },
             Expr::Collate {
                 source_position,

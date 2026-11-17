@@ -218,6 +218,8 @@ pub struct SqlState([u8; 5], ErrorOrigin);
 enum ErrorOrigin {
     Sql,
     InputExpression,
+    /// A cast's length coercion (see [`SqlError::type_modifier_coercion`]).
+    TypeModifierCoercion,
     Control(InternalControl),
     /// A retained plan node's build did not fit `plan_build_bytes`; the
     /// statement can still run the general executor's way.
@@ -294,6 +296,7 @@ impl SqlState {
             ErrorOrigin::Control(control) => Some(control),
             ErrorOrigin::Sql
             | ErrorOrigin::InputExpression
+            | ErrorOrigin::TypeModifierCoercion
             | ErrorOrigin::PlanBuild
             | ErrorOrigin::RoutineEngine => None,
         }
@@ -407,6 +410,21 @@ impl SqlError {
             self.sqlstate.1 = ErrorOrigin::InputExpression;
         }
         self
+    }
+
+    /// Marks a type modifier's failure raised by a cast's length coercion,
+    /// which PostgreSQL evaluates as a function after the input and so
+    /// reports without a position.
+    pub(crate) fn type_modifier_coercion(mut self) -> Self {
+        if self.sqlstate.1 == ErrorOrigin::Sql {
+            self.sqlstate.1 = ErrorOrigin::TypeModifierCoercion;
+        }
+        self
+    }
+
+    /// Whether a cast's length coercion raised this error.
+    pub(crate) fn is_type_modifier_coercion(&self) -> bool {
+        self.sqlstate.1 == ErrorOrigin::TypeModifierCoercion
     }
 
     /// Marks a `54000` raised because a retained sort or hash table did not
@@ -3805,8 +3823,21 @@ pub trait CatalogAccess {
         &self,
         _type_name: &str,
         _value: Datum<'a>,
+        _coercion: DomainCoercion,
         _arena: &'a Arena,
         _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
+    /// The base-type conversion of a cast to the domain `type_name` under
+    /// `coercion`, without the domain's own rules; `Ok(None)` when the name
+    /// is no visible domain.
+    fn coerce_domain_base<'a>(
+        &self,
+        _type_name: &str,
+        _value: Datum<'a>,
+        _coercion: DomainCoercion,
+        _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -3872,6 +3903,41 @@ pub enum DefinedCastContext {
     Explicit,
     Assignment,
     Implicit,
+}
+
+/// How a domain's base type modifier applies, as PostgreSQL decides it.
+/// An input function (`domain_in`, an array's or record's text) passes the
+/// modifier to the base type's input, which rejects an over-length value at
+/// the literal. A cast applies it afterwards through the type's length
+/// coercion function (`coerce_to_domain`), whose failures carry no position:
+/// an assignment or implicit coercion rejects an over-length value and an
+/// explicit cast truncates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainCoercion {
+    Input,
+    Assignment,
+    Explicit,
+}
+
+impl DomainCoercion {
+    /// The rule a cast node of `context` applies.
+    pub(crate) const fn of_cast(context: super::ast::CastContext) -> Self {
+        match context {
+            super::ast::CastContext::Explicit => Self::Explicit,
+            super::ast::CastContext::Assignment | super::ast::CastContext::Implicit => {
+                Self::Assignment
+            }
+        }
+    }
+}
+
+/// The catalog cast context a cast node of `context` may use.
+const fn defined_cast_context(context: super::ast::CastContext) -> DefinedCastContext {
+    match context {
+        super::ast::CastContext::Explicit => DefinedCastContext::Explicit,
+        super::ast::CastContext::Assignment => DefinedCastContext::Assignment,
+        super::ast::CastContext::Implicit => DefinedCastContext::Implicit,
+    }
 }
 
 /// A selected conversion retains its catalog definition while an array source
@@ -5337,6 +5403,7 @@ fn fold<'a>(
             type_name,
             type_mod,
             binding,
+            context,
         } if ColType::from_sql_name(type_name)
             .or_else(|| {
                 let catalog = catalog?;
@@ -5396,6 +5463,7 @@ fn fold<'a>(
                     type_name,
                     type_mod: *type_mod,
                     binding: *binding,
+                    context: *context,
                 })?,
                 None,
             ))
@@ -5580,7 +5648,35 @@ fn fold<'a>(
                     Ok(Some(fold(node, arena, folding).map_err(Failure)?.0))
                 })
                 .map_err(|Failure(error)| error)?;
+            // `eval_const_expressions` folds a constant cast to a domain down
+            // to its `CoerceToDomain`: the base type's conversion and length
+            // coercion run now, the domain's own rules with the statement.
+            if let (
+                Some(catalog),
+                Expr::Cast {
+                    operand,
+                    type_name,
+                    context,
+                    ..
+                },
+            ) = (catalog, rebuilt)
+                && ColType::from_sql_name(type_name).is_none()
+                && operand.is_literal_constant()
+            {
+                let hooks = EvalHooks {
+                    catalog: Some(catalog),
+                    ..NO_HOOKS
+                };
+                let value = eval_full(operand, arena, NO_PARAMS, &NoColumns, &hooks)?;
+                catalog.coerce_domain_base(
+                    type_name,
+                    value,
+                    DomainCoercion::of_cast(*context),
+                    arena,
+                )?;
+            }
             // `simplify_function`: a call no constant folding settled is
+
             // replaced by its SQL function's body when `inline_function`
             // accepts it, and the body folds in its place, under the
             // function's `during inlining` context.
@@ -8345,8 +8441,10 @@ fn eval_full_inner<'a>(
             type_name,
             type_mod,
             binding,
+            context,
             ..
         } => {
+            let coercion = DomainCoercion::of_cast(context);
             let array_target = ColType::from_sql_name(type_name).or_else(|| {
                 let catalog = hooks.catalog?;
                 constructor_type_from_oid(catalog.user_type_oid(type_name)?, &|oid| {
@@ -8364,6 +8462,7 @@ fn eval_full_inner<'a>(
                     Some(element),
                     type_mod,
                     binding,
+                    context,
                     arena,
                     params,
                     row,
@@ -8487,7 +8586,7 @@ fn eval_full_inner<'a>(
                         target_oid,
                         type_mod,
                         v,
-                        DefinedCastContext::Explicit,
+                        defined_cast_context(context),
                         coercion_input_collation(operand, row, hooks.catalog)?,
                         arena,
                         hooks.sequences,
@@ -8496,7 +8595,9 @@ fn eval_full_inner<'a>(
                     if type_mod != -1
                         && let Some(target) = ColType::from_sql_name(type_name)
                     {
-                        return super::exec::apply_cast_typmod(value, target, type_mod, arena);
+                        return super::exec::apply_coercion_typmod(
+                            value, target, type_mod, coercion, arena,
+                        );
                     }
                     return Ok(value);
                 }
@@ -8573,7 +8674,8 @@ fn eval_full_inner<'a>(
             // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none() {
                 if let Some(cat) = hooks.catalog
-                    && let Some(value) = cat.cast_user_type(type_name, v, arena, hooks.sequences)?
+                    && let Some(value) =
+                        cat.cast_user_type(type_name, v, coercion, arena, hooks.sequences)?
                 {
                     return Ok(value);
                 }
@@ -8643,12 +8745,13 @@ fn eval_full_inner<'a>(
             } else {
                 v
             };
-            // `::numeric(p,s)` / `::varchar(n)`: enforce the modifier on the
-            // cast result exactly as a column of that type would.
+            // `::numeric(p,s)` / `::varchar(n)`: an explicit cast truncates
+            // an over-length string, an implicit one rejects it as a column
+            // assignment does.
             if type_mod != -1
                 && let Some(ct) = ColType::from_sql_name(type_name)
             {
-                return super::exec::apply_cast_typmod(v, ct, type_mod, arena);
+                return super::exec::apply_coercion_typmod(v, ct, type_mod, coercion, arena);
             }
             Ok(v)
         }
@@ -9117,6 +9220,7 @@ fn eval_full_inner<'a>(
             None,
             -1,
             CastBinding::Resolve,
+            super::ast::CastContext::Implicit,
             arena,
             params,
             row,
@@ -10454,6 +10558,9 @@ struct ArrayConstructorPlan<'a> {
     multidimensional: bool,
     inputs: &'a [ArrayConstructorInput<'a>],
     named_type: Option<&'a str>,
+    /// A named element conversion's context: explicit under a cast of the
+    /// whole constructor, otherwise implicit.
+    coercion: DomainCoercion,
     target_type_mod: i32,
 }
 
@@ -10466,6 +10573,7 @@ fn prepare_array_constructor<'a>(
     expected: Option<ArrElem>,
     target_type_mod: i32,
     binding: CastBinding,
+    context: super::ast::CastContext,
     sites: &mut ArrayConstructorSites,
     arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
@@ -10486,11 +10594,7 @@ fn prepare_array_constructor<'a>(
     } else {
         types.element.element_oid()
     };
-    let context = if expected.is_some() {
-        DefinedCastContext::Explicit
-    } else {
-        DefinedCastContext::Implicit
-    };
+    let defined_context = defined_cast_context(context);
     let mut named_type = None;
     let inputs = arena
         .alloc_slice_with(items.len(), |_| ArrayConstructorInput {
@@ -10510,6 +10614,7 @@ fn prepare_array_constructor<'a>(
                 expected,
                 target_type_mod,
                 binding,
+                context,
                 sites,
                 arena,
                 row,
@@ -10535,7 +10640,7 @@ fn prepare_array_constructor<'a>(
         let cast = if binding == CastBinding::Resolve && source_oid != target_oid {
             match hooks.catalog {
                 Some(catalog) => catalog
-                    .bind_defined_cast(source_oid, target_oid, context)?
+                    .bind_defined_cast(source_oid, target_oid, defined_context)?
                     .map(|cast| {
                         arena
                             .alloc(cast)
@@ -10577,6 +10682,8 @@ fn prepare_array_constructor<'a>(
         multidimensional: types.multidimensional,
         inputs,
         named_type,
+        coercion: DomainCoercion::of_cast(context),
+
         target_type_mod,
     })
 }
@@ -10590,6 +10697,7 @@ fn eval_array_constructor<'a>(
     expected: Option<ArrElem>,
     target_type_mod: i32,
     binding: CastBinding,
+    context: super::ast::CastContext,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -10607,6 +10715,7 @@ fn eval_array_constructor<'a>(
         expected,
         target_type_mod,
         binding,
+        context,
         &mut sites,
         arena,
         row,
@@ -10659,6 +10768,7 @@ fn execute_array_constructor<'a>(
                         plan.named_type
                             .expect("named array conversion has its declared name"),
                         value,
+                        plan.coercion,
                         arena,
                         hooks.sequences,
                     )?
@@ -10679,6 +10789,7 @@ fn execute_array_constructor<'a>(
                 input.named_conversion,
                 element,
                 plan.named_type,
+                plan.coercion,
                 arena,
                 hooks,
             )?
@@ -10757,6 +10868,7 @@ fn coerce_array_constructor_element<'a>(
     named_conversion: bool,
     element: ArrElem,
     named_type: Option<&str>,
+    coercion: DomainCoercion,
     arena: &'a Arena,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
@@ -10768,6 +10880,7 @@ fn coerce_array_constructor_element<'a>(
             .cast_user_type(
                 named_type.expect("prepared named conversion"),
                 value,
+                coercion,
                 arena,
                 hooks.sequences,
             )?
@@ -11033,7 +11146,7 @@ pub(crate) fn undefined_function<'a, T>(
 /// (`round('1.5')` reads `'1.5'` as `double precision`). Numeric and boolean
 /// parameters take that conversion here; the handlers of other parameter
 /// types read the literal's text themselves.
-fn coerce_unknown_builtin_arguments<'a, 'b>(
+pub(crate) fn coerce_unknown_builtin_arguments<'a, 'b>(
     oid: i32,
     args: &'b [&'a Expr<'a>],
     variadic: bool,
@@ -11081,6 +11194,7 @@ where
                     type_name: ctype.name(),
                     type_mod: -1,
                     binding: crate::sql::ast::CastBinding::Resolve,
+                    context: crate::sql::ast::CastContext::Implicit,
                 })
                 .map_err(|_| arena_full())?;
         }
@@ -11207,6 +11321,7 @@ fn bind_builtin_default<'a>(
             operand,
             type_name,
             type_mod,
+            context,
             ..
         } => {
             if ColType::from_sql_name(type_name).is_none() {
@@ -11223,6 +11338,7 @@ fn bind_builtin_default<'a>(
                     type_name,
                     type_mod,
                     binding: super::ast::CastBinding::Builtin,
+                    context,
                 })
                 .map(|expression| &*expression)
                 .map_err(|_| arena_full())
@@ -12649,6 +12765,7 @@ fn builtin_function_expression<'a>(
                 type_name: declared.name(),
                 type_mod: -1,
                 binding: super::ast::CastBinding::Builtin,
+                context: super::ast::CastContext::Implicit,
             })
             .map(|cast| Some(&*cast))
             .map_err(|_| arena_full())
@@ -12730,6 +12847,7 @@ fn builtin_function_expression<'a>(
                 type_name: target.name(),
                 type_mod: -1,
                 binding: super::ast::CastBinding::Builtin,
+                context: super::ast::CastContext::Explicit,
             }
         } else if let Some(target) = super::catalog::builtin_input_function_type(oid)
             && let [argument] = args
@@ -12746,6 +12864,7 @@ fn builtin_function_expression<'a>(
                 type_name: target.name(),
                 type_mod: -1,
                 binding: super::ast::CastBinding::Builtin,
+                context: super::ast::CastContext::Explicit,
             }
         } else {
             return Ok(None);
@@ -14443,7 +14562,13 @@ pub(crate) fn input_error<'a>(
                 .and_then(|value| super::exec::apply_typmod(value, target, type_mod, arena)),
         )
     } else if let Some(catalog) = hooks.catalog {
-        match catalog.cast_user_type(base_name, Datum::Text(input), arena, hooks.sequences) {
+        match catalog.cast_user_type(
+            base_name,
+            Datum::Text(input),
+            DomainCoercion::Input,
+            arena,
+            hooks.sequences,
+        ) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
             Err(error) if !error.sqlstate.can_report_input_failure() => return Err(error),

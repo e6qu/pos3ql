@@ -12,7 +12,9 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
 use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
-use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, SourcePosition, UnaryOp};
+use crate::sql::ast::{
+    BinaryOp, CallKind, CastBinding, CastContext, Expr, SourcePosition, UnaryOp,
+};
 use crate::sql::types::ColType;
 
 /// The SQL/JSON function whose `RETURNING` clause is parsed.
@@ -107,6 +109,7 @@ impl<'a> Parser<'a> {
                 left = self.arena_expr(Expr::Cast {
                     source_position,
                     binding: CastBinding::Resolve,
+                    context: CastContext::Explicit,
                     operand: left,
                     type_name,
                     type_mod,
@@ -1256,6 +1259,7 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::Cast {
                     source_position,
                     binding: CastBinding::Resolve,
+                    context: CastContext::Explicit,
                     operand,
                     type_name,
                     type_mod,
@@ -1377,6 +1381,7 @@ impl<'a> Parser<'a> {
                     return self.arena_expr(Expr::Cast {
                         source_position,
                         binding: CastBinding::Resolve,
+                        context: CastContext::Explicit,
                         operand,
                         type_name: if with_timezone {
                             if name.eq_ignore_ascii_case("timestamp") {
@@ -1422,6 +1427,7 @@ impl<'a> Parser<'a> {
                     return self.arena_expr(Expr::Cast {
                         source_position,
                         binding: CastBinding::Resolve,
+                        context: CastContext::Explicit,
                         operand,
                         type_name: name,
                         type_mod,
@@ -2043,6 +2049,7 @@ impl<'a> Parser<'a> {
             return self.arena_expr(Expr::Cast {
                 source_position: SourcePosition::UNKNOWN,
                 binding: CastBinding::Resolve,
+                context: CastContext::Explicit,
                 operand: call,
                 type_name,
                 type_mod,
@@ -2055,6 +2062,7 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Cast {
             source_position,
             binding: CastBinding::Resolve,
+            context: CastContext::Explicit,
             operand: call,
             type_name,
             type_mod,
@@ -2222,6 +2230,7 @@ impl<'a> Parser<'a> {
             return self.arena_expr(Expr::Cast {
                 source_position,
                 binding: CastBinding::Resolve,
+                context: CastContext::Explicit,
                 operand: call,
                 type_name,
                 type_mod,
@@ -2345,6 +2354,7 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Cast {
             source_position,
             binding: CastBinding::Resolve,
+            context: CastContext::Explicit,
             operand: call,
             type_name,
             type_mod,
@@ -2477,6 +2487,7 @@ impl<'a> Parser<'a> {
             return self.arena_expr(Expr::Cast {
                 source_position,
                 binding: CastBinding::Resolve,
+                context: CastContext::Explicit,
                 operand: call,
                 type_name,
                 type_mod,
@@ -2993,6 +3004,7 @@ impl<'a> Parser<'a> {
             return self.arena_expr(Expr::Cast {
                 source_position,
                 binding: CastBinding::Resolve,
+                context: CastContext::Explicit,
                 operand: aggregate,
                 type_name,
                 type_mod,
@@ -3438,6 +3450,7 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Cast {
             source_position,
             binding: CastBinding::Resolve,
+            context: CastContext::Explicit,
             operand,
             type_name: name,
             type_mod: -1,
@@ -3552,6 +3565,7 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Cast {
             source_position,
             binding: CastBinding::Resolve,
+            context: CastContext::Explicit,
             operand,
             type_name: name,
             type_mod,

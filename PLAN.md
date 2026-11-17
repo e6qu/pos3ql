@@ -1311,12 +1311,21 @@ utility options and domain constraints, `EXECUTE` and routine arguments
 (unknown literals and row constructors converting to their parameter's type
 at analysis) and privilege checks on a written schema are positioned too
 (`differential_exact/814`). The exact-error corpus compares every error's
-cursor, psql's `LINE n:` excerpt and caret. Remaining: a literal cast to an
-array of a domain whose input applies the base type's length
-(`'{toolong}'::d[]`) and a named-notation literal argument of a function in
-`FROM` fail without a cursor; an explicit cast to a domain over
-`varchar(n)` raises `22001` where PostgreSQL truncates; and an explicit
-collation conflict is found only when a row is compared, not at analysis. Target and expression count errors of an `INSERT`, also with subscripted
+cursor, psql's `LINE n:` excerpt and caret. A domain's base type modifier
+follows the coercion context (`differential_exact/830`): an explicit cast
+truncates, an assignment, implicit coercion or input rejects; an input
+function's failure (`'{toolong}'::d[]`, a domain element's check) points at
+the literal, and a constant's length coercion, which the planner folds,
+fails without a cursor before any row is read, also when inlining a SQL
+function. An untyped literal argument of a function in `FROM`, positional or
+named, converts to its parameter's type at analysis, and a built-in's to the
+selected overload's (`generate_series(1, '3')`, `differential_exact/831`).
+Explicit `COLLATE` clauses that meet in one expression conflict while the
+query level, its subqueries, an `UPDATE` or a `DELETE` is analysed
+(`assign_collations`, `differential_exact/832`). Remaining: an `INSERT ...
+SELECT`, `ON CONFLICT` and `MERGE` assignment of a constant fold its length
+coercion only when a row is written, and an unknown or non-collatable
+`COLLATE` fails only when a row reaches it. Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

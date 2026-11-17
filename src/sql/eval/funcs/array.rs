@@ -118,40 +118,65 @@ pub(crate) fn coerce_compatible_arguments<'a>(
         } else {
             element.to_coltype()
         };
-        values[index] = if *input_oid == crate::sql::types::oid::UNKNOWN && element.is_named() {
-            let catalog = hooks.catalog.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "{} named argument types require a catalog",
-                    name
-                )
-            })?;
-            let element_name = catalog.type_name(element_oid, arena)?.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "{} argument type no longer exists",
-                    name
-                )
-            })?;
-            let type_name = if *array {
-                let mut written = crate::util::StackStr::<264>::new();
-                use core::fmt::Write as _;
-                write!(written, "{element_name}[]").map_err(|_| arena_full())?;
-                arena
-                    .alloc_str(written.as_str())
-                    .map_err(|_| arena_full())?
-            } else {
-                element_name
-            };
-            catalog
-                .cast_user_type(type_name, value, arena, hooks.sequences)?
-                .ok_or_else(|| {
+        // An untyped literal converts to the resolved type itself: a domain
+        // (the type of every typed input) applies its rules before the call
+        // reads its base type.
+        let domain = hooks
+            .catalog
+            .is_some_and(|catalog| catalog.domain_base_type(element_oid).is_some());
+        let value =
+            if *input_oid == crate::sql::types::oid::UNKNOWN && (element.is_named() || domain) {
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "{} named argument types require a catalog",
+                        name
+                    )
+                })?;
+                let element_name = catalog.type_name(element_oid, arena)?.ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
                         "{} argument type no longer exists",
                         name
                     )
-                })?
+                })?;
+                let type_name = if *array {
+                    let mut written = crate::util::StackStr::<264>::new();
+                    use core::fmt::Write as _;
+                    write!(written, "{element_name}[]").map_err(|_| arena_full())?;
+                    arena
+                        .alloc_str(written.as_str())
+                        .map_err(|_| arena_full())?
+                } else {
+                    element_name
+                };
+                catalog
+                    .cast_user_type(
+                        type_name,
+                        value,
+                        crate::sql::eval::DomainCoercion::Assignment,
+                        arena,
+                        hooks.sequences,
+                    )
+                    // An array's text is input, which fails at the literal.
+                    .map_err(|error| match args[index] {
+                        Expr::Str(literal) if !error.is_type_modifier_coercion() => {
+                            crate::sql::error_position::at_subject(error, literal)
+                        }
+                        _ => error,
+                    })?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "{} argument type no longer exists",
+                            name
+                        )
+                    })?
+            } else {
+                value
+            };
+        values[index] = if element.is_named() && *input_oid == crate::sql::types::oid::UNKNOWN {
+            value
         } else {
             let value = compatible_array_input(value, arena)?;
             match value {
@@ -450,7 +475,13 @@ pub(crate) fn dispatch<'a>(
                                     )
                                 })?;
                             *value = catalog
-                                .cast_user_type(name, *value, arena, hooks.sequences)?
+                                .cast_user_type(
+                                    name,
+                                    *value,
+                                    crate::sql::eval::DomainCoercion::Assignment,
+                                    arena,
+                                    hooks.sequences,
+                                )?
                                 .ok_or_else(|| {
                                     sql_err!(
                                         sqlstate::UNDEFINED_OBJECT,

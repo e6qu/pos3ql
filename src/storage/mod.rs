@@ -41146,7 +41146,15 @@ impl Storage {
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            self.values_enforcer_hashes_for(&arena, selection, bindings, &values[..n_columns], out)
+            crate::sql::query::index_key_calls::with_key_row(rowid, || {
+                self.values_enforcer_hashes_for(
+                    &arena,
+                    selection,
+                    bindings,
+                    &values[..n_columns],
+                    out,
+                )
+            })
         });
         // SAFETY: callers receive only hashes and binding ordinals; expression
         // evaluation cannot retain values allocated above this row-local mark.
@@ -41250,6 +41258,8 @@ impl Storage {
         let index;
         let key = if let Some(created_at) = enforcer.index_created_at {
             index = selection.index(self, created_at)?;
+            let index_name = index.name_for(evaluation_txid);
+            let index_oid = index_name.as_str();
             if let Some(source) = index.predicate {
                 let predicate = crate::sql::exec::expression_bindings::bound_index_expression(
                     source.as_str(),
@@ -41259,14 +41269,16 @@ impl Storage {
                     evaluation_txid,
                     arena,
                 )?;
-                if !crate::sql::exec::constraints::index_predicate_matches(
-                    self,
-                    evaluation_txid,
-                    selection.definition(),
-                    values,
-                    predicate,
-                    arena,
-                )? {
+                if !crate::sql::query::index_key_calls::with_key_index(index_oid, || {
+                    crate::sql::exec::constraints::index_predicate_matches(
+                        self,
+                        evaluation_txid,
+                        selection.definition(),
+                        values,
+                        predicate,
+                        arena,
+                    )
+                })? {
                     return visit(None, values, enforcer);
                 }
             }
@@ -41285,15 +41297,17 @@ impl Storage {
                     );
                 }
             }
-            crate::sql::exec::constraints::index_key_values(
-                self,
-                evaluation_txid,
-                selection.definition(),
-                values,
-                &index.columns[..index.n_cols],
-                &expressions[..index.n_cols],
-                arena,
-            )?
+            crate::sql::query::index_key_calls::with_key_index(index_oid, || {
+                crate::sql::exec::constraints::index_key_values(
+                    self,
+                    evaluation_txid,
+                    selection.definition(),
+                    values,
+                    &index.columns[..index.n_cols],
+                    &expressions[..index.n_cols],
+                    arena,
+                )
+            })?
         } else {
             return Self::with_plain_value_binding_values(enforcer, values, visit);
         };

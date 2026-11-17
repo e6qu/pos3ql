@@ -22,7 +22,7 @@ pub(crate) const MAX_RETAINED_SOURCES: usize = 8;
 pub(super) enum ItemShape<'a> {
     Table,
     Literals(usize),
-    Generated(&'a [crate::sql::query::generator::GeneratorKind]),
+    Generated(&'a [(crate::sql::query::generator::GeneratorKind, i32)]),
 }
 
 /// One FROM item of a retained join at its execution depth.

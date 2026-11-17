@@ -4697,6 +4697,7 @@ impl Engine {
             &self.storage,
             oid,
             bytes,
+            crate::sql::eval::DomainCoercion::Input,
             arena,
             txid,
             sequences
@@ -14900,16 +14901,26 @@ impl Engine {
                     {
                         Ok(Err(error))
                     } else {
-                        self.bind_type_inputs(
-                            core::slice::from_ref(candidate),
-                            arena,
-                            txn,
-                            sqlprep,
-                            cursors,
-                            guc,
-                            responder,
+                        // A failed input points at its literal in the text.
+                        error_position::with_statement_source(
+                            text,
+                            parser.source_copies(),
+                            true,
+                            0,
+                            || {
+                                self.bind_type_inputs(
+                                    core::slice::from_ref(candidate),
+                                    arena,
+                                    txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder,
+                                )
+                            },
                         )
                     };
+
                     match result {
                         Ok(Ok(value)) => {
                             if let Err(error) = sequence_scope.finish(guc.seq_session()) {
@@ -15319,6 +15330,7 @@ impl Engine {
                                         exec::coerce_user_type_array(
                                             value,
                                             element,
+                                            crate::sql::eval::DomainCoercion::Input,
                                             storage,
                                             txid,
                                             scratch,
@@ -15341,7 +15353,7 @@ impl Engine {
             });
             let encoded = match encoded {
                 Ok(Ok(encoded)) => encoded,
-                Ok(Err(error)) => return Ok(Err(error)),
+                Ok(Err(error)) => return Ok(Err(type_inputs::input_failure(error, candidate))),
                 Err(_) => return Ok(Err(eval::arena_full())),
             };
             bindings[count] = type_inputs::Binding {
@@ -22772,9 +22784,10 @@ impl Engine {
                 arena,
                 Some(&sequences),
             )
-            // A domain's constraints run with the statement, not its analysis.
+            // A domain's constraints and its base type's length coercion run
+            // with the statement, not its analysis.
             .map_err(|error| {
-                if error.sqlstate.as_str().starts_with("23") {
+                if error.sqlstate.as_str().starts_with("23") || error.is_type_modifier_coercion() {
                     error
                 } else {
                     error_position::at_expression(error, argument)
@@ -23580,6 +23593,24 @@ impl Engine {
                             .prepare_commit_row_keys(txn.txid, core::iter::once((table, rowid)))
                     },
                 );
+                // Index key calls collected by the attempt run first; the
+                // attempt read placeholders in their place.
+                if invocations.has_collected_key_calls() {
+                    let _ = invocations.take_pending();
+                    let _ = invocations.take_pending_replay();
+                    if let Err(error) = self.run_index_key_calls(
+                        &invocations,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
+                        return Ok(Err(error));
+                    }
+                    continue;
+                }
                 match prepared {
                     Ok(()) => break,
                     Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
@@ -23608,6 +23639,55 @@ impl Engine {
             }
         }
         Ok(Ok(()))
+    }
+
+    /// Runs the index key calls an attempt collected, in their order, each
+    /// under the restricted search path when a maintenance operation made
+    /// it; their results are kept by key site for the next attempt.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the calls forward the statement's execution services"
+    )]
+    fn run_index_key_calls(
+        &mut self,
+        invocations: &query::RoutineInvocationState,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        loop {
+            let call = match invocations.next_key_call(arena) {
+                Ok(Some(call)) => call,
+                Ok(None) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            };
+            let maintenance = if call.restricted {
+                match exec::MaintenancePath::enter(&self.storage, txn.txid) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                None
+            };
+            let completed = self.complete_pending_routine(
+                call.pending,
+                invocations,
+                arena,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )?;
+            drop(maintenance);
+            if let Err(error) = completed {
+                return Ok(Err(error));
+            }
+        }
     }
 
     /// Runs a utility statement whose expressions are evaluated outside a
@@ -23667,6 +23747,31 @@ impl Engine {
                     )
                 },
             )?;
+            // Index key calls the attempt collected run before anything
+            // else it raised or pended: its keys read placeholders for them.
+            if invocations.has_collected_key_calls() {
+                let _ = invocations.take_pending();
+                let _ = invocations.take_pending_replay();
+                let _ = invocations.take_pending_restricted();
+                if let Err(error) = responder.restart_attempt(output_mark) {
+                    return Ok(Err(error));
+                }
+                if txn.owns_statement_mark(mark) {
+                    self.rollback_waiting_statement(txn, mark);
+                }
+                if let Err(error) = self.run_index_key_calls(
+                    &invocations,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )? {
+                    return Ok(Err(error));
+                }
+                continue;
+            }
             let Err(error) = outcome else {
                 return Ok(outcome);
             };

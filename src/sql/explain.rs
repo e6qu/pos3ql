@@ -8642,6 +8642,7 @@ fn function_scan_estimate<'a>(
                                     type_name: ctype.name(),
                                     type_mod: -1,
                                     binding: crate::sql::ast::CastBinding::Builtin,
+                                    context: crate::sql::ast::CastContext::Implicit,
                                 })
                                 .map_err(|_| arena_full())?;
                             *value = if argument.is_constant(false) {

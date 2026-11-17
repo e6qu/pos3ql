@@ -1817,7 +1817,7 @@ mod numeric_loops;
 mod set_rows;
 mod transition_rows;
 pub(super) use call_environment::CallEnvironment;
-pub(crate) use call_environment::MaintenancePath;
+pub(crate) use call_environment::{MaintenancePath, maintenance_path_active};
 mod function_execution;
 mod procedure_execution;
 mod sql_function_execution;
@@ -41016,12 +41016,13 @@ fn execute_trigger_step_in<'a>(
                                     // value then fails a type modifier while planned.
                                     match assignment.expression {
                                         Expr::Str(literal)
-                                            if !local_fails_type_modifier_only(
-                                                context,
-                                                locals,
-                                                assignment.name,
-                                                value,
-                                            ) =>
+                                            if !error.is_type_modifier_coercion()
+                                                && !local_fails_type_modifier_only(
+                                                    context,
+                                                    locals,
+                                                    assignment.name,
+                                                    value,
+                                                ) =>
                                         {
                                             crate::sql::error_position::at_subject(error, literal)
                                         }
@@ -55374,6 +55375,7 @@ pub fn create_aggregate(
                             .routine_type_oid(moving_state.ctype, moving_state.user_type, txn.txid)
                             .expect("resolved moving state type has an OID"),
                         value.as_bytes(),
+                        crate::sql::eval::DomainCoercion::Input,
                         arena,
                         txn.txid,
                         None,
@@ -55437,6 +55439,7 @@ pub fn create_aggregate(
                     .routine_type_oid(state_type.ctype, state_type.user_type, txn.txid)
                     .expect("resolved aggregate state type has an OID"),
                 value.as_bytes(),
+                crate::sql::eval::DomainCoercion::Input,
                 arena,
                 txn.txid,
                 None,
@@ -60381,6 +60384,7 @@ fn stored_rule_definition<'a>(
                 type_name,
                 type_mod: metadata.type_mod,
                 binding: crate::sql::ast::CastBinding::Resolve,
+                context: crate::sql::ast::CastContext::Explicit,
             })
             .map(|expression| &*expression)
             .map_err(|_| arena_full())?;
@@ -66469,6 +66473,7 @@ fn validate_stored_domain_value(
             storage,
             crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(leaf)),
             value,
+            crate::sql::eval::DomainCoercion::Assignment,
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
@@ -74787,7 +74792,44 @@ fn validate_index_rows(
     arena: &Arena,
 ) -> Result<crate::storage::TableStatistics, SqlError> {
     let _maintenance = MaintenancePath::enter(storage, txid)?;
-    let statistics = scan_index_rows(storage, table_index, txid, arena, &mut |_, _, _| Ok(()))?;
+    // Rebuilding every index builds them one at a time in OID order, as
+    // PostgreSQL's `reindex_relation` does, so their keys' routine calls run
+    // index by index; the whole-table pass after reads the kept results.
+    if matches!(validation, IndexRowValidation::Reindex { selected: None }) {
+        let mut oids = crate::mem::arena::ArenaList::new(arena);
+        for index in storage.indexes_for_slot(table_index, txid) {
+            if index.mutable_for(txid).kind.live() {
+                oids.push(crate::sql::catalog::explicit_index_oid(&index))
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+            }
+        }
+        let oids = oids
+            .as_mut_slice()
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        oids.sort_unstable();
+        for oid in oids.iter() {
+            validate_index_rows(
+                storage,
+                table_index,
+                txid,
+                IndexRowValidation::Reindex {
+                    selected: Some(*oid),
+                },
+                arena,
+            )?;
+        }
+    }
+    // A new index forms only its own tuples; a REINDEX every selected one.
+    let only = match validation {
+        IndexRowValidation::Create { selected, .. }
+        | IndexRowValidation::Reindex {
+            selected: Some(selected),
+        } => Some(selected),
+        IndexRowValidation::Reindex { selected: None } => None,
+    };
+    let statistics = scan_index_rows(storage, table_index, txid, only, arena, &mut |_, _, _| {
+        Ok(())
+    })?;
     let keys = match validation {
         IndexRowValidation::Create { unique: false, .. } => return Ok(statistics),
         IndexRowValidation::Create {
@@ -74918,6 +74960,7 @@ fn scan_index_rows(
     storage: &Storage,
     table_index: usize,
     txid: u32,
+    only: Option<i32>,
     arena: &Arena,
     check: &mut IndexRowCheck<'_>,
 ) -> Result<crate::storage::TableStatistics, SqlError> {
@@ -74929,8 +74972,10 @@ fn scan_index_rows(
         let schema = &schema[..definition.n_columns];
         let mut validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
             let row_mark = arena.mark();
-            let result = check_index_tuple_sizes(storage, &definition, values, txid, arena)
-                .and_then(|()| check(rowid, schema, values));
+            let result = crate::sql::query::index_key_calls::with_key_row(rowid, || {
+                check_index_tuple_sizes(storage, &definition, values, only, txid, arena)
+            })
+            .and_then(|()| check(rowid, schema, values));
             // SAFETY: validation returns only an owned error or success; key
             // values and parsed expressions are consumed before returning.
             unsafe { arena.rewind_to(row_mark) };
@@ -81036,7 +81081,15 @@ fn decode_replication_tuple<'a, Definition0: crate::storage::DefinitionBacking>(
                     .declared_column_type(column, txn.txid)?
                     .replication_oid();
                 coerce(
-                    decode_text_input(storage, oid, bytes, arena, txn.txid, None)?,
+                    decode_text_input(
+                        storage,
+                        oid,
+                        bytes,
+                        crate::sql::eval::DomainCoercion::Input,
+                        arena,
+                        txn.txid,
+                        None,
+                    )?,
                     column,
                     storage,
                     txn.txid,
@@ -81914,6 +81967,7 @@ pub(crate) fn decode_binary_input<'a>(
                 storage,
                 slot,
                 value,
+                crate::sql::eval::DomainCoercion::Input,
                 txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
@@ -81993,6 +82047,7 @@ pub(crate) fn decode_text_input<'a>(
     storage: &Storage,
     oid: i32,
     bytes: &'a [u8],
+    coercion: crate::sql::eval::DomainCoercion,
     arena: &'a Arena,
     txid: u32,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
@@ -82033,7 +82088,15 @@ pub(crate) fn decode_text_input<'a>(
             element @ (crate::sql::types::ArrElem::Enum(_)
             | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
-        ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena, sequences),
+        ) => coerce_user_type_array(
+            Datum::Text(text),
+            element,
+            crate::sql::eval::DomainCoercion::Input,
+            storage,
+            txid,
+            arena,
+            sequences,
+        ),
         ColType::Array(element) if element.is_catalog_reference() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::reg_array_cast(Datum::Text(text), element, Some(&catalog), arena)
@@ -82046,14 +82109,21 @@ pub(crate) fn decode_text_input<'a>(
             storage,
             slot,
             decode_builtin(base)?,
+            coercion,
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
             sequences,
         ),
-        ParameterInputType::DomainArray(element) => {
-            coerce_user_type_array(Datum::Text(text), element, storage, txid, arena, sequences)
-        }
+        ParameterInputType::DomainArray(element) => coerce_user_type_array(
+            Datum::Text(text),
+            element,
+            crate::sql::eval::DomainCoercion::Input,
+            storage,
+            txid,
+            arena,
+            sequences,
+        ),
     }
 }
 
@@ -82072,6 +82142,7 @@ pub(crate) fn coerce_binary_input_null<'a>(
             storage,
             slot,
             Datum::Null,
+            crate::sql::eval::DomainCoercion::Input,
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
@@ -82527,6 +82598,7 @@ fn decode_binary_array<'a>(
                         })?,
                     )?,
                     value,
+                    crate::sql::eval::DomainCoercion::Input,
                     txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
@@ -105192,7 +105264,7 @@ fn alter_table_relation(
         };
         // The rebuilt indexes evaluate their keys over the rewritten rows.
         if let Err(error) = rows(true, &mut |_, values, _| {
-            constraints::check_index_tuple_sizes(storage, &new_def, values, txn.txid, arena)
+            constraints::check_index_tuple_sizes(storage, &new_def, values, None, txn.txid, arena)
         }) {
             return sql_fail(error);
         }
@@ -109250,6 +109322,7 @@ fn typed_subscript_base<'e, 'a: 'e>(
                 type_name: ctype.name(),
                 type_mod: -1,
                 binding: crate::sql::ast::CastBinding::Builtin,
+                context: crate::sql::ast::CastContext::Explicit,
             })
             .map_err(|_| super::query::arena_full_pub())?;
         let args = arena
@@ -109914,7 +109987,15 @@ fn coerce_column_value<'a>(
         | crate::sql::types::ArrElem::Domain { .. }),
     ) = col.ctype
     {
-        return coerce_user_type_array(v, element, storage, txid, arena, sequences);
+        return coerce_user_type_array(
+            v,
+            element,
+            crate::sql::eval::DomainCoercion::Assignment,
+            storage,
+            txid,
+            arena,
+            sequences,
+        );
     }
     if let ColType::Array(element) = col.ctype
         && element.is_catalog_reference()
@@ -109974,7 +110055,16 @@ pub(crate) fn coerce_routine_argument<'a>(
         ..ColumnMeta::EMPTY
     };
     if let Some(target) = constraints::column_domain_target(storage, &column, txid)? {
-        return coerce_domain_value(storage, target, value, txid, arena, &[], sequences);
+        return coerce_domain_value(
+            storage,
+            target,
+            value,
+            crate::sql::eval::DomainCoercion::Assignment,
+            txid,
+            arena,
+            &[],
+            sequences,
+        );
     }
     match argument.ctype {
         ColType::Composite(slot) => match value {
@@ -109990,7 +110080,15 @@ pub(crate) fn coerce_routine_argument<'a>(
             element @ (crate::sql::types::ArrElem::Enum(_)
             | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
-        ) => coerce_user_type_array(value, element, storage, txid, arena, sequences),
+        ) => coerce_user_type_array(
+            value,
+            element,
+            crate::sql::eval::DomainCoercion::Assignment,
+            storage,
+            txid,
+            arena,
+            sequences,
+        ),
         ctype if ctype.is_reg_object() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::regobject_cast(value, ctype, Some(&catalog), arena)
@@ -110152,8 +110250,15 @@ fn decode_composite_stored_field<'a>(
                     arena,
                 )?;
                 if matches!(out, Datum::Composite { .. }) {
-                    *out =
-                        coerce_user_type_array_element(*out, element, storage, txid, arena, None)?;
+                    *out = coerce_user_type_array_element(
+                        *out,
+                        element,
+                        crate::sql::eval::DomainCoercion::Input,
+                        storage,
+                        txid,
+                        arena,
+                        None,
+                    )?;
                 }
             }
             Ok(Datum::Array {
@@ -110471,6 +110576,11 @@ fn coerce_composite_value_inner<'a>(
                     storage,
                     domain,
                     value,
+                    if encoding == CompositeEncoding::ExplicitCast {
+                        crate::sql::eval::DomainCoercion::Explicit
+                    } else {
+                        crate::sql::eval::DomainCoercion::Input
+                    },
                     txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
@@ -110768,18 +110878,20 @@ fn decode_composite_text_inner<'a>(
 pub(crate) fn coerce_user_type_array<'a>(
     value: Datum<'a>,
     target: crate::sql::types::ArrElem,
+    coercion: crate::sql::eval::DomainCoercion,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    let (source, raw) = match value {
+    let (source, raw, coercion) = match value {
         Datum::Array { element, raw }
             if element == target && matches!(target, crate::sql::types::ArrElem::Domain { .. }) =>
         {
             return Ok(Datum::Array { element, raw });
         }
-        Datum::Array { element, raw } => (element, raw),
+        Datum::Array { element, raw } => (element, raw, coercion),
+        // Array text is element input, whatever the cast's context.
         Datum::Text(text) | Datum::Bpchar(text) => (
             crate::sql::types::ArrElem::Text,
             crate::sql::array::parse_literal(
@@ -110787,6 +110899,7 @@ pub(crate) fn coerce_user_type_array<'a>(
                 crate::sql::types::ArrElem::Text,
                 arena,
             )?,
+            crate::sql::eval::DomainCoercion::Input,
         ),
         Datum::Null => return Ok(Datum::Null),
         other => {
@@ -110805,7 +110918,9 @@ pub(crate) fn coerce_user_type_array<'a>(
         .iter_mut()
         .zip(crate::sql::array::elements(raw, source))
     {
-        *item = coerce_user_type_array_element(value, target, storage, txid, arena, sequences)?;
+        *item = coerce_user_type_array_element(
+            value, target, coercion, storage, txid, arena, sequences,
+        )?;
     }
     Ok(Datum::Array {
         element: target,
@@ -110819,6 +110934,7 @@ pub(crate) fn coerce_user_type_array<'a>(
 pub(crate) fn coerce_user_type_array_element<'a>(
     value: Datum<'a>,
     target: crate::sql::types::ArrElem,
+    coercion: crate::sql::eval::DomainCoercion,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -110842,6 +110958,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     })?,
                 )?,
                 value,
+                coercion,
                 txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
@@ -111031,6 +111148,27 @@ pub fn apply_cast_typmod<'a>(
             super::eval::fit_bits(bits, n, varying, arena)
         }
         _ => apply_typmod(v, ctype, type_mod, arena),
+    }
+}
+
+/// Applies a domain's base type modifier under its coercion context: input
+/// as a column assignment does, with the input's position; a cast's length
+/// coercion without one, truncating for an explicit cast.
+pub(crate) fn apply_coercion_typmod<'a>(
+    v: Datum<'a>,
+    ctype: ColType,
+    type_mod: i32,
+    coercion: crate::sql::eval::DomainCoercion,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match coercion {
+        crate::sql::eval::DomainCoercion::Input => apply_typmod(v, ctype, type_mod, arena),
+        crate::sql::eval::DomainCoercion::Assignment => {
+            apply_typmod(v, ctype, type_mod, arena).map_err(SqlError::type_modifier_coercion)
+        }
+        crate::sql::eval::DomainCoercion::Explicit => {
+            apply_cast_typmod(v, ctype, type_mod, arena).map_err(SqlError::type_modifier_coercion)
+        }
     }
 }
 

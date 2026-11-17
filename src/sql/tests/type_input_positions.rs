@@ -200,6 +200,7 @@ fn planner_constant_facts_release_numeric_scratch_without_heap_allocation() {
         type_name: "numeric",
         type_mod: -1,
         binding: ast::CastBinding::Builtin,
+        context: ast::CastContext::Explicit,
     };
     let before = arena.used();
     crate::mem::guard::forbid_alloc(|| {

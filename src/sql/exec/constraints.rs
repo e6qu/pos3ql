@@ -411,13 +411,19 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
     }
 }
 
-/// Coerces a value to a domain's base representation, applies the base typmod,
-/// then enforces the domain's own constraints. This is the one catalog-aware
-/// path shared by explicit casts, domain-array elements, and table writes.
+/// Coerces a value to a domain's base representation, applies the base typmod
+/// under `coercion`'s rules, then enforces the domain's own constraints. This
+/// is the one catalog-aware path shared by explicit casts, domain-array
+/// elements, and table writes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain coercion preserves its context, parameters and sequence access"
+)]
 pub(crate) fn coerce_domain_value<'a>(
     storage: &Storage,
     target: crate::storage::TypeDefinitionTarget,
     value: Datum<'a>,
+    coercion: crate::sql::eval::DomainCoercion,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -426,16 +432,37 @@ pub(crate) fn coerce_domain_value<'a>(
     let domain = storage
         .read_domain_definition(target, txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
-    coerce_selected_domain_value(storage, &domain, value, txid, arena, params, sequences)
+    coerce_selected_domain_value(
+        storage, &domain, value, coercion, txid, arena, params, sequences,
+    )
 }
 
-fn coerce_selected_domain_value<'a>(
+/// The base-type part of a domain coercion, without the domains' own rules:
+/// what PostgreSQL's planner folds of a constant cast to a domain, whose
+/// `CoerceToDomain` itself runs with the statement.
+pub(crate) fn coerce_domain_base_value<'a>(
+    storage: &Storage,
+    target: crate::storage::TypeDefinitionTarget,
+    value: Datum<'a>,
+    coercion: crate::sql::eval::DomainCoercion,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let domain = storage
+        .read_domain_definition(target, txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
+    coerce_domain_base(storage, &domain, value, coercion, txid, arena, None)
+}
+
+/// A domain's base conversion: its parent domain's, or its base type's input
+/// or cast, then its base type modifier under `coercion`'s rules.
+fn coerce_domain_base<'a>(
     storage: &Storage,
     domain: &crate::storage::DomainDef,
     value: Datum<'a>,
+    coercion: crate::sql::eval::DomainCoercion,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = if let Some(parent_name) = domain.base_domain {
@@ -450,7 +477,7 @@ fn coerce_selected_domain_value<'a>(
                     parent_name.name.as_str()
                 )
             })?;
-        coerce_selected_domain_value(storage, &parent, value, txid, arena, params, sequences)?
+        coerce_domain_base(storage, &parent, value, coercion, txid, arena, sequences)?
     } else {
         match domain.base {
             crate::sql::types::ColType::Enum(slot) => {
@@ -476,13 +503,59 @@ fn coerce_selected_domain_value<'a>(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Composite(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(value, element, storage, txid, arena, sequences)?,
+            ) => super::coerce_user_type_array(
+                value, element, coercion, storage, txid, arena, sequences,
+            )?,
             base => crate::sql::eval::cast_to(value, base, arena)?,
         }
     };
-    let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(storage, txid, domain, value, arena, params, sequences)?;
+    super::apply_coercion_typmod(value, domain.base, domain.base_type_mod, coercion, arena)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain coercion preserves its context, parameters and sequence access"
+)]
+fn coerce_selected_domain_value<'a>(
+    storage: &Storage,
+    domain: &crate::storage::DomainDef,
+    value: Datum<'a>,
+    coercion: crate::sql::eval::DomainCoercion,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<Datum<'a>, SqlError> {
+    let value = coerce_domain_base(storage, domain, value, coercion, txid, arena, sequences)?;
+    validate_domain_chain(storage, domain, value, txid, arena, params, sequences)?;
     Ok(value)
+}
+
+/// Enforces a domain's base domains' rules, outermost first, then its own.
+fn validate_domain_chain(
+    storage: &Storage,
+    domain: &crate::storage::DomainDef,
+    value: Datum,
+    txid: u32,
+    arena: &Arena,
+    params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(), SqlError> {
+    if let Some(parent_name) = domain.base_domain {
+        let reference = crate::storage::TypeReference::from_bound_name(parent_name)?;
+        let parent = storage
+            .read_domain_definition(crate::storage::TypeDefinitionTarget::Bound(reference), txid)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "base domain \"{}.{}\" does not exist",
+                    parent_name.schema.as_str(),
+                    parent_name.name.as_str()
+                )
+            })?;
+        validate_domain_chain(storage, &parent, value, txid, arena, params, sequences)?;
+    }
+    validate_domain_value(storage, txid, domain, value, arena, params, sequences)
 }
 
 fn validate_domain_value(
@@ -678,7 +751,16 @@ pub(crate) fn check_domain_constraints(
         // The column was already coerced to the base representation. Reusing
         // the catalog-aware path applies every inherited constraint as well as
         // the leaf domain's rules.
-        let _ = coerce_domain_value(storage, slot, value, txid, arena, params, sequences)?;
+        let _ = coerce_domain_value(
+            storage,
+            slot,
+            value,
+            crate::sql::eval::DomainCoercion::Assignment,
+            txid,
+            arena,
+            params,
+            sequences,
+        )?;
     }
     Ok(())
 }
@@ -1362,18 +1444,22 @@ pub(crate) fn index_key_values<'a>(
     };
     for (position, expression) in expressions.iter().enumerate() {
         keys[position] = match expression {
-            Some(expression) => eval_full(
-                expression,
-                arena,
-                crate::sql::eval::NO_PARAMS,
-                &RowCtx {
-                    table_oid: None,
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: row,
-                    alias: None,
-                },
-                &hooks,
-            )?,
+            Some(expression) => {
+                crate::sql::query::index_key_calls::at_key_position(position as u8, || {
+                    eval_full(
+                        expression,
+                        arena,
+                        crate::sql::eval::NO_PARAMS,
+                        &RowCtx {
+                            table_oid: None,
+                            def: crate::storage::RelationDefinition::from_definition(def),
+                            values: row,
+                            alias: None,
+                        },
+                        &hooks,
+                    )
+                })?
+            }
             None => row[columns[position] as usize],
         };
         // A named composite key, such as a whole row `(t)`, is kept in the
@@ -1973,18 +2059,24 @@ pub(crate) fn index_predicate_matches(
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS
     };
-    match eval_full(
-        predicate,
-        arena,
-        crate::sql::eval::NO_PARAMS,
-        &RowCtx {
-            table_oid: None,
-            def: crate::storage::RelationDefinition::from_definition(def),
-            values,
-            alias: None,
+    let matched = crate::sql::query::index_key_calls::at_key_position(
+        crate::sql::query::index_key_calls::KeySite::PREDICATE,
+        || {
+            eval_full(
+                predicate,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &RowCtx {
+                    table_oid: None,
+                    def: crate::storage::RelationDefinition::from_definition(def),
+                    values,
+                    alias: None,
+                },
+                &hooks,
+            )
         },
-        &hooks,
-    )? {
+    )?;
+    match matched {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
         _ => Err(sql_err!(
@@ -2306,16 +2398,18 @@ fn check_index_key_tuple_size(
 }
 
 /// Validates every persistent tuple shape visible on a table, including
-/// non-unique named indexes (which uniqueness-only enforcement does not walk).
+/// non-unique named indexes (which uniqueness-only enforcement does not walk),
+/// or only the index whose OID is `only`, which an index build forms.
 pub(crate) fn check_index_tuple_sizes(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
+    only: Option<i32>,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
-    let result = check_index_tuple_sizes_inner(storage, def, values, txid, arena);
+    let result = check_index_tuple_sizes_inner(storage, def, values, only, txid, arena);
     // SAFETY: parsed definitions and evaluated keys are consumed completely
     // by the size check and never escape this call.
     unsafe { arena.rewind_to(mark) };
@@ -2326,16 +2420,19 @@ fn check_index_tuple_sizes_inner(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
+    only: Option<i32>,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    for (column, metadata) in def.columns().iter().enumerate() {
-        if metadata.unique {
-            check_index_tuple_size(&[column as u16], values)?;
+    if only.is_none() {
+        for (column, metadata) in def.columns().iter().enumerate() {
+            if metadata.unique {
+                check_index_tuple_size(&[column as u16], values)?;
+            }
         }
-    }
-    for unique in def.uniques() {
-        check_index_tuple_size(unique.columns(), values)?;
+        for unique in def.uniques() {
+            check_index_tuple_size(unique.columns(), values)?;
+        }
     }
     let table_slot = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
@@ -2349,7 +2446,9 @@ fn check_index_tuple_sizes_inner(
         })?;
     let index_source = storage.table_def(table_slot, txid);
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if !index.mutable_for(txid).kind.live() {
+        if !index.mutable_for(txid).kind.live()
+            || only.is_some_and(|only| crate::sql::catalog::explicit_index_oid(&index) != only)
+        {
             continue;
         }
         let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
@@ -2399,6 +2498,8 @@ fn check_index_tuple_sizes_inner(
                 )
             })? as u16;
         }
+        let index_name = index.name_for(txid);
+        let index_oid = index_name.as_str();
         if let Some(source) = index.predicate {
             let predicate = super::expression_bindings::bound_index_expression(
                 source.as_str(),
@@ -2408,7 +2509,9 @@ fn check_index_tuple_sizes_inner(
                 txid,
                 arena,
             )?;
-            if !index_predicate_matches(storage, txid, def, values, predicate, arena)? {
+            if !crate::sql::query::index_key_calls::with_key_index(index_oid, || {
+                index_predicate_matches(storage, txid, def, values, predicate, arena)
+            })? {
                 continue;
             }
         }
@@ -2425,15 +2528,17 @@ fn check_index_tuple_sizes_inner(
                 )?);
             }
         }
-        let key = index_key_values(
-            storage,
-            txid,
-            def,
-            values,
-            &columns[..index.n_cols],
-            &expressions[..index.n_cols],
-            arena,
-        )?;
+        let key = crate::sql::query::index_key_calls::with_key_index(index_oid, || {
+            index_key_values(
+                storage,
+                txid,
+                def,
+                values,
+                &columns[..index.n_cols],
+                &expressions[..index.n_cols],
+                arena,
+            )
+        })?;
         check_index_key_tuple_size(
             &key[..index.n_cols],
             &include_columns[..index.n_include_cols],
@@ -2894,7 +2999,7 @@ pub(crate) fn enforce_row_keys(
     checks: &ParsedChecks,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    check_index_tuple_sizes(storage, def, values, txid, arena)?;
+    check_index_tuple_sizes(storage, def, values, None, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);

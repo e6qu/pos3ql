@@ -223,6 +223,7 @@ fn decode_remote_field<'a>(
             storage,
             declared.catalog_oid(),
             raw,
+            crate::sql::eval::DomainCoercion::Input,
             arena,
             txid,
             sequences,

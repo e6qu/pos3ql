@@ -383,7 +383,13 @@ pub(crate) fn sql_json_cast<'a>(
                 hooks,
             );
         }
-        if let Some(value) = catalog.cast_user_type(type_name, value, arena, hooks.sequences)? {
+        if let Some(value) = catalog.cast_user_type(
+            type_name,
+            value,
+            crate::sql::eval::DomainCoercion::Input,
+            arena,
+            hooks.sequences,
+        )? {
             return Ok(value);
         }
     }
@@ -605,7 +611,13 @@ pub(crate) fn populate_record_from_json<'a>(
         .type_name(declared_type_oid, arena)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
     catalog
-        .cast_user_type(type_name, result, arena, hooks.sequences)?
+        .cast_user_type(
+            type_name,
+            result,
+            crate::sql::eval::DomainCoercion::Input,
+            arena,
+            hooks.sequences,
+        )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))
 }
 
@@ -748,7 +760,13 @@ pub(crate) fn json_value_to_type<'a>(
             )
         })?;
         catalog
-            .cast_user_type(type_name, input, arena, hooks.sequences)?
+            .cast_user_type(
+                type_name,
+                input,
+                crate::sql::eval::DomainCoercion::Input,
+                arena,
+                hooks.sequences,
+            )?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     } else if let Some(ctype) = crate::sql::types::ColType::from_oid(type_oid) {
         super::super::cast_to(input, ctype, arena)?
@@ -761,7 +779,13 @@ pub(crate) fn json_value_to_type<'a>(
             )
         })?;
         catalog
-            .cast_user_type(type_name, input, arena, hooks.sequences)?
+            .cast_user_type(
+                type_name,
+                input,
+                crate::sql::eval::DomainCoercion::Input,
+                arena,
+                hooks.sequences,
+            )?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     };
     if type_mod != -1

@@ -4976,6 +4976,7 @@ pub(crate) fn validate_enum_input_literal(
                 super::exec::coerce_user_type_array(
                     Datum::Text(text),
                     super::types::ArrElem::Enum(creation),
+                    super::eval::DomainCoercion::Input,
                     storage,
                     txid,
                     scratch,

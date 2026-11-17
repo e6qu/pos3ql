@@ -2814,6 +2814,10 @@ pub trait CatalogAccess {
     fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
         None
     }
+    /// The error for a collation name [`Self::resolve_collation`] did not find.
+    fn collation_miss(&self, schema: Option<&str>, name: &str) -> SqlError {
+        collation_not_found(schema, name)
+    }
     /// Resolve PostgreSQL's identifier syntax used by `regcollation` input.
     fn collation_oid(&self, _name: &str) -> Option<i32> {
         None
@@ -10265,6 +10269,24 @@ impl DerivedCollation {
     }
 }
 
+/// `get_collation_oid`'s error for a name that names no collation, which
+/// shows the name as written, schema included.
+pub(crate) fn collation_not_found(schema: Option<&str>, name: &str) -> SqlError {
+    match schema {
+        Some(schema) => sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "collation \"{}.{}\" for encoding \"UTF8\" does not exist",
+            schema,
+            name
+        ),
+        None => sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "collation \"{}\" for encoding \"UTF8\" does not exist",
+            name
+        ),
+    }
+}
+
 fn expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
@@ -10276,27 +10298,26 @@ fn expression_collation<'a>(
             operand,
             collation,
         } => {
+            let located =
+                |error| crate::sql::error_position::at_source_position(error, *source_position);
             let collatable = static_type(operand, row).is_none_or(ColType::is_collatable);
             if !collatable {
-                return Err(sql_err!(
+                return Err(located(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "collations are not supported by type {}",
                     static_type(operand, row)
                         .expect("known noncollatable type")
                         .name()
-                ));
+                )));
             }
             let value = match *collation {
                 crate::sql::ast::ParsedCollation::Builtin(value) => value,
-                crate::sql::ast::ParsedCollation::Named(name) => catalog
-                    .and_then(|catalog| catalog.resolve_collation(name.schema, name.name))
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "collation \"{}\" does not exist",
-                            name.name
-                        )
-                    })?,
+                crate::sql::ast::ParsedCollation::Named(name) => match catalog {
+                    Some(catalog) => catalog
+                        .resolve_collation(name.schema, name.name)
+                        .ok_or_else(|| located(catalog.collation_miss(name.schema, name.name)))?,
+                    None => return Err(located(collation_not_found(name.schema, name.name))),
+                },
             };
             Ok(Some(DerivedCollation {
                 value,

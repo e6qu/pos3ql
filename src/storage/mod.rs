@@ -58484,6 +58484,21 @@ impl Storage {
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))
     }
 
+    /// The error `get_collation_oid` raises for a name that found no
+    /// collation: a missing schema first, then the qualified name.
+    pub(crate) fn collation_miss(&self, schema: Option<&str>, name: &str, txid: u32) -> SqlError {
+        match schema {
+            Some(schema) if !crate::sql::type_name_miss::type_schema_exists(self, txid, schema) => {
+                sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                )
+            }
+            _ => crate::sql::eval::collation_not_found(schema, name),
+        }
+    }
+
     pub(crate) fn resolve_collation(
         &self,
         schema: Option<&str>,

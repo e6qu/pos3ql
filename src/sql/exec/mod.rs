@@ -49405,11 +49405,7 @@ pub fn create_collation(
         CreateCollationDefinition::From(source) => {
             let Some(source) = storage.resolve_collation(source.schema, source.name, txn.txid)
             else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "collation \"{}\" does not exist",
-                    source.name
-                ));
+                return sql_fail(storage.collation_miss(source.schema, source.name, txn.txid));
             };
             let mut definition = match source {
                 crate::sql::ast::Collation::Catalog(selected) => {
@@ -50909,11 +50905,7 @@ pub fn alter_collation(
     responder: &mut Responder<'_>,
 ) -> Outcome {
     let Some(slot) = storage.collation_slot_on_path(name.schema, name.name, txn.txid) else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "collation \"{}\" does not exist",
-            name.name
-        ));
+        return sql_fail(storage.collation_miss(name.schema, name.name, txn.txid));
     };
     let mut definition = storage.collation(slot).definition_for(txn.txid);
     if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
@@ -51081,11 +51073,7 @@ pub(crate) fn drop_collation(
             responder.command_complete("DROP COLLATION")?;
             return sql_ok();
         }
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "collation \"{}\" does not exist",
-            name.name
-        ));
+        return sql_fail(storage.collation_miss(name.schema, name.name, txn.txid));
     };
     let definition = storage.collation(slot).definition_for(txn.txid);
     if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
@@ -61459,10 +61447,10 @@ pub fn comment(
             let Some(slot) =
                 storage.collation_slot_on_path(collation_name.schema, collation_name.name, txid)
             else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "collation \"{}\" does not exist",
-                    collation_name.name
+                return sql_fail(storage.collation_miss(
+                    collation_name.schema,
+                    collation_name.name,
+                    txid,
                 ));
             };
             let definition = storage.collation(slot).definition_for(txid);

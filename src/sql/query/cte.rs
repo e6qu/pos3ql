@@ -2998,7 +2998,11 @@ fn pull_up_rule_source<'a>(
 /// set-returning function, which keep a subquery from being pulled up
 /// (PostgreSQL's `is_simple_subquery`). A stored routine of that kind
 /// counts under any of its overloads.
-fn calls_grouping_or_set_routine(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn calls_grouping_or_set_routine(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
     if let Expr::Call { name, over, .. } = expression {
         let bare = name.rsplit('.').next().unwrap_or(name);
         if over.is_some()

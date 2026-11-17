@@ -1452,10 +1452,14 @@ named, converts to its parameter's type at analysis, and a built-in's to the
 selected overload's (`generate_series(1, '3')`, `differential_exact/831`).
 Explicit `COLLATE` clauses that meet in one expression conflict while the
 query level, its subqueries, an `UPDATE` or a `DELETE` is analysed
-(`assign_collations`, `differential_exact/832`). Remaining: an `INSERT ...
-SELECT`, `ON CONFLICT` and `MERGE` assignment of a constant fold its length
-coercion only when a row is written, and an unknown or non-collatable
-`COLLATE` fails only when a row reaches it. Target and expression count errors of an `INSERT`, also with subscripted
+(`assign_collations`, `differential_exact/832`). An `INSERT ... SELECT`
+source PostgreSQL pulls up (`is_simple_subquery`), an `ON CONFLICT DO UPDATE`
+assignment and a `MERGE` assignment or value of a constant fail its length
+coercion while the statement is planned, as an `UPDATE`'s does; an unknown
+collation (`42704`, naming the schema-qualified name and the encoding, or
+`3F000` for a missing schema) and a `COLLATE` on a type without collation
+(`42804`) fail at the clause, with its cursor, whether or not a row reaches
+it (`differential_exact/846`). Target and expression count errors of an `INSERT`, also with subscripted
 targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
 before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL

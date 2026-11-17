@@ -110,7 +110,9 @@ def probe(host, port):
         )
         exists_rows = connection.query(f"SELECT EXISTS ({cross})")
         using_rows = connection.query(using)
-        explain_ok = isinstance(connection.query(f"EXPLAIN {cross}"), list)
+        # A 128-relation join is planned by GEQO in PostgreSQL, whose costs
+        # pos3ql refuses to print; capacity is about planning the join at all.
+        explain_ok = isinstance(connection.query(f"EXPLAIN (COSTS OFF) {cross}"), list)
 
         view_setup = connection.query(
             "CREATE VIEW join_capacity_view AS "

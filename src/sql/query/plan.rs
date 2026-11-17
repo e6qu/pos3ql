@@ -1461,6 +1461,9 @@ fn expression_cost(
                 + expression_cost(pattern, columns, storage, txid, arena, use_)
                 + 2.0
         }
+        // An aggregate's value costs what a column does: its transition and
+        // final functions are charged to the aggregation.
+        Call { .. } if e.is_aggregate_use() => 0.0,
         Call {
             name,
             bound_oid,

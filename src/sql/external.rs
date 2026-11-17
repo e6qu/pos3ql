@@ -220,6 +220,13 @@ pub(crate) struct ExternalSorter {
     space: Option<SortSpace>,
     /// Whether [`ExternalSorter::keep_least`] dropped rows of this input.
     bounded: bool,
+    /// The tuples PostgreSQL's sort of these rows would hold, which size
+    /// the space `EXPLAIN ANALYZE` reports.
+    postgres: Option<crate::sql::query::instrument::SortTuples>,
+    /// The memory PostgreSQL's sort reports, once known.
+    postgres_bytes: Option<usize>,
+    /// Scratch positions of a bounded heap.
+    heap: Box<[usize]>,
 }
 
 impl ExternalSorter {
@@ -229,6 +236,7 @@ impl ExternalSorter {
             + ROWS_PER_CHUNK * core::mem::size_of::<BufferedRow>()
             + SstWriter::budget_bytes()
             + MERGE_FAN_IN * 4 * MAX_PAYLOAD
+            + ROWS_PER_CHUNK * core::mem::size_of::<usize>()
     }
 
     /// Allocates every run/merge buffer at startup.
@@ -247,6 +255,9 @@ impl ExternalSorter {
             spilled_bytes: 0,
             space: None,
             bounded: false,
+            postgres: None,
+            postgres_bytes: None,
+            heap: vec![0usize; ROWS_PER_CHUNK].into_boxed_slice(),
         })
     }
 
@@ -260,10 +271,52 @@ impl ExternalSorter {
         self.spilled_bytes = 0;
         self.space = None;
         self.bounded = false;
+        self.postgres = None;
+        self.postgres_bytes = None;
         for reader in &mut self.readers {
             reader.cursor = None;
             reader.current_len = 0;
         }
+    }
+
+    /// Sizes the space `EXPLAIN ANALYZE` reports for this input as
+    /// PostgreSQL's sort of `tuples` would hold it; set after [`Self::reset`].
+    pub(crate) fn size_as_postgres(
+        &mut self,
+        tuples: Option<crate::sql::query::instrument::SortTuples>,
+    ) {
+        self.postgres = tuples;
+    }
+
+    fn buffered_row(&self, position: usize) -> &[u8] {
+        let entry = &self.rows[position];
+        &self.chunk[entry.offset as usize + ORDINAL_BYTES..(entry.offset + entry.length) as usize]
+    }
+
+    /// PostgreSQL's figure for the buffered rows, still in arrival order.
+    fn postgres_space(
+        &mut self,
+        heap: Option<(usize, crate::sql::query::instrument::SortCompare<'_>)>,
+    ) -> Result<(), SqlError> {
+        let Some(tuples) = self.postgres else {
+            return Ok(());
+        };
+        let mut positions = core::mem::take(&mut self.heap);
+        let result = {
+            let this = &*self;
+            let row_at = |position: usize| this.buffered_row(position);
+            match heap {
+                Some((bound, compare)) => tuples.space(
+                    this.row_count,
+                    &row_at,
+                    Some((&mut positions[..bound.min(ROWS_PER_CHUNK)], compare)),
+                ),
+                None => tuples.space(this.row_count, &row_at, None),
+            }
+        };
+        self.heap = positions;
+        self.postgres_bytes = result?;
+        Ok(())
     }
 
     /// Encodes and appends one self-describing projected row without touching
@@ -347,6 +400,9 @@ impl ExternalSorter {
         // run is written for reading; more input merges the runs it spilled.
         let spilled = self.level_counts.iter().any(|&count| count != 0);
         let chunk_bytes = self.chunk_len + self.row_count * core::mem::size_of::<BufferedRow>();
+        if !spilled && !self.bounded {
+            self.postgres_space(None)?;
+        }
         self.flush_chunk(store, compare)?;
         self.space = Some(if spilled {
             SortSpace {
@@ -360,7 +416,7 @@ impl ExternalSorter {
                 } else {
                     SortMethod::Quicksort
                 },
-                bytes: chunk_bytes,
+                bytes: self.postgres_bytes.unwrap_or(chunk_bytes),
             }
         });
         let mut carry: Option<ExternalRun> = None;
@@ -403,6 +459,11 @@ impl ExternalSorter {
         {
             return Ok(());
         }
+        // The rows are still in arrival order, which PostgreSQL's bounded
+        // heap charges by.
+        self.postgres_space(Some((bound, &mut |left: &[u8], right: &[u8]| {
+            compare(left, right)
+        })))?;
         let chunk = &self.chunk;
         crate::util::try_heap_select_by(&mut self.rows[..self.row_count], bound, |a, b| {
             let row = |entry: &BufferedRow| {

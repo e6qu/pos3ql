@@ -13,7 +13,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Sort Method|Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

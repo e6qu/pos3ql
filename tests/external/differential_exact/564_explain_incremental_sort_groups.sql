@@ -1,8 +1,8 @@
 -- PostgreSQL 18 EXPLAIN ANALYZE of an Incremental Sort (show_incremental_sort_info):
 -- the batches nodeIncrementalSort.c sorts, at least 32 rows and the rest of
 -- the last one's prefix group in each full sort, and past 64 rows each
--- further prefix group on its own as a presorted group. Memory figures are
--- the allocator's own and are left out.
+-- further prefix group on its own as a presorted group. The memory of each
+-- batch and of the window below is not modelled yet (PLAN.md) and is left out.
 CREATE TABLE t564 (a int, b int);
 INSERT INTO t564 SELECT g % 4, g FROM generate_series(1, 200) g;
 CREATE TABLE u564 (a int, b int);

@@ -54984,6 +54984,7 @@ fn explain_analyze_counts_each_node_of_the_plan_it_runs() {
             "  Rows Removed by Join Filter: 15",
             "  ->  Seq Scan on nb x (actual rows=5.00 loops=1)",
             "  ->  Materialize (actual rows=5.00 loops=5)",
+            "        Storage: Memory  Maximum Storage: 17kB",
             "        ->  Seq Scan on nb y (actual rows=5.00 loops=1)",
         ]
     );

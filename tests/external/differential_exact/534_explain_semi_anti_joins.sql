@@ -2,8 +2,7 @@
 -- IN subqueries become semi and anti joins. The planner hashes the smaller
 -- side (Hash Semi/Anti Join, or Hash Right Semi/Anti Join when the query's
 -- own relation is smaller) and loops over a materialized copy when no
--- equality joins the two. Hash and materialize memory lines are the
--- allocator's own and are left out.
+-- equality joins the two, the copy's tuplestore holding each row it read.
 CREATE TABLE big534 (id int, v int);
 CREATE TABLE small534 (id int, aid int, w int);
 INSERT INTO big534 SELECT g, g % 7 FROM generate_series(1, 1000) g;
@@ -16,7 +15,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

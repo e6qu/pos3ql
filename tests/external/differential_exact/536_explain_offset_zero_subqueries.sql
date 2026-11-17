@@ -3,7 +3,7 @@
 -- A join input's Subquery Scan without a filter of its own is trivial and
 -- set_plan_references removes it (trivial_subqueryscan), so the join's
 -- conditions print the columns the subquery's own plan outputs.
--- Materialize memory lines are the allocator's own and are left out.
+-- A Materialize reports the tuplestore of the rows it copied.
 CREATE TABLE o536 (a int, b text);
 CREATE TABLE p536 (a int, b text);
 INSERT INTO o536 SELECT g, 'x' || g FROM generate_series(1, 20) g;
@@ -15,7 +15,6 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || query LOOP
-    CONTINUE WHEN line ~ '^\s*(Batches|Storage):';
     RETURN NEXT line;
   END LOOP;
 END

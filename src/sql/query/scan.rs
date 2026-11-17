@@ -7808,12 +7808,17 @@ impl DepthNodes {
         lazy_scan: instrument::Node::NONE,
     };
 
-    /// Counts an inner row the scan returned.
-    fn scanned(self, depth: usize) {
+    /// Counts an inner row the scan returned: for a lazy copy, whether the
+    /// scan read it rather than a loop reading it again from the copy.
+    fn scanned(self, depth: usize) -> bool {
         if !self.lazy_scan.measured() {
             self.scan.row();
+            true
         } else if materialized_read(depth) {
             self.lazy_scan.row();
+            true
+        } else {
+            false
         }
     }
 
@@ -10047,8 +10052,56 @@ fn scan_source_mode<'a>(
             }
         }
         if scope.n >= 2 {
-            nodes.scanned(count - 1);
+            let fresh = nodes.scanned(count - 1);
+            // Without a lazy copy the first loop reads every row.
+            let read = if nodes.lazy_scan.measured() {
+                fresh
+            } else {
+                nodes.materialize.loops() == 0
+            };
             nodes.materialize.row();
+            // The rows the scan reads fill the copy's tuplestore; the loops
+            // read them again.
+            let table = order[count - 1];
+            // A derived table's copy holds its query's output columns.
+            let derived_columns = || {
+                let mut columns = instrument::HashColumns::EMPTY;
+                for column in 0..scope.row_width(table) {
+                    columns.push(instrument::HashColumn::Column(u16::try_from(column).ok()?))?;
+                }
+                Some(columns)
+            };
+            if read
+                && nodes.materialize.measured()
+                && let Some(columns) = nodes.materialize.hash_columns().or_else(|| {
+                    scope.derived[table]
+                        .is_some()
+                        .then(derived_columns)
+                        .flatten()
+                })
+            {
+                let mut schema = [ColType::Bool; MAX_COLUMNS];
+                let width = scope.row_width(table);
+                let definition = scope.defs.get(table).expect("resolved");
+                for (ctype, column) in schema.iter_mut().zip(&definition.columns[..width]) {
+                    *ctype = column.ctype;
+                }
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                if let Some(row) = bound[table] {
+                    decode_hash_source(
+                        row,
+                        &schema[..width],
+                        scope.derived[table].is_some(),
+                        arena,
+                        &mut values,
+                    )?;
+                    nodes.materialize.store_row(instrument::minimal_tuple_len(
+                        columns.as_slice(),
+                        &values[..width],
+                        &schema[..width],
+                    ));
+                }
+            }
         }
         if let Some(on) = on {
             let row = assemble(

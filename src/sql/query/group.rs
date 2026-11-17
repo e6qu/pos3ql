@@ -214,6 +214,17 @@ pub(super) fn groups_for_mask<'a>(
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
+        // PostgreSQL sorts the grouping columns, when the aggregates read
+        // no column (see the in-memory path).
+        if input_sort.measured() && grouping_sort_is_keys(statement, agg_nodes, mask) {
+            let columns: [usize; crate::sql::parser::MAX_GROUP_TERMS] =
+                core::array::from_fn(|column| column);
+            sorter.size_as_postgres(instrument::SortTuples::new(
+                Some(&columns[..n_keys]),
+                0,
+                false,
+            ));
+        }
         // Equal keys keep input order, so each group reports its first input
         // row's key, as PostgreSQL's hashed grouping does.
         let input_position = |row: &[u8]| match crate::sql::exec::decode_projected_pub(row, n_keys)
@@ -407,16 +418,27 @@ pub(super) fn groups_for_mask<'a>(
                     .then(left.1.cmp(&right.1)),
             )
         })?;
-        if n_keys > 0 {
-            let bytes = keys
-                .iter()
-                .fold(core::mem::size_of_val(&*keys), |bytes, key| {
-                    bytes.saturating_add(key.0.len())
-                });
-            input_sort.sorted(instrument::SortSpace {
-                method: instrument::SortMethod::Quicksort,
-                bytes,
-            });
+        if n_keys > 0 && input_sort.measured() {
+            // PostgreSQL sorts the rows its scan returns: the grouping
+            // columns, and the aggregates' input columns, which pos3ql's
+            // key rows do not hold.
+            let key_only = grouping_sort_is_keys(statement, agg_nodes, mask);
+            let space = if key_only {
+                let rows = arena
+                    .alloc_slice_with(keys.len(), |at| keys[at].0)
+                    .map_err(|_| arena_full())?;
+                instrument::SortSpace::postgres(rows, None, false)
+            } else {
+                instrument::SortSpace {
+                    method: instrument::SortMethod::Quicksort,
+                    bytes: keys
+                        .iter()
+                        .fold(core::mem::size_of_val(&*keys), |bytes, key| {
+                            bytes.saturating_add(key.0.len())
+                        }),
+                }
+            };
+            input_sort.sorted(space);
         }
         let ng = {
             let mut g = 0usize;
@@ -468,6 +490,24 @@ pub(super) fn groups_for_mask<'a>(
     };
     if n_keys > 0 {
         input_sort.rows(row_count as u64);
+    }
+    if n_keys > 0
+        && let Some(sizing) = aggregate.hash_agg_sizing()
+    {
+        let mut columns = [0usize; crate::sql::parser::MAX_GROUP_TERMS];
+        let mut count = 0;
+        for key in (0..n_keys).filter(|&key| mask.contains(key)) {
+            columns[count] = key;
+            count += 1;
+        }
+        record_hash_agg_memory(
+            aggregate,
+            sizing,
+            &group_of[..row_count],
+            rep_keys,
+            &columns[..count],
+            arena,
+        )?;
     }
 
     // Correlated subquery nodes appearing in the select list, HAVING, or the
@@ -1123,7 +1163,28 @@ pub(super) fn grouped_rows<'a>(
         };
         // Past twice its limit's bound the sort keeps only a heap of the
         // rows the limit returns, as PostgreSQL's does.
+        let bounded = bound.filter(|_| !statement.distinct);
         let bound = bound.filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
+        let mut columns = [0usize; MAX_PROJ];
+        let count = super::postgres_sort_columns(
+            width,
+            statement.items,
+            &order_exprs[..n_order],
+            &mut columns,
+        );
+        // The memory PostgreSQL's sort reports, from the rows in arrival
+        // order.
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
+                out_rows,
+                Some(&columns[..count]),
+                0,
+                bound,
+                arena,
+                compare,
+            )?,
+            _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false),
+        };
         match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
@@ -1134,9 +1195,7 @@ pub(super) fn grouped_rows<'a>(
                 crate::mem::arena::try_stable_sort_via(arena, out_rows, compare, |_| arena_full())?
             }
         }
-        stages
-            .sort
-            .sorted(instrument::SortSpace::in_memory(out_rows, bound.is_some()));
+        stages.sort.sorted(space);
     }
 
     Ok((out_rows, width))
@@ -1551,4 +1610,133 @@ pub(super) fn ungrouped_column<'e, 'a>(
         }
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }
+}
+
+/// Under `EXPLAIN ANALYZE`, records the memory PostgreSQL's hash aggregate
+/// reports for these groups: each input row, in arrival order, looks its
+/// group (`group_of`) up, and a group's first row adds its representative
+/// tuple of the hashed `columns` of its key (`rep_keys`).
+pub(super) fn record_hash_agg_memory(
+    aggregate: instrument::Node,
+    sizing: super::postgres_memory::HashAggSizing,
+    group_of: &[u32],
+    rep_keys: &[&[u8]],
+    columns: &[usize],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(mut memory) = super::postgres_memory::HashAggMemory::new(sizing) else {
+        return Ok(());
+    };
+    let seen = arena
+        .alloc_slice_with(rep_keys.len(), |_| false)
+        .map_err(|_| arena_full())?;
+    for &group in group_of {
+        let group = group as usize;
+        let new = if seen.get(group).copied() == Some(false) {
+            seen[group] = true;
+            let Some(length) =
+                super::postgres_memory::projected_tuple_len(rep_keys[group], Some(columns))
+            else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN ANALYZE of a hash aggregate grouping by a value without a PostgreSQL storage size is not supported"
+                ));
+            };
+            Some(length)
+        } else {
+            None
+        };
+        memory.lookup(new);
+    }
+    aggregate.hash_agg_peak(memory.peak());
+    Ok(())
+}
+
+/// Under `EXPLAIN ANALYZE`, records the memory of a hash aggregate that
+/// keeps the distinct rows of `parts` (read in order, each row's first
+/// `width` values its key): every row looks its key up, and a key's first
+/// row adds its tuple.
+pub(super) fn record_distinct_hash_memory(
+    node: instrument::Node,
+    parts: &[&[&[u8]]],
+    width: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(sizing) = node.hash_agg_sizing() else {
+        return Ok(());
+    };
+    let total = parts.iter().map(|part| part.len()).sum::<usize>();
+    // Each row with its arrival position, ordered by key and then
+    // position: a key's first row in that order arrived first.
+    let mut position = 0usize;
+    let ordered = arena
+        .alloc_slice_with(total, |_| (&[][..], 0usize))
+        .map_err(|_| arena_full())?;
+    for part in parts {
+        for &row in *part {
+            ordered[position] = (row, position);
+            position += 1;
+        }
+    }
+    crate::mem::arena::try_stable_sort_via(
+        arena,
+        ordered,
+        |left, right| {
+            crate::sql::exec::compare_projected_prefix(storage, txid, left.0, right.0, width)
+        },
+        |_| arena_full(),
+    )?;
+    let mut groups = 0u32;
+    let group_of = arena
+        .alloc_slice_with(total, |_| 0u32)
+        .map_err(|_| arena_full())?;
+    let keys = arena
+        .alloc_slice_with(total, |_| &[][..])
+        .map_err(|_| arena_full())?;
+    for at in 0..total {
+        let new = at == 0
+            || !crate::sql::exec::compare_projected_prefix(
+                storage,
+                txid,
+                ordered[at - 1].0,
+                ordered[at].0,
+                width,
+            )?
+            .is_eq();
+        if new {
+            keys[groups as usize] = ordered[at].0;
+            groups += 1;
+        }
+        group_of[ordered[at].1] = groups - 1;
+    }
+    let columns = arena
+        .alloc_slice_with(width, |column| column)
+        .map_err(|_| arena_full())?;
+    record_hash_agg_memory(
+        node,
+        sizing,
+        group_of,
+        &keys[..groups as usize],
+        columns,
+        arena,
+    )
+}
+
+/// Whether PostgreSQL's sort of a `GroupAggregate`'s input holds only the
+/// grouping columns pos3ql's key rows hold: every key is in the set and no
+/// aggregate reads a column.
+fn grouping_sort_is_keys(
+    statement: &Select<'_>,
+    agg_nodes: &[(*const Expr<'_>, &Expr<'_>)],
+    mask: GroupingSet<'_>,
+) -> bool {
+    (0..statement.group_by.len()).all(|key| mask.contains(key))
+        && agg_nodes.iter().all(|(_, aggregate)| match aggregate {
+            Expr::Call { args, filter, .. } => {
+                filter.is_none() && args.iter().all(|argument| argument.is_constant(false))
+            }
+            _ => false,
+        })
 }

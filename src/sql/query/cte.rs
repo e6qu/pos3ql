@@ -496,22 +496,18 @@ fn with_schema_context<'a, 's, R>(
             if let Some(visit) = &mut visit {
                 visit(ScopedCte::Select(query))?;
             }
+            let volatile = select_contains_volatile(query, storage, txid);
             let runs_once_planned = match &planned {
                 Some(planned) => {
                     let references = cte_plan_references(with, index, cte, planned.root_references);
-                    references > 0
-                        && runs_once(
-                            cte.materialization,
-                            references,
-                            select_contains_volatile(query, storage, txid),
-                        )
+                    references > 0 && runs_once(cte.materialization, references, volatile)
                 }
                 None => false,
             };
             if let Some(planned) = planned.as_mut().filter(|_| runs_once_planned) {
                 // Described, not run: a plan reads only the rows' shape.
                 let relation =
-                    materialize_query_cte(cte, index, query, storage, txid, arena, None)?;
+                    materialize_query_cte(cte, index, query, volatile, storage, txid, arena, None)?;
                 materialized
                     .push((cte.name, relation))
                     .map_err(|_| arena_full())?;
@@ -5021,8 +5017,9 @@ fn with_exec_context<'a, 's, 'e, R>(
                 // query reading it, folding the CTE's constants then, even
                 // when no row of the query ever reads the CTE.
                 super::check_select_constants(query, arena, storage, txid)?;
-                let relation =
-                    materialize_query_cte(cte, cte_index, query, storage, txid, arena, enclosing)?;
+                let relation = materialize_query_cte(
+                    cte, cte_index, query, volatile, storage, txid, arena, enclosing,
+                )?;
                 materialized
                     .push((cte.name, relation))
                     .map_err(|_| arena_full())?;
@@ -5146,6 +5143,7 @@ fn materialize_query_cte<'a>(
     cte: &Cte<'a>,
     position: usize,
     query: &'a Select<'a>,
+    volatile: bool,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -5205,8 +5203,10 @@ fn materialize_query_cte<'a>(
         .alloc_slice_with(ncols, |index| described[index].collation)
         .map_err(|_| arena_full())?;
     let deferred = crate::sql::ast::DeferredCteQuery {
+        name,
         tree,
         block,
+        volatile,
         rows: arena.alloc_atomic_usize(0).map_err(|_| arena_full())?,
     };
     arena

@@ -39292,6 +39292,39 @@ fn recursive_cte_retains_its_declared_collation() {
 }
 
 #[test]
+fn deferred_cte_reads_resume_and_refuse_volatile_reruns() {
+    let (mut engine, mut budget) = test_engine();
+    // A later reader past an earlier one's stop reruns a stable query.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE lazy_values (a int); \
+         INSERT INTO lazy_values SELECT generate_series(1, 50); \
+         WITH c AS (SELECT a, 10 / (a - 40) AS x FROM lazy_values) \
+         SELECT (SELECT a FROM c LIMIT 1), (SELECT a FROM c OFFSET 20 LIMIT 1)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|21"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    // A volatile query would evaluate its first rows again.
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE lazy_sequence; \
+         WITH c AS (SELECT nextval('lazy_sequence') AS v FROM lazy_values) \
+         SELECT (SELECT v FROM c LIMIT 1), (SELECT v FROM c OFFSET 2 LIMIT 1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn recursive_cte_reuses_materialized_relation_metadata() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

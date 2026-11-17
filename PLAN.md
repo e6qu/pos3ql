@@ -1064,18 +1064,49 @@ locked; rows read in scan order are locked as the scan returns them, and the
 scan stops once the limit has its rows, as the `Limit` pulls them. An analyzed sort prints PostgreSQL's `Sort Method` (`quicksort`, or
 `top-N heapsort` when a limit directly above bounds it and it read more than
 twice the bound, which pos3ql then also keeps to a heap of the bounded rows;
-`external merge` when its rows spilled to disk) and the space of the rows it
-held in pos3ql's own encoding, which differs from PostgreSQL's allocator
-figures. Each window clause plans its own `WindowAgg` in PostgreSQL's
+`external merge` when its rows spilled to disk) and the memory
+`tuplesort_get_stats` reports: its `SortTuple` array (1024 slots, grown as
+`grow_memtuples` grows it) and each row's minimal tuple, a maxaligned bump
+chunk, an aset.c chunk when a limit may bound the sort, nothing for a datum
+sort of one column; a bounded heap charges the rows `make_bounded_heap`
+leaves charged, including the rows it replaced while heapifying
+(`differential_exact/476`, `820`). A sort's rows hold its output columns,
+the sort keys that are not among them and the `ctid`s a row lock reads; a
+`GroupAggregate`'s input sort is sized only when its aggregates read no
+column (pos3ql's grouping keys lack the aggregates' inputs), and a value of
+a type without a PostgreSQL size here (`jsonb`, arrays, records) or a sort
+past `work_mem` keeps pos3ql's own figure. A hash aggregate prints `Batches:
+1  Memory Usage` as `hash_agg_update_metrics` measures it once its input
+ends: the meta context (first block, the bucket array `simplehash` sizes
+from the planned groups and grows at its 0.9 fill factor, the table's
+expressions measured on PostgreSQL 18.6 for one to seven grouping columns,
+and the expression context under it), the bump context of the entries and
+the context of by-reference transition states (array initial values and the
+`Int128AggState` of integer averages and sums are modelled). `EXPLAIN
+ANALYZE` of a hash aggregate with another by-reference state (`numeric`
+sums, text `min`/`max`, collecting aggregates) or more than seven grouping
+columns fails with `0A000`; a table that would spill (`Batches` above 1) is
+not modelled, and outside the cost model the bucket array is sized from
+pos3ql's group estimate. A `CTE Scan` prints its query's tuplestore
+(`tuplestore_get_stats`: 2048 row pointers, doubled when a row reaches the
+last free slot, and each row's generation chunk), also when it never ran;
+a `Recursive Union` the sum of its working and intermediate tables, each
+cleared before it is refilled; a nested loop's `Materialize` the tuplestore
+of the inner rows its scan read (`differential_exact/537`, `561`, `534`,
+`536`, `820`). Each window clause plans its own `WindowAgg` in PostgreSQL's
 evaluation order, named `w1`, `w2`, ... when unnamed and printing its
 `Window:` definition (with the `ROWS UNBOUNDED PRECEDING` frame PostgreSQL
 gives windows of frame-independent functions), over a `Sort` of its input
 or an `Incremental Sort` when the rows already follow a prefix of its keys;
 a query `ORDER BY` the last window's rows follow needs no sort. Under
-`ANALYZE` a window prints its `Storage:` line, its bytes pos3ql's own, and
-the query's `Incremental Sort` over a window prints its `Full-sort Groups`
-and `Pre-sorted Groups` lines, batched as `nodeIncrementalSort.c` batches
-its input (the memory figures pos3ql's own). A
+`ANALYZE` a window prints its `Storage:` line, and the query's `Incremental
+Sort` over a window prints its `Full-sort Groups` and `Pre-sorted Groups`
+lines, batched as `nodeIncrementalSort.c` batches its input. Remaining: the
+window's storage, the sorts under windows and the incremental sort's group
+memory are pos3ql's own figures; PostgreSQL's need the window's
+`tuplestore_trim` points (its read and mark pointers per frame) and each
+batch's tuplesort reuse, which `differential_exact/472` and `564` still
+mask. A
 condition folded to false keeps the query's sort, limit, row locks,
 aggregation and windows over a `Result` with a false `One-Time Filter`. A
 subquery the planner does not merge runs as a subplan: an uncorrelated
@@ -1157,8 +1188,10 @@ limited rows, and a subquery's `LIMIT` without `ORDER BY` stops its scan
 once it has its rows. Still differing: an ordinary `WITH` query PostgreSQL
 runs once still runs whole when first read, and a recursive one read by a
 join, or by a recursive term that reads only part of an iteration, runs an
-iteration at a time where PostgreSQL pulls single rows; `ANALYZE` prints no
-`Storage:` lines for `CTE Scan` and `Recursive Union`; a `CTE Scan` in a
+iteration at a time where PostgreSQL pulls single rows (so a `WITH` query
+PostgreSQL never reads, or reads only partly under a `LIMIT`, runs whole
+here, evaluating and erroring on rows PostgreSQL never computes, and its
+`CTE Scan`'s storage counts every row); a `CTE Scan` in a
 scalar subquery's `InitPlan` prints `never executed`; a
 data-modifying `WITH` query's `INSERT ... SELECT` from a table prints no
 `ANALYZE` figures (its write runs on a path that does not enter the query's
@@ -1194,7 +1227,7 @@ use `DEFAULT`, a defaulted identity, serial or generated column,
 an `INSERT ... SELECT`'s `RETURNING` list and an `INSERT` into a view, a
 `(record).*` item, a sort below a postponed select list (whose input PostgreSQL
 computes without the postponed expressions), and an `EXISTS` subplan's
-list (the output columns' names are printed there), aggregate and `Materialize` storage lines, per-node `Buffers`
+list (the output columns' names are printed there), per-node `Buffers`
 and `WAL` (reported on the top node only), trigger time lines, an index-only
 scan's `Heap Fetches` and a bitmap heap scan's `Heap Blocks`. `EXPLAIN
 ANALYZE` of a joined `UPDATE` or `DELETE` counts the scans (each member's

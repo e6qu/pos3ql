@@ -2147,6 +2147,14 @@ pub(crate) fn materialized_rows<'a>(
     let mut live = rows.len();
     let scanned = live;
     if statement.distinct && n_on == 0 {
+        super::group::record_distinct_hash_memory(
+            stages.unique,
+            &[&rows[..]],
+            width,
+            storage,
+            txid,
+            arena,
+        )?;
         live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
@@ -2184,6 +2192,32 @@ pub(crate) fn materialized_rows<'a>(
                 b,
             )
         };
+        let mut columns = [0usize; MAX_PROJ];
+        let count = super::postgres_sort_columns(
+            width,
+            statement.items,
+            &order_exprs[..n_keys],
+            &mut columns,
+        );
+        // The memory PostgreSQL's sort reports, from the rows in arrival
+        // order.
+        let bounded = rank_window.filter(|_| !statement.distinct && n_on == 0);
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => instrument::SortSpace::postgres_top_n(
+                rows,
+                Some(&columns[..count]),
+                n_identities,
+                bound,
+                arena,
+                compare,
+            )?,
+            _ => instrument::SortSpace::postgres_locking(
+                rows,
+                Some(&columns[..count]),
+                n_identities,
+                rank_window.is_some(),
+            ),
+        };
         match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, rows, bound, compare, |_| {
@@ -2192,9 +2226,7 @@ pub(crate) fn materialized_rows<'a>(
             }
             None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
         }
-        stages
-            .sort
-            .sorted(instrument::SortSpace::in_memory(rows, bound.is_some()));
+        stages.sort.sorted(space);
     }
     // A sort under a DISTINCT returns every row it sorted.
     if stages.unique.measured() {

@@ -1789,6 +1789,16 @@ fn eval_set_tree<'a>(
             )?;
             input.rows((l.len() + r.len()) as u64);
             drop(input_loop);
+            if *operator == SetOp::Union && !*all {
+                super::group::record_distinct_hash_memory(
+                    node,
+                    &[l, r],
+                    collations.len(),
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
             let combined = combine_sets(storage, txid, collations, *operator, *all, l, r, arena)?;
             node.rows(combined.len() as u64);
             Ok(combined)
@@ -2404,6 +2414,13 @@ pub(crate) fn sort_set_rows(
     let compare = |a: &&[u8], b: &&[u8]| compare_set_order(storage, txid, columns, a, b, keys);
     // Past twice its limit's bound the sort keeps only a heap of the rows
     // the limit returns, as PostgreSQL's does.
+    // The memory PostgreSQL's sort reports, from the rows in arrival order.
+    let space = match bound {
+        Some(bound) if sort.measured() => {
+            instrument::SortSpace::postgres_top_n(rows, None, 0, bound, arena, compare)?
+        }
+        _ => instrument::SortSpace::postgres(rows, None, bound.is_some()),
+    };
     let bound = bound.filter(|&bound| rows.len() > bound * 2);
     match bound {
         Some(bound) => {
@@ -2411,7 +2428,7 @@ pub(crate) fn sort_set_rows(
         }
         None => crate::mem::arena::try_stable_sort_via(arena, rows, compare, |_| arena_full())?,
     }
-    sort.sorted(instrument::SortSpace::in_memory(rows, bound.is_some()));
+    sort.sorted(space);
     Ok(())
 }
 

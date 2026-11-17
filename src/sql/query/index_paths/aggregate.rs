@@ -28,6 +28,40 @@ pub(crate) struct AggregateCosts {
     pub(crate) transition_space: f64,
     /// The transition states (`list_length(root->aggtransinfos)`).
     pub(crate) transitions: usize,
+    /// The bytes each group's by-reference transition states allocate when
+    /// a hash aggregate starts the group, in state order.
+    pub(crate) per_group: [u16; MAX_SIZED_STATES],
+    pub(crate) per_group_count: usize,
+    /// A state allocates memory per group the hash aggregate memory model
+    /// does not reproduce.
+    pub(crate) unsized_states: bool,
+}
+
+use crate::sql::query::postgres_memory::MAX_SIZED_STATES;
+
+/// The bytes a transition state of transition function `function` allocates
+/// in the aggregate's memory when its group starts, as PostgreSQL 18.6 does,
+/// given that `space` is what `get_agg_clause_costs` charges for it: a copy
+/// of an array initial value (`'{0,0}'` is a 40-byte `int8[]`), or the
+/// 48-byte `Int128AggState` of the integer `avg`, `sum(int8)` and variance
+/// states. `None` for a state that allocates otherwise (text, numeric and
+/// collecting states).
+fn group_allocation(function: i32, space: f64) -> Option<u16> {
+    match function {
+        // int2_avg_accum, int4_avg_accum: `{0,0}` as `int8[]`.
+        1962 | 1963 => Some(40),
+        // float4_accum, float8_accum: `{0,0,0}` as `float8[]`.
+        208 | 222 => Some(48),
+        // float8_regr_accum: six `float8` elements.
+        2806 => Some(72),
+        // int8_avg_accum, int2_accum, int4_accum.
+        2746 | 1834 | 1835 => Some(48),
+        // Collecting states of no planned space.
+        2333 | 3173 | 3180 | 3265 | 3268 | 3535 | 3543 | 4051 | 4299 | 6225 | 6275 | 6277
+        | 6278 | 6279 | 6283 | 6285 | 6286 | 6287 => None,
+        _ if space == 0.0 => Some(0),
+        _ => None,
+    }
 }
 
 /// `AggStrategy`.
@@ -157,7 +191,7 @@ pub(crate) fn aggregate_costs<'a>(
         if let Some(filter) = filter {
             result.transition_per_tuple += charge(filter);
         }
-        result.transition_space += match aggregate.space {
+        let space = match aggregate.space {
             TransitionSpace::Fixed(bytes) => f64::from(bytes),
             TransitionSpace::Input => {
                 let Some(argument) = args.first() else {
@@ -173,6 +207,15 @@ pub(crate) fn aggregate_costs<'a>(
                 }
             }
         };
+        result.transition_space += space;
+        match group_allocation(aggregate.transition, space) {
+            Some(0) => {}
+            Some(bytes) if result.per_group_count < MAX_SIZED_STATES => {
+                result.per_group[result.per_group_count] = bytes;
+                result.per_group_count += 1;
+            }
+            Some(_) | None => result.unsized_states = true,
+        }
     }
     Ok(Some(result))
 }
@@ -284,6 +327,38 @@ pub(crate) fn planned_partitions(aggregates: &AggregateCosts, groups: f64, width
     let entry_size =
         hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
     hash_agg_set_limits(entry_size, groups).2
+}
+
+/// What sizes the memory of a hash aggregate of `groups` estimated groups
+/// over `columns` grouping columns, reading rows of `width`; `None` when a
+/// transition state's memory is outside the model.
+pub(crate) fn hash_agg_sizing(
+    aggregates: &AggregateCosts,
+    groups: f64,
+    width: f64,
+    columns: usize,
+) -> Option<crate::sql::query::postgres_memory::HashAggSizing> {
+    if aggregates.unsized_states
+        || columns == 0
+        || columns > crate::sql::query::postgres_memory::HashAggSizing::MAX_COLUMNS
+    {
+        return None;
+    }
+    let entry_size =
+        hash_agg_entry_size(aggregates.transitions, width, aggregates.transition_space);
+    let (memory, _, _) = hash_agg_set_limits(entry_size, groups);
+    Some(crate::sql::query::postgres_memory::HashAggSizing {
+        buckets: crate::sql::query::postgres_memory::HashAggSizing::buckets(
+            entry_size,
+            groups,
+            memory,
+            aggregates.transitions,
+        ),
+        columns,
+        transitions: aggregates.transitions,
+        per_group: aggregates.per_group,
+        per_group_count: aggregates.per_group_count,
+    })
 }
 
 /// `cost_agg`'s startup and total costs and its output rows, before any

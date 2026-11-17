@@ -15826,6 +15826,9 @@ impl Engine {
                         row_buffers,
                         responder,
                     )
+                    .inspect(|rows| {
+                        query::record_cte_storage(query::instrument::current_block(), rows)
+                    })
                 }?)
             };
             let materialized = arena
@@ -16542,6 +16545,7 @@ impl Engine {
                     row_buffers,
                     responder,
                 )
+                .inspect(|rows| query::record_cte_storage(query::instrument::current_block(), rows))
             }?);
             let materialized = arena
                 .alloc(materialized)

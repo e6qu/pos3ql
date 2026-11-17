@@ -125,6 +125,8 @@ struct PlanNode {
     /// The partitions a hash aggregate expects to spill its groups to,
     /// which text shows only when there are any.
     planned_partitions: Option<u32>,
+    /// What sizes a hash aggregate's memory as PostgreSQL's.
+    hash_agg: Option<query::postgres_memory::HashAggSizing>,
 }
 
 /// How a node runs a subplan: once before its first row, or per row.
@@ -264,6 +266,34 @@ impl QualLabel {
 }
 
 impl PlanNode {
+    /// A `HashAggregate` keeping distinct rows (no transition states) of
+    /// `groups` estimated groups over its key columns: its memory sizing,
+    /// or `EXPLAIN ANALYZE`'s refusal past the modelled key columns.
+    fn with_distinct_hash(mut self, groups: u64, width: u32) -> Self {
+        if self.name.as_str() != "HashAggregate" {
+            return self;
+        }
+        let columns = self
+            .keys
+            .plain
+            .as_str()
+            .split(KEY_SEPARATOR)
+            .filter(|key| !key.is_empty())
+            .count();
+        self.hash_agg = query::index_paths::hash_agg_sizing(
+            &query::index_paths::AggregateCosts::default(),
+            groups as f64,
+            f64::from(width),
+            columns,
+        );
+        if self.hash_agg.is_none() {
+            self.analyze_unsupported = Some(
+                "EXPLAIN ANALYZE of a hash aggregate of more grouping columns than PostgreSQL's memory figure is modelled for is not supported",
+            );
+        }
+        self
+    }
+
     /// This node with `qual` under `label`.
     fn with_qual(mut self, label: QualLabel, qual: Option<StackStr<512>>) -> Self {
         if let Some(qual) = qual {
@@ -397,6 +427,7 @@ impl PlanNode {
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
 }
 
@@ -561,7 +592,9 @@ impl<'a> Plan<'a> {
         let nodes = &self.nodes[..self.count];
         let slots = arena
             .alloc_slice_with(self.count, |index| {
-                Slot::new(nodes[index].key).with_hash_columns(nodes[index].hash_columns)
+                Slot::new(nodes[index].key)
+                    .with_hash_columns(nodes[index].hash_columns)
+                    .with_hash_agg(nodes[index].hash_agg)
             })
             .map_err(|_| query::arena_full_pub())?;
         let result = query::instrument::analyze(slots, timing, execute);
@@ -570,7 +603,50 @@ impl<'a> Plan<'a> {
             .map_err(|_| query::arena_full_pub())?;
         mirror_passthrough(nodes, counters);
         self.measured = Some(counters);
+        if counters
+            .iter()
+            .any(|counters| counters.cte_stored == Some(query::instrument::StoredSpace::Unsized))
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE of a WITH query returning values without a PostgreSQL storage size is not supported"
+            ));
+        }
         Ok(result)
+    }
+
+    /// What the tuplestore a `CTE Scan` at `index` reads held at most
+    /// (`show_ctescan_info`): its `WITH` query's rows once read, else the
+    /// empty store PostgreSQL creates with the scan.
+    fn cte_storage(&self, index: usize) -> Option<(bool, usize)> {
+        let node = &self.nodes[index];
+        if node.name.as_str() != "CTE Scan" {
+            return None;
+        }
+        let measured = self.measured?;
+        let named = |at: &usize| {
+            self.nodes[*at].subplan.as_ref().is_some_and(|(_, name)| {
+                name.as_str()
+                    .strip_prefix("CTE ")
+                    .is_some_and(|name| name == node.relation.as_str())
+            })
+        };
+        let root = (0..index)
+            .rev()
+            .find(named)
+            .or_else(|| (index + 1..self.count).find(named));
+        let stored = root.and_then(|root| {
+            let depth = self.nodes[root].depth;
+            (root..self.count)
+                .take_while(|&at| at == root || self.nodes[at].depth > depth)
+                .find_map(|at| measured[at].cte_stored)
+        });
+        Some(match stored {
+            Some(query::instrument::StoredSpace::Sized { disk, bytes }) => (disk, bytes),
+            Some(query::instrument::StoredSpace::Unsized) | None => {
+                (false, query::postgres_memory::Tuplestore::new().finish().1)
+            }
+        })
     }
 
     /// What the node at `index` did under `EXPLAIN ANALYZE`, as PostgreSQL
@@ -3117,6 +3193,7 @@ fn push_members(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
         ..PlanNode::EMPTY
     })?;
     for &leaf in expansion.started {
@@ -5361,6 +5438,7 @@ fn scan_node<'a>(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -6608,6 +6686,7 @@ fn plan_pulled_select<'a>(
         };
         let mut aggregate_keys = group_keys(statement, arena)?;
         let mut planned_partitions = None;
+        let mut hash_agg_sizing = None;
         let mut sets_keys = None;
         // Grouping sets outside the cost model still list PostgreSQL's
         // rollups and keys, arranged from pos3ql's own estimates.
@@ -6761,12 +6840,47 @@ fn plan_pulled_select<'a>(
                 aggregate_name = "GroupAggregate";
             }
             planned_partitions = path.planned_partitions;
+            hash_agg_sizing = Some(path.hash_agg);
             aggregate_keys = Some(grouped.group_keys);
             aggregate_startup = path.startup;
             total_cost = path.total;
             estimated_rows = path.rows as u64;
             width = grouped.width;
         }
+        // A hash table's memory, sized from pos3ql's own estimates outside
+        // the cost model.
+        let hash_agg = if aggregate_name == "HashAggregate" && sets_keys.is_none() {
+            match hash_agg_sizing {
+                Some(sizing) => sizing,
+                None => {
+                    let expressions = arena
+                        .alloc_slice_with(statement.items.len() + 1, |at| {
+                            match statement.items.get(at) {
+                                Some(SelectItem::Expr { expression, .. }) => *expression,
+                                _ => statement.having.unwrap_or(&Expr::Null),
+                            }
+                        })
+                        .map_err(|_| arena_full())?;
+                    query::index_paths::aggregate_costs(expressions, storage, txid, columns, arena)?
+                        .and_then(|aggregates| {
+                            query::index_paths::hash_agg_sizing(
+                                &aggregates,
+                                estimated_rows as f64,
+                                f64::from(width),
+                                statement.group_by.len(),
+                            )
+                        })
+                }
+            }
+        } else {
+            None
+        };
+        let hash_agg_unsupported = (aggregate_name == "HashAggregate"
+            && sets_keys.is_none()
+            && hash_agg.is_none())
+        .then_some(
+            "EXPLAIN ANALYZE of a hash aggregate whose transition states or grouping columns PostgreSQL's memory figure is not modelled for is not supported",
+        );
         add_stage(
             &mut stages,
             &mut stage_count,
@@ -6774,6 +6888,8 @@ fn plan_pulled_select<'a>(
                 name: StackStr::from_str(aggregate_name),
                 key: Some(NodeKey::new(aggregated_block, Role::Aggregate)),
                 planned_partitions,
+                hash_agg,
+                analyze_unsupported: hash_agg_unsupported,
                 keys: match aggregate_keys
                     .filter(|_| !statement.group_by.is_empty() && !constant_group)
                 {
@@ -7077,7 +7193,8 @@ fn plan_pulled_select<'a>(
                 object_requests,
                 cache_blocks,
                 ..PlanNode::EMPTY
-            },
+            }
+            .with_distinct_hash(estimated_rows, width),
         )?;
     }
     // A locking clause locks each row below the limit, as PostgreSQL's
@@ -7945,7 +8062,6 @@ fn plan_pulled_select<'a>(
                         }),
                         hash_columns: block_targets
                             .as_ref()
-                            .filter(|_| hash_join)
                             .and_then(|found| found.hashed_columns(table)),
                         depth: scan.depth,
                         total_cost: scan.total_cost,
@@ -9931,6 +10047,7 @@ fn physical_scan_node(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     }
 }
 
@@ -10106,6 +10223,13 @@ fn push_set_tree(
                 bitmap_index_estimate: None,
                 analyze_unsupported: None,
                 planned_partitions: None,
+                hash_agg: None,
+            };
+            let node = if hashed_union {
+                let width = node.width;
+                node.with_distinct_hash(rows, width)
+            } else {
+                node
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -10726,6 +10850,7 @@ fn plan_write<'a>(
         bitmap_index_estimate: None,
         analyze_unsupported: None,
         planned_partitions: None,
+        hash_agg: None,
     };
     plan.push(target_node)?;
     if let Some(slot) = relation_slot(storage, txid, target.schema, target.name)
@@ -13324,6 +13449,34 @@ pub(super) fn visit_text_rows<E>(
             );
             emit(line.as_str())?;
         }
+        // `show_hashagg_info`, which an aggregate prints between its
+        // `Filter` and the rows that removed.
+        let planned = options
+            .costs
+            .then_some(node.planned_partitions)
+            .flatten()
+            .filter(|&partitions| partitions > 0);
+        let peak = match node_actual {
+            NodeActual::Ran(counters) => counters.hash_agg_peak,
+            NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
+        };
+        let hash_agg_line = (planned.is_some() || peak.is_some()).then(|| {
+            let mut line = StackStr::<128>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            if let Some(partitions) = planned {
+                let _ = write!(line, "Planned Partitions: {partitions}");
+            }
+            if let Some(bytes) = peak {
+                if planned.is_some() {
+                    let _ = write!(line, "  ");
+                }
+                let _ = write!(line, "Batches: 1  Memory Usage: {}kB", bytes.div_ceil(1024));
+            }
+            line
+        });
+        let mut hash_agg_shown = false;
         for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
             for _ in 0..node_indent(node) {
@@ -13331,6 +13484,10 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(qual, "{}: {}", label.text(), text);
             emit(qual.as_str())?;
+            if let Some(line) = hash_agg_line.as_ref().filter(|_| !hash_agg_shown) {
+                emit(line.as_str())?;
+                hash_agg_shown = true;
+            }
             // In text PostgreSQL leaves out a count of no rows.
             if let Some((removed_label, removed)) = removed_count(node, node_actual, label)
                 && removed > 0.0
@@ -13343,14 +13500,7 @@ pub(super) fn visit_text_rows<E>(
                 emit(line.as_str())?;
             }
         }
-        if options.costs
-            && let Some(partitions) = node.planned_partitions.filter(|&partitions| partitions > 0)
-        {
-            let mut line = StackStr::<64>::new();
-            for _ in 0..node_indent(node) {
-                let _ = write!(line, " ");
-            }
-            let _ = write!(line, "Planned Partitions: {partitions}");
+        if let Some(line) = hash_agg_line.as_ref().filter(|_| !hash_agg_shown) {
             emit(line.as_str())?;
         }
         for line in index_scan_details(node, node_actual) {
@@ -13398,6 +13548,21 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(
                 line,
                 "Storage: Memory  Maximum Storage: {}kB",
+                bytes.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
+        if actual.is_some()
+            && let Some((disk, bytes)) = plan.cte_storage(index)
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Storage: {}  Maximum Storage: {}kB",
+                if disk { "Disk" } else { "Memory" },
                 bytes.div_ceil(1024)
             );
             emit(line.as_str())?;
@@ -14602,6 +14767,15 @@ fn structured_node(
     {
         document.number("Planned Partitions", partitions);
     }
+    if let NodeActual::Ran(NodeCounters {
+        hash_agg_peak: Some(bytes),
+        ..
+    }) = node_actual
+    {
+        document.number("HashAgg Batches", 1);
+        document.number("Peak Memory Usage", bytes.div_ceil(1024));
+        document.number("Disk Usage", 0);
+    }
     let counters = match node_actual {
         NodeActual::Unmeasured => None,
         NodeActual::NeverExecuted => Some(NodeCounters::default()),
@@ -14655,6 +14829,12 @@ fn structured_node(
     }) = node_actual
     {
         document.text("Storage", "Memory");
+        document.number("Maximum Storage", bytes.div_ceil(1024));
+    }
+    if actual.is_some()
+        && let Some((disk, bytes)) = plan.cte_storage(at)
+    {
+        document.text("Storage", if disk { "Disk" } else { "Memory" });
         document.number("Maximum Storage", bytes.div_ceil(1024));
     }
     if !node.relations.is_empty() {
@@ -14927,7 +15107,9 @@ pub(super) fn analyze_rewritten<'a, R>(
             if let RewrittenQuery::Planned(plan) = query {
                 if index < plan.count {
                     let node = &plan.nodes[index];
-                    return Slot::new(node.key).with_hash_columns(node.hash_columns);
+                    return Slot::new(node.key)
+                        .with_hash_columns(node.hash_columns)
+                        .with_hash_agg(node.hash_agg);
                 }
                 index -= plan.count;
             }

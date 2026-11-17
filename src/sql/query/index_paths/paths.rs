@@ -2703,6 +2703,16 @@ fn grouped<'a>(
         input_sort: (!hashed_chosen).then_some(input_sort),
         planned_partitions: hashed_chosen
             .then(|| super::aggregate::planned_partitions(&grouping.aggregates, groups, width)),
+        hash_agg: hashed_chosen
+            .then(|| {
+                super::aggregate::hash_agg_sizing(
+                    &grouping.aggregates,
+                    groups,
+                    width,
+                    columns.len(),
+                )
+            })
+            .flatten(),
         startup: aggregate.startup,
         total: aggregate.total,
         rows: groups,

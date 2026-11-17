@@ -139,6 +139,7 @@ pub(crate) use cte::{
 };
 pub(crate) mod instrument;
 mod outer_joins;
+pub(crate) mod postgres_memory;
 mod pullup;
 pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;
@@ -1309,9 +1310,13 @@ pub(crate) fn read_deferred_cte<'a>(
         }
         // SAFETY: the rows live in this arena's persistent tail, which only
         // a reset reclaims, and a reset needs the arena's unique borrow.
-        return Ok(unsafe {
+        let rows: &'a [&'a [u8]] = unsafe {
             core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
-        });
+        };
+        // A later attempt of the statement reads the rows an earlier one
+        // ran; its counters restarted.
+        record_cte_storage(deferred.block, rows);
+        return Ok(rows);
     }
     let Some(query) = query else {
         return Err(sql_err!(
@@ -1331,6 +1336,7 @@ pub(crate) fn read_deferred_cte<'a>(
             .as_ref()
             .map(|variables| variables as &dyn ColumnLookup<'a>),
     )?;
+    record_cte_storage(deferred.block, rows);
     // A dry run (such as CREATE TABLE AS counting its rows first) previews
     // sequence values; the run that consumes them must evaluate again.
     if query
@@ -1362,6 +1368,27 @@ pub(crate) fn read_deferred_cte<'a>(
         core::sync::atomic::Ordering::Relaxed,
     );
     Ok(kept)
+}
+
+/// Under `EXPLAIN ANALYZE`, records the memory the tuplestore of the `WITH`
+/// query run in `block` holds for `rows` (`nodeCtescan.c` stores every row
+/// the query returned), which its `CTE Scan`s report.
+pub(crate) fn record_cte_storage(block: instrument::BlockId, rows: &[&[u8]]) {
+    if !instrument::active() {
+        return;
+    }
+    let mut store = postgres_memory::Tuplestore::new();
+    for row in rows {
+        match postgres_memory::projected_tuple_len(row, None) {
+            Some(length) => store.put(length),
+            None => {
+                instrument::cte_stored(block, instrument::StoredSpace::Unsized);
+                return;
+            }
+        }
+    }
+    let (disk, bytes) = store.finish();
+    instrument::cte_stored(block, instrument::StoredSpace::Sized { disk, bytes });
 }
 
 /// Ends the attempt of a data-modifying `WITH` query's step at the start of
@@ -2568,6 +2595,7 @@ impl RoutineInvocationState {
         if let Some(Some(end)) = table.producer_end(statement_arena, key)? {
             end.skip()?;
         }
+        record_cte_storage(source.block, rows.as_slice());
         Ok(rows.as_slice())
     }
 
@@ -10540,6 +10568,41 @@ pub(super) struct ResolvedSortKey<'a> {
     source: SortKeySource,
 }
 
+/// The columns of a projected row of `width` output columns followed by
+/// `keys`' values that PostgreSQL's sort holds: the output columns and a
+/// junk column for each key that is not one of them or an earlier key
+/// (`findTargetlistEntrySQL92`). Writes them to `columns` and returns how
+/// many there are.
+pub(super) fn postgres_sort_columns(
+    width: usize,
+    items: &[SelectItem<'_>],
+    keys: &[Option<ResolvedSortKey<'_>>],
+    columns: &mut [usize; MAX_PROJ],
+) -> usize {
+    // A column a `*` lists is an output column too.
+    let wildcard = items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)));
+    let mut count = 0;
+    for column in 0..width.min(MAX_PROJ) {
+        columns[count] = column;
+        count += 1;
+    }
+    for (index, key) in keys.iter().enumerate() {
+        if count == MAX_PROJ {
+            break;
+        }
+        if key.is_some_and(|key| {
+            matches!(key.source, SortKeySource::Expression)
+                && !(wildcard && matches!(key.expression, Expr::Column { .. }))
+        }) {
+            columns[count] = width + index;
+            count += 1;
+        }
+    }
+    count
+}
+
 impl<'a> ResolvedSortKey<'a> {
     pub(super) fn value(
         self,
@@ -15009,6 +15072,16 @@ pub(crate) fn constant_select_resumable<'a>(
 
     let mut live = out_rows.len();
     if statement.distinct {
+        if let Err(error) = group::record_distinct_hash_memory(
+            stages.unique,
+            &[out_rows],
+            width,
+            storage,
+            txid,
+            arena,
+        ) {
+            return sql_fail(error);
+        }
         live = match super::exec::sort_dedup_projected(storage, txid, out_rows, width) {
             Ok(live) => live,
             Err(error) => return sql_fail(error),
@@ -15063,8 +15136,35 @@ pub(crate) fn constant_select_resumable<'a>(
         };
         // Past twice its limit's bound the sort keeps only a heap of the
         // rows the limit returns, as PostgreSQL's does.
-        let bound = group::sort_bound(statement, limit, offset)
-            .filter(|&bound| !statement.distinct && out_rows.len() > bound * 2);
+        // The sort holds the output columns and the keys that are not.
+        let mut columns = [0usize; MAX_PROJ];
+        let mut count = 0;
+        for column in (0..width)
+            .chain((0..n_order).filter_map(|key| order_item[key].is_none().then_some(width + key)))
+        {
+            columns[count] = column;
+            count += 1;
+        }
+        // The memory PostgreSQL's sort reports, from the rows in arrival
+        // order.
+        let bounded = group::sort_bound(statement, limit, offset).filter(|_| !statement.distinct);
+        let space = match bounded {
+            Some(bound) if stages.sort.measured() => {
+                match instrument::SortSpace::postgres_top_n(
+                    out_rows,
+                    Some(&columns[..count]),
+                    0,
+                    bound,
+                    arena,
+                    compare,
+                ) {
+                    Ok(space) => space,
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            _ => instrument::SortSpace::postgres(out_rows, Some(&columns[..count]), false),
+        };
+        let bound = bounded.filter(|&bound| out_rows.len() > bound * 2);
         let sorted = match bound {
             Some(bound) => {
                 crate::mem::arena::try_stable_top_n_via(arena, out_rows, bound, compare, |_| {
@@ -15079,9 +15179,7 @@ pub(crate) fn constant_select_resumable<'a>(
             return sql_fail(error);
         }
         stages.sort.rows(out_rows.len() as u64);
-        stages
-            .sort
-            .sorted(instrument::SortSpace::in_memory(out_rows, bound.is_some()));
+        stages.sort.sorted(space);
     }
 
     let start = (offset as usize).min(out_rows.len());

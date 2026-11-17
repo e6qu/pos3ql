@@ -8365,6 +8365,7 @@ impl<'a> RecursiveCteQuery<'a> {
             }
             &kept_rows[..kept]
         };
+        super::instrument::node(super::instrument::Role::SetOperation(0)).recursive_step(fresh);
         if fresh.is_empty() {
             return Ok((
                 RecursiveProgress {

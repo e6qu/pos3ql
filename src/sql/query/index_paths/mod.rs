@@ -36,7 +36,9 @@ mod predicate;
 
 pub(crate) use expressions::{ExpressionVariables, KeyReader};
 
-pub(crate) use aggregate::{AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg};
+pub(crate) use aggregate::{
+    AggInput, AggStrategy, AggregateCosts, aggregate_costs, cost_agg, hash_agg_sizing,
+};
 pub(crate) use append::{AppendKind, MemberPath, TreePath, member_path, member_scope};
 pub(crate) use grouping_sets::{
     GroupingSet, MAX_SET_COLUMNS, SetsPlan, SetsQuery, SetsStrategy, plan_grouping_sets,
@@ -2016,6 +2018,8 @@ pub(crate) struct GroupedPath {
     pub(crate) input_sort: Option<(f64, f64)>,
     /// The partitions a `HashAggregate` expects to spill its groups to.
     pub(crate) planned_partitions: Option<u32>,
+    /// What sizes a `HashAggregate`'s memory, when the model covers it.
+    pub(crate) hash_agg: Option<crate::sql::query::postgres_memory::HashAggSizing>,
     pub(crate) startup: f64,
     pub(crate) total: f64,
     pub(crate) rows: f64,

@@ -258,6 +258,9 @@ pub(super) struct Analyzer<'p, 's, 'a> {
     /// position past the table's columns.
     pub(super) expressions: [&'a Expr<'a>; MAX_CONJUNCTS],
     pub(super) expression_count: usize,
+    /// Operands that read another relation of a join: a nested loop's
+    /// parameters, of unknown value at planning.
+    pub(super) outer_operands: &'p [&'a Expr<'a>],
 }
 
 impl<'a> Analyzer<'_, '_, 'a> {
@@ -580,7 +583,7 @@ impl<'a> Analyzer<'_, '_, 'a> {
         self.conjuncts(&conjuncts[..count], depth)
     }
 
-    fn restriction(
+    pub(super) fn restriction(
         &mut self,
         conjunct: &'a Expr<'a>,
         depth: usize,
@@ -729,6 +732,10 @@ impl<'a> Analyzer<'_, '_, 'a> {
                 // constant of unknown value; a stable expression is
                 // estimated from its value now (`estimate_expression_value`).
                 let constant = if (matches!(operand, Expr::Param(_)) && self.params.is_empty())
+                    || self
+                        .outer_operands
+                        .iter()
+                        .any(|outer| core::ptr::eq(*outer, operand))
                     || self.init_plan_output(operand)?
                 {
                     None

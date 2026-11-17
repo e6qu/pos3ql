@@ -229,6 +229,9 @@ enum QualLabel {
     PresortedKey,
     /// A `Function Scan`'s call, which only `VERBOSE` prints.
     FunctionCall,
+    /// A `Memoize` node's parameters and how it compares them.
+    CacheKey,
+    CacheMode,
 }
 
 impl QualLabel {
@@ -243,7 +246,9 @@ impl QualLabel {
             | Self::HashCond
             | Self::MergeCond
             | Self::IndexCond
-            | Self::RecheckCond => 0,
+            | Self::RecheckCond
+            | Self::CacheKey
+            | Self::CacheMode => 0,
             Self::JoinFilter => 1,
             Self::Filter => 2,
             Self::None => 3,
@@ -263,6 +268,8 @@ impl QualLabel {
             Self::Window => "Window",
             Self::PresortedKey => "Presorted Key",
             Self::FunctionCall => "Function Call",
+            Self::CacheKey => "Cache Key",
+            Self::CacheMode => "Cache Mode",
         }
     }
 
@@ -471,6 +478,8 @@ impl NodeActual {
             | QualLabel::Window
             | QualLabel::PresortedKey
             | QualLabel::FunctionCall
+            | QualLabel::CacheKey
+            | QualLabel::CacheMode
             | QualLabel::None => return None,
         };
         Some(removed as f64 / counters.loops as f64)
@@ -490,6 +499,8 @@ impl QualLabel {
             | Self::Window
             | Self::PresortedKey
             | Self::FunctionCall
+            | Self::CacheKey
+            | Self::CacheMode
             | Self::None => None,
         }
     }
@@ -2743,30 +2754,35 @@ fn single_relation_quals<'a>(
             .alloc_slice_with(ordered.len(), |position| ordered[position].2)
             .map_err(|_| arena_full())?
     };
-    // The enclosing query's relation, whose columns print qualified.
-    let outer = OUTER_RELATIONS.with(|outer| {
+    // The enclosing query's relation, or the relations a join's
+    // parameterized scan reads, whose columns print qualified.
+    let (outer, outer_count) = OUTER_RELATIONS.with(|outer| {
         let outer = outer.borrow();
-        outer.1.checked_sub(1).map(|top| outer.0[top])
+        let count = JOIN_OUTER_RELATIONS
+            .with(core::cell::Cell::get)
+            .max(1)
+            .min(outer.1);
+        let mut taken = [(StackStr::<64>::new(), 0usize); 8];
+        for (at, held) in taken.iter_mut().enumerate().take(count) {
+            *held = outer.0[outer.1 - count + at];
+        }
+        (taken, count)
     });
-    let outer_definition = outer.map(|(_, slot)| storage.table_def(slot, txid));
-    let outer_name = match outer.as_ref() {
-        Some((name, _)) => Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?),
-        None => None,
-    };
-    let own = [crate::sql::catalog::deparse::Joined::new(exposed, &aliased)];
-    let with_outer;
-    let joined: &[crate::sql::catalog::deparse::Joined<'_>] =
-        match (outer_name, outer_definition.as_deref()) {
-            (Some(name), Some(definition)) => {
-                with_outer = [
-                    own[0],
-                    crate::sql::catalog::deparse::Joined::new(name, definition),
-                ];
-                &with_outer
-            }
-            _ => &own,
-        };
-    let outer_count = usize::from(outer.is_some());
+    let outer_definitions: [_; 8] =
+        core::array::from_fn(|at| (at < outer_count).then(|| storage.table_def(outer[at].1, txid)));
+    let mut outer_names = [""; 8];
+    for (name, (held, _)) in outer_names.iter_mut().zip(&outer).take(outer_count) {
+        *name = arena.alloc_str(held.as_str()).map_err(|_| arena_full())?;
+    }
+    let own = crate::sql::catalog::deparse::Joined::new(exposed, &aliased);
+    let mut with_outer = [own; 9];
+    for at in 0..outer_count {
+        if let Some(definition) = outer_definitions[at].as_deref() {
+            with_outer[at + 1] =
+                crate::sql::catalog::deparse::Joined::new(outer_names[at], definition);
+        }
+    }
+    let joined: &[crate::sql::catalog::deparse::Joined<'_>] = &with_outer[..=outer_count];
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
@@ -3658,7 +3674,8 @@ fn chosen_write_scan<'a>(
         query::index_paths::Planned::NotTable
         | query::index_paths::Planned::SeqOnly
         | query::index_paths::Planned::Members(_)
-        | query::index_paths::Planned::Tree(_) => Ok(None),
+        | query::index_paths::Planned::Tree(_)
+        | query::index_paths::Planned::Join(_) => Ok(None),
     }
 }
 
@@ -5738,6 +5755,38 @@ thread_local! {
     /// conditions name qualified.
     static OUTER_RELATIONS: core::cell::RefCell<([(StackStr<64>, usize); 8], usize)> =
         const { core::cell::RefCell::new(([(StackStr::new(), 0); 8], 0)) };
+    /// How many of the top [`OUTER_RELATIONS`] a join's parameterized scan
+    /// reads, all of which its conditions print qualified.
+    static JOIN_OUTER_RELATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Pushes the relations of `mask` in `scope` as the ones whose values a
+/// join's parameterized scan reads, returning how many it pushed.
+fn push_outer_mask(scope: &QueryScope<'_>, mask: u32) -> usize {
+    OUTER_RELATIONS.with(|outer| {
+        let mut outer = outer.borrow_mut();
+        let mut pushed = 0;
+        for table in 0..scope.n.min(32) {
+            if mask & 1 << table == 0 {
+                continue;
+            }
+            let count = outer.1;
+            if count == outer.0.len() {
+                break;
+            }
+            outer.0[count] = (StackStr::from_str(scope.names[table]), scope.slots[table]);
+            outer.1 = count + 1;
+            pushed += 1;
+        }
+        JOIN_OUTER_RELATIONS.with(|join| join.set(pushed));
+        pushed
+    })
+}
+
+/// Pops relations [`push_outer_mask`] pushed.
+fn pop_outer_relations(pushed: usize) {
+    JOIN_OUTER_RELATIONS.with(|join| join.set(0));
+    OUTER_RELATIONS.with(|outer| outer.borrow_mut().1 -= pushed);
 }
 
 /// Pushes the stored relations left of `table` in `scope` as relations
@@ -14017,6 +14066,24 @@ pub(super) fn visit_text_rows<E>(
             let _ = write!(line, "Batch Size: {size}");
             emit(line.as_str())?;
         }
+        if let NodeActual::Ran(counters) = node_actual
+            && let Some(cache) = counters.memoize
+        {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..node_indent(node) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(
+                line,
+                "Hits: {}  Misses: {}  Evictions: {}  Overflows: {}  Memory Usage: {}kB",
+                cache.hits,
+                cache.misses,
+                cache.evictions,
+                cache.overflows,
+                cache.peak.div_ceil(1024)
+            );
+            emit(line.as_str())?;
+        }
         if let Some(table) = hash_table(node_actual) {
             let table = PostgresHashTable::of(node, table);
             let mut line = StackStr::<256>::new();
@@ -15580,6 +15647,7 @@ fn mirror_passthrough(nodes: &[PlanNode], counters: &mut [NodeCounters]) {
                 hash: None,
                 sort: None,
                 stored: None,
+                memoize: None,
                 ..child
             };
         }

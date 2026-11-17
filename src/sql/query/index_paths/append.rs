@@ -582,7 +582,7 @@ pub(super) fn tree_path<'a>(
                 live_count += 1;
             }
             Planned::Outside(shape) => return Ok(Planned::Outside(shape)),
-            Planned::Chosen(_) | Planned::Tree(_) => {
+            Planned::Chosen(_) | Planned::Tree(_) | Planned::Join(_) => {
                 return Ok(Planned::Outside("a member planned outside its tree"));
             }
         }

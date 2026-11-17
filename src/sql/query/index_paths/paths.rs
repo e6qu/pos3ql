@@ -125,6 +125,10 @@ struct IndexPath<'a> {
     /// `cost_index`'s figures.
     startup: f64,
     total: f64,
+    /// The relations whose values its join clauses read (`PATH_REQ_OUTER`)
+    /// and its rows: the relation's, or `ppi_rows` of a parameterized path.
+    param: u8,
+    rows: f64,
 }
 
 /// A node of a bitmap: an index path, or an AND or OR of nodes.
@@ -145,6 +149,8 @@ struct BitmapNode<'a> {
     total: f64,
     /// The identities of the clauses it applies (`classify_index_clause_usage`).
     clauses: u64,
+    /// The relations its join clauses read (`PATH_REQ_OUTER`).
+    param: u8,
 }
 
 /// One candidate path of the relation, or of its ordered or limited
@@ -222,6 +228,18 @@ struct Paths<'p, 's, 'a> {
     /// Per index, the restrictions (by position) its predicate implies,
     /// which leave its scans' conditions and filters.
     predicate_implied: &'p [u64],
+    /// The join clauses of a base relation of a join, as
+    /// [`super::JoinScan::params`] lists them.
+    join: Option<JoinClauses<'a>>,
+}
+
+/// The join clauses of a base relation of a join and what costing its
+/// parameterized paths reads.
+#[derive(Clone, Copy)]
+struct JoinClauses<'a> {
+    scan: super::JoinScan,
+    /// `column = other relation's column`, each with that value unknown.
+    params: &'a [Restriction<'a>],
 }
 
 /// The result of path generation, or the shape outside the model.
@@ -239,6 +257,113 @@ macro_rules! outside {
 impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     fn costs(&self) -> Costs {
         self.planner.costs
+    }
+
+    /// `root->total_table_pages`: the pages of the query's base relations.
+    fn total_table_pages(&self) -> f64 {
+        self.join
+            .map_or(self.planner.size.pages, |join| join.scan.total_table_pages)
+    }
+
+    /// The join clause `restriction` is, by its position in
+    /// [`JoinClauses::params`].
+    fn param_of(&self, restriction: &Restriction<'a>) -> Option<usize> {
+        self.join?
+            .params
+            .iter()
+            .position(|param| core::ptr::eq(param, restriction))
+    }
+
+    /// The equivalence class of join clause `at`.
+    fn join_class(&self, at: usize) -> u8 {
+        self.join.expect("a join clause").scan.params[at].0
+    }
+
+    /// The other relation join clause `at` reads, by bit.
+    fn join_rel(&self, at: usize) -> u8 {
+        1 << self.join.expect("a join clause").scan.params[at].1
+    }
+
+    /// The relations the join clauses among `clauses` read.
+    fn clauses_param(&self, clauses: &[IndexClause<'a>]) -> u8 {
+        clauses
+            .iter()
+            .filter_map(|clause| self.param_of(clause.restriction))
+            .fold(0, |param, at| param | self.join_rel(at))
+    }
+
+    /// `get_loop_count`: the fewest rows among the relations `param`
+    /// names, or one.
+    fn loop_count(&self, param: u8) -> f64 {
+        let Some(join) = self.join else {
+            return 1.0;
+        };
+        let mut result = 0.0f64;
+        for (rel, &rows) in join.scan.rel_rows.iter().enumerate() {
+            if param & 1 << rel != 0 && (result == 0.0 || result > rows) {
+                result = rows;
+            }
+        }
+        if result > 0.0 { result } else { 1.0 }
+    }
+
+    /// The join clauses a path parameterized by `param` moves into the
+    /// scan (`ppi_clauses`): per equivalence class, the clause with its
+    /// first member among `param`, as `generate_join_implied_equalities`
+    /// chooses it.
+    fn moved_clauses(&self, param: u8, out: &mut [usize; super::MAX_JOIN_PARAMS]) -> usize {
+        let Some(join) = self.join.filter(|_| param != 0) else {
+            return 0;
+        };
+        let mut count = 0;
+        let params = &join.scan.params[..usize::from(join.scan.param_count)];
+        for (at, &(class, rel)) in params.iter().enumerate() {
+            if param & 1 << rel != 0 && !out[..count].iter().any(|&held| params[held].0 == class) {
+                out[count] = at;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// `has_indexed_join_quals` of a path parameterized by `param` whose
+    /// index applies `clauses`: each moved join clause's class has an index
+    /// condition.
+    fn indexed_join_quals(&self, clauses: &[IndexClause<'a>], param: u8) -> bool {
+        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
+        let moved_count = self.moved_clauses(param, &mut moved);
+        moved_count > 0
+            && moved[..moved_count].iter().all(|&at| {
+                let class = self.join_class(at);
+                clauses.iter().any(|clause| {
+                    self.param_of(clause.restriction)
+                        .is_some_and(|other| self.join_class(other) == class)
+                })
+            })
+    }
+
+    /// The rows of the relation's paths parameterized by `param`
+    /// (`get_parameterized_baserel_size`): its restrictions and the moved
+    /// join clauses, at most its own rows.
+    fn param_rows(&self, param: u8) -> Result<f64, SqlError> {
+        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
+        let moved_count = self.moved_clauses(param, &mut moved);
+        if moved_count == 0 {
+            return Ok(self.rows);
+        }
+        let params = self.join.expect("parameterized").params;
+        let all = self
+            .arena
+            .alloc_slice_with(moved_count + self.restrictions.len(), |at| {
+                if at < moved_count {
+                    params[moved[at]]
+                } else {
+                    self.restrictions[at - moved_count]
+                }
+            })
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        let rows = clamp_row_est(self.planner.size.tuples * self.planner.selectivity(all)?);
+        Ok(rows.min(self.rows))
     }
 
     fn index(&self, index: usize) -> &IndexInfo {
@@ -635,6 +760,52 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             .count()
     }
 
+    /// `build_index_pathkeys` of `index` scanned `backward`, truncated to
+    /// the keys useful for merging (`pathkeys_useful_for_merging`): leading
+    /// ascending keys of columns whose equivalence class reaches another
+    /// relation, a constant's class skipped as redundant.
+    fn merge_keys(&self, index: usize, backward: bool) -> Result<super::joins::Keys, Shape> {
+        let Some(join) = self.join else {
+            return Ok(super::joins::Keys::NONE);
+        };
+        let info = &self.index(index).catalog;
+        let mut keys = super::joins::Keys::NONE;
+        for position in 0..info.n_cols {
+            if info.pattern_keys[position]
+                || !info.column_collation[position]
+                || info.expression_keys[position]
+            {
+                break;
+            }
+            let column = usize::from(info.columns[position]);
+            if self.fixed & column_bit(column) != 0 {
+                continue;
+            }
+            let class = if column < 64 {
+                join.scan.classes[column]
+            } else {
+                super::NO_CLASS
+            };
+            if class == super::NO_CLASS {
+                break;
+            }
+            if keys.as_slice().contains(&class) {
+                continue;
+            }
+            // `right_merge_direction`: ascending only.
+            if info.descending[position] != backward {
+                break;
+            }
+            if info.nulls_first[position] != backward {
+                return Err("an index of a join's relation ordered with NULLs first");
+            }
+            if keys.push_class(class).is_none() {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
     /// `check_index_only`.
     fn index_only(&self, index: usize) -> bool {
         if !crate::sql::guc::planner_methods().indexonlyscan {
@@ -677,7 +848,8 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             .filter_map(|clause| match clause.restriction.clause {
                 Clause::Compare { operand, .. }
                     if !operand.is_constant(false)
-                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_)) =>
+                        && !matches!(operand, Expr::Param(_) | Expr::Subquery(_))
+                        && self.param_of(clause.restriction).is_none() =>
                 {
                     Some(
                         super::super::plan::qual_cost(
@@ -699,6 +871,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         &self,
         index: usize,
         clauses: &[IndexClause<'a>],
+        loop_count: f64,
     ) -> Result<(f64, f64, f64, f64), SqlError> {
         let planner = self.planner;
         let costs = self.costs();
@@ -853,14 +1026,18 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         } else {
             1.0
         };
-        let mut total = if sa_scans > 1.0 {
+        // Repeated scans (an array's, a nested loop's inner index scan's)
+        // fetch pages a cache may hold: the Mackert and Lohman estimate over
+        // every scan, pro-rated to one outer scan.
+        let scans = sa_scans * loop_count;
+        let mut total = if scans > 1.0 {
             let fetched = index_pages_fetched(
-                index_pages * sa_scans,
+                index_pages * scans,
                 info.pages,
-                info.pages,
+                self.total_table_pages() + info.pages,
                 costs.effective_cache_size,
             );
-            fetched * costs.random_page
+            fetched * costs.random_page / loop_count
         } else {
             index_pages * costs.random_page
         };
@@ -883,7 +1060,8 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         Ok((startup, total, selectivity, correlation))
     }
 
-    /// `create_index_path` with `cost_index`.
+    /// `create_index_path` with `cost_index`, parameterized by the
+    /// relations `param` (FROM positions by bit) when its clauses read them.
     fn index_path(
         &mut self,
         index: usize,
@@ -895,10 +1073,14 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let planner = self.planner;
         let costs = self.costs();
         let size = planner.size;
+        let param = self.clauses_param(clauses);
+        let loop_count = self.loop_count(param);
         let (index_startup, index_total, selectivity, correlation) =
-            self.btcostestimate(index, clauses)?;
+            self.btcostestimate(index, clauses, loop_count)?;
         let info = self.index(index);
-        // The restrictions the index does not apply.
+        // The restrictions the index does not apply, then the join clauses
+        // a parameterized path moves into the scan whose class no index
+        // clause applies (`extract_nonindex_conditions`).
         let mut other = QualCost::default();
         for restriction in self.restrictions {
             if !clauses
@@ -909,26 +1091,62 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 other = other.add(restriction.cost);
             }
         }
+        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
+        let moved_count = self.moved_clauses(param, &mut moved);
+        for &at in &moved[..moved_count] {
+            let class = self.join_class(at);
+            if !clauses.iter().any(|clause| {
+                self.param_of(clause.restriction)
+                    .map(|at| self.join_class(at))
+                    == Some(class)
+            }) {
+                other = other.add(self.join.expect("parameterized").params[at].cost);
+            }
+        }
+        let rows = self.param_rows(param)?;
         let tuples_fetched = clamp_row_est(selectivity * size.tuples);
         let visible_fraction = if index_only {
             1.0 - size.allvisfrac
         } else {
             1.0
         };
-        let total_pages = (size.pages + info.pages).max(1.0);
-        let pages_fetched = (index_pages_fetched(
-            tuples_fetched,
-            size.pages,
-            total_pages,
-            costs.effective_cache_size,
-        ) * visible_fraction)
-            .ceil();
-        let max_io = pages_fetched * costs.random_page;
-        let minimum_pages = ((selectivity * size.pages).ceil() * visible_fraction).ceil();
-        let min_io = if minimum_pages > 0.0 {
-            costs.random_page + (minimum_pages - 1.0).max(0.0) * costs.seq_page
+        let total_pages = (self.total_table_pages() + info.pages).max(1.0);
+        let (max_io, min_io) = if loop_count > 1.0 {
+            // Repeated scans: the Mackert and Lohman estimate over every
+            // scan's tuples, pro-rated to one; all fetches random.
+            let pages_fetched = (index_pages_fetched(
+                tuples_fetched * loop_count,
+                size.pages,
+                total_pages,
+                costs.effective_cache_size,
+            ) * visible_fraction)
+                .ceil();
+            let max_io = pages_fetched * costs.random_page / loop_count;
+            let pages = (selectivity * size.pages).ceil();
+            let pages_fetched = (index_pages_fetched(
+                pages * loop_count,
+                size.pages,
+                total_pages,
+                costs.effective_cache_size,
+            ) * visible_fraction)
+                .ceil();
+            (max_io, pages_fetched * costs.random_page / loop_count)
         } else {
-            0.0
+            let pages_fetched = (index_pages_fetched(
+                tuples_fetched,
+                size.pages,
+                total_pages,
+                costs.effective_cache_size,
+            ) * visible_fraction)
+                .ceil();
+            let max_io = pages_fetched * costs.random_page;
+            let minimum_pages = ((selectivity * size.pages).ceil() * visible_fraction).ceil();
+            let min_io = if minimum_pages > 0.0 {
+                costs.random_page + (minimum_pages - 1.0).max(0.0) * costs.seq_page
+            } else {
+                0.0
+            };
+            (max_io, min_io)
         };
         let startup = index_startup + other.startup;
         let run = index_total - index_startup
@@ -945,6 +1163,8 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             selectivity,
             startup,
             total: startup + run,
+            param,
+            rows,
         };
         Ok(self.index_paths.push(path, "more than 256 index paths"))
     }
@@ -961,10 +1181,11 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         }
         let node = BitmapNode {
             kind: BitmapKind::Index(path),
-            tree_cost: index_path.index_total + 0.1 * self.costs().cpu_operator * self.rows,
+            tree_cost: index_path.index_total + 0.1 * self.costs().cpu_operator * index_path.rows,
             selectivity: index_path.selectivity,
             total: index_path.total,
             clauses,
+            param: index_path.param,
         };
         self.nodes.push(node, "more than 256 bitmap nodes")
     }
@@ -972,11 +1193,32 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
     /// `cost_bitmap_heap_scan` over a bitmap whose tree costs `tree_cost`
     /// and keeps `selectivity` of the rows: startup and total cost.
     fn bitmap_heap(&self, tree_cost: f64, selectivity: f64) -> (f64, f64) {
+        self.bitmap_heap_param(tree_cost, selectivity, 0, 0.0)
+    }
+
+    /// `cost_bitmap_heap_scan` of a bitmap parameterized by `param`, whose
+    /// index scans' pages total `index_pages` (`get_indexpath_pages`).
+    fn bitmap_heap_param(
+        &self,
+        tree_cost: f64,
+        selectivity: f64,
+        param: u8,
+        index_pages: f64,
+    ) -> (f64, f64) {
         let costs = self.costs();
         let size = self.planner.size;
         let tuples_fetched = clamp_row_est(selectivity * size.tuples);
         let pages = if size.pages > 1.0 { size.pages } else { 1.0 };
         let mut pages_fetched = (2.0 * pages * tuples_fetched) / (2.0 * pages + tuples_fetched);
+        let loop_count = self.loop_count(param);
+        if loop_count > 1.0 {
+            pages_fetched = index_pages_fetched(
+                tuples_fetched * loop_count,
+                size.pages,
+                (self.total_table_pages() + index_pages).max(1.0),
+                costs.effective_cache_size,
+            ) / loop_count;
+        }
         if pages_fetched >= pages {
             pages_fetched = pages;
         } else {
@@ -988,10 +1230,29 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         } else {
             costs.random_page
         };
-        let startup = tree_cost + self.all_cost.startup;
-        let run = pages_fetched * cost_per_page
-            + (costs.cpu_tuple + self.all_cost.per_tuple) * tuples_fetched;
+        // `get_restriction_qual_cost`: the restrictions and every join
+        // clause the parameterization moves into the scan.
+        let mut quals = self.all_cost;
+        let mut moved = [0usize; super::MAX_JOIN_PARAMS];
+        let moved_count = self.moved_clauses(param, &mut moved);
+        for &at in &moved[..moved_count] {
+            quals = quals.add(self.join.expect("parameterized").params[at].cost);
+        }
+        let startup = tree_cost + quals.startup;
+        let run =
+            pages_fetched * cost_per_page + (costs.cpu_tuple + quals.per_tuple) * tuples_fetched;
         (startup, startup + run)
+    }
+
+    /// `get_indexpath_pages` of the bitmap `node`.
+    fn bitmap_index_pages(&self, node: usize) -> f64 {
+        match self.nodes.items[node].kind {
+            BitmapKind::Index(path) => self.index(self.index_paths.items[path].index).pages,
+            BitmapKind::And(children) | BitmapKind::Or(children) => children
+                .iter()
+                .map(|&child| self.bitmap_index_pages(child))
+                .sum(),
+        }
     }
 
     /// `create_bitmap_and_path` or `create_bitmap_or_path` of `children`.
@@ -1000,10 +1261,12 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
         let mut cost = 0.0;
         let mut selectivity = if and { 1.0 } else { 0.0 };
         let mut clauses = 0u64;
+        let mut param = 0u8;
         for (position, &child) in children.iter().enumerate() {
             let node = self.nodes.items[child];
             cost += node.tree_cost;
             clauses |= node.clauses;
+            param |= node.param;
             if and {
                 selectivity *= node.selectivity;
                 if position > 0 {
@@ -1033,6 +1296,7 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             selectivity,
             total: cost,
             clauses,
+            param,
         };
         Ok(self.nodes.push(node, "more than 256 bitmap nodes"))
     }
@@ -1089,7 +1353,14 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
             group[0] = kept[leader];
             let mut group_count = 1;
             let first = self.nodes.items[kept[leader]];
-            let mut cost_so_far = self.bitmap_heap(first.tree_cost, first.selectivity).1;
+            let mut cost_so_far = self
+                .bitmap_heap_param(
+                    first.tree_cost,
+                    first.selectivity,
+                    first.param,
+                    self.bitmap_index_pages(kept[leader]),
+                )
+                .1;
             let mut clauses_so_far = first.clauses;
             let mut quals_so_far = [Prop::And(&[]); 64];
             let mut quals_count = 0;
@@ -1124,15 +1395,19 @@ impl<'p, 's, 'a> Paths<'p, 's, 'a> {
                 // `bitmap_and_cost_est`.
                 let mut cost = 0.0;
                 let mut selectivity = 1.0;
+                let mut param = 0u8;
+                let mut pages = 0.0;
                 for (position, &member) in group[..=group_count].iter().enumerate() {
+                    pages += self.bitmap_index_pages(member);
                     let member = self.nodes.items[member];
                     cost += member.tree_cost;
                     selectivity *= member.selectivity;
+                    param |= member.param;
                     if position > 0 {
                         cost += 100.0 * self.costs().cpu_operator;
                     }
                 }
-                let new_cost = self.bitmap_heap(cost, selectivity).1;
+                let new_cost = self.bitmap_heap_param(cost, selectivity, param, pages).1;
                 if new_cost < cost_so_far {
                     cost_so_far = new_cost;
                     clauses_so_far |= node.clauses;
@@ -1791,6 +2066,20 @@ fn cheapest_total(paths: &[Option<Candidate>]) -> Option<Candidate> {
 /// `estimate_num_groups` of the relation's `columns` over its `rows`.
 pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows: f64) -> f64 {
     let input = clamp_row_est(rows);
+    let (groups, _) = relation_groups(planner, columns, rows);
+    groups.ceil().min(input).max(1.0)
+}
+
+/// `estimate_num_groups`' factor for the relation's `columns`, which the
+/// relation's `rows` restrict: its distinct combinations times two per
+/// boolean, and whether a column's distinct count was a default
+/// (`SELFLAG_USED_DEFAULT`).
+pub(super) fn relation_groups(
+    planner: &Planner<'_, '_>,
+    columns: &[usize],
+    rows: f64,
+) -> (f64, bool) {
+    let mut used_default = false;
     let mut groups = 1.0;
     let mut product = 1.0;
     let mut largest = 1.0f64;
@@ -1811,7 +2100,8 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
             continue;
         }
         let variable = planner.variable(column);
-        let distinct = planner.distinct(&variable).0;
+        let (distinct, default) = planner.distinct(&variable);
+        used_default |= default;
         product *= distinct;
         largest = largest.max(distinct);
         count += 1;
@@ -1826,7 +2116,8 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
     }
     for &column in &grouped[..grouped_count] {
         let variable = planner.variable(column);
-        let distinct = planner.distinct(&variable).0;
+        let (distinct, default) = planner.distinct(&variable);
+        used_default |= default;
         product *= distinct;
         largest = largest.max(distinct);
         count += 1;
@@ -1848,7 +2139,7 @@ pub(super) fn estimate_groups(planner: &Planner<'_, '_>, columns: &[usize], rows
         }
         groups *= clamp_row_est(product);
     }
-    groups.ceil().min(input).max(1.0)
+    (groups, used_default)
 }
 
 /// `tuplesort_merge_order`.
@@ -2033,6 +2324,44 @@ pub(crate) fn scan_path<'a>(
     {
         return Ok(Planned::Outside("more than 32 conditions"));
     }
+    // A join's base relation: its last conjuncts are the join clauses an
+    // index may apply, each comparing a column with another relation's.
+    let join_scan = match shape.member {
+        super::Member::Join(scan) => Some(scan),
+        _ => None,
+    };
+    let join_count = join_scan.map_or(0, |scan| usize::from(scan.param_count));
+    if join_count > count {
+        return Ok(Planned::Outside("a join clause the scan does not hold"));
+    }
+    count -= join_count;
+    let join_conjuncts = &conjuncts[count..count + join_count];
+    let mut outer_operands = [&Expr::Null; super::MAX_JOIN_PARAMS];
+    for (at, &conjunct) in join_conjuncts.iter().enumerate() {
+        let Expr::Binary {
+            operator: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = conjunct
+        else {
+            return Ok(Planned::Outside("a join clause other than an equality"));
+        };
+        let own = |side: &Expr<'_>| {
+            matches!(side, Expr::Column { qualifier, name }
+                if matches!(scope.find_column(*qualifier, name),
+                    Ok(super::super::scope::ResolvedColumn::Table(0, _))))
+        };
+        outer_operands[at] = match (own(left), own(right)) {
+            (true, false) => right,
+            (false, true) => left,
+            _ => {
+                return Ok(Planned::Outside(
+                    "a join clause of two columns of one relation",
+                ));
+            }
+        };
+    }
     let mut kept_conjuncts = [&Expr::Null; clauses::MAX_CONJUNCTS];
     let mut kept_count = 0;
     for &conjunct in &conjuncts[..count] {
@@ -2076,12 +2405,45 @@ pub(crate) fn scan_path<'a>(
         seen_count: 0,
         expressions: [&Expr::Null; clauses::MAX_CONJUNCTS],
         expression_count: 0,
+        outer_operands: &outer_operands[..join_count],
     };
     let restrictions = match analyzer.conjuncts(&kept_conjuncts[..kept_count], 0)? {
         Ok(restrictions) => restrictions,
         Err(clauses::CONTRADICTION) => return Ok(Planned::NotTable),
         Err(shape) => return Ok(Planned::Outside(shape)),
     };
+    // The join clauses, each `column = value` of a value unknown until
+    // the outer row is read, costing one operator.
+    let mut join_params = [None::<Restriction<'a>>; super::MAX_JOIN_PARAMS];
+    for (at, &conjunct) in join_conjuncts.iter().enumerate() {
+        let restriction = match analyzer.restriction(conjunct, 0)? {
+            Ok(restriction) => restriction,
+            Err(shape) => return Ok(Planned::Outside(shape)),
+        };
+        if !matches!(
+            restriction.clause,
+            Clause::Compare {
+                comparison: Comparison::Eq,
+                constant: None,
+                pattern: false,
+                ..
+            }
+        ) {
+            return Ok(Planned::Outside("a join clause the model does not read"));
+        }
+        join_params[at] = Some(Restriction {
+            cost: QualCost {
+                startup: 0.0,
+                per_tuple: planner.costs.cpu_operator,
+            },
+            ..restriction
+        });
+    }
+    let join_params = &*arena
+        .alloc_slice_with(join_count, |at| {
+            join_params[at].expect("analyzed join clause")
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
     // Each partial btree's predicate, read as restrictions.
     let mut predicates: [&'a [Restriction<'a>]; MAX_INDEXES] = [&[]; MAX_INDEXES];
     let mut predicate_unread = [false; MAX_INDEXES];
@@ -2255,7 +2617,19 @@ pub(crate) fn scan_path<'a>(
             catalog_index.method,
             IndexAccessMethod::Gist | IndexAccessMethod::SpGist
         ) && order.contains(&OrderKey::Expression);
+        // A join's base relation: a join clause may use any index on its
+        // column.
+        let join_columns = join_scan.map_or(0, |scan| {
+            (0..64).fold(0u64, |mask, column| {
+                if scan.classes[column] == super::NO_CLASS {
+                    mask
+                } else {
+                    mask | 1 << column
+                }
+            })
+        });
         let relevant = expression_served
+            || index_columns & join_columns != 0
             || unread_partial
             || returns
             || orders_by_distance
@@ -2293,7 +2667,9 @@ pub(crate) fn scan_path<'a>(
         .iter()
         .map(|restriction| or_arms(&restriction.clause))
         .sum();
-    let path_capacity = (index_count * (2 + 2 * arms) + 4).min(MAX_INDEX_PATHS);
+    // A join's base relation builds two paths per index and join clause
+    // set (`consider_index_join_outer_rels`).
+    let path_capacity = (index_count * (2 + 2 * arms + 4 * join_count) + 4).min(MAX_INDEX_PATHS);
     let mut paths = Paths {
         planner: &planner,
         arena,
@@ -2317,6 +2693,8 @@ pub(crate) fn scan_path<'a>(
                 selectivity: 1.0,
                 startup: 0.0,
                 total: 0.0,
+                param: 0,
+                rows: 0.0,
             },
         )?,
         nodes: Pool::new(
@@ -2328,12 +2706,17 @@ pub(crate) fn scan_path<'a>(
                 selectivity: 1.0,
                 total: 0.0,
                 clauses: 0,
+                param: 0,
             },
         )?,
         next_id,
         predicates: &predicates[..index_count],
         pred_ok: &pred_ok[..index_count],
         predicate_implied: &predicate_implied[..index_count],
+        join: join_scan.map(|scan| JoinClauses {
+            scan,
+            params: join_params,
+        }),
     };
     // With a condition of unknown selectivity only a plan without index
     // paths is exact: a sequential scan, sorted when asked.
@@ -2386,6 +2769,16 @@ pub(crate) fn scan_path<'a>(
             Ok(true) => Planned::Outside(shape),
             Err(shape) => Planned::Outside(shape),
         });
+    }
+    // A statistics object would estimate a join clause with the
+    // restrictions it covers (`statext_clauselist_selectivity`).
+    if join_count > 0
+        && storage
+            .extended_statistics_for_table(slot, txid)
+            .next()
+            .is_some()
+    {
+        return Ok(Planned::Outside("a statistics object on a join's relation"));
     }
     let rows = clamp_row_est(planner.size.tuples * planner.selectivity(restrictions)?);
     paths.rows = rows;
@@ -2501,6 +2894,9 @@ fn build<'a>(
 ) -> Built<Planned<'a>> {
     let planner = paths.planner;
     let arena = paths.arena;
+    if let super::Member::Join(scan) = shape.member {
+        return join_build(paths, all, shape, definition, needed, rows, scan);
+    }
     let kept = outside!(rel_candidates(paths, all, shape, rows)?);
     let width = f64::from(shape.projection.map_or_else(
         || {
@@ -2525,7 +2921,7 @@ fn build<'a>(
             )?);
             return Ok(Ok(Planned::Chosen(path)));
         }
-        super::Member::No => {}
+        super::Member::No | super::Member::Join(_) => {}
     }
     if let Some(grouping) = shape.grouping {
         return grouped(
@@ -2906,6 +3302,448 @@ fn rel_candidates<'a>(
         .map_err(|_| crate::sql::eval::arena_full())?))
 }
 
+/// The paths of a base relation of a join, as `set_plain_rel_pathlist`
+/// submits them to `add_path`.
+#[derive(Clone, Copy)]
+pub(crate) struct JoinRelPaths<'a> {
+    pub(crate) rows: f64,
+    pub(crate) width: f64,
+    pub(crate) candidates: &'a [JoinCandidate],
+    /// The table's indexes, which its columns' statistics read.
+    pub(super) indexes: &'a [super::IndexInfo],
+    /// The columns its restrictions equate with a constant.
+    pub(crate) fixed: u64,
+}
+
+/// One path of a join's base relation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JoinCandidate {
+    pub(crate) candidate: Candidate,
+    /// The relations whose values its join clauses read, by FROM position.
+    pub(crate) param: u8,
+    /// Its pathkeys useful for merging: equivalence classes, ascending.
+    pub(crate) keys: [u8; 8],
+    pub(crate) key_count: u8,
+    pub(crate) rows: f64,
+    pub(crate) describe: super::JoinDescribe,
+    /// `has_indexed_join_quals`: its index conditions apply every join
+    /// clause it moves into the scan.
+    pub(crate) indexed_join_quals: bool,
+}
+
+fn join_build<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    all: &'a [&'a Restriction<'a>],
+    shape: QueryShape,
+    definition: &crate::storage::TableDef,
+    needed: Option<u64>,
+    rows: f64,
+    scan: super::JoinScan,
+) -> Built<Planned<'a>> {
+    let candidates = outside!(join_candidates(paths, all)?);
+    let width = f64::from(super::output_width(
+        definition,
+        paths.planner.statistics,
+        shape.output.or(needed),
+    ));
+    let Some(chosen) = scan.describe else {
+        return Ok(Ok(Planned::Join(JoinRelPaths {
+            rows,
+            width,
+            candidates,
+            indexes: paths
+                .arena
+                .alloc_slice_copy(paths.planner.indexes)
+                .map_err(|_| crate::sql::eval::arena_full())?,
+            fixed: paths.fixed,
+        })));
+    };
+    let Some(held) = candidates.iter().find(|held| held.describe == chosen) else {
+        return Ok(Err("a join's scan the paths no longer hold"));
+    };
+    let mut path = outside!(describe(
+        paths,
+        &held.candidate,
+        &held.candidate,
+        shape,
+        definition,
+        needed,
+        rows
+    )?);
+    path.rows = held.rows;
+    Ok(Ok(Planned::Chosen(path)))
+}
+
+/// `create_index_paths` of a join's base relation: each index's paths of
+/// the restrictions, then its parameterized paths of each join clause set
+/// (`consider_index_join_clauses`), the bitmap heap path of the
+/// restrictions' bitmap paths and one per parameterization of the join
+/// clauses' (`choose_bitmap_and`), in the order `add_path` receives them.
+fn join_candidates<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    all: &'a [&'a Restriction<'a>],
+) -> Built<&'a [JoinCandidate]> {
+    const MAX_JOIN_CANDIDATES: usize = 128;
+    let methods = crate::sql::guc::planner_methods();
+    let planner = paths.planner;
+    let costs = planner.costs;
+    let size = planner.size;
+    let arena = paths.arena;
+    let join = paths.join.expect("a join's relation");
+    let mut out = [None::<JoinCandidate>; MAX_JOIN_CANDIDATES];
+    let mut count = 0usize;
+    macro_rules! push {
+        ($candidate:expr, $param:expr, $keys:expr) => {{
+            if count == MAX_JOIN_CANDIDATES {
+                return Ok(Err("more than 128 paths of a join's relation"));
+            }
+            let keys: super::joins::Keys = $keys;
+            let mut held = [0u8; 8];
+            held[..keys.as_slice().len()].copy_from_slice(keys.as_slice());
+            let candidate: Candidate = $candidate;
+            out[count] = Some(JoinCandidate {
+                candidate,
+                param: $param,
+                keys: held,
+                key_count: keys.as_slice().len() as u8,
+                rows: paths.param_rows($param)?,
+                describe: super::JoinDescribe {
+                    kind: candidate.kind,
+                    index: u16::MAX,
+                    backward: false,
+                    param: $param,
+                },
+                indexed_join_quals: match candidate.kind {
+                    ScanKind::Bitmap => match paths.nodes.items[candidate.path].kind {
+                        BitmapKind::Index(path) => {
+                            paths.indexed_join_quals(paths.index_paths.items[path].clauses, $param)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                },
+            });
+            count += 1;
+        }};
+    }
+    push!(
+        Candidate {
+            kind: ScanKind::Seq,
+            path: usize::MAX,
+            startup: paths.all_cost.startup,
+            total: paths.all_cost.startup
+                + (costs.cpu_tuple + paths.all_cost.per_tuple) * size.tuples
+                + costs.seq_page * size.pages,
+            disabled: u32::from(!methods.seqscan),
+            presorted: 0,
+            sort: SortKind::None,
+        },
+        0,
+        super::joins::Keys::NONE
+    );
+    let mut bitmap_candidates = [usize::MAX; MAX_CHILDREN];
+    let mut bitmap_count = 0;
+    let mut join_bitmaps = [usize::MAX; MAX_CHILDREN];
+    let mut join_bitmap_count = 0;
+    for index in 0..planner.indexes.len() {
+        if !paths.usable[index] {
+            continue;
+        }
+        if planner.indexes[index].catalog.partial {
+            return Ok(Err("a partial index of a join's relation"));
+        }
+        // The restrictions' paths.
+        let clauses = outside!(paths.index_clauses(index, &[all])?);
+        outside!(join_index_paths(
+            paths,
+            index,
+            clauses,
+            false,
+            &mut out,
+            &mut count,
+            &mut bitmap_candidates,
+            &mut bitmap_count,
+        )?);
+        // `match_eclass_clauses_to_index`: each key column's join clauses,
+        // matched to the first column they fit.
+        let keys = paths.index(index).catalog.n_cols;
+        let params = join.params;
+        let mut by_column = [[usize::MAX; super::MAX_JOIN_PARAMS]; crate::storage::MAX_INDEX_COLS];
+        let mut column_count = [0usize; crate::storage::MAX_INDEX_COLS];
+        for (at, param) in params.iter().enumerate() {
+            for position in 0..keys {
+                if outside!(paths.match_clause(param, index, position)?).is_some() {
+                    by_column[position][column_count[position]] = at;
+                    column_count[position] += 1;
+                    break;
+                }
+            }
+        }
+        // `consider_index_join_outer_rels`: each clause's relation alone,
+        // and with each set tried before.
+        let mut considered = [0u8; 64];
+        let mut considered_count = 0usize;
+        let mut considered_clauses = 0usize;
+        for position in 0..keys {
+            let list = &by_column[position][..column_count[position]];
+            considered_clauses += list.len();
+            for &at in list {
+                let relids = paths.join_rel(at);
+                if considered[..considered_count].contains(&relids) {
+                    continue;
+                }
+                let tried = considered_count;
+                for old_at in 0..tried {
+                    let old = considered[old_at];
+                    if relids & old == relids || relids & old == old {
+                        continue;
+                    }
+                    // `eclass_already_used`.
+                    let class = paths.join_class(at);
+                    if list.iter().any(|&other| {
+                        paths.join_class(other) == class && paths.join_rel(other) & !old == 0
+                    }) {
+                        continue;
+                    }
+                    if considered_count >= 10 * considered_clauses {
+                        break;
+                    }
+                    outside!(join_index_paths_for(
+                        paths,
+                        index,
+                        all,
+                        &by_column,
+                        &column_count,
+                        relids | old,
+                        &mut considered,
+                        &mut considered_count,
+                        &mut out,
+                        &mut count,
+                        &mut join_bitmaps,
+                        &mut join_bitmap_count,
+                    )?);
+                }
+                outside!(join_index_paths_for(
+                    paths,
+                    index,
+                    all,
+                    &by_column,
+                    &column_count,
+                    relids,
+                    &mut considered,
+                    &mut considered_count,
+                    &mut out,
+                    &mut count,
+                    &mut join_bitmaps,
+                    &mut join_bitmap_count,
+                )?);
+            }
+        }
+    }
+    outside!(paths.or_paths(all, &[], &mut bitmap_candidates, &mut bitmap_count)?);
+    if bitmap_count > 0 {
+        let node = outside!(paths.choose_bitmap_and(&bitmap_candidates[..bitmap_count])?);
+        let tree = paths.nodes.items[node];
+        let (startup, total) = paths.bitmap_heap(tree.tree_cost, tree.selectivity);
+        push!(
+            Candidate {
+                kind: ScanKind::Bitmap,
+                path: node,
+                startup,
+                total,
+                disabled: u32::from(!methods.bitmapscan),
+                presorted: 0,
+                sort: SortKind::None,
+            },
+            0,
+            super::joins::Keys::NONE
+        );
+    }
+    // One bitmap heap path per parameterization the join clauses' bitmap
+    // paths need, over those needing no more and the restrictions'.
+    let mut outers = [0u8; MAX_CHILDREN];
+    let mut outer_count = 0;
+    for &node in &join_bitmaps[..join_bitmap_count] {
+        let param = paths.nodes.items[node].param;
+        if !outers[..outer_count].contains(&param) {
+            outers[outer_count] = param;
+            outer_count += 1;
+        }
+    }
+    for &outer in &outers[..outer_count] {
+        let mut set = [usize::MAX; MAX_CHILDREN];
+        let mut set_count = 0;
+        for &node in join_bitmaps[..join_bitmap_count]
+            .iter()
+            .chain(&bitmap_candidates[..bitmap_count])
+        {
+            if paths.nodes.items[node].param & !outer == 0 && set_count < MAX_CHILDREN {
+                set[set_count] = node;
+                set_count += 1;
+            }
+        }
+        let node = outside!(paths.choose_bitmap_and(&set[..set_count])?);
+        let tree = paths.nodes.items[node];
+        let (startup, total) = paths.bitmap_heap_param(
+            tree.tree_cost,
+            tree.selectivity,
+            tree.param,
+            paths.bitmap_index_pages(node),
+        );
+        push!(
+            Candidate {
+                kind: ScanKind::Bitmap,
+                path: node,
+                startup,
+                total,
+                disabled: u32::from(!methods.bitmapscan),
+                presorted: 0,
+                sort: SortKind::None,
+            },
+            tree.param,
+            super::joins::Keys::NONE
+        );
+    }
+    Ok(Ok(&*arena
+        .alloc_slice_with(count, |at| out[at].expect("dense join candidates"))
+        .map_err(|_| crate::sql::eval::arena_full())?))
+}
+
+/// `get_join_index_paths` of `index` for the join clause set `relids`:
+/// per key column the first join clause it allows, then the restrictions.
+#[expect(clippy::too_many_arguments, reason = "planner state is explicit")]
+fn join_index_paths_for<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    index: usize,
+    all: &'a [&'a Restriction<'a>],
+    by_column: &[[usize; super::MAX_JOIN_PARAMS]; crate::storage::MAX_INDEX_COLS],
+    column_count: &[usize; crate::storage::MAX_INDEX_COLS],
+    relids: u8,
+    considered: &mut [u8; 64],
+    considered_count: &mut usize,
+    out: &mut [Option<JoinCandidate>; 128],
+    count: &mut usize,
+    bitmaps: &mut [usize; MAX_CHILDREN],
+    bitmap_count: &mut usize,
+) -> Built<()> {
+    if considered[..*considered_count].contains(&relids) {
+        return Ok(Ok(()));
+    }
+    let join = paths.join.expect("a join's relation");
+    let mut selected = [None::<&'a Restriction<'a>>; crate::storage::MAX_INDEX_COLS];
+    let mut selected_count = 0;
+    for position in 0..paths.index(index).catalog.n_cols {
+        if let Some(&at) = by_column[position][..column_count[position]]
+            .iter()
+            .find(|&&at| paths.join_rel(at) & !relids == 0)
+        {
+            selected[selected_count] = Some(&join.params[at]);
+            selected_count += 1;
+        }
+    }
+    let selected = &*paths
+        .arena
+        .alloc_slice_with(selected_count, |at| selected[at].expect("dense selection"))
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let clauses = outside!(paths.index_clauses(index, &[selected, all])?);
+    outside!(join_index_paths(
+        paths,
+        index,
+        clauses,
+        true,
+        out,
+        count,
+        bitmaps,
+        bitmap_count
+    )?);
+    if *considered_count < considered.len() {
+        considered[*considered_count] = relids;
+        *considered_count += 1;
+    }
+    Ok(Ok(()))
+}
+
+/// `build_index_paths` and `get_index_paths` of `index` over `clauses`:
+/// the forward path when it has conditions, useful pathkeys or covers the
+/// query's columns, and the backward path when its pathkeys are useful;
+/// each that selects rows or has no pathkeys is a bitmap candidate.
+#[expect(clippy::too_many_arguments, reason = "planner state is explicit")]
+fn join_index_paths<'a>(
+    paths: &mut Paths<'_, '_, 'a>,
+    index: usize,
+    clauses: &'a [IndexClause<'a>],
+    parameterized: bool,
+    out: &mut [Option<JoinCandidate>; 128],
+    count: &mut usize,
+    bitmaps: &mut [usize; MAX_CHILDREN],
+    bitmap_count: &mut usize,
+) -> Built<()> {
+    let methods = crate::sql::guc::planner_methods();
+    let index_only = paths.index_only(index);
+    for backward in [false, true] {
+        let keys = outside!(paths.merge_keys(index, backward));
+        let wanted = if backward {
+            !keys.as_slice().is_empty()
+        } else {
+            !clauses.is_empty() || !keys.as_slice().is_empty() || index_only
+        };
+        if !wanted {
+            continue;
+        }
+        let path = outside!(paths.index_path(index, clauses, backward, index_only, 0)?);
+        let index_path = paths.index_paths.items[path];
+        if parameterized && index_path.param == 0 {
+            // A join clause set no key column takes builds nothing new.
+            continue;
+        }
+        if *count == out.len() {
+            return Ok(Err("more than 128 paths of a join's relation"));
+        }
+        let mut held = [0u8; 8];
+        held[..keys.as_slice().len()].copy_from_slice(keys.as_slice());
+        out[*count] = Some(JoinCandidate {
+            candidate: Candidate {
+                kind: if index_only {
+                    ScanKind::IndexOnly
+                } else {
+                    ScanKind::Index
+                },
+                path,
+                startup: index_path.startup,
+                total: index_path.total,
+                disabled: u32::from(!methods.indexscan),
+                presorted: 0,
+                sort: SortKind::None,
+            },
+            param: index_path.param,
+            keys: held,
+            key_count: keys.as_slice().len() as u8,
+            rows: index_path.rows,
+            describe: super::JoinDescribe {
+                kind: if index_only {
+                    ScanKind::IndexOnly
+                } else {
+                    ScanKind::Index
+                },
+                index: index as u16,
+                backward,
+                param: index_path.param,
+            },
+            indexed_join_quals: paths.indexed_join_quals(clauses, index_path.param),
+        });
+        *count += 1;
+        if keys.as_slice().is_empty() || index_path.selectivity < 1.0 {
+            let node = outside!(paths.index_node(path));
+            if *bitmap_count == MAX_CHILDREN {
+                return Ok(Err("more than 64 bitmap candidates"));
+            }
+            bitmaps[*bitmap_count] = node;
+            *bitmap_count += 1;
+        }
+    }
+    Ok(Ok(()))
+}
+
 /// `rel->consider_startup`: a `LIMIT` gives the query a tuple fraction.
 fn consider_startup(shape: QueryShape) -> bool {
     shape
@@ -3179,7 +4017,8 @@ fn describe<'a>(
                 .map_err(|_| crate::sql::eval::arena_full())?;
             let mut absorbed = [&Expr::Null; clauses::MAX_CONJUNCTS];
             let mut absorbed_count = 0;
-            for restriction in paths.restrictions {
+            let joins = paths.join.map_or(&[][..], |join| join.params);
+            for restriction in paths.restrictions.iter().chain(joins) {
                 let applied = index_path
                     .clauses
                     .iter()
@@ -3230,7 +4069,8 @@ fn describe<'a>(
             let mut absorbed_count = 0;
             let mut filtered = [&Expr::Null; clauses::MAX_CONJUNCTS];
             let mut filtered_count = 0;
-            for restriction in paths.restrictions {
+            let joins = paths.join.map_or(&[][..], |join| join.params);
+            for restriction in paths.restrictions.iter().chain(joins) {
                 if implied(paths, restriction, &index_quals)? {
                     absorbed[absorbed_count] = restriction.source;
                     absorbed_count += 1;

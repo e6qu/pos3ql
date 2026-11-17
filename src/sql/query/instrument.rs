@@ -106,6 +106,10 @@ pub(crate) enum Role {
     Hash(u16),
     /// The materialized copy of the FROM position a nested loop rescans.
     Materialize(u16),
+    /// The cache over a parameterized scan a nested loop reads.
+    Memoize(u16),
+    /// The sort of a merge join's outer (0) or inner (1) input.
+    MergeSort(u16, u8),
     /// The block's aggregation or grouping.
     Aggregate,
     /// The sort of the input a `GroupAggregate` groups.
@@ -188,6 +192,19 @@ pub(crate) struct NodeCounters {
     pub(crate) heap_blocks: u64,
     /// An index-only scan's rows read from pages not all-visible.
     pub(crate) heap_fetches: u64,
+    /// A `Memoize` node's cache figures.
+    pub(crate) memoize: Option<MemoizeStats>,
+}
+
+/// A `Memoize` node's cache figures (`MemoizeInstrumentation`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct MemoizeStats {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) evictions: u64,
+    pub(crate) overflows: u64,
+    /// `mem_peak`: the most bytes its entries and cached rows held.
+    pub(crate) peak: usize,
 }
 
 /// The rows a `MERGE`'s actions inserted, updated and deleted.
@@ -878,6 +895,7 @@ impl Slot {
                 },
                 heap_blocks: 0,
                 heap_fetches: 0,
+                memoize: None,
             },
             open: 0,
             started: None,
@@ -1350,6 +1368,11 @@ impl Node {
         sizing
     }
 
+    /// Records a `Memoize` node's cache figures.
+    pub(crate) fn memoize(self, stats: MemoizeStats) {
+        self.with(|slot, _| slot.counters.memoize = Some(stats));
+    }
+
     /// Records a hashed aggregate's peak memory; across rescans PostgreSQL
     /// reports the most.
     pub(crate) fn hash_agg_peak(self, bytes: usize) {
@@ -1447,6 +1470,18 @@ impl Node {
             slot.counters.stored = Some(working + intermediate);
             let (disk, bytes) = stores.scanned.finish();
             slot.counters.cte_stored = Some(StoredSpace::Sized { disk, bytes });
+        });
+    }
+
+    /// Opens the node's tuplestore, which reports its memory even when no
+    /// row enters it.
+    pub(crate) fn store_opened(self) {
+        self.with(|slot, _| {
+            if slot.store.is_none() {
+                let store = super::postgres_memory::Tuplestore::new();
+                slot.counters.stored = Some(store.finish().1);
+                slot.store = Some(Some(store));
+            }
         });
     }
 

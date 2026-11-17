@@ -93,13 +93,37 @@ pub(crate) struct Clause {
     pub(crate) source: Option<u16>,
 }
 
-/// A base relation's size and cheapest scan.
+/// A base relation's size and the paths `set_plain_rel_pathlist` submits
+/// to `add_path`, in that order.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BaseRel {
+pub(crate) struct BaseRel<'p> {
     pub(crate) rows: f64,
     pub(crate) width: f64,
+    pub(crate) paths: &'p [BasePath],
+    /// The key columns of each unique, immediately enforced, whole-table
+    /// index whose keys are plain columns of the default operator class.
+    pub(crate) unique: &'p [u64],
+    /// The columns its restrictions equate with a constant.
+    pub(crate) fixed: u64,
+}
+
+/// One path of a base relation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BasePath {
     pub(crate) startup: f64,
     pub(crate) total: f64,
+    pub(crate) rows: f64,
+    pub(crate) disabled: u32,
+    pub(crate) keys: Keys,
+    /// The relations whose values it reads (`PATH_REQ_OUTER`).
+    pub(crate) param: Relids,
+    /// The join clauses a parameterized path enforces (`ppi_clauses`).
+    pub(crate) enforced: ClauseList,
+    /// An index scan, which supports mark and restore.
+    pub(crate) mark_restore: bool,
+    /// A parameterized index scan (or bitmap of one) whose index conditions
+    /// apply every join clause it enforces (`has_indexed_join_quals`).
+    pub(crate) indexed_join_quals: bool,
 }
 
 /// A column of a base relation that something above its scan reads.
@@ -118,6 +142,9 @@ pub(crate) struct NeededColumn {
 pub(crate) trait JoinStatistics {
     /// `eqjoinsel` of `left = right` for an inner join.
     fn equality(&self, left: Member, right: Member) -> Result<f64, SqlError>;
+    /// `estimate_num_groups` of the columns `members` over `calls` rows;
+    /// `calls` when a column's distinct count is a default.
+    fn groups(&self, members: &[Member], calls: f64) -> Result<f64, SqlError>;
     /// `estimate_hash_bucket_stats` of `member` over `buckets`: its most
     /// common value's frequency and its bucket size fraction.
     fn bucket(&self, member: Member, buckets: f64) -> Result<(f64, f64), SqlError>;
@@ -138,6 +165,7 @@ pub(crate) struct JoinSettings {
     pub(crate) mergejoin: bool,
     pub(crate) material: bool,
     pub(crate) sort: bool,
+    pub(crate) memoize: bool,
 }
 
 /// An ordered list of clause numbers.
@@ -148,7 +176,7 @@ pub(crate) struct ClauseList {
 }
 
 impl ClauseList {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         ids: [0; MAX_JOIN_CLAUSES],
         len: 0,
     };
@@ -165,6 +193,11 @@ impl ClauseList {
 
     fn contains(&self, id: u8) -> bool {
         self.as_slice().contains(&id)
+    }
+
+    /// Appends clause `id`, or `None` when the list is full.
+    pub(crate) fn push_id(&mut self, id: u8) -> Option<()> {
+        self.push(id)
     }
 }
 
@@ -192,6 +225,20 @@ impl Keys {
         Some(())
     }
 
+    /// Appends `class`, or `None` when the keys are full.
+    pub(crate) fn push_class(&mut self, class: u8) -> Option<()> {
+        self.push(class)
+    }
+
+    /// Keys of the classes `classes`.
+    pub(crate) fn of(classes: &[u8]) -> Self {
+        let mut keys = Self::NONE;
+        for &class in classes {
+            let _ = keys.push(class);
+        }
+        keys
+    }
+
     fn truncated(mut self, len: usize) -> Self {
         self.len = self.len.min(len as u8);
         self
@@ -217,6 +264,8 @@ impl Keys {
 pub(crate) enum PathKind {
     Scan {
         rel: u8,
+        /// Its position in [`BaseRel::paths`].
+        path: u16,
     },
     Material {
         input: u32,
@@ -225,6 +274,19 @@ pub(crate) enum PathKind {
         outer: u32,
         inner: u32,
         clauses: ClauseList,
+        /// The inner relation is unique for the join's clauses: the loop
+        /// moves to the next outer row at the first match.
+        inner_unique: bool,
+    },
+    /// A cache of a parameterized inner path's rows by its parameters'
+    /// values (`Memoize`): `keys` are the outer columns, as class members.
+    Memoize {
+        input: u32,
+        keys: [Member; MAX_KEYS],
+        key_count: u8,
+        /// `singlerow`: the join's inner relation is unique, so an entry
+        /// is complete at its first row.
+        single_row: bool,
     },
     HashJoin {
         outer: u32,
@@ -242,6 +304,9 @@ pub(crate) enum PathKind {
         outer_sort: Keys,
         inner_sort: Keys,
         materialize_inner: bool,
+        /// The inner relation is unique: each outer row stops at its first
+        /// match, and with no other clause the inner input is never marked.
+        inner_unique: bool,
     },
 }
 
@@ -256,6 +321,8 @@ pub(crate) struct Path {
     pub(crate) total: f64,
     pub(crate) disabled: u32,
     pub(crate) keys: Keys,
+    /// The relations outside it whose values it reads (`PATH_REQ_OUTER`).
+    pub(crate) param: Relids,
 }
 
 /// A relation the search built: its paths and, once its level is done,
@@ -268,6 +335,10 @@ struct Rel {
     count: u8,
     cheapest_total: u32,
     cheapest_startup: u32,
+    /// `cheapest_parameterized_paths`: the cheapest total path, then each
+    /// parameterized path.
+    parameterized: [u32; MAX_REL_PATHS],
+    parameterized_count: u8,
     /// The pair that built a join relation, whose target lists its own
     /// concatenates (`build_joinrel_tlist`).
     first: (Relids, Relids),
@@ -317,15 +388,31 @@ impl JoinPlan<'_> {
 /// A problem outside the model; the text names the shape.
 pub(crate) type Outside = &'static str;
 
+/// A foreign key of one relation referencing another whose every column
+/// pair an equivalence class equates (`match_foreign_keys_to_quals`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForeignKeyJoin {
+    pub(crate) referencing: u8,
+    pub(crate) referenced: u8,
+    /// Each key column pair's class.
+    pub(crate) classes: [u8; MAX_KEYS],
+    pub(crate) count: u8,
+    /// The referenced table's rows (`ref_rel->tuples`, at least one).
+    pub(crate) referenced_tuples: f64,
+}
+
 /// The join problem.
 pub(crate) struct JoinProblem<'p> {
-    pub(crate) rels: &'p [BaseRel],
+    pub(crate) rels: &'p [BaseRel<'p>],
     pub(crate) classes: &'p [EquivalenceClass],
     /// The query's join clauses in the order PostgreSQL distributes them,
-    /// equalities of class members included.
+    /// equalities of class members included, then the clauses its base
+    /// relations' index paths derived (`source` `None`).
     pub(crate) clauses: &'p [Clause],
     pub(crate) needed: &'p [NeededColumn],
     pub(crate) settings: JoinSettings,
+    /// The query's foreign keys, as `root->fkey_list` holds them.
+    pub(crate) foreign_keys: &'p [ForeignKeyJoin],
 }
 
 struct Search<'p, 'a, 's> {
@@ -340,6 +427,11 @@ struct Search<'p, 'a, 's> {
     levels: [ArenaList<'a, Relids>; MAX_JOIN_RELS + 1],
     /// A shape outside the model met while generating paths.
     outside: Option<Outside>,
+    /// Each Memoize path's `cost_memoize_rescan`.
+    memoize_rescans: ArenaList<'a, (u32, f64, f64)>,
+    /// Each parameterized join's `ppi_rows`, by its relations and
+    /// parameterization.
+    param_rows: ArenaList<'a, (Relids, Relids, f64)>,
 }
 
 /// Plans the join of `problem`'s relations as `standard_join_search` does.
@@ -362,33 +454,45 @@ pub(crate) fn search<'a>(
         rels: full,
         levels: core::array::from_fn(|_| ArenaList::new(arena)),
         outside: None,
+        memoize_rescans: ArenaList::new(arena),
+        param_rows: ArenaList::new(arena),
     };
     for clause in problem.clauses {
         search.clauses.push(*clause).map_err(|_| arena_full())?;
     }
     for (index, rel) in problem.rels.iter().enumerate() {
         let relids = 1 << index;
-        let path = search.push_path(Path {
-            kind: PathKind::Scan { rel: index as u8 },
-            relids,
-            rows: rel.rows,
-            width: rel.width,
-            startup: rel.startup,
-            total: rel.total,
-            disabled: 0,
-            keys: Keys::NONE,
-        })?;
-        let mut built = Rel {
+        search.rels[relids as usize] = Some(Rel {
             rows: rel.rows,
             width: rel.width,
             paths: [0; MAX_REL_PATHS],
-            count: 1,
-            cheapest_total: path,
-            cheapest_startup: path,
+            count: 0,
+            cheapest_total: 0,
+            cheapest_startup: 0,
+            parameterized: [0; MAX_REL_PATHS],
+            parameterized_count: 0,
             first: (relids, 0),
-        };
-        built.paths[0] = path;
-        search.rels[relids as usize] = Some(built);
+        });
+        for (at, base) in rel.paths.iter().enumerate() {
+            search.add_path(
+                relids,
+                Path {
+                    kind: PathKind::Scan {
+                        rel: index as u8,
+                        path: at as u16,
+                    },
+                    relids,
+                    rows: base.rows,
+                    width: rel.width,
+                    startup: base.startup,
+                    total: base.total,
+                    disabled: base.disabled,
+                    keys: base.keys,
+                    param: base.param,
+                },
+            )?;
+        }
+        search.set_cheapest(relids);
         search.levels[1].push(relids).map_err(|_| arena_full())?;
     }
     for level in 2..=n {
@@ -445,6 +549,11 @@ struct JoinInputs {
     restrict: ClauseList,
     /// `select_mergejoin_clauses`' mergeable clauses, in restriction order.
     mergeable: ClauseList,
+    /// `innerrel_is_unique`, and then `compute_semi_anti_join_factors`:
+    /// the fraction of outer rows with a match and the matches each has.
+    inner_unique: bool,
+    match_fraction: f64,
+    match_count: f64,
 }
 
 impl<'p, 'a, 's> Search<'p, 'a, 's> {
@@ -466,16 +575,19 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         self.rels[relids as usize].expect("the relation was built")
     }
 
-    /// `old_rel->joininfo != NIL || old_rel->has_eclass_joins`.
+    /// `old_rel->joininfo != NIL || old_rel->has_eclass_joins`: a class
+    /// with a constant counts, though it derives no join clause.
     fn has_joins(&self, relids: Relids) -> bool {
         let clause_join = self
             .problem
             .clauses
             .iter()
             .any(|clause| clause.relids & relids != 0 && clause.relids & !relids != 0);
-        let class_join = self.problem.classes.iter().any(|class| {
-            !class.has_const && class.relids() & relids != 0 && class.relids() & !relids != 0
-        });
+        let class_join = self
+            .problem
+            .classes
+            .iter()
+            .any(|class| class.relids() & relids != 0 && class.relids() & !relids != 0);
         clause_join || class_join
     }
 
@@ -487,9 +599,11 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 && clause.relids & !(left | right) == 0
         });
         joined
-            || self.problem.classes.iter().any(|class| {
-                !class.has_const && class.relids() & left != 0 && class.relids() & right != 0
-            })
+            || self
+                .problem
+                .classes
+                .iter()
+                .any(|class| class.relids() & left != 0 && class.relids() & right != 0)
     }
 
     /// `join_search_one_level`.
@@ -552,11 +666,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let restrict = self.restrictlist(left, right)?;
         if self.rels[relids as usize].is_none() {
             let (outer, inner) = (self.rel(left), self.rel(right));
-            let mut selectivity = 1.0;
-            for &id in restrict.as_slice() {
-                selectivity *= self.selectivity(id)?;
-            }
-            let rows = clamp_row_est(outer.rows * inner.rows * selectivity);
+            let rows = self.join_size(left, right, outer.rows, inner.rows, &restrict)?;
             self.rels[relids as usize] = Some(Rel {
                 rows,
                 width: self.width(relids),
@@ -564,6 +674,8 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 count: 0,
                 cheapest_total: 0,
                 cheapest_startup: 0,
+                parameterized: [0; MAX_REL_PATHS],
+                parameterized_count: 0,
                 first: (left, right),
             });
             self.levels[level].push(relids).map_err(|_| arena_full())?;
@@ -578,11 +690,20 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     }
                 }
             }
+            let inner_unique = self.inner_unique(inner, &restrict);
+            let (match_fraction, match_count) = if inner_unique {
+                self.semi_factors(inner, &restrict)?
+            } else {
+                (1.0, 1.0)
+            };
             let inputs = JoinInputs {
                 outer,
                 inner,
                 restrict,
                 mergeable,
+                inner_unique,
+                match_fraction,
+                match_count,
             };
             self.sort_inner_and_outer(relids, &inputs)?;
             self.match_unsorted_outer(relids, &inputs)?;
@@ -739,8 +860,36 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut rel = self.rel(relids);
         let mut total: Option<u32> = None;
         let mut startup: Option<u32> = None;
+        let mut best_param: Option<u32> = None;
+        let mut parameterized = [0u32; MAX_REL_PATHS];
+        let mut parameterized_count = 1usize;
         for &id in &rel.paths[..usize::from(rel.count)] {
             let path = self.path(id);
+            if path.param != 0 {
+                parameterized[parameterized_count] = id;
+                parameterized_count += 1;
+                if total.is_some() {
+                    continue;
+                }
+                best_param = Some(match best_param {
+                    None => id,
+                    Some(best) => {
+                        let held = self.path(best);
+                        if path.param == held.param {
+                            if compare_costs(&path, &held, false) < 0 {
+                                id
+                            } else {
+                                best
+                            }
+                        } else if path.param & !held.param == 0 {
+                            id
+                        } else {
+                            best
+                        }
+                    }
+                });
+                continue;
+            }
             let Some(best_total) = total else {
                 total = Some(id);
                 startup = Some(id);
@@ -763,12 +912,28 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 total = Some(id);
             }
         }
-        rel.cheapest_total = total.expect("a joinrel has a path");
-        rel.cheapest_startup = startup.expect("a joinrel has a path");
+        let (total, startup) = match total {
+            Some(total) => {
+                parameterized[0] = total;
+                (total, startup.expect("set with the total"))
+            }
+            None => {
+                let best = best_param.expect("a relation has a path");
+                parameterized.copy_within(1..parameterized_count, 0);
+                parameterized_count -= 1;
+                (best, best)
+            }
+        };
+        rel.cheapest_total = total;
+        rel.cheapest_startup = startup;
+        rel.parameterized = parameterized;
+        rel.parameterized_count = parameterized_count as u8;
         self.rels[relids as usize] = Some(rel);
     }
 
-    /// `add_path` without parameterized or parallel paths.
+    /// `add_path` without parallel paths. A parameterized path's pathkeys
+    /// do not count, and one path dominates another only when it needs no
+    /// more of the other relations (`bms_subset_compare`).
     fn add_path(&mut self, relids: Relids, new: Path) -> Result<(), SqlError> {
         let mut rel = self.rel(relids);
         let mut kept = [0u32; MAX_REL_PATHS];
@@ -785,38 +950,58 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             let mut remove_old = false;
             let costs = compare_fuzzily(&new, &old, FUZZ);
             if costs != CostOrder::Different {
-                let keys = compare_keys(&new.keys, &old.keys);
+                let new_keys = if new.param != 0 { Keys::NONE } else { new.keys };
+                let old_keys = if old.param != 0 { Keys::NONE } else { old.keys };
+                let keys = compare_keys(&new_keys, &old_keys);
+                // `bms_subset_compare` of the parameterizations.
+                let outer = match (new.param & !old.param == 0, old.param & !new.param == 0) {
+                    (true, true) => Subset::Equal,
+                    (true, false) => Subset::Subset1,
+                    (false, true) => Subset::Subset2,
+                    (false, false) => Subset::Different,
+                };
+                let new_wins = matches!(outer, Subset::Equal | Subset::Subset1);
+                let old_wins = matches!(outer, Subset::Equal | Subset::Subset2);
                 if keys != KeysOrder::Different {
                     match costs {
                         CostOrder::Equal => match keys {
-                            KeysOrder::Better1 => remove_old = new.rows <= old.rows,
+                            KeysOrder::Better1 => remove_old = new_wins && new.rows <= old.rows,
                             KeysOrder::Better2 => {
-                                if new.rows >= old.rows {
+                                if old_wins && new.rows >= old.rows {
                                     accept = false;
                                 }
                             }
-                            KeysOrder::Equal => {
-                                if new.rows < old.rows {
-                                    remove_old = true;
-                                } else if new.rows > old.rows {
-                                    accept = false;
-                                } else if compare_fuzzily(&new, &old, 1.000_000_000_1)
-                                    == CostOrder::Better1
-                                {
-                                    remove_old = true;
-                                } else {
-                                    accept = false;
+                            KeysOrder::Equal => match outer {
+                                Subset::Equal => {
+                                    if new.rows < old.rows {
+                                        remove_old = true;
+                                    } else if new.rows > old.rows {
+                                        accept = false;
+                                    } else if compare_fuzzily(&new, &old, 1.000_000_000_1)
+                                        == CostOrder::Better1
+                                    {
+                                        remove_old = true;
+                                    } else {
+                                        accept = false;
+                                    }
                                 }
-                            }
+                                Subset::Subset1 => remove_old = new.rows <= old.rows,
+                                Subset::Subset2 => {
+                                    if new.rows >= old.rows {
+                                        accept = false;
+                                    }
+                                }
+                                Subset::Different => {}
+                            },
                             KeysOrder::Different => {}
                         },
                         CostOrder::Better1 => {
-                            if keys != KeysOrder::Better2 && new.rows <= old.rows {
+                            if keys != KeysOrder::Better2 && new_wins && new.rows <= old.rows {
                                 remove_old = true;
                             }
                         }
                         CostOrder::Better2 => {
-                            if keys != KeysOrder::Better1 && new.rows >= old.rows {
+                            if keys != KeysOrder::Better1 && old_wins && new.rows >= old.rows {
                                 accept = false;
                             }
                         }
@@ -996,14 +1181,332 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             None
         };
         for &outer in &outer_rel.paths[..usize::from(outer_rel.count)] {
+            // An outer path reading the inner relation's values cannot be.
+            if self.path(outer).param & inputs.inner != 0 {
+                continue;
+            }
             let keys = self.join_keys(joined, &self.path(outer).keys);
-            self.try_nestloop(joined, inputs, outer, inner_total, keys)?;
+            // The cheapest inner path of each parameterization, the
+            // unparameterized one first.
+            for &inner in &inner_rel.parameterized[..usize::from(inner_rel.parameterized_count)] {
+                self.try_nestloop(joined, inputs, outer, inner, keys)?;
+                if let Some(memoize) = self.memoize_path(inputs, outer, inner)? {
+                    self.try_nestloop(joined, inputs, outer, memoize, keys)?;
+                }
+            }
             if let Some(material) = material {
                 self.try_nestloop(joined, inputs, outer, material, keys)?;
             }
-            self.generate_mergejoin_paths(joined, inputs, outer, inner_total, keys)?;
+            // A parameterized outer path's merge joins stay parameterized,
+            // which an inner join's search rejects.
+            if self.path(outer).param == 0 {
+                self.generate_mergejoin_paths(joined, inputs, outer, inner_total, keys)?;
+            }
         }
         Ok(())
+    }
+
+    /// `calc_joinrel_size_estimate` of an inner join of `left` and `right`
+    /// rows by `restrict`, with `get_foreign_key_join_selectivity`: a
+    /// foreign key whose every class the clauses equate makes each
+    /// referencing row match one referenced row, and its clauses leave the
+    /// estimate.
+    fn join_size(
+        &mut self,
+        left: Relids,
+        right: Relids,
+        left_rows: f64,
+        right_rows: f64,
+        restrict: &ClauseList,
+    ) -> Result<f64, SqlError> {
+        let mut kept = *restrict;
+        let mut foreign = 1.0;
+        for key in self.problem.foreign_keys {
+            let spans = (left & 1 << key.referencing != 0 && right & 1 << key.referenced != 0)
+                || (left & 1 << key.referenced != 0 && right & 1 << key.referencing != 0);
+            if !spans {
+                continue;
+            }
+            let classes = &key.classes[..usize::from(key.count)];
+            let mut remaining = ClauseList::EMPTY;
+            let mut removed = 0;
+            for &id in kept.as_slice() {
+                match self.clause(id).form {
+                    ClauseForm::Equality { class, .. } if classes.contains(&class) => removed += 1,
+                    _ => {
+                        remaining.push(id);
+                    }
+                }
+            }
+            if removed == 0 || removed != classes.len() {
+                continue;
+            }
+            kept = remaining;
+            foreign *= 1.0 / key.referenced_tuples;
+        }
+        let foreign = foreign.clamp(0.0, 1.0);
+        let mut selectivity = 1.0;
+        for &id in kept.as_slice() {
+            selectivity *= self.selectivity(id)?;
+        }
+        Ok(clamp_row_est(
+            left_rows * right_rows * foreign * selectivity,
+        ))
+    }
+
+    /// `innerrel_is_unique` of an inner join: the inner relation is one
+    /// base relation with a unique index whose every key column a join
+    /// clause or a constant equality fixes (`relation_has_unique_index_ext`).
+    fn inner_unique(&self, inner: Relids, restrict: &ClauseList) -> bool {
+        if restrict.len == 0 || inner.count_ones() != 1 {
+            return false;
+        }
+        let base = &self.problem.rels[inner.trailing_zeros() as usize];
+        if base.unique.is_empty() {
+            return false;
+        }
+        let mut matched = base.fixed;
+        for &id in restrict.as_slice() {
+            if let ClauseForm::Equality { class, left, right } = self.clause(id).form {
+                let members = self.problem.classes[usize::from(class)].members();
+                for member in [members[usize::from(left)], members[usize::from(right)]] {
+                    if inner & 1 << member.rel != 0 && member.column < 64 {
+                        matched |= 1 << member.column;
+                    }
+                }
+            }
+        }
+        base.unique.iter().any(|&keys| keys & !matched == 0)
+    }
+
+    /// `compute_semi_anti_join_factors` of an inner join whose inner
+    /// relation is unique. Its `sjinfo` is the inner join's, so `eqjoinsel`
+    /// answers the semijoin selectivity with the inner one: every outer row
+    /// matches by that selectivity, each with the inner relation's rows.
+    fn semi_factors(
+        &mut self,
+        inner: Relids,
+        restrict: &ClauseList,
+    ) -> Result<(f64, f64), SqlError> {
+        let mut selectivity = 1.0;
+        for &id in restrict.as_slice() {
+            selectivity *= self.selectivity(id)?;
+        }
+        let count = if selectivity > 0.0 {
+            (selectivity * self.rel(inner).rows / selectivity).max(1.0)
+        } else {
+            1.0
+        };
+        Ok((selectivity, count))
+    }
+
+    /// `get_memoize_path`: a cache over a parameterized inner path whose
+    /// every moved join clause hashes, read once per outer row.
+    fn memoize_path(
+        &mut self,
+        inputs: &JoinInputs,
+        outer: u32,
+        inner: u32,
+    ) -> Result<Option<u32>, SqlError> {
+        let settings = self.problem.settings;
+        let inner_path = self.path(inner);
+        // A parameterized join's `ppi_clauses` are empty: it gets no cache.
+        if !matches!(inner_path.kind, PathKind::Scan { .. })
+            || !settings.memoize
+            || self.rel(inputs.outer).rows < 2.0
+            || inner_path.param == 0
+            || inner_path.param & !inputs.outer != 0
+        {
+            return Ok(None);
+        }
+        let enforced = self.enforced(inner);
+        if enforced.len == 0 || (inputs.inner_unique && enforced.len < inputs.restrict.len) {
+            return Ok(None);
+        }
+        // The cache key: each moved clause's outer side, once.
+        let mut keys = [Member { rel: 0, column: 0 }; MAX_KEYS];
+        let mut key_count = 0usize;
+        let mut width = 0.0;
+        for &id in enforced.as_slice() {
+            let ClauseForm::Equality { class, left, right } = self.clause(id).form else {
+                return Ok(None);
+            };
+            let members = self.problem.classes[usize::from(class)].members();
+            let Some(key) = [members[usize::from(left)], members[usize::from(right)]]
+                .into_iter()
+                .find(|member| inputs.outer & 1 << member.rel != 0)
+            else {
+                return Ok(None);
+            };
+            if !keys[..key_count].contains(&key) {
+                if key_count == MAX_KEYS {
+                    return Ok(None);
+                }
+                keys[key_count] = key;
+                key_count += 1;
+                width += self.column_width(key);
+            }
+        }
+        let costs = settings.costs;
+        let outer_path = self.path(outer);
+        let calls = clamp_row_est(outer_path.rows);
+        // `cost_memoize_rescan`.
+        let tuples = inner_path.rows;
+        let entry_bytes =
+            relation_byte_size(tuples, inner_path.width) + 48.0 + 16.0 * tuples + width;
+        let cache_entries = (settings.hash_mem_bytes / entry_bytes).floor();
+        let distinct = self.statistics.groups(&keys[..key_count], calls)?;
+        let evict_ratio = 1.0 - cache_entries.min(distinct) / distinct;
+        let hit_ratio =
+            ((calls - distinct) / calls) * (cache_entries / distinct.max(cache_entries));
+        let mut rescan_total = inner_path.total * (1.0 - hit_ratio) + costs.cpu_operator;
+        rescan_total += costs.cpu_tuple * evict_ratio;
+        rescan_total += costs.cpu_operator / 10.0 * evict_ratio * tuples;
+        rescan_total += costs.cpu_tuple + costs.cpu_operator * tuples;
+        let rescan_startup = inner_path.startup * (1.0 - hit_ratio) + costs.cpu_tuple;
+        let id = self.push_path(Path {
+            kind: PathKind::Memoize {
+                input: inner,
+                keys,
+                key_count: key_count as u8,
+                single_row: inputs.inner_unique,
+            },
+            startup: inner_path.startup + costs.cpu_tuple,
+            total: inner_path.total + costs.cpu_tuple,
+            ..inner_path
+        })?;
+        self.memoize_rescans
+            .push((id, rescan_startup, rescan_total))
+            .map_err(|_| arena_full())?;
+        Ok(Some(id))
+    }
+
+    /// The width of a base relation's column, as its target list has it.
+    fn column_width(&self, member: Member) -> f64 {
+        self.problem
+            .needed
+            .iter()
+            .find(|column| column.rel == member.rel && column.column == member.column)
+            .map_or(0.0, |column| column.width)
+    }
+
+    /// The join clauses a parameterized path enforces
+    /// (`get_param_path_clause_serials`): a base path's moved clauses, a
+    /// parameterized join's own clauses and its parameterized inputs'.
+    fn enforced(&self, id: u32) -> ClauseList {
+        let path = self.path(id);
+        if path.param == 0 {
+            return ClauseList::EMPTY;
+        }
+        match path.kind {
+            PathKind::Scan { rel, path } => {
+                self.problem.rels[usize::from(rel)].paths[usize::from(path)].enforced
+            }
+            PathKind::Material { input } | PathKind::Memoize { input, .. } => self.enforced(input),
+            PathKind::NestLoop {
+                outer,
+                inner,
+                clauses,
+                ..
+            } => {
+                let mut all = self.enforced(outer);
+                for list in [self.enforced(inner), clauses] {
+                    for &id in list.as_slice() {
+                        if !all.contains(id) {
+                            let _ = all.push(id);
+                        }
+                    }
+                }
+                all
+            }
+            PathKind::HashJoin { .. } | PathKind::MergeJoin { .. } => ClauseList::EMPTY,
+        }
+    }
+
+    /// `get_joinrel_parampathinfo`'s clauses of a join parameterized by
+    /// `required` whose inputs read `outer_param` and `inner_param`: per
+    /// class, its first member among `required` equated with its first in
+    /// the join, unless an input can apply that clause; then, for each class
+    /// whose clause the inner path applies, its first member among
+    /// `required` equated with its first in the outer relation, unless the
+    /// outer path applies it.
+    fn moved_join_clauses(
+        &mut self,
+        joined: Relids,
+        inputs: &JoinInputs,
+        (outer_param, inner_param): (Relids, Relids),
+        required: Relids,
+    ) -> Result<ClauseList, SqlError> {
+        // `join_clause_is_movable_into` an input reading `param`.
+        let movable = |input: Relids, param: Relids, one: u8, two: u8| {
+            let relids = 1 << one | 1 << two;
+            param != 0 && relids & !(input | param) == 0 && relids & input != 0
+        };
+        let mut moved = ClauseList::EMPTY;
+        let mut dropped = [0u8; MAX_JOIN_CLAUSES];
+        let mut dropped_count = 0;
+        let first = |members: &[Member], relids: Relids| {
+            members
+                .iter()
+                .position(|member| relids & 1 << member.rel != 0)
+        };
+        for class_id in 0..self.problem.classes.len() {
+            let class = self.problem.classes[class_id];
+            if class.has_const {
+                continue;
+            }
+            let members = class.members();
+            let (Some(outside), Some(within)) = (first(members, required), first(members, joined))
+            else {
+                continue;
+            };
+            let (one, two) = (members[outside].rel, members[within].rel);
+            if movable(inputs.outer, outer_param, one, two) {
+                continue;
+            }
+            if movable(inputs.inner, inner_param, one, two) {
+                if dropped_count < dropped.len() {
+                    dropped[dropped_count] = class_id as u8;
+                    dropped_count += 1;
+                }
+                continue;
+            }
+            let id = self.class_clause(class_id as u8, outside as u8, within as u8)?;
+            moved.push(id).ok_or_else(too_many)?;
+        }
+        for &class_id in &dropped[..dropped_count] {
+            let members = self.problem.classes[usize::from(class_id)].members();
+            let (Some(outside), Some(outer)) =
+                (first(members, required), first(members, inputs.outer))
+            else {
+                continue;
+            };
+            if movable(
+                inputs.outer,
+                outer_param,
+                members[outside].rel,
+                members[outer].rel,
+            ) {
+                continue;
+            }
+            let id = self.class_clause(class_id, outside as u8, outer as u8)?;
+            moved.push(id).ok_or_else(too_many)?;
+        }
+        Ok(moved)
+    }
+
+    /// `has_indexed_join_quals` of a nested loop over `inner` keeping the
+    /// join clauses `clauses`.
+    fn indexed_join_quals(&self, inner: u32, clauses: &ClauseList) -> bool {
+        if clauses.len != 0 {
+            return false;
+        }
+        match self.path(inner).kind {
+            PathKind::Scan { rel, path } => {
+                self.problem.rels[usize::from(rel)].paths[usize::from(path)].indexed_join_quals
+            }
+            _ => false,
+        }
     }
 
     /// `ExecMaterializesOutput`.
@@ -1110,6 +1613,9 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         let mut best: Option<u32> = None;
         for &id in &rel.paths[..usize::from(rel.count)] {
             let path = self.path(id);
+            if path.param != 0 {
+                continue;
+            }
             if best.is_some_and(|best| compare_costs(&self.path(best), &path, startup) <= 0) {
                 continue;
             }
@@ -1132,21 +1638,121 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
     ) -> Result<(), SqlError> {
         let settings = self.problem.settings;
         let (outer_path, inner_path) = (self.path(outer), self.path(inner));
+        // `calc_nestloop_required_outer`: what the join still reads from
+        // other relations, which an inner join's search rejects unless
+        // `allow_star_schema_join` lets it build a parameterized join.
+        let required = (outer_path.param | inner_path.param) & !inputs.outer;
+        let mut moved = ClauseList::EMPTY;
+        if required != 0 {
+            let star =
+                inner_path.param & inputs.outer != 0 && inner_path.param & !inputs.outer != 0;
+            if !star {
+                return Ok(());
+            }
+            moved = self.moved_join_clauses(
+                joined,
+                inputs,
+                (outer_path.param, inner_path.param),
+                required,
+            )?;
+        }
+        // The join clauses the inner path enforces leave the join's; a
+        // parameterized join's moved clauses come first
+        // (`get_joinrel_parampathinfo`).
+        let mut clauses = moved;
+        let enforced = if inner_path.param & inputs.outer != 0 {
+            self.enforced(inner)
+        } else {
+            ClauseList::EMPTY
+        };
+        for &id in inputs.restrict.as_slice() {
+            if !enforced.contains(id) {
+                clauses.push(id).ok_or_else(too_many)?;
+            }
+        }
+        // `ppi_rows`: the first estimate for the join's parameterization.
+        let param_rows = if required == 0 {
+            None
+        } else if let Some(&(_, _, rows)) = self
+            .param_rows
+            .borrowed_slice()
+            .iter()
+            .find(|(relids, param, _)| *relids == joined && *param == required)
+        {
+            Some(rows)
+        } else {
+            let rows = self
+                .join_size(
+                    inputs.outer,
+                    inputs.inner,
+                    outer_path.rows,
+                    inner_path.rows,
+                    &clauses,
+                )?
+                .min(self.rel(joined).rows);
+            self.param_rows
+                .push((joined, required, rows))
+                .map_err(|_| arena_full())?;
+            Some(rows)
+        };
         let (rescan_startup, rescan_total) = self.rescan_cost(inner);
         let mut startup = outer_path.startup + inner_path.startup;
         let mut run = outer_path.total - outer_path.startup;
         if outer_path.rows > 1.0 {
             run += (outer_path.rows - 1.0) * rescan_startup;
         }
-        run += inner_path.total - inner_path.startup;
-        if outer_path.rows > 1.0 {
-            run += (outer_path.rows - 1.0) * (rescan_total - rescan_startup);
+        let inner_run = inner_path.total - inner_path.startup;
+        let inner_rescan_run = rescan_total - rescan_startup;
+        if !inputs.inner_unique {
+            run += inner_run;
+            if outer_path.rows > 1.0 {
+                run += (outer_path.rows - 1.0) * inner_rescan_run;
+            }
         }
-        let outer_rows = outer_path.rows.max(1.0);
-        let inner_rows = inner_path.rows.max(1.0);
+        let outer_rows = if outer_path.rows <= 0.0 {
+            1.0
+        } else {
+            outer_path.rows
+        };
+        let inner_rows = if inner_path.rows <= 0.0 {
+            1.0
+        } else {
+            inner_path.rows
+        };
         let rel = self.rel(joined);
-        let tuples = outer_rows * inner_rows;
-        let qual = self.qual_cost(&inputs.restrict);
+        // `final_cost_nestloop`: a unique inner relation's scan stops at
+        // the first match.
+        let tuples = if inputs.inner_unique {
+            let mut matched = (outer_rows * inputs.match_fraction).round_ties_even();
+            let mut unmatched = outer_rows - matched;
+            let scan_fraction = 2.0 / (inputs.match_count + 1.0);
+            let mut tuples = matched * inner_rows * scan_fraction;
+            if self.indexed_join_quals(inner, &clauses) {
+                run += inner_run * scan_fraction;
+                if matched > 1.0 {
+                    run += (matched - 1.0) * inner_rescan_run * scan_fraction;
+                }
+                run += unmatched * inner_rescan_run / inner_rows;
+            } else {
+                tuples += unmatched * inner_rows;
+                run += inner_run;
+                if unmatched >= 1.0 {
+                    unmatched -= 1.0;
+                } else {
+                    matched -= 1.0;
+                }
+                if matched > 0.0 {
+                    run += matched * inner_rescan_run * scan_fraction;
+                }
+                if unmatched > 0.0 {
+                    run += unmatched * inner_rescan_run;
+                }
+            }
+            tuples
+        } else {
+            outer_rows * inner_rows
+        };
+        let qual = self.qual_cost(&clauses);
         startup += 0.0;
         run += (settings.costs.cpu_tuple + qual) * tuples;
         self.add_path(
@@ -1155,15 +1761,17 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 kind: PathKind::NestLoop {
                     outer,
                     inner,
-                    clauses: inputs.restrict,
+                    clauses,
+                    inner_unique: inputs.inner_unique,
                 },
                 relids: joined,
-                rows: rel.rows,
+                rows: param_rows.unwrap_or(rel.rows),
                 width: rel.width,
                 startup,
                 total: startup + run,
                 disabled: u32::from(!settings.nestloop) + outer_path.disabled + inner_path.disabled,
                 keys,
+                param: required,
             },
         )
     }
@@ -1182,6 +1790,14 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 (0.0, run)
             }
             PathKind::HashJoin { batches: 1, .. } => (0.0, path.total - path.startup),
+            PathKind::Memoize { .. } => self
+                .memoize_rescans
+                .borrowed_slice()
+                .iter()
+                .find(|(held, _, _)| *held == id)
+                .map_or((path.startup, path.total), |&(_, startup, total)| {
+                    (startup, total)
+                }),
             _ => (path.startup, path.total),
         }
     }
@@ -1275,11 +1891,19 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
             selectivity *= self.selectivity(id)?;
         }
         let merged = clamp_row_est(selectivity * outer_path.rows * inner_path.rows);
-        let rescanned = (merged - inner_rows_all).max(0.0);
+        // A unique inner relation every clause merges needs no mark.
+        let skip_mark_restore = inputs.inner_unique && inputs.restrict.len == merge.len;
+        let rescanned = if skip_mark_restore {
+            0.0
+        } else {
+            (merged - inner_path.rows).max(0.0)
+        };
         let rescan_ratio = 1.0 + rescanned / inner_rows_read;
         let bare = inner_run * rescan_ratio;
         let materialized = inner_run + settings.costs.cpu_operator * inner_rows_read * rescan_ratio;
-        let materialize_inner = if (settings.material && materialized < bare)
+        let materialize_inner = if skip_mark_restore {
+            false
+        } else if (settings.material && materialized < bare)
             || (inner_sort.is_none() && !self.supports_mark_restore(inner))
         {
             true
@@ -1310,6 +1934,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                     outer_sort: outer_sort.unwrap_or(Keys::NONE),
                     inner_sort: inner_sort.unwrap_or(Keys::NONE),
                     materialize_inner,
+                    inner_unique: inputs.inner_unique,
                 },
                 relids: joined,
                 rows: rel.rows,
@@ -1318,13 +1943,20 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 total: startup + run,
                 disabled,
                 keys,
+                param: 0,
             },
         )
     }
 
     /// `ExecSupportsMarkRestore` of a path's plan.
     fn supports_mark_restore(&self, id: u32) -> bool {
-        matches!(self.path(id).kind, PathKind::Material { .. })
+        match self.path(id).kind {
+            PathKind::Material { .. } => true,
+            PathKind::Scan { rel, path } => {
+                self.problem.rels[usize::from(rel)].paths[usize::from(path)].mark_restore
+            }
+            _ => false,
+        }
     }
 
     /// `cost_sort` of a path's rows: its startup and total cost.
@@ -1425,12 +2057,27 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
         }
         let hash_cost = self.qual_cost(&hash);
         let other_cost = self.qual_cost(&inputs.restrict) - hash_cost;
-        run += hash_cost * outer_path.rows * clamp_row_est(inner_path.rows * bucket_size) * 0.5;
-        let mut selectivity = 1.0;
-        for &id in hash.as_slice() {
-            selectivity *= self.selectivity(id)?;
-        }
-        let tuples = clamp_row_est(selectivity * outer_path.rows * inner_path.rows);
+        let tuples = if inputs.inner_unique {
+            // Each outer row stops at its first match.
+            let matched = (outer_path.rows * inputs.match_fraction).round_ties_even();
+            let scan_fraction = 2.0 / (inputs.match_count + 1.0);
+            run += hash_cost
+                * matched
+                * clamp_row_est(inner_path.rows * bucket_size * scan_fraction)
+                * 0.5;
+            run += hash_cost
+                * (outer_path.rows - matched)
+                * clamp_row_est(inner_path.rows / virtual_buckets)
+                * 0.05;
+            matched
+        } else {
+            run += hash_cost * outer_path.rows * clamp_row_est(inner_path.rows * bucket_size) * 0.5;
+            let mut selectivity = 1.0;
+            for &id in hash.as_slice() {
+                selectivity *= self.selectivity(id)?;
+            }
+            clamp_row_est(selectivity * outer_path.rows * inner_path.rows)
+        };
         run += (costs.cpu_tuple + other_cost) * tuples;
         let rel = self.rel(joined);
         self.add_path(
@@ -1451,6 +2098,7 @@ impl<'p, 'a, 's> Search<'p, 'a, 's> {
                 total: startup + run,
                 disabled,
                 keys: Keys::NONE,
+                param: 0,
             },
         )
     }
@@ -1634,6 +2282,15 @@ fn compare_costs(first: &Path, second: &Path, startup: bool) -> i32 {
     0
 }
 
+/// `bms_subset_compare`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Subset {
+    Equal,
+    Subset1,
+    Subset2,
+    Different,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeysOrder {
     Better1,
@@ -1677,6 +2334,7 @@ mod tests {
             mergejoin: true,
             material: true,
             sort: true,
+            memoize: true,
         }
     }
 
@@ -1710,6 +2368,24 @@ mod tests {
         fn merge_range(&self, _: Member, _: Member) -> Result<Option<[f64; 4]>, SqlError> {
             Ok(Some([0.0, 1.0, 0.0, 1.0]))
         }
+        fn groups(&self, _: &[Member], calls: f64) -> Result<f64, SqlError> {
+            Ok(calls)
+        }
+    }
+
+    /// A sequential scan of `rows` rows over `total` cost.
+    fn seq(rows: f64, total: f64) -> BasePath {
+        BasePath {
+            startup: 0.0,
+            total,
+            rows,
+            disabled: 0,
+            keys: Keys::NONE,
+            param: 0,
+            enforced: ClauseList::EMPTY,
+            mark_restore: false,
+            indexed_join_quals: false,
+        }
     }
 
     #[test]
@@ -1730,14 +2406,16 @@ mod tests {
                 BaseRel {
                     rows: 1000.0,
                     width: 12.0,
-                    startup: 0.0,
-                    total: 16.0,
+                    paths: &[seq(1000.0, 16.0)],
+                    unique: &[],
+                    fixed: 0,
                 },
                 BaseRel {
                     rows: 2000.0,
                     width: 8.0,
-                    startup: 0.0,
-                    total: 29.0,
+                    paths: &[seq(2000.0, 29.0)],
+                    unique: &[],
+                    fixed: 0,
                 },
             ],
             classes: &[class],
@@ -1769,6 +2447,7 @@ mod tests {
                 },
             ],
             settings: settings(),
+            foreign_keys: &[],
         };
         let plan = search(&problem, &Uniform, &arena).unwrap().unwrap();
         let top = plan.path(plan.top);

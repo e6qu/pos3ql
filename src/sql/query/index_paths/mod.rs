@@ -377,32 +377,58 @@ pub(crate) fn btree_size(
 ) -> BtreeSize {
     let key = (key_width.ceil() as usize).next_multiple_of(8);
     let tuple = 8 + key;
-    // Leaf bytes: a posting tuple per run of equal keys, else one tuple each.
+    // The leaf tuples: a posting tuple per run of equal keys, whose
+    // posting list (padding included) a page's fill test discounts as
+    // truncatable (`truncextra`), else one tuple per entry.
     let entries = entries.max(0.0);
-    let leaf_bytes = if deduplicate && distinct >= 1.0 && entries / distinct >= 2.0 {
-        let per_key = entries / distinct;
-        let per_posting = ((812 - tuple) / 6).max(1) as f64;
-        let postings = (per_key / per_posting).ceil();
-        let posting_bytes = (tuple as f64 + 6.0 * per_key / postings).ceil();
-        distinct * postings * (((posting_bytes as usize).next_multiple_of(8) + 4) as f64)
-    } else {
-        entries * (tuple + 4) as f64
-    };
-    // Free bytes of a page after its header, special space and a line
-    // pointer, less the fill factor's reserve and the high key.
-    let leaf_capacity = (8148 - 819 - (tuple + 4)) as f64;
-    let leaves = (leaf_bytes / leaf_capacity).ceil().max(1.0);
-    let pivot = (tuple + 4) as f64;
-    let inner_capacity = ((8148 - 2457) as f64 / pivot).floor().max(2.0);
+    let (leaf_tuples, leaf_size, truncatable) =
+        if deduplicate && distinct >= 1.0 && entries / distinct >= 2.0 {
+            let per_key = entries / distinct;
+            let per_posting = ((812 - tuple) / 6).max(1) as f64;
+            let postings = (per_key / per_posting).ceil();
+            let posting =
+                ((tuple as f64 + 6.0 * per_key / postings).ceil() as usize).next_multiple_of(8);
+            (distinct * postings, posting, posting - tuple)
+        } else {
+            (entries, tuple, 0)
+        };
+    let leaves = level_pages(leaf_tuples, leaf_size, truncatable, 819, true);
+    // Inner levels hold one pivot per page below, filled to 70%.
     let mut level = leaves;
     let mut pages = 1.0 + leaves;
     let mut height = 0;
     while level > 1.0 {
-        level = (level / inner_capacity).ceil();
+        level = level_pages(level, tuple, 0, 2457, false);
         pages += level;
         height += 1;
     }
     BtreeSize { pages, height }
+}
+
+/// The pages `_bt_buildadd` fills with `tuples` tuples of `size` bytes:
+/// a page closes when a tuple arrives and its free space
+/// (`PageGetFreeSpace`), with the last tuple's `truncatable` bytes, is under
+/// `reserve` (or a leaf's has no room for the tuple and a heap TID), and
+/// its last tuple moves to the next page.
+fn level_pages(tuples: f64, size: usize, truncatable: usize, reserve: usize, leaf: bool) -> f64 {
+    // `BLCKSZ` less the page header, the special space and the high key's
+    // line pointer `_bt_blnewpage` reserves, less one line pointer.
+    const FREE: usize = 8192 - 24 - 16 - 4 - 4;
+    let line = size + 4;
+    let room = size + if leaf { 8 } else { 0 };
+    // The tuples on a page when the next one arrives and closes it.
+    let mut full = 2usize;
+    loop {
+        let free = FREE.saturating_sub(full * line);
+        if free < room || free + truncatable < reserve {
+            break;
+        }
+        full += 1;
+    }
+    if tuples <= full as f64 {
+        return 1.0;
+    }
+    1.0 + ((tuples - full as f64) / (full - 1) as f64).ceil()
 }
 
 /// Whether a btree on `ctype` deduplicates equal keys (its operator class
@@ -771,6 +797,8 @@ pub(crate) enum Planned<'a> {
     /// The `Append` or `Merge Append` PostgreSQL chooses over the members
     /// of a partition or inheritance tree.
     Tree(append::TreePath<'a>),
+    /// The paths of a base relation of a join ([`Member::Join`]).
+    Join(paths::JoinRelPaths<'a>),
 }
 
 impl<'a> Planned<'a> {
@@ -781,7 +809,8 @@ impl<'a> Planned<'a> {
             | Self::SeqOnly
             | Self::Outside(_)
             | Self::Members(_)
-            | Self::Tree(_) => None,
+            | Self::Tree(_)
+            | Self::Join(_) => None,
         }
     }
 
@@ -2055,7 +2084,48 @@ pub(crate) enum Member {
     Paths,
     /// The scan of the one of its paths the tree chose.
     Describe(paths::Candidate),
+    /// A base relation of a join PostgreSQL's join search plans: its paths
+    /// with their merge pathkeys and parameterizations, or the scan of one.
+    Join(JoinScan),
 }
+
+/// Join clauses an index of a join's base relation may apply, as
+/// `generate_implied_equalities_for_column` derives them.
+pub(crate) const MAX_JOIN_PARAMS: usize = 16;
+
+/// What the paths of one base relation of a join depend on beyond its own
+/// conditions (`create_index_paths` with its join clauses).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JoinScan {
+    /// The last `param_count` conjuncts of the scan's condition equate one
+    /// of its columns with another relation's: `(class, other relation)`,
+    /// each class's in the order of its members.
+    pub(crate) params: [(u8, u8); MAX_JOIN_PARAMS],
+    pub(crate) param_count: u8,
+    /// Each column's equivalence class when it has a member in another
+    /// relation (`eclass_useful_for_merging`), else [`NO_CLASS`].
+    pub(crate) classes: [u8; 64],
+    /// Each relation's rows by FROM position (`get_loop_count`).
+    pub(crate) rel_rows: [f64; 8],
+    /// `root->total_table_pages`.
+    pub(crate) total_table_pages: f64,
+    /// The path to describe, or `None` for the relation's paths.
+    pub(crate) describe: Option<JoinDescribe>,
+}
+
+/// Which path of a join's base relation a scan runs: its kind, index and
+/// direction, and parameterization, which name it whatever join clauses
+/// its planning sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinDescribe {
+    pub(crate) kind: ScanKind,
+    pub(crate) index: u16,
+    pub(crate) backward: bool,
+    pub(crate) param: u8,
+}
+
+/// No equivalence class in [`JoinScan::classes`].
+pub(crate) const NO_CLASS: u8 = u8::MAX;
 
 /// The scan's target list (`apply_scanjoin_target_to_paths`): the select
 /// list and the sort keys it lacks, each column's analyzed width and each

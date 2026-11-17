@@ -852,13 +852,34 @@ whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
 skip-array scan over several leaf pages. A `SELECT` of plain columns from
-two to eight plain, analyzed local tables without indexes or row security,
+two to eight plain, analyzed local tables without row security,
 inner-joined by equalities of same-typed columns (integer, `text`,
 `numeric`, `date`, `bool`), is planned by PostgreSQL 18's join search
 (`standard_join_search`, `add_paths_to_joinrel` with its merge, nested-loop
 and hash paths, the join costs of `costsize.c`, `eqjoinsel` over the
 columns' most common values, equivalence classes and `add_path`), and
-`EXPLAIN` prints, and execution runs, the chosen plan: hash joins build
+`EXPLAIN` prints, and execution runs, the chosen plan. Each relation's
+btree indexes give it index and bitmap paths (`create_index_paths`), the
+ascending ones useful for merging keeping their order for merge joins,
+and parameterized index and bitmap scans of the join clauses its key
+columns take (`consider_index_join_clauses`), costed per outer row
+(`get_loop_count`, `cost_index` and `genericcostestimate` with the loop
+count) and run inside nested loops reading the outer row's values; a
+unique inner relation (`innerrel_is_unique`) changes the nested-loop,
+merge and hash costs and ends each outer row's scan at its first match,
+and `Memoize` caches a parameterized scan's rows by its key
+(`cost_memoize_rescan`), counting hits, misses and memory as
+`ExecMemoize` does. A scan parameterized by relations on both sides of a
+join gives a parameterized nested loop (`allow_star_schema_join`, with
+`get_joinrel_parampathinfo`'s moved clauses and rows), as a link table's
+two-column key does; a foreign key whose columns the join equates sets
+its size (`get_foreign_key_join_selectivity`); and a merge join runs as
+`ExecMergeJoin`'s states, marking and restoring its inner input, so
+`EXPLAIN ANALYZE` counts what it fetched from each input
+(`differential_exact/844`). A join column equated with a constant
+restricts every member of its class to it and joins nothing
+(`generate_base_implied_equalities_const`, `differential_exact/845`).
+Hash joins build
 their table on the first outer row and return each outer row's matches in
 their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
 when the table outgrows its planned buckets), keep a one-batch table across
@@ -874,19 +895,19 @@ values, so rows, `Batches` and `Memory Usage` match
 planner out of such joins, and fail with `0A000` should their one-batch
 table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
 `Buckets` and memory and a `Materialize` store included, except a merge
-join (`0A000`). Remaining for that search: tables with indexes
-(parameterized and sorted index paths, `innerrel_is_unique`), other join
-clauses and types (outer, semi and anti joins, `USING`, non-equality join
-conditions), equivalence classes with constants, output expressions, upper
+join over an input in index order that is not a plain index scan without
+a filter (`0A000`). Remaining for that search: other join clauses and types (outer, semi and anti joins, `USING`, non-equality join
+conditions), a class with two constants, output expressions, upper
 stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
 pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
 FROM` and `DELETE ... USING` through the same search, more relations than
 `join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
 not ported; such queries keep pos3ql's join order and refuse cost output
-with `0A000`), merge-join `EXPLAIN ANALYZE`, and the merge-join scan range
-(`mergejoinscansel`) of a column whose statistics hold common values but no
-histogram, which can cost a merge join below PostgreSQL's estimate and
-choose it where PostgreSQL does not. The local reference used to verify costs runs
+with `0A000`). A parameterized index scan's cost reads its index's pages:
+an index built over loaded rows is sized as `_bt_buildadd` fills its
+pages (a page closes when its free space and its last tuple's posting
+list fall under the fill factor's reserve, that tuple moving on), but one
+grown by inserts is the btree size estimate below. The local reference used to verify costs runs
 on arm64, whose compiler fuses multiply-adds, so a cost there can differ
 from x86-64's (and pos3ql's) in its last printed digit. Other queries'
 joins are not costed as PostgreSQL costs them (`final_cost_hashjoin`,

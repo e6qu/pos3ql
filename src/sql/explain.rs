@@ -8331,9 +8331,17 @@ fn plan_pulled_select<'a>(
             // A join reads its input's physical columns (`use_physical_tlist`),
             // which a subquery's own plan outputs in order; a query of the
             // one relation projects its own select list.
+            // A plain aggregate over it reads the physical columns too:
+            // `use_physical_tlist` refuses only a grouping key's label.
+            let plain_aggregate = aggregate
+                && statement.having.is_none()
+                && statement.group_by.is_empty()
+                && statement.grouping_sets.is_empty()
+                && statement.windows.is_empty();
             let passes_through = body.locking.is_empty()
                 && !has_resjunk_targets(body)
                 && (!from.joins.is_empty()
+                    || plain_aggregate
                     || statement
                         .items
                         .iter()

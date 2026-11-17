@@ -525,6 +525,19 @@ binding them follows the same dependency-list pattern. Renaming an enum value th
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`.
+A `WITH` query run once is read lazily from the store its readers share,
+as PostgreSQL's `CTE Scan` reads it, when the reader is its query's only
+`FROM` item (`differential_exact/840`). Remaining: a join reads the whole
+query at its first read (which needs the join executor below to pull its
+inputs), a declared cursor runs its whole query at its first `FETCH`, a
+reader that needs rows past an earlier read's stop runs the query again from
+its first row (refused with `0A000` for a volatile query, which PostgreSQL
+runs once), and a materialized `WITH` inside a subquery cannot read the
+enclosing query's columns (`42P01` where PostgreSQL runs it as a correlated
+plan). Under `EXPLAIN ANALYZE`, a subplan reading a materialized `WITH`
+query of its enclosing statement prints `(never executed)` for its nodes:
+the executed subquery is a copy of the explained one, so its counters key
+by another identity.
 The differential corpora compare notices, warnings and INFO messages with
 their statement positions. The planner folds constants as PostgreSQL's
 `eval_const_expressions` does: before a `SELECT`, `INSERT ... VALUES`,
@@ -917,7 +930,8 @@ the left-deep join tree pos3ql runs, with scan filters, a hash join's
 condition and each nested loop's join filter, sort and grouping keys
 (`Sort Key`, `Group Key`), a `VALUES` list of several rows as `Values Scan
 on "*VALUES*"`, a derived table's own plan under its `Subquery Scan` (or in
-its place when the scan neither filters nor reshapes rows), and each outer
+its place when the scan neither filters nor reshapes rows, also under a
+plain aggregate, `differential_exact/841`), and each outer
 join narrowed by conditions that reject its nullable side's NULLs, as
 PostgreSQL's `reduce_outer_joins` does. A derived table's, a function's
 (`Function Scan`) and a pulled-up `VALUES` list's scan print their `Filter`, a

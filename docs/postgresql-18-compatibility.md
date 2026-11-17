@@ -448,8 +448,16 @@ Syntax and errors:
   `invalid reference to FROM-clause entry for table "a"` and its hint to mark
   the subquery `LATERAL`. `UPDATE ... FROM` and `DELETE ... USING` items
   cannot read the target table, even when `LATERAL`.
-- A materialized `WITH` query runs when its rows are first read, as
-  PostgreSQL's CTE scan runs it; one that nothing reads never runs.
+- A materialized `WITH` query (or one read more than once) runs only as far
+  as its readers read it, as PostgreSQL's CTE scan pulls rows into the store
+  its readers share; one that nothing reads never runs. For example, `WITH c
+  AS MATERIALIZED (SELECT 1 / (a - 2000) FROM t) SELECT * FROM c LIMIT 2`
+  returns two rows without reaching the row that divides by zero. A reader
+  that needs rows past where an earlier read stopped runs the query again
+  from its first row; a query calling a volatile function would evaluate
+  those rows differently, so that read fails with `0A000`. Readers that
+  are the only item of their `FROM` read this way; a join reads the whole
+  query at its first read.
 - `UPDATE` and `INSERT` assign through composite fields and array elements:
   `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
   a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,

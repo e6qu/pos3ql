@@ -494,6 +494,37 @@ pub(crate) fn modeled_join<'a>(
     let Ok(plan) = super::joins::search(&problem, &reader, arena)? else {
         return Ok(None);
     };
+    // A hash join planned with several batches assigns rows by their keys'
+    // hash values, which only some key types have here.
+    for path in plan.paths {
+        if let super::joins::PathKind::HashJoin { hash, batches, .. } = path.kind
+            && batches > 1
+            && hash.as_slice().iter().any(|&id| {
+                let ClauseForm::Equality { class, left, .. } = plan.clauses[usize::from(id)].form
+                else {
+                    return true;
+                };
+                let member = classes[usize::from(class)].members()[usize::from(left)];
+                let ctype = scope
+                    .defs
+                    .stored(usize::from(member.rel))
+                    .expect("plain table")
+                    .columns()[usize::from(member.column)]
+                .ctype;
+                !matches!(
+                    ctype,
+                    ColType::Int2
+                        | ColType::Int4
+                        | ColType::Int8
+                        | ColType::Date
+                        | ColType::Bool
+                        | ColType::Text
+                )
+            })
+        {
+            return Ok(None);
+        }
+    }
     let rels = arena
         .alloc_slice_with(n, |table| rels[table].expect("planned"))
         .map_err(|_| crate::sql::eval::arena_full())?;

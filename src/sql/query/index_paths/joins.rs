@@ -1497,11 +1497,13 @@ fn page_size(tuples: f64, width: f64) -> f64 {
 }
 
 /// What `ExecChooseHashTableSize` chooses for a table of `tuples` rows.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct HashSizing {
     pub(crate) buckets: u32,
     pub(crate) batches: u32,
     pub(crate) skew_mcvs: u32,
+    /// `space_allowed`: the table's memory, its skew buckets' included.
+    pub(crate) space_allowed: f64,
 }
 
 /// `ExecChooseHashTableSize` of a serial hash join with skew optimization.
@@ -1518,10 +1520,11 @@ pub(crate) fn choose_hash_table_size(
     let tuple_size = TUPLE_OVERHEAD + (width as u64).next_multiple_of(8) as f64;
     let inner_bytes = tuples * tuple_size;
     let mut table_bytes = settings.hash_mem_bytes.trunc();
+    let mut space_allowed = table_bytes;
     // `bytes_per_mcv`: the tuple, eight bucket pointers, the skew bucket
     // number and the `HashSkewBucket`.
     let per_mcv = tuple_size + 8.0 * POINTER + 4.0 + 16.0;
-    let skew_mcvs = ((table_bytes / per_mcv).trunc() * 2.0 / 100.0).trunc();
+    let mut skew_mcvs = ((table_bytes / per_mcv).trunc() * 2.0 / 100.0).trunc();
     if skew_mcvs > 0.0 {
         table_bytes -= skew_mcvs * per_mcv;
     }
@@ -1544,25 +1547,23 @@ pub(crate) fn choose_hash_table_size(
             .ceil()
             .min(max_pointers);
         batches = next_power_of_two(batch.max(2.0));
-        // The walk back to fewer batches whose file buffers cost less.
-        while batches > 1.0 {
-            if buckets > MAX_ALLOC / POINTER / 2.0 {
-                break;
-            }
-            let current = table_bytes + 2.0 * batches * BLOCK;
-            let halved = table_bytes * 2.0 + batches * BLOCK;
-            if current <= halved {
-                break;
-            }
-            batches /= 2.0;
-            buckets *= 2.0;
-            table_bytes *= 2.0;
+    }
+    // Halving the batches while their file buffers outweigh the table
+    // memory a halving doubles.
+    while batches > 1.0 {
+        if buckets > MAX_ALLOC / POINTER / 2.0 || batches < (space_allowed / BLOCK).trunc() {
+            break;
         }
+        buckets *= 2.0;
+        skew_mcvs *= 2.0;
+        space_allowed *= 2.0;
+        batches /= 2.0;
     }
     HashSizing {
         buckets: buckets as u32,
         batches: batches as u32,
         skew_mcvs: skew_mcvs as u32,
+        space_allowed,
     }
 }
 
@@ -1688,6 +1689,7 @@ mod tests {
                 buckets: 1024,
                 batches: 1,
                 skew_mcvs: 1271,
+                space_allowed: 8.0 * 1024.0 * 1024.0,
             }
         );
         assert_eq!(

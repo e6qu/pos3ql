@@ -13595,6 +13595,8 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
 struct PostgresHashTable {
     buckets: u64,
     original_buckets: u64,
+    batches: u64,
+    original_batches: u64,
     bytes: usize,
 }
 
@@ -13620,10 +13622,21 @@ impl PostgresHashTable {
         {
             buckets *= 2;
         }
+        if let Some(batches) = table.batches {
+            return Self {
+                buckets: u64::from(batches.buckets),
+                original_buckets: u64::from(batches.original_buckets),
+                batches: u64::from(batches.batches),
+                original_batches: u64::from(batches.original_batches),
+                bytes: batches.peak,
+            };
+        }
         let rows = table.tuple_bytes.unwrap_or(table.own_bytes);
         Self {
             buckets,
             original_buckets: original,
+            batches: 1,
+            original_batches: 1,
             bytes: rows.saturating_add(buckets as usize * 8),
         }
     }
@@ -14010,17 +14023,17 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, " ");
             }
             let memory = table.bytes.div_ceil(1024);
-            if table.original_buckets == table.buckets {
+            if table.original_buckets == table.buckets && table.original_batches == table.batches {
                 let _ = write!(
                     line,
-                    "Buckets: {}  Batches: 1  Memory Usage: {memory}kB",
-                    table.buckets
+                    "Buckets: {}  Batches: {}  Memory Usage: {memory}kB",
+                    table.buckets, table.batches
                 );
             } else {
                 let _ = write!(
                     line,
-                    "Buckets: {} (originally {})  Batches: 1 (originally 1)  Memory Usage: {memory}kB",
-                    table.buckets, table.original_buckets
+                    "Buckets: {} (originally {})  Batches: {} (originally {})  Memory Usage: {memory}kB",
+                    table.buckets, table.original_buckets, table.batches, table.original_batches
                 );
             }
             emit(line.as_str())?;
@@ -15158,8 +15171,8 @@ fn structured_node(
         let table = PostgresHashTable::of(node, table);
         document.number("Hash Buckets", table.buckets);
         document.number("Original Hash Buckets", table.original_buckets);
-        document.number("Hash Batches", 1);
-        document.number("Original Hash Batches", 1);
+        document.number("Hash Batches", table.batches);
+        document.number("Original Hash Batches", table.original_batches);
         document.number("Peak Memory Usage", table.bytes.div_ceil(1024));
     }
     for (label, text) in node.shown_qualifications(options.verbose) {
@@ -15753,6 +15766,7 @@ mod tests {
                     tuples,
                     tuple_bytes: Some(1000),
                     own_bytes: 7,
+                    batches: None,
                 },
             )
         };

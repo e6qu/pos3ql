@@ -9502,6 +9502,7 @@ fn scan_source_mode<'a>(
                     tuples: n as u64,
                     tuple_bytes,
                     own_bytes: allocated,
+                    batches: None,
                 });
                 drop(build_loop);
                 drop(hash_loop);

@@ -609,6 +609,21 @@ pub(crate) struct HashTable {
     pub(crate) tuple_bytes: Option<usize>,
     /// The bytes pos3ql's own arrays took, every array it outgrew included.
     pub(crate) own_bytes: usize,
+    /// A table built as PostgreSQL's join builds it, batches included: its
+    /// figures as `EXPLAIN ANALYZE` reports them.
+    pub(crate) batches: Option<HashBatches>,
+}
+
+/// The figures of a hash table PostgreSQL's executor builds
+/// (`HashInstrumentation`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct HashBatches {
+    pub(crate) buckets: u32,
+    pub(crate) original_buckets: u32,
+    pub(crate) batches: u32,
+    pub(crate) original_batches: u32,
+    /// `spacePeak`.
+    pub(crate) peak: usize,
 }
 
 /// A value the rows of a `Hash` node hold, which sizes it as PostgreSQL
@@ -1312,6 +1327,17 @@ impl Node {
                         .zip(table.tuple_bytes)
                         .map(|(held, built)| held.max(built)),
                     own_bytes: held.own_bytes.max(table.own_bytes),
+                    // `ExecHashAccumInstrumentation`: the largest of each.
+                    batches: match (held.batches, table.batches) {
+                        (Some(held), Some(built)) => Some(HashBatches {
+                            buckets: held.buckets.max(built.buckets),
+                            original_buckets: held.original_buckets.max(built.original_buckets),
+                            batches: held.batches.max(built.batches),
+                            original_batches: held.original_batches.max(built.original_batches),
+                            peak: held.peak.max(built.peak),
+                        }),
+                        (held, built) => built.or(held),
+                    },
                 },
             });
         });

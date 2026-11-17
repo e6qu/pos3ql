@@ -833,10 +833,48 @@ timestamp and UUID types estimates, a sub-partitioned table
 whose partitions have index paths, an `ORDER BY` of an index expression
 of a tree, a tree with a foreign member whose other members have index
 paths, and, under `EXPLAIN ANALYZE`, `Index Searches` of an array or
-skip-array scan over several leaf pages. A query's joins are not costed
-as PostgreSQL costs them (`final_cost_hashjoin`, `final_cost_nestloop`,
-`calc_joinrel_size_estimate`), so an `EXPLAIN` showing costs of a plan
-with a join fails with `0A000` naming the join node, as does one of an
+skip-array scan over several leaf pages. A `SELECT` of plain columns from
+two to eight plain, analyzed local tables without indexes or row security,
+inner-joined by equalities of same-typed columns (integer, `text`,
+`numeric`, `date`, `bool`), is planned by PostgreSQL 18's join search
+(`standard_join_search`, `add_paths_to_joinrel` with its merge, nested-loop
+and hash paths, the join costs of `costsize.c`, `eqjoinsel` over the
+columns' most common values, equivalence classes and `add_path`), and
+`EXPLAIN` prints, and execution runs, the chosen plan: hash joins build
+their table on the first outer row and return each outer row's matches in
+their bucket chain's order (re-chained as `ExecHashIncreaseNumBuckets` does
+when the table outgrows its planned buckets), keep a one-batch table across
+rescans, merge joins sort with PostgreSQL's quicksort, and nested loops
+rescan their inner input or its `Materialize` store
+(`differential_exact/842`). A hash join whose table outgrows `work_mem`
+times `hash_mem_multiplier` runs in batches as PostgreSQL's does
+(`ExecChooseHashTableSize`, `ExecHashIncreaseNumBatches`, the outer key's
+skew buckets from `ExecHashBuildSkewHash` and `ExecHashJoinNewBatch`), its
+rows assigned by `hashint2`/`hashint4`/`hashint8`/`hashtext`/`hashchar`
+values, so rows, `Batches` and `Memory Usage` match
+(`differential_exact/843`); keys of other types (`numeric`) keep the
+planner out of such joins, and fail with `0A000` should their one-batch
+table outgrow its memory while running. `EXPLAIN ANALYZE` counts these nodes, a hash's
+`Buckets` and memory and a `Materialize` store included, except a merge
+join (`0A000`). Remaining for that search: tables with indexes
+(parameterized and sorted index paths, `innerrel_is_unique`), other join
+clauses and types (outer, semi and anti joins, `USING`, non-equality join
+conditions), equivalence classes with constants, output expressions, upper
+stages (`ORDER BY`, `LIMIT`, grouping, which also bring the query's
+pathkeys and tuple fraction into the search), derived tables, `UPDATE ...
+FROM` and `DELETE ... USING` through the same search, more relations than
+`join_collapse_limit` (several join problems) or `geqo_threshold` (GEQO,
+not ported; such queries keep pos3ql's join order and refuse cost output
+with `0A000`), merge-join `EXPLAIN ANALYZE`, and the merge-join scan range
+(`mergejoinscansel`) of a column whose statistics hold common values but no
+histogram, which can cost a merge join below PostgreSQL's estimate and
+choose it where PostgreSQL does not. The local reference used to verify costs runs
+on arm64, whose compiler fuses multiply-adds, so a cost there can differ
+from x86-64's (and pos3ql's) in its last printed digit. Other queries'
+joins are not costed as PostgreSQL costs them (`final_cost_hashjoin`,
+`final_cost_nestloop`, `calc_joinrel_size_estimate`), so an `EXPLAIN`
+showing costs of such a plan with a join fails with `0A000` naming the
+join node, as does one of an
 `INSERT` whose listed values or defaults need a computation or coercion
 the model does not cost, of an `INSERT` into a view, and of a write whose
 source the planner does not model; `COSTS OFF` prints the join tree pos3ql

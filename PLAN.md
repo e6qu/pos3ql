@@ -492,10 +492,13 @@ in `pg_subscription_rel` at commit as `i` (`r` without `copy_data`)
 (`differential_exact/782`). Remaining: the initial copy still runs as one
 bootstrap under one synchronization slot, so a table moves from `i` to `r`
 when the whole copy commits, without PostgreSQL's per-table `d`, `f` and `s`
-states, and a publication's differing column lists for one table are
-rejected by that copy rather than by the statement. The publisher connection
-needs a numeric host, port, user, dbname and sslmode (`22023` otherwise),
-where libpq resolves names and defaults.
+states. A table its publications publish with different column lists fails
+`CREATE SUBSCRIPTION` with PostgreSQL's `0A000` before any slot is created,
+as `fetch_table_list` does; `ALTER SUBSCRIPTION ... REFRESH PUBLICATION`
+still rejects it in its copy rather than in the statement. The publisher connection
+needs a port, user, dbname and sslmode (`22023` otherwise), where libpq
+applies its defaults, and a numeric host: resolving a host name as libpq does
+is blocked by the fixed-memory rule ([B-351](BUGS.md)).
 A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
@@ -966,10 +969,13 @@ PostgreSQL's order. The hash keys are any equalities between an
 expression of the target and one of the FROM table (`t.id = s.k + 1`), and
 a SQL-language routine's parameters, a PL/pgSQL routine's variables and
 built-in function calls in the conditions are planned as PostgreSQL plans
-them (`differential_exact/740`). Other joined writes (several FROM items, a
-derived table, a FROM table with column aliases, relations without
-statistics, which PostgreSQL may merge-join, a nested loop on an equality)
-keep the row-by-row executor: they
+them (`differential_exact/740`). A FROM table read under column aliases
+plans the same join, its conditions and output lists printed with the
+aliased names, as the range table entry's `eref` names them
+(`differential_exact/798`). Other joined writes (several FROM items, a
+derived table, relations without statistics, which PostgreSQL may
+merge-join, a nested loop on an equality) keep the row-by-row executor,
+whose EXPLAIN shows pos3ql's own join order and costs: they
 hash their first FROM table when it is joined to the target by equality,
 as a `SELECT` of the two tables would, and join later FROM items to it in
 nested loops; PostgreSQL may instead hash the joined FROM items. A statement
@@ -1010,13 +1016,54 @@ InitPlan's output (a constant of unknown value: `var_eq_non_const` and
 and with a stable expression estimated from its value at planning
 (`estimate_expression_value`), whose evaluation an index scan charges once at
 startup (`index_other_operands_eval_cost`) (`differential_exact/783`).
-Remaining there: a stable expression the model cannot evaluate (a
-user-defined function) leaves the crude estimate, and PostgreSQL's
-`min`/`max` InitPlan of a local table (`preprocess_minmax_aggregates`) and the
-cost of an implicit coercion function inside a condition (`length(name)`
-casting to `text`) are not modelled. A plain `Aggregate`'s cost is not
-PostgreSQL's `cost_agg` (its input cost plus each aggregate's transition
-function per input row): EXPLAIN shows pos3ql's own estimate. JSON nests as
+`min` and `max` of the columns of one plain table are explained as
+PostgreSQL's `preprocess_minmax_aggregates` plans them: each an InitPlan
+reading the first row of the index scan ordered by its column with nulls
+excluded, when those scans cost less than the aggregate
+(`differential_exact/791`). Execution runs those InitPlans, and a nested
+query's `ORDER BY ... LIMIT` over a scan returning rows in its order stops
+at the limit as PostgreSQL's `Limit` does, so `EXPLAIN ANALYZE` counts one
+row per InitPlan and the rows a filtered scan passed over
+(`differential_exact/795`). Remaining there: a stable expression the model cannot evaluate
+(a user-defined function) leaves the crude estimate. A built-in function's
+argument of another type than it declares is charged its cast function
+(`length(name)` reads `text(name)`), unless the types are binary coercible,
+and an operator between two integer types or between `real` and `double
+precision` casts nothing, as PostgreSQL's cross-type operators do
+(`differential_exact/793`). `real` against an integer or `numeric` operand
+takes the `real`-`double precision` operator, so EXPLAIN and view
+definitions print the other side as `double precision` (`'2'::double
+precision`) and the result type is `double precision`
+(`differential_exact/796`). Aggregation over the chosen scan of one
+plain table is costed as PostgreSQL's `cost_agg` costs it
+(`differential_exact/790`): each transition state's function and input
+expressions per input row and each final function once per group
+(`get_agg_clause_costs`, from PostgreSQL 18.6's `pg_aggregate`, states shared
+as `find_compatible_trans` shares them), a plain `Aggregate`, and for a
+`GROUP BY` of the table's columns a `GroupAggregate` over a `Sort` weighed
+against a `HashAggregate` with its spill model (`hash_agg_entry_size`,
+`hash_agg_set_limits`, `Planned Partitions`) and the `ORDER BY` sort above
+either, the grouping taking the `ORDER BY`'s key order
+(`preprocess_groupclause`) and the groups `estimate_num_groups`.
+Under `EXPLAIN ANALYZE` a `GroupAggregate`'s `Sort` returns every input row
+and the aggregate one row per group in the sort's key order, and the JSON
+form names it an `Aggregate` of strategy `Sorted` (`differential_exact/794`).
+Grouping sets are arranged as PostgreSQL's planner arranges them: the
+sets chained into rollups (`extract_rollup_sets` with its bipartite
+matching, `reorder_grouping_sets`), then every set hashed when the tables
+fit in `hash_mem` (a `MixedAggregate` when an empty set needs the sorted
+phase), the input sorted for the first rollup with the rollups that fit
+hashed (`DiscreteKnapsack`) and the rest sorted again, or every rollup
+sorted, kept by cost; each node lists its `Hash Key`, `Group Key` and
+indented `Sort Key` lines and the JSON `Grouping Sets` groups, and over one
+plain table its costs and rows are PostgreSQL's (`differential_exact/802`).
+Outside that cost model (the shapes below) the rollups and keys are
+arranged from pos3ql's own estimates, so a sorted arrangement PostgreSQL's
+costs would pick may show as hashed. Remaining: `HAVING`, `LIMIT`, aggregates with `DISTINCT` or
+`ORDER BY` inputs, user-defined aggregates, a select list computing
+expressions over aggregates, grouping by expressions, by a column an index
+orders (presorted and incremental paths) and over joins keep pos3ql's own
+estimate. JSON nests as
 deeply as PostgreSQL 18.6's `json` and `jsonb` inputs do under the default
 `max_stack_depth` (21,790 and 18,675 levels on the reference build), and
 deeper documents, or a recursion that would exhaust the query thread's
@@ -1385,9 +1432,14 @@ target list, and a cursor may be declared in a nested block
 (`differential_exact/743`, `744`). An exclusion constraint's build sorts the
 rows by its equality elements and sweeps one range-overlap element in O(n
 log n) comparisons and names the first conflicting row in heap order
-(`differential_exact/746`); other operators still compare every pair, and
-for a GiST constraint PostgreSQL names the partner its index scan finds
-first, where pos3ql names the first in heap order. Merged CHECK predicates
+(`differential_exact/746`); elements of other operators are compared only
+among the rows its equality elements make equal (`differential_exact/792`)
+and, with a range-overlap element, whose ranges overlap, swept in
+lower-bound order with the rows whose ranges still reach the current one
+(`differential_exact/797`). Without an equality or range-overlap element (a
+box `&&`, a multirange) every pair is compared, and for a GiST constraint
+PostgreSQL names the partner its index scan finds first, where pos3ql names
+the first in heap order. Box `&&` is PostgreSQL's `box_ov`. Merged CHECK predicates
 compare in their analysed form, as PostgreSQL's `equal()` compares cooked
 trees: `a > 0::integer` and `a > 0` merge, `d > 0` and `d > 0::bigint` (another
 operator) conflict; a predicate outside the deparser's typed coverage compares

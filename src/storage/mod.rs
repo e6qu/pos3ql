@@ -8849,6 +8849,8 @@ struct SubscriptionConnect {
     missing: u64,
     /// The publications name more tables than a subscription can hold.
     overflow: bool,
+    /// The last table found was listed again with another column list.
+    mismatched_columns: bool,
 }
 
 impl SubscriptionConnect {
@@ -8858,6 +8860,7 @@ impl SubscriptionConnect {
         tables: 0,
         missing: 0,
         overflow: false,
+        mismatched_columns: false,
     };
 
     const fn owner(&self) -> Option<SlotDropOwner> {
@@ -46209,17 +46212,19 @@ impl Storage {
             tables: 0,
             missing: 0,
             overflow: false,
+            mismatched_columns: false,
         };
         Ok(SubscriptionConnectPoll::Pending)
     }
 
     /// The publisher tables and missing publications (by position) the
-    /// finished discovery of connect slot `slot` found; an error when they
-    /// name more tables than a subscription holds.
+    /// finished discovery of connect slot `slot` found, and whether the
+    /// last table has different column lists in different publications;
+    /// an error when they name more tables than a subscription holds.
     pub(crate) fn subscription_connect_result<T>(
         &self,
         slot: usize,
-        visit: impl FnOnce(&[PublisherTable], u64) -> T,
+        visit: impl FnOnce(&[PublisherTable], u64, bool) -> T,
     ) -> Result<T, SqlError> {
         let catalog = self
             .subscription_catalog
@@ -46236,6 +46241,7 @@ impl Storage {
         Ok(visit(
             &catalog.connect_tables[slot * capacity..slot * capacity + connect.tables],
             connect.missing,
+            connect.mismatched_columns,
         ))
     }
 
@@ -46307,6 +46313,15 @@ impl Storage {
             .expect("subscription catalog lock poisoned");
         let capacity = catalog.connect_tables.len() / catalog.connects.len().max(1);
         let count = catalog.connects[slot].tables;
+        if catalog.connects[slot].mismatched_columns {
+            return;
+        }
+        // The publisher lists each table once per distinct column list, in
+        // name order (`fetch_table_list`).
+        if count > 0 && catalog.connect_tables[slot * capacity + count - 1] == table {
+            catalog.connects[slot].mismatched_columns = true;
+            return;
+        }
         if count == capacity {
             catalog.connects[slot].overflow = true;
             return;

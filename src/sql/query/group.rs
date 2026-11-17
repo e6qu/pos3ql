@@ -194,6 +194,10 @@ pub(super) fn groups_for_mask<'a>(
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
     let aggregate = instrument::node(instrument::Role::Aggregate);
+    // A `GroupAggregate` reads its input from a sort by the grouping keys,
+    // which this pass's key sort is: it returns every input row.
+    let input_sort = instrument::node(instrument::Role::GroupSort);
+    let input_sort_loop = input_sort.start();
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -288,6 +292,9 @@ pub(super) fn groups_for_mask<'a>(
         let run = storage
             .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
             .expect("spill-attached block store")?;
+        if let Some(space) = sorter.space() {
+            input_sort.sorted(space);
+        }
         drop(sorter);
         let rep_keys_buf = arena
             .alloc_slice_with(row_count, |_| empty)
@@ -396,6 +403,17 @@ pub(super) fn groups_for_mask<'a>(
                     .then(left.1.cmp(&right.1)),
             )
         })?;
+        if n_keys > 0 {
+            let bytes = keys
+                .iter()
+                .fold(core::mem::size_of_val(&*keys), |bytes, key| {
+                    bytes.saturating_add(key.0.len())
+                });
+            input_sort.sorted(instrument::SortSpace {
+                method: instrument::SortMethod::Quicksort,
+                bytes,
+            });
+        }
         let ng = {
             let mut g = 0usize;
             for i in 0..keys.len() {
@@ -444,6 +462,9 @@ pub(super) fn groups_for_mask<'a>(
         }
         (ng, &rep_keys_buf[..ng])
     };
+    if n_keys > 0 {
+        input_sort.rows(row_count as u64);
+    }
 
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
@@ -658,6 +679,7 @@ pub(super) fn groups_for_mask<'a>(
         }
     }
 
+    drop(input_sort_loop);
     let empty_group: &[&[u8]] = &[];
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)

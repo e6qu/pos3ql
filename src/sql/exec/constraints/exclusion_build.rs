@@ -4,8 +4,10 @@
 //! that conflicts with any other, and a row it conflicts with. Comparing
 //! every pair of rows finds that row in O(n²); here equality elements group
 //! the rows by sorting and a range-overlap element is swept in lower-bound
-//! order, so the build makes O(n log n) comparisons. Other operators keep
-//! the pairwise check. The partner reported is the first conflicting row in
+//! order, so the build makes O(n log n) comparisons. Elements of other
+//! operators are compared only among the rows whose equality elements are
+//! equal and, with a range-overlap element, whose ranges overlap: a sweep in
+//! lower-bound order keeps the rows whose ranges reach the current one. The partner reported is the first conflicting row in
 //! heap order, which is PostgreSQL's B-tree index order among equal keys.
 
 use core::cell::Cell;
@@ -28,13 +30,16 @@ struct Entry {
     length: u32,
 }
 
-/// How the build finds conflicting rows.
+/// How the build finds conflicting rows: it sorts them by their equality
+/// elements, then within each run of equal rows sweeps one range-overlap
+/// element, comparing the overlapping pairs on every element when another
+/// operator remains, or every pair without an overlap element.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Strategy {
-    /// Equality elements, and at most one range-overlap element.
-    Sorted { overlap: Option<usize> },
-    /// Another operator: every pair of rows.
-    Pairwise,
+struct Strategy {
+    /// The elements whose operator is equality.
+    equal: [bool; MAX_INDEX_COLS],
+    overlap: Option<usize>,
+    pairwise: bool,
 }
 
 /// Checks the exclusion constraint at `position` of `def` over `rows`, as
@@ -199,23 +204,17 @@ pub(crate) fn check_exclusion_build<B: crate::storage::DefinitionBacking>(
         Ok(conflict)
     };
     // The first row in heap order that conflicts with another.
-    let first = match strategy(&scan, n) {
-        Strategy::Pairwise => {
-            let mut first = None;
-            'rows: for a in 0..count {
-                for b in 0..count {
-                    if a != b && conflicts(a, b)? {
-                        first = Some(a);
-                        break 'rows;
-                    }
-                }
-            }
-            first
-        }
-        Strategy::Sorted { overlap } => sorted_first(
-            storage, txid, &scan, n, overlap, count, &with_keys, &conflicts, arena,
-        )?,
-    };
+    let first = sorted_first(
+        storage,
+        txid,
+        &scan,
+        n,
+        strategy(&scan, n),
+        count,
+        &with_keys,
+        &conflicts,
+        arena,
+    )?;
     let Some(first) = first else {
         return Ok(());
     };
@@ -281,36 +280,69 @@ type WithKeys<'w> = dyn Fn(usize, &mut dyn FnMut(&ExclusionKeys<'_>) -> Result<(
 
 /// How the elements' operators let the build find conflicts.
 fn strategy(scan: &ExclusionScan<'_, '_>, n: usize) -> Strategy {
-    let mut overlap = None;
+    let mut strategy = Strategy {
+        equal: [false; MAX_INDEX_COLS],
+        overlap: None,
+        pairwise: false,
+    };
     for (position, operator) in scan.exclusion.operators()[..n].iter().enumerate() {
         match operator.binary() {
             // A catalog collation's equality is the collation's.
-            Some(BinaryOp::Eq) => {}
-            Some(BinaryOp::Overlaps) if overlap.is_none() => overlap = Some(position),
-            _ => return Strategy::Pairwise,
+            Some(BinaryOp::Eq) => strategy.equal[position] = true,
+            Some(BinaryOp::Overlaps) if strategy.overlap.is_none() => {
+                strategy.overlap = Some(position);
+            }
+            _ => strategy.pairwise = true,
         }
     }
-    Strategy::Sorted { overlap }
+    strategy
 }
 
 /// The first row in heap order with a conflict, found by sorting the rows
 /// by their equality elements, then by the overlap element's lower bound:
-/// equal rows conflict, and within a run of equal rows a range overlaps
-/// another exactly when it overlaps the next one or the earlier one that
-/// reaches furthest.
+/// equal rows conflict, within a run of equal rows a range overlaps another
+/// exactly when it overlaps the next one or the earlier one that reaches
+/// furthest, and other operators are tried on each pair of the run.
 #[allow(clippy::too_many_arguments)]
 fn sorted_first(
     storage: &Storage,
     txid: u32,
     scan: &ExclusionScan<'_, '_>,
     n: usize,
-    overlap: Option<usize>,
+    strategy: Strategy,
     count: usize,
     with_keys: &WithKeys<'_>,
     conflicts: &dyn Fn(usize, usize) -> Result<bool, SqlError>,
     arena: &Arena,
 ) -> Result<Option<usize>, SqlError> {
     let full = || crate::sql::eval::arena_full();
+    // An overlap element sweeps only a range type's values; another type's
+    // `&&` (boxes, multiranges) is one more operator compared pairwise.
+    let mut overlap = strategy.overlap;
+    if let Some(position) = overlap {
+        for row in 0..count {
+            let mut typed = None;
+            with_keys(row, &mut |keys| {
+                typed = match keys[position] {
+                    Datum::Null => None,
+                    Datum::Range { .. } => Some(true),
+                    _ => Some(false),
+                };
+                Ok(())
+            })?;
+            if let Some(range) = typed {
+                if !range {
+                    overlap = None;
+                }
+                break;
+            }
+        }
+    }
+    let strategy = Strategy {
+        overlap,
+        pairwise: strategy.pairwise || (strategy.overlap.is_some() && overlap.is_none()),
+        ..strategy
+    };
     // Rows that can conflict at all: no NULL element, no empty range.
     let mut candidates = 0usize;
     let eligible = arena
@@ -347,7 +379,7 @@ fn sorted_first(
         with_keys(a, &mut |left| {
             with_keys(b, &mut |right| {
                 for position in 0..n {
-                    if Some(position) == overlap {
+                    if !strategy.equal[position] {
                         continue;
                     }
                     ordering = compare_datums_collated(
@@ -390,6 +422,17 @@ fn sorted_first(
     let flagged = arena
         .alloc_slice_with(count, |_| false)
         .map_err(|_| full())?;
+    // The rows of a run whose ranges still reach the sweep position.
+    let active = arena
+        .alloc_slice_with(
+            if overlap.is_some() && strategy.pairwise {
+                order.len()
+            } else {
+                0
+            },
+            |_| 0u32,
+        )
+        .map_err(|_| full())?;
     let mut start = 0usize;
     while start < order.len() {
         let mut end = start + 1;
@@ -400,12 +443,59 @@ fn sorted_first(
         }
         let run = &order[start..end];
         match overlap {
+            None if strategy.pairwise => {
+                for (index, &row) in run.iter().enumerate() {
+                    for &other in &run[index + 1..] {
+                        if (!flagged[row as usize] || !flagged[other as usize])
+                            && conflicts(row as usize, other as usize)?
+                        {
+                            flagged[row as usize] = true;
+                            flagged[other as usize] = true;
+                        }
+                    }
+                }
+            }
             None if run.len() > 1 => {
                 for &row in run {
                     flagged[row as usize] = true;
                 }
             }
             None => {}
+            Some(position) if strategy.pairwise => {
+                // Sorted by lower bound, a range that misses the current
+                // one ends before it and misses every later one: only the
+                // rows still overlapping are compared on every element.
+                let mut live = 0usize;
+                for &row in run {
+                    let row_index = row as usize;
+                    let mut kept = 0usize;
+                    for at in 0..live {
+                        let other = active[at];
+                        let mut overlapping = false;
+                        with_keys(row_index, &mut |left| {
+                            with_keys(other as usize, &mut |right| {
+                                let (left, kind) = range_of(&left[position])?;
+                                let (right, _) = range_of(&right[position])?;
+                                overlapping = crate::sql::range::overlaps(left, right, kind)?;
+                                Ok(())
+                            })
+                        })?;
+                        if !overlapping {
+                            continue;
+                        }
+                        active[kept] = other;
+                        kept += 1;
+                        if (!flagged[row_index] || !flagged[other as usize])
+                            && conflicts(other as usize, row_index)?
+                        {
+                            flagged[row_index] = true;
+                            flagged[other as usize] = true;
+                        }
+                    }
+                    active[kept] = row;
+                    live = kept + 1;
+                }
+            }
             Some(position) => {
                 // The earlier row of the run whose range reaches furthest.
                 let mut reach: Option<u32> = None;

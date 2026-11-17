@@ -1564,6 +1564,10 @@ pub(crate) struct OrderedIndexAccessPlan<'a> {
     order_positions: [u8; MAX_INDEX_COLS],
     order: &'a [OrderBy<'a>],
     knn: Option<KnnOrder<'a>>,
+    /// The key positions whose column the query's conditions require to be
+    /// `IS NOT NULL`: the scan's index condition, which reads no entry with
+    /// a NULL there.
+    not_null_keys: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -3307,6 +3311,47 @@ pub(crate) fn ordered_index_access_plan<'a>(
             &mut by_column,
         );
     }
+    // The columns a top-level `column IS NOT NULL` conjunct requires.
+    let mut not_null_columns = ColumnSet::EMPTY;
+    let mut pending = [None::<&'a Expr<'a>>; 64];
+    pending[0] = where_clause;
+    let mut depth = 1usize;
+    while depth > 0 {
+        depth -= 1;
+        let Some(conjunct) = pending[depth].take() else {
+            continue;
+        };
+        match conjunct {
+            Expr::Binary {
+                operator: BinaryOp::And,
+                left,
+                right,
+                ..
+            } if depth + 2 <= pending.len() => {
+                pending[depth] = Some(left);
+                pending[depth + 1] = Some(right);
+                depth += 2;
+            }
+            Expr::IsNull {
+                operand,
+                negated: true,
+            } => {
+                if let Some(column) = resolve_column(operand).filter(|&column| column < MAX_COLUMNS)
+                {
+                    not_null_columns.insert(column);
+                }
+            }
+            _ => {}
+        }
+    }
+    let not_null_keys = |columns: &[u16]| {
+        columns
+            .iter()
+            .take(32)
+            .enumerate()
+            .filter(|(_, column)| not_null_columns.contains(usize::from(**column)))
+            .fold(0u32, |mask, (position, _)| mask | (1 << position))
+    };
     let mut order_columns = [None; MAX_INDEX_COLS];
     let mut order_targets = [&Expr::Null; MAX_INDEX_COLS];
     for (position, requested) in order.iter().enumerate() {
@@ -3386,6 +3431,8 @@ pub(crate) fn ordered_index_access_plan<'a>(
             order_positions,
             order,
             knn: None,
+            not_null_keys: not_null_keys(&access.columns[..access.n_columns])
+                & !access.expression_mask,
         };
         if selected.is_none_or(|(best, _)| score > best) {
             selected = Some((score, plan));
@@ -3468,6 +3515,9 @@ pub(crate) fn ordered_index_access_plan<'a>(
             order_positions,
             order,
             knn,
+            // An expression key's column is not a table column.
+            not_null_keys: not_null_keys(&access.columns[..access.n_columns])
+                & !access.expression_mask,
         };
         if (knn.is_some() || start <= equality_prefix)
             && selected.is_none_or(|(best, _)| score > best)
@@ -4682,6 +4732,26 @@ fn indexed_candidates_for_plan<'a>(
             }
             if live > 0 && candidates[live - 1].rowid == candidate.rowid {
                 continue;
+            }
+            if ordered.not_null_keys != 0 {
+                let key = &encoded[candidate.key_at..candidate.key_at + candidate.key_len];
+                let mut decoded = [Datum::Null; MAX_INDEX_COLS];
+                rowenc::decode(
+                    key,
+                    &plan.key_types[..plan.n_columns],
+                    &mut decoded[..plan.n_columns],
+                )?;
+                if decoded[..plan.n_columns]
+                    .iter()
+                    .enumerate()
+                    .any(|(position, value)| {
+                        position < 32
+                            && ordered.not_null_keys & (1 << position) != 0
+                            && value.is_null()
+                    })
+                {
+                    continue;
+                }
             }
             candidates[live] = candidate;
             live += 1;

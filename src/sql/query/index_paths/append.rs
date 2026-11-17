@@ -101,6 +101,7 @@ impl<'a> TreePath<'a> {
             searches_unmodeled: false,
             sort_cost: self.sort_cost,
             limit_cost: self.limit_cost,
+            grouped: None,
         }
     }
 }

@@ -87887,6 +87887,7 @@ fn record_merge_scans<Definition0: crate::storage::DefinitionBacking>(
         tuples: inner_rows,
         tuple_bytes,
         own_bytes,
+        batches: None,
     });
 }
 

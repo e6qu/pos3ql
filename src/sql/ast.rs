@@ -3530,17 +3530,21 @@ pub(crate) enum MaterializedCteSource<'a> {
     Recursive(crate::sql::query::RecursiveCteQuery<'a>),
 }
 
-/// The query of a [`MaterializedCteSource::Deferred`] source and its rows
-/// once read. The rows live in the statement arena's persistent tail, which
-/// per-row rewinds cannot reclaim.
+/// The query of a [`MaterializedCteSource::Deferred`] source and the rows
+/// its readers pulled so far. The rows live in the statement arena's
+/// persistent tail, which per-row rewinds cannot reclaim.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeferredCteQuery<'a> {
+    pub name: &'a str,
     pub tree: &'a SetTree<'a>,
     /// The block of an explained plan the query runs in: its statement's
     /// `CTE name` InitPlan, wherever its rows are first read.
     pub block: crate::sql::query::instrument::BlockId,
-    /// Zero until read, then the address of the persistent
-    /// [`MaterializedCteInlineSource`] naming the rows.
+    /// The query calls a volatile function, so running it again to reach
+    /// rows past an earlier run would evaluate its first rows twice.
+    pub volatile: bool,
+    /// Zero until read, then the address of the persistent store its readers
+    /// share (`DeferredCteStore`).
     pub rows: &'a core::sync::atomic::AtomicUsize,
 }
 

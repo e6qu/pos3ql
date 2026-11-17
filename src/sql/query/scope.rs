@@ -589,6 +589,13 @@ impl<'a> QueryDefinitions<'a> {
     }
 }
 
+/// A `WITH` query its only reader runs as it reads.
+#[derive(Clone, Copy)]
+pub(crate) enum LazyCte<'a> {
+    Recursive(super::RecursiveCteQuery<'a>),
+    Deferred(crate::sql::ast::DeferredCteQuery<'a>),
+}
+
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
@@ -621,10 +628,10 @@ pub struct QueryScope<'d> {
     /// as the plan consumes rows. `derived` is `Some` (empty) for it, as for
     /// an external run: a marker, not the rows.
     pub(crate) foreign_streams: &'d mut [Option<crate::sql::foreign::ForeignStream<'d>>],
-    /// A recursive `WITH` query that is its query's only FROM item: the
-    /// scan runs it a step at a time as it reads (`derived` holds an empty
-    /// placeholder), so a reader that stops early stops the recursion.
-    pub(crate) recursive: &'d mut [Option<super::RecursiveCteQuery<'d>>],
+    /// A `WITH` query run once that is its query's only FROM item: the scan
+    /// runs it as it reads (`derived` holds an empty placeholder), so a
+    /// reader that stops early leaves the query's later rows unrun.
+    pub(crate) lazy_ctes: &'d mut [Option<LazyCte<'d>>],
     /// Whether the FROM item being added is the query's only one, so a
     /// foreign table there streams instead of being read whole first.
     sole_source: bool,
@@ -1528,7 +1535,7 @@ impl<'d> QueryScope<'d> {
         let external_runs = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
-        let recursive = arena
+        let lazy_ctes = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
         let foreign_streams = arena
@@ -1577,7 +1584,7 @@ impl<'d> QueryScope<'d> {
             derived,
             external_runs,
             foreign_streams,
-            recursive,
+            lazy_ctes,
             sole_source: false,
             lateral,
             func_scalar,
@@ -2351,11 +2358,18 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, def_reference);
         let materialize = read.is_some();
-        if let (true, crate::sql::ast::MaterializedCteSource::Recursive(query)) =
-            (materialize && self.sole_source, m.source)
-        {
+        let lazy = match m.source {
+            crate::sql::ast::MaterializedCteSource::Recursive(query) => {
+                Some(LazyCte::Recursive(query))
+            }
+            crate::sql::ast::MaterializedCteSource::Deferred(query) => {
+                Some(LazyCte::Deferred(query))
+            }
+            _ => None,
+        };
+        if let Some(lazy) = lazy.filter(|_| materialize && self.sole_source) {
             self.derived[self.n] = Some(&[]);
-            self.recursive[self.n] = Some(query);
+            self.lazy_ctes[self.n] = Some(lazy);
         } else {
             self.derived[self.n] = Some(if materialize {
                 m.read_rows(arena, read)?

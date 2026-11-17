@@ -48,6 +48,10 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
+mod join_exec;
+pub(crate) use join_exec::{
+    node_number as join_exec_node_number, scan_segment as join_exec_scan_segment,
+};
 mod joined_from;
 #[cfg(test)]
 pub(crate) use joined_from::target_hash_builds;
@@ -1283,93 +1287,324 @@ pub(crate) struct DeferredCteRead<'r, 'a> {
     pub outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 
-/// The rows of a read deferred `WITH` query and the arena that holds them.
+/// The tuplestore a deferred ordinary `WITH` query's readers share, as
+/// PostgreSQL's `CTE Scan`s share their query's tuplestore: rows are run on
+/// demand and appended once, and each reader keeps its own position. It
+/// lives in the statement arena's persistent tail, which per-row rewinds
+/// cannot reclaim; only an arena reset does, and that needs the arena's
+/// unique borrow.
 #[derive(Clone, Copy)]
-struct DeferredCteRows {
+struct DeferredCteStore<'a> {
     owner: usize,
-    address: usize,
-    length: usize,
+    /// `rows[..count]` of a persistent array of `capacity` entries, grown
+    /// geometrically; a replaced array stays valid for readers holding it.
+    rows: *mut &'a [u8],
+    capacity: usize,
+    count: usize,
+    /// A run reached the query's end, so `rows[..count]` is every row.
+    done: bool,
+    /// Runs of the query in progress: a reader inside one run's row can
+    /// read further than that run has gone.
+    producing: usize,
 }
 
-/// Runs a deferred ordinary `WITH` query on its first read and keeps its rows
-/// in the arena's persistent tail for every later read.
-pub(crate) fn read_deferred_cte<'a>(
+/// The single mutable store of a deferred query. Each access copies the
+/// store in or out, so no reference into it outlives a call.
+#[derive(Clone, Copy)]
+struct DeferredCteStoreRef<'a>(*mut DeferredCteStore<'a>);
+
+impl<'a> DeferredCteStoreRef<'a> {
+    fn get(self) -> DeferredCteStore<'a> {
+        // SAFETY: the address names the persistent store `deferred_cte_store`
+        // allocated, which lives until the arena resets.
+        unsafe { *self.0 }
+    }
+
+    fn set(self, store: DeferredCteStore<'a>) {
+        // SAFETY: as in `get`; no reference into the store is live.
+        unsafe { self.0.write(store) }
+    }
+
+    fn rows(self) -> &'a [&'a [u8]] {
+        let store = self.get();
+        if store.count == 0 {
+            return &[];
+        }
+        // SAFETY: entries below `count` were written before `count` grew and
+        // are never rewritten; arrays live in the persistent tail.
+        unsafe { core::slice::from_raw_parts(store.rows, store.count) }
+    }
+
+    fn push(self, row: &'a [u8], arena: &'a Arena) -> Result<(), SqlError> {
+        let mut store = self.get();
+        if store.count == store.capacity {
+            let capacity = (store.capacity * 2).max(16);
+            let previous = self.rows();
+            let grown = arena
+                .alloc_persistent_slice_with(capacity, |index| {
+                    previous.get(index).copied().unwrap_or(&[])
+                })
+                .map_err(|_| arena_full())?;
+            store.rows = grown.as_mut_ptr();
+            store.capacity = capacity;
+        }
+        // SAFETY: `count < capacity`, and no reader counts this entry yet.
+        unsafe { store.rows.add(store.count).write(row) };
+        store.count += 1;
+        self.set(store);
+        Ok(())
+    }
+}
+
+/// Ends a run of a deferred query, also when it fails.
+struct DeferredCteRun<'a> {
+    store: Option<DeferredCteStoreRef<'a>>,
+}
+
+impl Drop for DeferredCteRun<'_> {
+    fn drop(&mut self) {
+        if let Some(store) = self.store {
+            let mut current = store.get();
+            current.producing -= 1;
+            store.set(current);
+        }
+    }
+}
+
+/// A dry run (such as CREATE TABLE AS counting its rows first) previews
+/// sequence values; the run that consumes them must evaluate again, so it
+/// shares no rows.
+fn deferred_cte_dry_run(read: DeferredCteRead<'_, '_>) -> bool {
+    read.sequences
+        .is_some_and(|sequences| !sequences.has_effects())
+}
+
+fn deferred_cte_store<'a>(
     deferred: super::ast::DeferredCteQuery<'a>,
     arena: &'a Arena,
-    query: Option<DeferredCteRead<'_, 'a>>,
-) -> Result<&'a [&'a [u8]], SqlError> {
-    let _cte = instrument::enter_block(deferred.block);
+) -> Result<DeferredCteStoreRef<'a>, SqlError> {
+    let owner = core::ptr::from_ref(arena) as usize;
     let saved = deferred.rows.load(core::sync::atomic::Ordering::Relaxed);
     if saved != 0 {
-        // SAFETY: a nonzero address names an immutable persistent descriptor
-        // allocated with the rows by the first read.
-        let source = unsafe { &*(saved as *const DeferredCteRows) };
-        if source.owner != core::ptr::from_ref(arena) as usize {
+        let store = DeferredCteStoreRef(saved as *mut DeferredCteStore<'a>);
+        if store.get().owner != owner {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "a WITH query was read outside the statement memory that ran it"
             ));
         }
-        // SAFETY: the rows live in this arena's persistent tail, which only
-        // a reset reclaims, and a reset needs the arena's unique borrow.
-        let rows: &'a [&'a [u8]] = unsafe {
-            core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
-        };
-        // A later attempt of the statement reads the rows an earlier one
-        // ran; its counters restarted.
-        record_cte_storage(deferred.block, rows);
-        return Ok(rows);
+        return Ok(store);
     }
+    let store = arena
+        .alloc_persistent_slice_with(1, |_| DeferredCteStore {
+            owner,
+            rows: core::ptr::null_mut(),
+            capacity: 0,
+            count: 0,
+            done: false,
+            producing: 0,
+        })
+        .map_err(|_| arena_full())?;
+    let address = core::ptr::from_mut(&mut store[0]);
+    deferred
+        .rows
+        .store(address as usize, core::sync::atomic::Ordering::Relaxed);
+    Ok(DeferredCteStoreRef(address))
+}
+
+/// Runs a deferred query from its first row, passing `visit` each row at
+/// or past `from` with its position, until `visit` returns false (then
+/// `Ok(false)`) or the query ends. With a store, rows past the stored ones
+/// are appended as they are run.
+fn run_deferred_cte<'a>(
+    deferred: super::ast::DeferredCteQuery<'a>,
+    store: Option<DeferredCteStoreRef<'a>>,
+    from: usize,
+    arena: &'a Arena,
+    read: DeferredCteRead<'_, 'a>,
+    visit: &mut dyn FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    let mut rerun = false;
+    if let Some(store) = store {
+        let mut current = store.get();
+        rerun = current.count > 0 || current.producing > 0;
+        // Rows a run already returned are run again before new ones, which
+        // a volatile query would evaluate differently.
+        if deferred.volatile && rerun {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "WITH query \"{}\" calls a volatile function and is read past the rows an earlier read of it stopped at",
+                deferred.name
+            ));
+        }
+        current.producing += 1;
+        store.set(current);
+    }
+    let _run = DeferredCteRun { store };
+    // The reader's own nodes count in its block, not the query's.
+    let reader_block = instrument::current_block();
+    let _cte = instrument::enter_block(deferred.block);
+    let _rerun = rerun.then(instrument::rerun);
+    let variables = read.outer.map(super::eval::RoutineVariables);
+    let mut position = 0usize;
+    // `visit` stopped reading, or another run inside its row went further
+    // than this one, whose reader then reads on from the store.
+    let mut stopped = false;
+    let mut overtaken = false;
+    let result = setops::stream_set_body(
+        read.storage,
+        read.txid,
+        deferred.tree,
+        arena,
+        read.params,
+        read.sequences,
+        variables
+            .as_ref()
+            .map(|variables| variables as &dyn ColumnLookup<'a>),
+        &mut |row| {
+            check_timeout()?;
+            let this = position;
+            position += 1;
+            let row = match store {
+                Some(store) => {
+                    let stored = store.rows();
+                    if this < stored.len() {
+                        // Another run stored it first; runs of a query
+                        // without volatile calls return the same rows.
+                        stored[this]
+                    } else {
+                        store.push(row, arena)?;
+                        row
+                    }
+                }
+                None => row,
+            };
+            if this < from {
+                return Ok(());
+            }
+            let keep = {
+                let _reader = instrument::enter_block(reader_block);
+                let _counted = instrument::outside_rerun();
+                visit(this, row)?
+            };
+            if !keep {
+                stopped = true;
+            } else if store.is_some_and(|store| store.rows().len() > position) {
+                overtaken = true;
+            } else {
+                return Ok(());
+            }
+            Err(sql_err!(
+                sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE,
+                "WITH query reader completed"
+            ))
+        },
+    );
+    match result {
+        Err(error)
+            if (stopped || overtaken)
+                && error.sqlstate == sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE =>
+        {
+            Ok(!stopped)
+        }
+        Err(error) => {
+            // The attempt that failed is abandoned; a later one runs the
+            // query again from its first row, as it ran nothing.
+            if let Some(store) = store {
+                let current = store.get();
+                store.set(DeferredCteStore {
+                    count: 0,
+                    done: false,
+                    ..current
+                });
+            }
+            Err(error)
+        }
+        Ok(()) => {
+            if let Some(store) = store {
+                let mut current = store.get();
+                current.done = true;
+                store.set(current);
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Reads a deferred ordinary `WITH` query as PostgreSQL's `CTE Scan` reads
+/// its query's tuplestore: the stored rows first, then rows run on demand,
+/// so a reader that stops (a `LIMIT`) leaves the query's later rows unrun.
+/// Returns false once `visit` does.
+pub(crate) fn scan_deferred_cte<'a>(
+    deferred: super::ast::DeferredCteQuery<'a>,
+    arena: &'a Arena,
+    read: DeferredCteRead<'_, 'a>,
+    visit: &mut dyn FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    if deferred_cte_dry_run(read) {
+        return run_deferred_cte(deferred, None, 0, arena, read, visit);
+    }
+    let store = deferred_cte_store(deferred, arena)?;
+    let mut index = 0usize;
+    let finished = loop {
+        let rows = store.rows();
+        while index < rows.len() {
+            check_timeout()?;
+            if !visit(index, rows[index])? {
+                record_cte_storage(deferred.block, store.rows());
+                return Ok(false);
+            }
+            index += 1;
+        }
+        if store.get().done {
+            break true;
+        }
+        if !run_deferred_cte(deferred, Some(store), index, arena, read, &mut |at, row| {
+            index = at + 1;
+            visit(at, row)
+        })? {
+            break false;
+        }
+    };
+    record_cte_storage(deferred.block, store.rows());
+    Ok(finished)
+}
+
+/// Every row of a deferred ordinary `WITH` query, running the rows no
+/// reader pulled yet.
+pub(crate) fn read_deferred_cte<'a>(
+    deferred: super::ast::DeferredCteQuery<'a>,
+    arena: &'a Arena,
+    query: Option<DeferredCteRead<'_, 'a>>,
+) -> Result<&'a [&'a [u8]], SqlError> {
     let Some(query) = query else {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "a WITH query was read without its statement context"
         ));
     };
-    let variables = query.outer.map(super::eval::RoutineVariables);
-    let (rows, _, _) = setops::materialize_set_body_tied(
-        query.storage,
-        query.txid,
-        deferred.tree,
-        arena,
-        query.params,
-        query.sequences,
-        variables
-            .as_ref()
-            .map(|variables| variables as &dyn ColumnLookup<'a>),
-    )?;
-    record_cte_storage(deferred.block, rows);
-    // A dry run (such as CREATE TABLE AS counting its rows first) previews
-    // sequence values; the run that consumes them must evaluate again.
-    if query
-        .sequences
-        .is_some_and(|sequences| !sequences.has_effects())
-    {
+    if deferred_cte_dry_run(query) {
+        let _cte = instrument::enter_block(deferred.block);
+        let variables = query.outer.map(super::eval::RoutineVariables);
+        let (rows, _, _) = setops::materialize_set_body_tied(
+            query.storage,
+            query.txid,
+            deferred.tree,
+            arena,
+            query.params,
+            query.sequences,
+            variables
+                .as_ref()
+                .map(|variables| variables as &dyn ColumnLookup<'a>),
+        )?;
         return Ok(rows);
     }
-    const EMPTY: &[u8] = &[];
-    let kept = arena
-        .alloc_persistent_slice_with(rows.len(), |_| EMPTY)
-        .map_err(|_| arena_full())?;
-    for (kept, row) in kept.iter_mut().zip(rows) {
-        let bytes = arena
-            .alloc_persistent_slice_with(row.len(), |index| row[index])
-            .map_err(|_| arena_full())?;
-        *kept = &*bytes;
+    let store = deferred_cte_store(deferred, arena)?;
+    if !store.get().done {
+        scan_deferred_cte(deferred, arena, query, &mut |_, _| Ok(true))?;
     }
-    let kept: &'a [&'a [u8]] = kept;
-    let source = arena
-        .alloc_persistent_slice_with(1, |_| DeferredCteRows {
-            owner: core::ptr::from_ref(arena) as usize,
-            address: kept.as_ptr() as usize,
-            length: kept.len(),
-        })
-        .map_err(|_| arena_full())?;
-    deferred.rows.store(
-        core::ptr::from_ref(&source[0]) as usize,
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    Ok(kept)
+    record_cte_storage(deferred.block, store.rows());
+    Ok(store.rows())
 }
 
 /// Under `EXPLAIN ANALYZE`, records the memory the tuplestore of the `WITH`
@@ -14463,7 +14698,9 @@ pub(crate) fn select_query_resumable<'a>(
         let stages = instrument::Stages::current();
         let _stages = stages.start();
         let scan_output = instrument::ScanOutput::current(scope.n);
-        let scan = scan_source_recycling_with_pax_columns(
+        let scan = join_exec::scan_statement_source(
+            statement,
+            true,
             storage,
             &scope,
             from,
@@ -16612,35 +16849,21 @@ fn select_into_rows_mode<'a>(
         Ok(produced < stop_after)
     };
     let pax_columns = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-    if recycle_rows {
-        scan_source_recycling_with_pax_columns(
-            storage,
-            &scope,
-            from,
-            txid,
-            where_in_scan,
-            arena,
-            params,
-            &hooks,
-            outer,
-            pax_columns,
-            &mut visit,
-        )
-    } else {
-        scan_source_with_pax_columns(
-            storage,
-            &scope,
-            from,
-            txid,
-            where_in_scan,
-            arena,
-            params,
-            &hooks,
-            outer,
-            pax_columns,
-            &mut visit,
-        )
-    }
+    join_exec::scan_statement_source(
+        statement,
+        recycle_rows,
+        storage,
+        &scope,
+        from,
+        txid,
+        where_in_scan,
+        arena,
+        params,
+        &hooks,
+        outer,
+        pax_columns,
+        &mut visit,
+    )
 }
 
 pub(super) fn streaming_pax_columns<'a>(

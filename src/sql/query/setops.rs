@@ -18,7 +18,7 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Outcome, QueryScope, arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type,
-    instrument, select_into_rows_recycling, sql_fail, sql_ok,
+    instrument, select_into_rows, select_into_rows_recycling, sql_fail, sql_ok,
 };
 
 #[derive(Clone, Copy)]
@@ -2136,6 +2136,177 @@ pub(super) fn materialize_set_body_tied<'a>(
     sequences: Option<&dyn SequenceAccess>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
+    let (target, collations) = set_body_columns(storage, txid, tree, arena, outer)?;
+    let rows = eval_set_tree(
+        tree,
+        storage,
+        txid,
+        arena,
+        params,
+        sequences,
+        target,
+        collations,
+        outer,
+        &mut (0, 0),
+    )?;
+    Ok((rows, target, target.len()))
+}
+
+/// Runs a set-operation body as its reader pulls rows, as PostgreSQL's
+/// executor does under a `CTE Scan`: each leaf `SELECT` streams, and a
+/// `UNION ALL` reads its right input only after its left one ended. Other
+/// set operations read both inputs whole first, as their PostgreSQL nodes
+/// do. Each row is encoded in the arena's persistent tail before `emit`
+/// sees it; an error from `emit` stops the body.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set body carries its execution scope"
+)]
+pub(super) fn stream_set_body<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    tree: &'a SetTree<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    emit: &mut dyn FnMut(&'a [u8]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let (target, collations) = set_body_columns(storage, txid, tree, arena, outer)?;
+    stream_set_tree(
+        tree,
+        storage,
+        txid,
+        arena,
+        params,
+        sequences,
+        target,
+        collations,
+        outer,
+        &mut (0, 0),
+        emit,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set tree carries its execution scope"
+)]
+fn stream_set_tree<'a>(
+    tree: &'a SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    target: &[ColType],
+    collations: &[Collation],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    numbers: &mut (u16, u16),
+    emit: &mut dyn FnMut(&'a [u8]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    match tree {
+        SetTree::Select(s) => {
+            let _branch = instrument::enter(instrument::Segment::Branch(numbers.1));
+            numbers.1 = numbers.1.saturating_add(1);
+            if let Some(body) = s.set_body
+                && s.order_by.is_empty()
+                && s.limit.is_none()
+                && s.offset.is_none()
+                && s.with.is_empty()
+                && s.locking.is_empty()
+            {
+                // A set operation the leaf only wraps streams too.
+                let stages = instrument::Stages::current();
+                let _stages = stages.start();
+                return stream_set_tree(
+                    body,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    sequences,
+                    target,
+                    collations,
+                    outer,
+                    &mut (0, 0),
+                    emit,
+                );
+            }
+            let n = target.len();
+            select_into_rows(
+                storage,
+                txid,
+                s,
+                arena,
+                params,
+                outer,
+                sequences,
+                &mut |vals| {
+                    if vals.len() != n {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "each UNION query must have the same number of columns"
+                        ));
+                    }
+                    let mut coerced = [Datum::Null; MAX_PROJ];
+                    for c in 0..n {
+                        coerced[c] = coerce_set_value(vals[c], target[c], arena)?;
+                    }
+                    emit(exec::encode_projected_persistent_pub(&coerced[..n], arena)?)
+                },
+            )
+        }
+        SetTree::Op {
+            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+            operator: SetOp::Union,
+            all: true,
+            left,
+            right,
+        } => {
+            let node = instrument::node(instrument::Role::SetOperation(numbers.0));
+            let input = instrument::node(instrument::Role::SetInput(numbers.0));
+            numbers.0 = numbers.0.saturating_add(1);
+            let _loop = node.start();
+            let _input_loop = input.start();
+            for side in [left, right] {
+                stream_set_tree(
+                    side,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    sequences,
+                    target,
+                    collations,
+                    outer,
+                    numbers,
+                    &mut |row| {
+                        input.row();
+                        node.row();
+                        emit(row)
+                    },
+                )?;
+            }
+            Ok(())
+        }
+        SetTree::Op { .. } => {
+            let rows = eval_set_tree(
+                tree, storage, txid, arena, params, sequences, target, collations, outer, numbers,
+            )?;
+            rows.iter().try_for_each(|row| emit(row))
+        }
+    }
+}
+
+/// The unified column types and collations of a set-operation body.
+fn set_body_columns<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    tree: &'a SetTree<'a>,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(&'a [ColType], &'a [Collation]), SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n = describe_set_body(
         storage,
@@ -2164,23 +2335,10 @@ pub(super) fn materialize_set_body_tied<'a>(
     let target = arena
         .alloc_slice_copy(&tgt[..n])
         .map_err(|_| arena_full())?;
-    let mut collations = [Collation::None; MAX_PROJ];
-    for (index, column) in columns[..n].iter().enumerate() {
-        collations[index] = column.collation;
-    }
-    let rows = eval_set_tree(
-        tree,
-        storage,
-        txid,
-        arena,
-        params,
-        sequences,
-        target,
-        &collations[..n],
-        outer,
-        &mut (0, 0),
-    )?;
-    Ok((rows, target, n))
+    let collations = arena
+        .alloc_slice_with(n, |index| columns[index].collation)
+        .map_err(|_| arena_full())?;
+    Ok((target, collations))
 }
 
 #[expect(

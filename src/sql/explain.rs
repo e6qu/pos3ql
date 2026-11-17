@@ -26,6 +26,7 @@ use crate::storage::Storage;
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
 
+mod joins;
 mod rewrite;
 mod targets;
 
@@ -218,6 +219,7 @@ enum QualLabel {
     OneTimeFilter,
     Filter,
     HashCond,
+    MergeCond,
     IndexCond,
     RecheckCond,
     JoinFilter,
@@ -239,6 +241,7 @@ impl QualLabel {
             | Self::FunctionCall
             | Self::OneTimeFilter
             | Self::HashCond
+            | Self::MergeCond
             | Self::IndexCond
             | Self::RecheckCond => 0,
             Self::JoinFilter => 1,
@@ -253,6 +256,7 @@ impl QualLabel {
             Self::OneTimeFilter => "One-Time Filter",
             Self::Filter => "Filter",
             Self::HashCond => "Hash Cond",
+            Self::MergeCond => "Merge Cond",
             Self::IndexCond => "Index Cond",
             Self::RecheckCond => "Recheck Cond",
             Self::JoinFilter => "Join Filter",
@@ -463,6 +467,7 @@ impl NodeActual {
             QualLabel::IndexCond | QualLabel::RecheckCond => 0,
             QualLabel::OneTimeFilter
             | QualLabel::HashCond
+            | QualLabel::MergeCond
             | QualLabel::Window
             | QualLabel::PresortedKey
             | QualLabel::FunctionCall
@@ -481,6 +486,7 @@ impl QualLabel {
             Self::IndexCond | Self::RecheckCond => Some("Rows Removed by Index Recheck"),
             Self::OneTimeFilter
             | Self::HashCond
+            | Self::MergeCond
             | Self::Window
             | Self::PresortedKey
             | Self::FunctionCall
@@ -6367,6 +6373,24 @@ fn plan_pulled_select<'a>(
         |columns| columns,
     );
     let aggregate = has_aggregate(statement, storage, txid, columns)?;
+    // A join PostgreSQL's join search plans is explained as that plan.
+    if !aggregate
+        && outer.is_none()
+        && foreign_scan.is_none()
+        && let Some(scope) = scope.as_ref()
+        && let Some(model) = query::index_paths::join_query::modeled_join(
+            storage,
+            txid,
+            statement,
+            scope,
+            &[],
+            arena,
+        )?
+    {
+        let mut plan = joins::join_plan(storage, txid, scope, &model, block, arena)?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     let ordered_index = if !statement.distinct
         && statement.distinct_on.is_empty()
         && !statement.order_by.is_empty()
@@ -8332,9 +8356,17 @@ fn plan_pulled_select<'a>(
             // A join reads its input's physical columns (`use_physical_tlist`),
             // which a subquery's own plan outputs in order; a query of the
             // one relation projects its own select list.
+            // A plain aggregate over it reads the physical columns too:
+            // `use_physical_tlist` refuses only a grouping key's label.
+            let plain_aggregate = aggregate
+                && statement.having.is_none()
+                && statement.group_by.is_empty()
+                && statement.grouping_sets.is_empty()
+                && statement.windows.is_empty();
             let passes_through = body.locking.is_empty()
                 && !has_resjunk_targets(body)
                 && (!from.joins.is_empty()
+                    || plain_aggregate
                     || statement
                         .items
                         .iter()
@@ -13564,6 +13596,8 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
 struct PostgresHashTable {
     buckets: u64,
     original_buckets: u64,
+    batches: u64,
+    original_batches: u64,
     bytes: usize,
 }
 
@@ -13589,10 +13623,21 @@ impl PostgresHashTable {
         {
             buckets *= 2;
         }
+        if let Some(batches) = table.batches {
+            return Self {
+                buckets: u64::from(batches.buckets),
+                original_buckets: u64::from(batches.original_buckets),
+                batches: u64::from(batches.batches),
+                original_batches: u64::from(batches.original_batches),
+                bytes: batches.peak,
+            };
+        }
         let rows = table.tuple_bytes.unwrap_or(table.own_bytes);
         Self {
             buckets,
             original_buckets: original,
+            batches: 1,
+            original_batches: 1,
             bytes: rows.saturating_add(buckets as usize * 8),
         }
     }
@@ -13979,17 +14024,17 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, " ");
             }
             let memory = table.bytes.div_ceil(1024);
-            if table.original_buckets == table.buckets {
+            if table.original_buckets == table.buckets && table.original_batches == table.batches {
                 let _ = write!(
                     line,
-                    "Buckets: {}  Batches: 1  Memory Usage: {memory}kB",
-                    table.buckets
+                    "Buckets: {}  Batches: {}  Memory Usage: {memory}kB",
+                    table.buckets, table.batches
                 );
             } else {
                 let _ = write!(
                     line,
-                    "Buckets: {} (originally {})  Batches: 1 (originally 1)  Memory Usage: {memory}kB",
-                    table.buckets, table.original_buckets
+                    "Buckets: {} (originally {})  Batches: {} (originally {})  Memory Usage: {memory}kB",
+                    table.buckets, table.original_buckets, table.batches, table.original_batches
                 );
             }
             emit(line.as_str())?;
@@ -15127,8 +15172,8 @@ fn structured_node(
         let table = PostgresHashTable::of(node, table);
         document.number("Hash Buckets", table.buckets);
         document.number("Original Hash Buckets", table.original_buckets);
-        document.number("Hash Batches", 1);
-        document.number("Original Hash Batches", 1);
+        document.number("Hash Batches", table.batches);
+        document.number("Original Hash Batches", table.original_batches);
         document.number("Peak Memory Usage", table.bytes.div_ceil(1024));
     }
     for (label, text) in node.shown_qualifications(options.verbose) {
@@ -15722,6 +15767,7 @@ mod tests {
                     tuples,
                     tuple_bytes: Some(1000),
                     own_bytes: 7,
+                    batches: None,
                 },
             )
         };

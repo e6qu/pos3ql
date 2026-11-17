@@ -609,6 +609,21 @@ pub(crate) struct HashTable {
     pub(crate) tuple_bytes: Option<usize>,
     /// The bytes pos3ql's own arrays took, every array it outgrew included.
     pub(crate) own_bytes: usize,
+    /// A table built as PostgreSQL's join builds it, batches included: its
+    /// figures as `EXPLAIN ANALYZE` reports them.
+    pub(crate) batches: Option<HashBatches>,
+}
+
+/// The figures of a hash table PostgreSQL's executor builds
+/// (`HashInstrumentation`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct HashBatches {
+    pub(crate) buckets: u32,
+    pub(crate) original_buckets: u32,
+    pub(crate) batches: u32,
+    pub(crate) original_batches: u32,
+    /// `spacePeak`.
+    pub(crate) peak: usize,
 }
 
 /// A value the rows of a `Hash` node hold, which sizes it as PostgreSQL
@@ -830,6 +845,9 @@ pub(crate) struct Slot {
     carried: Option<(u64, u64)>,
     /// The attempt whose work the counters hold.
     attempt: u32,
+    /// The run of a `WITH` query run again from its first row whose work
+    /// the counters hold (see [`rerun`]); zero outside such runs.
+    rerun: u32,
 }
 
 impl Slot {
@@ -866,6 +884,7 @@ impl Slot {
             first_row: None,
             carried: None,
             attempt: 0,
+            rerun: 0,
         }
     }
 
@@ -888,11 +907,12 @@ impl Slot {
     }
 
     fn restart(&mut self, attempt: u32) {
-        let carried = self.carried;
+        let (carried, rerun) = (self.carried, self.rerun);
         *self = Self::new(self.key)
             .with_hash_columns(self.hash_columns)
             .with_hash_agg(self.hash_agg);
         self.attempt = attempt;
+        self.rerun = rerun;
         if let Some((rows, filtered)) = carried {
             self.carried = carried;
             self.counters.rows = rows;
@@ -913,11 +933,46 @@ struct Registry {
     next_query: Option<u16>,
     /// The statement's current attempt.
     attempt: u32,
+    /// The runs [`rerun`] started.
+    reruns: u32,
 }
 
 thread_local! {
     static ACTIVE: Cell<Option<NonNull<Registry>>> = const { Cell::new(None) };
     static BLOCK: Cell<BlockId> = const { Cell::new(BlockId::ROOT) };
+    /// The [`rerun`] whose nodes are counting, or zero.
+    static RERUN: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts a `WITH` query run again from its first row, to reach rows past
+/// where an earlier run stopped, until the returned scope ends: each node
+/// it reaches restarts its counters there, so the nodes report the rows up
+/// to the furthest row read, once, as PostgreSQL's single run of the query
+/// does.
+#[must_use]
+pub(crate) fn rerun() -> Rerun {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return Rerun(RERUN.with(Cell::get));
+    };
+    // SAFETY: see `node`; nothing else borrows the registry here.
+    let registry = unsafe { registry.as_mut() };
+    registry.reruns = registry.reruns.wrapping_add(1).max(1);
+    Rerun(RERUN.with(|rerun| rerun.replace(registry.reruns)))
+}
+
+/// Counts the reader of a rerun query's rows normally until the returned
+/// scope ends.
+#[must_use]
+pub(crate) fn outside_rerun() -> Rerun {
+    Rerun(RERUN.with(|rerun| rerun.replace(0)))
+}
+
+pub(crate) struct Rerun(u32);
+
+impl Drop for Rerun {
+    fn drop(&mut self) {
+        RERUN.with(|rerun| rerun.set(self.0));
+    }
 }
 
 struct Restore {
@@ -959,6 +1014,7 @@ fn install<R>(
         timing,
         next_query,
         attempt: 0,
+        reruns: 0,
     };
     let _restore = Restore {
         active: ACTIVE.with(|active| active.replace(Some(NonNull::from(&mut registry)))),
@@ -1176,6 +1232,11 @@ impl Node {
             if slot.attempt != self.attempt {
                 slot.restart(self.attempt);
             }
+            let rerun = RERUN.with(Cell::get);
+            if rerun != 0 && slot.rerun != rerun {
+                slot.restart(slot.attempt);
+                slot.rerun = rerun;
+            }
             update(slot, self.timing);
         }
     }
@@ -1266,6 +1327,17 @@ impl Node {
                         .zip(table.tuple_bytes)
                         .map(|(held, built)| held.max(built)),
                     own_bytes: held.own_bytes.max(table.own_bytes),
+                    // `ExecHashAccumInstrumentation`: the largest of each.
+                    batches: match (held.batches, table.batches) {
+                        (Some(held), Some(built)) => Some(HashBatches {
+                            buckets: held.buckets.max(built.buckets),
+                            original_buckets: held.original_buckets.max(built.original_buckets),
+                            batches: held.batches.max(built.batches),
+                            original_batches: held.original_batches.max(built.original_batches),
+                            peak: held.peak.max(built.peak),
+                        }),
+                        (held, built) => built.or(held),
+                    },
                 },
             });
         });
@@ -1493,7 +1565,11 @@ impl Node {
 
     fn end(self) {
         self.with(|slot, _| {
-            slot.open = slot.open.saturating_sub(1);
+            // A loop a rerun's restart closed does not count again.
+            if slot.open == 0 {
+                return;
+            }
+            slot.open -= 1;
             if slot.open != 0 {
                 return;
             }

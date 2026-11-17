@@ -448,8 +448,16 @@ Syntax and errors:
   `invalid reference to FROM-clause entry for table "a"` and its hint to mark
   the subquery `LATERAL`. `UPDATE ... FROM` and `DELETE ... USING` items
   cannot read the target table, even when `LATERAL`.
-- A materialized `WITH` query runs when its rows are first read, as
-  PostgreSQL's CTE scan runs it; one that nothing reads never runs.
+- A materialized `WITH` query (or one read more than once) runs only as far
+  as its readers read it, as PostgreSQL's CTE scan pulls rows into the store
+  its readers share; one that nothing reads never runs. For example, `WITH c
+  AS MATERIALIZED (SELECT 1 / (a - 2000) FROM t) SELECT * FROM c LIMIT 2`
+  returns two rows without reaching the row that divides by zero. A reader
+  that needs rows past where an earlier read stopped runs the query again
+  from its first row; a query calling a volatile function would evaluate
+  those rows differently, so that read fails with `0A000`. Readers that
+  are the only item of their `FROM` read this way; a join reads the whole
+  query at its first read.
 - `UPDATE` and `INSERT` assign through composite fields and array elements:
   `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
   a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,
@@ -1266,9 +1274,13 @@ Where pos3ql's planner has the same choice, the setting decides it:
   For the plan costs of such a scan, `seq_page_cost`, `random_page_cost`,
   `cpu_tuple_cost`, `cpu_index_tuple_cost`, `cpu_operator_cost` and
   `effective_cache_size` apply as in PostgreSQL.
-- `enable_hashjoin` and `enable_nestloop` choose between a hash join and a
-  nested loop, and `enable_material` drops the `Materialize` step `EXPLAIN`
-  shows over a nested loop's inner sequential scan.
+- `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop` choose
+  between a hash join, a merge join and a nested loop, and
+  `enable_material` drops the `Materialize` step `EXPLAIN` shows over a
+  nested loop's inner sequential scan. For example, `SELECT * FROM a JOIN b
+  ON a.id = b.id` over two analyzed tables without indexes is planned with
+  PostgreSQL's costs: `EXPLAIN` prints the same plan and costs, and the rows
+  come back in the same order.
 - When every way to run a step is disabled, the step still runs and `EXPLAIN`
   marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
   followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
@@ -1356,9 +1368,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
-  node, and a nested loop's `Join Filter` and `Materialize` inner scan, in
-  PostgreSQL's layout. There is no merge join, so a query PostgreSQL plans as
-  `Merge Join` shows a hash join or nested loop. A statement a rewrite rule
+  node, a merge join's `Merge Cond` and sorts, and a nested loop's `Join
+  Filter` and `Materialize` inner scan, in PostgreSQL's layout. Joins of
+  plain tables without indexes, inner-joined by column equalities, follow
+  PostgreSQL's join search and costs; other joins keep pos3ql's own order
+  and methods, without merge joins, and `EXPLAIN` with costs refuses them
+  with `0A000`. A statement a rewrite rule
   changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.

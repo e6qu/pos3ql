@@ -47,12 +47,27 @@ installed by the owning workflow. `Cargo.toml`, `examples/dev.conf` and
 `.github/workflows/` define the actual build and environment.
 
 Protect the interactive machine. Full builds, full test gates and large
-benchmark or evidence regeneration run on GitHub runners. Local work is serial,
-low priority and monitored through the workspace's resource guard: keep at
-least 64 GiB free disk, generated `target` data below 2 GiB, and each workload
-at or below 1 GiB sampled aggregate RSS with a 180-second deadline. If the guard
-refuses or a limit is reached, move the work to CI; do not bypass the guard or
-raise its limits.
+benchmark or evidence regeneration run on GitHub runners. Local work is serial
+and low priority: run one build or one test workload at a time, never a test
+loop beside a compile, and stop every server a run starts. Bound every
+generated or exploratory query's output (`LIMIT`, or `psql -v FETCH_COUNT=1000`
+with `statement_timeout`): psql buffers a whole result, and one unbounded
+multi-table join once grew a client to 24 GiB and froze the host.
+
+Keep `tools/dev-memory-guard.sh` running for the whole local session:
+
+```sh
+nohup tools/dev-memory-guard.sh >/dev/null 2>&1 &
+```
+
+It stops your own test clients (psql, Python) above 3 GiB resident memory and
+database servers (pos3ql, postgres) above 10 GiB. When available system memory
+falls below 12%, it stops the largest of those processes, compilers or cargo
+test binaries. It logs each stop with the command line to
+`~/.cache/pos3ql/dev-memory-guard.log`, and warns when free disk, which swap
+needs, falls below 20 GiB. The script's header lists its settings. A stopped
+run means the workload is too large for the machine: bound it or move it to CI
+rather than raising the limits.
 
 A focused regression on a suitable runner:
 

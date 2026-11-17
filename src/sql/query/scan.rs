@@ -6788,7 +6788,7 @@ pub(crate) fn derived_key_plan<'a>(
     let build_table = order[depth];
     if scope.derived[build_table].is_none()
         || scope.external_runs[build_table].is_some()
-        || scope.recursive[build_table].is_some()
+        || scope.lazy_ctes[build_table].is_some()
         || scope.foreign_streams[build_table].is_some()
         || scope.lateral[build_table]
     {
@@ -9502,6 +9502,7 @@ fn scan_source_mode<'a>(
                     tuples: n as u64,
                     tuple_bytes,
                     own_bytes: allocated,
+                    batches: None,
                 });
                 drop(build_loop);
                 drop(hash_loop);
@@ -10625,7 +10626,27 @@ fn scan_source_mode<'a>(
                     }
                 }
             }
-        } else if let Some(recursive) = scope.recursive[order[depth]] {
+        } else if let Some(super::scope::LazyCte::Deferred(deferred)) =
+            scope.lazy_ctes[order[depth]]
+        {
+            // Run the query only as far as this scan reads it.
+            let read = super::DeferredCteRead {
+                storage,
+                txid,
+                params,
+                sequences: hooks.sequences,
+                outer,
+            };
+            if !super::scan_deferred_cte(deferred, arena, read, &mut |index, bytes| {
+                recycled(arena, recycle_rows, retain_match, || {
+                    visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                })
+            })? {
+                return Ok(false);
+            }
+        } else if let Some(super::scope::LazyCte::Recursive(recursive)) =
+            scope.lazy_ctes[order[depth]]
+        {
             // Run the recursive query only as far as this scan reads it.
             let read = super::DeferredCteRead {
                 storage,
